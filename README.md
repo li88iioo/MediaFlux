@@ -12,7 +12,6 @@
 
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/) [![FastAPI](https://img.shields.io/badge/FastAPI-0.140+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/) [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](docs/部署指南.md) [![MIT License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-
 <br/>
 
 [快速开始](#快速开始) • [项目由来](#项目由来) • [功能概览](#功能概览) • [工作流程](docs/tutorials/00_自动化流转全景与工作流程.md) • [部署指南](docs/部署指南.md) • [配置教程](docs/配置教程.md) • [常见问题](docs/常见问题.md) • [免责声明](docs/免责声明.md)
