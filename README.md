@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="app/static/img/mediaflux-logo.svg" alt="MediaFlux Logo" width="320" />
+<a href="#readme"><img src="app/static/img/mediaflux-logo.svg" alt="MediaFlux Logo" width="320" /></a>
 
 <br/>
 
@@ -10,7 +10,8 @@
 
 <br/>
 
-![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white) ![FastAPI](https://img.shields.io/badge/FastAPI-0.140+-009688?logo=fastapi&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white) ![License](https://img.shields.io/badge/License-MIT-green)
+[![Python 3.13](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/) [![FastAPI](https://img.shields.io/badge/FastAPI-0.140+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/) [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](docs/部署指南.md) [![MIT License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+
 
 <br/>
 
