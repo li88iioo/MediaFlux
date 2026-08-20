@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}媒体探索 - MediaFlux{% endblock %}
+{% block body_class %}discovery-workspace-page{% endblock %}
+{% block page_title %}媒体探索{% endblock %}
+{% block workspace_bar %}
+<div class="discovery-mobile-bar">
+    <button class="icon-btn workspace-menu-btn" id="toggleSidebar" aria-label="菜单" title="打开导航"><i data-lucide="menu" aria-hidden="true"></i></button>
+</div>
+{% endblock %}
+
+{% block content %}
+<div
+    class="discovery-page"
+    aria-labelledby="discovery-heading"
+    data-discovery-root
+    data-resource-results-enabled="{{ 'true' if resource_results_enabled else 'false' }}"
+>
+    <h1 class="sr-only" id="discovery-heading">媒体探索</h1>
+
+    <section class="discovery-control-deck" aria-label="探索控制台">
+        <div class="discovery-source-tabs" id="discovery-source-tabs" role="tablist" aria-label="探索来源">
+            <button class="discovery-source-tab is-active" type="button" role="tab" aria-selected="true" id="discovery-tab-sections" aria-controls="discovery-stage" data-mode="sections" data-provider="all" data-media-type="all">
+                <span class="discovery-tab-index">01</span><span>放映排期</span>
+            </button>
+            <button class="discovery-source-tab" type="button" role="tab" aria-selected="false" id="discovery-tab-douban-movie" aria-controls="discovery-stage" tabindex="-1" data-mode="items" data-provider="douban" data-media-type="movie">
+                <span class="discovery-tab-index">02</span><span>豆瓣电影</span>
+            </button>
+            <button class="discovery-source-tab" type="button" role="tab" aria-selected="false" id="discovery-tab-douban-tv" aria-controls="discovery-stage" tabindex="-1" data-mode="items" data-provider="douban" data-media-type="tv">
+                <span class="discovery-tab-index">03</span><span>豆瓣剧集</span>
+            </button>
+            <button class="discovery-source-tab" type="button" role="tab" aria-selected="false" id="discovery-tab-tmdb-movie" aria-controls="discovery-stage" tabindex="-1" data-mode="items" data-provider="tmdb" data-media-type="movie">
+                <span class="discovery-tab-index">04</span><span>TMDB 电影</span>
+            </button>
+            <button class="discovery-source-tab" type="button" role="tab" aria-selected="false" id="discovery-tab-tmdb-tv" aria-controls="discovery-stage" tabindex="-1" data-mode="items" data-provider="tmdb" data-media-type="tv">
+                <span class="discovery-tab-index">05</span><span>TMDB 剧集</span>
+            </button>
+            <button class="discovery-source-tab" type="button" role="tab" aria-selected="false" id="discovery-tab-bangumi" aria-controls="discovery-stage" tabindex="-1" data-mode="items" data-provider="bangumi" data-media-type="tv">
+                <span class="discovery-tab-index">06</span><span>Bangumi</span>
+            </button>
+        </div>
+
+        <div class="discovery-toolbar">
+            <form class="discovery-search-form" id="discovery-search-form" role="search" aria-label="搜索影视资料">
+                <label class="sr-only" for="discovery-search-query">影视名称</label>
+                <div class="discovery-search-field">
+                    <input class="form-input discovery-search-input" id="discovery-search-query" name="q" type="search" maxlength="120" autocomplete="off" placeholder="搜索电影、剧集或动画" required>
+                    <button class="icon-btn discovery-search-submit" id="discovery-search-submit" type="submit" aria-label="搜索" title="搜索">
+                        <i data-lucide="search" aria-hidden="true"></i>
+                    </button>
+                </div>
+            </form>
+            <div class="discovery-filter-region" id="discovery-filter-region" aria-label="探索筛选条件" hidden></div>
+            <div class="discovery-toolbar-meta">
+                <span class="discovery-provider-status" id="discovery-provider-status" role="status" aria-label="等待数据源" title="等待数据源" data-tone="error">
+                    <i data-lucide="radio" aria-hidden="true"></i>
+                </span>
+                <button class="icon-btn discovery-refresh" id="discovery-refresh" type="button" aria-label="刷新探索内容" title="刷新探索内容">
+                    <i data-lucide="refresh-cw" aria-hidden="true"></i>
+                </button>
+            </div>
+        </div>
+    </section>
+
+    <div class="sr-only" id="discovery-live" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <section class="discovery-stage" id="discovery-stage" role="tabpanel" aria-labelledby="discovery-tab-sections" aria-label="探索内容">
+        <div class="discovery-sections" id="discovery-sections" aria-busy="false"></div>
+        <div class="discovery-grid" id="discovery-grid" aria-busy="false" hidden></div>
+        <div class="discovery-page-sentinel" id="discovery-page-sentinel" aria-hidden="true"></div>
+        <div class="discovery-load-more-row" id="discovery-load-more-row" hidden>
+            <button class="jump-btn discovery-load-more" id="discovery-load-more" type="button">
+                <span>调取下一卷</span><i data-lucide="arrow-down" aria-hidden="true"></i>
+            </button>
+        </div>
+    </section>
+
+    <dialog class="discovery-dialog" id="discovery-detail-dialog" aria-labelledby="discovery-detail-title">
+        <div class="discovery-dialog-frame">
+            <header class="discovery-dialog-head">
+                <div>
+                    <h2 id="discovery-detail-title">CATALOGUE RECORD / 媒体档案</h2>
+                </div>
+                <button class="icon-btn" type="button" data-discovery-dialog-close aria-label="关闭" title="关闭"><i data-lucide="x" aria-hidden="true"></i></button>
+            </header>
+            <aside class="discovery-dialog-notice" id="discovery-dialog-notice" data-discovery-dialog-notice role="status" aria-live="polite" hidden>
+                <span class="discovery-dialog-notice-icon" id="discovery-dialog-notice-icon" aria-hidden="true"><i data-lucide="circle-check-big" aria-hidden="true"></i></span>
+                <div class="discovery-dialog-notice-copy">
+                    <span>RESOURCE DISPATCH</span>
+                    <strong id="discovery-dialog-notice-title">下载任务状态</strong>
+                    <p id="discovery-dialog-notice-text"></p>
+                </div>
+                <button class="icon-btn discovery-dialog-notice-close" id="discovery-dialog-notice-close" type="button" aria-label="关闭资源通知"><i data-lucide="x" aria-hidden="true"></i></button>
+            </aside>
+            <div class="discovery-dialog-body" id="discovery-detail-body"></div>
+        </div>
+    </dialog>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='js/discovery.js') }}?v=20260820c" defer></script>
+{% endblock %}

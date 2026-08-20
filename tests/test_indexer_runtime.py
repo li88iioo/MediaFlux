@@ -1,0 +1,351 @@
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+import unittest
+from unittest.mock import AsyncMock, Mock, patch
+
+from app.indexers import runtime
+
+
+class FakeRegistry:
+    def ids(self):
+        return ("nyaa", "sukebei", "mikan", "btbtla", "1lou", "animetosho", "tpb")
+
+    def enabled_ids(self):
+        return ("nyaa",)
+
+
+class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        runtime._service = None
+        runtime.unbind_indexer_event_loop()
+
+    def test_build_service_passes_configured_user_agent_to_registry(self):
+        registry = FakeRegistry()
+
+        def get_value(key, default=""):
+            if key == "INDEXER_USER_AGENT":
+                return "MediaFlux/Test"
+            return default
+
+        with patch("app.indexers.runtime.config.get", side_effect=get_value), patch(
+            "app.indexers.runtime.config.get_int",
+            side_effect=lambda _key, default: default,
+        ), patch(
+            "app.indexers.runtime.config.get_bool",
+            side_effect=lambda _key, default: default,
+        ), patch(
+            "app.indexers.runtime.build_default_registry",
+            return_value=registry,
+        ) as build:
+            service = runtime._build_service()
+
+        build.assert_called_once_with(
+            user_agent="MediaFlux/Test",
+            btbtla_min_interval_seconds=5,
+            onelou_min_interval_seconds=5,
+            onelou_google_enabled=True,
+        )
+        self.assertIs(service.registry, registry)
+
+    def test_build_service_enables_env_example_default_sites(self):
+        registry = FakeRegistry()
+
+        with patch("app.indexers.runtime.config.get", side_effect=lambda _key, default="": default), patch(
+            "app.indexers.runtime.config.get_int",
+            side_effect=lambda _key, default: default,
+        ), patch(
+            "app.indexers.runtime.config.get_bool",
+            return_value=False,
+        ), patch(
+            "app.indexers.runtime.build_default_registry",
+            return_value=registry,
+        ):
+            service = runtime._build_service()
+
+        self.assertEqual(
+            service.enabled_site_ids,
+            frozenset({"nyaa", "mikan", "btbtla", "1lou", "animetosho", "tpb"}),
+        )
+
+    async def test_sync_bridge_runs_on_bound_lifespan_loop(self):
+        owner_loop = asyncio.get_running_loop()
+        runtime.bind_indexer_event_loop(owner_loop)
+        observed: list[asyncio.AbstractEventLoop] = []
+
+        async def capture_loop():
+            observed.append(asyncio.get_running_loop())
+            return "ok"
+
+        result = await asyncio.to_thread(
+            runtime.run_indexer_awaitable_sync,
+            capture_loop(),
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(observed, [owner_loop])
+
+    async def test_sync_bridge_closes_service_on_same_bound_loop(self):
+        owner_loop = asyncio.get_running_loop()
+        runtime.bind_indexer_event_loop(owner_loop)
+        closed_on: list[asyncio.AbstractEventLoop] = []
+        service = Mock()
+
+        async def close():
+            closed_on.append(asyncio.get_running_loop())
+
+        service.aclose = close
+        runtime._service = service
+
+        await asyncio.to_thread(
+            runtime.run_indexer_awaitable_sync,
+            runtime.shutdown_indexer_service(),
+            timeout_seconds=1.0,
+        )
+
+        self.assertEqual(closed_on, [owner_loop])
+        self.assertIsNone(runtime._service)
+
+    async def test_async_bridge_from_worker_loop_runs_on_bound_lifespan_loop(self):
+        owner_loop = asyncio.get_running_loop()
+        runtime.bind_indexer_event_loop(owner_loop)
+        observed: list[asyncio.AbstractEventLoop] = []
+
+        async def capture_loop():
+            observed.append(asyncio.get_running_loop())
+            return "ok"
+
+        def run_from_worker_loop():
+            return asyncio.run(
+                runtime.run_indexer_awaitable(
+                    capture_loop(), timeout_seconds=1.0
+                )
+            )
+
+        result = await asyncio.to_thread(run_from_worker_loop)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(observed, [owner_loop])
+
+    async def test_async_bridge_accepts_generic_awaitable_on_bound_loop(self):
+        owner_loop = asyncio.get_running_loop()
+        runtime.bind_indexer_event_loop(owner_loop)
+        observed: list[asyncio.AbstractEventLoop] = []
+
+        class GenericAwaitable:
+            def __await__(self):
+                async def capture():
+                    observed.append(asyncio.get_running_loop())
+                    return "ok"
+
+                return capture().__await__()
+
+        def run_from_worker_loop():
+            return asyncio.run(runtime.run_indexer_awaitable(GenericAwaitable()))
+
+        result = await asyncio.to_thread(run_from_worker_loop)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(observed, [owner_loop])
+
+    async def test_shutdown_gate_cancels_pending_bridge_and_rejects_new_work(self):
+        owner_loop = asyncio.get_running_loop()
+        runtime.bind_indexer_event_loop(owner_loop)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        worker_result: list[BaseException] = []
+
+        async def gated_call():
+            entered.set()
+            await release.wait()
+
+        def worker_target():
+            try:
+                asyncio.run(runtime.run_indexer_awaitable(gated_call()))
+            except BaseException as exc:
+                worker_result.append(exc)
+
+        worker = threading.Thread(target=worker_target, daemon=True)
+        worker.start()
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        self.assertEqual(runtime.begin_indexer_shutdown(owner_loop), 1)
+        await asyncio.to_thread(worker.join, 1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(worker_result)
+
+        async def rejected_call():
+            return "unexpected"
+
+        with self.assertRaisesRegex(RuntimeError, "正在关闭"):
+            await runtime.run_indexer_awaitable(rejected_call())
+
+    async def test_shutdown_wait_offloaded_from_owner_loop_allows_worker_bridge_to_finish(self):
+        owner_loop = asyncio.get_running_loop()
+        runtime.bind_indexer_event_loop(owner_loop)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        worker_done = threading.Event()
+        stop_called_on: list[int] = []
+
+        async def gated_call():
+            entered.set()
+            await release.wait()
+            return "ok"
+
+        def worker_target():
+            try:
+                asyncio.run(runtime.run_indexer_awaitable(gated_call()))
+            finally:
+                worker_done.set()
+
+        worker = threading.Thread(target=worker_target, daemon=True)
+        worker.start()
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        def wait_for_worker():
+            stop_called_on.append(threading.get_ident())
+            worker.join(timeout=1.0)
+            return not worker.is_alive()
+
+        async def release_soon():
+            await asyncio.sleep(0.02)
+            release.set()
+
+        release_task = asyncio.create_task(release_soon())
+        started = time.monotonic()
+        stopped = await asyncio.to_thread(wait_for_worker)
+        elapsed = time.monotonic() - started
+        await release_task
+
+        self.assertTrue(stopped)
+        self.assertTrue(worker_done.is_set())
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(len(stop_called_on), 1)
+        self.assertNotEqual(stop_called_on[0], threading.get_ident())
+
+    async def test_async_bridge_on_owner_loop_awaits_directly(self):
+        owner_loop = asyncio.get_running_loop()
+        runtime.bind_indexer_event_loop(owner_loop)
+
+        async def capture_loop():
+            return asyncio.get_running_loop()
+
+        observed = await runtime.run_indexer_awaitable(capture_loop())
+
+        self.assertIs(observed, owner_loop)
+
+    async def test_application_lifespan_offloads_background_shutdown(self):
+        from app.main import create_app
+
+        owner_loop = asyncio.get_running_loop()
+        owner_thread = threading.get_ident()
+        stop_threads: list[int] = []
+        owner_progress = asyncio.Event()
+        proxy = Mock()
+        proxy.start = AsyncMock()
+        proxy.stop = AsyncMock()
+
+        async def mark_owner_progress():
+            owner_progress.set()
+
+        def stop_background():
+            stop_threads.append(threading.get_ident())
+            future = asyncio.run_coroutine_threadsafe(mark_owner_progress(), owner_loop)
+            future.result(timeout=1.0)
+            return True
+
+        with patch.object(owner_loop, "slow_callback_duration", 2.0), patch(
+            "app.main.database.init_db"
+        ), patch(
+            "app.modules.recognition_knowledge.ensure_seed_knowledge"
+        ), patch(
+            "app.modules.media_proxy.get_media_proxy_manager", return_value=proxy
+        ), patch(
+            "app.indexers.runtime.bind_indexer_event_loop"
+        ), patch(
+            "app.indexers.runtime.unbind_indexer_event_loop"
+        ), patch(
+            "app.main.start_background_services"
+        ), patch(
+            "app.main.stop_background_services", side_effect=stop_background
+        ), patch(
+            "app.discovery.service.shutdown_discovery_service"
+        ), patch(
+            "app.discovery.search.shutdown_discovery_search_service"
+        ), patch(
+            "app.indexers.runtime.shutdown_indexer_service", new=AsyncMock()
+        ):
+            app = create_app(start_background=True)
+            async with app.router.lifespan_context(app):
+                self.assertTrue(app.state.ready)
+
+        self.assertTrue(owner_progress.is_set())
+        self.assertEqual(len(stop_threads), 1)
+        self.assertNotEqual(stop_threads[0], owner_thread)
+        proxy.start.assert_awaited_once_with()
+        proxy.stop.assert_awaited_once_with()
+
+    async def test_application_lifespan_keeps_shutdown_gate_when_workers_do_not_stop(self):
+        from app.main import create_app
+
+        proxy = Mock()
+        proxy.start = AsyncMock()
+        proxy.stop = AsyncMock()
+        begin = Mock()
+        unbind = Mock()
+        shutdown = AsyncMock()
+
+        with patch(
+            "app.main.database.init_db"
+        ), patch(
+            "app.modules.recognition_knowledge.ensure_seed_knowledge"
+        ), patch(
+            "app.modules.media_proxy.get_media_proxy_manager", return_value=proxy
+        ), patch(
+            "app.indexers.runtime.bind_indexer_event_loop"
+        ), patch(
+            "app.indexers.runtime.begin_indexer_shutdown", begin
+        ), patch(
+            "app.indexers.runtime.unbind_indexer_event_loop", unbind
+        ), patch(
+            "app.main.start_background_services"
+        ), patch(
+            "app.main.stop_background_services", return_value=False
+        ), patch(
+            "app.discovery.service.shutdown_discovery_service"
+        ) as shutdown_discovery, patch(
+            "app.discovery.search.shutdown_discovery_search_service"
+        ) as shutdown_search, patch(
+            "app.indexers.runtime.shutdown_indexer_service", new=shutdown
+        ):
+            app = create_app(start_background=True)
+            async with app.router.lifespan_context(app):
+                self.assertTrue(app.state.ready)
+
+        begin.assert_called_once()
+        unbind.assert_not_called()
+        shutdown.assert_not_awaited()
+        shutdown_discovery.assert_not_called()
+        shutdown_search.assert_not_called()
+        proxy.stop.assert_awaited_once_with()
+
+    async def test_shutdown_uses_service_lifecycle_hook(self):
+        service = Mock()
+        service.aclose = AsyncMock()
+        service.registry = Mock()
+        service.registry.aclose = AsyncMock()
+        runtime._service = service
+
+        await runtime.shutdown_indexer_service()
+
+        service.aclose.assert_awaited_once_with()
+        service.registry.aclose.assert_not_awaited()
+        self.assertIsNone(runtime._service)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,352 @@
+"""LLM Provider 四协议公共适配测试。"""
+from __future__ import annotations
+
+import unittest
+
+from app.clients.openai_compatible import (
+    ANTHROPIC_VERSION,
+    ProviderStreamError,
+    extract_output_text,
+    infer_protocol_from_url,
+    append_native_tool_results,
+    iter_provider_text_deltas,
+    native_tool_definitions,
+    native_tool_initial_history,
+    native_tool_request_body,
+    normalize_provider_location,
+    parse_native_tool_turn,
+    protocol_attempts,
+    provider_headers,
+    resolve_protocol,
+    structured_request_body,
+    text_stream_request_body,
+)
+
+
+class LLMProviderProtocolTests(unittest.TestCase):
+    def test_explicit_endpoint_inference_and_location_normalization(self):
+        cases = {
+            "https://api.example.com/v1/responses": "responses",
+            "https://api.example.com/v1/chat/completions": "chat_completions",
+            "https://api.example.com/v1/messages": "anthropic_messages",
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(infer_protocol_from_url(url), expected)
+                self.assertEqual(resolve_protocol("auto", url), expected)
+                self.assertEqual(
+                    normalize_provider_location(url).base_url,
+                    "https://api.example.com/v1",
+                )
+        self.assertEqual(resolve_protocol("auto", "https://api.example.com/v1"), "auto")
+        self.assertEqual(
+            protocol_attempts("auto"), ("responses", "chat_completions")
+        )
+        self.assertEqual(protocol_attempts("anthropic_messages"), ("anthropic_messages",))
+
+    def test_protocol_endpoints_are_distinct(self):
+        location = normalize_provider_location("https://api.example.com/v1")
+        self.assertEqual(location.endpoint("responses"), "https://api.example.com/v1/responses")
+        self.assertEqual(
+            location.endpoint("chat_completions"),
+            "https://api.example.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            location.endpoint("anthropic_messages"),
+            "https://api.example.com/v1/messages",
+        )
+
+    def test_anthropic_headers_do_not_send_bearer_token(self):
+        headers = provider_headers("anthropic_messages", "secret-key")
+        self.assertEqual(headers["x-api-key"], "secret-key")
+        self.assertEqual(headers["anthropic-version"], ANTHROPIC_VERSION)
+        self.assertNotIn("Authorization", headers)
+        with self.assertRaises(ValueError):
+            provider_headers("anthropic_messages", "bad\nkey")
+
+    def test_anthropic_structured_output_body_and_text_extraction(self):
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}},
+        }
+        body = structured_request_body(
+            protocol="anthropic_messages",
+            model="claude-test",
+            system_prompt="system",
+            user_content="user",
+            schema_name="reply",
+            schema=schema,
+            max_tokens=200,
+        )
+        self.assertEqual(body["system"], "system")
+        self.assertEqual(body["messages"], [{"role": "user", "content": "user"}])
+        self.assertEqual(body["output_config"]["format"]["type"], "json_schema")
+        self.assertEqual(body["output_config"]["format"]["schema"], schema)
+        self.assertNotIn("response_format", body)
+        self.assertEqual(
+            extract_output_text(
+                {
+                    "type": "message",
+                    "stop_reason": "end_turn",
+                    "content": [
+                        {"type": "text", "text": '{"answer":'},
+                        {"type": "text", "text": '"ok"}'},
+                    ],
+                },
+                "anthropic_messages",
+            ),
+            '{"answer":"ok"}',
+        )
+        with self.assertRaises(ValueError):
+            extract_output_text(
+                {
+                    "type": "message",
+                    "stop_reason": "max_tokens",
+                    "content": [{"type": "text", "text": "{}"}],
+                },
+                "anthropic_messages",
+            )
+
+    def test_native_tool_definitions_match_provider_shapes(self):
+        capabilities = [{
+            "name": "mf_workspace_health",
+            "description": "读取工作区健康状态",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        }]
+        responses = native_tool_definitions("responses", capabilities)
+        self.assertEqual(responses[0]["type"], "function")
+        self.assertEqual(responses[0]["name"], "mf_workspace_health")
+        self.assertTrue(responses[0]["strict"])
+        chat = native_tool_definitions("chat_completions", capabilities)
+        self.assertEqual(chat[0]["function"]["name"], "mf_workspace_health")
+        anthropic = native_tool_definitions("anthropic_messages", capabilities)
+        self.assertEqual(anthropic[0]["name"], "mf_workspace_health")
+        self.assertEqual(anthropic[0]["input_schema"], capabilities[0]["parameters"])
+
+        optional_capability = [{
+            "name": "mf_optional_search",
+            "description": "可选查询参数",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        }]
+        optional_responses = native_tool_definitions(
+            "responses", optional_capability
+        )
+        self.assertNotIn("strict", optional_responses[0])
+        optional_chat = native_tool_definitions(
+            "chat_completions", optional_capability
+        )
+        self.assertNotIn("strict", optional_chat[0]["function"])
+
+    def test_native_tool_request_bodies_and_history(self):
+        tools = [{"type": "function", "name": "mf_workspace_health"}]
+        responses_history = native_tool_initial_history(
+            "responses", system_prompt="system", user_content="user"
+        )
+        responses = native_tool_request_body(
+            protocol="responses", model="model", system_prompt="system",
+            history=responses_history, tools=tools, max_tokens=400,
+        )
+        self.assertEqual(responses["input"], responses_history)
+        self.assertFalse(responses["parallel_tool_calls"])
+        self.assertNotIn("stream", responses)
+
+        chat_history = native_tool_initial_history(
+            "chat_completions", system_prompt="system", user_content="user"
+        )
+        chat = native_tool_request_body(
+            protocol="chat_completions", model="model", system_prompt="system",
+            history=chat_history, tools=tools, max_tokens=400, stream=True,
+        )
+        self.assertEqual(chat["messages"], chat_history)
+        self.assertTrue(chat["stream"])
+
+        anthropic_history = native_tool_initial_history(
+            "anthropic_messages", system_prompt="system", user_content="user"
+        )
+        anthropic = native_tool_request_body(
+            protocol="anthropic_messages", model="model", system_prompt="system",
+            history=anthropic_history, tools=tools, max_tokens=400,
+        )
+        self.assertEqual(anthropic["system"], "system")
+        self.assertEqual(anthropic["messages"], anthropic_history)
+        self.assertNotIn("stream", anthropic)
+
+    def test_parse_and_append_responses_native_tool_turn(self):
+        turn = parse_native_tool_turn({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "mf_workspace_health",
+                "arguments": "{}",
+            }],
+        }, "responses")
+        self.assertEqual(turn.tool_calls[0].name, "mf_workspace_health")
+        history = append_native_tool_results(
+            "responses", [], turn, [(turn.tool_calls[0], '{"ok":true}')],
+        )
+        self.assertEqual(history[-1]["type"], "function_call_output")
+        self.assertEqual(history[-1]["call_id"], "call_1")
+
+    def test_parse_and_append_chat_native_tool_turn(self):
+        turn = parse_native_tool_turn({
+            "choices": [{"message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "mf_downloads_diagnose_queue",
+                        "arguments": '{"limit":5}',
+                    },
+                }],
+            }}],
+        }, "chat_completions")
+        self.assertEqual(turn.tool_calls[0].arguments, {"limit": 5})
+        history = append_native_tool_results(
+            "chat_completions", [], turn, [(turn.tool_calls[0], '{"ok":true}')],
+        )
+        self.assertEqual(history[-1]["role"], "tool")
+        self.assertEqual(history[-1]["tool_call_id"], "call_2")
+
+    def test_parse_and_append_anthropic_native_tool_turn(self):
+        turn = parse_native_tool_turn({
+            "type": "message",
+            "stop_reason": "tool_use",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "mf_library_patrol_status",
+                "input": {},
+            }],
+        }, "anthropic_messages")
+        self.assertEqual(turn.tool_calls[0].call_id, "toolu_1")
+        history = append_native_tool_results(
+            "anthropic_messages", [], turn, [(turn.tool_calls[0], '{"ok":true}')],
+        )
+        self.assertEqual(history[-1]["role"], "user")
+        self.assertEqual(history[-1]["content"][0]["type"], "tool_result")
+
+    def test_native_tool_arguments_must_be_complete_json_object(self):
+        with self.assertRaises(ValueError):
+            parse_native_tool_turn({
+                "choices": [{"message": {
+                    "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {
+                            "name": "mf_workspace_health",
+                            "arguments": '{"broken":',
+                        },
+                    }],
+                }}],
+            }, "chat_completions")
+
+
+async def _chunks(*parts: bytes):
+    for part in parts:
+        yield part
+
+
+class LLMProviderStreamTests(unittest.IsolatedAsyncioTestCase):
+    def test_text_stream_bodies_and_accept_header(self):
+        for protocol in ("responses", "chat_completions", "anthropic_messages"):
+            with self.subTest(protocol=protocol):
+                body = text_stream_request_body(
+                    protocol=protocol,
+                    model="model",
+                    system_prompt="system",
+                    user_content="user",
+                    max_tokens=123,
+                )
+                self.assertTrue(body["stream"])
+                self.assertNotIn("tools", body)
+                headers = provider_headers(protocol, "secret", stream=True)
+                self.assertEqual(headers["Accept"], "text/event-stream")
+        self.assertIn("input", text_stream_request_body(
+            protocol="responses", model="model", system_prompt="system",
+            user_content="user", max_tokens=123,
+        ))
+        self.assertIn("messages", text_stream_request_body(
+            protocol="chat_completions", model="model", system_prompt="system",
+            user_content="user", max_tokens=123,
+        ))
+        anthropic = text_stream_request_body(
+            protocol="anthropic_messages", model="model", system_prompt="system",
+            user_content="user", max_tokens=123,
+        )
+        self.assertEqual(anthropic["system"], "system")
+
+    async def test_responses_stream_handles_fragmented_utf8(self):
+        wire = (
+            'data: {"type":"response.output_text.delta","delta":"你"}\r\n\r\n'
+            'data: {"type":"response.output_text.delta","delta":"好"}\n\n'
+            'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        ).encode("utf-8")
+        split = wire.index("你".encode("utf-8")) + 1
+        deltas = [delta async for delta in iter_provider_text_deltas(
+            _chunks(wire[:split], wire[split:split + 2], wire[split + 2:]),
+            protocol="responses",
+        )]
+        self.assertEqual(deltas, ["你", "好"])
+
+    async def test_chat_completions_stream_requires_terminal_event(self):
+        valid = (
+            b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n'
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        self.assertEqual(
+            [delta async for delta in iter_provider_text_deltas(
+                _chunks(valid), protocol="chat_completions"
+            )],
+            ["hello"],
+        )
+        truncated = b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        with self.assertRaises(ProviderStreamError):
+            _ = [delta async for delta in iter_provider_text_deltas(
+                _chunks(truncated), protocol="chat_completions"
+            )]
+
+    async def test_anthropic_stream_text_and_completion(self):
+        wire = (
+            b'event: message_start\ndata: {"type":"message_start"}\n\n'
+            b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}\n\n'
+            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        )
+        self.assertEqual(
+            [delta async for delta in iter_provider_text_deltas(
+                _chunks(wire), protocol="anthropic_messages"
+            )],
+            ["ok"],
+        )
+
+    async def test_pure_text_stream_rejects_tool_arguments_and_oversized_events(self):
+        tool_stream = (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        with self.assertRaises(ProviderStreamError):
+            _ = [delta async for delta in iter_provider_text_deltas(
+                _chunks(tool_stream), protocol="chat_completions"
+            )]
+        oversized = b'data: {"type":"response.output_text.delta","delta":"0123456789"}\n\n'
+        with self.assertRaises(ProviderStreamError):
+            _ = [delta async for delta in iter_provider_text_deltas(
+                _chunks(oversized), protocol="responses", max_event_bytes=8
+            )]
+
+
+if __name__ == "__main__":
+    unittest.main()

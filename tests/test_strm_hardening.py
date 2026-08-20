@@ -1,0 +1,1086 @@
+from __future__ import annotations
+
+import tempfile
+import threading
+import time
+import unittest
+import uuid
+from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
+from contextlib import nullcontext
+from pathlib import Path
+from unittest.mock import patch
+
+from app import database as db
+from app.clients.guangya import GuangYaFile
+from app.modules import strm as strm_module
+from tests.support import IsolatedDatabaseTestCase
+
+from app.modules.strm import (
+    MAX_METADATA_WORKERS,
+    STRM_SUBDIR,
+    generate_strm,
+    safe_path_component,
+    sync_strm,
+)
+
+
+class _TreeClient:
+    def __init__(self, tree):
+        self.tree = tree
+
+    def list_dir(self, file_id):
+        value = self.tree[file_id]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+class _Response:
+    def __init__(self, payload: bytes, tracker=None, *, headers=None, chunks=None):
+        self.payload = payload
+        self.tracker = tracker
+        self.headers = headers or {}
+        self.chunks = chunks
+
+    def __enter__(self):
+        if self.tracker:
+            self.tracker.enter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.tracker:
+            self.tracker.exit()
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self, chunk_size):
+        if self.tracker:
+            time.sleep(0.04)
+        yield from self.chunks if self.chunks is not None else (self.payload,)
+
+
+class _ConcurrencyTracker:
+    def __init__(self):
+        self.active = 0
+        self.maximum = 0
+        self.lock = threading.Lock()
+
+    def enter(self):
+        with self.lock:
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+
+    def exit(self):
+        with self.lock:
+            self.active -= 1
+
+
+class _SubmissionTracker:
+    def __init__(self):
+        self.outstanding = 0
+        self.maximum = 0
+        self.lock = threading.Lock()
+
+    def submitted(self):
+        with self.lock:
+            self.outstanding += 1
+            self.maximum = max(self.maximum, self.outstanding)
+
+    def completed(self, _future):
+        with self.lock:
+            self.outstanding -= 1
+
+
+class _TrackingExecutor:
+    def __init__(self, tracker: _SubmissionTracker, *args, **kwargs):
+        self._tracker = tracker
+        self._executor = RealThreadPoolExecutor(*args, **kwargs)
+
+    def __enter__(self):
+        self._executor.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._executor.__exit__(*args)
+
+    def submit(self, *args, **kwargs):
+        future = self._executor.submit(*args, **kwargs)
+        self._tracker.submitted()
+        future.add_done_callback(self._tracker.completed)
+        return future
+
+
+def _cleanup_source_indexes(source_id: str) -> None:
+    for source_key in (f"guangya:{source_id}", f"guangya-meta:{source_id}"):
+        rows = db.list_strm_index(source_key)
+        db.delete_strm_index_ids(source_key, [row["file_id"] for row in rows])
+
+
+class StrmHardeningTests(IsolatedDatabaseTestCase):
+    def test_long_utf8_names_are_hashed_stably_and_keep_media_extension(self):
+        prefix = "超长中文影视名称" * 40
+        first = GuangYaFile("f1", f"{prefix}甲.mkv", False, 100, "e1")
+        second = GuangYaFile("f2", f"{prefix}乙.mkv", False, 100, "e2")
+
+        with tempfile.TemporaryDirectory() as root:
+            path1 = generate_strm(first, "", "http://example", root)
+            again = generate_strm(first, "", "http://example", root)
+            path2 = generate_strm(second, "", "http://example", root)
+
+            self.assertEqual(path1, again)
+            self.assertNotEqual(path1.name, path2.name)
+            self.assertLessEqual(len(path1.name.encode("utf-8")), 255)
+            self.assertTrue(path1.name.endswith(".mkv.strm"), path1.name)
+            self.assertRegex(path1.name, r"~[0-9a-f]{12}\.mkv\.strm$")
+            self.assertFalse(list(path1.parent.glob("*.part")))
+
+    def test_remote_directory_components_cannot_escape_root(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        dangerous_dir = GuangYaFile("dir-1", "../危险\\目录", True, parent_id=source_id)
+        video = GuangYaFile("video-1", "片名/正片.mkv", False, 100, "etag", "dir-1")
+        client = _TreeClient({source_id: [dangerous_dir], "dir-1": [video]})
+        source_key = f"guangya:{source_id}"
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                result = sync_strm(source_id, "http://example", root, client=client)
+                self.assertEqual(result["generated"], 1)
+                generated = list((Path(root) / STRM_SUBDIR).rglob("*.strm"))
+                self.assertEqual(len(generated), 1)
+                self.assertTrue(generated[0].resolve().is_relative_to((Path(root) / STRM_SUBDIR).resolve()))
+                self.assertNotIn("..", generated[0].relative_to(Path(root) / STRM_SUBDIR).parts)
+                self.assertRegex(generated[0].name, r"^片名_正片~[0-9a-f]{12}\.mkv\.strm$")
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_same_target_name_selects_larger_then_stable_file_id_tiebreak(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        files = [
+            GuangYaFile("small", "Movie.mkv", False, 100, "small-etag", source_id),
+            GuangYaFile("z-large", "Movie.mkv", False, 200, "z-etag", source_id),
+            GuangYaFile("a-large", "Movie.mkv", False, 200, "a-etag", source_id),
+        ]
+        client = _TreeClient({source_id: files})
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                result = sync_strm(source_id, "http://example", root, client=client)
+                target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                self.assertEqual(result["total"], 3)
+                self.assertEqual(result["generated"], 1)
+                self.assertEqual(result["duplicates_skipped"], 2)
+                self.assertIn("/playgy/a-large/", target.read_text(encoding="utf-8"))
+                rows = db.list_strm_index(source_key)
+                self.assertEqual([row["file_id"] for row in rows], ["a-large"])
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_candidate_fold_preserves_first_seen_on_exact_tie(self):
+        first = GuangYaFile("same", "Movie.mkv", False, 100, "etag", "first")
+        second = GuangYaFile("same", "Movie.mkv", False, 100, "etag", "second")
+        target = Path("/library/Movie.mkv.strm")
+        winners = {}
+
+        strm_module._record_candidate(winners, target, (first, "first-dir"))
+        strm_module._record_candidate(winners, target, (second, "second-dir"))
+
+        winner, rel_dir, duplicate_count = winners[str(target)]
+        self.assertIs(winner, first)
+        self.assertEqual(rel_dir, "first-dir")
+        self.assertEqual(duplicate_count, 1)
+
+    def test_generate_stop_keeps_all_scanned_duplicate_statistics(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        files = [
+            GuangYaFile("a-small", "A.mkv", False, 100, "a1", source_id),
+            GuangYaFile("a-large", "A.mkv", False, 200, "a2", source_id),
+            GuangYaFile("b-small", "B.mkv", False, 100, "b1", source_id),
+            GuangYaFile("b-large", "B.mkv", False, 200, "b2", source_id),
+        ]
+        client = _TreeClient({source_id: files})
+        phase = {"generate": False}
+
+        def on_progress(stage, _completed, _total, _message):
+            if stage == "generate":
+                phase["generate"] = True
+
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                result = sync_strm(
+                    source_id,
+                    "http://example",
+                    root,
+                    client=client,
+                    on_progress=on_progress,
+                    should_stop=lambda: phase["generate"],
+                )
+            self.assertTrue(result["stopped"])
+            self.assertEqual(result["stop_stage"], "generate")
+            self.assertEqual(result["duplicates_skipped"], 2)
+            self.assertEqual(result["skipped"], 2)
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_winner_change_rewrites_shared_path_without_stale_cleanup_deleting_it(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        tree = {
+            source_id: [GuangYaFile("old", "Movie.mkv", False, 100, "old", source_id)]
+        }
+        client = _TreeClient(tree)
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                sync_strm(source_id, "http://example", root, client=client)
+                tree[source_id] = [GuangYaFile("new", "Movie.mkv", False, 200, "new", source_id)]
+                result = sync_strm(source_id, "http://example", root, client=client)
+
+                target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                self.assertTrue(target.exists())
+                self.assertIn("/playgy/new/", target.read_text(encoding="utf-8"))
+                self.assertEqual(result["cleaned"], 0)
+                rows = db.list_strm_index(source_key)
+                self.assertEqual([row["file_id"] for row in rows], ["new"])
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_metadata_downloads_use_bounded_workers_and_atomic_replace(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        files = [
+            GuangYaFile(f"meta-{index}", f"poster-{index}.jpg", False, 8, f"e{index}", source_id)
+            for index in range(6)
+        ]
+        client = _TreeClient({source_id: files})
+        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
+        tracker = _ConcurrencyTracker()
+
+        def fake_get(url, stream, timeout):
+            return _Response(b"metadata", tracker)
+
+        try:
+            with tempfile.TemporaryDirectory() as root, patch("app.modules.strm.requests.get", side_effect=fake_get):
+                result = sync_strm(
+                    source_id,
+                    "http://example",
+                    root,
+                    client=client,
+                    metadata_exts={"jpg"},
+                    metadata_workers=99,
+                )
+                self.assertEqual(result["metadata_generated"], 6)
+                self.assertGreater(tracker.maximum, 1)
+                self.assertLessEqual(tracker.maximum, MAX_METADATA_WORKERS)
+                self.assertFalse(list((Path(root) / STRM_SUBDIR).rglob("*.part")))
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_metadata_download_rejects_declared_and_streamed_oversize_payloads(self):
+        file = GuangYaFile("meta", "poster.jpg", False, 4, "etag", "root")
+        cases = (
+            _Response(b"", headers={"Content-Length": "5"}),
+            _Response(b"", chunks=[b"123", b"45"]),
+        )
+        for response in cases:
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as root, \
+                    patch("app.modules.strm._metadata_file_limit", return_value=4), \
+                    patch("app.modules.strm.requests.get", return_value=response):
+                with self.assertRaises(ValueError):
+                    strm_module.download_metadata(
+                        file,
+                        "",
+                        root,
+                        download_url="https://download.invalid/meta",
+                    )
+                self.assertFalse(list(Path(root).rglob("*.part")))
+
+    def test_metadata_download_rejects_oversize_remote_file_before_request(self):
+        file = GuangYaFile("meta", "poster.jpg", False, 5, "etag", "root")
+        with tempfile.TemporaryDirectory() as root, \
+                patch("app.modules.strm._metadata_file_limit", return_value=4), \
+                patch("app.modules.strm.requests.get") as request:
+            with self.assertRaises(ValueError):
+                strm_module.download_metadata(
+                    file,
+                    "",
+                    root,
+                    download_url="https://download.invalid/meta",
+                )
+        request.assert_not_called()
+
+    def test_metadata_download_enforces_total_deadline(self):
+        file = GuangYaFile("meta", "poster.jpg", False, 4, "etag", "root")
+        response = _Response(b"", chunks=[b"12", b"34"])
+        with tempfile.TemporaryDirectory() as root, \
+                patch("app.modules.strm._metadata_file_limit", return_value=4), \
+                patch("app.modules.strm._metadata_download_deadline_seconds", return_value=1), \
+                patch("app.modules.strm.time.monotonic", side_effect=[0.0, 0.0, 0.5, 1.5]), \
+                patch("app.modules.strm.requests.get", return_value=response):
+            with self.assertRaises(TimeoutError):
+                strm_module.download_metadata(
+                    file,
+                    "",
+                    root,
+                    download_url="https://download.invalid/meta",
+                )
+            self.assertFalse(list(Path(root).rglob("*.part")))
+
+    def test_metadata_submission_window_is_bounded_by_worker_count(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        files = [
+            GuangYaFile(f"meta-{index}", f"poster-{index}.jpg", False, 8, f"e{index}", source_id)
+            for index in range(6)
+        ]
+        client = _TreeClient({source_id: files})
+        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
+        submission_tracker = _SubmissionTracker()
+
+        def fake_get(url, stream, timeout):
+            return _Response(b"metadata", _ConcurrencyTracker())
+
+        def executor_factory(*args, **kwargs):
+            return _TrackingExecutor(submission_tracker, *args, **kwargs)
+
+        try:
+            with tempfile.TemporaryDirectory() as root, \
+                    patch("app.modules.strm.requests.get", side_effect=fake_get), \
+                    patch("app.modules.strm.ThreadPoolExecutor", new=executor_factory):
+                result = sync_strm(
+                    source_id,
+                    "http://example",
+                    root,
+                    client=client,
+                    metadata_exts={"jpg"},
+                    metadata_workers=2,
+                )
+                self.assertEqual(result["metadata_generated"], 6)
+                self.assertLessEqual(submission_tracker.maximum, 2)
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_index_and_cleanup_database_calls_stay_on_coordinator_thread(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        client = _TreeClient({
+            source_id: [
+                GuangYaFile("video", "Movie.mkv", False, 100, "v", source_id),
+                GuangYaFile("meta", "Movie.nfo", False, 4, "m", source_id),
+            ]
+        })
+        client.get_download_url = lambda file_id: "https://download.invalid/meta"
+        coordinator = threading.get_ident()
+        call_threads = []
+        original_upsert = db.upsert_strm_index
+        original_list = db.list_strm_index
+        original_delete = db.delete_strm_index_ids
+
+        def record(callable_):
+            def wrapper(*args, **kwargs):
+                call_threads.append(threading.get_ident())
+                return callable_(*args, **kwargs)
+            return wrapper
+
+        try:
+            with tempfile.TemporaryDirectory() as root, \
+                    patch("app.modules.strm.requests.get", return_value=_Response(b"nfo")), \
+                    patch("app.modules.strm.db.upsert_strm_index", side_effect=record(original_upsert)), \
+                    patch("app.modules.strm.db.list_strm_index", side_effect=record(original_list)), \
+                    patch("app.modules.strm.db.delete_strm_index_ids", side_effect=record(original_delete)):
+                sync_strm(
+                    source_id,
+                    "http://example",
+                    root,
+                    client=client,
+                    metadata_exts={"nfo"},
+                    metadata_workers=2,
+                )
+            self.assertTrue(call_threads)
+            self.assertEqual(set(call_threads), {coordinator})
+        finally:
+            for cleanup_key in (source_key, f"guangya-meta:{source_id}"):
+                rows = original_list(cleanup_key)
+                original_delete(cleanup_key, [row["file_id"] for row in rows])
+
+    def test_failed_winner_install_preserves_old_file_and_index_and_skips_cleanup(self):
+        """新赢家安装任一步失败，都必须回滚到旧赢家并熔断 stale cleanup。"""
+        original_upsert = db.upsert_strm_index
+        original_delete = db.delete_strm_index_ids
+        original_replace = Path.replace
+
+        for stage in ("generate", "replace", "upsert", "old_index"):
+            with self.subTest(stage=stage):
+                source_id = f"source-{stage}-{uuid.uuid4().hex}"
+                source_key = f"guangya:{source_id}"
+                tree = {
+                    source_id: [GuangYaFile("old", "Movie.mkv", False, 100, "old-etag", source_id)]
+                }
+                client = _TreeClient(tree)
+                try:
+                    with tempfile.TemporaryDirectory() as root:
+                        first = sync_strm(source_id, "http://example", root, client=client)
+                        self.assertEqual(first["generated"], 1)
+                        target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                        old_text = target.read_text(encoding="utf-8")
+                        tree[source_id] = [
+                            GuangYaFile("new", "Movie.mkv", False, 200, "new-etag", source_id)
+                        ]
+
+                        patches = []
+                        if stage == "generate":
+                            patches.append(patch("app.modules.strm.generate_strm", side_effect=OSError("generate failed")))
+                        elif stage == "replace":
+                            def fail_new_replace(path_obj, destination):
+                                if path_obj.name.endswith(".part") and Path(destination) == target:
+                                    raise OSError("replace failed")
+                                return original_replace(path_obj, destination)
+                            patches.append(patch.object(Path, "replace", new=fail_new_replace))
+                        elif stage == "upsert":
+                            def fail_new_upsert(source, file_id, *args, **kwargs):
+                                if file_id == "new":
+                                    raise RuntimeError("upsert failed")
+                                return original_upsert(source, file_id, *args, **kwargs)
+                            patches.append(patch("app.modules.strm.db.upsert_strm_index", side_effect=fail_new_upsert))
+                        else:
+                            def fail_conflict_transaction(source, file_id, *args, **kwargs):
+                                if file_id == "new" and tuple(
+                                    kwargs.get("conflicting_file_ids") or ()
+                                ) == ("old",):
+                                    raise RuntimeError("old index delete failed")
+                                return original_upsert(source, file_id, *args, **kwargs)
+                            patches.append(patch(
+                                "app.modules.strm.db.upsert_strm_index",
+                                side_effect=fail_conflict_transaction,
+                            ))
+
+                        entered = []
+                        try:
+                            for current_patch in patches:
+                                entered.append(current_patch)
+                                current_patch.start()
+                            try:
+                                result = sync_strm(source_id, "http://example", root, client=client)
+                                raised = None
+                            except Exception as exc:
+                                result = {}
+                                raised = exc
+                        finally:
+                            for current_patch in reversed(entered):
+                                current_patch.stop()
+
+                        self.assertIsNone(raised, f"{stage} 不应把事务异常抛出: {raised}")
+                        self.assertTrue(result.get("clean_skipped"), stage)
+                        self.assertTrue(target.exists(), stage)
+                        self.assertEqual(target.read_text(encoding="utf-8"), old_text, stage)
+                        rows = db.list_strm_index(source_key)
+                        self.assertEqual([row["file_id"] for row in rows], ["old"], stage)
+                finally:
+                    for cleanup_key in (source_key, f"guangya-meta:{source_id}"):
+                        rows = db.list_strm_index(cleanup_key)
+                        original_delete(cleanup_key, [row["file_id"] for row in rows])
+
+    def test_old_path_unlink_failure_rolls_back_new_path_and_index(self):
+        """同一 file_id 改名时，旧路径删除失败必须完整回滚。"""
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        tree = {
+            source_id: [GuangYaFile("same-id", "Old.mkv", False, 100, "old-etag", source_id)]
+        }
+        client = _TreeClient(tree)
+        original_unlink = Path.unlink
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                sync_strm(source_id, "http://example", root, client=client)
+                old_path = Path(root) / STRM_SUBDIR / "Old.mkv.strm"
+                old_text = old_path.read_text(encoding="utf-8")
+                new_path = Path(root) / STRM_SUBDIR / "New.mkv.strm"
+                tree[source_id] = [
+                    GuangYaFile("same-id", "New.mkv", False, 120, "new-etag", source_id)
+                ]
+
+                def fail_old_unlink(path_obj, *args, **kwargs):
+                    if path_obj == old_path:
+                        raise OSError("old path unlink failed")
+                    return original_unlink(path_obj, *args, **kwargs)
+
+                with patch.object(Path, "unlink", new=fail_old_unlink):
+                    result = sync_strm(source_id, "http://example", root, client=client)
+
+                self.assertTrue(result["clean_skipped"])
+                self.assertTrue(old_path.exists())
+                self.assertEqual(old_path.read_text(encoding="utf-8"), old_text)
+                self.assertFalse(new_path.exists())
+                rows = db.list_strm_index(source_key)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["file_id"], "same-id")
+                self.assertEqual(rows[0]["etag"], "old-etag")
+                self.assertEqual(rows[0]["strm_path"], str(old_path))
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_windows_reserved_and_forbidden_components_are_sanitized_stably(self):
+        for raw in ("CON", "con.txt", "AUX.", "bad:name?x*", "trailing. "):
+            with self.subTest(raw=raw):
+                cleaned = safe_path_component(raw)
+                self.assertEqual(cleaned, safe_path_component(raw))
+                self.assertFalse(any(char in cleaned for char in '<>:"/\\|?*'))
+                self.assertFalse(cleaned.endswith((" ", ".")))
+                stem = cleaned.split(".", 1)[0].upper()
+                self.assertNotIn(stem, {
+                    "CON", "PRN", "AUX", "NUL",
+                    *(f"COM{i}" for i in range(1, 10)),
+                    *(f"LPT{i}" for i in range(1, 10)),
+                })
+        self.assertNotEqual(safe_path_component("CON"), safe_path_component("_CON"))
+
+    def test_full_scan_ignores_remote_directory_cycles(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        calls = {}
+
+        class CountingClient(_TreeClient):
+            def list_dir(self, file_id):
+                calls[file_id] = calls.get(file_id, 0) + 1
+                return super().list_dir(file_id)
+
+        client = CountingClient({
+            source_id: [GuangYaFile("dir-a", "A", True, parent_id=source_id)],
+            "dir-a": [
+                GuangYaFile(source_id, "root-loop", True, parent_id="dir-a"),
+                GuangYaFile("video-a", "Episode.mkv", False, 10, "etag", "dir-a"),
+            ],
+        })
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                result = sync_strm(
+                    source_id, "http://example", root, client=client, clean_invalid=False,
+                )
+            self.assertEqual(result["generated"], 1)
+            self.assertEqual(result["directories"], 2)
+            self.assertEqual(calls, {source_id: 1, "dir-a": 1})
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_full_scan_handles_directory_depth_beyond_python_recursion_limit(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        tree = {}
+        current = source_id
+        depth = 1100
+        for index in range(depth):
+            child = f"dir-{index}"
+            tree[current] = [GuangYaFile(child, "d", True, parent_id=current)]
+            current = child
+        tree[current] = []
+        client = _TreeClient(tree)
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                result = sync_strm(
+                    source_id, "http://example", root, client=client, clean_invalid=False,
+                )
+            self.assertEqual(result["directories"], depth + 1)
+            self.assertEqual(result["failed"], 0)
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_retry_lookup_ignores_cycles_per_source(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        calls = {}
+
+        class CountingClient(_TreeClient):
+            def list_dir(self, file_id):
+                calls[file_id] = calls.get(file_id, 0) + 1
+                return super().list_dir(file_id)
+
+        client = CountingClient({
+            source_id: [GuangYaFile("dir-a", "A", True, parent_id=source_id)],
+            "dir-a": [
+                GuangYaFile(source_id, "root-loop", True, parent_id="dir-a"),
+                GuangYaFile("wanted", "Episode.mkv", False, 10, "etag", "dir-a"),
+            ],
+        })
+        lookup = strm_module._locate_retry_files(
+            client, [{"id": source_id, "rel_prefix": ""}], {"wanted"},
+        )
+        self.assertIn("wanted", lookup.located)
+        self.assertFalse(lookup.scan_incomplete)
+        self.assertFalse(lookup.stopped)
+        self.assertEqual(calls, {source_id: 1, "dir-a": 1})
+
+    def test_retry_lookup_enforces_directory_entry_and_deadline_budgets(self):
+        cases = (
+            (
+                "directories",
+                {
+                    "source": [GuangYaFile("child", "Child", True, parent_id="source")],
+                    "child": [GuangYaFile("wanted", "Episode.mkv", False, 10, "e", "child")],
+                },
+                (1, 100, 100, 60),
+                None,
+            ),
+            (
+                "entries",
+                {
+                    "source": [
+                        GuangYaFile("other", "Other.mkv", False, 10, "o", "source"),
+                        GuangYaFile("wanted", "Episode.mkv", False, 10, "e", "source"),
+                    ],
+                },
+                (100, 1, 100, 60),
+                None,
+            ),
+            (
+                "deadline",
+                {
+                    "source": [GuangYaFile("wanted", "Episode.mkv", False, 10, "e", "source")],
+                },
+                (100, 100, 100, 1),
+                (0.0, 2.0),
+            ),
+        )
+        for reason, tree, limits, clock_values in cases:
+            with self.subTest(reason=reason), patch(
+                "app.modules.strm._scan_limits", return_value=limits
+            ):
+                client = _TreeClient(tree)
+                clock = (
+                    patch(
+                        "app.modules.strm.time.monotonic",
+                        side_effect=lambda values=iter(clock_values or ()): next(values, 2.0),
+                    )
+                    if clock_values is not None
+                    else nullcontext()
+                )
+                with clock:
+                    lookup = strm_module._locate_retry_files(
+                        client, [{"id": "source", "rel_prefix": ""}], {"wanted"},
+                    )
+                self.assertNotIn("wanted", lookup.located)
+                self.assertTrue(lookup.scan_incomplete)
+                self.assertEqual(lookup.scan_limit_reason, reason)
+                self.assertLessEqual(lookup.entries, limits[1])
+
+    def test_retry_lookup_applies_entry_budget_before_advancing_iter_dir(self):
+        class PagingClient:
+            def __init__(self):
+                self.yielded = 0
+
+            def iter_dir(self, _file_id, *, should_stop=None):
+                if should_stop and should_stop():
+                    return
+                for index in range(3):
+                    self.yielded += 1
+                    yield GuangYaFile(
+                        f"other-{index}", f"Other-{index}.mkv", False,
+                        10, str(index), "source",
+                    )
+
+        client = PagingClient()
+        with patch("app.modules.strm._scan_limits", return_value=(100, 1, 100, 60)):
+            lookup = strm_module._locate_retry_files(
+                client, [{"id": "source", "rel_prefix": ""}], {"wanted"},
+            )
+
+        self.assertEqual(client.yielded, 1)
+        self.assertEqual(lookup.entries, 1)
+        self.assertTrue(lookup.scan_incomplete)
+        self.assertEqual(lookup.scan_limit_reason, "entries")
+
+    def test_cleaned_names_always_get_raw_name_hash_to_avoid_component_collisions(self):
+        """只要发生清洗，就必须用原名哈希区分清洗前不同的组件。"""
+        escaped = safe_path_component("Movie\\Cut.mkv", extra_suffix=".strm")
+        literal = safe_path_component("Movie_Cut.mkv", extra_suffix=".strm")
+        self.assertNotEqual(escaped, literal)
+        self.assertEqual(escaped, safe_path_component("Movie\\Cut.mkv", extra_suffix=".strm"))
+        self.assertRegex(escaped, r"^Movie_Cut~[0-9a-f]{12}\.mkv\.strm$")
+        self.assertEqual(literal, "Movie_Cut.mkv.strm")
+
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        client = _TreeClient({
+            source_id: [
+                GuangYaFile("dir-a", "Season\\Cut", True, parent_id=source_id),
+                GuangYaFile("dir-b", "Season_Cut", True, parent_id=source_id),
+            ],
+            "dir-a": [GuangYaFile("video-a", "Episode.mkv", False, 10, "a", "dir-a")],
+            "dir-b": [GuangYaFile("video-b", "Episode.mkv", False, 10, "b", "dir-b")],
+        })
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                result = sync_strm(source_id, "http://example", root, client=client)
+                generated = list((Path(root) / STRM_SUBDIR).rglob("*.strm"))
+                self.assertEqual(result["generated"], 2)
+                self.assertEqual(len(generated), 2)
+                self.assertEqual(len({path.parent.name for path in generated}), 2)
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_metadata_same_size_new_identity_refreshes_content_and_index_state(self):
+        """同名元数据的 file_id/etag 改变时，不能仅凭尺寸相同跳过。"""
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya-meta:{source_id}"
+        tree = {
+            source_id: [GuangYaFile("meta-old", "poster.jpg", False, 8, "etag-old", source_id)]
+        }
+        client = _TreeClient(tree)
+        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
+
+        def fake_get(url, stream, timeout):
+            payload = b"old-data" if url.endswith("meta-old") else b"new-data"
+            return _Response(payload)
+
+        try:
+            with tempfile.TemporaryDirectory() as root, patch(
+                "app.modules.strm.requests.get", side_effect=fake_get
+            ):
+                first = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"},
+                )
+                target = Path(root) / STRM_SUBDIR / "poster.jpg"
+                self.assertEqual(first["metadata_generated"], 1)
+                self.assertEqual(target.read_bytes(), b"old-data")
+
+                tree[source_id] = [
+                    GuangYaFile("meta-new", "poster.jpg", False, 8, "etag-new", source_id)
+                ]
+                second = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"},
+                )
+
+                self.assertEqual(second["metadata_generated"], 1)
+                self.assertEqual(second["metadata_skipped"], 0)
+                self.assertEqual(target.read_bytes(), b"new-data")
+                rows = db.list_strm_index(source_key)
+                self.assertEqual([row["file_id"] for row in rows], ["meta-new"])
+                self.assertEqual(rows[0]["etag"], "etag-new")
+                self.assertEqual(rows[0]["strm_path"], str(target))
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_metadata_index_failure_restores_previous_content_and_state(self):
+        """元数据文件已下载但索引提交失败时，必须恢复旧文件和旧索引。"""
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya-meta:{source_id}"
+        tree = {
+            source_id: [GuangYaFile("meta-old", "poster.jpg", False, 8, "etag-old", source_id)]
+        }
+        client = _TreeClient(tree)
+        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
+        original_upsert = db.upsert_strm_index
+
+        def fake_get(url, stream, timeout):
+            return _Response(b"old-data" if url.endswith("meta-old") else b"new-data")
+
+        try:
+            with tempfile.TemporaryDirectory() as root, patch(
+                "app.modules.strm.requests.get", side_effect=fake_get
+            ):
+                sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"},
+                )
+                target = Path(root) / STRM_SUBDIR / "poster.jpg"
+                old_text = target.read_bytes()
+                tree[source_id] = [
+                    GuangYaFile("meta-new", "poster.jpg", False, 8, "etag-new", source_id)
+                ]
+
+                def fail_new_upsert(source, file_id, *args, **kwargs):
+                    if file_id == "meta-new":
+                        raise RuntimeError("metadata upsert failed")
+                    return original_upsert(source, file_id, *args, **kwargs)
+
+                with patch(
+                    "app.modules.strm.db.upsert_strm_index", side_effect=fail_new_upsert
+                ):
+                    result = sync_strm(
+                        source_id, "http://example", root, client=client,
+                        metadata_exts={"jpg"},
+                    )
+
+                self.assertEqual(result["metadata_failed"], 1)
+                self.assertTrue(result["clean_skipped"])
+                self.assertTrue(target.exists())
+                self.assertEqual(target.read_bytes(), old_text)
+                rows = db.list_strm_index(source_key)
+                self.assertEqual([row["file_id"] for row in rows], ["meta-old"])
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_disabling_metadata_sync_preserves_downloaded_file_and_index(self):
+        """关闭 metadata_exts 后不得扫描或清理独立元数据 namespace。"""
+        source_id = f"source-{uuid.uuid4().hex}"
+        metadata_key = f"guangya-meta:{source_id}"
+        tree = {
+            source_id: [GuangYaFile("poster", "poster.jpg", False, 4, "etag", source_id)]
+        }
+        client = _TreeClient(tree)
+        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
+
+        try:
+            with tempfile.TemporaryDirectory() as root, patch(
+                "app.modules.strm.requests.get", return_value=_Response(b"data")
+            ):
+                enabled = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"},
+                )
+                target = Path(root) / STRM_SUBDIR / "poster.jpg"
+                self.assertEqual(enabled["metadata_generated"], 1)
+                self.assertTrue(target.exists())
+
+                disabled = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts=set(),
+                )
+
+                self.assertEqual(disabled["metadata_total"], 0)
+                self.assertEqual(disabled["metadata_cleaned"], 0)
+                self.assertTrue(target.exists())
+                rows = db.list_strm_index(metadata_key)
+                self.assertEqual([row["file_id"] for row in rows], ["poster"])
+                self.assertEqual(rows[0]["strm_path"], str(target))
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_complete_enabled_scan_cleans_video_and_metadata_with_split_stats(self):
+        """完整成功扫描时分别清理失效 STRM 与元数据并拆分统计。"""
+        source_id = f"source-{uuid.uuid4().hex}"
+        video_key = f"guangya:{source_id}"
+        metadata_key = f"guangya-meta:{source_id}"
+        tree = {
+            source_id: [
+                GuangYaFile("video", "Movie.mkv", False, 100, "video-etag", source_id),
+                GuangYaFile("poster", "poster.jpg", False, 4, "meta-etag", source_id),
+            ]
+        }
+        client = _TreeClient(tree)
+        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
+
+        try:
+            with tempfile.TemporaryDirectory() as root, patch(
+                "app.modules.strm.requests.get", return_value=_Response(b"data")
+            ):
+                sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"},
+                )
+                video_path = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                metadata_path = Path(root) / STRM_SUBDIR / "poster.jpg"
+                tree[source_id] = []
+
+                result = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"},
+                )
+
+                self.assertEqual(result["cleaned"], 1)
+                self.assertEqual(result["metadata_cleaned"], 1)
+                self.assertFalse(video_path.exists())
+                self.assertFalse(metadata_path.exists())
+                self.assertEqual(db.list_strm_index(video_key), [])
+                self.assertEqual(db.list_strm_index(metadata_key), [])
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_remote_scan_failure_preserves_both_namespaces(self):
+        """任一远端目录扫描失败时，视频和元数据 namespace 都禁止清理。"""
+        source_id = f"source-{uuid.uuid4().hex}"
+        video_key = f"guangya:{source_id}"
+        metadata_key = f"guangya-meta:{source_id}"
+        tree = {
+            source_id: [
+                GuangYaFile("video", "Movie.mkv", False, 100, "video-etag", source_id),
+                GuangYaFile("poster", "poster.jpg", False, 4, "meta-etag", source_id),
+            ]
+        }
+        client = _TreeClient(tree)
+        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
+
+        try:
+            with tempfile.TemporaryDirectory() as root, patch(
+                "app.modules.strm.requests.get", return_value=_Response(b"data")
+            ):
+                sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"},
+                )
+                video_path = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                metadata_path = Path(root) / STRM_SUBDIR / "poster.jpg"
+                tree[source_id] = [
+                    GuangYaFile("broken-dir", "Broken", True, parent_id=source_id)
+                ]
+                tree["broken-dir"] = RuntimeError("scan failed")
+
+                result = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"},
+                )
+
+                self.assertTrue(result["clean_skipped"])
+                self.assertEqual(result["cleaned"], 0)
+                self.assertEqual(result["metadata_cleaned"], 0)
+                self.assertTrue(video_path.exists())
+                self.assertTrue(metadata_path.exists())
+                self.assertEqual([row["file_id"] for row in db.list_strm_index(video_key)], ["video"])
+                self.assertEqual([row["file_id"] for row in db.list_strm_index(metadata_key)], ["poster"])
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_legacy_metadata_rows_in_video_namespace_are_preserved_conservatively(self):
+        """旧版混合 namespace 中非 STRM 记录不能因迁移猜测被删除。"""
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        client = _TreeClient({source_id: []})
+
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                legacy_metadata = Path(root) / STRM_SUBDIR / "legacy.jpg"
+                stale_strm = Path(root) / STRM_SUBDIR / "stale.mkv.strm"
+                legacy_metadata.parent.mkdir(parents=True)
+                legacy_metadata.write_bytes(b"legacy")
+                stale_strm.write_text("old", encoding="utf-8")
+                db.upsert_strm_index(
+                    source_key, "legacy-meta", "meta-etag", 6,
+                    "legacy.jpg", str(legacy_metadata),
+                )
+                db.upsert_strm_index(
+                    source_key, "stale-video", "video-etag", 3,
+                    "stale.mkv", str(stale_strm),
+                )
+
+                result = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts=set(),
+                )
+
+                self.assertEqual(result["cleaned"], 0)
+                self.assertEqual(result["metadata_cleaned"], 0)
+                self.assertTrue(result["clean_skipped"])
+                self.assertTrue(legacy_metadata.exists())
+                self.assertTrue(stale_strm.exists())
+                rows = db.list_strm_index(source_key)
+                self.assertEqual(
+                    [row["file_id"] for row in rows],
+                    ["legacy-meta", "stale-video"],
+                )
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_metadata_urls_are_resolved_on_coordinator_before_http_workers(self):
+        """worker 只能做 HTTP 下载，不能共享 GuangYaClient 获取签名 URL。"""
+        source_id = f"source-{uuid.uuid4().hex}"
+        files = [
+            GuangYaFile(f"meta-{index}", f"image-{index}.jpg", False, 4, f"e{index}", source_id)
+            for index in range(4)
+        ]
+        client = _TreeClient({source_id: files})
+        coordinator = threading.get_ident()
+        url_threads = []
+        http_threads = []
+
+        def get_download_url(file_id):
+            url_threads.append(threading.get_ident())
+            return f"https://download.invalid/{file_id}"
+
+        def fake_get(url, stream, timeout):
+            http_threads.append(threading.get_ident())
+            time.sleep(0.02)
+            return _Response(b"data")
+
+        client.get_download_url = get_download_url
+        try:
+            with tempfile.TemporaryDirectory() as root, patch(
+                "app.modules.strm.requests.get", side_effect=fake_get
+            ):
+                result = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    metadata_exts={"jpg"}, metadata_workers=4,
+                )
+
+            self.assertEqual(result["metadata_generated"], 4)
+            self.assertEqual(set(url_threads), {coordinator})
+            self.assertTrue(http_threads)
+            self.assertNotIn(coordinator, set(http_threads))
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_deep_relative_paths_are_stably_compressed_within_byte_budget(self):
+        """完整相对路径超预算时必须稳定压缩目录组件而不是触发 ENAMETOOLONG。"""
+        file = GuangYaFile("deep", "Final.Movie.2160p.mkv", False, 100, "etag")
+        component = "非常深的中文目录" * 12
+        rel_dir = "/".join(f"{index:02d}-{component}" for index in range(36))
+
+        with tempfile.TemporaryDirectory() as root:
+            first = generate_strm(file, rel_dir, "http://example", root)
+            second = generate_strm(file, rel_dir, "http://example", root)
+            relative = first.relative_to(Path(root))
+            budget = getattr(strm_module, "MAX_RELATIVE_PATH_BYTES", 3072)
+
+            self.assertEqual(first, second)
+            self.assertTrue(first.exists())
+            self.assertLessEqual(len(str(relative).encode("utf-8")), budget)
+            self.assertTrue(first.name.endswith(".mkv.strm"))
+            self.assertTrue(any(part.startswith("~path-") for part in relative.parts))
+
+    def test_any_directory_scan_failure_disables_stale_cleanup_for_whole_round(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        stale_id = "stale"
+        failing_dir = GuangYaFile("broken-dir", "Broken", True, parent_id=source_id)
+        video = GuangYaFile("new", "New.mkv", False, 100, "new", source_id)
+        client = _TreeClient({
+            source_id: [video, failing_dir],
+            "broken-dir": RuntimeError("scan failed"),
+        })
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                stale_path = Path(root) / STRM_SUBDIR / "Stale.mkv.strm"
+                stale_path.parent.mkdir(parents=True)
+                stale_path.write_text("old", encoding="utf-8")
+                db.upsert_strm_index(source_key, stale_id, "e", 1, "Stale.mkv", str(stale_path))
+
+                result = sync_strm(source_id, "http://example", root, client=client)
+
+                self.assertTrue(result["clean_skipped"])
+                self.assertTrue(result["scan_incomplete"])
+                self.assertEqual(result["generated"], 0)
+                self.assertFalse((Path(root) / STRM_SUBDIR / "New.mkv.strm").exists())
+                self.assertTrue(stale_path.exists())
+                self.assertEqual([row["file_id"] for row in db.list_strm_index(source_key)], [stale_id])
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_scan_budget_aborts_before_generation_and_preserves_existing_index(self):
+        source_id = f"source-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        client = _TreeClient({
+            source_id: [
+                GuangYaFile("new-a", "A.mkv", False, 100, "a", source_id),
+                GuangYaFile("new-b", "B.mkv", False, 100, "b", source_id),
+            ]
+        })
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                stale_path = Path(root) / STRM_SUBDIR / "Stale.mkv.strm"
+                stale_path.parent.mkdir(parents=True)
+                stale_path.write_text("old", encoding="utf-8")
+                db.upsert_strm_index(source_key, "stale", "e", 1, "Stale.mkv", str(stale_path))
+
+                with patch("app.modules.strm._scan_limits", return_value=(100, 1, 100, 60)):
+                    result = sync_strm(source_id, "http://example", root, client=client)
+
+                self.assertTrue(result["scan_incomplete"])
+                self.assertEqual(result["scan_limit_reason"], "entries")
+                self.assertEqual(result["generated"], 0)
+                self.assertTrue(result["clean_skipped"])
+                self.assertTrue(stale_path.exists())
+                self.assertFalse((Path(root) / STRM_SUBDIR / "A.mkv.strm").exists())
+                self.assertEqual(
+                    [row["file_id"] for row in db.list_strm_index(source_key)],
+                    ["stale"],
+                )
+        finally:
+            _cleanup_source_indexes(source_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

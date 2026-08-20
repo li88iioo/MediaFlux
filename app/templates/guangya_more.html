@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}更多 - MediaFlux{% endblock %}
+{% block page_title %}更多{% endblock %}
+
+{% block content %}
+{% set initial_view = more_view if more_view in ['share', 'gcid'] else 'share' %}
+<div class="guangya-more-shell" data-guangya-more data-initial-view="{{ initial_view }}">
+    <div class="strm-nav-tabs guangya-more-tabs" role="tablist" aria-label="更多光鸭工具">
+        <button type="button" class="strm-tab-btn{% if initial_view == 'share' %} active{% endif %}" id="guangyaMoreShareTab" role="tab" aria-selected="{{ 'true' if initial_view == 'share' else 'false' }}" aria-controls="guangyaMoreSharePanel" tabindex="{{ '0' if initial_view == 'share' else '-1' }}" data-more-view="share">
+            <i data-lucide="link-2"></i>分享转存
+        </button>
+        <button type="button" class="strm-tab-btn{% if initial_view == 'gcid' %} active{% endif %}" id="guangyaMoreGcidTab" role="tab" aria-selected="{{ 'true' if initial_view == 'gcid' else 'false' }}" aria-controls="guangyaMoreGcidPanel" tabindex="{{ '0' if initial_view == 'gcid' else '-1' }}" data-more-view="gcid">
+            <i data-lucide="file-json-2"></i>GCID 清单
+        </button>
+    </div>
+
+    <section class="guangya-more-panel" id="guangyaMoreSharePanel" role="tabpanel" aria-labelledby="guangyaMoreShareTab"{% if initial_view != 'share' %} hidden{% endif %}>
+        {% include "_share_transfer_content.html" %}
+    </section>
+
+    <section class="guangya-more-panel" id="guangyaMoreGcidPanel" role="tabpanel" aria-labelledby="guangyaMoreGcidTab"{% if initial_view != 'gcid' %} hidden{% endif %}>
+        {% include "_gcid_content.html" %}
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    const root=document.querySelector('[data-guangya-more]');
+    if(!root)return;
+    const tabs=[...root.querySelectorAll('[data-more-view]')];
+    const panels={
+        share:document.getElementById('guangyaMoreSharePanel'),
+        gcid:document.getElementById('guangyaMoreGcidPanel'),
+    };
+    function activate(view,{updateUrl=false}={}){
+        const next=panels[view]?view:'share';
+        tabs.forEach(tab=>{
+            const selected=tab.dataset.moreView===next;
+            tab.classList.toggle('active',selected);
+            tab.setAttribute('aria-selected',selected?'true':'false');
+            tab.tabIndex=selected?0:-1;
+        });
+        Object.entries(panels).forEach(([name,panel])=>{panel.hidden=name!==next;});
+        if(updateUrl){
+            const url=new URL(window.location.href);
+            if(next==='share')url.searchParams.delete('view');
+            else url.searchParams.set('view',next);
+            window.history.replaceState(window.history.state,'',url);
+        }
+    }
+    tabs.forEach((tab,index)=>{
+        tab.addEventListener('click',()=>activate(tab.dataset.moreView,{updateUrl:true}));
+        tab.addEventListener('keydown',event=>{
+            if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+            event.preventDefault();
+            let nextIndex=index;
+            if(event.key==='ArrowLeft')nextIndex=(index-1+tabs.length)%tabs.length;
+            if(event.key==='ArrowRight')nextIndex=(index+1)%tabs.length;
+            if(event.key==='Home')nextIndex=0;
+            if(event.key==='End')nextIndex=tabs.length-1;
+            const nextTab=tabs[nextIndex];
+            activate(nextTab.dataset.moreView,{updateUrl:true});
+            nextTab.focus();
+        });
+    });
+    activate(root.dataset.initialView);
+})();
+</script>
+{% include "_share_transfer_scripts.html" %}
+{% include "_gcid_scripts.html" %}
+{% endblock %}

@@ -1,0 +1,259 @@
+{% extends "base.html" %}
+{% block title %}日志记录 - MediaFlux{% endblock %}
+{% block page_title %}日志记录{% endblock %}
+{% block page_styles %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/scrape-preview.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="logs-summary" id="summary">
+    <div class="stat-card organize">
+        <div class="stat-card-head">
+            <span class="stat-label">整理成功</span>
+            <i data-lucide="check-circle-2" class="stat-icon-subtle is-green"></i>
+        </div>
+        <div class="stat-value" id="orgSuccess">—</div>
+        <div class="stat-foot">媒体库硬链完成</div>
+    </div>
+    <div class="stat-card organize">
+        <div class="stat-card-head">
+            <span class="stat-label">整理失败</span>
+            <i data-lucide="alert-triangle" class="stat-icon-subtle is-red"></i>
+        </div>
+        <div class="stat-value" id="orgFailed">—</div>
+        <div class="stat-foot">需检查源路径/权限</div>
+    </div>
+    <div class="stat-card organize">
+        <div class="stat-card-head">
+            <span class="stat-label">整理跳过</span>
+            <i data-lucide="forward" class="stat-icon-subtle is-amber"></i>
+        </div>
+        <div class="stat-value" id="orgSkipped">—</div>
+        <div class="stat-foot">策略重名跳过</div>
+    </div>
+    <div class="stat-card organize">
+        <div class="stat-card-head">
+            <span class="stat-label">已回退</span>
+            <i data-lucide="undo-2" class="stat-icon-subtle is-purple"></i>
+        </div>
+        <div class="stat-value" id="orgReverted">—</div>
+        <div class="stat-foot">硬链清理还原</div>
+    </div>
+</div>
+
+<div class="tab-bar">
+    <button class="tab-btn active" id="tabOrganize" onclick="switchTab('organize')">整理日志</button>
+    <button class="tab-btn" id="tabRuntime" onclick="switchTab('runtime')">项目实时日志</button>
+</div>
+
+<section class="card card-pad logs-panel" id="organizePanel">
+    <div class="logs-filterbar">
+        <select class="form-select" id="orgOrigin" onchange="loadOrganize(1)" aria-label="整理来源">
+            <option value="all">全部来源</option>
+            <option value="guangya">光鸭整理</option>
+            <option value="local">本地整理</option>
+        </select>
+        <select class="form-select" id="orgStatus" onchange="loadOrganize(1)" aria-label="整理状态">
+            <option value="">全部状态</option>
+            <option value="success">成功</option>
+            <option value="failed">失败</option>
+            <option value="skipped">跳过</option>
+            <option value="manual">待确认</option>
+            <option value="processing">处理中</option>
+            <option value="reverted">已回退</option>
+        </select>
+        <div class="logs-search-row">
+            <div class="logs-searchbox">
+                <i data-lucide="search"></i>
+                <input type="search" class="form-input" id="orgKeyword" placeholder="搜索路径、标题、来源或错误" onkeydown="if(event.key==='Enter')loadOrganize(1)">
+            </div>
+            <button class="btn btn-primary logs-search-btn" onclick="loadOrganize(1)"><i data-lucide="search"></i><span>搜索</span></button>
+        </div>
+        <div class="logs-primary-actions">
+            <button type="button" class="jump-btn" id="refreshLogsBtn" aria-busy="false" onclick="refreshActive()"><i data-lucide="refresh-cw"></i>刷新</button>
+            <button type="button" class="jump-btn danger" id="clearOrganizeLogsBtn"><i data-lucide="eraser"></i>清理记录</button>
+        </div>
+    </div>
+    <div class="logs-batchbar">
+        <div class="logs-batch-meta">
+            <span class="organize-batch-count" id="organizeBatchCount">已选 0 条</span>
+            <span class="text-muted logs-refresh-time" id="lastRefresh">—</span>
+            <span class="inline-save-state" id="organizeBatchState"></span>
+        </div>
+        <div class="logs-batch-actions">
+            <button type="button" class="jump-btn" id="organizeBatchRenameBtn" disabled><i data-lucide="files"></i>批量改名</button>
+            <button type="button" class="jump-btn" id="organizeBatchRevertBtn" disabled><i data-lucide="undo-2"></i>批量回退</button>
+            <button type="button" class="jump-btn danger" id="organizeBatchDeleteBtn" disabled><i data-lucide="trash-2"></i>批量移入光鸭回收站</button>
+        </div>
+    </div>
+    <div class="table-wrap"><table class="logs-table organize-batch-table"><colgroup><col class="select-col"><col class="origin-col"><col class="path-col"><col class="newpath-col"><col class="status-col"><col class="time-col"><col class="action-col"></colgroup><thead><tr><th><input type="checkbox" id="organizeSelectAll" aria-label="选择当前页全部光鸭整理日志"></th><th>来源</th><th>原路径</th><th>整理后路径</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody id="organizeList"><tr><td colspan="7" class="table-empty">读取中...</td></tr></tbody></table></div>
+    <div class="table-pagination" id="organizePagination" aria-label="整理日志分页">
+        <span class="table-pagination-info" id="organizePageInfo">第 1 页</span>
+        <div class="table-pagination-actions"><button type="button" class="jump-btn" id="organizePrev"><i data-lucide="chevron-left"></i>上一页</button><button type="button" class="jump-btn" id="organizeNext">下一页<i data-lucide="chevron-right"></i></button></div>
+    </div>
+</section>
+
+<section class="card card-pad logs-panel scrape-lab" id="scrapePanel" style="display:none;">
+    <div class="panel-head scrape-lab-head">
+        <div>
+            <span class="server-kicker">RECOGNITION LAB</span>
+            <div class="section-title"><i data-lucide="brain-circuit"></i>TMDB 刮削实验室</div>
+            <div class="panel-desc">解析文件名、核对 TMDB 详情与资源规格，在移动文件前锁定正确映射。</div>
+        </div>
+        <button type="button" class="icon-action" id="closeScrapeBtn" title="返回整理日志"><i data-lucide="x"></i></button>
+    </div>
+    <div class="scrape-lab-input">
+        <div class="scrape-lab-input-row">
+            <div class="scrape-lab-input-fields">
+                <label for="scrapeFilename">媒体文件名</label>
+                <input type="text" class="form-input" id="scrapeFilename" placeholder="如 The.Furious.2026.2160p.WEB-DL.H.265-DreamHD.mkv" autocomplete="off">
+                <label for="scrapeParentPath">父目录路径（可选）</label>
+                <input type="text" class="form-input" id="scrapeParentPath" placeholder="如 /剧集/幕府将军 Shogun (2024)/Season 01" autocomplete="off">
+            </div>
+            <button type="button" class="btn btn-primary scrape-go" id="scrapeBtn"><i data-lucide="scan-search"></i><span>开始识别</span></button>
+        </div>
+        <div class="scrape-lab-hints"><span>确定性清洗</span><span>目录上下文</span><span>Top 3 评分</span><span>命名预览</span></div>
+    </div>
+    <div id="scrapeResult" class="scrape-lab-result" data-state="idle" aria-live="polite" aria-busy="false">
+        <div class="scrape-lab-empty" id="scrapeEmpty">
+            <div class="scrape-lab-empty-icon"><i data-lucide="sparkles"></i></div>
+            <strong>等待识别输入</strong>
+            <p>结果将在这里保持稳定展示；再次识别时会保留旧结果，避免页面跳动。</p>
+        </div>
+        <article class="scrape-lab-hero" id="scrapeHero" hidden>
+            <div class="scrape-lab-backdrop"><img id="scrapeBackdrop" alt="" width="1280" height="720" hidden></div>
+            <div class="scrape-lab-hero-content">
+                <div class="scrape-lab-poster"><img id="scrapePoster" alt="" width="500" height="750" hidden><div id="scrapePosterFallback"><i data-lucide="image"></i></div></div>
+                <div class="scrape-lab-hero-copy">
+                    <span class="scrape-lab-status" id="scrapeMatchStatus">等待识别</span>
+                    <h3 id="scrapeTitle">—</h3>
+                    <p class="scrape-lab-subtitle" id="scrapeSubtitle">—</p>
+                    <div class="scrape-lab-chip-row" id="scrapeHeroChips"></div>
+                    <p class="scrape-lab-overview" id="scrapeOverview">暂无简介</p>
+                </div>
+            </div>
+        </article>
+        <section class="scrape-lab-diagnostic" id="scrapeDiagnostic" hidden></section>
+        <section class="scrape-lab-recognition" id="scrapeRecognitionContext" hidden>
+            <div class="scrape-lab-section-head"><div><span class="scrape-lab-eyebrow">DETERMINISTIC PIPELINE</span><h4>识别上下文与阈值决策</h4></div><span id="scrapePipelineMode">确定性优先</span></div>
+            <div class="scrape-lab-recognition-grid">
+                <div class="scrape-lab-context-cell"><span class="scrape-lab-eyebrow">CLEANED</span><div class="scrape-lab-info" id="scrapeCleanedComponents"></div></div>
+                <div class="scrape-lab-context-cell"><span class="scrape-lab-eyebrow">FOLDER</span><div class="scrape-lab-info" id="scrapeFolderContext"></div></div>
+                <div class="scrape-lab-context-cell"><span class="scrape-lab-eyebrow">QUERIES</span><div class="scrape-lab-chip-row scrape-lab-query-list" id="scrapeQueryVariants"></div></div>
+                <div class="scrape-lab-context-cell"><span class="scrape-lab-eyebrow">DECISION</span><div class="scrape-lab-info" id="scrapeThresholdDecision"></div></div>
+            </div>
+        </section>
+        <section class="scrape-lab-ai" id="scrapeAiDiagnostic" hidden>
+            <div class="scrape-lab-section-head"><div><span class="scrape-lab-eyebrow">STRUCTURED AI FALLBACK</span><h4>AI 回退诊断</h4><small>AI 只纠正搜索条件；二次 TMDB 严格评分与详情复核均通过后才可自动命中。</small></div><span id="scrapeAiStatus">未运行</span></div>
+            <div class="scrape-lab-ai-grid">
+                <div class="scrape-lab-ai-cell"><span class="scrape-lab-eyebrow">SANITIZED INPUT</span><div class="scrape-lab-info" id="scrapeAiInput"></div></div>
+                <div class="scrape-lab-ai-cell"><span class="scrape-lab-eyebrow">STRUCTURED OUTPUT</span><div class="scrape-lab-info" id="scrapeAiOutput"></div></div>
+                <div class="scrape-lab-ai-cell"><span class="scrape-lab-eyebrow">LOCAL VERDICT</span><div class="scrape-lab-info" id="scrapeAiDecision"></div></div>
+            </div>
+        </section>
+        <div class="scrape-lab-grid" id="scrapeDetailGrid" hidden>
+            <section class="scrape-lab-card"><span class="scrape-lab-eyebrow">PARSING</span><h4>文件名解析</h4><div class="scrape-lab-info" id="scrapeParsed"></div></section>
+            <section class="scrape-lab-card" id="scrapeMetadata"><span class="scrape-lab-eyebrow">METADATA</span><h4>TMDB 详情</h4><div class="scrape-lab-info" id="scrapeMetadataRows"></div></section>
+            <section class="scrape-lab-card" id="scrapeResourceTags"><span class="scrape-lab-eyebrow">MEDIA TAGS</span><h4>资源规格</h4><div class="scrape-lab-info" id="scrapeResourceRows"></div></section>
+            <section class="scrape-lab-card" id="scrapeNaming"><span class="scrape-lab-eyebrow">OUTPUT</span><h4>命名预览</h4><div class="scrape-lab-info" id="scrapeNamingRows"></div></section>
+        </div>
+        <section class="scrape-lab-candidates" id="scrapeCandidates" hidden>
+            <div class="scrape-lab-section-head"><div><span class="scrape-lab-eyebrow">REVIEW QUEUE</span><h4>候选结果</h4></div><span id="scrapeCandidateCount">0 个</span></div>
+            <div class="scrape-lab-candidate-list" id="scrapeCandidateList"></div>
+        </section>
+    </div>
+</section>
+
+<section class="card card-pad logs-panel runtime-log-panel" id="runtimePanel" style="display:none;">
+    <div class="logs-filterbar runtime-log-filterbar">
+        <select class="form-select runtime-level-select" id="runtimeLevel">
+            <option value="">全部级别</option>
+            <option value="INFO">INFO</option>
+            <option value="WARNING">WARNING</option>
+            <option value="ERROR">ERROR</option>
+            <option value="DEBUG">DEBUG</option>
+        </select>
+        <div class="logs-searchbox runtime-searchbox">
+            <i data-lucide="search"></i>
+            <input type="search" class="form-input" id="runtimeFilter" placeholder="过滤模块或关键词">
+        </div>
+        <div class="logs-primary-actions runtime-log-actions">
+            <div class="runtime-log-meta-row">
+                <label class="runtime-log-toggle"><input type="checkbox" id="runtimeAutoScroll" checked>自动滚动</label>
+                <span class="runtime-log-state" id="runtimeState">未连接</span>
+            </div>
+            <div class="runtime-btn-group">
+                <button type="button" class="jump-btn" id="runtimePauseBtn"><i data-lucide="pause"></i>暂停</button>
+                <button type="button" class="jump-btn danger" id="runtimeClearBtn"><i data-lucide="eraser"></i>清空</button>
+            </div>
+        </div>
+    </div>
+    <pre class="runtime-log-view" id="runtimeLogView" aria-live="polite"></pre>
+</section>
+
+<div class="app-modal organize-detail-modal" id="organizeDetailModal" hidden>
+    <div class="card organize-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="organizeDetailTitle">
+        <header class="organize-detail-head">
+            <div class="organize-detail-heading">
+                <h2 id="organizeDetailTitle">整理日志详情</h2>
+                <p id="organizeDetailSubtitle"></p>
+            </div>
+            <button type="button" class="icon-action" data-modal-close aria-label="关闭"><i data-lucide="x"></i></button>
+        </header>
+        <div class="organize-detail-body">
+            <div id="organizeSafetyNotice" class="organize-safety-notice" hidden></div>
+            <div id="organizeDetailSummary" class="organize-detail-summary"></div>
+            <section class="organize-detail-section organize-release-parse" id="organizeReleaseParseSection" hidden>
+                <div class="organize-detail-section-head"><strong>识别解析</strong></div>
+                <div id="organizeReleaseParse" class="organize-release-parse-grid"></div>
+            </section>
+            <section class="organize-detail-section">
+                <div class="organize-detail-section-head"><strong>文件</strong></div>
+                <div id="organizeDetailItems" class="organize-item-list"></div>
+            </section>
+            <section class="organize-detail-section" id="organizeCorrectionPanel">
+                <div class="organize-detail-section-head"><strong>重新识别</strong></div>
+                <div class="organize-search-grid">
+                    <input type="text" class="form-input" id="organizeTmdbQuery" placeholder="输入片名或剧名">
+                    <input type="text" class="form-input" id="organizeTmdbYear" placeholder="搜索年份（可选）" inputmode="numeric">
+                    <select class="form-select" id="organizeTmdbType" aria-label="TMDB 搜索媒体类型"><option value="movie">电影结果</option><option value="tv">剧集结果</option></select>
+                    <button type="button" class="jump-btn" id="organizeTmdbSearchBtn"><i data-lucide="search"></i>搜索</button>
+                </div>
+                <div class="organize-position-fields" id="organizePositionFields" hidden>
+                    <span>剧集位置</span>
+                    <label>季<input type="number" class="form-input" id="organizeSeasonOverride" min="0" max="999" inputmode="numeric" placeholder="自动"></label>
+                    <label>集<input type="number" class="form-input" id="organizeEpisodeOverride" min="1" max="999" inputmode="numeric" placeholder="自动"></label>
+                    <small>仅在原文件季号或集号不准确时覆盖；预览和实际整理使用同一值。</small>
+                </div>
+                <p class="organize-correction-hint"><i data-lucide="info"></i><span>可同时修正 TMDB 条目与剧集位置；目标路径仍按当前整理规则生成。</span></p>
+                <div id="organizeTmdbCandidates" class="candidate-list organize-candidates"></div>
+                <div id="organizeNamingPreview" class="naming-preview organize-naming-preview" hidden></div>
+            </section>
+            <section class="organize-detail-section" id="organizeOperationSection" hidden>
+                <div class="organize-detail-section-head"><strong>操作记录</strong></div>
+                <div id="organizeDetailOperations" class="organize-operation-list"></div>
+            </section>
+            <section class="organize-detail-section" id="organizeDeleteAuditSection" hidden>
+                <div class="organize-detail-section-head"><strong>删除记录</strong></div>
+                <div id="organizeDeleteAudits" class="organize-delete-audit-list"></div>
+            </section>
+            <section class="organize-danger-zone" id="organizeDangerZone">
+                <div><strong>移入回收站</strong><span>作用于整个媒体组，需输入 DELETE 确认。</span></div>
+                <button type="button" class="jump-btn danger" id="organizeDeleteBtn"><i data-lucide="trash-2"></i>移入光鸭回收站</button>
+            </section>
+        </div>
+        <footer class="organize-detail-footer">
+            <span id="organizeOperationState" class="inline-save-state"></span>
+            <div class="organize-detail-actions">
+                <button type="button" class="jump-btn" id="organizeReturnBtn"><i data-lucide="corner-up-left"></i>送回源目录</button>
+                <button type="button" class="jump-btn" id="organizeRevertBtn"><i data-lucide="undo-2"></i>回退最近操作</button>
+                <button type="button" class="btn btn-primary" id="organizeReorganizeBtn"><i data-lucide="wand-sparkles"></i>执行重新整理</button>
+            </div>
+        </footer>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='js/logs.js') }}?v=20260820a"></script>
+{% endblock %}

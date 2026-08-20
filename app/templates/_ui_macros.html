@@ -1,0 +1,44 @@
+{% macro theme_toggle(location) -%}
+<button type="button" class="icon-btn theme-toggle" data-theme-toggle data-theme-location="{{ location }}" aria-label="主题模式：自动" title="当前自动，点击切换浅色">
+    <i data-lucide="monitor-cog"></i>
+    <span class="sr-only" data-theme-label aria-live="polite">主题模式：自动</span>
+</button>
+{%- endmacro %}
+
+{% macro brand_mark(modifier='') -%}
+<svg class="brand-mark-svg{% if modifier %} brand-mark-svg--{{ modifier }}{% endif %}" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+    <defs>
+        <mask id="flux-gate-cut{% if modifier %}-{{ modifier }}{% endif %}" maskUnits="userSpaceOnUse">
+            <rect width="64" height="64" fill="#fff"/>
+            <path fill="#000" d="m26 22 18 10-18 10V22Z"/>
+        </mask>
+    </defs>
+    <g mask="url(#flux-gate-cut{% if modifier %}-{{ modifier }}{% endif %})">
+        <path class="brand-mark-upper" d="M7 11h13l12 9 12-9h13v12h-9L32 35 16 23H7V11Z"/>
+        <path class="brand-mark-lower" d="M7 53V41h9l16-12 16 12h9v12H44l-12-9-12 9H7Z"/>
+    </g>
+</svg>
+{%- endmacro %}
+
+{% macro brand_wordmark(modifier='') -%}
+<span class="brand-wordmark{% if modifier %} brand-wordmark--{{ modifier }}{% endif %}" role="img" aria-label="MediaFlux">
+    <svg class="brand-wordmark-svg" viewBox="84 15 185 35" aria-hidden="true" focusable="false">
+        <g transform="translate(84 0) scale(.8 1) translate(-84 0)">
+        <g class="brand-wordmark-media">
+            <path d="M84 17h9l9 18 9-18h9v31h-8V31l-7 14h-6l-7-14v17h-8V17Z"/>
+            <path d="M127 25h22v15h-14v3h14v5h-22V25Zm8 6v4h7v-4h-7Z"/>
+            <path d="M155 25h13v-8h8v31h-21V25Zm8 6v11h5V31h-5Z"/>
+            <path d="M183 17h8v6h-8v-6Zm0 8h8v23h-8V25Z"/>
+            <path d="M197 25h21v23h-21V34h13v-3h-13v-6Zm8 14v4h5v-4h-5Z"/>
+        </g>
+        <g class="brand-wordmark-flux">
+            <path d="M225 17h22v7h-14v6h12v7h-12v11h-8V17Z"/>
+            <path d="M252 17h8v31h-8V17Z"/>
+            <path d="M266 25h8v17h6V25h8v23h-22V25Z"/>
+            <path d="m292 25 6 11-7 12h9l3-6 3 6h9l-7-12 6-11h-9l-2 5-2-5h-9Z"/>
+        </g>
+        </g>
+    </svg>
+    <span class="brand-wordmark-cut" aria-hidden="true"></span>
+</span>
+{%- endmacro %}

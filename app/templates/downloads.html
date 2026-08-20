@@ -1,0 +1,177 @@
+{% extends "base.html" %}
+{% block title %}下载 - MediaFlux{% endblock %}
+{% block page_title %}下载管理{% endblock %}
+
+{% block content %}
+<div class="download-summary" id="summary">
+    <div class="stat-card stat-card-control">
+        <div class="stat-card-head">
+            <div class="stat-label">qB 任务</div>
+            <button class="icon-action-subtle" id="refreshBtn" type="button" onclick="loadOverview(true)" title="刷新下载状态" aria-label="刷新下载状态"><i data-lucide="refresh-cw" class="stat-icon-subtle is-blue"></i></button>
+        </div>
+        <div class="stat-value" id="qbCount">—</div>
+        <div class="stat-foot stat-foot-stack"><span id="qbStatus">连接中</span><span id="lastRefresh">· 自动刷新 10s</span></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-card-head">
+            <div class="stat-label">下载速度</div>
+            <i data-lucide="arrow-down-circle" class="stat-icon-subtle is-green"></i>
+        </div>
+        <div class="stat-value" id="dlSpeed">—</div>
+        <div class="stat-foot" id="upSpeed">上传 —</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-card-head">
+            <div class="stat-label">下载记录</div>
+            <i data-lucide="history" class="stat-icon-subtle is-purple"></i>
+        </div>
+        <div class="stat-value" id="logCount">—</div>
+        <div class="stat-foot">日志履历总数</div>
+    </div>
+</div>
+
+<div class="download-layout">
+    <section class="card card-pad download-panel">
+        <div class="dl-tab-header">
+            <div class="dl-tab-bar">
+                <button type="button" class="dl-tab-btn active" id="tabTasksBtn" onclick="switchDlTab('tasks')">
+                    <i data-lucide="zap"></i><span>实时任务</span>
+                    <span class="dl-tab-badge" id="tabTasksBadge">0</span>
+                </button>
+                <button type="button" class="dl-tab-btn" id="tabIssuesBtn" onclick="switchDlTab('issues')">
+                    <i data-lucide="circle-alert"></i><span>待处理</span>
+                    <span class="dl-tab-badge" id="tabIssuesBadge">0</span>
+                </button>
+                <button type="button" class="dl-tab-btn" id="tabLogsBtn" onclick="switchDlTab('logs')">
+                    <i data-lucide="history"></i><span>下载日志</span>
+                    <span class="dl-tab-badge" id="tabLogsBadge">0</span>
+                </button>
+            </div>
+            <span class="connection-dot online" id="qbDot"></span>
+            <div id="dlLogsFilters" class="download-log-filters" style="display:none;">
+                <div class="download-log-search">
+                    <input class="form-input" id="logKeyword" type="search" placeholder="搜索标题、链接或任务 ID" onkeydown="if(event.key==='Enter')loadLogs(1)">
+                    <button class="download-log-search-btn" type="button" onclick="loadLogs(1)" title="搜索下载日志" aria-label="搜索下载日志"><i data-lucide="search"></i></button>
+                </div>
+                <select class="form-select" id="logSource" onchange="loadLogs(1)"><option value="">全部来源</option><option value="qb">qBittorrent</option><option value="guangya">光鸭</option></select>
+                <select class="form-select" id="logStatus" onchange="loadLogs(1)"><option value="">全部状态</option><option value="success">成功</option><option value="failed">失败</option><option value="submitted">已提交</option><option value="downloading">下载中</option></select>
+            </div>
+        </div>
+
+        <!-- 实时任务 Tab 视图 -->
+        <div id="viewTasks">
+            <div class="qb-task-toolbar" id="qbTaskToolbar" aria-label="qBittorrent 批量任务操作">
+                <label class="qb-select-all" for="qbSelectAll">
+                    <input id="qbSelectAll" type="checkbox" aria-label="全选实时任务">
+                    <span id="qbSelectionLabel" aria-live="polite">选择任务</span>
+                </label>
+                <div class="qb-bulk-actions">
+                    <button class="rss-btn" id="qbBulkResume" type="button" disabled><i data-lucide="play"></i><span>启动</span></button>
+                    <button class="rss-btn" id="qbBulkPause" type="button" disabled><i data-lucide="pause"></i><span>停止</span></button>
+                    <button class="rss-btn is-danger" id="qbBulkDelete" type="button" disabled><i data-lucide="trash-2"></i><span>删除</span></button>
+                </div>
+            </div>
+            <div class="dl-table-container">
+                <table class="dl-table">
+                    <thead>
+                        <tr>
+                            <th style="width:42%;">任务与详情</th>
+                            <th style="width:28%;">下载进度</th>
+                            <th style="width:12%;">状态</th>
+                            <th style="width:18%;text-align:right;">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="qbList">
+                        <tr><td colspan="4" class="table-empty">读取中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 下载及后处理异常 Tab 视图 -->
+        <div id="viewIssues" style="display:none;">
+            <div class="download-batch-toolbar" id="issueBatchToolbar" aria-label="待处理批量操作">
+                <label class="download-batch-select-all" for="issueSelectAll">
+                    <input id="issueSelectAll" type="checkbox" aria-label="全选本页待处理请求">
+                    <span id="issueSelectionLabel" aria-live="polite">选择待处理</span>
+                </label>
+                <div class="download-batch-actions download-batch-actions-issues">
+                    <button class="rss-btn" id="issueBulkQb" type="button" disabled><i data-lucide="download"></i><span>qB</span></button>
+                    <button class="rss-btn" id="issueBulkGuangya" type="button" disabled><i data-lucide="cloud-download"></i><span>光鸭</span></button>
+                    <button class="rss-btn is-accent" id="issueBulkBoth" type="button" disabled><i data-lucide="copy-plus"></i><span>两者</span></button>
+                    <button class="rss-btn is-danger" id="issueBulkClear" type="button" disabled><i data-lucide="x"></i><span>清理</span></button>
+                </div>
+            </div>
+            <div class="dl-table-container">
+                <table class="dl-table download-attention-table">
+                    <thead>
+                        <tr>
+                            <th style="width:27%;">请求</th>
+                            <th style="width:42%;">问题</th>
+                            <th style="width:12%;">更新时间</th>
+                            <th style="width:19%;text-align:right;">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="issueList">
+                        <tr><td colspan="4" class="table-empty">读取中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="table-pagination" id="downloadIssuePagination" aria-label="待处理请求分页" style="margin-top:14px;">
+                <span class="table-pagination-info" id="downloadIssuePageInfo">第 1 页</span>
+                <div class="table-pagination-actions">
+                    <button type="button" class="rss-btn" id="downloadIssuePrev"><i data-lucide="chevron-left"></i><span>上一页</span></button>
+                    <button type="button" class="rss-btn" id="downloadIssueNext"><span>下一页</span><i data-lucide="chevron-right"></i></button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 下载日志 Tab 视图 -->
+        <div id="viewLogs" style="display:none;">
+            <div class="download-batch-toolbar" id="logBatchToolbar" aria-label="下载日志批量操作">
+                <label class="download-batch-select-all" for="logSelectAll">
+                    <input id="logSelectAll" type="checkbox" aria-label="全选本页下载日志">
+                    <span id="logSelectionLabel" aria-live="polite">选择日志</span>
+                </label>
+                <div class="download-batch-actions download-batch-actions-logs">
+                    <button class="rss-btn is-danger" id="logBulkClear" type="button" disabled><i data-lucide="trash-2"></i><span>清理日志</span></button>
+                </div>
+            </div>
+            <div class="dl-table-container">
+                <table class="dl-table download-log-table">
+                    <colgroup>
+                        <col class="download-log-source-col">
+                        <col class="download-log-title-col">
+                        <col class="download-log-status-col">
+                        <col class="download-log-target-col">
+                        <col class="download-log-time-col">
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th>来源</th>
+                            <th>标题</th>
+                            <th>状态</th>
+                            <th>下载来源</th>
+                            <th>时间</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logList">
+                        <tr><td colspan="5" class="table-empty">读取中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="table-pagination" id="downloadLogPagination" aria-label="下载日志分页" style="margin-top:14px;">
+                <span class="table-pagination-info" id="downloadLogPageInfo">第 1 页</span>
+                <div class="table-pagination-actions">
+                    <button type="button" class="rss-btn" id="downloadLogPrev"><i data-lucide="chevron-left"></i><span>上一页</span></button>
+                    <button type="button" class="rss-btn" id="downloadLogNext"><span>下一页</span><i data-lucide="chevron-right"></i></button>
+                </div>
+            </div>
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='js/downloads.js') }}?v=20260820a"></script>
+{% endblock %}

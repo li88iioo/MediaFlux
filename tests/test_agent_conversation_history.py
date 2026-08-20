@@ -1,0 +1,934 @@
+"""Media Agent 安全会话摘要持久化与 API 回归测试。"""
+from __future__ import annotations
+
+import json
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+from app import database as db
+from app.agent.conversation_history import SQLiteAgentConversationHistoryRepository
+from app.agent.operation_coordinator import reset_agent_operation_state_for_tests
+from app.agent.registry import AgentToolError
+from app.agent.rate_limit import agent_rate_limiter
+from app.config import web_credentials
+from app.main import create_app
+from tests.support import IsolatedDatabaseTestCase
+
+
+SESSION_A = "agent_session_history_0001"
+SESSION_B = "agent_session_history_0002"
+
+
+def _response(*, summary: str = "媒体库检查完成") -> dict:
+    return {
+        "request_id": "request-secret-not-persisted",
+        "mode": "tool_result",
+        "tool_call": {
+            "name": "library.audit_episodes",
+            "arguments": {"path": "/media/private", "token": "do-not-store"},
+            "elapsed_ms": 12,
+        },
+        "confirmation_id": "confirmation-secret-not-persisted",
+        "result": {
+            "ok": True,
+            "status": "success",
+            "summary": summary,
+            "error": "",
+            "suggestions": ["继续检查更新", {"secret": "do-not-store"}],
+            "data": {
+                "title": "九门",
+                "original_title": "Jiu Men",
+                "year": "2026",
+                "media_type": "movie",
+                "magnet": "magnet:?xt=urn:btih:secret",
+                "result_id": "private-result-id",
+                "path": "/media/private",
+            },
+        },
+    }
+
+
+class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM agent_conversation_messages")
+            conn.execute("DELETE FROM agent_conversations")
+            conn.execute("DELETE FROM agent_conversation_epochs")
+        self.repository = SQLiteAgentConversationHistoryRepository(
+            secret_provider=lambda: "history-test-secret",
+            max_sessions=2,
+            max_messages=4,
+        )
+
+    def test_history_is_owner_scoped_signed_and_uses_safe_projection(self):
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="检查《黑镜》有没有缺集",
+            response=_response(),
+        )
+
+        sessions = self.repository.list_sessions(principal="browser-principal-a")
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["session_id"], SESSION_A)
+        self.assertEqual(sessions[0]["message_count"], 2)
+        self.assertEqual(
+            self.repository.list_sessions(principal="browser-principal-b"), []
+        )
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertIsNotNone(history)
+        self.assertEqual([item["role"] for item in history["messages"]], ["user", "assistant"])
+        assistant = history["messages"][1]["data"]
+        self.assertEqual(assistant["tool_name"], "library.audit_episodes")
+        self.assertEqual(assistant["summary"], "媒体库检查完成")
+        self.assertEqual(assistant["suggestions"], ["继续检查更新"])
+        self.assertEqual(assistant["media_context"], {
+            "title": "九门",
+            "original_title": "Jiu Men",
+            "year": "2026",
+            "media_type": "tv",
+        })
+        self.assertNotIn("arguments", assistant)
+        self.assertNotIn("confirmation_id", assistant)
+
+        with db.get_conn() as conn:
+            raw = "\n".join(
+                str(row["payload"])
+                for row in conn.execute(
+                    "SELECT payload FROM agent_conversation_messages ORDER BY id"
+                ).fetchall()
+            )
+            principals = "\n".join(
+                str(row["principal_digest"])
+                for row in conn.execute(
+                    "SELECT principal_digest FROM agent_conversations"
+                ).fetchall()
+            )
+        self.assertNotIn("browser-principal-a", principals)
+        for forbidden in (
+            "confirmation-secret-not-persisted",
+            "request-secret-not-persisted",
+            "magnet:?",
+            "/media/private",
+            "do-not-store",
+            "private-result-id",
+            '"arguments"',
+        ):
+            self.assertNotIn(forbidden, raw)
+
+    def test_tampered_payload_fails_closed_and_delete_is_owner_scoped(self):
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="检查项目配置",
+            response=_response(),
+        )
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT id,payload FROM agent_conversation_messages "
+                "WHERE role='assistant' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            envelope = json.loads(row["payload"])
+            envelope["data"]["summary"] = "被篡改"
+            conn.execute(
+                "UPDATE agent_conversation_messages SET payload=? WHERE id=?",
+                (json.dumps(envelope, ensure_ascii=False), int(row["id"])),
+            )
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(len(history["messages"]), 1)
+        self.assertEqual(history["messages"][0]["role"], "user")
+        self.assertFalse(
+            self.repository.delete_session(
+                principal="browser-principal-b", session_id=SESSION_A
+            )
+        )
+        self.assertTrue(
+            self.repository.delete_session(
+                principal="browser-principal-a", session_id=SESSION_A
+            )
+        )
+        self.assertIsNone(
+            self.repository.get_session(
+                principal="browser-principal-a", session_id=SESSION_A
+            )
+        )
+
+    def test_natural_language_slashes_are_not_mistaken_for_file_paths(self):
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="检查电影/剧集更新，并核对 S01/S02 是否完整",
+            response=_response(),
+        )
+
+        detail = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertIsNotNone(detail)
+        self.assertEqual(
+            detail["messages"][0]["data"]["text"],
+            "检查电影/剧集更新，并核对 S01/S02 是否完整",
+        )
+
+    def test_sensitive_user_input_is_never_persisted(self):
+        sensitive_messages = (
+            "检查 /media/private/secret.mkv",
+            "检查路径:/media/private/secret.mkv",
+            "路径：/media/private/secret.mkv",
+            "检查 file:///media/private/secret.mkv",
+            "检查 %2Fmedia%2Fprivate%2Fsecret.mkv",
+            r"检查 C:\private\secret.mkv",
+            "下载 magnet:?xt=urn:btih:private",
+            "Cookie: sessionid=private",
+            "set-cookie: session=private",
+            "登录口令 correcthorsebatterystaple",
+            "服务器密码 my-secret-password",
+            "pass=correcthorsebatterystaple",
+            "https://example.test/api?pass=correcthorsebatterystaple",
+            "private share url https://host.example/s/abc?pwd=xxxx",
+        )
+        for index, message in enumerate(sensitive_messages):
+            with self.subTest(message=message), self.assertRaises(ValueError):
+                self.repository.append_query_turn(
+                    principal="browser-principal-a",
+                    session_id=f"agent_sensitive_session_{index:02d}",
+                    message=message,
+                    response=_response(),
+                )
+        self.assertEqual(
+            self.repository.list_sessions(principal="browser-principal-a"), []
+        )
+
+    def test_delete_epoch_blocks_late_append_but_allows_new_requests(self):
+        generation = self.repository.session_generation(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertFalse(
+            self.repository.delete_session(
+                principal="browser-principal-a", session_id=SESSION_A
+            )
+        )
+        self.assertFalse(
+            self.repository.append_query_turn(
+                principal="browser-principal-a",
+                session_id=SESSION_A,
+                message="删除前启动的迟到请求",
+                response=_response(),
+                expected_generation=generation,
+            )
+        )
+        self.assertIsNone(
+            self.repository.get_session(
+                principal="browser-principal-a", session_id=SESSION_A
+            )
+        )
+
+        next_generation = self.repository.session_generation(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertNotEqual(generation, next_generation)
+        self.assertTrue(
+            self.repository.append_query_turn(
+                principal="browser-principal-a",
+                session_id=SESSION_A,
+                message="删除后开始的新请求",
+                response=_response(),
+                expected_generation=next_generation,
+            )
+        )
+
+    def test_pruned_epoch_never_reuses_deleted_generation(self):
+        repository = SQLiteAgentConversationHistoryRepository(
+            secret_provider=lambda: "history-test-secret",
+            retention_days=1,
+        )
+        generation = repository.session_generation(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        repository.delete_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE agent_conversation_epochs SET updated_at='2000-01-01 00:00:00'"
+            )
+        repository.list_sessions(principal="browser-principal-a")
+        self.assertFalse(
+            repository.append_query_turn(
+                principal="browser-principal-a",
+                session_id=SESSION_A,
+                message="极慢请求不得复活历史",
+                response=_response(),
+                expected_generation=generation,
+            )
+        )
+
+    def test_sensitive_assistant_output_is_replaced(self):
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="检查媒体摘要",
+            response=_response(summary="结果位于 file:///media/private/secret.mkv"),
+        )
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(history["messages"][1]["data"]["summary"], "[已隐藏敏感详情]")
+
+    def test_expired_sessions_are_pruned_on_read_without_new_writes(self):
+        repository = SQLiteAgentConversationHistoryRepository(
+            secret_provider=lambda: "history-test-secret",
+            retention_days=1,
+        )
+        repository.append_query_turn(
+            principal="expired-principal",
+            session_id="agent_expired_session_0001",
+            message="检查旧会话",
+            response=_response(),
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE agent_conversations SET updated_at='2000-01-01 00:00:00'"
+            )
+        self.assertEqual(repository.list_sessions(principal="expired-principal"), [])
+        self.assertIsNone(repository.get_session(
+            principal="expired-principal", session_id="agent_expired_session_0001"
+        ))
+
+    def test_repository_prunes_expired_and_global_excess_sessions(self):
+        repository = SQLiteAgentConversationHistoryRepository(
+            secret_provider=lambda: "history-test-secret",
+            max_sessions=100,
+            max_messages=4,
+            retention_days=1,
+            max_total_sessions=10,
+        )
+        repository.append_query_turn(
+            principal="expired-principal",
+            session_id="agent_expired_session_0001",
+            message="检查旧会话",
+            response=_response(),
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE agent_conversations SET updated_at='2000-01-01 00:00:00'"
+            )
+
+        for index in range(11):
+            repository.append_query_turn(
+                principal=f"principal-{index}",
+                session_id=f"agent_global_session_{index:04d}",
+                message=f"检查会话 {index}",
+                response=_response(summary=f"结果 {index}"),
+            )
+
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT session_id FROM agent_conversations ORDER BY id"
+            ).fetchall()
+        session_ids = {str(row["session_id"]) for row in rows}
+        self.assertEqual(len(session_ids), 10)
+        self.assertNotIn("agent_expired_session_0001", session_ids)
+        self.assertNotIn("agent_global_session_0000", session_ids)
+        self.assertIn("agent_global_session_0010", session_ids)
+
+    def test_repository_enforces_session_and_message_bounds(self):
+        for session_id in (SESSION_A, SESSION_B, "agent_session_history_0003"):
+            self.repository.append_query_turn(
+                principal="browser-principal-a",
+                session_id=session_id,
+                message=f"查询 {session_id}",
+                response=_response(),
+            )
+        sessions = self.repository.list_sessions(principal="browser-principal-a")
+        self.assertEqual(len(sessions), 2)
+        self.assertNotIn(SESSION_A, {item["session_id"] for item in sessions})
+
+        for index in range(3):
+            self.repository.append_query_turn(
+                principal="browser-principal-a",
+                session_id=SESSION_B,
+                message=f"继续查询 {index}",
+                response=_response(summary=f"结果 {index}"),
+            )
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_B
+        )
+        self.assertEqual(len(history["messages"]), 4)
+        self.assertEqual(history["message_count"], 4)
+
+
+class _FakeAgentService:
+    def __init__(self) -> None:
+        self.query_owners: list[str] = []
+        self.reset_owners: list[str] = []
+        self.invoke_calls: list[tuple[str, dict, str]] = []
+        self.confirm_calls: list[tuple[str, str]] = []
+        self.discard_calls: list[tuple[str, str]] = []
+        self.prepare_calls: list[tuple[str, dict, str, int | None]] = []
+        self.confirm_response: dict = _response(summary="受控操作执行完成")
+        self.confirm_hook = None
+        self.prepare_hook = None
+        self.reset_error: AgentToolError | None = None
+        self.confirmation_epoch = 0
+
+    def query(self, _message: str, *, owner: str, **_kwargs):
+        self.query_owners.append(owner)
+        return _response()
+
+    def has_tool(self, tool_name: str) -> bool:
+        return bool(str(tool_name or "").strip())
+
+    def invoke(self, tool_name: str, arguments: dict, *, owner: str = ""):
+        self.invoke_calls.append((tool_name, dict(arguments), owner))
+        return _response()
+
+    def begin_query_confirmation_epoch(self, *, owner: str) -> int:
+        del owner
+        self.confirmation_epoch += 1
+        return self.confirmation_epoch
+
+    def prepare(
+        self,
+        tool_name: str,
+        arguments: dict,
+        *,
+        owner: str,
+        expected_owner_generation: int | None = None,
+    ) -> dict:
+        self.prepare_calls.append(
+            (tool_name, dict(arguments), owner, expected_owner_generation)
+        )
+        if self.prepare_hook is not None:
+            self.prepare_hook()
+        return {
+            "mode": "confirmation_required",
+            "confirmation": {"confirmation_id": "prepared-confirmation-123456"},
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "等待确认",
+                "suggestions": [],
+                "evidence": [],
+            },
+        }
+
+    def confirm(self, confirmation_id: str, *, owner: str):
+        self.confirm_calls.append((confirmation_id, owner))
+        if self.confirm_hook is not None:
+            self.confirm_hook()
+        return self.confirm_response
+
+    def discard_confirmation(self, confirmation_id: str, *, owner: str):
+        self.discard_calls.append((confirmation_id, owner))
+        return True
+
+    def reset_session(self, *, owner: str):
+        self.reset_owners.append(owner)
+        self.confirmation_epoch += 1
+        if self.reset_error is not None:
+            raise self.reset_error
+        return {"reset": True}
+
+
+class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        agent_rate_limiter.reset()
+        reset_agent_operation_state_for_tests()
+        self.client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        self.service = _FakeAgentService()
+
+    def tearDown(self) -> None:
+        self.client.close()
+        agent_rate_limiter.reset()
+        reset_agent_operation_state_for_tests()
+
+    @staticmethod
+    def _token(html: str) -> str:
+        matched = re.search(
+            r'name="csrf_token"\s+(?:value|content)="([^"]+)"', html
+        ) or re.search(r'name="csrf-token" content="([^"]+)"', html)
+        if not matched:
+            raise AssertionError("页面未输出 CSRF Token")
+        return matched.group(1)
+
+    def _login(self, client: TestClient | None = None) -> str:
+        target = client or self.client
+        login_page = target.get("/login")
+        username, password = web_credentials()
+        response = target.post(
+            "/login",
+            data={
+                "username": username,
+                "password": password,
+                "csrf_token": self._token(login_page.text),
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 302, response.text)
+        return self._token(target.get("/agent").text)
+
+    def test_query_list_restore_and_delete_session(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            query = self.client.post(
+                "/api/agent/query",
+                headers=headers,
+                json={"message": "检查《黑镜》有没有缺集", "session_id": SESSION_A},
+            )
+            listing = self.client.get("/api/agent/sessions")
+            detail = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+            deleted = self.client.delete(
+                f"/api/agent/sessions/{SESSION_A}", headers=headers
+            )
+            missing = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+
+        self.assertEqual(query.status_code, 200, query.text)
+        self.assertEqual(listing.status_code, 200, listing.text)
+        self.assertEqual(listing.json()["sessions"][0]["session_id"], SESSION_A)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        raw_detail = detail.text
+        for forbidden in (
+            "confirmation-secret-not-persisted",
+            "request-secret-not-persisted",
+            "magnet:?",
+            "/media/private",
+            "private-result-id",
+            '"arguments"',
+        ):
+            self.assertNotIn(forbidden, raw_detail)
+        self.assertTrue(deleted.json()["deleted"])
+        self.assertTrue(deleted.json()["reset"]["reset"])
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(len(self.service.query_owners), 1)
+        self.assertEqual(len(self.service.reset_owners), 1)
+        self.assertTrue(self.service.query_owners[0].startswith("web:v1:"))
+        self.assertEqual(self.service.reset_owners[0], self.service.query_owners[0])
+
+    def test_discard_confirmation_returns_minimal_contract_without_archiving(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            seeded = self.client.post(
+                "/api/agent/query",
+                headers=headers,
+                json={"message": "检查下载队列", "session_id": SESSION_A},
+            )
+            history_before = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+            response = self.client.post(
+                "/api/agent/actions/confirm/discard",
+                headers=headers,
+                json={
+                    "confirmation_id": "confirmation-token-123456",
+                    "session_id": SESSION_A,
+                },
+            )
+            history_after = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+
+        self.assertEqual(seeded.status_code, 200, seeded.text)
+        self.assertEqual(history_before.status_code, 200, history_before.text)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"discarded": True})
+        self.assertEqual(len(self.service.discard_calls), 1)
+        confirmation_id, owner = self.service.discard_calls[0]
+        self.assertEqual(confirmation_id, "confirmation-token-123456")
+        self.assertTrue(owner.startswith("web:v1:"))
+        self.assertEqual(history_after.status_code, 200, history_after.text)
+        self.assertEqual(history_after.json(), history_before.json())
+
+    def test_direct_read_tool_with_session_is_archived_and_restorable(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            response = self.client.post(
+                "/api/agent/tools/library.check_updates",
+                headers=headers,
+                json={
+                    "arguments": {"query": "黑镜", "media_type": "tv"},
+                    "session_id": SESSION_A,
+                },
+            )
+            detail = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        messages = detail.json()["session"]["messages"]
+        self.assertEqual([item["role"] for item in messages], ["user", "assistant"])
+        self.assertEqual(messages[0]["data"]["text"], "执行只读检查 · 媒体更新检查")
+        self.assertNotIn("tool_name", messages[1]["data"])
+        self.assertEqual(messages[1]["data"]["tool_label"], "剧集完整性检查")
+        self.assertNotIn("library.audit_episodes", detail.text)
+        self.assertEqual(self.service.invoke_calls[0][:2], (
+            "library.check_updates", {"query": "黑镜", "media_type": "tv"},
+        ))
+
+
+    def test_confirmed_action_with_session_is_archived_as_safe_outcome(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        self.service.confirm_response = {
+            "request_id": "confirm-request-secret",
+            "mode": "confirmed_action",
+            "tool_call": {
+                "name": "indexer.submit_resource",
+                "arguments": {"result_id": "private-result-id", "target": "qb"},
+            },
+            "confirmation": {"confirmation_id": "do-not-store-confirmation"},
+            "result": {
+                "ok": True,
+                "status": "accepted",
+                "summary": "下载任务已提交",
+                "error": "",
+                "suggestions": ["稍后检查下载状态"],
+                "data": {"magnet": "magnet:?xt=urn:btih:secret"},
+            },
+        }
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            response = self.client.post(
+                "/api/agent/actions/confirm",
+                headers=headers,
+                json={
+                    "confirmation_id": "confirmation-token-123456",
+                    "session_id": SESSION_A,
+                },
+            )
+            detail = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(detail.status_code, 200, detail.text)
+        messages = detail.json()["session"]["messages"]
+        self.assertEqual(messages[0]["data"]["text"], "确认并执行 · 资源下载提交")
+        self.assertEqual(messages[1]["data"]["summary"], "下载任务已提交")
+        self.assertEqual(messages[1]["data"]["status"], "accepted")
+        self.assertEqual(messages[1]["data"]["tool_label"], "资源下载提交")
+        self.assertNotIn("tool_name", messages[1]["data"])
+        for forbidden in (
+            "confirmation-token-123456",
+            "do-not-store-confirmation",
+            "private-result-id",
+            "magnet:?",
+            '"arguments"',
+        ):
+            self.assertNotIn(forbidden, detail.text)
+
+    def test_confirmed_business_conflict_is_archived_without_changing_status_code(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        self.service.confirm_response = {
+            "mode": "confirmed_action",
+            "tool_call": {"name": "config.set_feature_state"},
+            "result": {
+                "ok": False,
+                "status": "no_changes",
+                "summary": "配置已经处于目标状态",
+                "error": "",
+                "suggestions": [],
+                "data": {},
+            },
+        }
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            response = self.client.post(
+                "/api/agent/actions/confirm",
+                headers=headers,
+                json={
+                    "confirmation_id": "confirmation-token-123456",
+                    "session_id": SESSION_A,
+                },
+            )
+            detail = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+
+        self.assertEqual(response.status_code, 409, response.text)
+        messages = detail.json()["session"]["messages"]
+        self.assertEqual(messages[0]["data"]["text"], "确认并执行 · 功能开关修改")
+        self.assertFalse(messages[1]["data"]["ok"])
+        self.assertEqual(messages[1]["data"]["status"], "no_changes")
+        self.assertEqual(messages[1]["data"]["tool_label"], "功能开关修改")
+        self.assertNotIn("tool_name", messages[1]["data"])
+
+    def test_confirm_without_session_is_rejected_without_history(self):
+        csrf = self._login()
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            response = self.client.post(
+                "/api/agent/actions/confirm",
+                headers={"X-CSRF-Token": csrf},
+                json={"confirmation_id": "confirmation-token-123456"},
+            )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.client.get("/api/agent/sessions").json()["sessions"], [])
+
+    def test_late_confirm_cannot_recreate_deleted_session(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        repository = SQLiteAgentConversationHistoryRepository()
+        self.service.confirm_hook = lambda: repository.delete_session(
+            principal=csrf, session_id=SESSION_A
+        )
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            response = self.client.post(
+                "/api/agent/actions/confirm",
+                headers=headers,
+                json={
+                    "confirmation_id": "confirmation-token-123456",
+                    "session_id": SESSION_A,
+                },
+            )
+            missing = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(missing.status_code, 404, missing.text)
+
+    def test_reset_waits_for_confirmed_write_to_leave_owner_window(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        confirm_started = threading.Event()
+        release_confirm = threading.Event()
+        reset_completed = threading.Event()
+
+        def block_confirm() -> None:
+            confirm_started.set()
+            if not release_confirm.wait(timeout=3):
+                raise TimeoutError("测试未释放确认操作")
+
+        self.service.confirm_hook = block_confirm
+        reset_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        reset_client.cookies.update(self.client.cookies)
+        try:
+            with patch(
+                "app.routes.agent_api.get_agent_service", return_value=self.service
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                confirm_future = pool.submit(
+                    self.client.post,
+                    "/api/agent/actions/confirm",
+                    headers=headers,
+                    json={
+                        "confirmation_id": "confirmation-token-123456",
+                        "session_id": SESSION_A,
+                    },
+                )
+                self.assertTrue(confirm_started.wait(timeout=2))
+
+                def reset_session():
+                    response = reset_client.post(
+                        "/api/agent/session/reset",
+                        headers=headers,
+                        json={"session_id": SESSION_A},
+                    )
+                    reset_completed.set()
+                    return response
+
+                reset_future = pool.submit(reset_session)
+                self.assertFalse(reset_completed.wait(timeout=0.1))
+                release_confirm.set()
+                confirmed = confirm_future.result(timeout=3)
+                reset = reset_future.result(timeout=3)
+        finally:
+            release_confirm.set()
+            reset_client.close()
+
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertTrue(reset_completed.is_set())
+        self.assertEqual(len(self.service.confirm_calls), 1)
+        self.assertEqual(len(self.service.reset_owners), 1)
+
+    def test_delete_waits_for_confirmed_write_then_removes_archive(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        confirm_started = threading.Event()
+        release_confirm = threading.Event()
+        delete_completed = threading.Event()
+
+        def block_confirm() -> None:
+            confirm_started.set()
+            if not release_confirm.wait(timeout=3):
+                raise TimeoutError("测试未释放确认操作")
+
+        self.service.confirm_hook = block_confirm
+        delete_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        delete_client.cookies.update(self.client.cookies)
+        try:
+            with patch(
+                "app.routes.agent_api.get_agent_service", return_value=self.service
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                confirm_future = pool.submit(
+                    self.client.post,
+                    "/api/agent/actions/confirm",
+                    headers=headers,
+                    json={
+                        "confirmation_id": "confirmation-token-123456",
+                        "session_id": SESSION_A,
+                    },
+                )
+                self.assertTrue(confirm_started.wait(timeout=2))
+
+                def delete_session():
+                    response = delete_client.delete(
+                        f"/api/agent/sessions/{SESSION_A}", headers=headers
+                    )
+                    delete_completed.set()
+                    return response
+
+                delete_future = pool.submit(delete_session)
+                self.assertFalse(delete_completed.wait(timeout=0.1))
+                release_confirm.set()
+                confirmed = confirm_future.result(timeout=3)
+                deleted = delete_future.result(timeout=3)
+        finally:
+            release_confirm.set()
+            delete_client.close()
+
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertTrue(deleted.json()["deleted"])
+        self.assertTrue(delete_completed.is_set())
+        self.assertEqual(
+            self.client.get(f"/api/agent/sessions/{SESSION_A}").status_code, 404
+        )
+
+    def test_reset_supersedes_inflight_prepare_without_returning_ticket(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        prepare_started = threading.Event()
+        release_prepare = threading.Event()
+
+        def block_prepare() -> None:
+            prepare_started.set()
+            if not release_prepare.wait(timeout=3):
+                raise TimeoutError("测试未释放预检操作")
+
+        self.service.prepare_hook = block_prepare
+        reset_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        reset_client.cookies.update(self.client.cookies)
+        try:
+            with patch(
+                "app.routes.agent_api.get_agent_service", return_value=self.service
+            ), ThreadPoolExecutor(max_workers=1) as pool:
+                prepare_future = pool.submit(
+                    self.client.post,
+                    "/api/agent/actions/write.test/prepare",
+                    headers=headers,
+                    json={"arguments": {}, "session_id": SESSION_A},
+                )
+                self.assertTrue(prepare_started.wait(timeout=2))
+                reset = reset_client.post(
+                    "/api/agent/session/reset",
+                    headers=headers,
+                    json={"session_id": SESSION_A},
+                )
+                self.assertEqual(reset.status_code, 200, reset.text)
+                release_prepare.set()
+                prepared = prepare_future.result(timeout=3)
+        finally:
+            release_prepare.set()
+            reset_client.close()
+
+        self.assertEqual(prepared.status_code, 409, prepared.text)
+        self.assertNotIn("confirmation", prepared.json())
+        self.assertEqual(len(self.service.prepare_calls), 1)
+        self.assertEqual(self.service.prepare_calls[0][3], 1)
+
+    def test_delete_removes_archive_even_when_runtime_reset_fails(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        self.service.reset_error = AgentToolError(
+            "runtime reset failed", code="confirmation_invalid"
+        )
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            query = self.client.post(
+                "/api/agent/query",
+                headers=headers,
+                json={"message": "检查项目配置", "session_id": SESSION_A},
+            )
+            deleted = self.client.delete(
+                f"/api/agent/sessions/{SESSION_A}", headers=headers
+            )
+            missing = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+
+        self.assertEqual(query.status_code, 200, query.text)
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertTrue(deleted.json()["deleted"])
+        self.assertFalse(deleted.json()["reset"]["reset"])
+        self.assertNotIn("runtime reset failed", deleted.text)
+        self.assertEqual(missing.status_code, 404)
+
+    def test_sensitive_query_succeeds_without_archiving_private_input(self):
+        csrf = self._login()
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            response = self.client.post(
+                "/api/agent/query",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "message": "检查 /media/private/secret.mkv",
+                    "session_id": SESSION_A,
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        listing = self.client.get("/api/agent/sessions")
+        self.assertEqual(listing.status_code, 200, listing.text)
+        self.assertEqual(listing.json()["sessions"], [])
+
+    def test_session_history_isolated_between_login_sessions(self):
+        csrf = self._login()
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            response = self.client.post(
+                "/api/agent/query",
+                headers={"X-CSRF-Token": csrf},
+                json={"message": "检查项目配置", "session_id": SESSION_A},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        other = TestClient(create_app(start_background=False), raise_server_exceptions=False)
+        try:
+            self._login(other)
+            listing = other.get("/api/agent/sessions")
+            detail = other.get(f"/api/agent/sessions/{SESSION_A}")
+        finally:
+            other.close()
+        self.assertEqual(listing.status_code, 200, listing.text)
+        self.assertEqual(listing.json()["sessions"], [])
+        self.assertEqual(detail.status_code, 404)
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()

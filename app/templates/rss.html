@@ -1,0 +1,788 @@
+{% extends "base.html" %}
+{% block title %}订阅 - MediaFlux{% endblock %}
+{% block page_title %}订阅{% endblock %}
+
+{% block page_styles %}
+<script>
+(() => {
+    const initialTab = window.location.hash.slice(1);
+    if (new Set(['rss', 'watchlist', 'runs']).has(initialTab)) {
+        document.documentElement.dataset.subscriptionInitialTab = initialTab;
+    }
+})();
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="subscription-center" data-subscription-center>
+    <section class="subscription-overview" aria-label="订阅运行概览">
+        <article class="subscription-metric">
+            <span class="subscription-metric-icon"><i data-lucide="layers-3"></i></span>
+            <span class="subscription-metric-copy"><small>全部订阅</small><span class="subscription-metric-note">媒体与 RSS</span></span>
+            <strong class="subscription-metric-value" id="subscriptionStatTotal">0</strong>
+        </article>
+        <article class="subscription-metric">
+            <span class="subscription-metric-icon is-active"><i data-lucide="radar"></i></span>
+            <span class="subscription-metric-copy"><small>媒体追更</small><span class="subscription-metric-note">正在巡检</span></span>
+            <strong class="subscription-metric-value" id="subscriptionStatMediaActive">0</strong>
+        </article>
+        <article class="subscription-metric">
+            <span class="subscription-metric-icon is-warning"><i data-lucide="circle-alert"></i></span>
+            <span class="subscription-metric-copy"><small>缺失媒体</small><span class="subscription-metric-note">等待资源</span></span>
+            <strong class="subscription-metric-value" id="subscriptionStatMissing">0</strong>
+        </article>
+        <article class="subscription-metric">
+            <span class="subscription-metric-icon is-rss"><i data-lucide="rss"></i></span>
+            <span class="subscription-metric-copy"><small>RSS 待处理</small><span class="subscription-metric-note">下载队列</span></span>
+            <strong class="subscription-metric-value" id="subscriptionStatRssPending">0</strong>
+        </article>
+    </section>
+
+    <nav class="subscription-tabs" role="tablist" aria-label="订阅中心视图">
+        <button type="button" class="subscription-tab is-active" id="subscriptionTabMedia" role="tab" aria-selected="true" aria-controls="subscriptionPanelMedia" data-subscription-tab="media">
+            <i data-lucide="clapperboard"></i><span>媒体订阅</span><b id="subscriptionMediaBadge">0</b>
+        </button>
+        <button type="button" class="subscription-tab" id="subscriptionTabRss" role="tab" aria-selected="false" aria-controls="subscriptionPanelRss" data-subscription-tab="rss">
+            <i data-lucide="rss"></i><span>RSS 订阅</span><b id="subscriptionRssBadge">0</b>
+        </button>
+        <button type="button" class="subscription-tab" id="subscriptionTabWatchlist" role="tab" aria-selected="false" aria-controls="subscriptionPanelWatchlist" data-subscription-tab="watchlist">
+            <i data-lucide="bookmark"></i><span>收藏清单</span><b id="subscriptionWatchlistBadge">0</b>
+        </button>
+        <button type="button" class="subscription-tab" id="subscriptionTabRuns" role="tab" aria-selected="false" aria-controls="subscriptionPanelRuns" data-subscription-tab="runs">
+            <i data-lucide="history"></i><span>运行记录</span>
+        </button>
+    </nav>
+
+    <section class="subscription-panel is-active" id="subscriptionPanelMedia" role="tabpanel" aria-labelledby="subscriptionTabMedia" data-subscription-panel="media">
+        <header class="subscription-panel-head">
+            <div class="subscription-heading">
+                <div class="subscription-heading-line"><span class="subscription-eyebrow">MEDIA FOLLOW</span><span class="subscription-heading-divider" aria-hidden="true">/</span><h2>媒体追更</h2></div>
+                <p>按 TMDB 身份核对 Jellyfin / Emby 库存，只搜索已播且缺失的内容。</p>
+            </div>
+            <div class="subscription-panel-actions">
+                <select class="form-select" id="mediaSubscriptionStatus" aria-label="媒体订阅状态筛选">
+                    <option value="">全部状态</option>
+                    <option value="missing">发现缺失</option>
+                    <option value="satisfied">已满足</option>
+                    <option value="checking">检查中</option>
+                    <option value="inconclusive">待核验</option>
+                    <option value="error">异常</option>
+                    <option value="paused">已暂停</option>
+                </select>
+                <button type="button" class="jump-btn subscription-refresh" id="refreshMediaSubscriptions"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+                <button type="button" class="btn btn-primary subscription-create" id="createMediaSubscription" aria-label="新建媒体订阅" title="新建媒体订阅"><i data-lucide="plus"></i><span>新建媒体订阅</span></button>
+            </div>
+        </header>
+        <div class="subscription-list-frame" aria-live="polite" aria-busy="false">
+            <div class="subscription-media-list" id="mediaSubscriptionList"></div>
+        </div>
+    </section>
+
+    <section class="subscription-panel" id="subscriptionPanelRss" role="tabpanel" aria-labelledby="subscriptionTabRss" data-subscription-panel="rss" hidden>
+        <div class="rss-stats-bar subscription-rss-stats">
+            <div class="stat-card"><div class="stat-card-head"><span class="stat-label">订阅源总数</span><i data-lucide="rss" class="stat-icon-subtle is-blue"></i></div><div class="stat-value" id="statSubTotal">0</div><div class="stat-foot">全局 RSS 订阅源</div></div>
+            <div class="stat-card"><div class="stat-card-head"><span class="stat-label">自动刷新中</span><i data-lucide="refresh-cw" class="stat-icon-subtle is-green"></i></div><div class="stat-value" id="statSubActive">0</div><div class="stat-foot">后台定时抓取</div></div>
+            <div class="stat-card"><div class="stat-card-head"><span class="stat-label">抓取条目总计</span><i data-lucide="layers" class="stat-icon-subtle is-purple"></i></div><div class="stat-value" id="statEntryTotal">0</div><div class="stat-foot">已解析种子条目</div></div>
+            <div class="stat-card"><div class="stat-card-head"><span class="stat-label">待处理任务</span><i data-lucide="clock" class="stat-icon-subtle is-amber"></i></div><div class="stat-value" id="statEntryPending">0</div><div class="stat-foot">队列中待执行</div></div>
+        </div>
+
+        <div class="card card-pad subscription-rss-card">
+            <div class="subscription-section-toolbar">
+                <div class="subscription-heading"><div class="subscription-heading-line"><span class="subscription-eyebrow">RSS SOURCES</span><span class="subscription-heading-divider" aria-hidden="true">/</span><h2>RSS 订阅源</h2></div></div>
+                <button class="btn btn-primary btn-sm subscription-rss-create" type="button" onclick="openSubForm(null,this)" aria-label="新建 RSS 订阅" title="新建 RSS 订阅"><i data-lucide="plus"></i>新建 RSS 订阅</button>
+            </div>
+            <div id="subList" class="subscription-rss-source-list"></div>
+        </div>
+
+        <div class="card card-pad subscription-rss-card">
+            <div class="rss-entry-head">
+                <div><span class="subscription-eyebrow">FEED ITEMS</span><h2>订阅抓取条目</h2></div>
+                <div class="rss-entry-filters" aria-label="订阅条目筛选">
+                    <div class="rss-search-field"><i data-lucide="search"></i><input type="search" class="form-input" id="filterKeyword" placeholder="搜索标题、订阅源或 GUID" onkeydown="if(event.key==='Enter')loadEntries()"></div>
+                    <select class="form-select" id="filterSub" onchange="loadEntries()"><option value="">全部订阅源</option></select>
+                    <select class="form-select" id="filterStatus" onchange="loadEntries()"><option value="">全部状态</option><option value="pending">待处理</option><option value="submitting">提交中</option><option value="downloaded">已处理</option><option value="failed">失败</option><option value="skipped">手动已处理</option></select>
+                    <button class="jump-btn subscription-refresh" id="refreshRssEntries" type="button" onclick="loadEntries()"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+                </div>
+            </div>
+            <div class="rss-batchbar" id="rssBatchbar">
+                <label class="rss-check-all"><input type="checkbox" id="entryCheckAll"><span>全选列表</span></label>
+                <span id="rssSelectedCount">已选择 0 条</span>
+                <div class="rss-batch-actions"><button type="button" class="jump-btn" id="batchDownloadBtn" disabled><i data-lucide="download"></i>批量下载</button><button type="button" class="jump-btn" id="batchProcessedBtn" disabled><i data-lucide="check-check"></i>标记已处理</button><button type="button" class="jump-btn" id="batchPendingBtn" disabled><i data-lucide="rotate-ccw"></i>标记未处理</button></div>
+            </div>
+            <div id="entryList" class="rss-entry-list subscription-rss-entry-list" aria-live="polite" aria-busy="false"></div>
+        </div>
+    </section>
+
+    <section class="subscription-panel" id="subscriptionPanelWatchlist" role="tabpanel" aria-labelledby="subscriptionTabWatchlist" data-subscription-panel="watchlist" hidden>
+        <header class="subscription-panel-head"><div class="subscription-heading"><div class="subscription-heading-line"><span class="subscription-eyebrow">WATCHLIST</span><span class="subscription-heading-divider" aria-hidden="true">/</span><h2>收藏清单</h2></div><p>收藏不再只是标记：可查看档案、搜索资源，或转为自动追更订阅。</p></div><button type="button" class="jump-btn subscription-refresh" id="refreshSubscriptionWatchlist"><i data-lucide="refresh-cw"></i><span>刷新</span></button></header>
+        <div class="subscription-list-frame" aria-live="polite" aria-busy="false"><div class="subscription-watchlist-grid" id="subscriptionWatchlist"></div></div>
+    </section>
+
+    <section class="subscription-panel" id="subscriptionPanelRuns" role="tabpanel" aria-labelledby="subscriptionTabRuns" data-subscription-panel="runs" hidden>
+        <header class="subscription-panel-head"><div class="subscription-heading"><div class="subscription-heading-line"><span class="subscription-eyebrow">AUDIT LOG</span><span class="subscription-heading-divider" aria-hidden="true">/</span><h2>媒体巡检记录</h2></div><p>记录每次库存核验、缺集判断、资源候选与自动提交结果。</p></div><button type="button" class="jump-btn subscription-refresh" id="refreshSubscriptionRuns"><i data-lucide="refresh-cw"></i><span>刷新</span></button></header>
+        <div class="subscription-list-frame" aria-live="polite" aria-busy="false"><div class="subscription-run-list" id="subscriptionRunList"></div></div>
+    </section>
+</div>
+
+<!-- 新建/编辑订阅弹窗 -->
+<div id="subModal" class="rss-sub-modal subscription-modal subscription-source-modal" aria-hidden="true">
+    <div class="rss-sub-modal-card subscription-modal-card subscription-source-modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="rss-modal-header">
+            <div><span class="subscription-eyebrow">RSS SOURCE</span><h3 id="modalTitle">新建订阅源</h3><p>配置订阅地址、刷新周期与自动下载策略。</p></div>
+            <button class="icon-btn" type="button" aria-label="关闭订阅源窗口" title="关闭" onclick="closeSubForm()"><i data-lucide="x"></i></button>
+        </div>
+        <div class="subscription-source-form">
+            <div class="grid-2 subscription-source-grid is-name-row">
+                <div class="form-group">
+                    <label class="form-label" for="f_name">订阅名称</label>
+                    <input type="text" class="form-input" id="f_name" placeholder="如：莉可丽丝 4K">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="f_interval">自动刷新周期</label>
+                    <select class="form-select" id="f_interval">
+                        <option value="0">不自动刷新</option>
+                        <option value="5">每 5 分钟</option>
+                        <option value="15">每 15 分钟</option>
+                        <option value="30">每 30 分钟</option>
+                        <option value="60">每 1 小时</option>
+                        <option value="180">每 3 小时</option>
+                        <option value="360">每 6 小时</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="f_urls">RSS URL <span class="subscription-source-field-hint">多个换行分隔，支持 mikanani.me / 蜜柑计划</span></label>
+                <textarea class="form-textarea" id="f_urls" rows="3" placeholder="https://mikanani.me/RSS/Search?searchstr=..."></textarea>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="f_exclude">排除关键词 <span class="subscription-source-field-hint">逗号或空格分隔，命中即自动跳过</span></label>
+                <input type="text" class="form-input" id="f_exclude" placeholder="如：繁体, 720p, 试看, 预览版">
+            </div>
+            <div class="grid-2 subscription-source-grid">
+                <div class="form-group">
+                    <label class="form-label" for="f_action">下载策略</label>
+                    <select class="form-select" id="f_action">
+                        <option value="subscribe">仅订阅（手动确认下载）</option>
+                        <option value="download">自动触发离线下载</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="f_method">下载目标</label>
+                    <select class="form-select" id="f_method">
+                        <option value="">继承全局设置</option>
+                        <option value="qb">qBittorrent</option>
+                        <option value="guangya">光鸭云盘</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group" id="rssQbPathRow">
+                <label class="form-label" for="f_qb_path">qB 本地保存路径</label>
+                <input type="text" class="form-input" id="f_qb_path" placeholder="留空继承全局路径，如 /volume/download/动漫">
+            </div>
+            <div class="form-group" id="rssGyTargetRow">
+                <span class="form-label" id="rssGyTargetLabel">光鸭目标目录</span>
+                <input type="hidden" id="f_gy_target">
+                <input type="hidden" id="f_gy_target_name">
+                <div class="rss-target-control"><div class="organize-target-value" id="rssGyTargetValue"><strong>继承全局目录</strong><span>未给该订阅指定独立目录</span></div><button type="button" class="jump-btn" id="pickRssTargetBtn" aria-label="选择光鸭目标目录"><i data-lucide="folder"></i>选择目录</button></div>
+            </div>
+        </div>
+        <div class="rss-modal-footer subscription-modal-footer">
+            <label class="rss-modal-enable-toggle">
+                <span class="toggle"><input type="checkbox" id="f_enabled" checked><span class="toggle-slider"></span></span>
+                <span class="rss-modal-enable-label">启用订阅</span>
+            </label>
+            <div class="rss-modal-footer-btns">
+                <button class="rss-btn" type="button" onclick="closeSubForm()">取消</button>
+                <button class="rss-btn is-primary" type="button" id="saveBtn" onclick="saveSub()">保存订阅</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 媒体订阅弹窗 -->
+<div id="mediaSubModal" class="rss-sub-modal subscription-modal" aria-hidden="true">
+    <div class="rss-sub-modal-card subscription-modal-card" role="dialog" aria-modal="true" aria-labelledby="mediaSubModalTitle">
+        <div class="rss-modal-header"><div><span class="subscription-eyebrow">MEDIA SUBSCRIPTION</span><h3 id="mediaSubModalTitle">新建媒体订阅</h3><p id="mediaSubModalHint">使用 TMDB ID 建立可靠的媒体身份。</p></div><button class="icon-btn" type="button" aria-label="关闭媒体订阅窗口" title="关闭" data-media-sub-close><i data-lucide="x"></i></button></div>
+        <form id="mediaSubForm" class="subscription-form" novalidate>
+            <input type="hidden" id="ms_subscription_id"><input type="hidden" id="ms_provider" value="tmdb"><input type="hidden" id="ms_external_id">
+            <div class="grid-2 subscription-form-grid">
+                <div class="form-group"><label class="form-label" for="ms_tmdb_id">TMDB ID</label><input class="form-input" id="ms_tmdb_id" inputmode="numeric" pattern="[0-9]{1,10}" placeholder="如 105556" required></div>
+                <div class="form-group"><label class="form-label" for="ms_media_type">媒体类型</label><select class="form-select" id="ms_media_type"><option value="tv">剧集</option><option value="movie">电影</option></select></div>
+                <div class="form-group" id="msMonitorRow"><label class="form-label" for="ms_monitor_mode">追更范围</label><select class="form-select" id="ms_monitor_mode"><option value="missing">全部已播缺集</option><option value="future">仅订阅后新播内容</option><option value="selected">指定季度</option></select></div>
+                <div class="form-group" id="msSeasonsRow"><label class="form-label" for="ms_seasons">季度</label><input class="form-input" id="ms_seasons" placeholder="如 1, 2；仅指定季度时必填"></div>
+                <div class="form-group"><label class="form-label" for="ms_action">发现资源后</label><select class="form-select" id="ms_action"><option value="confirm">保留候选，人工确认</option><option value="notify">仅通知缺失</option><option value="auto">高置信候选自动下载</option></select></div>
+                <div class="form-group"><label class="form-label" for="ms_download_target">下载目标</label><select class="form-select" id="ms_download_target"><option value="guangya">光鸭云盘</option><option value="qb">qBittorrent</option><option value="both">两者</option></select></div>
+                <div class="form-group"><label class="form-label" for="ms_sites">限定资源站</label><input class="form-input" id="ms_sites" placeholder="留空搜索全部；多个用逗号分隔"></div>
+                <div class="form-group"><label class="form-label" for="ms_interval">检查间隔</label><select class="form-select" id="ms_interval"><option value="4320" selected>每 3 天</option><option value="10080">每 7 天</option></select></div>
+            </div>
+            <section class="subscription-mapping" id="mediaMappingCandidates" aria-labelledby="mediaMappingTitle" hidden>
+                <div class="subscription-mapping-head">
+                    <div><span class="subscription-eyebrow">IDENTITY MATCH</span><strong id="mediaMappingTitle">确认对应的 TMDB 媒体</strong></div>
+                    <span id="mediaMappingCount"></span>
+                </div>
+                <div class="subscription-mapping-list" id="mediaMappingList"></div>
+            </section>
+            <div class="subscription-form-options">
+                <label class="subscription-switch" id="msSpecialsRow"><span><strong>包含 Specials</strong><small>同时监控 TMDB 第 0 季</small></span><span class="toggle"><input type="checkbox" id="ms_include_specials"><span class="toggle-slider"></span></span></label>
+                <label class="subscription-switch"><span><strong>启用订阅</strong><small>关闭后保留配置但不执行巡检</small></span><span class="toggle"><input type="checkbox" id="ms_enabled" checked><span class="toggle-slider"></span></span></label>
+            </div>
+            <div class="rss-modal-footer subscription-modal-footer"><span class="subscription-form-status" id="mediaSubFormStatus" role="status" aria-live="polite"></span><div class="rss-modal-footer-btns"><button class="rss-btn" type="button" data-media-sub-close>取消</button><button class="rss-btn is-primary" type="submit" id="mediaSubSaveBtn"><i data-lucide="save"></i><span>保存订阅</span></button></div></div>
+        </form>
+    </div>
+</div>
+
+<!-- 媒体候选弹窗 -->
+<div id="mediaCandidateModal" class="rss-sub-modal subscription-modal" aria-hidden="true">
+    <div class="rss-sub-modal-card subscription-modal-card subscription-candidate-modal-card" role="dialog" aria-modal="true" aria-labelledby="mediaCandidateTitle">
+        <div class="rss-modal-header">
+            <div>
+                <span class="subscription-eyebrow">RESOURCE CANDIDATES</span>
+                <h3 id="mediaCandidateTitle">可用资源</h3>
+                <p id="mediaCandidateHint">选择已核验的候选并提交到下载目标。</p>
+                <span class="subscription-form-status" id="mediaCandidateStatus" role="status" aria-live="polite"></span>
+            </div>
+            <button class="icon-btn" type="button" aria-label="关闭资源候选窗口" title="关闭" data-media-candidate-close><i data-lucide="x"></i></button>
+        </div>
+        <div class="subscription-candidate-list" id="mediaCandidateList"></div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+let editingId = null;
+let subscriptions = [];
+let entries = [];
+const selectedEntries = new Set();
+let rssSubsRequestId = 0;
+let rssEntriesRequestId = 0;
+let rssSelectionRevision = 0;
+let rssSubsController = null;
+let rssEntriesController = null;
+let rssBatchBusy = false;
+let rssSubsLoaded = false;
+let rssEntriesLoaded = false;
+let rssPanelLoadPromise = null;
+
+function lockRssListHeight(list){
+    if(!list)return()=>{};
+    const height=list.getBoundingClientRect().height;
+    if(height>0)list.style.minHeight=`${Math.ceil(height)}px`;
+    return()=>requestAnimationFrame(()=>requestAnimationFrame(()=>{list.style.minHeight='';}));
+}
+
+function animateRssStats(values){
+    Object.entries(values).forEach(([id,value])=>{
+        const target=document.getElementById(id);if(!target)return;
+        if(window.MFAnim)window.MFAnim.countUp(target,Number(value)||0,{duration:.6});
+        else target.textContent=String(Number(value)||0);
+    });
+}
+
+function escapeHtml(value){
+    return String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+}
+
+// Smart parser for Anime / Media title tags like [1080P], [Baha], [WEB-DL], [CHT]
+function parseEntryTitle(rawTitle) {
+    if (!rawTitle) return { mainTitle: '', tags: [] };
+    const tags = [];
+    const cleanedTitle = rawTitle.replace(/(?:\[|【)([^\]】]+)(?:\]|】)/g, (match, tag) => {
+        const trimmed = tag.trim();
+        if (trimmed && !tags.includes(trimmed)) {
+            tags.push(trimmed);
+        }
+        return ' ';
+    }).replace(/\s+/g, ' ').trim();
+
+    return {
+        mainTitle: cleanedTitle || rawTitle,
+        tags: tags.slice(0, 6)
+    };
+}
+
+function renderRssTarget(id,name){
+    document.getElementById('f_gy_target').value=id||'';
+    document.getElementById('f_gy_target_name').value=name||'';
+    const box=document.getElementById('rssGyTargetValue');box.replaceChildren();
+    const strong=document.createElement('strong');const span=document.createElement('span');
+    strong.textContent=name||'继承全局目录';span.textContent=id||'未给该订阅指定独立目录';box.append(strong,span);
+}
+
+function updateTargetRows(){
+    const method=document.getElementById('f_method').value;
+    document.getElementById('rssQbPathRow').classList.toggle('is-disabled',method==='guangya');
+    document.getElementById('f_qb_path').disabled=method==='guangya';
+    document.getElementById('rssGyTargetRow').classList.toggle('is-disabled',method==='qb');
+    document.getElementById('pickRssTargetBtn').disabled=method==='qb';
+}
+
+function api(path, opts={}){
+    return fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+}
+
+async function rssApiJSON(path,opts={}){
+    const response=await api(path,opts);
+    let payload={};
+    try{payload=await response.json();}catch(_){payload={};}
+    if(!response.ok||payload?.error)throw new Error(payload?.error||`请求失败（HTTP ${response.status}）`);
+    return payload;
+}
+
+function setRssButtonBusy(button,busy,label='处理中'){
+    if(!button)return;
+    if(busy){
+        if(!button.dataset.idleHtml)button.dataset.idleHtml=button.innerHTML;
+        if(!button.dataset.idleWidth)button.dataset.idleWidth=String(Math.ceil(button.getBoundingClientRect().width));
+        if(button.dataset.idleWidth)button.style.width=`${button.dataset.idleWidth}px`;
+        button.disabled=true;button.classList.add('is-loading');
+        button.innerHTML=`<i data-lucide="loader-circle"></i><span>${escapeHtml(label)}</span>`;
+    }else{
+        button.disabled=false;button.classList.remove('is-loading');
+        if(button.dataset.idleHtml)button.innerHTML=button.dataset.idleHtml;
+        button.style.width='';delete button.dataset.idleWidth;
+    }
+    window.renderLucideIcons?.(button);
+}
+
+function rssSkeleton(kind='runs',count=2){
+    return `<div class="subscription-skeleton-stack is-${kind}" aria-hidden="true">${Array.from({length:count},()=>`<div class="subscription-skeleton is-${kind}"><span></span><span></span><span></span></div>`).join('')}</div>`;
+}
+
+async function settleRssSkeleton(list,minimumMs=320){
+    const shownAt=Number(list?.dataset?.skeletonShownAt||0);if(!shownAt)return;
+    const wait=Math.max(0,minimumMs-(Date.now()-shownAt));if(wait)await new Promise(resolve=>window.setTimeout(resolve,wait));
+    delete list.dataset.skeletonShownAt;
+}
+
+async function updateStats(){
+    try{
+        const response=await api('/api/rss/stats');const stats=await response.json();
+        if(!response.ok)throw new Error(stats.error||'统计读取失败');
+        animateRssStats({
+            statSubTotal:stats.subscription_total||0,
+            statSubActive:stats.active_subscriptions||0,
+            statEntryTotal:stats.entry_total||0,
+            statEntryPending:stats.pending_total||0,
+        });
+        document.dispatchEvent(new CustomEvent('mediaflux:rss-stats-updated'));
+    }catch(error){console.warn('RSS 统计读取失败',error);}
+}
+
+async function loadSubs({preserve=true}={}){
+    rssSubsController?.abort();
+    const controller=new AbortController();
+    rssSubsController=controller;
+    const requestId=++rssSubsRequestId;
+    const list=document.getElementById('subList');
+    const sel=document.getElementById('filterSub');
+    const selectedValue=sel.value;
+    const hadContent=list.childElementCount>0;
+    let skeletonTimer=null;
+    if(!hadContent||!preserve){
+        skeletonTimer=window.setTimeout(()=>{
+            if(requestId!==rssSubsRequestId||list.childElementCount)return;
+            list.dataset.skeletonShownAt=String(Date.now());list.innerHTML=rssSkeleton('runs',2);
+        },320);
+    }
+    try{
+        const response=await api('/api/rss/subscriptions',{signal:controller.signal});
+        const payload=await response.json();
+        if(!response.ok)throw new Error(payload.error||'订阅源读取失败');
+        if(requestId!==rssSubsRequestId)return;
+        await settleRssSkeleton(list);if(requestId!==rssSubsRequestId)return;
+        const rows=Array.isArray(payload)?payload:[];
+        subscriptions=rows;
+        rssSubsLoaded=true;
+        const releaseHeight=preserve&&hadContent?lockRssListHeight(list):()=>{};
+        sel.replaceChildren(new Option('全部订阅源',''));
+        rows.forEach(s=>sel.appendChild(new Option(s.name||`订阅源 #${s.id}`,String(s.id))));
+        if([...sel.options].some(option=>option.value===selectedValue))sel.value=selectedValue;
+
+        if(!rows.length){
+            list.innerHTML='<div class="subscription-empty"><span class="subscription-empty-icon"><i data-lucide="rss"></i></span><strong>暂无 RSS 订阅</strong><span>新建订阅源后，抓取条目会汇入同一订阅中心。</span></div>';
+            window.renderLucideIcons?.(list);
+            updateStats();
+            releaseHeight();
+            return;
+        }
+
+        list.innerHTML=rows.map(s=>{
+            const urls=(s.urls||'').split('\n').filter(Boolean);
+            const en=Boolean(s.enabled);
+            const targetText=s.download_method==='qb'?'qBittorrent':(s.download_method==='guangya'?'光鸭云盘':'继承全局');
+            const intervalText=s.refresh_interval_minutes?`每 ${s.refresh_interval_minutes} 分钟`:'手动刷新';
+            const actionText=s.action==='download'?'自动离线':'仅订阅';
+            return `<div class="rss-sub-card">
+                <div class="rss-sub-header-row">
+                    <div class="rss-sub-left">
+                        <div class="rss-sub-avatar ${en?'':'is-disabled'}"><i data-lucide="rss"></i></div>
+                        <div class="rss-sub-details"><div class="rss-sub-title-row"><span class="rss-sub-title">${escapeHtml(s.name)}</span>${en?'<span class="rss-badge rss-badge-success"><i data-lucide="check-circle-2"></i> 已启用</span>':'<span class="rss-badge rss-badge-muted"><i data-lucide="pause-circle"></i> 已停用</span>'}</div></div>
+                    </div>
+                    <div class="rss-sub-actions">
+                        <button type="button" class="rss-btn" onclick="refreshSub(${s.id},this)" title="刷新订阅"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+                        <button type="button" class="rss-btn" onclick="autoDl(${s.id},this)" title="刷新并自动下载"><i data-lucide="zap"></i><span>自动下载</span></button>
+                        <button type="button" class="rss-btn rss-sub-toggle ${en?'':'is-enable'}" onclick="toggleSub(${s.id},${en},this)" title="${en?'暂停定时刷新':'启用定时刷新'}" aria-label="${en?'暂停定时刷新':'启用定时刷新'}"><i data-lucide="${en?'pause':'play'}"></i><span>${en?'暂停':'启用'}</span></button>
+                        <button type="button" class="rss-btn" onclick="editSub(${s.id},this)" title="编辑订阅"><i data-lucide="edit"></i><span>编辑</span></button>
+                        <button type="button" class="rss-btn is-danger" onclick="delSub(${s.id},this)" title="删除订阅" aria-label="删除订阅"><i data-lucide="trash-2"></i></button>
+                    </div>
+                </div>
+                <div class="rss-sub-body-row">
+                    <div class="rss-sub-url-inline"><i data-lucide="link"></i><span>${escapeHtml(urls[0]||'')}</span>${urls.length>1?`<span class="url-count-badge">+${urls.length-1} 个源</span>`:''}</div>
+                    <div class="rss-sub-meta-group">
+                        <span class="rss-meta-pill" title="刷新间隔"><i data-lucide="clock"></i> ${intervalText}</span>
+                        <span class="rss-meta-pill" title="下载器"><i data-lucide="download"></i> ${targetText}</span>
+                        <span class="rss-meta-pill" title="策略"><i data-lucide="zap"></i> ${actionText}</span>
+                        ${s.exclude_keywords?`<span class="rss-meta-pill is-warning" title="排除词"><i data-lucide="filter"></i> 排除: ${escapeHtml(s.exclude_keywords)}</span>`:''}
+                        ${s.skip_existing_episodes&&s.media_tmdb_id?`<span class="rss-meta-pill is-library" title="按 TMDB 精确过滤已有剧集"><i data-lucide="library-big"></i> TMDB ${escapeHtml(s.media_tmdb_id)} · S${String(s.media_default_season??1).padStart(2,'0')}</span>`:''}
+                    </div>
+                </div>
+            </div>`;
+        }).join('');
+        window.renderLucideIcons?.(list);
+        updateStats();
+        releaseHeight();
+    }catch(error){
+        if(error.name==='AbortError'||requestId!==rssSubsRequestId)return;
+        if(!hadContent||!preserve){
+            await settleRssSkeleton(list);if(requestId!==rssSubsRequestId)return;
+            list.innerHTML=`<div class="subscription-empty is-error"><span class="subscription-empty-icon"><i data-lucide="triangle-alert"></i></span><strong>订阅源读取失败</strong><span>${escapeHtml(error.message||'请稍后重试')}</span><button type="button" class="jump-btn" onclick="loadSubs({preserve:false})"><i data-lucide="refresh-cw"></i>重新读取</button></div>`;
+            window.renderLucideIcons?.(list);
+        }else{
+            appAlert?.({type:'error',title:'RSS 订阅读取失败',message:error.message||'请求失败'});
+        }
+    }finally{
+        if(skeletonTimer)window.clearTimeout(skeletonTimer);
+        if(rssSubsController===controller)rssSubsController=null;
+    }
+}
+
+function openSubForm(id,trigger){
+    editingId = id||null;
+    document.getElementById('modalTitle').textContent = id?'编辑订阅源':'新建订阅源';
+    document.getElementById('f_name').value='';
+    document.getElementById('f_urls').value='';
+    document.getElementById('f_exclude').value='';
+    document.getElementById('f_action').value='subscribe';
+    document.getElementById('f_interval').value='0';
+    document.getElementById('f_method').value='';
+    document.getElementById('f_qb_path').value='';
+    renderRssTarget('','');
+    document.getElementById('f_enabled').checked=true;
+    if(id){
+        const s=subscriptions.find(x=>x.id===id);
+        if(s){
+            document.getElementById('f_name').value=s.name;
+            document.getElementById('f_urls').value=s.urls;
+            document.getElementById('f_exclude').value=s.exclude_keywords||'';
+            document.getElementById('f_action').value=s.action;
+            document.getElementById('f_interval').value=String(s.refresh_interval_minutes||0);
+            document.getElementById('f_method').value=s.download_method||'';
+            document.getElementById('f_qb_path').value=s.qb_save_path||'';
+            renderRssTarget(s.gy_target_dir||'',s.gy_target_dir_name||'');
+            document.getElementById('f_enabled').checked=s.enabled;
+        }
+    }
+    updateTargetRows();
+    const modal=document.getElementById('subModal');
+    if(window.openSubscriptionModal)window.openSubscriptionModal(modal,trigger||document.activeElement);
+    else{modal.style.display='flex';modal.setAttribute('aria-hidden','false');document.body.classList.add('subscription-modal-open');}
+}
+function closeSubForm(){
+    const modal=document.getElementById('subModal');
+    if(window.closeSubscriptionModal)window.closeSubscriptionModal(modal);
+    else{modal.style.display='none';modal.setAttribute('aria-hidden','true');document.body.classList.remove('subscription-modal-open');}
+}
+
+function editSub(id,trigger){ openSubForm(id,trigger); }
+
+async function saveSub(){
+    const name = document.getElementById('f_name').value.trim();
+    const urls = document.getElementById('f_urls').value.trim();
+    if(!name||!urls){
+        const missing=!name?document.getElementById('f_name'):document.getElementById('f_urls');
+        missing.focus();
+        appAlert({type:'warning',title:'订阅信息不完整',message:'名称和 RSS URL 都是必填项。',trigger:missing});
+        return;
+    }
+    const body = {
+        name, urls,
+        exclude_keywords: document.getElementById('f_exclude').value.trim(),
+        action: document.getElementById('f_action').value,
+        refresh_interval_minutes: parseInt(document.getElementById('f_interval').value||0),
+        download_method: document.getElementById('f_method').value,
+        qb_save_path: document.getElementById('f_qb_path').value.trim(),
+        gy_target_dir: document.getElementById('f_gy_target').value,
+        gy_target_dir_name: document.getElementById('f_gy_target_name').value,
+        enabled: document.getElementById('f_enabled').checked,
+    };
+    const btn = document.getElementById('saveBtn');
+    if(btn.disabled)return;
+    setRssButtonBusy(btn,true,'保存中');
+    try{
+        await rssApiJSON(editingId?'/api/rss/subscriptions/'+editingId:'/api/rss/subscriptions',{method:editingId?'PUT':'POST',body:JSON.stringify(body)});
+        closeSubForm();await loadSubs();
+    }catch(error){await appAlert({type:'error',title:'订阅保存失败',message:error.message||'请求失败，请检查网络和服务状态。'});}
+    finally{setRssButtonBusy(btn,false);}
+}
+
+async function delSub(id,trigger){
+    const confirmed=await appConfirm({title:'删除 RSS 订阅',message:'将删除该订阅及其本地条目记录，不会删除已经提交的下载任务或媒体文件。',confirmText:'删除订阅',danger:true});if(!confirmed)return;
+    if(trigger?.disabled)return;setRssButtonBusy(trigger,true,'删除中');
+    try{
+        await rssApiJSON('/api/rss/subscriptions/'+id,{method:'DELETE'});
+        await loadSubs();
+        await loadEntries();
+    }
+    catch(error){await appAlert({type:'error',title:'删除订阅失败',message:error.message||'请求失败'});}
+    finally{setRssButtonBusy(trigger,false);}
+}
+
+async function toggleSub(id,enabled,trigger){
+    if(trigger?.disabled)return;
+    const nextEnabled=!enabled;
+    setRssButtonBusy(trigger,true,nextEnabled?'启用中':'暂停中');
+    try{
+        await rssApiJSON('/api/rss/subscriptions/'+id,{method:'PUT',body:JSON.stringify({enabled:nextEnabled})});
+        await loadSubs({preserve:true});
+    }catch(error){
+        await appAlert({type:'error',title:nextEnabled?'启用订阅失败':'暂停订阅失败',message:error.message||'请求失败，请检查网络和服务状态。'});
+    }finally{
+        setRssButtonBusy(trigger,false);
+    }
+}
+
+async function refreshSub(id,trigger){
+    if(trigger?.disabled)return;setRssButtonBusy(trigger,true,'刷新中');
+    try{
+        const d=await rssApiJSON('/api/rss/subscriptions/'+id+'/refresh',{method:'POST'});
+        const s=d.stats;
+        const librarySkipped=Number(s.library_skipped)||0;const duplicates=Number(s.semantic_duplicates)||0;const unresolved=Number(s.identity_unresolved)||0;const bindingBypassed=Boolean(s.media_binding_bypassed);
+        const bypassReason=String(s.binding_bypass_reason||'');
+        const bypassDetail=bypassReason==='mixed_feed'
+            ?`检测到 ${Number(s.detected_series_count)||2} 个剧目，已跳过 TMDB 绑定和已有剧集过滤`
+            :'无法确认所有条目属于同一剧目，已保留条目并跳过 TMDB 绑定和已有剧集过滤';
+        const libraryUnavailable=s.library_check&&Number(s.library_check.ready||0)===0;
+        const details=[];if(librarySkipped||duplicates)details.push(`媒体库已有 ${librarySkipped} 条 · 语义重复 ${duplicates} 条`);if(unresolved)details.push(`${unresolved} 条未解析出明确集号，已保留`);if(bindingBypassed)details.push(bypassDetail);if(libraryUnavailable)details.push('媒体服务器暂不可核对，本次未按库存过滤');
+        const warning=bindingBypassed||libraryUnavailable;
+        await appAlert({type:warning?'warning':'success',title:bindingBypassed?'订阅已刷新，已有剧集过滤已跳过':libraryUnavailable?'订阅已刷新，库存核对未完成':'订阅刷新完成',message:`拉取 ${s.total} 条\n新增 ${s.new} 条\n排除 ${s.skipped} 条${details.length?'\n'+details.join('\n'):''}`});
+        await loadEntries();
+    }catch(error){await appAlert({type:'error',title:'订阅刷新失败',message:error.message||'请求失败，请检查网络和服务状态。'});}
+    finally{setRssButtonBusy(trigger,false);}
+}
+
+async function autoDl(id,trigger){
+    const confirmed=await appConfirm({title:'自动下载待处理条目',message:'将刷新订阅，并把全部符合规则的待处理条目提交到已配置的下载后端。',confirmText:'刷新并下载'});if(!confirmed)return;
+    if(trigger?.disabled)return;setRssButtonBusy(trigger,true,'处理中');
+    try{
+        const d=await rssApiJSON('/api/rss/subscriptions/'+id+'/auto',{method:'POST'});
+        const r=d.result;
+        const added=Number(r.downloaded)||0;
+        const existing=Number(r.existing)||0;
+        const unverified=Number(r.unverified)||0;
+        const failed=Number(r.failed)||0;
+        const outcomeUnknown=Number(r.outcome_unknown_count)||0;
+        const libraryUnavailable=r.refresh.library_check&&Number(r.refresh.library_check.ready||0)===0;
+        const bindingBypassed=Boolean(r.refresh.media_binding_bypassed);
+        const bypassDetail=String(r.refresh.binding_bypass_reason||'')==='mixed_feed'
+            ?`检测到 ${Number(r.refresh.detected_series_count)||2} 个剧目，已跳过 TMDB 绑定和已有剧集过滤`
+            :'无法确认所有条目属于同一剧目，已保留条目并跳过 TMDB 绑定和已有剧集过滤';
+        const warning=failed>0||outcomeUnknown>0||unverified>0||libraryUnavailable||bindingBypassed;
+        const filtered=Number(r.refresh.library_skipped||0)+Number(r.refresh.semantic_duplicates||0);
+        await appAlert({
+            type:failed&&(added+existing+unverified===0)?'error':warning?'warning':'success',
+            title:outcomeUnknown?'自动下载结果待核对':failed?'自动下载部分失败':bindingBypassed?'自动下载完成，已有剧集过滤已跳过':libraryUnavailable?'自动下载完成，库存核对未完成':unverified?'自动下载待核验':'自动下载完成',
+            message:`刷新：拉取 ${r.refresh.total} 条，新增 ${r.refresh.new} 条${filtered?`，精确过滤 ${filtered} 条`:''}\n下载：新增提交 ${added} 条 · qB 已存在 ${existing} 条 · 待核验 ${unverified} 条 · 失败 ${failed} 条${outcomeUnknown?`\n其中 ${outcomeUnknown} 条提交结果未知，请先检查下载器状态，勿直接重复提交`:''}${bindingBypassed?`\n${bypassDetail}`:libraryUnavailable?'\n媒体服务器暂不可核对，本次未按库存过滤':''}`
+        });
+        await loadEntries();
+    }catch(error){await appAlert({type:'error',title:'自动下载失败',message:error.message||'请求失败，请检查网络和服务状态。'});}
+    finally{setRssButtonBusy(trigger,false);}
+}
+
+function updateBatchbar(){
+    const count=selectedEntries.size;
+    document.getElementById('rssSelectedCount').textContent=`已选择 ${count} 条`;
+    ['batchDownloadBtn','batchProcessedBtn','batchPendingBtn'].forEach(id=>document.getElementById(id).disabled=!count||rssBatchBusy);
+    const checkAll=document.getElementById('entryCheckAll');
+    checkAll.checked=entries.length>0&&entries.every(e=>selectedEntries.has(e.id));
+    checkAll.indeterminate=count>0&&!checkAll.checked;
+}
+
+function toggleEntry(id,checked){
+    if(checked)selectedEntries.add(id);else selectedEntries.delete(id);
+    rssSelectionRevision+=1;
+    updateBatchbar();
+}
+
+async function loadEntries({preserve=true}={}){
+    rssEntriesController?.abort();
+    const controller=new AbortController();
+    rssEntriesController=controller;
+    const requestId=++rssEntriesRequestId;
+    const selectionRevisionAtStart=rssSelectionRevision;
+    const sid=document.getElementById('filterSub').value;
+    const st=document.getElementById('filterStatus').value;
+    const keyword=document.getElementById('filterKeyword').value.trim();
+    const params=[];
+    if(sid)params.push('subscription_id='+encodeURIComponent(sid));
+    if(st)params.push('status='+encodeURIComponent(st));
+    if(keyword)params.push('q='+encodeURIComponent(keyword));
+    const list=document.getElementById('entryList');
+    const refreshButton=document.getElementById('refreshRssEntries');
+    setRssButtonBusy(refreshButton,true,'刷新');
+    list.setAttribute('aria-busy','true');
+    const hadContent=list.childElementCount>0;
+    let skeletonTimer=null;
+    if(!hadContent||!preserve){
+        skeletonTimer=window.setTimeout(()=>{
+            if(requestId!==rssEntriesRequestId||list.childElementCount)return;
+            list.dataset.skeletonShownAt=String(Date.now());list.innerHTML=rssSkeleton('runs',3);
+        },320);
+    }
+    try{
+        const response=await api('/api/rss/entries'+(params.length?('?'+params.join('&')):''),{signal:controller.signal});
+        const payload=await response.json();
+        if(!response.ok)throw new Error(payload.error||'订阅条目读取失败');
+        if(requestId!==rssEntriesRequestId)return;
+        await settleRssSkeleton(list);if(requestId!==rssEntriesRequestId)return;
+        const rows=Array.isArray(payload)?payload:[];
+        entries=rows;
+        rssEntriesLoaded=true;
+        const releaseHeight=preserve&&hadContent?lockRssListHeight(list):()=>{};
+        if(selectionRevisionAtStart===rssSelectionRevision){
+            selectedEntries.clear();
+        }else{
+            const visibleIds=new Set(rows.map(item=>Number(item.id)));
+            [...selectedEntries].forEach(id=>{if(!visibleIds.has(Number(id)))selectedEntries.delete(id);});
+        }
+        updateBatchbar();
+        updateStats();
+        if(!rows.length){
+            list.innerHTML='<div class="subscription-empty"><span class="subscription-empty-icon"><i data-lucide="inbox"></i></span><strong>暂无匹配条目</strong><span>调整订阅源、状态或关键词后重新筛选。</span></div>';
+            window.renderLucideIcons?.(list);
+            releaseHeight();
+            return;
+        }
+        list.innerHTML=rows.map(e=>{
+            const statusMap={
+                pending:{icon:'clock',class:'status-pending',text:'待处理'},
+                submitting:{icon:'loader',class:'status-submitting',text:'提交中'},
+                downloaded:{icon:'check-circle-2',class:'status-downloaded',text:'已处理'},
+                failed:{icon:'alert-circle',class:'status-failed',text:'失败'},
+                skipped:{icon:'minus-circle',class:'status-skipped',text:e.skip_reason?'自动跳过':'手动已处理'}
+            };
+            const stInfo=statusMap[e.status]||{icon:'help-circle',class:'status-skipped',text:e.status};
+            const parsed=parseEntryTitle(e.title);
+            return `<article class="rss-entry-card">
+                <label class="rss-entry-check" title="选择条目"><input type="checkbox" data-entry-check="${e.id}" ${selectedEntries.has(Number(e.id))?'checked':''}></label>
+                <div class="rss-status-badge ${stInfo.class}" title="${escapeHtml(stInfo.text)}"><i data-lucide="${stInfo.icon}"></i></div>
+                <div class="rss-entry-body">
+                    <div class="rss-entry-title-row"><span class="rss-entry-title-text">${escapeHtml(parsed.mainTitle)}</span>${parsed.tags.length?`<div class="rss-tag-group">${parsed.tags.map(t=>`<span class="rss-tag">${escapeHtml(t)}</span>`).join('')}</div>`:''}</div>
+                    <div class="rss-entry-meta"><span class="meta-item"><i data-lucide="rss"></i> ${escapeHtml(e.sub_name||'未知订阅源')}</span><span class="meta-sep">•</span><span class="meta-item"><i data-lucide="calendar"></i> ${escapeHtml(e.pub_date||'未知时间')}</span>${e.media_episode?`<span class="meta-sep">•</span><span class="meta-item"><i data-lucide="scan-search"></i> S${String(e.media_season).padStart(2,'0')}E${String(e.media_episode).padStart(2,'0')}</span>`:''}${e.skip_reason?`<span class="rss-entry-skip-reason"><i data-lucide="shield-check"></i>${escapeHtml(e.skip_reason)}</span>`:''}</div>
+                </div>
+                <div class="rss-entry-actions">${e.processed?'<div class="rss-icon-done-badge" title="已完成处理"><i data-lucide="check-check"></i></div>':`<button class="rss-btn" style="background:var(--accent);color:var(--on-accent);border-color:var(--accent);" type="button" onclick="dlEntry(${e.id},this)"><i data-lucide="download"></i><span>下载</span></button>`}</div>
+            </article>`;
+        }).join('');
+        window.renderLucideIcons?.(list);
+        list.querySelectorAll('[data-entry-check]').forEach(input=>input.addEventListener('change',()=>toggleEntry(Number(input.dataset.entryCheck),input.checked)));
+        releaseHeight();
+    }catch(error){
+        if(error.name==='AbortError'||requestId!==rssEntriesRequestId)return;
+        if(!hadContent||!preserve){
+            await settleRssSkeleton(list);if(requestId!==rssEntriesRequestId)return;
+            list.innerHTML=`<div class="subscription-empty is-error"><span class="subscription-empty-icon"><i data-lucide="triangle-alert"></i></span><strong>条目读取失败</strong><span>${escapeHtml(error.message||'请稍后重试')}</span><button type="button" class="jump-btn" onclick="loadEntries({preserve:false})"><i data-lucide="refresh-cw"></i>重新读取</button></div>`;
+            window.renderLucideIcons?.(list);
+        }else{
+            appAlert?.({type:'error',title:'RSS 条目读取失败',message:error.message||'请求失败'});
+        }
+    }finally{
+        if(skeletonTimer)window.clearTimeout(skeletonTimer);
+        if(rssEntriesController===controller)rssEntriesController=null;
+        if(requestId===rssEntriesRequestId){setRssButtonBusy(refreshButton,false);list.setAttribute('aria-busy','false');}
+    }
+}
+
+async function batchRequest(path,body,confirmText,trigger){
+    const ids=[...selectedEntries];
+    if(!ids.length)return;
+    if(rssBatchBusy)return;
+    rssBatchBusy=true;setRssButtonBusy(trigger,true,'处理中');updateBatchbar();
+    try{
+        if(confirmText){const confirmed=await appConfirm({title:'确认批量操作',message:confirmText.replace('{count}',ids.length),confirmText:'继续'});if(!confirmed)return;}
+        return await rssApiJSON(path,{method:'POST',body:JSON.stringify({...body,entry_ids:ids})});
+    }finally{rssBatchBusy=false;setRssButtonBusy(trigger,false);updateBatchbar();}
+}
+
+async function batchDownload(trigger){
+    try{
+        const data=await batchRequest('/api/rss/entries/batch-download',{},'确认批量下载选中的 {count} 个条目？',trigger);
+        if(!data)return;
+        const result=data.result||{};
+        const success=Number(result.success_count)||0;
+        const existing=Number(result.existing_count)||0;
+        const unverified=Number(result.unverified_count)||0;
+        const failed=Number(result.failure_count)||0;
+        const handled=success+existing+unverified;
+        await appAlert({
+            type:failed&&!handled?'error':failed||unverified?'warning':'success',
+            title:failed?'批量提交部分失败':unverified?'批量提交待核验':'批量提交完成',
+            message:`新增提交 ${success} 条\nqB 已存在 ${existing} 条\n待核验 ${unverified} 条\n失败 ${failed} 条`
+        });
+        loadEntries();
+    }catch(error){await appAlert({type:'error',title:'批量提交失败',message:error.message||'请求失败'});}
+}
+async function batchMark(processed,trigger){
+    try{
+        const data=await batchRequest('/api/rss/entries/mark',{processed},processed?'确认将选中的 {count} 个条目标记为已处理？':'确认将选中的 {count} 个条目标记为未处理？',trigger);
+        if(!data)return;
+        await appAlert({type:'success',title:'条目状态已更新',message:`已更新 ${data.updated} 个条目。`});
+        loadEntries();
+    }catch(error){await appAlert({type:'error',title:'批量更新失败',message:error.message||'请求失败'});}
+}
+
+async function dlEntry(id,trigger){
+    if(trigger?.disabled)return;setRssButtonBusy(trigger,true,'提交中');
+    try{
+        const d=await rssApiJSON('/api/rss/entries/'+id+'/download',{method:'POST'});
+        const result=d.result||{};
+        const ok=Boolean(result.ok);
+        const existing=Boolean(result.existing);
+        const unverified=Boolean(result.unverified);
+        await appAlert({
+            type:ok?(unverified?'warning':'success'):'error',
+            title:existing?'qB 任务已存在':unverified?'提交成功，等待核验':ok?'下载已提交':'下载提交失败',
+            message:existing?'相同种子已经在 qB 中，本次未重复添加。':unverified?'下载请求已发送，但当前链接无法提取 infohash，请在 qB 中确认。':ok?'条目已推送到下载后端。':'请检查下载器配置和连接状态。'
+        });
+        await loadEntries();
+    }catch(error){await appAlert({type:'error',title:'下载提交失败',message:error.message||'请求失败，请检查网络和服务状态。'});}
+    finally{setRssButtonBusy(trigger,false);}
+}
+
+document.getElementById('f_method').addEventListener('change',updateTargetRows);
+document.getElementById('pickRssTargetBtn').addEventListener('click',()=>openGuangYaDirectoryPicker({modalId:'rssTargetModal',title:'选择 RSS 光鸭目标目录',onSelect:dir=>renderRssTarget(dir.id,dir.name)}));
+document.getElementById('entryCheckAll').addEventListener('change',event=>{
+    if(event.target.checked)entries.forEach(e=>selectedEntries.add(e.id));else selectedEntries.clear();
+    rssSelectionRevision+=1;
+    document.querySelectorAll('[data-entry-check]').forEach(input=>{input.checked=event.target.checked;});updateBatchbar();
+});
+document.getElementById('batchDownloadBtn').addEventListener('click',event=>batchDownload(event.currentTarget));
+document.getElementById('batchProcessedBtn').addEventListener('click',event=>batchMark(true,event.currentTarget));
+document.getElementById('batchPendingBtn').addEventListener('click',event=>batchMark(false,event.currentTarget));
+
+const subModal=document.getElementById('subModal');
+if(subModal&&subModal.parentElement!==document.body)document.body.appendChild(subModal);
+subModal?.addEventListener('click',event=>{if(event.target===subModal)closeSubForm();});
+
+window.ensureRssPanelLoaded=()=>{
+    if(rssSubsLoaded&&rssEntriesLoaded)return Promise.resolve();
+    if(rssPanelLoadPromise)return rssPanelLoadPromise;
+    rssPanelLoadPromise=Promise.all([
+        rssSubsLoaded?Promise.resolve():loadSubs({preserve:false}),
+        rssEntriesLoaded?Promise.resolve():loadEntries({preserve:false}),
+    ]).finally(()=>{rssPanelLoadPromise=null;});
+    return rssPanelLoadPromise;
+};
+</script>
+<script src="/static/js/subscriptions.js?v=20260820b"></script>
+{% endblock %}

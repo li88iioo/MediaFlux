@@ -1,0 +1,382 @@
+{% extends "base.html" %}
+{% block title %}离线转存 - MediaFlux{% endblock %}
+{% block page_title %}光鸭离线转存{% endblock %}
+{% block body_class %}persistent-savebar-page{% endblock %}
+{% block content %}
+<section class="standalone-settings offline-settings-shell" id="offlineForm">
+    <div class="offline-settings-grid">
+        <div class="settings-section offline-settings-section">
+            <div class="offline-card-head">
+                <h3><i data-lucide="shield-check"></i>协议与过滤</h3>
+                <span class="offline-card-tag">AUTO FILTER</span>
+            </div>
+            <p class="desc">Telegram Bot 收到磁力、ED2K 或 BT 种子后，将按扩展名、体积和排除词自动筛选并提交到光鸭。</p>
+            <div class="offline-protocol-grid">
+                <div class="offline-protocol-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title offline-protocol-title">
+                            <div class="organize-toggle-icon"><i data-lucide="magnet"></i></div>
+                            <div class="offline-protocol-copy">
+                                <label for="offlineMagnetEnabled">允许磁力链接</label>
+                            </div>
+                        </div>
+                        <label class="toggle">
+                            <input id="offlineMagnetEnabled" type="checkbox" data-key="OFFLINE_MAGNET_ENABLED" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="offline-protocol-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title offline-protocol-title">
+                            <div class="organize-toggle-icon"><i data-lucide="link-2"></i></div>
+                            <div class="offline-protocol-copy">
+                                <label for="offlineEd2kEnabled">允许 ED2K</label>
+                            </div>
+                        </div>
+                        <label class="toggle">
+                            <input id="offlineEd2kEnabled" type="checkbox" data-key="OFFLINE_ED2K_ENABLED" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="offline-protocol-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title offline-protocol-title">
+                            <div class="organize-toggle-icon"><i data-lucide="globe"></i></div>
+                            <div class="offline-protocol-copy">
+                                <label for="offlineHttpEnabled">允许 HTTP(S)</label>
+                            </div>
+                        </div>
+                        <label class="toggle">
+                            <input id="offlineHttpEnabled" type="checkbox" data-key="OFFLINE_HTTP_ENABLED">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="offline-protocol-card offline-protocol-card--fallback organize-toggle-tile">
+                    <div class="offline-protocol-copy offline-protocol-fallback-copy">
+                        <label for="offlineMagnetFallback">磁力解析失败自动隔离</label>
+                        <div class="offline-protocol-hint">无法取得文件树时，仅允许自动任务整单进入独立目录；默认开启，可手动关闭</div>
+                    </div>
+                    <label class="toggle">
+                        <input id="offlineMagnetFallback" type="checkbox" data-key="OFFLINE_MAGNET_UNVERIFIED_FALLBACK" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+            </div>
+            <div class="form-row offline-textarea-row">
+                <div class="field-label">
+                    <div class="name">排除词</div>
+                    <div class="hint">链接或文件名匹配时自动排除；按 Enter 或逗号生成标签</div>
+                </div>
+                <div class="field-control">
+                    <input type="hidden" data-key="OFFLINE_EXCLUDE_KEYWORDS" id="offlineExcludeKeywords">
+                    <div class="offline-tag-input-box" id="offlineExcludeTagBox">
+                        <div class="offline-tag-list"></div>
+                        <input type="text" class="offline-tag-field" id="offlineExcludeTagField" placeholder="输入排除词按 Enter 添加...">
+                    </div>
+                    <div class="offline-preset-chips" id="offlinePresetChips">
+                        <span class="chip-label">常用快捷填入:</span>
+                        <button type="button" class="tag-chip" data-chip="CAM">CAM</button>
+                        <button type="button" class="tag-chip" data-chip="TS抢先">TS抢先</button>
+                        <button type="button" class="tag-chip" data-chip="sample">sample</button>
+                        <button type="button" class="tag-chip" data-chip="预览版">预览版</button>
+                    </div>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="field-label">
+                    <div class="name">最小文件 (MB)</div>
+                    <div class="hint">小于此体积的文件自动排除</div>
+                </div>
+                <div class="field-control">
+                    <input type="number" min="0" class="form-input" data-key="OFFLINE_MIN_FILE_MB" id="offlineMinFileMb" value="0">
+                </div>
+            </div>
+            <div class="form-row offline-textarea-row">
+                <div class="field-label">
+                    <div class="name">允许扩展名</div>
+                    <div class="hint">当前生效的默认媒体类型已展开；按 Enter 或逗号添加，点击标签可删除</div>
+                </div>
+                <div class="field-control">
+                    <input type="hidden" data-key="OFFLINE_ALLOWED_EXTS" id="offlineAllowedExts">
+                    <div class="offline-tag-input-box" id="offlineAllowedExtsTagBox">
+                        <div class="offline-tag-list"></div>
+                        <input type="text" class="offline-tag-field" id="offlineAllowedExtsTagField" placeholder="输入扩展名 (如 mkv) 按 Enter 添加...">
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="settings-section offline-settings-section">
+            <div class="offline-card-head">
+                <h3><i data-lucide="folders"></i>保存目录与分流</h3>
+                <span class="offline-card-tag">DIRECTORY ROUTING</span>
+            </div>
+            <p class="desc">Telegram 自动下载会按照默认目录和关键词分流规则保存到光鸭。</p>
+            <div class="form-row">
+                <div class="field-label">
+                    <div class="name">默认保存目录</div>
+                    <div class="hint">未命中二次分流时使用</div>
+                </div>
+                <div class="field-control offline-dir-control">
+                    <input type="hidden" data-key="OFFLINE_TARGET_DIR" id="offlineTargetDir">
+                    <input type="hidden" data-key="OFFLINE_TARGET_DIR_NAME" id="offlineTargetDirName">
+                    <div class="offline-dir-value" id="offlineTargetDirValue">未选择</div>
+                    <button type="button" class="jump-btn" data-offline-dir="primary"><i data-lucide="folder-search"></i>选择目录</button>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="field-label">
+                    <div class="name">启用二次分流</div>
+                    <div class="hint">关键词命中时改存到另一个目录</div>
+                </div>
+                <div class="field-control">
+                    <label class="toggle"><input type="checkbox" data-key="OFFLINE_SECONDARY_ENABLED" id="offlineSecondaryEnabled"><span class="toggle-slider"></span></label>
+                </div>
+            </div>
+            <div id="offlineSecondaryRows" class="offline-secondary-block">
+                <div class="form-row">
+                    <div class="field-label">
+                        <div class="name">二次分流目录</div>
+                        <div class="hint">关键词命中时使用</div>
+                    </div>
+                    <div class="field-control offline-dir-control">
+                        <input type="hidden" data-key="OFFLINE_SECONDARY_DIR" id="offlineSecondaryDir">
+                        <input type="hidden" data-key="OFFLINE_SECONDARY_DIR_NAME" id="offlineSecondaryDirName">
+                        <div class="offline-dir-value" id="offlineSecondaryDirValue">未选择</div>
+                        <button type="button" class="jump-btn" data-offline-dir="secondary"><i data-lucide="folder-search"></i>选择目录</button>
+                    </div>
+                </div>
+                <div class="form-row offline-textarea-row">
+                    <div class="field-label">
+                        <div class="name">分流关键词</div>
+                        <div class="hint">按 Enter 或逗号生成标签</div>
+                    </div>
+                    <div class="field-control">
+                        <input type="hidden" data-key="OFFLINE_SECONDARY_KEYWORDS" id="offlineSecondaryKeywords">
+                        <div class="offline-tag-input-box" id="offlineSecondaryTagBox">
+                            <div class="offline-tag-list"></div>
+                            <input type="text" class="offline-tag-field" id="offlineSecondaryTagField" placeholder="输入分流词按 Enter 添加...">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="settings-savebar workspace-savebar">
+        <span id="offlineSaveState" aria-live="polite">尚未修改</span>
+        <button type="button" class="btn btn-primary" id="saveOfflineBtn"><i data-lucide="save"></i>保存离线转存设置</button>
+    </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+(function(){
+    const form=document.getElementById('offlineForm');
+    const secondary=document.getElementById('offlineSecondaryEnabled');
+    const secondaryRows=document.getElementById('offlineSecondaryRows');
+    const saveButton=document.getElementById('saveOfflineBtn');
+    const saveState=document.getElementById('offlineSaveState');
+    const excludeInput=document.getElementById('offlineExcludeKeywords');
+    const secondaryKeywordsInput=document.getElementById('offlineSecondaryKeywords');
+    let busy=true;
+    const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+
+    function initTagInput(boxEl, hiddenInputEl, options={}){
+        const listEl=boxEl.querySelector('.offline-tag-list');
+        const inputEl=boxEl.querySelector('.offline-tag-field');
+        const badgeClass=options.badgeClass||'';
+        let tags=[];
+
+        function syncHidden(){
+            hiddenInputEl.value=tags.join(', ');
+            if(typeof options.onChange === 'function') options.onChange(tags);
+        }
+        function renderTags(){
+            listEl.innerHTML='';
+            tags.forEach((tag,idx)=>{
+                const badge=document.createElement('span');
+                badge.className='tag-chip-badge'+(badgeClass?' '+badgeClass:'');
+                badge.textContent=tag+' ';
+                const btn=document.createElement('button');
+                btn.type='button';
+                btn.className='tag-chip-remove';
+                btn.setAttribute('aria-label',`删除 ${tag}`);
+                btn.innerHTML='&times;';
+                btn.addEventListener('click',e=>{
+                    e.stopPropagation();
+                    removeTag(idx);
+                });
+                badge.appendChild(btn);
+                listEl.appendChild(badge);
+            });
+            syncHidden();
+        }
+        function addTags(rawText){
+            if(!rawText)return;
+            const items=String(rawText).split(/[,，\r\n]+/).map(s=>s.trim()).filter(Boolean);
+            let added=false;
+            items.forEach(item=>{
+                if(item && !tags.includes(item)){
+                    tags.push(item);
+                    added=true;
+                }
+            });
+            if(added) renderTags();
+        }
+        function removeTag(index){
+            if(index>=0 && index<tags.length){
+                tags.splice(index,1);
+                renderTags();
+            }
+        }
+        function setTagsFromString(rawText){
+            tags=(rawText||'').split(/[,，\r\n]+/).map(s=>s.trim()).filter(Boolean);
+            renderTags();
+        }
+
+        boxEl.addEventListener('click',e=>{
+            if(e.target!==inputEl && !e.target.closest('.tag-chip-remove')){
+                inputEl.focus();
+            }
+        });
+        inputEl.addEventListener('keydown',e=>{
+            if(e.key==='Enter' || e.key===',' || e.key==='，' || e.key==='Tab'){
+                e.preventDefault();
+                const val=inputEl.value.trim();
+                if(val){
+                    addTags(val);
+                    inputEl.value='';
+                }
+            }else if(e.key==='Backspace' && !inputEl.value && tags.length>0){
+                removeTag(tags.length-1);
+            }
+        });
+        inputEl.addEventListener('blur',()=>{
+            const val=inputEl.value.trim();
+            if(val){
+                addTags(val);
+                inputEl.value='';
+            }
+        });
+        inputEl.addEventListener('paste',e=>{
+            e.preventDefault();
+            const text=(e.clipboardData||window.clipboardData).getData('text');
+            addTags(text);
+            inputEl.value='';
+        });
+
+        return { addTags, removeTag, setTagsFromString, getTags:()=>[...tags] };
+    }
+
+    const excludeTagInput = initTagInput(
+        document.getElementById('offlineExcludeTagBox'),
+        excludeInput,
+        { onChange: markDirty }
+    );
+    const allowedExtsTagInput = initTagInput(
+        document.getElementById('offlineAllowedExtsTagBox'),
+        document.getElementById('offlineAllowedExts'),
+        { onChange: markDirty }
+    );
+    const secondaryTagInput = initTagInput(
+        document.getElementById('offlineSecondaryTagBox'),
+        secondaryKeywordsInput,
+        { badgeClass: 'is-secondary', onChange: markDirty }
+    );
+
+    function renderDirs(){
+        [['offlineTarget','未选择'],['offlineSecondary','未选择']].forEach(([prefix,fallback])=>{
+            const nameEl=document.getElementById(prefix+'DirName');
+            const idEl=document.getElementById(prefix+'Dir');
+            const valEl=document.getElementById(prefix+'DirValue');
+            const name=nameEl.value||fallback;
+            const id=idEl.value||'0';
+            const hasVal=Boolean(idEl.value && idEl.value!=='0');
+
+            if(hasVal){
+                valEl.innerHTML=`<div class="offline-dir-badge"><i data-lucide="folder" class="offline-dir-icon"></i><div class="offline-dir-text"><strong>${esc(name)}</strong><span class="offline-dir-id">ID: ${esc(id)}</span></div></div>`;
+            }else{
+                valEl.innerHTML=`<div class="offline-dir-badge is-empty"><i data-lucide="folder-dashed" class="offline-dir-icon"></i><div class="offline-dir-text"><strong>${esc(fallback)}</strong><span class="offline-dir-id">未选择关联目录</span></div></div>`;
+            }
+        });
+        window.renderLucideIcons?.(document.getElementById('offlineConfigForm'));
+    }
+    function syncSecondary(){
+        const disabled=busy||!secondary.checked;
+        secondaryRows.classList.toggle('is-disabled',!secondary.checked);
+        secondaryRows.querySelectorAll('input,button').forEach(element=>element.disabled=disabled);
+        document.getElementById('offlineSecondaryTagField').disabled=disabled;
+    }
+    function setBusy(value){
+        busy=value;
+        saveButton.disabled=value;
+        form.querySelector('[data-offline-dir="primary"]').disabled=value;
+        syncSecondary();
+    }
+    function markDirty(){
+        if(busy)return;
+        saveState.className='is-dirty';
+        saveState.textContent='尚未保存';
+    }
+    function pick(target){
+        openGuangYaDirectoryPicker({modalId:'offlineStandaloneDirModal',title:target==='primary'?'选择默认保存目录':'选择二次分流目录',onSelect:directory=>{
+            const prefix=target==='primary'?'offlineTarget':'offlineSecondary';
+            document.getElementById(prefix+'Dir').value=directory.id;
+            document.getElementById(prefix+'DirName').value=directory.name;
+            renderDirs();
+            markDirty();
+        }});
+    }
+
+    // Quick tag chips helper
+    document.querySelectorAll('#offlinePresetChips [data-chip]').forEach(chip=>{
+        chip.addEventListener('click', ()=>{
+            if(busy) return;
+            excludeTagInput.addTags(chip.dataset.chip);
+        });
+    });
+    setBusy(true);
+    loadAppConfig().then(config=>{
+        fillConfigFields(form,config);
+        excludeTagInput.setTagsFromString(config.OFFLINE_EXCLUDE_KEYWORDS || '');
+        allowedExtsTagInput.setTagsFromString(config.OFFLINE_ALLOWED_EXTS || '');
+        secondaryTagInput.setTagsFromString(config.OFFLINE_SECONDARY_KEYWORDS || '');
+        if(!config.OFFLINE_MAGNET_ENABLED)form.querySelector('[data-key="OFFLINE_MAGNET_ENABLED"]').checked=true;
+        if(!config.OFFLINE_ED2K_ENABLED)form.querySelector('[data-key="OFFLINE_ED2K_ENABLED"]').checked=true;
+        if(config.OFFLINE_MAGNET_UNVERIFIED_FALLBACK===undefined||config.OFFLINE_MAGNET_UNVERIFIED_FALLBACK==='')form.querySelector('[data-key="OFFLINE_MAGNET_UNVERIFIED_FALLBACK"]').checked=true;
+        renderDirs();
+    }).catch(error=>{
+        saveState.className='is-error';
+        saveState.textContent=error.message;
+    }).finally(()=>setBusy(false));
+
+    document.querySelectorAll('[data-offline-dir]').forEach(button=>button.addEventListener('click',()=>pick(button.dataset.offlineDir)));
+    form.addEventListener('input',markDirty);
+    form.addEventListener('change',event=>{
+        if(event.target===secondary)syncSecondary();
+        markDirty();
+    });
+    saveButton.addEventListener('click',async()=>{
+        if(busy)return;
+        setBusy(true);
+        saveState.className='';
+        saveState.textContent='保存中...';
+        try{
+            await saveAppConfig(form);
+            saveState.className='is-success';
+            saveState.textContent='离线转存设置已保存';
+        }catch(error){
+            saveState.className='is-error';
+            saveState.textContent=error.message;
+        }finally{
+            setBusy(false);
+        }
+    });
+})();
+</script>
+{% endblock %}

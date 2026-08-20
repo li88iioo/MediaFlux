@@ -1,0 +1,438 @@
+{
+  "schema_version": 1,
+  "revision": 3,
+  "entries": [
+    {
+      "knowledge_key": "release-group:ani",
+      "knowledge_type": "release_group",
+      "canonical_value": "ANi",
+      "aliases": [
+        "ANi"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:orion-origin",
+      "knowledge_type": "release_group",
+      "canonical_value": "orion origin",
+      "aliases": [
+        "orion origin",
+        "Orion Origin",
+        "orion-origin",
+        "orion_origin"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:dynamis-one",
+      "knowledge_type": "release_group",
+      "canonical_value": "Dynamis One",
+      "aliases": [
+        "Dynamis One",
+        "Dynamis-One",
+        "Dynamis_One"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:loli-house",
+      "knowledge_type": "release_group",
+      "canonical_value": "LoliHouse",
+      "aliases": [
+        "LoliHouse",
+        "Loli House",
+        "Loli-House",
+        "Loli_House"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:h-enc",
+      "knowledge_type": "release_group",
+      "canonical_value": "H-Enc",
+      "aliases": [
+        "H-Enc",
+        "H Enc",
+        "H_Enc",
+        "H.Enc"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:hdsky",
+      "knowledge_type": "release_group",
+      "canonical_value": "HDSky",
+      "aliases": [
+        "HDSky",
+        "HD Sky",
+        "HD-Sky"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:ktxp",
+      "knowledge_type": "release_group",
+      "canonical_value": "KTXP",
+      "aliases": [
+        "KTXP"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:nekomoe",
+      "knowledge_type": "release_group",
+      "canonical_value": "Nekomoe kissaten",
+      "aliases": [
+        "Nekomoe",
+        "Nekomoe kissaten",
+        "Nekomoe-kissaten"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:sakurato",
+      "knowledge_type": "release_group",
+      "canonical_value": "Sakurato",
+      "aliases": [
+        "Sakurato"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:lilith-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "Lilith-Raws",
+      "aliases": [
+        "Lilith-Raws",
+        "Lilith Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:nc-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "NC-Raws",
+      "aliases": [
+        "NC-Raws",
+        "NC Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:vcb-studio",
+      "knowledge_type": "release_group",
+      "canonical_value": "VCB-Studio",
+      "aliases": [
+        "VCB-Studio",
+        "VCB Studio"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:reinforce",
+      "knowledge_type": "release_group",
+      "canonical_value": "ReinForce",
+      "aliases": [
+        "ReinForce"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:moozzi2",
+      "knowledge_type": "release_group",
+      "canonical_value": "Moozzi2",
+      "aliases": [
+        "Moozzi2"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:snow-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "Snow-Raws",
+      "aliases": [
+        "Snow-Raws",
+        "Snow Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:beatrice-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "Beatrice-Raws",
+      "aliases": [
+        "Beatrice-Raws",
+        "Beatrice Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:dbd-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "DBD-Raws",
+      "aliases": [
+        "DBD-Raws",
+        "DBD Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:ank-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "ANK-Raws",
+      "aliases": [
+        "ANK-Raws",
+        "ANK Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:ai-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "AI-Raws",
+      "aliases": [
+        "AI-Raws",
+        "AI Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:skymoon-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "Skymoon-Raws",
+      "aliases": [
+        "Skymoon-Raws",
+        "Skymoon Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:philosophy-raws",
+      "knowledge_type": "release_group",
+      "canonical_value": "Philosophy-Raws",
+      "aliases": [
+        "Philosophy-Raws",
+        "Philosophy Raws"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:sweetdreamday",
+      "knowledge_type": "release_group",
+      "canonical_value": "SweetDreamDay",
+      "aliases": [
+        "SweetDreamDay"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:flsnow",
+      "knowledge_type": "release_group",
+      "canonical_value": "FLsnow",
+      "aliases": [
+        "FLsnow"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:mce",
+      "knowledge_type": "release_group",
+      "canonical_value": "MCE",
+      "aliases": [
+        "MCE"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:yui-7",
+      "knowledge_type": "release_group",
+      "canonical_value": "YUI-7",
+      "aliases": [
+        "YUI-7",
+        "YUI 7"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:sandwich",
+      "knowledge_type": "release_group",
+      "canonical_value": "三明治摆烂组",
+      "aliases": [
+        "三明治摆烂组",
+        "三明治擺爛組"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:nekomoe-lolihouse",
+      "knowledge_type": "release_group",
+      "canonical_value": "Nekomoe kissaten & LoliHouse",
+      "aliases": [
+        "Nekomoe kissaten&LoliHouse",
+        "Nekomoe kissaten & LoliHouse",
+        "Nekomoe kissaten＆LoliHouse"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:miaomeng",
+      "knowledge_type": "release_group",
+      "canonical_value": "喵萌奶茶屋",
+      "aliases": [
+        "喵萌奶茶屋"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:wind-sanctuary",
+      "knowledge_type": "release_group",
+      "canonical_value": "风之圣殿",
+      "aliases": [
+        "风之圣殿",
+        "風之聖殿"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:clarity-academy",
+      "knowledge_type": "release_group",
+      "canonical_value": "澄空学园",
+      "aliases": [
+        "澄空学园",
+        "澄空學園"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:academy",
+      "knowledge_type": "release_group",
+      "canonical_value": "学院部",
+      "aliases": [
+        "学院部",
+        "學院部"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:not-pigeon",
+      "knowledge_type": "release_group",
+      "canonical_value": "不鸽",
+      "aliases": [
+        "不鸽",
+        "不鴿"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:tianyue",
+      "knowledge_type": "release_group",
+      "canonical_value": "天月动漫",
+      "aliases": [
+        "天月动漫",
+        "天月動漫"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:nightingale",
+      "knowledge_type": "release_group",
+      "canonical_value": "夜莺家族",
+      "aliases": [
+        "夜莺家族",
+        "夜鶯家族"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:lipu-sub",
+      "knowledge_type": "release_group",
+      "canonical_value": "离谱Sub",
+      "aliases": [
+        "离谱Sub",
+        "離譜Sub",
+        "离谱-Sub",
+        "離譜-Sub"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:prejudice-studio",
+      "knowledge_type": "release_group",
+      "canonical_value": "Prejudice-Studio",
+      "aliases": [
+        "Prejudice-Studio",
+        "Prejudice Studio"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:shridhuu",
+      "knowledge_type": "release_group",
+      "canonical_value": "Shridhuu",
+      "aliases": [
+        "Shridhuu"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:dreamhd",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "DreamHD",
+      "aliases": [
+        "DreamHD"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:colorweb",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "ColorWEB",
+      "aliases": [
+        "ColorWEB"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:quickio",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "QuickIO",
+      "aliases": [
+        "QuickIO"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:poke",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "POKE",
+      "aliases": [
+        "POKE"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:ben-the-men",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "BEN.THE.MEN",
+      "aliases": [
+        "BEN.THE.MEN"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:blacktv",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "BlackTV",
+      "aliases": [
+        "BlackTV"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:linmeng",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "LINMENG@CHDBits",
+      "aliases": [
+        "LINMENG@CHDBits"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:lxylab",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "LxyLab",
+      "aliases": [
+        "LxyLab"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:rudr",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "RuDR",
+      "aliases": [
+        "RuDR"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:xdm",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "XDM",
+      "aliases": [
+        "XDM"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:bitsrc",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "BitS(RC)",
+      "aliases": [
+        "BitS(RC)",
+        "BitSRC"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:frds",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "FRDS",
+      "aliases": [
+        "FRDS"
+      ]
+    }
+  ]
+}

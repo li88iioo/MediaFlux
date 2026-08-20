@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" role="img" aria-label="MediaFlux">
+  <rect width="16" height="16" rx="2.5" fill="#18201d"/>
+  <path fill="#65f0c2" d="M2 3h3l3 2 3-2h3v3h-2L8 8 4 6H2V3Z"/>
+  <path fill="#9de8ff" d="M2 13v-3h2l4-2 4 2h2v3h-3l-3-2-3 2H2Z"/>
+  <path fill="#18201d" d="m6 5.5 6 2.5-6 2.5v-5Z"/>
+</svg>

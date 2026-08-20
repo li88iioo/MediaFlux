@@ -1,0 +1,30 @@
+<script>
+(() => {
+    const key = 'mediaflux.theme.mode';
+    const allowed = new Set(['auto', 'light', 'dark']);
+    let mode = 'auto';
+    try {
+        const saved = localStorage.getItem(key);
+        if (allowed.has(saved)) mode = saved;
+    } catch (_) {}
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+    const theme = mode === 'auto' ? (media?.matches ? 'dark' : 'light') : mode;
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.dataset.themeMode = mode;
+    document.documentElement.style.colorScheme = theme;
+    let sidebar = 'expanded';
+    try {
+        if (window.innerWidth > 900 && localStorage.getItem('mediaflux.sidebar.collapsed') === '1') {
+            sidebar = 'collapsed';
+        }
+    } catch (_) {}
+    document.documentElement.dataset.sidebar = sidebar;
+    let guangyaNav = 'open';
+    try {
+        if (localStorage.getItem('mediaflux.nav.guangya.open') === '0') {
+            guangyaNav = 'closed';
+        }
+    } catch (_) {}
+    document.documentElement.dataset.navGuangya = guangyaNav;
+})();
+</script>

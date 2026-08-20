@@ -1,0 +1,187 @@
+<script>
+(function(){
+    let previewId='';
+    let files=[];
+
+    const escapeHtml=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const formatSize=size=>{
+        const n=Number(size)||0;
+        if(!n) return '文件夹';
+        if(n>=1073741824) return (n/1073741824).toFixed(2)+' GB';
+        if(n>=1048576) return (n/1048576).toFixed(1)+' MB';
+        return (n/1024).toFixed(1)+' KB';
+    };
+    function setState(text,tone=''){
+        const tag=document.getElementById('shareStateTag');
+        let icon = 'clock';
+        if(tone === 'is-success') icon = 'check-circle-2';
+        else if(tone === 'is-danger') icon = 'alert-circle';
+        else if(text.includes('中')) icon = 'loader-2';
+        tag.innerHTML = `<i data-lucide="${icon}"></i><span>${escapeHtml(text)}</span>`;
+        tag.className = 'share-status-badge ' + tone;
+        window.renderLucideIcons?.(tag);
+    }
+    function selectedIds(){
+        return [...document.querySelectorAll('.share-file-check:checked')].map(el=>el.value);
+    }
+    function updateSelection(){
+        const selected=selectedIds();
+        document.getElementById('shareSelectionCount').textContent=`已选择 ${selected.length} / ${files.length} 项`;
+        document.getElementById('shareCheckAll').checked=files.length>0&&selected.length===files.length;
+        document.getElementById('shareCheckAll').indeterminate=selected.length>0&&selected.length<files.length;
+        document.getElementById('restoreShareBtn').disabled=!previewId||!selected.length;
+        document.getElementById('shareTransferSummary').textContent=previewId?`${selected.length} 项将转存到「${document.getElementById('shareTargetDirName').value}」`:'尚未解析分享链接';
+    }
+    function renderFiles(){
+        const list=document.getElementById('shareFileList');
+        document.getElementById('shareFileToolbar').hidden=false;
+        list.innerHTML=files.map(item=>`<label class="share-file-row">
+            <input type="checkbox" class="share-file-check" value="${escapeHtml(item.id)}" checked>
+            <span class="share-file-type-icon"><i data-lucide="${item.is_dir?'folder':'file-text'}"></i></span>
+            <div class="share-file-meta">
+                <strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong>
+                <small>${item.is_dir?'目录 / 文件夹':formatSize(item.size)} · ID ${escapeHtml(item.id)}</small>
+            </div>
+        </label>`).join('');
+        window.renderLucideIcons?.(list);
+        list.querySelectorAll('.share-file-check').forEach(el=>el.addEventListener('change',updateSelection));
+        updateSelection();
+    }
+    async function inspectShare(){
+        const url=document.getElementById('shareUrl').value.trim();
+        if(!url){ document.getElementById('shareMessage').textContent='请输入有效的光鸭分享链接'; return; }
+        const btn=document.getElementById('inspectShareBtn');
+        btn.disabled=true; btn.innerHTML='<i data-lucide="loader-2" class="spin"></i> 解析中...'; setState('解析中');
+        window.renderLucideIcons?.(btn);
+        previewId=''; files=[]; document.getElementById('restoreShareBtn').disabled=true;
+        try{
+            const response=await fetch('/api/share/inspect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+            const data=await response.json(); if(!response.ok) throw new Error(data.error||'解析失败');
+            previewId=data.preview_id; files=data.files||[];
+            document.getElementById('shareMessage').textContent=`分享 ID: ${data.share_id} · 共 ${data.count} 项文件 · 预览 15 分钟内有效`;
+            setState('解析完成','is-success'); renderFiles();
+        }catch(error){
+            document.getElementById('shareMessage').textContent=error.message;
+            document.getElementById('shareFileToolbar').hidden=true;
+            document.getElementById('shareFileList').innerHTML=`<div class="share-empty-state">
+                <div class="share-empty-icon" style="color:var(--danger);background:rgba(239,68,68,0.1);"><i data-lucide="alert-triangle"></i></div>
+                <strong>解析失败</strong>
+                <p>${escapeHtml(error.message||'请检查提取码与分享链接有效性')}</p>
+            </div>`;
+            window.renderLucideIcons?.(document.getElementById('shareFileList'));
+            setState('解析失败','is-danger');
+        }finally{
+            btn.disabled=false;
+            btn.innerHTML='<i data-lucide="scan-line"></i> 解析分享';
+            window.renderLucideIcons?.(btn);
+        }
+    }
+    function renderTarget(directory){
+        document.getElementById('shareTargetDir').value=String(directory.id||'0');
+        document.getElementById('shareTargetDirName').value=directory.name||'根目录';
+        const value=document.getElementById('shareTargetValue');
+        value.innerHTML = `
+            <div class="share-target-icon"><i data-lucide="folder-tree"></i></div>
+            <div class="share-target-details">
+                <strong>${escapeHtml(directory.name||'根目录')}</strong>
+                <small>ID ${escapeHtml(String(directory.id||'0'))}</small>
+            </div>
+        `;
+        window.renderLucideIcons?.(value);
+        updateSelection();
+    }
+    function openTargetPicker(){
+        openGuangYaDirectoryPicker({
+            modalId:'shareDirModal',
+            title:'选择转存目标目录',
+            onSelect:(directory)=>renderTarget(directory),
+        });
+    }
+    async function saveDefaultTarget(){
+        const btn=document.getElementById('saveShareTargetBtn');
+        btn.disabled=true;
+        try{
+            const response=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+                GY_SHARE_TARGET_DIR:document.getElementById('shareTargetDir').value,
+                GY_SHARE_TARGET_DIR_NAME:document.getElementById('shareTargetDirName').value,
+            })});
+            const data=await response.json();
+            if(!response.ok) throw new Error(data.error||'保存失败');
+            document.getElementById('shareMessage').textContent='默认转存目录已保存';
+        }catch(error){document.getElementById('shareMessage').textContent=error.message;}
+        finally{btn.disabled=false;}
+    }
+    const wait=milliseconds=>new Promise(resolve=>window.setTimeout(resolve,milliseconds));
+    async function followShareRequest(requestId,targetName){
+        let queryFailures=0;
+        for(let attempt=0;attempt<45;attempt+=1){
+            await wait(2000);
+            try{
+                const response=await fetch(`/api/share/requests/${encodeURIComponent(requestId)}`,{headers:{Accept:'application/json'},cache:'no-store'});
+                const data=await response.json();
+                if(!response.ok) throw new Error(data.error||'状态查询失败');
+                queryFailures=0;
+                if(!data.terminal){
+                    document.getElementById('shareMessage').textContent=`转存请求 ${requestId} 正在处理`;
+                    continue;
+                }
+                if(data.success){
+                    setState('转存成功','is-success');
+                    document.getElementById('shareMessage').textContent=`转存请求 ${requestId} 已完成 · 目标「${data.target_dir_name||targetName}」`;
+                    document.getElementById('shareTransferSummary').textContent='本次转存已完成';
+                }else{
+                    setState(data.status==='manual_review'?'需要核对':'转存失败','is-danger');
+                    document.getElementById('shareMessage').textContent=data.error||`转存请求 ${requestId} 未完成，请重新解析后重试`;
+                    document.getElementById('shareTransferSummary').textContent='请核对目标目录或重新解析分享链接';
+                }
+                return;
+            }catch(error){
+                queryFailures+=1;
+                if(queryFailures>=3){
+                    setState('状态待确认','');
+                    document.getElementById('shareMessage').textContent=`转存请求 ${requestId} 已受理，但暂时无法查询状态，请稍后在下载或日志页面核对`;
+                    document.getElementById('shareTransferSummary').textContent='请求仍可能在后台执行';
+                    return;
+                }
+            }
+        }
+        setState('仍在处理','');
+        document.getElementById('shareMessage').textContent=`转存请求 ${requestId} 仍在处理，请稍后在下载或日志页面核对`;
+        document.getElementById('shareTransferSummary').textContent='请求已受理并在后台继续执行';
+    }
+
+    async function restoreShare(){
+        const ids=selectedIds(); if(!previewId||!ids.length)return;
+        const targetName=document.getElementById('shareTargetDirName').value;
+        const confirmed=await appConfirm({title:'确认分享转存',message:`把 ${ids.length} 项文件转存到「${targetName}」。该操作将在云盘直接执行。`,confirmText:'开始转存'});if(!confirmed)return;
+        const btn=document.getElementById('restoreShareBtn'); btn.disabled=true;btn.innerHTML='<i data-lucide="loader-2" class="spin"></i> 转存中...';
+        window.renderLucideIcons?.(btn);
+        try{
+            const response=await fetch('/api/share/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({preview_id:previewId,file_ids:ids,target_dir_id:document.getElementById('shareTargetDir').value,target_dir_name:targetName})});
+            const data=await response.json();if(!response.ok)throw new Error(data.error||'转存失败');
+            previewId='';
+            if(response.status===202||(data.accepted&&data.duplicate)){
+                setState('请求处理中','');
+                document.getElementById('shareMessage').textContent=`相同请求正在处理${data.request_id?` · 请求 ${data.request_id}`:''}`;
+                document.getElementById('shareTransferSummary').textContent='已复用正在执行的转存请求，正在跟踪结果';
+                if(data.request_id) await followShareRequest(data.request_id,targetName);
+            }else{
+                setState('转存成功','is-success');document.getElementById('shareMessage').textContent=`已成功转存 ${data.count||0} 项到「${data.target_dir_name||targetName}」`;document.getElementById('shareTransferSummary').textContent='本次转存已完成';
+            }
+        }catch(error){setState('转存失败','is-danger');document.getElementById('shareMessage').textContent=error.message;btn.disabled=false;}
+        finally{
+            btn.innerHTML='<i data-lucide="cloud-download"></i> 执行转存';
+            window.renderLucideIcons?.(btn);
+        }
+    }
+    document.getElementById('inspectShareBtn').addEventListener('click',inspectShare);
+    document.getElementById('shareCheckAll').addEventListener('change',e=>{document.querySelectorAll('.share-file-check').forEach(el=>el.checked=e.target.checked);updateSelection();});
+    document.getElementById('pickShareTargetBtn').addEventListener('click',openTargetPicker);
+    document.getElementById('saveShareTargetBtn').addEventListener('click',saveDefaultTarget);
+    document.getElementById('restoreShareBtn').addEventListener('click',restoreShare);
+    loadAppConfig().then(config=>renderTarget({
+        id:config.GY_SHARE_TARGET_DIR||'0',
+        name:config.GY_SHARE_TARGET_DIR_NAME||'根目录',
+    })).catch(()=>renderTarget({id:'0',name:'根目录'}));
+})();
+</script>

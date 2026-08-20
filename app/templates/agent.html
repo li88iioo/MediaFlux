@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block title %}Media Agent - MediaFlux{% endblock %}
+{% block body_class %}agent-page-body{% endblock %}
+{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/agent.css') }}?v=20260818c">{% endblock %}
+{% block workspace_bar %}
+<div class="agent-mobile-bar">
+    <button class="icon-btn workspace-menu-btn" id="toggleSidebar" aria-label="菜单" title="打开导航"><i data-lucide="menu"></i></button>
+    <span><i data-lucide="bot"></i>Media Agent</span>
+    {{ theme_toggle('agent-mobile') }}
+</div>
+{% endblock %}
+{% block content %}
+<section class="agent-page" aria-label="Media Agent 工作台">
+
+    <div class="agent-workbench">
+        <section class="agent-console" aria-label="Agent 对话工作区">
+            <div class="agent-transcript" id="agentTranscript" role="log" aria-live="polite" aria-relevant="additions">
+                <article class="agent-message agent-message-system" data-agent-welcome>
+                    <div class="agent-message-mark"><i data-lucide="sparkles"></i></div>
+                    <div class="agent-message-body">
+                        <span class="agent-message-label">START HERE</span>
+                        <h2>今天要检查什么？</h2>
+                        <p>选择一个常用任务，或者直接描述目标。Agent 会说明数据来源、执行边界和需要确认的步骤。</p>
+                    </div>
+                </article>
+            </div>
+
+            <form class="agent-composer" id="agentComposer">
+                <div class="agent-shortcuts-timeline-popover" id="agentShortcutsTimeline" hidden>
+                    <div class="agent-timeline-bubble-header">
+                        <span class="agent-timeline-bubble-pill"><i data-lucide="sparkles"></i> 常用 Agent 任务</span>
+                    </div>
+                    <div class="agent-timeline-body">
+                        <div class="agent-timeline-track">
+                            <div class="agent-timeline-stem"></div>
+                            <div class="agent-timeline-list">
+                                <button type="button" class="agent-timeline-task" data-agent-prompt="媒体系统健康总检">
+                                    <span class="agent-timeline-node"><i data-lucide="activity"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>媒体健康总检</strong><span class="agent-timeline-tag">直接执行</span></div>
+                                        <p>检查媒体服务连通性、反代与近期状态</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-draft="检查《剧名》有没有缺集">
+                                    <span class="agent-timeline-node is-draft"><i data-lucide="list-video"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>剧集查缺集</strong><span class="agent-timeline-tag is-draft">填入草稿</span></div>
+                                        <p>核对指定剧集在媒体库中的季集完整度</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-draft="检查电视剧《剧名》有没有更新">
+                                    <span class="agent-timeline-node is-draft"><i data-lucide="calendar-sync"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>检查更新</strong><span class="agent-timeline-tag is-draft">填入草稿</span></div>
+                                        <p>检索追踪剧集的最新播出或入库状态</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-draft="在网上找《片名》">
+                                    <span class="agent-timeline-node is-draft"><i data-lucide="search"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>找剧与影片</strong><span class="agent-timeline-tag is-draft">填入草稿</span></div>
+                                        <p>在已配置的资源站检索可下载资源</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-prompt="预览光鸭云盘整理计划">
+                                    <span class="agent-timeline-node"><i data-lucide="folder-search-2"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>整理计划预览</strong><span class="agent-timeline-tag">直接执行</span></div>
+                                        <p>预览云盘未整理文件的重命名与刮削归档计划</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-prompt="查看 STRM 同步进度">
+                                    <span class="agent-timeline-node"><i data-lucide="scan-line"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>STRM 状态</strong><span class="agent-timeline-tag">直接执行</span></div>
+                                        <p>检查 STRM 索引生成、失败与重试进度</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-prompt="工作区待办">
+                                    <span class="agent-timeline-node"><i data-lucide="list-checks"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>工作区待办</strong><span class="agent-timeline-tag">直接执行</span></div>
+                                        <p>聚合下载、订阅、整理与同步中的待处理异常</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-prompt="检查项目配置">
+                                    <span class="agent-timeline-node"><i data-lucide="settings-2"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>配置诊断</strong><span class="agent-timeline-tag">直接执行</span></div>
+                                        <p>检查当前媒体服务、转存下载与网络凭证配置</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-prompt="诊断 RSS 订阅">
+                                    <span class="agent-timeline-node"><i data-lucide="rss"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>RSS 诊断</strong><span class="agent-timeline-tag">直接执行</span></div>
+                                        <p>检查 RSS 订阅源抓取、过滤规则与执行状态</p>
+                                    </div>
+                                </button>
+                                <button type="button" class="agent-timeline-task" data-agent-prompt="诊断资源站是否就绪">
+                                    <span class="agent-timeline-node"><i data-lucide="radio-tower"></i></span>
+                                    <div class="agent-timeline-info">
+                                        <div class="agent-timeline-row"><strong>资源站诊断</strong><span class="agent-timeline-tag">直接执行</span></div>
+                                        <p>测试各索引站连通性与检索可用性</p>
+                                    </div>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="agent-composer-header">
+                    <div class="agent-composer-left">
+                        <button type="button" class="agent-shortcuts-trigger" id="toggleAgentShortcuts" aria-label="常用任务" title="常用任务" aria-expanded="false" aria-controls="agentShortcutsTimeline"><i data-lucide="sparkles"></i><span>常用任务</span></button>
+                    </div>
+                    <div class="agent-composer-shortcuts sr-only" role="group" aria-label="常用 Agent 任务">
+                        <button type="button" data-agent-prompt="媒体系统健康总检" title="媒体健康总检" aria-label="媒体健康总检"><i data-lucide="activity"></i><span>媒体健康</span></button>
+                        <button type="button" data-agent-draft="检查《剧名》有没有缺集" title="剧集完整性" aria-label="剧集完整性"><i data-lucide="list-video"></i><span>查缺集</span></button>
+                        <button type="button" data-agent-draft="检查电视剧《剧名》有没有更新" title="检查更新" aria-label="检查更新"><i data-lucide="calendar-sync"></i><span>查更新</span></button>
+                        <button type="button" data-agent-draft="在网上找《片名》" title="找剧与影片" aria-label="找剧与影片"><i data-lucide="search"></i><span>找资源</span></button>
+                        <button type="button" data-agent-prompt="预览光鸭云盘整理计划" title="整理计划预览" aria-label="整理计划预览"><i data-lucide="folder-search-2"></i><span>整理预览</span></button>
+                        <button type="button" data-agent-prompt="查看 STRM 同步进度" title="STRM 状态" aria-label="STRM 状态"><i data-lucide="scan-line"></i><span>STRM 状态</span></button>
+                        <button type="button" data-agent-prompt="工作区待办" title="工作区待办" aria-label="工作区待办"><i data-lucide="list-checks"></i><span>工作区待办</span></button>
+                        <button type="button" data-agent-prompt="检查项目配置" title="配置诊断" aria-label="配置诊断"><i data-lucide="settings-2"></i><span>配置诊断</span></button>
+                        <button type="button" data-agent-prompt="诊断 RSS 订阅" title="RSS 诊断" aria-label="RSS 诊断"><i data-lucide="rss"></i><span>RSS 诊断</span></button>
+                        <button type="button" data-agent-prompt="诊断资源站是否就绪" title="资源站诊断" aria-label="资源站诊断"><i data-lucide="radio-tower"></i><span>资源站诊断</span></button>
+                    </div>
+                    <div class="agent-composer-actions">
+                        <a class="agent-action-btn" href="{{ url_for('pages.settings') }}#agent" aria-label="Agent 设置" title="Agent 设置"><i data-lucide="sliders-horizontal"></i></a>
+                        <button type="button" class="agent-action-btn agent-resume-session" id="agentResumeLatestSession" aria-label="继续上次会话" title="继续上次会话" disabled><i data-lucide="message-square-reply"></i><span>继续上次</span></button>
+                        <button type="button" class="agent-action-btn" id="toggleAgentRail" aria-label="历史会话" title="历史会话" aria-expanded="false" aria-controls="agentHistoryRail"><i data-lucide="history"></i></button>
+                        <button type="button" class="agent-action-btn primary" id="agentNewSession" aria-label="新会话" title="新会话"><i data-lucide="plus"></i></button>
+                    </div>
+                </div>
+                <div class="agent-composer-main">
+                    <label class="sr-only" for="agentPrompt">输入要交给 Agent 的任务</label>
+                    <textarea id="agentPrompt" rows="1" maxlength="1000" placeholder="描述一个检查、查询或预览任务…" autocomplete="off"></textarea>
+                    <span class="agent-submit-slot">
+                        <button type="submit" class="agent-send" id="agentSend" aria-label="发送"><i data-lucide="send-horizontal"></i></button>
+                        <button type="button" class="agent-stop" id="agentStop" aria-label="停止本次任务" title="停止本次任务" hidden disabled><i data-lucide="square"></i></button>
+                    </span>
+                </div>
+            </form>
+        </section>
+
+        <dialog class="agent-rail agent-history-drawer" id="agentHistoryRail" aria-labelledby="agent-session-heading">
+            <section class="agent-rail-section agent-session-panel">
+                <div class="agent-session-heading">
+                    <div><span class="agent-kicker">HISTORY</span><h3 id="agent-session-heading">最近会话</h3></div>
+                    <div class="agent-session-heading-actions">
+                        <span class="agent-session-count" id="agentSessionCount">0</span>
+                        <button type="button" class="agent-history-close" data-agent-history-close aria-label="关闭历史会话" title="关闭历史会话"><i data-lucide="x"></i></button>
+                    </div>
+                </div>
+                <div class="agent-session-list" id="agentSessionList" aria-live="polite" aria-busy="true"><div class="agent-session-empty"><i data-lucide="message-circle-dashed"></i><span>尚无已保存的查询摘要</span></div></div>
+                <p class="sr-only" id="agentSessionStatus" role="status" aria-live="polite"></p>
+            </section>
+        </dialog>
+    </div>
+</section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='js/agent.js') }}?v=20260811c" defer></script>{% endblock %}

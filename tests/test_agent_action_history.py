@@ -1,0 +1,519 @@
+"""Agent 受确认动作审计历史的持久化、脱敏与查询测试。"""
+from __future__ import annotations
+
+import json
+import re
+import unittest
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+from app import database as db
+from app.agent.action_history import (
+    action_history_arguments,
+    action_history_owner_digest,
+    list_action_history,
+    record_confirmed_result,
+)
+from app.agent.confirmation import ConfirmationStore
+from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
+from app.agent.orchestrator import AgentOrchestrator, agent_action_history_request
+from app.agent.owner_routes import web_agent_owner
+from app.agent.rate_limit import agent_rate_limiter
+from app.agent.registry import AgentToolError, ToolRegistry
+from app.agent.service import reset_agent_service_for_tests
+from app.main import create_app
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database
+
+
+OWNER = "test-action-history-owner"
+OWNER_DIGEST = "a" * 64
+
+
+class AgentActionHistoryCoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._database = isolated_test_database("agent-action-history.db")
+        self._database.__enter__()
+
+    def tearDown(self) -> None:
+        self._database.__exit__(None, None, None)
+
+    def test_database_orders_filters_and_bounds_results(self):
+        first = db.add_agent_action_history(
+            owner_digest=OWNER_DIGEST,
+            tool_name="strm.run_once",
+            risk="danger",
+            status="accepted",
+            ok=True,
+            summary="STRM 手动同步：已提交",
+            safe_details={"accepted": True, "trigger": "manual"},
+            elapsed_ms=12,
+        )
+        second = db.add_agent_action_history(
+            owner_digest=OWNER_DIGEST,
+            tool_name="rss.retry_failed_to_qb",
+            risk="danger",
+            status="failed",
+            ok=False,
+            summary="RSS 失败条目重试：执行失败",
+            safe_details={"submitted": 0, "failed": 2},
+            error_code="confirmation_stale",
+            elapsed_ms=4,
+        )
+        self.assertGreater(second, first)
+        rows = db.list_agent_action_history(owner_digest=OWNER_DIGEST, limit=10)
+        self.assertEqual([row["tool_name"] for row in rows], [
+            "rss.retry_failed_to_qb", "strm.run_once",
+        ])
+        self.assertEqual(len(db.list_agent_action_history(owner_digest=OWNER_DIGEST, limit=10, outcome="success")), 1)
+        self.assertEqual(len(db.list_agent_action_history(owner_digest=OWNER_DIGEST, limit=10, outcome="failed")), 1)
+        with self.assertRaises(ValueError):
+            db.list_agent_action_history(owner_digest=OWNER_DIGEST, limit=51)
+        with self.assertRaises(ValueError):
+            db.add_agent_action_history(
+                owner_digest=OWNER_DIGEST,
+                tool_name="strm.run_once",
+                risk="read",
+                status="accepted",
+                ok=True,
+                summary="invalid",
+            )
+        with self.assertRaises(ValueError):
+            db.add_agent_action_history(
+                owner_digest=OWNER_DIGEST,
+                tool_name="strm.run_once",
+                risk="danger",
+                status="accepted",
+                ok=True,
+                summary="invalid",
+                safe_details={"nested": {"path": "/private"}},
+            )
+
+    def test_projection_keeps_only_strict_safe_fields(self):
+        record_confirmed_result(
+            owner=OWNER,
+            tool_name="indexer.submit_resource",
+            risk=RiskLevel.DANGER,
+            result=ToolResult(
+                ok=True,
+                status="completed",
+                summary="raw magnet:?xt=urn:btih:secret /private/path",
+                data={
+                    "target": "qb",
+                    "status": "completed",
+                    "created": True,
+                    "succeeded": 1,
+                    "failed": 0,
+                    "duplicate": False,
+                    "result_id": "secret-result",
+                    "request_id": "secret-request",
+                    "magnet": "magnet:?xt=urn:btih:secret",
+                    "path": "/private/path",
+                },
+                error="token=secret",
+            ),
+            elapsed_ms=8,
+        )
+        row = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest(OWNER), limit=1
+        )[0]
+        details = json.loads(row["safe_details"])
+        self.assertEqual(details, {
+            "created": True,
+            "duplicate": False,
+            "failed": 0,
+            "status": "completed",
+            "succeeded": 1,
+            "target": "qb",
+        })
+        serialized = json.dumps(dict(row), ensure_ascii=False)
+        for secret in ("secret-result", "secret-request", "magnet:", "/private", "token="):
+            self.assertNotIn(secret, serialized)
+
+    def test_confirmation_contract_round_trips_through_safe_action_history(self):
+        contract = {
+            "version": 1,
+            "action": "提交资源下载",
+            "object": "你刚才选择的资源候选",
+            "impact": "会向所选下载目标创建任务。",
+            "reversibility": "可在目标下载器中暂停或删除。",
+            "preflight_at": "2026-08-09T12:34:56+08:00",
+            "risk": "danger",
+            "preflight_summary": "预检通过:目标下载器可用。",
+        }
+        record_confirmed_result(
+            owner=OWNER,
+            tool_name="indexer.submit_resource",
+            risk=RiskLevel.DANGER,
+            result=ToolResult(
+                ok=True,
+                status="completed",
+                summary="done",
+                data={"target": "qb", "created": True},
+            ),
+            elapsed_ms=9,
+            confirmation_contract=contract,
+        )
+
+        result = list_action_history(
+            {"limit": 20, "outcome": "all"},
+            ToolContext(owner=OWNER),
+        )
+        self.assertEqual(result.data["items"][0]["confirmation"], contract)
+
+        row = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest(OWNER), limit=1
+        )[0]
+        stored = json.loads(row["safe_details"])
+        self.assertEqual(stored["contract_risk"], "danger")
+        self.assertEqual(
+            stored["contract_preflight_summary"],
+            "预检通过:目标下载器可用。",
+        )
+        serialized = json.dumps(stored, ensure_ascii=False)
+        self.assertNotIn("confirmation_id", serialized)
+        self.assertNotIn("magnet:", serialized)
+
+    def test_long_confirmation_summary_is_truncated_to_database_scalar_limit(self):
+        contract = {
+            "version": 1,
+            "action": "批量刷新 RSS",
+            "object": "当前已启用的订阅源",
+            "impact": "会抓取最新条目。",
+            "reversibility": "刷新请求无法撤回。",
+            "preflight_at": "2026-08-09T12:34:56+08:00",
+            "risk": "write",
+            "preflight_summary": "订阅" * 100,
+        }
+        record_confirmed_result(
+            owner=OWNER,
+            tool_name="rss.refresh_subscriptions",
+            risk=RiskLevel.WRITE,
+            result=ToolResult(
+                ok=True,
+                status="completed",
+                summary="done",
+                data={"requested": 101, "refreshed": 101, "failed": 0},
+            ),
+            elapsed_ms=9,
+            confirmation_contract=contract,
+        )
+
+        rows = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest(OWNER), limit=1
+        )
+        self.assertEqual(len(rows), 1)
+        stored = json.loads(rows[0]["safe_details"])
+        self.assertLessEqual(len(stored["contract_preflight_summary"]), 128)
+
+    def test_organize_stop_history_keeps_only_requested_boolean(self):
+        record_confirmed_result(
+            owner=OWNER,
+            tool_name="guangya.organize.stop",
+            risk=RiskLevel.DANGER,
+            result=ToolResult(
+                ok=True,
+                status="accepted",
+                summary="raw secret-task /private/path",
+                data={
+                    "accepted": True,
+                    "task_id": "secret-task",
+                    "path": "/private/path",
+                },
+            ),
+            elapsed_ms=5,
+        )
+        row = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest(OWNER), limit=1
+        )[0]
+        self.assertEqual(row["tool_name"], "guangya.organize.stop")
+        self.assertEqual(json.loads(row["safe_details"]), {"accepted": True})
+        serialized = json.dumps(dict(row), ensure_ascii=False)
+        self.assertNotIn("secret-task", serialized)
+        self.assertNotIn("/private/path", serialized)
+
+    def test_clean_empty_history_keeps_only_aggregate_counts(self):
+        record_confirmed_result(
+            owner=OWNER,
+            tool_name="guangya.organize.clean_empty",
+            risk=RiskLevel.DANGER,
+            result=ToolResult(
+                ok=True,
+                status="completed",
+                summary="raw secret-source /private/path",
+                data={
+                    "cleaned": 4,
+                    "failed": 1,
+                    "source_count": 2,
+                    "sources": [{"id": "secret-source", "path": "/private/path"}],
+                },
+            ),
+            elapsed_ms=5,
+        )
+        row = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest(OWNER), limit=1
+        )[0]
+        self.assertEqual(row["tool_name"], "guangya.organize.clean_empty")
+        self.assertEqual(
+            json.loads(row["safe_details"]),
+            {"cleaned": 4, "failed": 1, "source_count": 2},
+        )
+        serialized = json.dumps(dict(row), ensure_ascii=False)
+        self.assertNotIn("secret-source", serialized)
+        self.assertNotIn("/private/path", serialized)
+
+    def test_confirm_records_success_stale_and_replay_only_once(self):
+        context = {"value": "one"}
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="strm.run_once",
+            description="test",
+            risk=RiskLevel.DANGER,
+            parameters={},
+            validator=lambda arguments: {},
+            preview_handler=lambda arguments: ToolResult(True, "confirmation_required", "preview"),
+            handler=lambda arguments: ToolResult(
+                True,
+                "accepted",
+                "raw /private/path",
+                data={"accepted": True, "trigger": "manual", "path": "/private/path"},
+            ),
+            confirmation_context=lambda arguments: context["value"],
+            requires_confirmation=True,
+        ))
+        store = ConfirmationStore(token_factory=lambda: "ticket-1234567890abcdef")
+        service = AgentOrchestrator(registry, store, record_actions=True)
+
+        prepared = service.prepare("strm.run_once", {}, owner="owner")
+        confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+        self.assertEqual(confirmed["result"]["status"], "accepted")
+        success = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest("owner"), limit=10
+        )
+        self.assertEqual(len(success), 1)
+        self.assertEqual(success[0]["status"], "accepted")
+        self.assertNotIn("/private", success[0]["safe_details"])
+
+        prepared = service.prepare("strm.run_once", {}, owner="owner")
+        context["value"] = "two"
+        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        with self.assertRaises(AgentToolError) as stale:
+            service.confirm(confirmation_id, owner="owner")
+        self.assertEqual(stale.exception.code, "confirmation_stale")
+        rows = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest("owner"), limit=10
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["error_code"], "confirmation_stale")
+        with self.assertRaises(AgentToolError):
+            service.confirm(confirmation_id, owner="owner")
+        self.assertEqual(
+            len(db.list_agent_action_history(
+                owner_digest=action_history_owner_digest("owner"), limit=10
+            )),
+            2,
+        )
+
+    def test_audit_storage_failure_does_not_change_confirmed_result(self):
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="strm.run_once",
+            description="test",
+            risk=RiskLevel.DANGER,
+            parameters={},
+            validator=lambda arguments: {},
+            preview_handler=lambda arguments: ToolResult(True, "confirmation_required", "preview"),
+            handler=lambda arguments: ToolResult(True, "accepted", "done"),
+            requires_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "ticket-abcdefghijklmnop"),
+            record_actions=True,
+        )
+        prepared = service.prepare("strm.run_once", {}, owner="owner")
+        with patch("app.agent.action_history.db.add_agent_action_history", side_effect=OSError("disk")):
+            response = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+        self.assertTrue(response["result"]["ok"])
+        self.assertEqual(response["result"]["status"], "accepted")
+
+    def test_read_tool_arguments_and_natural_language_request_are_strict(self):
+        self.assertEqual(action_history_arguments({}), {"limit": 20, "outcome": "all"})
+        self.assertEqual(
+            agent_action_history_request("查看最近 5 条 Agent 失败操作历史"),
+            {"limit": 5, "outcome": "failed"},
+        )
+        self.assertIsNone(agent_action_history_request("查看下载历史"))
+        with self.assertRaises(AgentToolError):
+            action_history_arguments({"limit": 10, "token": "secret"})
+        with self.assertRaisesRegex(ValueError, "1 到 50"):
+            agent_action_history_request("查看最近 99 条 Agent 操作历史")
+
+    def test_read_tool_returns_safe_rows(self):
+        db.add_agent_action_history(
+            owner_digest=action_history_owner_digest(OWNER),
+            tool_name="config.set_feature_state",
+            risk="low_write",
+            status="completed",
+            ok=True,
+            summary="功能开关修改：已完成",
+            safe_details={"feature": "discovery", "enabled": False},
+            elapsed_ms=3,
+        )
+        result = list_action_history(
+            {"limit": 20, "outcome": "all"}, ToolContext(owner=OWNER)
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["count"], 1)
+        self.assertEqual(result.data["items"][0]["details"], {
+            "feature": "discovery", "enabled": False,
+        })
+
+    def test_read_tool_resanitizes_polluted_persisted_rows(self):
+        db.add_agent_action_history(
+            owner_digest=action_history_owner_digest(OWNER),
+            tool_name="strm.run_once",
+            risk="danger",
+            status="token-secret",
+            ok=False,
+            summary="magnet:?xt=secret /private/path token=secret",
+            safe_details={"accepted": True, "token": "secret", "path": "/private"},
+            error_code="private_error",
+            elapsed_ms=3,
+            finished_at="token-secret",
+        )
+        item = list_action_history(
+            {"limit": 1, "outcome": "all"}, ToolContext(owner=OWNER)
+        ).data["items"][0]
+        self.assertEqual(item["tool"], "strm.run_once")
+        self.assertEqual(item["status"], "unavailable")
+        self.assertEqual(item["summary"], "STRM 手动同步：暂时不可用")
+        self.assertEqual(item["details"], {"accepted": True})
+        self.assertEqual(item["error_code"], "")
+        self.assertEqual(item["finished_at"], "")
+        serialized = json.dumps(item, ensure_ascii=False)
+        for secret in ("magnet:", "/private", "token=", "token-secret", "private_error"):
+            self.assertNotIn(secret, serialized)
+
+    def test_history_is_isolated_by_owner_and_requires_identity(self):
+        owner_a = "owner-a"
+        owner_b = "owner-b"
+        for owner, status in ((owner_a, "accepted"), (owner_b, "completed")):
+            db.add_agent_action_history(
+                owner_digest=action_history_owner_digest(owner),
+                tool_name="strm.run_once",
+                risk="danger",
+                status=status,
+                ok=True,
+                summary="STRM 手动同步：已记录",
+            )
+
+        result_a = list_action_history(
+            {"limit": 20, "outcome": "all"}, ToolContext(owner=owner_a)
+        )
+        result_b = list_action_history(
+            {"limit": 20, "outcome": "all"}, ToolContext(owner=owner_b)
+        )
+        self.assertEqual([item["status"] for item in result_a.data["items"]], ["accepted"])
+        self.assertEqual([item["status"] for item in result_b.data["items"]], ["completed"])
+        with self.assertRaises(AgentToolError) as missing:
+            list_action_history(
+                {"limit": 20, "outcome": "all"}, ToolContext()
+            )
+        self.assertEqual(missing.exception.code, "identity_required")
+
+    def test_history_retention_keeps_latest_two_thousand_rows(self):
+        timestamp = db.now()
+        with db.get_conn() as conn:
+            conn.executemany(
+                "INSERT INTO agent_action_history("
+                "tool_name,risk,status,ok,mode,summary,safe_details,error_code,"
+                "elapsed_ms,started_at,finished_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    ("strm.run_once", "danger", "accepted", 1, "confirmed_action",
+                     "STRM 手动同步：已提交", "{}", "", 1, timestamp, timestamp)
+                    for _ in range(2000)
+                ],
+            )
+        newest = db.add_agent_action_history(
+            owner_digest=OWNER_DIGEST,
+            tool_name="strm.run_once",
+            risk="danger",
+            status="accepted",
+            ok=True,
+            summary="STRM 手动同步：已提交",
+            elapsed_ms=1,
+        )
+        with db.get_conn() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM agent_action_history").fetchone()[0]
+            oldest = conn.execute("SELECT MIN(id) FROM agent_action_history").fetchone()[0]
+        self.assertEqual(count, 2000)
+        self.assertEqual(oldest, newest - 1999)
+
+
+class AgentActionHistoryAPITests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        reset_agent_service_for_tests()
+        agent_rate_limiter.reset()
+        self.client = TestClient(create_app())
+        self.client.__enter__()
+
+    @staticmethod
+    def _token(html: str) -> str:
+        match = re.search(r'name="csrf_token"\s+(?:value|content)="([^"]+)"', html)
+        if not match:
+            match = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
+        if not match:
+            raise AssertionError("CSRF token missing")
+        return match.group(1)
+
+    def login(self) -> str:
+        token = self._token(self.client.get("/login").text)
+        response = self.client.post(
+            "/login",
+            data={"username": "admin", "password": "123456", "csrf_token": token},
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 302, response.text)
+        return self._token(self.client.get("/settings").text)
+
+    def test_api_query_requires_auth_and_returns_persisted_history(self):
+        unauthorized = self.client.post(
+            "/api/agent/query", json={"session_id": "test_session_identifier_0001", "message": "查看 Agent 操作历史"}
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+        csrf = self.login()
+        db.add_agent_action_history(
+            owner_digest=action_history_owner_digest(web_agent_owner(csrf, session_id="action_history_http_0001")),
+            tool_name="strm.run_once",
+            risk="danger",
+            status="accepted",
+            ok=True,
+            summary="STRM 手动同步：已提交",
+            safe_details={"accepted": True, "trigger": "manual"},
+            elapsed_ms=5,
+        )
+        response = self.client.post(
+            "/api/agent/query",
+            headers={"X-CSRF-Token": csrf},
+            json={"message": "查看最近 1 条 Agent 操作历史", "session_id": "action_history_http_0001"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["tool_call"]["name"], "agent.action_history")
+        self.assertEqual(body["result"]["data"]["count"], 1)
+        self.assertNotIn("confirmation_id", response.text)
+        self.assertNotIn(csrf, response.text)
+    def test_api_rejects_excessive_history_limit(self):
+        csrf = self.login()
+        response = self.client.post(
+            "/api/agent/query",
+            headers={"X-CSRF-Token": csrf},
+            json={"session_id": "test_session_identifier_0001", "message": "查看最近 99 条 Agent 操作历史"},
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+
+
+if __name__ == "__main__":
+    unittest.main()

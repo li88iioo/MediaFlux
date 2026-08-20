@@ -1,0 +1,63 @@
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime data and secrets
+db/
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/.mediaflux-*.lock
+/mediaflux.pid
+/guangya_token.json
+/.guangya_token.json.generation
+
+# Generated media pointers and local artifacts
+/build/
+/dist/
+strm-data/
+outputs/
+*.part
+*.tmp
+# Local Agent/Superpowers artifacts
+/.superpowers/
+/docs/superpowers/
+
+# Browser and test artifacts
+playwright-report/
+test-results/
+.browser-data/
+
+# WorkBuddy project context (all internal state stays private; never publish)
+.workbuddy/
+
+# Local isolated worktrees
+.worktrees/
+
+# Sensitive model keys
+.model
+
+# 源码运行时生成的私有一致性备份（可能包含凭据）
+/backups/
+
+# Claude-managed local isolated worktrees
+/.claude/worktrees/

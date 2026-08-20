@@ -1,0 +1,123 @@
+{% from "_ui_macros.html" import brand_mark, brand_wordmark, theme_toggle %}
+<!DOCTYPE html>
+<html lang="zh-CN" data-sidebar="expanded">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta name="global-search-url" content="{{ url_for('pages.global_search') }}">
+    <title>{% block title %}MediaFlux{% endblock %}</title>
+    {% include "_theme_bootstrap.html" %}
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='css/main.css') }}?v=20260821a">
+    {% block page_styles %}{% endblock %}
+</head>
+<body class="{% block body_class %}{% endblock %}{% if active in ['logs', 'local_media', 'organize', 'organize_rules', 'downloads', 'rss', 'guangya', 'guangya_offline', 'guangya_more', 'share_transfer', 'guangya_strm', 'media_proxy', 'gcid'] %} compact-workspace-page{% endif %}">
+    <div class="app-shell">
+        <aside class="sidebar" id="sidebar">
+            <div class="brand">
+                <div class="brand-logo">{{ brand_mark('sidebar') }}</div>
+                <div class="brand-text">
+                    {{ brand_wordmark('sidebar') }}
+                    <span class="brand-sub">MEDIA AUTOMATION</span>
+                </div>
+                <button type="button" class="sidebar-collapse-btn" id="collapseSidebar" aria-label="收缩侧栏" title="收缩侧栏" aria-expanded="true"><i data-lucide="panel-left-close"></i></button>
+            </div>
+
+            <nav class="nav">
+                <a href="{{ url_for('pages.dashboard') }}" class="nav-item {% if active=='dashboard' %}active{% endif %}"><i data-lucide="layout-dashboard"></i><span>看板</span></a>
+                {% if agent_enabled %}<a href="{{ url_for('pages.agent') }}" class="nav-item {% if active=='agent' %}active{% endif %}"><i data-lucide="bot"></i><span>Agent</span></a>{% endif %}
+                {% if discovery_enabled %}<a href="{{ url_for('pages.discovery') }}" class="nav-item {% if active=='discovery' %}active{% endif %}"><i data-lucide="clapperboard"></i><span>探索</span></a>{% endif %}
+                <div class="nav-cluster open{% if active in ['guangya','guangya_more','share_transfer','gcid','guangya_offline','guangya_strm','media_proxy','organize'] %} active{% endif %}" data-nav-cluster="guangya" data-nav-default-open="true">
+                    <button type="button" class="nav-item nav-cluster-toggle" aria-controls="guangyaSubmenu guangyaFlyout" aria-expanded="true"><i data-lucide="cloud-cog"></i><span>光鸭</span><i class="nav-cluster-chevron" data-lucide="chevron-down"></i></button>
+                    <div class="nav-submenu" id="guangyaSubmenu">
+                        <a href="{{ url_for('pages.guangya') }}" class="nav-subitem {% if active=='guangya' %}active{% endif %}"><i data-lucide="log-in"></i><span>登录</span></a>
+                        <a href="{{ url_for('pages.guangya_offline') }}" class="nav-subitem {% if active=='guangya_offline' %}active{% endif %}"><i data-lucide="cloud-download"></i><span>离线转存</span></a>
+                        <a href="{{ url_for('pages.organize') }}" class="nav-subitem {% if active=='organize' %}active{% endif %}"><i data-lucide="folder-cog"></i><span>光鸭整理</span></a>
+                        <a href="{{ url_for('pages.guangya_strm') }}" class="nav-subitem {% if active=='guangya_strm' %}active{% endif %}"><i data-lucide="scan-line"></i><span>STRM 同步</span></a>
+                        <a href="{{ url_for('pages.media_proxy') }}" class="nav-subitem {% if active=='media_proxy' %}active{% endif %}"><i data-lucide="route"></i><span>媒体反代</span></a>
+                        <a href="{{ url_for('pages.guangya_more') }}" class="nav-subitem {% if active=='guangya_more' %}active{% endif %}"><i data-lucide="ellipsis"></i><span>更多</span></a>
+                    </div>
+                    <div class="nav-cluster-flyout" id="guangyaFlyout" role="menu" aria-label="光鸭功能" hidden>
+                        <span class="nav-flyout-label">GUANGYA</span>
+                        <a href="{{ url_for('pages.guangya') }}" class="nav-flyout-item{% if active=='guangya' %} active{% endif %}" role="menuitem"><i data-lucide="log-in"></i><span>登录</span></a>
+                        <a href="{{ url_for('pages.guangya_offline') }}" class="nav-flyout-item{% if active=='guangya_offline' %} active{% endif %}" role="menuitem"><i data-lucide="cloud-download"></i><span>离线转存</span></a>
+                        <a href="{{ url_for('pages.organize') }}" class="nav-flyout-item{% if active=='organize' %} active{% endif %}" role="menuitem"><i data-lucide="folder-cog"></i><span>光鸭整理</span></a>
+                        <a href="{{ url_for('pages.guangya_strm') }}" class="nav-flyout-item{% if active=='guangya_strm' %} active{% endif %}" role="menuitem"><i data-lucide="scan-line"></i><span>STRM 同步</span></a>
+                        <a href="{{ url_for('pages.media_proxy') }}" class="nav-flyout-item{% if active=='media_proxy' %} active{% endif %}" role="menuitem"><i data-lucide="route"></i><span>媒体反代</span></a>
+                        <a href="{{ url_for('pages.guangya_more') }}" class="nav-flyout-item{% if active=='guangya_more' %} active{% endif %}" role="menuitem"><i data-lucide="ellipsis"></i><span>更多</span></a>
+                    </div>
+                </div>
+                <a href="{{ url_for('pages.rss') }}" class="nav-item {% if active=='rss' %}active{% endif %}"><i data-lucide="rss"></i><span>订阅</span></a>
+                <a href="{{ url_for('pages.downloads') }}" class="nav-item {% if active=='downloads' %}active{% endif %}"><i data-lucide="circle-arrow-down"></i><span>下载</span></a>
+                <a href="{{ url_for('pages.organize_rules') }}" class="nav-item {% if active=='organize_rules' %}active{% endif %}"><i data-lucide="list-checks"></i><span>整理规则</span></a>
+                <a href="{{ url_for('pages.local_media') }}" class="nav-item {% if active=='local_media' %}active{% endif %}"><i data-lucide="hard-drive"></i><span>本地整理</span></a>
+                <a href="{{ url_for('pages.logs') }}" class="nav-item {% if active=='logs' %}active{% endif %}"><i data-lucide="scroll-text"></i><span>日志记录</span></a>
+                <a href="{{ url_for('pages.settings') }}" class="nav-item {% if active=='settings' %}active{% endif %}"><i data-lucide="settings-2"></i><span>设置</span></a>
+            </nav>
+
+            <div class="sidebar-footer">
+                <form method="post" action="{{ url_for('auth.logout') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="nav-item nav-submit"><i data-lucide="log-out"></i><span>退出登录</span></button>
+                </form>
+            </div>
+        </aside>
+
+        <main class="main">
+            {% block workspace_bar %}
+            <div class="workspace-bar">
+                <button class="icon-btn workspace-menu-btn" id="toggleSidebar" aria-label="菜单" title="打开导航"><i data-lucide="menu"></i></button>
+                {% block workspace_heading %}
+                <div class="workspace-heading">
+                    <span class="workspace-kicker">CONTROL SURFACE</span>
+                    <h1 class="page-title">{% block page_title %}{% endblock %}</h1>
+                </div>
+                {% endblock %}
+                <div class="workspace-actions">{% block workspace_theme_toggle %}{{ theme_toggle('workspace') }}{% endblock %}{% block page_actions %}{% endblock %}</div>
+            </div>
+            {% endblock %}
+            <div class="content">{% block content %}{% endblock %}</div>
+        </main>
+    </div>
+    <div class="app-modal app-confirm-modal" id="appConfirmModal" hidden>
+        <div class="card app-confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="appConfirmTitle" aria-describedby="appConfirmMessage">
+            <div class="app-confirm-icon" data-confirm-icon><i data-lucide="circle-help"></i></div>
+            <div class="app-confirm-copy">
+                <span class="server-kicker" id="appConfirmKicker">CONFIRM ACTION</span>
+                <h2 id="appConfirmTitle">确认操作</h2>
+                <p id="appConfirmMessage"></p>
+                <label class="app-confirm-verify" id="appConfirmVerify" hidden>
+                    <span id="appConfirmVerifyLabel"></span>
+                    <input type="text" class="form-input" id="appConfirmVerifyInput" autocomplete="off">
+                </label>
+            </div>
+            <div class="app-confirm-actions">
+                <button type="button" class="jump-btn" id="appConfirmCancel">取消</button>
+                <button type="button" class="btn btn-primary" id="appConfirmSubmit">确认</button>
+            </div>
+        </div>
+    </div>
+    <div class="app-modal app-message-modal" id="appMessageModal" hidden>
+        <div class="card app-message-dialog" role="alertdialog" aria-modal="true" aria-labelledby="appMessageTitle" aria-describedby="appMessageText">
+            <div class="app-message-icon" data-message-icon><i data-lucide="info"></i></div>
+            <div class="app-message-copy">
+                <span class="server-kicker" id="appMessageKicker">SYSTEM MESSAGE</span>
+                <h2 id="appMessageTitle">提示</h2>
+                <p id="appMessageText"></p>
+            </div>
+            <div class="app-message-actions">
+                <button type="button" class="btn btn-primary" id="appMessageClose">知道了</button>
+            </div>
+        </div>
+    </div>
+    <div class="app-toast-container" id="appToastContainer" aria-live="polite" aria-atomic="true"></div>
+    <script src="{{ url_for('static', path='js/lucide.min.js') }}?v=20260816a"></script>
+    {% if active in ['dashboard', 'agent', 'downloads', 'guangya_strm', 'local_media', 'logs', 'rss'] %}
+    <script src="{{ url_for('static', path='js/vendor/gsap.min.js') }}?v=20260818a"></script>
+    <script src="{{ url_for('static', path='js/motion.js') }}?v=20260820a"></script>
+    {% endif %}
+    <script src="{{ url_for('static', path='js/app.js') }}?v=20260820b"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

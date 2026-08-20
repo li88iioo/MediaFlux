@@ -1,0 +1,717 @@
+{% extends "base.html" %}
+{% block title %}光鸭云盘 - MediaFlux{% endblock %}
+{% block page_title %}光鸭云盘{% endblock %}
+{% block page_styles %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/guangya-directory-scrape.css') }}?v=20260808a">
+{% endblock %}
+
+{% block content %}
+<style>
+.gy-status-card { min-height: 286px; }
+.gy-token-header { display:flex; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; gap:16px; }
+.gy-token-heading { display:flex; align-items:center; gap:12px; min-height:38px; }
+.gy-token-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.gy-token-action { min-width:112px; height:38px; width:112px; justify-content:center; white-space:nowrap; }
+.gy-token-action.is-danger { background:rgba(239,68,68,.12); color:var(--danger); border-color:rgba(239,68,68,.32); }
+.gy-token-operation-status { min-height:22px; margin-top:8px; color:var(--text-muted); font-size:12px; line-height:22px; }
+.gy-token-loading { min-height:220px; display:flex; align-items:center; justify-content:center; }
+@media (max-width:760px) {
+    .gy-token-header { align-items:stretch; }
+    .gy-token-actions { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); width:100%; }
+    .gy-token-action { min-width:0; width:100%; }
+}
+</style>
+
+<!-- 登录状态区域 -->
+<div id="gyStatusContainer">
+    <div class="card card-pad gy-status-card" id="gyStatusLoading">
+        <div class="empty-state gy-token-loading"><p>加载登录状态...</p></div>
+    </div>
+    
+    <div id="gyStatusLoggedIn" style="display:none;">
+        <div class="card card-pad" style="margin-bottom:18px;">
+            <div class="gy-token-header">
+                <div class="gy-token-heading">
+                    <span class="badge online" id="gyTokenBadge"><span class="dot"></span>凭证在线</span>
+                    <div class="badge" id="gyCapabilityBadge" style="margin-left:8px;">
+                        <span class="dot"></span><span id="gyCapabilityText">正在检测 SDK、302 反代与 STRM 配置</span>
+                    </div>
+                </div>
+                <div class="gy-token-actions" aria-label="Token 运维操作">
+                    <button type="button" class="jump-btn gy-token-action" id="gyRefreshTokenBtn" onclick="gyRefreshToken()">刷新 Token</button>
+                    <button type="button" class="jump-btn gy-token-action" id="gyValidateTokenBtn" onclick="gyValidateToken()">校验 Token</button>
+                    <button type="button" class="jump-btn gy-token-action is-danger" id="gyClearTokenBtn" onclick="gyClearToken()">清除 Token</button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card card-pad" style="margin-bottom:18px;">
+            <div class="dir-browser-header">
+                <div class="section-title">目录浏览</div>
+                <div class="dir-browser-actions">
+                    <label class="dir-sort-control" title="调整当前目录排序方式">
+                        <i data-lucide="arrow-up-down"></i>
+                        <select id="gySortSelect" aria-label="目录排序方式" onchange="gySetSortMode(this.value)">
+                            <option value="name_asc">文件名 A–Z</option>
+                            <option value="name_desc">文件名 Z–A</option>
+                            <option value="created_desc">创建时间：新到旧</option>
+                            <option value="created_asc">创建时间：旧到新</option>
+                            <option value="updated_desc">更新时间：新到旧</option>
+                            <option value="updated_asc">更新时间：旧到新</option>
+                            <option value="type_asc">文件类型</option>
+                            <option value="size_desc">文件大小：大到小</option>
+                            <option value="size_asc">文件大小：小到大</option>
+                        </select>
+                    </label>
+                    <div class="dir-view-toggle">
+                        <button type="button" class="icon-btn active" id="gyViewListBtn" aria-label="列表视图" aria-pressed="true" onclick="gySetViewMode('list')">
+                            <i data-lucide="list"></i>
+                        </button>
+                        <button type="button" class="icon-btn" id="gyViewGridBtn" aria-label="网格视图" aria-pressed="false" onclick="gySetViewMode('grid')">
+                            <i data-lucide="layout-grid"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="dir-browser-toolbar">
+                <button type="button" class="jump-btn dir-browser-up" id="gyUpBtn" disabled title="返回上一级">
+                    <i data-lucide="arrow-up"></i>
+                    上一级
+                </button>
+                <nav id="gyBreadcrumb" class="dir-breadcrumb" aria-label="当前目录路径"></nav>
+            </div>
+            <div id="gyDirList"><div class="empty-state"><p>等待凭证校验...</p></div></div>
+        </div>
+    </div>
+    
+    <div class="card card-pad gy-status-card" id="gyStatusLoggedOut" style="display:none; margin-bottom:18px;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;min-height:38px;">
+            <span class="badge offline"><span class="dot"></span>未登录</span>
+            <span class="text-muted">短信验证码登录（两步）</span>
+        </div>
+        <div class="form-group">
+            <label class="form-label">手机号</label>
+            <input type="tel" inputmode="numeric" autocomplete="tel" class="form-input" id="gyPhone" placeholder="请输入手机号" style="max-width:300px;">
+        </div>
+        <button class="btn btn-primary" id="gySendBtn" style="max-width:300px;min-height:42px;" onclick="gySendSms()">发送验证码</button>
+        <div id="gyCodeRow" style="display:none;margin-top:16px;">
+            <div class="form-group">
+                <label class="form-label">验证码</label>
+                <input type="text" class="form-input" id="gyCode" placeholder="收到的短信验证码" style="max-width:300px;">
+            </div>
+            <button class="btn btn-primary" style="max-width:300px;min-height:42px;" onclick="gyLogin()">登录</button>
+        </div>
+        <div id="gyMsg" style="margin-top:12px;min-height:20px;font-size:13px;"></div>
+    </div>
+</div>
+
+<template id="gyDirectoryActionTemplate">
+    <button type="button" class="icon-btn gy-dir-action-btn" aria-label="打开项目操作" aria-haspopup="menu" aria-expanded="false" title="操作">
+        <i data-lucide="ellipsis"></i>
+    </button>
+</template>
+
+<div class="gy-directory-context-menu" id="gyDirectoryContextMenu" role="menu" aria-label="目录与文件操作" hidden>
+    <button type="button" role="menuitem" data-scrape-action="manual">
+        <i data-lucide="search-check"></i>
+        <span><strong>搜索并刮削</strong><small>人工选择 TMDB 媒体</small></span>
+    </button>
+    <button type="button" role="menuitem" data-scrape-action="auto">
+        <i data-lucide="wand-sparkles"></i>
+        <span><strong>自动匹配并刮削</strong><small>可靠命中后直接归档</small></span>
+    </button>
+    <button type="button" role="menuitem" data-browser-action="delete-item" hidden>
+        <i data-lucide="trash-2"></i>
+        <span><strong data-delete-title>删除项目</strong><small data-delete-hint>可在光鸭回收站恢复</small></span>
+    </button>
+</div>
+
+<div class="app-modal gy-scrape-modal" id="gyScrapeModal" hidden>
+    <section class="card gy-scrape-dialog" role="dialog" aria-modal="true" aria-label="搜索并刮削所选媒体">
+        <header class="gy-scrape-head">
+            <div class="gy-scrape-head-context">
+                <i data-lucide="folder-search"></i>
+                <div>
+                    <span>手动刮削</span>
+                    <p id="gyScrapeDirectory">等待目录检查</p>
+                </div>
+            </div>
+            <button type="button" class="icon-btn" id="gyScrapeCloseBtn" aria-label="关闭刮削窗口" title="关闭">
+                <i data-lucide="x"></i>
+            </button>
+        </header>
+
+        <div class="gy-scrape-searchbar">
+            <label class="gy-scrape-query-label">
+                <span>搜索名称</span>
+                <div class="gy-scrape-query-input-wrap">
+                    <input type="search" class="form-input" id="gyScrapeQuery" autocomplete="off" placeholder="输入电影或剧集名称">
+                    <button type="button" class="gy-scrape-clean-btn" id="gyScrapeCleanBtn" title="智能精简搜索词（保留正式副标题，仅移除发布噪声）" aria-label="一键精简搜索名称">
+                        <i data-lucide="sparkles"></i>
+                        <span>一键精简</span>
+                    </button>
+                </div>
+            </label>
+            <label>
+                <span>媒体类型</span>
+                <select class="form-select" id="gyScrapeType">
+                    <option value="auto">自动</option>
+                    <option value="movie">电影</option>
+                    <option value="tv">剧集</option>
+                </select>
+            </label>
+            <div class="gy-scrape-episode-fields" id="gyScrapeEpisodeFields" hidden>
+                <label id="gyScrapeNumberingField" title="自动判断发布组编号是否需要按 TMDB 季集重新映射">
+                    <span>编号方式</span>
+                    <select class="form-select" id="gyScrapeNumbering" aria-label="剧集编号映射方式">
+                        <option value="auto">自动判断</option>
+                        <option value="standard">保持原编号</option>
+                        <option value="absolute">绝对集数</option>
+                        <option value="season_continuous">跨季连续</option>
+                    </select>
+                </label>
+                <label id="gyScrapeSeasonField" title="目录模式下会将季号应用到其中全部剧集文件">
+                    <span>归档季</span>
+                    <input type="number" class="form-input" id="gyScrapeSeason" min="0" max="99" inputmode="numeric" aria-label="归档季号">
+                </label>
+                <label id="gyScrapeEpisodeField">
+                    <span>集</span>
+                    <input type="number" class="form-input" id="gyScrapeEpisode" min="1" max="999" inputmode="numeric" aria-label="归档集号">
+                </label>
+            </div>
+            <button type="button" class="btn btn-primary" id="gyScrapeSearchBtn">
+                <i data-lucide="search"></i><span>搜索</span>
+            </button>
+        </div>
+
+        <div class="gy-scrape-workspace">
+            <section class="gy-scrape-candidate-region" aria-labelledby="gyScrapeCandidateTitle">
+                <div class="gy-scrape-region-head">
+                    <div>
+                        <strong id="gyScrapeCandidateTitle">媒体候选</strong>
+                        <small id="gyScrapeCandidateCount">0 项</small>
+                    </div>
+                    <button type="button" class="jump-btn gy-scrape-external-btn" id="gyScrapeExternalBtn">
+                        <i data-lucide="book-open-check"></i><span>豆瓣 / BGM 线索</span>
+                    </button>
+                </div>
+                <div class="gy-scrape-candidates" id="gyScrapeCandidates" aria-live="polite">
+                    <div class="gy-scrape-placeholder">
+                        <i data-lucide="scan-search"></i>
+                        <strong>等待搜索</strong>
+                        <span>候选结果会保留在这里，切换候选不会引起布局跳动。</span>
+                    </div>
+                </div>
+                <div class="gy-scrape-external-hints" id="gyScrapeExternalHints" hidden aria-live="polite"></div>
+            </section>
+
+            <section class="gy-scrape-detail-region" aria-labelledby="gyScrapeDetailTitle">
+                <div class="gy-scrape-region-head">
+                    <strong id="gyScrapeDetailTitle">媒体与归档预览</strong>
+                    <small id="gyScrapeStatus" aria-live="polite">尚未选择</small>
+                </div>
+                <div class="gy-scrape-detail" id="gyScrapeDetail">
+                    <div class="gy-scrape-placeholder">
+                        <i data-lucide="clapperboard"></i>
+                        <strong>选择一个媒体候选</strong>
+                        <span>选择候选后，将逐项核对源文件、季集映射和最终归档名称。</span>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <footer class="gy-scrape-footer">
+            <div class="gy-scrape-footer-context">
+                <div class="gy-scrape-inspection" id="gyScrapeInspection" data-state="ready" aria-live="polite">
+                    <i data-lucide="shield-check"></i>
+                    <div>
+                        <strong id="gyScrapeInspectionSummary">等待检查</strong>
+                        <span class="sr-only" id="gyScrapeInspectionHint">仅归档已确认文件</span>
+                    </div>
+                </div>
+                <div class="gy-scrape-target">
+                    <strong id="gyScrapePlanSummary">确认前不会写入云盘</strong>
+                    <small id="gyScrapeArchiveTarget">将整理至：等待目录检查</small>
+                </div>
+            </div>
+            <div class="gy-scrape-footer-actions">
+                <button type="button" class="jump-btn" id="gyScrapeCancelBtn">取消</button>
+                <button type="button" class="btn btn-primary" id="gyScrapeRunBtn" disabled>
+                    <i data-lucide="folder-check"></i><span>确认并开始刮削</span>
+                </button>
+            </div>
+        </footer>
+    </section>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='js/guangya-directory-scrape.js') }}?v=20260810a"></script>
+<script>
+function gyApi(path, opts){
+    return fetch('/api/guangya'+path, opts).then(async response=>{
+        const data = await response.json();
+        if(!response.ok) throw new Error(data.error || '请求失败');
+        return data;
+    });
+}
+
+function renderGyCapabilities(data){
+    const badge=document.getElementById('gyCapabilityBadge');
+    const text=document.getElementById('gyCapabilityText');
+    if(!badge||!text) return;
+    const states=[
+        `SDK ${data.sdk_available?'已就绪':'不可用'}`,
+        `302 反代${data.proxy_enabled?'已开启':'未开启'}`,
+        `STRM ${data.strm_configured?'已配置':'未配置'}`,
+    ];
+    badge.className=`badge ${data.sdk_available&&data.proxy_enabled&&data.strm_configured?'online':'offline'}`;
+    text.textContent=states.join(' · ');
+    const details=[];
+    if(data.strm_error) details.push(data.strm_error);
+    if(!data.sdk_available) details.push('请检查 guangyaclient 依赖');
+    badge.title=details.join('；');
+}
+
+let gyDirectoryLoaded=false;
+
+function renderGyTokenStatus(data){
+    const hasToken=Boolean(data.has_access_token||data.has_refresh_token);
+    document.getElementById('gyStatusLoading').style.display='none';
+    document.getElementById('gyStatusLoggedIn').style.display=hasToken?'block':'none';
+    document.getElementById('gyStatusLoggedOut').style.display=hasToken?'none':'block';
+    if(!hasToken) return;
+    const badge = document.getElementById('gyTokenBadge');
+    if (badge) {
+        badge.className = 'badge ' + (data.valid ? 'online' : 'warning');
+        badge.innerHTML = '<span class="dot"></span>' + (data.valid ? '凭证有效' : '凭证失效');
+    }
+    if(data.has_access_token&&!gyDirectoryLoaded){
+        gyDirectoryLoaded=true;
+        gyNavigator.root();
+    }
+}
+
+function setGyTokenButtonLoading(button, loading, pendingLabel=''){
+    if(!button.dataset.label) button.dataset.label=button.textContent;
+    button.disabled=loading;
+    button.setAttribute('aria-busy',loading?'true':'false');
+    button.textContent=loading&&pendingLabel?pendingLabel:button.dataset.label;
+}
+
+function setGyTokenControlsBusy(loading, activeButton=null, pendingLabel=''){
+    document.querySelectorAll('.gy-token-action').forEach(button=>{
+        setGyTokenButtonLoading(
+            button,
+            loading,
+            button===activeButton?pendingLabel:'',
+        );
+    });
+}
+
+async function gyTokenOperation(path, buttonId, pendingLabel, successMessage){
+    const button=document.getElementById(buttonId);
+    setGyTokenControlsBusy(true,button,pendingLabel);
+    try{
+        const data=await gyApi(path,{method:'POST'});
+        renderGyTokenStatus(data);
+        return data;
+    }catch(error){
+        await window.appAlert?.({type:'error', title:'操作失败', message: error.message||'未知错误', trigger:button});
+        throw error;
+    }finally{
+        setGyTokenControlsBusy(false);
+    }
+}
+
+function gyRefreshToken(){
+    return gyTokenOperation('/token/refresh','gyRefreshTokenBtn','刷新中...','Token 已刷新并原子保存。').catch(()=>null);
+}
+
+function gyValidateToken(){
+    return gyTokenOperation('/token/validate','gyValidateTokenBtn','校验中...','Token 校验已完成。').catch(()=>null);
+}
+
+async function gyClearToken(){
+    const confirmed=await appConfirm({title:'清除光鸭 Token',message:'将删除本机保存的 Access Token 与 Refresh Token，需要重新短信登录才能继续访问。',confirmText:'清除 Token',danger:true});
+    if(!confirmed) return;
+    await gyTokenOperation('/token/clear','gyClearTokenBtn','清除中...','Token 已清除。').catch(()=>null);
+}
+
+async function gyLoadStatus(){
+    const results=await Promise.allSettled([
+        gyApi('/token/validate',{method:'POST'}),
+        gyApi('/capabilities'),
+    ]);
+    if(results[0].status==='fulfilled') renderGyTokenStatus(results[0].value);
+    else document.getElementById('gyStatusLoading').innerHTML='<p>状态获取失败</p>';
+    if(results[1].status==='fulfilled') renderGyCapabilities(results[1].value);
+    else {
+        const text=document.getElementById('gyCapabilityText');
+        if(text) text.textContent='能力状态获取失败';
+    }
+}
+
+function gySendSms(){
+    const phone = document.getElementById('gyPhone').value.trim();
+    if(!phone){ document.getElementById('gyMsg').innerHTML='<span style="color:var(--danger)">请输入手机号</span>'; return; }
+    const btn = document.getElementById('gySendBtn');
+    btn.disabled = true; btn.textContent='发送中...';
+    document.getElementById('gyMsg').innerHTML='';
+    gyApi('/send_sms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})}).then(d=>{
+        btn.disabled=false; btn.textContent='重新发送验证码';
+        if(d.success){
+            document.getElementById('gyCodeRow').style.display='block';
+            const hint = d.is_user ? '账号已注册' : '新账号';
+            document.getElementById('gyMsg').innerHTML = '<span style="color:var(--success)">验证码已发送（'+hint+'，'+d.expires_in+'秒有效）</span>';
+        } else {
+            document.getElementById('gyMsg').innerHTML = '<span style="color:var(--danger)">'+(d.error||'发送失败')+'</span>';
+        }
+    }).catch(()=>{ btn.disabled=false; btn.textContent='发送验证码'; document.getElementById('gyMsg').innerHTML='<span style="color:var(--danger)">请求失败</span>'; });
+}
+
+function gyLogin(){
+    const phone = document.getElementById('gyPhone').value.trim();
+    const code = document.getElementById('gyCode').value.trim();
+    if(!code){ document.getElementById('gyMsg').innerHTML='<span style="color:var(--danger)">请输入验证码</span>'; return; }
+    document.getElementById('gyMsg').innerHTML='<span class="text-muted">登录中...</span>';
+    gyApi('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,code})}).then(d=>{
+        if(d.success){ document.getElementById('gyMsg').innerHTML='<span style="color:var(--success)">登录成功</span>'; setTimeout(()=>location.reload(),800); }
+        else { document.getElementById('gyMsg').innerHTML='<span style="color:var(--danger)">'+(d.error||'登录失败')+'</span>'; }
+    }).catch(()=>{ document.getElementById('gyMsg').innerHTML='<span style="color:var(--danger)">请求失败</span>'; });
+}
+
+const gyDirList = document.getElementById('gyDirList');
+const gyUpBtn = document.getElementById('gyUpBtn');
+const gyBreadcrumb = document.getElementById('gyBreadcrumb');
+
+function gyEmptyState(message){
+    const box = document.createElement('div');
+    box.className = 'empty-state';
+    const text = document.createElement('p');
+    text.textContent = message;
+    box.appendChild(text);
+    return box;
+}
+
+function parseGuangYaDirName(rawName) {
+    const source = String(rawName || '').trim();
+    if (!source) return { title: '', tags: [], raw: '' };
+
+    const tags = [];
+    const seen = new Set();
+    const addTag = (type, text) => {
+        const value = String(text || '').trim();
+        const key = `${type}:${value.toLocaleLowerCase()}`;
+        if (!value || seen.has(key)) return;
+        seen.add(key);
+        tags.push({ type, text: value });
+    };
+    const canonical = (value, table) => {
+        const key = String(value || '').replace(/[\s._-]+/g, '').toLowerCase();
+        return table[key] || String(value || '').trim();
+    };
+    const isReleaseGroup = (content, offset) => {
+        if (offset !== 0) return false;
+        const value = String(content || '').trim();
+        const compact = value.length <= 24
+            && !/\s/.test(value)
+            && /^[\p{L}\p{N}][\p{L}\p{N}.'&+_-]*$/u.test(value);
+        const namedGroup = value.length <= 40
+            && /(?:raws?|house|kissaten|enc|字幕[组組]|压制|壓制|製作|team|group)/i.test(value);
+        return compact || namedGroup;
+    };
+    const classify = (content, offset) => {
+        const value = String(content || '').trim();
+        const found = [];
+        let rest = value;
+        const consume = (regex, type, normalize = (match) => match) => {
+            rest = rest.replace(regex, (...args) => {
+                const match = args[0];
+                found.push({ type, text: normalize(match) });
+                return ' ';
+            });
+        };
+
+        consume(/\btmdb[\s_-]*\d+\b/gi, 'tmdb', (match) => `TMDB ${match.match(/\d+/)[0]}`);
+        consume(/\b(?:19|20)\d{2}\b/g, 'year');
+        consume(/(?:\bS\d{1,2}(?:E\d{1,3})?\b|\bS\d{1,2}\s*[-~]\s*S?\d{1,2}\b|\b\d{1,3}\s*[-~]\s*\d{1,3}\b|第[零〇一二两三四五六七八九十百0-9]{1,4}季)/gi, 'season', (match) => match.replace(/\s+/g, '').replace('~', '-').toUpperCase());
+        consume(/\b(?:480p|720p|1080p|1440p|2160p|4k|8k|uhd)\b/gi, 'resolution', (match) => match.toUpperCase());
+        consume(/\b(?:web[ ._-]?dl|web[ ._-]?rip|blu[ ._-]?ray|bd[ ._-]?rip|remux|hdrip|dvd[ ._-]?rip|baha|bilibili|cr|netflix|nf|disney\+?|amazon|amzn|itunes)\b|(?:蓝光压制|藍光壓製)/gi, 'source', (match) => canonical(match, {
+            webdl: 'WEB-DL', webrip: 'WEBRip', bluray: 'BluRay', bdrip: 'BDRip',
+            remux: 'Remux', hdrip: 'HDRip', dvdrip: 'DVDRip', baha: 'Baha',
+            bilibili: 'Bilibili', cr: 'CR', netflix: 'Netflix', nf: 'NF',
+            disney: 'Disney', 'disney+': 'Disney+', amazon: 'Amazon', amzn: 'AMZN', itunes: 'iTunes',
+            蓝光压制: '蓝光压制', 藍光壓製: '藍光壓製',
+        }));
+        consume(/\b(?:h[ ._-]?264|h[ ._-]?265|x264|x265|avc|hevc|av1|10[ ._-]?bit)\b(?:编码|編碼)?/gi, 'video', (match) => canonical(match.replace(/(?:编码|編碼)$/i, ''), {
+            h264: 'H.264', h265: 'H.265', x264: 'x264', x265: 'x265',
+            avc: 'AVC', hevc: 'HEVC', av1: 'AV1', '10bit': '10bit',
+        }));
+        consume(/\b(?:hdr10\+?|hdr|sdr|dolby[ ._-]?vision|dv)\b/gi, 'color', (match) => canonical(match, {
+            hdr: 'HDR', hdr10: 'HDR10', 'hdr10+': 'HDR10+', sdr: 'SDR',
+            dolbyvision: 'Dolby Vision', dv: 'DV',
+        }));
+        consume(/\b(?:aac|flac|ac[ ._-]?3|eac[ ._-]?3|ddp(?:[ ._-]?\d(?:\.\d)?)?|dts(?:[ ._-]?hd)?|truehd|atmos)\b/gi, 'audio', (match) => canonical(match, {
+            aac: 'AAC', flac: 'FLAC', ac3: 'AC3', eac3: 'EAC3', ddp: 'DDP',
+            'ddp20': 'DDP 2.0', 'ddp51': 'DDP 5.1', dts: 'DTS', dtshd: 'DTS-HD',
+            truehd: 'TrueHD', atmos: 'Atmos',
+        }));
+        consume(/\b(?:chs|cht|big5|gb|multi|fre|ita|lat|rus|ukr|jpn|eng|srtx?\d*|assx?\d*)\b|(?:简繁英字幕|簡繁英字幕|简繁字幕|簡繁字幕|中文字幕|中字|简中|簡中|繁中|中英双语|中英雙語|粤语|粵語|日语|日語|英语|英語)/gi, 'language', (match) => /^[a-z0-9]+$/i.test(match) ? match.toUpperCase() : match);
+        consume(/\b(?:mkv|mp4)\b/gi, 'format', (match) => match.toUpperCase());
+
+        if (found.length && !rest.replace(/[\s,;/+|._~-]+/g, '')) return found;
+        if (isReleaseGroup(value, offset)) return [{ type: 'group', text: value }];
+        return null;
+    };
+
+    const bracketRegex = /[\(\[（【]([^\(\)\[\]（）【】]+)[\)\]）】]/g;
+    let title = source.replace(bracketRegex, (token, content, offset) => {
+        const classified = classify(content, offset);
+        if (!classified) return token;
+        classified.forEach((tag) => addTag(tag.type, tag.text));
+        return ' ';
+    });
+    title = title.replace(/\s+/g, ' ').replace(/^[\s_-]+|[\s_-]+$/g, '');
+    const singleBracketTitle = title.match(/^[\[【（(]([^\]】）)]+)[\]】）)]$/);
+    if (singleBracketTitle) title = singleBracketTitle[1].replace(/_+/g, ' ').trim();
+    if (!title) title = source;
+
+    const priority = {
+        group: 10, season: 20, year: 30, resolution: 40, source: 50,
+        video: 60, color: 65, audio: 70, language: 80, format: 90, tmdb: 100,
+    };
+    tags.sort((left, right) => (priority[left.type] || 999) - (priority[right.type] || 999));
+    return { title, tags, raw: source };
+}
+
+const gyNameCollator = new Intl.Collator('zh-CN', {
+    numeric: true,
+    sensitivity: 'base',
+});
+const gySortModes = new Set([
+    'name_asc', 'name_desc',
+    'created_desc', 'created_asc',
+    'updated_desc', 'updated_asc',
+    'type_asc', 'size_desc', 'size_asc',
+]);
+let gySortMode = localStorage.getItem('mediaflux_gy_sort_mode') || 'name_asc';
+if (!gySortModes.has(gySortMode)) gySortMode = 'name_asc';
+let gyDirectoryItems = [];
+
+function gyFileExtension(item){
+    if(item.is_dir) return 'folder';
+    const explicit = String(item.extension || '').replace(/^\./, '').toLowerCase();
+    if(explicit) return explicit;
+    const name = String(item.name || '');
+    return name.includes('.') ? name.split('.').pop().toLowerCase() : '';
+}
+
+function gyTimeValue(value){
+    const parsed = Number(value || 0);
+    if(!Number.isFinite(parsed) || parsed <= 0) return 0;
+    return parsed < 100000000000 ? parsed * 1000 : parsed;
+}
+
+function gyFormatTime(value){
+    const time = gyTimeValue(value);
+    if(!time) return '时间未知';
+    return new Intl.DateTimeFormat('zh-CN', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(new Date(time));
+}
+
+function gyFormatSize(value){
+    const size = Math.max(0, Number(value || 0));
+    if(size >= 1073741824) return `${(size / 1073741824).toFixed(2)} GB`;
+    if(size >= 1048576) return `${(size / 1048576).toFixed(1)} MB`;
+    if(size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
+    return `${Math.round(size)} B`;
+}
+
+function gyItemMeta(item, isDirectory){
+    if(gySortMode.startsWith('created_')) return `创建 ${gyFormatTime(item.created_at)}`;
+    if(gySortMode.startsWith('updated_')) return `更新 ${gyFormatTime(item.updated_at)}`;
+    if(gySortMode === 'type_asc') {
+        const extension = gyFileExtension(item);
+        return isDirectory ? '文件夹' : (extension ? `${extension.toUpperCase()} 文件` : '无扩展名文件');
+    }
+    return isDirectory ? '文件夹' : gyFormatSize(item.size);
+}
+
+function gyCompareOptionalNumber(left, right, descending){
+    const a = Number(left || 0);
+    const b = Number(right || 0);
+    const aValid = Number.isFinite(a) && a > 0;
+    const bValid = Number.isFinite(b) && b > 0;
+    if(aValid !== bValid) return aValid ? -1 : 1;
+    if(!aValid) return 0;
+    if(a === b) return 0;
+    return descending ? (b > a ? 1 : -1) : (a > b ? 1 : -1);
+}
+
+function gyCompareItems(left, right){
+    let result = 0;
+    if(gySortMode === 'name_desc') result = gyNameCollator.compare(right.name || '', left.name || '');
+    else if(gySortMode === 'created_desc') result = gyCompareOptionalNumber(left.created_at, right.created_at, true);
+    else if(gySortMode === 'created_asc') result = gyCompareOptionalNumber(left.created_at, right.created_at, false);
+    else if(gySortMode === 'updated_desc') result = gyCompareOptionalNumber(left.updated_at, right.updated_at, true);
+    else if(gySortMode === 'updated_asc') result = gyCompareOptionalNumber(left.updated_at, right.updated_at, false);
+    else if(gySortMode === 'type_asc') result = gyNameCollator.compare(gyFileExtension(left), gyFileExtension(right));
+    else if(gySortMode === 'size_desc') result = gyCompareOptionalNumber(left.size, right.size, true);
+    else if(gySortMode === 'size_asc') result = gyCompareOptionalNumber(left.size, right.size, false);
+    else result = gyNameCollator.compare(left.name || '', right.name || '');
+    if(result) return result;
+    result = gyNameCollator.compare(left.name || '', right.name || '');
+    if(result) return result;
+    return String(left.file_id || '').localeCompare(String(right.file_id || ''));
+}
+
+function gySetSortMode(mode){
+    gySortMode = gySortModes.has(mode) ? mode : 'name_asc';
+    localStorage.setItem('mediaflux_gy_sort_mode', gySortMode);
+    const select = document.getElementById('gySortSelect');
+    if(select && select.value !== gySortMode) select.value = gySortMode;
+    if(gyDirectoryItems.length) gyRenderItems(gyDirectoryItems);
+}
+
+const GY_DIR_VISIBLE_TAG_LIMIT = 3;
+
+function gyMediaRow(item, isDirectory){
+    const row = document.createElement('div');
+    row.className = 'gy-dir-row';
+
+    const icon = document.createElement('div');
+    icon.className = 'gy-dir-icon ' + (isDirectory ? 'is-folder' : 'is-file');
+    const glyph = document.createElement('i');
+    glyph.setAttribute('data-lucide', isDirectory ? 'folder' : 'file');
+    icon.appendChild(glyph);
+
+    // 目录名允许拆出年份/TMDB/规格标签；文件名必须完整展示。
+    // 发布组文件名常由多段 [] 组成，按目录规则解析会把正文一并剥掉，
+    // 最终只剩扩展名（例如 `.mkv`）。
+    const parsed = isDirectory
+        ? parseGuangYaDirName(item.name)
+        : { title: String(item.name || ''), tags: [], raw: String(item.name || '') };
+
+    const info = document.createElement('div');
+    info.className = 'gy-dir-info';
+
+    const name = document.createElement('div');
+    name.className = 'gy-dir-name';
+    name.textContent = parsed.title;
+    name.title = item.name;
+    info.appendChild(name);
+
+    const tagsBox = document.createElement('div');
+    tagsBox.className = 'gy-dir-tags';
+    if (!parsed.tags.length) tagsBox.classList.add('is-empty');
+    const visibleTags = parsed.tags.slice(0, GY_DIR_VISIBLE_TAG_LIMIT);
+    visibleTags.forEach(t => {
+        const badge = document.createElement('span');
+        badge.className = `gy-dir-tag-badge tag-${t.type}`;
+        badge.textContent = t.text;
+        tagsBox.appendChild(badge);
+    });
+    const hiddenTags = parsed.tags.slice(GY_DIR_VISIBLE_TAG_LIMIT);
+    if (hiddenTags.length) {
+        const more = document.createElement('span');
+        more.className = 'gy-dir-tag-badge tag-more';
+        more.textContent = `+${hiddenTags.length}`;
+        more.title = hiddenTags.map(tag => tag.text).join(' · ');
+        tagsBox.appendChild(more);
+    }
+    info.appendChild(tagsBox);
+
+    const sub = document.createElement('div');
+    sub.className = 'gy-dir-sub';
+    sub.textContent = gyItemMeta(item, isDirectory);
+    info.appendChild(sub);
+
+    let summary;
+    if(isDirectory){
+        summary = document.createElement('button');
+        summary.type = 'button';
+        summary.className = 'gy-dir-summary is-actionable';
+        summary.title = `打开 ${item.name}`;
+        summary.addEventListener('click', ()=>gyNavigator.enter({id:item.file_id, name:item.name}));
+    } else {
+        summary = document.createElement('div');
+        summary.className = 'gy-dir-summary';
+    }
+    summary.append(icon, info);
+
+    const actionTemplate = document.getElementById('gyDirectoryActionTemplate');
+    const action = actionTemplate.content.firstElementChild.cloneNode(true);
+    action.className = 'gy-dir-action-btn';
+
+    row.append(summary, action);
+    window.GuangYaDirectoryScrapeUI?.bindMediaRow(row, item, action);
+    return row;
+}
+
+function gyRenderItems(items){
+    gyDirectoryItems = Array.from(items || []);
+    gyDirList.replaceChildren();
+    if(!gyDirectoryItems.length){
+        gyDirList.appendChild(gyEmptyState('空目录'));
+        return;
+    }
+    const dirs = gyDirectoryItems.filter(item=>item.is_dir).sort(gyCompareItems);
+    const files = gyDirectoryItems.filter(item=>!item.is_dir).sort(gyCompareItems);
+    dirs.forEach(item=>gyDirList.appendChild(gyMediaRow(item, true)));
+    files.forEach(item=>gyDirList.appendChild(gyMediaRow(item, false)));
+    if(!dirs.length && !files.length) gyDirList.appendChild(gyEmptyState('无文件'));
+}
+
+const gyNavigator = createGuangYaDirectoryNavigator({
+    rootId: '0',
+    fetchDirectory: (id)=>gyApi('/dirs?parent_id='+encodeURIComponent(id)),
+    onLoading: ()=>gyDirList.replaceChildren(gyEmptyState('加载中...')),
+    onPathChange: (state)=>{
+        renderDirectoryBreadcrumb(gyBreadcrumb, state.path, index=>gyNavigator.goTo(index));
+        gyUpBtn.disabled = state.isRoot;
+    },
+    onLoaded: (items)=>gyRenderItems(items),
+    onError: (error)=>gyDirList.replaceChildren(gyEmptyState(error.message || '加载失败')),
+});
+window.gyNavigator = gyNavigator;
+
+gyUpBtn.addEventListener('click', ()=>gyNavigator.up());
+renderDirectoryBreadcrumb(gyBreadcrumb, [], index=>gyNavigator.goTo(index));
+
+
+let gyViewMode = localStorage.getItem('mediaflux_gy_view_mode') || 'list';
+function gySetViewMode(mode) {
+    const nextMode = mode === 'grid' ? 'grid' : 'list';
+    gyViewMode = nextMode;
+    localStorage.setItem('mediaflux_gy_view_mode', nextMode);
+    const listBtn = document.getElementById('gyViewListBtn');
+    const gridBtn = document.getElementById('gyViewGridBtn');
+    const dirList = document.getElementById('gyDirList');
+    if (listBtn) {
+        listBtn.classList.toggle('active', nextMode === 'list');
+        listBtn.setAttribute('aria-pressed', String(nextMode === 'list'));
+    }
+    if (gridBtn) {
+        gridBtn.classList.toggle('active', nextMode === 'grid');
+        gridBtn.setAttribute('aria-pressed', String(nextMode === 'grid'));
+    }
+    if (dirList) {
+        dirList.classList.add('is-view-switching');
+        dirList.classList.toggle('is-list', nextMode === 'list');
+        dirList.classList.toggle('is-grid', nextMode === 'grid');
+        // 先以最终布局完成一次同步样式计算，再恢复 hover 过渡，避免
+        // list -> grid 时未定义的左右边框颜色和操作按钮 opacity 被补间。
+        void dirList.offsetWidth;
+        dirList.classList.remove('is-view-switching');
+    }
+}
+
+gySetViewMode(gyViewMode);
+gySetSortMode(gySortMode);
+gyLoadStatus();
+</script>
+{% endblock %}

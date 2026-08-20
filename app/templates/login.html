@@ -1,0 +1,310 @@
+{% from "_ui_macros.html" import brand_mark, brand_wordmark, theme_toggle %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% if setup_mode %}00 // INITIALIZE{% else %}01 // CONTROL SURFACE{% endif %} - MediaFlux</title>
+    {% include "_theme_bootstrap.html" %}
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='css/core-layout.css') }}?v=20260818c">
+</head>
+<body>
+    <div class="login-page{% if login_wallpaper and not setup_mode %} login-page--wallpaper{% endif %}"{% if login_wallpaper and not setup_mode %} style="--login-wallpaper: url('{{ login_wallpaper.image_url }}');"{% endif %}>
+        <!-- 全屏物理交互粒子画布 -->
+        <canvas id="telemetry-canvas"></canvas>
+
+        <!-- 顶部边缘状态条 -->
+        <header class="login-header">
+            <span class="login-index">{% if setup_mode %}00 / INIT_SEQUENCE{% else %}01 / CORE_BOOT{% endif %}</span>
+            <div class="login-signal" id="systemSignal">
+                {% if setup_mode %}INITIALIZATION REQUIRED{% else %}SYSTEM SIGNAL STABLE{% endif %}
+            </div>
+            {{ theme_toggle('login') }}
+        </header>
+
+        <!-- 居中悬浮极简玻璃卡片 -->
+        <div class="login-card-container">
+            <div class="login-card">
+                <div class="login-logo">
+                    {{ brand_mark('login') }}
+                </div>
+
+                {% if setup_mode %}
+                <div class="login-kicker">INIT // SYSTEM_DEPLOY</div>
+                {% endif %}
+
+                <h1 class="login-title">{{ brand_wordmark('login') }}</h1>
+                <p class="login-sub">{% if setup_mode %}控制台初始化 · 配置首个管理员凭据{% else %}自动化媒体整理引擎控制面板{% endif %}</p>
+
+                <!-- 极简错误警报框 -->
+                <div class="form-error{% if not error %} is-empty{% endif %}" role="alert">
+                    <i data-lucide="alert-triangle" style="width:15px;height:15px;flex-shrink:0;"></i>
+                    <span>{{ error }}</span>
+                </div>
+
+                {% if setup_mode %}
+                <form class="login-form setup-form" method="post" action="{{ url_for('auth.setup_submit') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                    <div class="form-group">
+                        <label class="form-label" for="setup-username">管理员用户名</label>
+                        <input id="setup-username" type="text" name="username" class="form-input" placeholder="admin" value="{{ username|default('') }}" autocomplete="username" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="setup-password">安全访问密码</label>
+                        <div class="secret-input-shell">
+                            <input id="setup-password" type="password" name="password" class="form-input" placeholder="至少输入 8 位字符" autocomplete="new-password" required>
+                            <button type="button" class="secret-input-toggle" onclick="const p = document.getElementById('setup-password'); p.type = p.type === 'password' ? 'text' : 'password'; this.querySelector('.eye-icon').style.display = p.type === 'password' ? 'block' : 'none'; this.querySelector('.eye-off-icon').style.display = p.type === 'password' ? 'none' : 'block';">
+                                <i data-lucide="eye" class="eye-icon"></i>
+                                <i data-lucide="eye-off" class="eye-off-icon" style="display:none"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="setup-password-confirm">确认安全密码</label>
+                        <div class="secret-input-shell">
+                            <input id="setup-password-confirm" type="password" name="password_confirm" class="form-input" placeholder="请再次输入以确认" autocomplete="new-password" required>
+                            <button type="button" class="secret-input-toggle" onclick="const p = document.getElementById('setup-password-confirm'); p.type = p.type === 'password' ? 'text' : 'password'; this.querySelector('.eye-icon').style.display = p.type === 'password' ? 'block' : 'none'; this.querySelector('.eye-off-icon').style.display = p.type === 'password' ? 'none' : 'block';">
+                                <i data-lucide="eye" class="eye-icon"></i>
+                                <i data-lucide="eye-off" class="eye-off-icon" style="display:none"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary">完成部署并登录<i data-lucide="arrow-right"></i></button>
+                </form>
+                {% else %}
+                <form class="login-form" method="post" action="{{ url_for('auth.login_submit') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                    <div class="form-group">
+                        <label class="form-label" for="login-username">用户名</label>
+                        <input id="login-username" type="text" name="username" class="form-input" placeholder="admin" autocomplete="username" autofocus required>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="login-password">安全密码</label>
+                        <div class="secret-input-shell">
+                            <input id="login-password" type="password" name="password" class="form-input" placeholder="输入控制台访问凭证" autocomplete="current-password" required>
+                            <button type="button" class="secret-input-toggle" onclick="const p = document.getElementById('login-password'); p.type = p.type === 'password' ? 'text' : 'password'; this.querySelector('.eye-icon').style.display = p.type === 'password' ? 'block' : 'none'; this.querySelector('.eye-off-icon').style.display = p.type === 'password' ? 'none' : 'block';">
+                                <i data-lucide="eye" class="eye-icon"></i>
+                                <i data-lucide="eye-off" class="eye-off-icon" style="display:none"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary">验证凭证进入系统<i data-lucide="arrow-right"></i></button>
+                </form>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- 底部边缘跑马灯状态流 & 壁纸源 -->
+        <footer class="login-footer">
+            <div class="ticker-wrap">
+                <div class="ticker-content" id="telemetryTicker">
+                    <!-- Log streams injected dynamically -->
+                </div>
+            </div>
+            {% if login_wallpaper and not setup_mode %}
+            <a class="login-wallpaper-link" href="{{ login_wallpaper.tmdb_url }}" target="_blank" rel="noopener noreferrer" aria-label="在 TMDB 查看 {{ login_wallpaper.title }}">
+                <i data-lucide="clapperboard"></i>
+                <span>{{ login_wallpaper.title }}</span>
+            </a>
+            {% endif %}
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', path='js/lucide.min.js') }}?v=20260816a"></script>
+    <script src="{{ url_for('static', path='js/app.js') }}?v=20260816a"></script>
+
+    <!-- 交互画布与跑马灯日志脚本 -->
+    <script>
+    (function() {
+        const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const saveData = Boolean(navigator.connection && navigator.connection.saveData);
+        const motionDisabled = reducedMotion || saveData;
+
+        // 1. 跑马灯滚动系统日志流
+        const ticker = document.getElementById('telemetryTicker');
+        if (ticker) {
+            const rawLogs = [
+                "SYSTEM: Boot online.",
+                "CONN: Database connected successfully.",
+                "SCHED: STRM engine scanning directory hierarchy...",
+                "NET: Listening on port 1258.",
+                "LOAD: Config file user.env processed.",
+                "RSS: Feeds active.",
+                "QB: Client alive.",
+                "FLOW: Ready."
+            ];
+            // 构造跑马灯连贯内容
+            ticker.innerHTML = rawLogs.map(log => `<span>[${new Date().toLocaleTimeString()}] ${log}</span>`).join('<span class="divider">//</span>');
+
+            if (!motionDisabled) {
+                // 动效允许时才周期更新，避免低功耗和减少动态效果模式持续唤醒页面。
+                setInterval(() => {
+                    const randomLog = rawLogs[Math.floor(Math.random() * rawLogs.length)];
+                    const spans = ticker.querySelectorAll('span:not(.divider)');
+                    if (spans.length > 0) {
+                        const targetSpan = spans[Math.floor(Math.random() * spans.length)];
+                        targetSpan.textContent = `[${new Date().toLocaleTimeString()}] ${randomLog}`;
+                    }
+                }, 3000);
+            }
+        }
+
+        // 2. 全屏 Canvas 粒子效果 (Theme Aware)
+        const canvas = document.getElementById('telemetry-canvas');
+        if (canvas && !motionDisabled) {
+            const ctx = canvas.getContext('2d');
+            let width = canvas.width = window.innerWidth;
+            let height = canvas.height = window.innerHeight;
+
+            // Theme colors
+            let brandColor = '#00f0b5';
+            let gridColor = '#1a2233';
+
+            function updateThemeColors() {
+                const computed = getComputedStyle(document.documentElement);
+                brandColor = computed.getPropertyValue('--mf-brand').trim() || '#00f0b5';
+                gridColor = computed.getPropertyValue('--mf-border-strong').trim() || '#1a2233';
+            }
+            updateThemeColors();
+
+            // Listen for theme changes
+            const observer = new MutationObserver((mutations) => {
+                mutations.forEach((mutation) => {
+                    if (mutation.attributeName === 'data-theme') {
+                        updateThemeColors();
+                    }
+                });
+            });
+            observer.observe(document.documentElement, { attributes: true });
+
+            window.addEventListener('resize', () => {
+                if (canvas) {
+                    width = canvas.width = window.innerWidth;
+                    height = canvas.height = window.innerHeight;
+                }
+            });
+
+            const particles = [];
+            const particleCount = Math.min(42, Math.max(20, Math.floor((width * height) / 45000)));
+            const mouse = { x: null, y: null, radius: 120 };
+
+            class Particle {
+                constructor() {
+                    this.x = Math.random() * width;
+                    this.y = Math.random() * height;
+                    this.baseX = this.x;
+                    this.baseY = this.y;
+                    this.density = (Math.random() * 25) + 10;
+                    this.size = Math.random() * 1.5 + 0.8;
+                }
+                update() {
+                    if (mouse.x !== null) {
+                        let dx = mouse.x - this.x;
+                        let dy = mouse.y - this.y;
+                        let distance = Math.sqrt(dx * dx + dy * dy);
+                        let forceDirectionX = distance > 0 ? dx / distance : 0;
+                        let forceDirectionY = distance > 0 ? dy / distance : 0;
+                        let maxDistance = mouse.radius;
+                        let force = (maxDistance - distance) / maxDistance;
+                        let directionX = forceDirectionX * force * this.density;
+                        let directionY = forceDirectionY * force * this.density;
+
+                        if (distance < mouse.radius) {
+                            this.x -= directionX;
+                            this.y -= directionY;
+                        } else {
+                            if (this.x !== this.baseX) {
+                                let dx = this.x - this.baseX;
+                                this.x -= dx / 15;
+                            }
+                            if (this.y !== this.baseY) {
+                                let dy = this.y - this.baseY;
+                                this.y -= dy / 15;
+                            }
+                        }
+                    }
+                }
+                draw() {
+                    ctx.fillStyle = brandColor;
+                    ctx.globalAlpha = 0.35;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                    ctx.closePath();
+                    ctx.fill();
+                }
+            }
+
+            for (let i = 0; i < particleCount; i++) {
+                particles.push(new Particle());
+            }
+
+            window.addEventListener('mousemove', (e) => {
+                mouse.x = e.clientX;
+                mouse.y = e.clientY;
+            });
+
+            window.addEventListener('mouseout', () => {
+                mouse.x = null;
+                mouse.y = null;
+            });
+
+            function animate() {
+                ctx.clearRect(0, 0, width, height);
+
+                // 全屏精细网格线背景
+                ctx.strokeStyle = gridColor;
+                ctx.lineWidth = 0.5;
+                ctx.globalAlpha = 0.25;
+                const gridSize = 50;
+                for (let x = 0; x < width; x += gridSize) {
+                    ctx.beginPath();
+                    ctx.moveTo(x, 0);
+                    ctx.lineTo(x, height);
+                    ctx.stroke();
+                }
+                for (let y = 0; y < height; y += gridSize) {
+                    ctx.beginPath();
+                    ctx.moveTo(0, y);
+                    ctx.lineTo(width, y);
+                    ctx.stroke();
+                }
+
+                ctx.globalAlpha = 1.0;
+                particles.forEach(p => {
+                    p.update();
+                    p.draw();
+                });
+
+                // 画笔连线
+                ctx.strokeStyle = brandColor;
+                ctx.globalAlpha = 0.15;
+                ctx.lineWidth = 1.0;
+                for (let a = 0; a < particles.length; a++) {
+                    for (let b = a; b < particles.length; b++) {
+                        let dx = particles[a].x - particles[b].x;
+                        let dy = particles[a].y - particles[b].y;
+                        let dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist < 90) {
+                            ctx.beginPath();
+                            ctx.moveTo(particles[a].x, particles[a].y);
+                            ctx.lineTo(particles[b].x, particles[b].y);
+                            ctx.stroke();
+                        }
+                    }
+                }
+                requestAnimationFrame(animate);
+            }
+            animate();
+        }
+    })();
+    </script>
+</body>
+</html>

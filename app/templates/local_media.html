@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+{% block title %}本地媒体 - MediaFlux{% endblock %}
+{% block page_title %}本地媒体{% endblock %}
+{% block body_class %}local-media-page{% endblock %}
+{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260820c">{% endblock %}
+
+{% block content %}
+<div class="lm-page" data-windows-package="{{ '1' if package_type == 'windows' else '0' }}">
+    <div class="lm-command-strip" aria-label="本地媒体运行状态">
+        <div class="lm-stat"><span>媒体来源</span><strong id="lmSourceCount">—</strong></div>
+        <div class="lm-stat"><span>处理中</span><strong id="lmPendingCount">—</strong></div>
+        <div class="lm-stat"><span>待确认</span><strong id="lmReviewCount">—</strong></div>
+        <button class="jump-btn lm-refresh-btn" type="button" id="lmRefreshBtn"><i data-lucide="refresh-cw"></i><span data-button-label>刷新</span></button>
+    </div>
+
+    <section class="card lm-workspace-card">
+        <div class="dl-tab-header lm-tab-header">
+            <div class="dl-tab-bar lm-tab-bar" role="tablist" aria-label="本地媒体视图切换">
+                <button type="button" class="dl-tab-btn lm-tab-btn active" data-tab-target="tasks" role="tab" id="lmTabTasksBtn">
+                    <i data-lucide="list-todo"></i><span>整理任务</span>
+                    <span class="dl-tab-badge" id="lmTasksTabBadge">0</span>
+                </button>
+                <button type="button" class="dl-tab-btn lm-tab-btn" data-tab-target="sources" role="tab" id="lmTabSourcesBtn">
+                    <i data-lucide="folder-git-2"></i><span>媒体来源</span>
+                    <span class="dl-tab-badge" id="lmSourcesTabBadge">0</span>
+                </button>
+                <button type="button" class="dl-tab-btn lm-tab-btn" data-tab-target="review" role="tab" id="lmTabReviewBtn">
+                    <i data-lucide="circle-alert"></i><span>待确认</span>
+                    <span class="dl-tab-badge" id="lmReviewBadge">0</span>
+                </button>
+                <button type="button" class="dl-tab-btn lm-tab-btn" data-tab-target="manual" role="tab" id="lmTabManualBtn">
+                    <i data-lucide="folder-search-2"></i><span>手动整理</span>
+                    <span class="dl-tab-badge" id="lmManualState">0</span>
+                </button>
+            </div>
+            <div class="lm-tab-actions">
+                <div class="lm-tab-action-group" data-tab-action="tasks">
+                    <select class="form-select lm-filter" id="lmTaskFilter" aria-label="筛选整理任务状态">
+                        <option value="">全部状态</option><option value="waiting_stable">等待稳定</option><option value="recognizing">识别中</option>
+                        <option value="requires_manual">待确认</option><option value="moving">移动中</option><option value="completed">已完成</option><option value="failed">失败</option>
+                    </select>
+                </div>
+                <div class="lm-tab-action-group" data-tab-action="sources" hidden>
+                    <button class="btn btn-primary lm-compact-btn" type="button" id="lmAddSourceBtn"><i data-lucide="plus"></i><span>新增来源</span></button>
+                </div>
+                <div class="lm-tab-action-group" data-tab-action="review" hidden>
+                    <span class="lm-tab-hint"><i data-lucide="info"></i>点击「人工确认」会打开同款刮削弹窗匹配 TMDB</span>
+                </div>
+                <div class="lm-tab-action-group" data-tab-action="manual" hidden>
+                    <span class="lm-safe-label"><i data-lucide="shield-check"></i>右键条目进行刮削，确认前不写入媒体库</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="lm-tab-panel active" data-tab-panel="tasks" id="lmTasksSection" aria-labelledby="lmTasksTitle">
+            <h2 id="lmTasksTitle" class="sr-only">整理任务</h2>
+            <div class="table-wrap lm-task-table-wrap">
+                <table class="lm-task-table">
+                    <thead><tr><th>任务</th><th>来源</th><th>触发</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+                    <tbody id="lmTaskList"><tr class="is-empty-row"><td colspan="6" class="table-empty">正在读取任务…</td></tr></tbody>
+                </table>
+            </div>
+            <div class="lm-task-more" id="lmTaskMore" hidden>
+                <button class="jump-btn" type="button" id="lmLoadMoreTasksBtn"><span data-button-label>显示更多</span></button>
+            </div>
+        </div>
+
+        <div class="lm-tab-panel" data-tab-panel="sources" id="lmSourcesSection" aria-labelledby="lmSourcesTitle" hidden>
+            <div class="lm-panel-subhead">
+                <div>
+                    <h2 id="lmSourcesTitle">媒体来源配置</h2>
+                    <p>管理 qBittorrent 下载路径映射、定时扫描轮询策略与分类媒体库。</p>
+                </div>
+                <button class="btn btn-primary lm-compact-btn lm-mobile-add-btn" type="button" id="lmAddSourceMobileBtn"><i data-lucide="plus"></i><span>新增来源</span></button>
+            </div>
+            <div class="lm-source-grid" id="lmSourceGrid" aria-live="polite">
+                <div class="lm-empty-state"><div class="lm-empty-icon"><i data-lucide="folder-git-2"></i></div><strong>正在读取来源配置…</strong></div>
+            </div>
+        </div>
+
+        <div class="lm-tab-panel" data-tab-panel="review" id="lmReviewSection" aria-labelledby="lmReviewTitle" hidden>
+            <div class="lm-panel-subhead">
+                <div>
+                    <h2 id="lmReviewTitle">待确认任务</h2>
+                    <p>自动识别置信度不足或存在命名冲突的内容，人工指派 TMDB 后即可安全归档入库。</p>
+                </div>
+            </div>
+            <div class="lm-review-list" id="lmReviewList"><div class="lm-empty-state"><div class="lm-empty-icon"><i data-lucide="circle-alert"></i></div><strong>正在读取待确认任务…</strong></div></div>
+        </div>
+
+        <div class="lm-tab-panel lm-manual-panel" data-tab-panel="manual" id="lmManualSection" aria-labelledby="lmManualTitle" hidden>
+            <section class="lm-media-browser" aria-labelledby="lmManualTitle">
+                <header class="lm-media-browser-head">
+                    <div>
+                        <span class="subscription-eyebrow">LOCAL MEDIA INBOX</span>
+                        <h2 id="lmManualTitle">本地媒体条目</h2>
+                        <p>直接读取已配置来源的一级目录与视频文件；右键条目即可搜索刮削、自动匹配或移入回收区。</p>
+                    </div>
+                    <div class="lm-media-browser-tools">
+                        <label class="lm-item-search">
+                            <i data-lucide="search"></i>
+                            <input id="lmItemFilter" type="search" placeholder="筛选名称或来源" autocomplete="off" aria-label="筛选本地媒体条目">
+                        </label>
+                        <select class="form-select" id="lmItemSourceFilter" aria-label="筛选媒体来源">
+                            <option value="">全部来源</option>
+                        </select>
+                        <button class="jump-btn lm-item-refresh" type="button" id="lmRefreshItemsBtn"><i data-lucide="refresh-cw"></i><span data-button-label>刷新条目</span></button>
+                    </div>
+                </header>
+                <div class="lm-media-source-errors" id="lmMediaSourceErrors" hidden aria-live="polite"></div>
+                <div class="lm-media-list-head" aria-hidden="true">
+                    <span>媒体条目</span><span>来源</span><span>类型</span><span>修改时间</span><span>大小</span><span></span>
+                </div>
+                <div class="lm-media-list" id="lmMediaItems" aria-live="polite">
+                    <div class="lm-empty-state"><div class="lm-empty-icon"><i data-lucide="folder-search-2"></i></div><strong>正在读取本地媒体条目…</strong></div>
+                </div>
+            </section>
+        </div>
+    </section>
+</div>
+
+<div class="lm-item-context-menu" id="lmItemContextMenu" role="menu" aria-label="本地媒体条目操作" hidden>
+    <button type="button" role="menuitem" data-item-action="search"><i data-lucide="search-check"></i><span><strong>搜索刮削</strong><small>搜索 TMDB 并确认归档方案</small></span></button>
+    <button type="button" role="menuitem" data-item-action="auto"><i data-lucide="wand-sparkles"></i><span><strong>自动匹配</strong><small>自动识别并生成整理预览</small></span></button>
+    <button type="button" role="menuitem" class="is-danger" data-item-action="delete"><i data-lucide="trash-2"></i><span><strong>删除</strong><small>移入来源内的 MediaFlux 回收区</small></span></button>
+</div>
+
+<div class="app-modal lm-scrape-modal" id="lmScrapeModal" hidden>
+    <section class="lm-scrape-dialog" role="dialog" aria-modal="true" aria-labelledby="lmScrapeTitle">
+        <header class="lm-scrape-head">
+            <div class="lm-scrape-head-context">
+                <i data-lucide="folder-search"></i>
+                <div><span id="lmScrapeTitle">本地手动刮削</span><p id="lmScrapeItemPath">等待选择条目</p></div>
+            </div>
+            <button type="button" class="icon-btn" id="lmScrapeCloseBtn" aria-label="关闭刮削窗口" title="关闭"><i data-lucide="x"></i></button>
+        </header>
+        <div class="lm-scrape-searchbar">
+            <label><span>搜索名称</span><input type="search" class="form-input" id="lmSearchQuery" autocomplete="off" placeholder="输入电影或剧集名称"></label>
+            <label><span>媒体类型</span><select class="form-select" id="lmMediaType"><option value="movie">电影</option><option value="tv">剧集</option></select></label>
+            <button class="jump-btn" type="button" id="lmAutoPreviewBtn"><i data-lucide="wand-sparkles"></i><span data-button-label>自动匹配</span></button>
+            <button class="btn btn-primary" type="button" id="lmSearchBtn"><i data-lucide="search"></i><span data-button-label>搜索</span></button>
+        </div>
+        <div class="lm-scrape-workspace">
+            <section class="lm-scrape-candidate-region" aria-labelledby="lmCandidateTitle">
+                <div class="lm-scrape-region-head"><div><strong id="lmCandidateTitle">媒体候选</strong><small id="lmCandidateCount">0 项</small></div></div>
+                <div class="lm-candidate-list" id="lmCandidates" aria-live="polite">
+                    <div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>等待搜索</strong><span>候选结果会保留在这里，切换候选不会引起布局跳动。</span></div>
+                </div>
+            </section>
+            <section class="lm-scrape-detail-region" aria-labelledby="lmScrapeDetailTitle">
+                <div class="lm-scrape-region-head"><strong id="lmScrapeDetailTitle">媒体与归档预览</strong><small id="lmScrapeStatus">尚未选择</small></div>
+                <div class="lm-scrape-detail" id="lmScrapeDetail">
+                    <div class="lm-scrape-placeholder"><i data-lucide="clapperboard"></i><strong>选择媒体候选或自动匹配</strong><span>这里会逐项展示移动、覆盖和清理动作；不会生成编号副本。</span></div>
+                </div>
+            </section>
+        </div>
+        <footer class="lm-scrape-footer">
+            <div class="lm-scrape-footer-context">
+                <div class="lm-scrape-inspection"><i data-lucide="shield-check"></i><div><strong id="lmScrapeInspectionSummary">等待检查</strong><span>手动整理遇到同名目标时安全覆盖</span></div></div>
+                <div class="lm-scrape-target"><strong id="lmPlanSummary">确认前不会写入媒体库</strong><small id="lmScrapeTarget">目标路径将在识别后显示</small></div>
+            </div>
+            <div class="lm-scrape-footer-actions">
+                <button type="button" class="jump-btn" id="lmScrapeCancelBtn">取消</button>
+                <button type="button" class="btn btn-primary" id="lmExecuteBtn" disabled><i data-lucide="folder-check"></i><span data-button-label>确认并开始整理</span></button>
+            </div>
+        </footer>
+    </section>
+</div>
+
+<div class="app-modal lm-modal" id="lmSourceModal" hidden>
+    <div class="card lm-source-dialog" role="dialog" aria-modal="true" aria-labelledby="lmSourceDialogTitle">
+        <header class="lm-dialog-head">
+            <div><span class="subscription-eyebrow">MEDIA SOURCE</span><h2 id="lmSourceDialogTitle">新增媒体来源</h2><p>配置下载路径映射、扫描策略与分类媒体库。</p></div>
+            <button class="icon-action" id="lmCloseSourceBtn" type="button" data-modal-close aria-label="关闭媒体来源配置"><i data-lucide="x"></i></button>
+        </header>
+        <form id="lmSourceForm">
+            <div class="lm-dialog-body">
+                <input type="hidden" id="lmSourceId">
+                <input type="hidden" id="lmSourceMode" value="move">
+                <section class="lm-dialog-section">
+                    <div class="lm-form-grid">
+                        <label class="lm-field"><span>来源名称</span><input class="form-input" id="lmSourceName" required maxlength="128" placeholder="例如：下载目录 1"></label>
+                        <label class="lm-field"><span>qB 路径前缀</span><input class="form-input" id="lmQbPrefix" placeholder="/downloads"></label>
+                        <label class="lm-field lm-wide"><span>MediaFlux 本地路径</span><span class="lm-path-control"><input class="form-input" id="lmLocalRoot" required placeholder="{% if package_type == 'windows' %}D:\Downloads 或 \\NAS\Downloads{% else %}/mnt/downloads{% endif %}"><button class="jump-btn lm-picker-btn" type="button" id="lmPickLocalRootBtn" aria-label="浏览本地目录" title="浏览本地目录"><i data-lucide="folder-open"></i></button></span>{% if package_type == 'windows' %}<small class="lm-network-hint"><i data-lucide="network"></i><span>SMB 网络共享请直接填写 <code>\\NAS\共享名</code>。若 NAS 设置了账号密码，可在下方配置访问凭据自动挂载。</span></small>{% endif %}</label>
+                        {% if package_type == 'windows' %}
+                        <div class="lm-form-grid lm-wide lm-smb-auth-grid" id="lmSmbAuthSection">
+                            <label class="lm-field"><span>NAS 访问账号 <small class="text-muted">（可选，免密留空）</small></span><input class="form-input" id="lmSmbUser" placeholder="例如：admin 或 nasuser" autocomplete="username"></label>
+                            <label class="lm-field"><span>NAS 访问密码 <small class="text-muted">（可选，免密留空）</small></span><input class="form-input" id="lmSmbPass" type="password" placeholder="NAS 共享密码" autocomplete="current-password"></label>
+                        </div>
+                        {% endif %}
+                        <div class="lm-form-grid-3 lm-wide">
+                            <label class="lm-field"><span>识别范围</span><select class="form-select" id="lmSourceMediaType"><option value="auto">自动判断</option><option value="movie">仅电影</option><option value="tv">剧集 / 动漫</option></select></label>
+                            <label class="lm-field"><span>稳定等待</span><div class="lm-input-unit"><input class="form-input" id="lmStableSeconds" type="number" min="0" max="86400" value="300"><span>秒</span></div></label>
+                            <label class="lm-field"><span>扫描间隔</span><div class="lm-input-unit"><input class="form-input" id="lmScanMinutes" type="number" min="1" max="1440" value="10"><span>分钟</span></div></label>
+                        </div>
+                    </div>
+                    <div class="lm-switch-row">
+                        <label class="lm-switch-item"><span class="toggle"><input id="lmSourceEnabled" type="checkbox" checked><span class="toggle-slider"></span></span><span><strong>qB 完成触发</strong><small>下载完成后自动加入队列</small></span></label>
+                        <label class="lm-switch-item"><span class="toggle"><input id="lmScanEnabled" type="checkbox"><span class="toggle-slider"></span></span><span><strong>定时扫描</strong><small>按间隔检查来源目录</small></span></label>
+                    </div>
+                </section>
+                <section class="lm-dialog-section">
+                    <div class="lm-dialog-section-title"><strong>分类媒体库</strong><small>具体分类未配置时使用默认目标</small></div>
+                    <div class="lm-target-editor"><div id="lmTargetRows"></div></div>
+                </section>
+            </div>
+            <footer class="lm-dialog-actions">
+                <div>
+                    <button class="jump-btn lm-fixed-btn" type="button" id="lmCancelSourceBtn" data-modal-close>取消</button>
+                    <button class="btn btn-primary lm-fixed-btn" id="lmSaveSourceBtn" type="submit"><i data-lucide="save"></i><span data-button-label>保存来源</span></button>
+                </div>
+            </footer>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260820c"></script>{% endblock %}

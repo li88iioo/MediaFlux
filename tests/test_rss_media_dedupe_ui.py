@@ -1,0 +1,41 @@
+from pathlib import Path
+import unittest
+
+
+class RSSMediaDedupeUITests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.template = Path("app/templates/rss.html").read_text(encoding="utf-8")
+        cls.css = Path("app/static/css/main.css").read_text(encoding="utf-8")
+
+    def test_exact_library_filter_is_removed_from_default_form_without_removing_backend_notices(self) -> None:
+        self.assertNotIn('id="f_skip_existing"', self.template)
+        self.assertNotIn('id="f_media_tmdb_id"', self.template)
+        self.assertNotIn('id="f_media_season"', self.template)
+        self.assertNotIn("media_tmdb_id: skipExisting", self.template)
+        self.assertNotIn("skip_existing_episodes: skipExisting", self.template)
+        self.assertNotIn(".rss-library-dedupe", self.css)
+        self.assertIn("media_binding_bypassed", self.template)
+        self.assertIn("无法确认所有条目属于同一剧目", self.template)
+        self.assertIn("e.skip_reason", self.template)
+
+    def test_rss_source_cards_expose_stable_direct_pause_and_enable_actions(self) -> None:
+        self.assertIn('class="rss-btn rss-sub-toggle ${en?', self.template)
+        self.assertIn('onclick="toggleSub(${s.id},${en},this)"', self.template)
+        self.assertIn("async function toggleSub(id,enabled,trigger)", self.template)
+        self.assertIn("JSON.stringify({enabled:nextEnabled})", self.template)
+        self.assertIn("await loadSubs({preserve:true});", self.template)
+        self.assertIn("nextEnabled?'启用中':'暂停中'", self.template)
+        self.assertIn('.rss-sub-toggle {', self.css)
+        self.assertIn('min-width: 72px;', self.css)
+        self.assertIn('.subscription-section-toolbar .subscription-rss-create { width: 38px;', self.css)
+        self.assertIn('.rss-sub-actions .rss-btn:not(.rss-sub-toggle) span { display: none; }', self.css)
+
+    def test_rss_lists_keep_cards_static_and_animate_numbers_only(self) -> None:
+        self.assertIn("function lockRssListHeight(list)", self.template)
+        self.assertIn("requestAnimationFrame(()=>requestAnimationFrame", self.template)
+        self.assertIn("window.MFAnim.countUp", self.template)
+        self.assertNotIn("window.MFAnim.staggerIn", self.template)
+        self.assertNotIn("window.MFAnim.crossfade", self.template)
+        self.assertIn("preserve&&hadContent?lockRssListHeight(list)", self.template)
+        self.assertIn("loadSubs({preserve:true})", self.template)

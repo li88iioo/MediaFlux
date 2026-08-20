@@ -1,0 +1,13 @@
+preset = "basic"
+python-interpreter-path = ".venv/bin/python"
+search-path = ["."]
+project-includes = [
+    "app/**/*.py",
+    "tests/**/*.py",
+    "packaging/**/*.py",
+    "*.py",
+]
+ignore-missing-imports = [
+    "playwright",
+    "playwright.*",
+]

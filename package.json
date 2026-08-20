@@ -1,0 +1,16 @@
+{
+  "name": "mediaflux-static-build",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:static": "node packaging/scripts/minify_static.mjs"
+  },
+  "devDependencies": {
+    "lightningcss": "1.33.0",
+    "terser": "5.50.0"
+  }
+}

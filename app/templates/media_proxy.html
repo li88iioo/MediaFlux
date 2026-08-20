@@ -1,0 +1,495 @@
+{% extends "base.html" %}
+{% block title %}媒体反代 - MediaFlux{% endblock %}
+{% block page_title %}Emby / Jellyfin 媒体反代{% endblock %}
+{% block page_styles %}
+<script>
+(() => {
+    const initialTab = window.location.hash.slice(1);
+    if (new Set(['records', 'advanced']).has(initialTab)) {
+        document.documentElement.dataset.mediaProxyInitialTab = initialTab;
+    }
+})();
+</script>
+{% endblock %}
+{% block page_actions %}
+<button type="button" class="btn btn-primary" id="newProxyBtn">
+    <i data-lucide="plus"></i>新增实例
+</button>
+{% endblock %}
+
+{% block content %}
+<div class="proxy-settings-shell" id="proxyShell">
+    <!-- Top Nav Tabs Switcher -->
+    <div class="strm-nav-tabs proxy-nav-tabs" role="tablist" aria-label="媒体反代页面">
+        <button type="button" class="strm-tab-btn proxy-tab-btn active" id="proxyTabButton_instances" data-tab="instances" role="tab" aria-controls="proxyTab_instances" aria-selected="true">
+            <i data-lucide="server"></i>实例与上游
+        </button>
+        <button type="button" class="strm-tab-btn proxy-tab-btn" id="proxyTabButton_records" data-tab="records" role="tab" aria-controls="proxyTab_records" aria-selected="false" tabindex="-1">
+            <i data-lucide="history"></i>播放链路记录
+        </button>
+        <button type="button" class="strm-tab-btn proxy-tab-btn" id="proxyTabButton_advanced" data-tab="advanced" role="tab" aria-controls="proxyTab_advanced" aria-selected="false" tabindex="-1">
+            <i data-lucide="wrench"></i>高级映射与模式
+        </button>
+    </div>
+
+    <!-- Tab 1: Proxy Instances & Upstream Servers -->
+    <div class="proxy-tab-panel" id="proxyTab_instances" role="tabpanel" aria-labelledby="proxyTabButton_instances">
+        <div class="strm-stacked-grid">
+            <!-- Server Configs -->
+            <section class="card card-pad proxy-profile-panel">
+                <div class="panel-head">
+                    <div>
+                        <h3>已配置媒体服务器</h3>
+                        <p>直接复用看板配置，无需重复填写地址或 API 凭据</p>
+                    </div>
+                    <a class="jump-btn" href="/"><i data-lucide="layout-dashboard"></i>前往看板</a>
+                </div>
+                <div id="proxyProfileGrid" class="proxy-profile-grid" aria-live="polite" aria-busy="true">
+                    <div class="proxy-profile-card proxy-initial-skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
+                    <div class="proxy-profile-card proxy-initial-skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
+                </div>
+            </section>
+
+            <!-- Instances List -->
+            <section class="card card-pad proxy-instance-panel">
+                <div class="panel-head">
+                    <div>
+                        <h3>反代实例</h3>
+                        <p>每个实例拥有独立端口；本地视频继续由上游负责直放、转封装或转码</p>
+                    </div>
+                    <button type="button" class="jump-btn" id="refreshProxyBtn">
+                        <i data-lucide="refresh-cw"></i><span id="refreshProxyText">刷新</span>
+                    </button>
+                </div>
+                <div id="proxyInstanceList" class="proxy-instance-list" aria-live="polite" aria-busy="true">
+                    <div class="proxy-instance-card proxy-initial-skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Tab 2: Playback Chain Logs & Cache -->
+    <div class="proxy-tab-panel" id="proxyTab_records" role="tabpanel" aria-labelledby="proxyTabButton_records" hidden>
+        <section class="card card-pad proxy-record-panel" id="proxyRecordsPanel">
+            <div class="panel-head proxy-record-head">
+                <div>
+                    <h3>媒体播放会话</h3>
+                    <p>一次媒体播放显示一条摘要；展开可查看请求链路，且不会保存直链、Token 或上游凭据</p>
+                </div>
+                <div class="proxy-record-actions">
+                    <button type="button" class="jump-btn proxy-record-action" id="proxyRecordRefreshBtn">
+                        <i data-lucide="refresh-cw"></i><span id="proxyRecordRefreshText">刷新记录</span>
+                    </button>
+                    <button type="button" class="jump-btn proxy-record-action is-danger" id="proxyRecordClearBtn">
+                        <i data-lucide="trash-2"></i><span>清理记录</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Cache Metrics Tiles -->
+            <div class="proxy-cache-metrics" id="proxyCacheMetrics" aria-live="polite">
+                <div class="metric-tile" data-tone="safe">
+                    <span>缓存命中</span><strong>—</strong>
+                </div>
+                <div class="metric-tile" data-tone="warning">
+                    <span>缓存未命中</span><strong>—</strong>
+                </div>
+                <div class="metric-tile" data-tone="info">
+                    <span>当前条目</span><strong>—</strong>
+                </div>
+                <div class="metric-tile" data-tone="neutral">
+                    <span>已过期</span><strong>—</strong>
+                </div>
+            </div>
+
+            <!-- Single-Row Toolbar Filters -->
+            <div class="proxy-record-inline-bar" aria-label="播放会话筛选">
+                <div class="proxy-filter-group">
+                    <select class="strm-select-input" id="proxyRecordInstance">
+                        <option value="">全部实例</option>
+                    </select>
+                    <select class="strm-select-input" id="proxyRecordStatus">
+                        <option value="">全部状态</option>
+                        <option value="success">成功</option>
+                        <option value="error">失败</option>
+                    </select>
+                    <select class="strm-select-input" id="proxyRecordSource">
+                        <option value="">全部来源</option>
+                        <option value="guangya">光鸭 302</option>
+                        <option value="upstream">上游直放/转码</option>
+                        <option value="playback_info">PlaybackInfo</option>
+                        <option value="hls">HLS 上游</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Playback Sessions -->
+            <div class="proxy-record-list" id="proxyRecordList" aria-live="polite" aria-busy="true">
+                <div class="proxy-record-loading">
+                    <i data-lucide="activity"></i><p>正在读取媒体播放会话...</p>
+                </div>
+            </div>
+
+            <!-- Pagination -->
+            <div class="proxy-record-pagination">
+                <button type="button" class="jump-btn proxy-record-action" id="proxyRecordPrev" disabled>
+                    <i data-lucide="chevron-left"></i>上一页
+                </button>
+                <span id="proxyRecordPage">第 1 / 1 页</span>
+                <button type="button" class="jump-btn proxy-record-action" id="proxyRecordNext" disabled>
+                    下一页<i data-lucide="chevron-right"></i>
+                </button>
+            </div>
+        </section>
+    </div>
+
+    <!-- Tab 3: Advanced Mappings -->
+    <div class="proxy-tab-panel" id="proxyTab_advanced" role="tabpanel" aria-labelledby="proxyTabButton_advanced" hidden>
+        <section class="card card-pad proxy-advanced-panel">
+            <div class="proxy-work-mode">
+                <i data-lucide="workflow"></i>
+                <div>
+                    <strong>工作方式</strong>
+                    <p>普通请求固定转发到所选 Jellyfin/Emby。本地媒体由媒体服务器负责直放、转封装或转码；确认属于光鸭的原画请求返回 302 直链。</p>
+                </div>
+            </div>
+            <div class="proxy-compat-note">
+                <i data-lucide="badge-info"></i>
+                <p>光鸭 302 以原画直链为主。强制转码、字幕烧录或 HLS 分片由 Jellyfin/Emby 处理，此时不保证继续使用光鸭直链。</p>
+            </div>
+
+            <div class="panel-head proxy-mapping-head">
+                <div>
+                    <h3>高级光鸭播放映射</h3>
+                    <p id="bindingPanelHint">先在上方选择一个反代实例</p>
+                </div>
+                <button type="button" class="jump-btn" id="newBindingBtn" disabled>
+                    <i data-lucide="link-2"></i>新增光鸭映射
+                </button>
+            </div>
+            <div id="proxyBindingList" class="proxy-binding-list">
+                <div class="empty-state compact">
+                    <i data-lucide="mouse-pointer-2"></i><p>选择实例后查看映射</p>
+                </div>
+            </div>
+        </section>
+    </div>
+</div>
+
+<!-- Modals -->
+<div id="proxyModal" class="media-config-modal" hidden>
+    <form class="media-config-dialog proxy-config-dialog" id="proxyInstanceForm" role="dialog" aria-modal="true" aria-labelledby="proxyModalTitle" onsubmit="return false;" novalidate>
+        <div class="media-config-head">
+            <div><span>PROXY INSTANCE</span><h3 id="proxyModalTitle">新增反代实例</h3><p>选择已配置服务器，或为额外节点填写独立上游。</p></div>
+            <button type="button" class="icon-btn" data-proxy-close title="关闭"><i data-lucide="x"></i></button>
+        </div>
+        <div class="media-config-body">
+            <div class="form-group"><label class="form-label">选择媒体服务器</label><div id="proxyModalProfiles" class="proxy-modal-profiles"></div><input type="hidden" id="proxyConfigSource" value=""></div>
+            <div class="form-group"><label class="form-label" for="proxyName">实例名称</label><input class="form-input" id="proxyName" maxlength="100" placeholder="如：客厅 Jellyfin"></div>
+            <details class="proxy-custom-upstream" id="proxyCustomDetails">
+                <summary>自定义上游（兼容额外服务器）</summary>
+                <div class="proxy-custom-fields">
+                    <div class="form-group"><label class="form-label" for="proxyServerType">服务器类型</label><select class="form-select" id="proxyServerType"><option value="jellyfin">Jellyfin</option><option value="emby">Emby</option></select></div>
+                    <div class="form-group"><label class="form-label" for="proxyUpstream">上游地址</label><input class="form-input" id="proxyUpstream" placeholder="http://192.168.88.11:8096"></div>
+                    <div class="form-group"><label class="form-label" for="proxyApiKey">管理 API Key / Token</label><input class="form-input" id="proxyApiKey" type="password" autocomplete="new-password" placeholder="留空表示不修改现有凭据"></div>
+                </div>
+            </details>
+            <div class="grid-2"><div class="form-group"><label class="form-label" for="proxyHost">监听地址</label><select class="form-select" id="proxyHost"><option value="0.0.0.0">0.0.0.0（局域网）</option><option value="127.0.0.1">127.0.0.1（仅本机）</option><option value="::">::（IPv6 全部）</option><option value="::1">::1（IPv6 本机）</option></select></div><div class="form-group"><label class="form-label" for="proxyPort">监听端口</label><input class="form-input" id="proxyPort" type="number" min="1024" max="65535" value="18096"></div></div>
+            <label class="proxy-enable-row"><span><strong>启用独立监听</strong><small>保存后自动热加载，不影响其他实例</small></span><label class="toggle"><input type="checkbox" id="proxyEnabled" checked><span class="toggle-slider"></span></label></label>
+        </div>
+        <div class="media-config-footer"><span class="inline-save-state" id="proxySaveState"></span><div class="media-config-actions"><button type="button" class="jump-btn" data-proxy-close>取消</button><button type="button" class="btn btn-primary" id="saveProxyBtn">保存并加载</button></div></div>
+    </form>
+</div>
+
+<div id="bindingModal" class="media-config-modal" hidden>
+    <div class="media-config-dialog proxy-binding-dialog" role="dialog" aria-modal="true" aria-labelledby="bindingModalTitle">
+        <div class="media-config-head">
+            <div><span>GUANGYA OVERRIDE</span><h3 id="bindingModalTitle">新增光鸭播放映射</h3><p>仅在自动识别失败时建立精确覆盖关系。</p></div>
+            <button type="button" class="icon-btn" data-binding-close title="关闭"><i data-lucide="x"></i></button>
+        </div>
+        <div class="media-config-body">
+            <div class="proxy-binding-guide"><i data-lucide="badge-info"></i><span>仅用于自动识别失败。绑定 Jellyfin/Emby Item ID，可选 MediaSourceId，并指定对应光鸭文件 ID。</span></div>
+            <div class="grid-2"><div class="form-group"><label class="form-label" for="bindingItemId">Item ID</label><input class="form-input" id="bindingItemId" placeholder="媒体服务器 Item ID"></div><div class="form-group"><label class="form-label" for="bindingSourceId">MediaSourceId（可选）</label><input class="form-input" id="bindingSourceId" placeholder="多版本时建议填写"></div></div>
+            <div class="form-group"><label class="form-label" for="bindingGuangyaId">光鸭文件 ID</label><input class="form-input" id="bindingGuangyaId" placeholder="fileId"></div>
+        </div>
+        <div class="media-config-footer"><span class="inline-save-state" id="bindingSaveState"></span><div class="media-config-actions"><button type="button" class="jump-btn" data-binding-close>取消</button><button type="button" class="btn btn-primary" id="saveBindingBtn">保存映射</button></div></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    let profiles=[];
+    let instances=[];
+    let selectedId=null;
+    let editingId=null;
+    let selectedSource='';
+    let activeProxyTab='instances';
+    let proxyBaseLoaded=false;
+    let proxyBaseLoadPromise=null;
+    let proxyRecordsLoaded=false;
+    let proxyRecordsLoadPromise=null;
+    let proxyRecordPage=1;
+    let proxyRecordTotal=0;
+    let proxyRecordRequestSerial=0;
+    const proxySessionDetails=new Map();
+    const proxySessionDetailPromises=new Map();
+    const proxyExpandedSessions=new Set();
+    let proxyLegacyExpanded=false;
+    let proxyLegacyRequestSerial=0;
+    const proxyModal=createAppModal(document.getElementById('proxyModal'));
+    const bindingModal=createAppModal(document.getElementById('bindingModal'));
+    const esc=value=>String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+    const proxyTabs=[...document.querySelectorAll('.proxy-tab-btn')];
+    const proxyPanels=[...document.querySelectorAll('.proxy-tab-panel')];
+    const validProxyTabs=new Set(proxyTabs.map(button=>button.dataset.tab));
+    let initialProxyLoaderVisibleAt=0;
+    let initialProxyLoadPending=true;
+    const initialProxyLoaderTimer=window.setTimeout(()=>{
+        if(!initialProxyLoadPending)return;
+        initialProxyLoaderVisibleAt=performance.now();
+        document.querySelectorAll('.proxy-initial-skeleton').forEach(node=>node.classList.add('is-visible'));
+    },320);
+
+    function activateProxyTab(tab,{focus=false,updateHash=true}={}){
+        const normalized=validProxyTabs.has(tab)?tab:'instances';
+        activeProxyTab=normalized;
+        proxyTabs.forEach(button=>{
+            const active=button.dataset.tab===normalized;
+            button.classList.toggle('active',active);
+            button.setAttribute('aria-selected',String(active));
+            button.tabIndex=active?0:-1;
+            if(active&&focus)button.focus({preventScroll:true});
+        });
+        proxyPanels.forEach(panel=>{panel.hidden=panel.id!==`proxyTab_${normalized}`;});
+        if(updateHash){
+            const url=new URL(window.location.href);
+            url.hash=normalized==='instances'?'':normalized;
+            window.history.replaceState(window.history.state,'',`${url.pathname}${url.search}${url.hash}`);
+        }
+        if(document.documentElement?.dataset)delete document.documentElement.dataset.mediaProxyInitialTab;
+        void ensureProxyTabLoaded(normalized);
+    }
+    proxyTabs.forEach((button,index)=>{
+        button.addEventListener('click',()=>activateProxyTab(button.dataset.tab));
+        button.addEventListener('keydown',event=>{
+            let nextIndex=null;
+            if(event.key==='ArrowRight')nextIndex=(index+1)%proxyTabs.length;
+            else if(event.key==='ArrowLeft')nextIndex=(index-1+proxyTabs.length)%proxyTabs.length;
+            else if(event.key==='Home')nextIndex=0;
+            else if(event.key==='End')nextIndex=proxyTabs.length-1;
+            if(nextIndex===null)return;
+            event.preventDefault();
+            activateProxyTab(proxyTabs[nextIndex].dataset.tab,{focus:true});
+        });
+    });
+    activateProxyTab(window.location?.hash?.slice(1)||'',{updateHash:false});
+    window.addEventListener?.('hashchange',()=>activateProxyTab(window.location?.hash?.slice(1)||'',{updateHash:false}));
+
+    async function settleInitialProxyLoading(){
+        if(!initialProxyLoadPending)return;
+        initialProxyLoadPending=false;
+        window.clearTimeout(initialProxyLoaderTimer);
+        if(initialProxyLoaderVisibleAt){
+            const remaining=Math.max(0,300-(performance.now()-initialProxyLoaderVisibleAt));
+            if(remaining)await new Promise(resolve=>window.setTimeout(resolve,remaining));
+        }
+    }
+
+    async function request(path,options={}){const response=await fetch(path,{headers:{'Content-Type':'application/json'},...options});const data=await response.json();if(!response.ok)throw new Error(data.error||'请求失败');return data;}
+    function statusMeta(instance){if(instance.status==='running')return ['running','运行中'];if(instance.status==='error')return ['failed','启动失败'];if(!instance.enabled)return ['paused','已停用'];return ['paused','已停止'];}
+    function setNotice(text,error=false){const root=document.getElementById('proxySaveState');root.textContent=text;root.classList.toggle('is-error',error);}
+    function profileState(profile){if(!profile.configured)return ['未完成配置','failed'];if(!profile.enabled)return ['已在看板停用','paused'];return ['可用于反代','running'];}
+    function renderProfiles(){
+        const root=document.getElementById('proxyProfileGrid');
+        root.setAttribute('aria-busy','false');
+        const available=profiles.filter(item=>item.configured||item.url);
+        if(!available.length){root.innerHTML='<div class="empty-state compact proxy-profile-empty"><i data-lucide="server-off"></i><p>看板尚未配置 Jellyfin 或 Emby</p><span class="hint">先完成地址和 API 凭据配置，再创建反代实例</span></div>';renderLucideIcons(root);return;}
+        root.innerHTML=available.map(profile=>{const state=profileState(profile);return `<article class="proxy-profile-card"><div class="proxy-profile-mark"><i data-lucide="${profile.server_type==='emby'?'tv-minimal-play':'server'}"></i></div><div><span>${esc(profile.server_type.toUpperCase())}</span><strong>${esc(profile.label)}</strong><p>${esc(profile.url||'地址未配置')}</p></div><span class="status-pill ${state[1]}">${state[0]}</span><button type="button" class="jump-btn" data-create-source="${esc(profile.source)}" ${profile.enabled&&profile.configured?'':'disabled'}>创建反代</button></article>`;}).join('');
+        root.querySelectorAll('[data-create-source]').forEach(btn=>btn.addEventListener('click',()=>openInstance(null,btn.dataset.createSource)));
+        renderLucideIcons(root);
+    }
+    function renderModalProfiles(){
+        const root=document.getElementById('proxyModalProfiles');
+        const choices=profiles.filter(item=>item.configured||item.url);
+        root.innerHTML=choices.map(profile=>`<button type="button" class="proxy-modal-profile ${selectedSource===profile.source?'active':''}" data-modal-source="${esc(profile.source)}" ${profile.enabled&&profile.configured?'':'disabled'}><i data-lucide="${profile.server_type==='emby'?'tv-minimal-play':'server'}"></i><span><strong>${esc(profile.label)}</strong><small>${esc(profile.url||'未配置')}</small></span><i data-lucide="check"></i></button>`).join('')+`<button type="button" class="proxy-modal-profile ${selectedSource==='custom'?'active':''}" data-modal-source="custom"><i data-lucide="settings-2"></i><span><strong>自定义上游</strong><small>仅用于额外媒体服务器</small></span><i data-lucide="check"></i></button>`;
+        root.querySelectorAll('[data-modal-source]').forEach(btn=>btn.addEventListener('click',()=>selectModalSource(btn.dataset.modalSource)));
+        renderLucideIcons(root);
+    }
+    function selectModalSource(source){selectedSource=source;document.getElementById('proxyConfigSource').value=source;document.getElementById('proxyCustomDetails').open=source==='custom';renderModalProfiles();}
+    async function loadProxyBase(background=false){
+        const refresh=document.getElementById('refreshProxyText');
+        if(background)refresh.textContent='刷新中';
+        try{
+            const [profileData,instanceData]=await Promise.all([request('/api/media-proxy/profiles'),request('/api/media-proxy')]);
+            profiles=profileData;instances=instanceData;
+            if(!background)await settleInitialProxyLoading();
+            renderProfiles();renderInstances();renderProxyRecordInstances();
+            if(selectedId&&!instances.some(item=>item.id===selectedId))selectInstance(null);
+            else if(selectedId)await loadBindings();
+            return true;
+        }catch(error){
+            if(!background){
+                await settleInitialProxyLoading();
+                const profileRoot=document.getElementById('proxyProfileGrid');
+                const instanceRoot=document.getElementById('proxyInstanceList');
+                profileRoot.setAttribute('aria-busy','false');instanceRoot.setAttribute('aria-busy','false');
+                profileRoot.innerHTML='<div class="empty-state compact proxy-profile-empty"><p>媒体服务器配置读取失败</p></div>';
+                instanceRoot.innerHTML=`<div class="empty-state"><p>${esc(error.message)}</p></div>`;
+            }
+            return false;
+        }finally{refresh.textContent='刷新';}
+    }
+    function ensureProxyBaseLoaded(background=false){
+        if(!background&&proxyBaseLoaded)return Promise.resolve(true);
+        if(proxyBaseLoadPromise)return proxyBaseLoadPromise;
+        proxyBaseLoadPromise=loadProxyBase(background).then(success=>{
+            if(success)proxyBaseLoaded=true;
+            return success;
+        }).finally(()=>{proxyBaseLoadPromise=null;});
+        return proxyBaseLoadPromise;
+    }
+    function ensureProxyRecordsLoaded(){
+        if(proxyRecordsLoaded)return Promise.resolve(true);
+        if(proxyRecordsLoadPromise)return proxyRecordsLoadPromise;
+        proxyRecordsLoadPromise=loadProxyRecords({background:false}).finally(()=>{proxyRecordsLoadPromise=null;});
+        return proxyRecordsLoadPromise;
+    }
+    async function ensureProxyTabLoaded(tab){
+        await ensureProxyBaseLoaded(false);
+        if(tab==='records')await ensureProxyRecordsLoaded();
+    }
+    async function loadAll(background=false){
+        await ensureProxyBaseLoaded(background);
+        if(activeProxyTab==='records')await loadProxyRecords({background:proxyRecordsLoaded});
+    }
+    let instanceTestState={};
+    function resolveInstanceProxyUrl(instance){
+        let host=String(instance?.listen_host||'').trim();
+        if(!host||host==='0.0.0.0'||host==='::'){
+            host=window.location.hostname||'127.0.0.1';
+        }
+        const isIpv6=host.includes(':')&&!host.startsWith('[');
+        const formattedHost=isIpv6?`[${host}]`:host;
+        const port=Number(instance?.listen_port||18096);
+        return `http://${formattedHost}:${port}`;
+    }
+    function paintProxyCopyState(btn,{text,icon,state=''}){
+        btn.classList.remove('copied','copy-failed');
+        if(state)btn.classList.add(state);
+        btn.innerHTML=`<i data-lucide="${esc(icon)}" class="proxy-copy-icon"></i><span class="proxy-url-text">${esc(text)}</span>`;
+        renderLucideIcons(btn);
+    }
+    async function copyProxyUrl(url,btn){
+        let success=false;
+        try{
+            if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+                await navigator.clipboard.writeText(url);
+                success=true;
+            }
+        }catch(_){}
+        if(!success){
+            try{
+                const textarea=document.createElement('textarea');
+                textarea.value=url;
+                textarea.style.position='fixed';
+                textarea.style.opacity='0';
+                textarea.setAttribute('readonly','');
+                document.body.appendChild(textarea);
+                textarea.focus();
+                textarea.select();
+                success=document.execCommand('copy');
+                textarea.remove();
+            }catch(_){}
+        }
+        if(btn._copyResetTimer)clearTimeout(btn._copyResetTimer);
+        const width=Math.ceil(btn.getBoundingClientRect().width);
+        if(width>0)btn.style.width=`${width}px`;
+        paintProxyCopyState(btn,success
+            ?{text:'已复制',icon:'check',state:'copied'}
+            :{text:'复制失败',icon:'alert-circle',state:'copy-failed'}
+        );
+        btn.title=success?'反代地址已复制':'复制失败，请手动选择地址';
+        btn.setAttribute('aria-label',btn.title);
+        btn._copyResetTimer=setTimeout(()=>{
+            paintProxyCopyState(btn,{text:url,icon:'copy'});
+            btn.style.width='';
+            btn.title='点击复制反代地址';
+            btn.setAttribute('aria-label','复制反代地址');
+            btn._copyResetTimer=null;
+        },1600);
+    }
+    function renderInstances(){
+        const root=document.getElementById('proxyInstanceList');
+        root.setAttribute('aria-busy','false');
+        if(!instances.length){root.innerHTML='<div class="empty-state compact proxy-instance-placeholder"><i data-lucide="server-off"></i><p>暂无反代实例</p><span class="hint">从上方已配置服务器快速创建</span></div>';renderLucideIcons(root);return;}
+        root.innerHTML=instances.map(instance=>{
+            const meta=statusMeta(instance);
+            const testState=instanceTestState[instance.id];
+            let testBadge='';
+            if(testState){
+                if(testState.loading){
+                    testBadge=`<span class="proxy-test-status testing"><i data-lucide="loader-2"></i> 测试中...</span>`;
+                }else if(testState.success){
+                    testBadge=`<span class="proxy-test-status is-success"><i data-lucide="check-circle-2"></i> 连通正常 · ${testState.elapsed_ms} ms</span>`;
+                }else if(testState.error){
+                    testBadge=`<span class="proxy-test-status is-error"><i data-lucide="alert-circle"></i> ${esc(testState.error)}</span>`;
+                }
+            }
+            const proxyUrl=resolveInstanceProxyUrl(instance);
+            return `<article class="proxy-instance-card ${selectedId===instance.id?'active':''}" data-select-instance="${instance.id}"><div class="proxy-instance-icon"><i data-lucide="${instance.server_type==='emby'?'tv-minimal-play':'server'}"></i></div><div class="proxy-instance-copy"><div><strong>${esc(instance.name)}</strong><span class="status-pill ${meta[0]}">${meta[1]}</span>${testBadge}</div><p class="proxy-url-line"><button type="button" class="proxy-url-chip" data-copy-url="${esc(proxyUrl)}" title="点击复制反代地址"><i data-lucide="copy" class="proxy-copy-icon"></i><span class="proxy-url-text">${esc(proxyUrl)}</span></button><i data-lucide="arrow-right" class="proxy-arrow-icon"></i><span class="proxy-upstream-url">${esc(instance.upstream_url)}</span></p><small>${esc(instance.source_label||instance.server_type.toUpperCase())} · 本地播放透传上游</small>${instance.last_error?`<em>${esc(instance.last_error)}</em>`:''}</div><div class="proxy-instance-actions"><button class="icon-action" data-test-instance="${instance.id}" title="测试上游"><i data-lucide="activity"></i></button><button class="icon-action" data-edit-instance="${instance.id}" title="编辑"><i data-lucide="pencil"></i></button><button class="icon-action danger" data-delete-instance="${instance.id}" title="删除"><i data-lucide="trash-2"></i></button></div></article>`;
+        }).join('');
+        root.querySelectorAll('[data-select-instance]').forEach(card=>card.addEventListener('click',event=>{if(event.target.closest('button'))return;selectInstance(Number(card.dataset.selectInstance));}));
+        root.querySelectorAll('[data-copy-url]').forEach(btn=>btn.addEventListener('click',event=>{event.stopPropagation();event.preventDefault();copyProxyUrl(btn.dataset.copyUrl,btn);}));
+        root.querySelectorAll('[data-test-instance]').forEach(btn=>btn.addEventListener('click',()=>testInstance(Number(btn.dataset.testInstance),btn)));
+        root.querySelectorAll('[data-edit-instance]').forEach(btn=>btn.addEventListener('click',()=>openInstance(instances.find(item=>item.id===Number(btn.dataset.editInstance)))));
+        root.querySelectorAll('[data-delete-instance]').forEach(btn=>btn.addEventListener('click',()=>removeInstance(Number(btn.dataset.deleteInstance))));
+        renderLucideIcons(root);
+    }
+    async function selectInstance(id){selectedId=id;document.getElementById('newBindingBtn').disabled=!id;const instance=instances.find(item=>item.id===id);document.getElementById('bindingPanelHint').textContent=instance?`当前实例：${instance.name}`:'先在上方选择一个反代实例';renderInstances();await loadBindings();}
+    async function loadBindings(){
+        const root=document.getElementById('proxyBindingList');
+        if(!selectedId){root.innerHTML='<div class="empty-state compact"><i data-lucide="mouse-pointer-2"></i><p>选择实例后查看映射</p></div>';renderLucideIcons(root);return;}
+        try{const rows=(await request(`/api/media-proxy/${selectedId}/bindings`)).filter(row=>row.source_type==='guangya');root.innerHTML=rows.length?rows.map(row=>`<article class="proxy-binding-card"><div class="proxy-binding-icon"><i data-lucide="cloud"></i></div><div><strong>${esc(row.media_item_id)}</strong><p>${row.media_source_id?`Source ${esc(row.media_source_id)} · `:''}光鸭文件 ${esc(row.guangya_file_id)}</p></div><button class="icon-action danger" data-delete-binding="${row.id}" title="删除映射"><i data-lucide="trash-2"></i></button></article>`).join(''):'<div class="empty-state compact"><i data-lucide="link-2-off"></i><p>没有人工映射</p><span class="hint">标准 STRM 会自动识别，无需手工配置</span></div>';root.querySelectorAll('[data-delete-binding]').forEach(btn=>btn.addEventListener('click',()=>removeBinding(Number(btn.dataset.deleteBinding))));renderLucideIcons(root);}catch(error){root.innerHTML=`<div class="empty-state compact"><p>${esc(error.message)}</p></div>`;}
+    }
+    function openInstance(instance=null,presetSource=''){
+        editingId=instance?.id||null;selectedSource=instance?.config_source||presetSource||profiles.find(item=>item.enabled&&item.configured)?.source||'custom';document.getElementById('proxyModalTitle').textContent=instance?'编辑反代实例':'新增反代实例';document.getElementById('proxyName').value=instance?.name||'';document.getElementById('proxyServerType').value=instance?.server_type||'jellyfin';document.getElementById('proxyUpstream').value=instance?.config_source==='custom'?instance.upstream_url||'':'';document.getElementById('proxyApiKey').value=instance?.config_source==='custom'&&instance.has_api_key?'********':'';document.getElementById('proxyHost').value=instance?.listen_host||'0.0.0.0';document.getElementById('proxyPort').value=instance?.listen_port||18096;document.getElementById('proxyEnabled').checked=instance?.enabled!==false;setNotice('');selectModalSource(selectedSource);proxyModal.open(document.getElementById('newProxyBtn'));
+    }
+    async function saveInstance(){const btn=document.getElementById('saveProxyBtn');const body={name:document.getElementById('proxyName').value.trim(),config_source:selectedSource,listen_host:document.getElementById('proxyHost').value,listen_port:Number(document.getElementById('proxyPort').value),enabled:document.getElementById('proxyEnabled').checked};if(selectedSource==='custom'){body.server_type=document.getElementById('proxyServerType').value;body.upstream_url=document.getElementById('proxyUpstream').value.trim();body.api_key=document.getElementById('proxyApiKey').value.trim();}btn.disabled=true;setNotice('保存并热加载中...');try{const result=await request(editingId?`/api/media-proxy/${editingId}`:'/api/media-proxy',{method:editingId?'PUT':'POST',body:JSON.stringify(body)});proxyModal.close();selectedId=result.instance.id;await loadAll(true);}catch(error){setNotice(error.message,true);}finally{btn.disabled=false;}}
+    async function testInstance(id,btn){instanceTestState[id]={loading:true};renderInstances();try{const result=await request(`/api/media-proxy/${id}/test`,{method:'POST'});instanceTestState[id]={success:true,elapsed_ms:result.elapsed_ms};}catch(error){instanceTestState[id]={error:error.message||'连接失败'};}finally{renderInstances();window.setTimeout(()=>{if(instanceTestState[id]&&!instanceTestState[id].loading){delete instanceTestState[id];renderInstances();}},8000);}}
+    async function removeInstance(id){const instance=instances.find(item=>item.id===id);const confirmed=await appConfirm({title:'删除媒体反代实例',message:`删除实例「${instance?.name||id}」及其人工光鸭映射。监听端口会立即关闭。`,confirmText:'删除实例',danger:true,verifyText:'DELETE'});if(!confirmed)return;try{await request(`/api/media-proxy/${id}`,{method:'DELETE'});if(selectedId===id)selectedId=null;await loadAll(true);}catch(error){setNotice(error.message,true);}}
+    function openBinding(){if(!selectedId)return;document.getElementById('bindingItemId').value='';document.getElementById('bindingSourceId').value='';document.getElementById('bindingGuangyaId').value='';document.getElementById('bindingSaveState').textContent='';bindingModal.open(document.getElementById('newBindingBtn'));}
+    async function saveBinding(){const btn=document.getElementById('saveBindingBtn');const state=document.getElementById('bindingSaveState');const body={media_item_id:document.getElementById('bindingItemId').value.trim(),media_source_id:document.getElementById('bindingSourceId').value.trim(),source_type:'guangya',guangya_file_id:document.getElementById('bindingGuangyaId').value.trim(),enabled:true};btn.disabled=true;state.textContent='保存中...';try{await request(`/api/media-proxy/${selectedId}/bindings`,{method:'POST',body:JSON.stringify(body)});bindingModal.close();await loadBindings();}catch(error){state.textContent=error.message;}finally{btn.disabled=false;}}
+    async function removeBinding(id){const confirmed=await appConfirm({title:'删除光鸭播放映射',message:'删除后该播放请求将恢复自动识别或透传上游，不会删除光鸭文件。',confirmText:'删除映射',danger:true});if(!confirmed)return;try{await request(`/api/media-proxy/${selectedId}/bindings/${id}`,{method:'DELETE'});await loadBindings();}catch(error){document.getElementById('bindingPanelHint').textContent=error.message;}}
+    function renderProxyRecordInstances(){const select=document.getElementById('proxyRecordInstance');const current=select.value;select.innerHTML='<option value="">全部实例</option>'+instances.map(item=>`<option value="${item.id}">${esc(item.name)}</option>`).join('');if([...select.options].some(option=>option.value===current))select.value=current;}
+    function sourceBadge(source){return {guangya:['cloud','光鸭 302'],upstream:['server','上游'],playback_info:['list-video','PlaybackInfo'],hls:['radio-tower','HLS']}[source]||['route','未知'];}
+    function statusBadge(code){const value=Number(code||0);if(value>=200&&value<400)return ['running',String(value||'成功')];if(value>=400)return ['failed',String(value)];return ['paused','未完成'];}
+    function sessionStatusBadge(session){const errors=Number(session.error_count||0);const successes=Number(session.success_count||0);const last=Number(session.last_status_code||0);if(errors&&last>=200&&last<400)return ['paused','有重试'];if(errors)return ['failed',String(last>=400?last:'失败')];if(successes)return ['running','成功'];return ['paused','未完成'];}
+    function routeLabel(route){return {guangya_direct:'原画直链',stream:'视频流',playback_info:'播放信息',upstream_hls:'HLS/分片'}[route]||route||'上游请求';}
+    function setProxyRecordsBusy(busy){document.querySelectorAll('.proxy-record-action').forEach(button=>button.disabled=busy||button.dataset.pageDisabled==='1');const text=document.getElementById('proxyRecordRefreshText');text.textContent=busy?'刷新中':'刷新记录';document.getElementById('proxyRecordList').setAttribute('aria-busy',busy?'true':'false');}
+    function renderProxyCacheMetrics(metrics){
+        const root=document.getElementById('proxyCacheMetrics');
+        const value=metrics&&typeof metrics.hits==='number'?metrics:{hits:0,misses:0,entries:0,expired:0};
+        root.innerHTML=`
+            <div class="metric-tile" data-tone="safe"><span>缓存命中</span><strong>${value.hits}</strong></div>
+            <div class="metric-tile" data-tone="warning"><span>缓存未命中</span><strong>${value.misses}</strong></div>
+            <div class="metric-tile" data-tone="info"><span>当前条目</span><strong>${value.entries}</strong></div>
+            <div class="metric-tile" data-tone="neutral"><span>已过期</span><strong>${value.expired}</strong></div>
+        `;
+    }
+    function proxyRecordMarkup(record){const source=sourceBadge(record.source);const status=statusBadge(record.status_code);const latency=Number(record.total_latency_ms||0);const cache=record.source==='guangya'?`<span class="proxy-record-cache ${record.cache_hit?'hit':'miss'}">${record.cache_hit?'HIT':'MISS'}</span>`:'<span class="proxy-record-cache neutral">—</span>';return `<article class="proxy-record-card" data-record-id="${record.id}"><div class="proxy-record-primary"><time>${esc(record.created_at||'—')}</time><strong>${esc(routeLabel(record.route_class))}</strong><small>${esc(record.method||'GET')} · 实例 #${record.instance_id}</small></div><span class="proxy-record-source"><i data-lucide="${source[0]}"></i>${source[1]}</span><span class="status-pill ${status[0]}">${status[1]}</span>${cache}<div class="proxy-record-latency"><strong>${latency} ms</strong><small>${record.failure_stage?esc(record.failure_stage):'总耗时'}</small></div>${record.error?`<p class="proxy-record-error">${esc(record.error)}</p>`:''}</article>`;}
+    function proxySessionDetailsMarkup(data){const rows=Array.isArray(data?.items)?data.items:[];if(!rows.length)return '<div class="proxy-session-detail-empty"><i data-lucide="list-tree"></i><span>该会话暂无可展开的请求明细</span></div>';return `<div class="proxy-session-detail-head"><span>请求链路</span><small>最近 ${rows.length} / ${Number(data.total||rows.length)} 条</small></div><div class="proxy-record-table-head"><span>时间 / 路由</span><span>来源</span><span>状态</span><span>缓存</span><span>耗时</span></div>${rows.map(proxyRecordMarkup).join('')}`;}
+    function proxySessionIdentity(session){if(session.media_item_id)return `媒体 ${session.media_item_id}`;if(session.guangya_file_id)return `光鸭文件 ${session.guangya_file_id}`;return '未识别媒体';}
+    function proxySessionMarkup(session){const id=Number(session.id);const source=sourceBadge(session.last_source);const status=sessionStatusBadge(session);const requests=Number(session.request_count||0);const hits=Number(session.cache_hit_count||0);const misses=Number(session.cache_miss_count||0);const cacheTotal=hits+misses;const avg=Number(session.average_total_latency_ms||0);const max=Number(session.max_total_latency_ms||0);const sourceId=session.media_source_id?`MediaSource ${esc(session.media_source_id)}`:'未提供 MediaSourceId';const isOpen=proxyExpandedSessions.has(id);let cached=proxySessionDetails.get(id);if(cached&&Number(cached.total||0)<requests){proxySessionDetails.delete(id);cached=null;}const detail=cached?proxySessionDetailsMarkup(cached):'<div class="proxy-session-detail-loading"><i data-lucide="list-tree"></i><span>展开后读取请求明细</span></div>';return `<details class="proxy-session-card" data-session-id="${id}" ${isOpen?'open':''}><summary class="proxy-session-summary"><span class="proxy-session-marker"><i data-lucide="play"></i></span><span class="proxy-session-identity"><time>${esc(session.last_request_at||session.started_at||'—')}</time><strong>${esc(proxySessionIdentity(session))}</strong><small>${sourceId} · 实例 #${session.instance_id}</small></span><span class="proxy-record-source"><i data-lucide="${source[0]}"></i>${source[1]}</span><span class="status-pill ${status[0]}">${status[1]}</span><span class="proxy-session-count"><strong>${requests}</strong><small>链路请求</small></span><span class="proxy-session-cache ${cacheTotal?'active':''}"><strong>${cacheTotal?`${hits}/${cacheTotal}`:'—'}</strong><small>${cacheTotal?'缓存命中':'未使用缓存'}</small></span><span class="proxy-session-latency"><strong>${avg} ms</strong><small>平均 · 峰值 ${max} ms</small></span><span class="proxy-session-chevron" aria-hidden="true"><i data-lucide="chevron-down"></i></span></summary><div class="proxy-session-detail" id="proxySessionDetail_${id}">${detail}</div>${session.last_error?`<p class="proxy-session-last-error">最近错误：${esc(session.last_error)}</p>`:''}</details>`;}
+    function proxyLegacyMarkup(total){return `<details class="proxy-session-card proxy-legacy-session" ${proxyLegacyExpanded?'open':''}><summary class="proxy-session-summary"><span class="proxy-session-marker is-legacy"><i data-lucide="archive"></i></span><span class="proxy-session-identity"><time>兼容记录</time><strong>历史 / 未关联链路</strong><small>升级前或缺少会话标识的请求，无法可靠归并到具体媒体</small></span><span class="proxy-record-source"><i data-lucide="unlink"></i>未关联</span><span class="status-pill paused">历史</span><span class="proxy-session-count"><strong>${Number(total||0)}</strong><small>请求明细</small></span><span class="proxy-session-cache"><strong>—</strong><small>按原记录显示</small></span><span class="proxy-session-latency"><strong>—</strong><small>展开查看</small></span><span class="proxy-session-chevron" aria-hidden="true"><i data-lucide="chevron-down"></i></span></summary><div class="proxy-session-detail" id="proxyLegacyDetail"><div class="proxy-session-detail-loading"><i data-lucide="list-tree"></i><span>展开后读取历史明细</span></div></div></details>`;}
+    async function loadProxyLegacyDetails(){const host=document.getElementById('proxyLegacyDetail');if(!host)return;const serial=++proxyLegacyRequestSerial;const query=new URLSearchParams({unlinked:'true',page:'1',page_size:'100'});const instance=document.getElementById('proxyRecordInstance').value;const status=document.getElementById('proxyRecordStatus').value;const source=document.getElementById('proxyRecordSource').value;if(instance)query.set('instance_id',instance);if(status)query.set('status',status);if(source)query.set('source',source);host.innerHTML='<div class="proxy-session-detail-loading is-loading"><i data-lucide="loader-circle"></i><span>正在读取历史明细...</span></div>';renderLucideIcons(host);try{const data=await request(`/api/media-proxy/records?${query}`);if(serial!==proxyLegacyRequestSerial)return;const current=document.getElementById('proxyLegacyDetail');if(current){current.innerHTML=proxySessionDetailsMarkup(data);renderLucideIcons(current);}}catch(error){if(serial!==proxyLegacyRequestSerial)return;const current=document.getElementById('proxyLegacyDetail');if(current)current.innerHTML=`<div class="proxy-session-detail-empty is-error"><span>${esc(error.message)}</span></div>`;}}
+    async function loadProxySessionDetails(sessionId){const id=Number(sessionId);const host=document.getElementById(`proxySessionDetail_${id}`);if(!host)return;if(proxySessionDetails.has(id)){host.innerHTML=proxySessionDetailsMarkup(proxySessionDetails.get(id));renderLucideIcons(host);return;}if(proxySessionDetailPromises.has(id)){await proxySessionDetailPromises.get(id);return;}host.innerHTML='<div class="proxy-session-detail-loading is-loading"><i data-lucide="loader-circle"></i><span>正在读取请求明细...</span></div>';renderLucideIcons(host);const pending=request(`/api/media-proxy/records?session_id=${encodeURIComponent(id)}&page=1&page_size=100`);proxySessionDetailPromises.set(id,pending);try{const data=await pending;proxySessionDetails.set(id,data);const current=document.getElementById(`proxySessionDetail_${id}`);if(current){current.innerHTML=proxySessionDetailsMarkup(data);renderLucideIcons(current);}}catch(error){const current=document.getElementById(`proxySessionDetail_${id}`);if(current)current.innerHTML=`<div class="proxy-session-detail-empty is-error"><span>${esc(error.message)}</span></div>`;}finally{proxySessionDetailPromises.delete(id);}}
+    function bindProxySessionDetails(root){root.querySelectorAll('.proxy-session-card[data-session-id]').forEach(card=>{const id=Number(card.dataset.sessionId);card.addEventListener('toggle',()=>{if(card.open){proxyExpandedSessions.add(id);loadProxySessionDetails(id);}else{proxyExpandedSessions.delete(id);}});if(card.open)loadProxySessionDetails(id);});const legacy=root.querySelector('.proxy-legacy-session');if(legacy){legacy.addEventListener('toggle',()=>{proxyLegacyExpanded=legacy.open;if(legacy.open)loadProxyLegacyDetails();});if(legacy.open)loadProxyLegacyDetails();}}
+    function renderProxyRecords(data){const root=document.getElementById('proxyRecordList');root.querySelectorAll('.proxy-session-card[data-session-id][open]').forEach(card=>proxyExpandedSessions.add(Number(card.dataset.sessionId)));const existingLegacy=root.querySelector('.proxy-legacy-session');if(existingLegacy)proxyLegacyExpanded=existingLegacy.open;const rows=Array.isArray(data.items)?data.items:[];const legacyTotal=Number(data.unlinked_total||0);proxyRecordTotal=Number(data.total||0);const legacyMarkup=proxyRecordPage===1&&legacyTotal?proxyLegacyMarkup(legacyTotal):'';if(!rows.length&&!legacyMarkup){root.innerHTML='<div class="empty-state proxy-record-empty"><i data-lucide="history"></i><p>暂无符合筛选条件的媒体播放会话</p></div>';}else{root.innerHTML=legacyMarkup+rows.map(proxySessionMarkup).join('');bindProxySessionDetails(root);}const pages=Math.max(1,Math.ceil(proxyRecordTotal/20));proxyRecordPage=Math.min(proxyRecordPage,pages);const legacyLabel=legacyTotal?` · ${legacyTotal} 条历史明细`:'';document.getElementById('proxyRecordPage').textContent=`第 ${proxyRecordPage} / ${pages} 页 · ${proxyRecordTotal} 次播放${legacyLabel}`;const prev=document.getElementById('proxyRecordPrev');const next=document.getElementById('proxyRecordNext');prev.dataset.pageDisabled=proxyRecordPage<=1?'1':'0';next.dataset.pageDisabled=proxyRecordPage>=pages?'1':'0';prev.disabled=prev.dataset.pageDisabled==='1';next.disabled=next.dataset.pageDisabled==='1';renderLucideIcons(root);}
+    async function loadProxyRecords({background=false}={}){const serial=++proxyRecordRequestSerial;const instance=document.getElementById('proxyRecordInstance').value;const status=document.getElementById('proxyRecordStatus').value;const source=document.getElementById('proxyRecordSource').value;const query=new URLSearchParams({page:String(proxyRecordPage),page_size:'20'});if(instance)query.set('instance_id',instance);if(status)query.set('status',status);if(source)query.set('source',source);if(!background&&!proxyRecordsLoaded)document.getElementById('proxyRecordList').innerHTML='<div class="proxy-record-loading"><i data-lucide="activity"></i><p>正在读取媒体播放会话...</p></div>';setProxyRecordsBusy(true);try{const metricsQuery=instance?`?instance_id=${encodeURIComponent(instance)}`:'';const [data,metrics]=await Promise.all([request(`/api/media-proxy/sessions?${query}`),request(`/api/media-proxy/cache-metrics${metricsQuery}`)]);if(serial!==proxyRecordRequestSerial)return;renderProxyRecords(data);renderProxyCacheMetrics(metrics);proxyRecordsLoaded=true;}catch(error){if(serial===proxyRecordRequestSerial&&!proxyRecordsLoaded)document.getElementById('proxyRecordList').innerHTML=`<div class="empty-state proxy-record-empty"><p>${esc(error.message)}</p></div>`;}finally{if(serial===proxyRecordRequestSerial){setProxyRecordsBusy(false);renderLucideIcons(document.getElementById('proxyRecordsPanel'));}}}
+    async function clearProxyRecords(){const instance=document.getElementById('proxyRecordInstance').value;const confirmed=await appConfirm({title:'清理媒体播放会话',message:instance?'仅清理当前筛选实例的播放摘要与请求明细。此操作不会影响反代实例或媒体文件。':'清理全部反代实例的播放摘要与请求明细。此操作不会影响媒体文件。',confirmText:'清理记录',danger:true,verifyText:'CLEAR PLAYBACK RECORDS'});if(!confirmed)return;setProxyRecordsBusy(true);try{const body={confirm:'CLEAR PLAYBACK RECORDS'};if(instance)body.instance_id=Number(instance);await request('/api/media-proxy/records',{method:'DELETE',body:JSON.stringify(body)});proxySessionDetails.clear();proxySessionDetailPromises.clear();proxyExpandedSessions.clear();proxyLegacyExpanded=false;proxyLegacyRequestSerial+=1;proxyRecordPage=1;await loadProxyRecords({background:true});}catch(error){document.getElementById('proxyRecordPage').textContent=error.message;}finally{setProxyRecordsBusy(false);}}
+    document.getElementById('newProxyBtn').addEventListener('click',()=>openInstance());document.getElementById('refreshProxyBtn').addEventListener('click',()=>loadAll(true));document.getElementById('saveProxyBtn').addEventListener('click',saveInstance);document.getElementById('newBindingBtn').addEventListener('click',openBinding);document.getElementById('saveBindingBtn').addEventListener('click',saveBinding);document.getElementById('proxyRecordRefreshBtn').addEventListener('click',()=>loadProxyRecords({background:true}));document.getElementById('proxyRecordClearBtn').addEventListener('click',clearProxyRecords);['proxyRecordInstance','proxyRecordStatus','proxyRecordSource'].forEach(id=>document.getElementById(id).addEventListener('change',()=>{proxyRecordPage=1;loadProxyRecords({background:true});}));document.getElementById('proxyRecordPrev').addEventListener('click',()=>{if(proxyRecordPage>1){proxyRecordPage-=1;loadProxyRecords({background:true});}});document.getElementById('proxyRecordNext').addEventListener('click',()=>{proxyRecordPage+=1;loadProxyRecords({background:true});});document.querySelectorAll('[data-proxy-close]').forEach(btn=>btn.addEventListener('click',()=>proxyModal.close()));document.querySelectorAll('[data-binding-close]').forEach(btn=>btn.addEventListener('click',()=>bindingModal.close()));
+})();
+</script>
+{% endblock %}

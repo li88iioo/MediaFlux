@@ -1,0 +1,652 @@
+{% extends "base.html" %}
+{% from "_ui_macros.html" import theme_toggle %}
+{% block title %}看板 - MediaFlux{% endblock %}
+{% block body_class %}dashboard-page{% endblock %}
+{% block page_title %}看板{% endblock %}
+{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/dashboard-workbench.css') }}?v=20260820a">{% endblock %}
+
+{% block workspace_bar %}
+<header class="dashboard-topbar">
+    <button class="icon-btn workspace-menu-btn dashboard-mobile-menu" id="toggleSidebar" type="button" aria-label="打开导航" title="打开导航" aria-expanded="false"><i data-lucide="menu"></i></button>
+    <form class="dashboard-global-search" role="search" action="{{ url_for('pages.global_search') }}" method="get" data-search-enabled="true">
+        <i data-lucide="search"></i>
+        <input id="dashboardSearchInput" name="q" type="search" maxlength="120" autocomplete="off" placeholder="搜索媒体、订阅、任务或日志" required>
+        <kbd>Ctrl K</kbd>
+    </form>
+    <div class="dashboard-top-actions">
+        <div class="dashboard-quick-status" aria-label="自动化概览">
+            <a class="dashboard-quick-status-item" href="{{ url_for('pages.downloads') }}" title="查看下载任务"><span class="dashboard-quick-status-icon"><i data-lucide="download"></i></span><span class="dashboard-quick-status-copy"><b data-count-target="{{ automation.downloads_active }}">{{ automation.downloads_active }}</b><small>下载</small></span></a>
+            <a class="dashboard-quick-status-item" href="{{ url_for('pages.rss') }}" title="RSS 订阅源与媒体追更订阅合计"><span class="dashboard-quick-status-icon"><i data-lucide="rss"></i></span><span class="dashboard-quick-status-copy"><b data-count-target="{{ automation.subscriptions_total }}">{{ automation.subscriptions_total }}</b><small>订阅</small></span></a>
+            {% set issue_href = '#dashboardAutomationStatus' %}
+            {% set issue_title = '当前无待处理问题，查看自动化状态' %}
+            {% set issue_label = '待处理' %}
+            {% if automation.issue_source == 'downloads' %}
+                {% set issue_href = url_for('pages.downloads') ~ '?view=issues' %}
+                {% set issue_title = '查看 ' ~ automation.issues ~ ' 项下载及后处理异常' %}
+                {% set issue_label = '下载待处理' %}
+            {% elif automation.issue_source == 'rss' %}
+                {% set issue_href = url_for('pages.rss') ~ '#rss' %}
+                {% set issue_title = '查看 ' ~ automation.issues ~ ' 项 RSS 处理失败' %}
+                {% set issue_label = 'RSS 待处理' %}
+            {% elif automation.issue_source == 'organize' %}
+                {% set issue_href = url_for('pages.organize') %}
+                {% set issue_title = '查看 ' ~ automation.issues ~ ' 项整理异常' %}
+                {% set issue_label = '整理待处理' %}
+            {% elif automation.issue_source == 'strm' %}
+                {% set issue_href = url_for('pages.guangya_strm') ~ '#diagnostics' %}
+                {% set issue_title = '查看 ' ~ automation.issues ~ ' 项 STRM 失败任务' %}
+                {% set issue_label = 'STRM 待处理' %}
+            {% elif automation.issue_source == 'mixed' %}
+                {% set issue_title = '查看 ' ~ automation.issues ~ ' 项跨模块待处理问题' %}
+            {% endif %}
+            <a class="dashboard-quick-status-item {{ 'has-issues' if automation.issues else '' }}" href="{{ issue_href }}" title="{{ issue_title }}" aria-label="{{ issue_title }}" data-dashboard-issues-link><span class="dashboard-quick-status-icon"><i data-lucide="circle-alert"></i></span><span class="dashboard-quick-status-copy"><b data-count-target="{{ automation.issues }}">{{ automation.issues }}</b><small>{{ issue_label }}</small></span></a>
+        </div>
+        {{ theme_toggle('dashboard') }}
+        {% if dashboards %}
+        <label class="dashboard-connection-picker{% if not is_cached %} is-hydrating{% elif not dashboards[0].online %} is-offline{% endif %}" data-server-connection>
+            <span class="dashboard-connection-dot{% if is_cached and not dashboards[0].online %} is-offline{% endif %}" aria-hidden="true"></span>
+            <select data-server-select aria-label="切换媒体服务器">
+                {% for server in dashboards %}<option value="{{ server.server_type }}" data-online="{{ 'true' if server.online else 'false' }}" data-name="{{ server.server_name }}" data-product="{{ server.server_product or server.server_type|upper }}">{{ server.server_name }} · {{ server.server_product or server.server_type|upper }}</option>{% endfor %}
+            </select>
+            <i data-lucide="chevron-down"></i>
+        </label>
+        {% else %}
+        <span class="dashboard-connection-picker is-offline"><span class="dashboard-connection-dot is-offline"></span>未配置媒体服务器</span>
+        {% endif %}
+        <button type="button" class="icon-btn dashboard-config-button" data-open-media-config="{{ dashboards[0].server_type if dashboards else '' }}" aria-label="配置媒体服务器" title="配置媒体服务器"><i data-lucide="sliders-horizontal"></i></button>
+    </div>
+</header>
+{% endblock %}
+
+{% block content %}
+<div class="dashboard-shell" data-is-cached="{{ 'true' if is_cached else 'false' }}">
+{% if not dashboards %}
+    <section class="dashboard-panel dashboard-empty-state">
+        <span class="dashboard-empty-icon"><i data-lucide="server-off"></i></span>
+        <strong>尚未启用任何媒体服务器</strong>
+        <p>配置 Emby 或 Jellyfin 后，这里会显示真实的媒体概览、最近播放和入库内容。</p>
+        <button type="button" class="primary-btn dashboard-config-link" data-open-media-config><i data-lucide="plus"></i>去配置媒体服务</button>
+    </section>
+{% endif %}
+
+{% for b in dashboards %}
+{% if loop.first %}
+<section class="dashboard-server-panel active{% if not is_cached %} is-hydrating{% endif %}" data-server-panel="{{ b.server_type }}">
+{% else %}
+<section class="dashboard-server-panel{% if not is_cached %} is-hydrating{% endif %}" data-server-panel="{{ b.server_type }}" hidden>
+{% endif %}
+    <section class="dashboard-summary-strip" aria-label="媒体概览">
+        <article class="dashboard-metric">
+            <div class="dashboard-metric-head">
+                <span class="dashboard-metric-label">媒体总数</span>
+                <span class="dashboard-metric-icon"><i data-lucide="layers-3"></i></span>
+            </div>
+            <div class="dashboard-metric-value"><span data-metric="total_items" data-count-target="{{ b.total_items }}">{{ "{:,}".format(b.total_items) }}</span><small>项</small></div>
+            <div class="dashboard-metric-foot">已建立索引的全部媒体</div>
+        </article>
+        <article class="dashboard-metric">
+            <div class="dashboard-metric-head">
+                <span class="dashboard-metric-label">媒体库</span>
+                <span class="dashboard-metric-icon is-blue"><i data-lucide="library-big"></i></span>
+            </div>
+            <div class="dashboard-metric-value"><span data-metric="libraries" data-count-target="{{ b.libraries|length }}">{{ b.libraries|length }}</span><small>个分区</small></div>
+            <div class="dashboard-metric-foot">当前可访问的内容分区</div>
+        </article>
+        <article class="dashboard-metric">
+            <div class="dashboard-metric-head">
+                <span class="dashboard-metric-label">最近入库</span>
+                <span class="dashboard-metric-icon is-orange"><i data-lucide="package-open"></i></span>
+            </div>
+            <div class="dashboard-metric-value"><span data-metric="recent_added" data-count-target="{{ b.recent_added|length }}">{{ b.recent_added|length }}</span><small>项</small></div>
+            <div class="dashboard-metric-foot">已去重的新内容</div>
+        </article>
+        <article class="dashboard-metric">
+            <div class="dashboard-metric-head">
+                <span class="dashboard-metric-label">下载任务</span>
+                <span class="dashboard-metric-icon is-violet"><i data-lucide="download"></i></span>
+            </div>
+            <div class="dashboard-metric-value"><span data-count-target="{{ automation.downloads_active }}">{{ automation.downloads_active }}</span><small>项进行中</small></div>
+            {% if automation.downloads_review %}<a class="dashboard-metric-foot dashboard-metric-foot-link is-orange" href="{{ url_for('pages.downloads') }}?view=issues">{{ automation.downloads_review }} 项需处理</a>{% else %}<div class="dashboard-metric-foot">队列运行正常</div>{% endif %}
+        </article>
+        <article class="dashboard-metric">
+            <div class="dashboard-metric-head">
+                <span class="dashboard-metric-label">服务状态</span>
+                <button type="button" class="dashboard-metric-icon is-status dashboard-refresh-button" data-dashboard-refresh aria-label="刷新看板数据" title="刷新看板数据" aria-busy="false"><i data-lucide="refresh-cw"></i></button>
+            </div>
+            <div class="dashboard-metric-value dashboard-status-value">{% if not is_cached %}加载中{% elif not b.online %}异常{% elif b.partial_errors %}部分异常{% else %}正常{% endif %}</div>
+            <div class="dashboard-metric-foot {% if not is_cached %}is-muted{% elif b.online and not b.partial_errors %}is-status{% else %}is-orange{% endif %}">{% if not is_cached %}正在读取 {{ b.server_product or b.server_type|upper }} 数据{% elif b.partial_errors %}{{ b.partial_errors|length }} 项数据未同步{% else %}{{ b.server_name }} · {{ b.server_product or b.server_type|upper }}{% endif %}</div>
+        </article>
+    </section>
+
+    <section class="dashboard-panel dashboard-error-card"{% if not b.error %} hidden{% endif %}>
+        <span class="dashboard-error-icon"><i data-lucide="circle-alert"></i></span>
+        <div><strong>节点连接失败</strong><p>{{ b.error }}</p><small>检查服务地址、凭证与网络可达性后重新保存。</small></div>
+        <button type="button" class="secondary-btn" data-open-media-config="{{ b.server_type }}"><i data-lucide="wrench"></i>修复配置</button>
+    </section>
+    <section class="dashboard-primary-grid"{% if b.error %} hidden{% endif %}>
+        <article class="dashboard-panel">
+            <header class="dashboard-panel-head">
+                <div class="dashboard-panel-title"><i data-lucide="history"></i><strong>最近播放</strong></div>
+            </header>
+            <div class="dashboard-table-scroll"{% if not b.recent_played %} hidden{% endif %}>
+                <table class="dashboard-playback-table">
+                    <colgroup><col style="width:48%"><col style="width:28%"><col style="width:12%"><col style="width:12%"></colgroup>
+                    <thead><tr><th>名称</th><th>播放进度</th><th>类型</th><th>操作</th></tr></thead>
+                    <tbody>
+                    {% for item in b.recent_played[:4] %}
+                    <tr class="dashboard-playback-row">
+                        <td><a class="dashboard-media-name" href="{{ item.web_url }}" target="_blank" rel="noopener">{% if item.primary_image %}<img src="{{ item.primary_image }}" alt="" loading="lazy">{% else %}<span class="dashboard-media-thumb"><i data-lucide="film"></i></span>{% endif %}<span><strong>{{ item.display_name }}</strong><small>{% if item.episode_label %}{{ item.episode_label }}{% elif item.year %}{{ item.year }}{% else %}{{ item.type }}{% endif %}</small></span></a></td>
+                        <td><div class="dashboard-progress"><span><i data-progress-width="{{ [item.progress, 100]|min }}"></i></span><b>{{ item.progress|round|int }}%</b></div><small class="dashboard-progress-note">{% if item.last_played %}{{ item.last_played[:10] }}{% else %}暂无播放时间{% endif %}</small></td>
+                        <td><span class="dashboard-state-tag">{{ '剧集' if item.episode_label else '电影' }}</span></td>
+                        <td><a class="dashboard-row-action" href="{{ item.web_url }}" target="_blank" rel="noopener" aria-label="打开 {{ item.display_name }}"><i data-lucide="external-link"></i></a></td>
+                    </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% if not b.recent_played %}
+            <div class="dashboard-panel-empty"><i data-lucide="history"></i><span>暂无最近播放记录</span></div>
+            {% endif %}
+        </article>
+
+        <aside class="dashboard-panel dashboard-library-status">
+            <header class="dashboard-panel-head">
+                <div class="dashboard-panel-title"><i data-lucide="server"></i><strong>媒体库</strong><span data-library-count-label>{{ b.libraries|length }} 个分区</span></div>
+                {% if b.web_url %}<a class="dashboard-text-link" href="{{ b.web_url }}" target="_blank" rel="noopener">打开媒体库<i data-lucide="external-link"></i></a>{% endif %}
+            </header>
+            <div class="dashboard-library-body"{% if not b.libraries %} hidden{% endif %}>
+                {% set library_total = b.libraries|sum(attribute='count') %}
+                {% for lib in b.libraries %}
+                {% set share = ((lib.count / library_total * 100) if library_total else 0) %}
+                <a class="dashboard-library-row" href="{{ lib.web_url or '#' }}" target="_blank" rel="noopener">
+                    <div class="dashboard-library-row-head"><span><i data-lucide="folder"></i>{{ lib.name }}</span><strong>{{ "{:,}".format(lib.count) }} 项</strong></div>
+                    <div class="dashboard-library-track"><i data-progress-width="{{ [share, 100]|min|round }}"></i></div>
+                </a>
+                {% endfor %}
+            </div>
+            {% if not b.libraries %}
+            <div class="dashboard-panel-empty"><i data-lucide="library"></i><span>暂无媒体库信息</span></div>
+            {% endif %}
+            <footer class="dashboard-library-foot"><span data-library-footer-count>{{ b.libraries|length }} 个媒体库</span><span data-library-footer-total>{{ "{:,}".format(b.total_items) }} 项内容</span><span class="is-status" data-library-footer-health><i data-lucide="check"></i>{{ b.server_product or b.server_type|upper }} 正常</span></footer>
+        </aside>
+    </section>
+
+    <section class="dashboard-lower-grid"{% if b.error %} hidden{% endif %}>
+        <article class="dashboard-panel">
+            <header class="dashboard-panel-head">
+                <div class="dashboard-panel-title"><i data-lucide="film"></i><strong>最近入库</strong><span data-recent-added-count-label>{{ b.recent_added|length }} 项新内容</span></div>
+                <a class="dashboard-text-link" href="{{ url_for('pages.media_recent') }}?server={{ b.server_type }}">查看全部<i data-lucide="chevron-right"></i></a>
+            </header>
+            <div class="dashboard-poster-list"{% if not b.recent_added %} hidden{% endif %}>
+                {% for item in b.recent_added[:5] %}
+                <a class="dashboard-poster-card" href="{{ item.web_url }}" target="_blank" rel="noopener" title="{{ item.display_name }}">
+                    <div class="dashboard-poster-art">{% if item.primary_image %}<img src="{{ item.primary_image }}" alt="{{ item.display_name }}" loading="lazy">{% else %}<span><i data-lucide="film"></i></span>{% endif %}<small>{{ "%02d"|format(loop.index) }} / {{ item.type|upper }}</small></div>
+                    <div class="dashboard-poster-copy"><strong>{{ item.display_name }}</strong><span><b>{{ item.year or item.type }}</b><b>{% if item.episode_label %}{{ item.episode_label }}{% elif item.runtime %}{{ item.runtime }} 分钟{% else %}新入库{% endif %}</b></span></div>
+                </a>
+                {% endfor %}
+            </div>
+            {% if not b.recent_added %}
+            <div class="dashboard-panel-empty is-poster"><i data-lucide="inbox"></i><span>暂无最近入库内容</span></div>
+            {% endif %}
+        </article>
+
+        <article class="dashboard-panel dashboard-node-facts dashboard-automation-status" id="dashboardAutomationStatus{% if not loop.first %}-{{ loop.index }}{% endif %}">
+            <header class="dashboard-panel-head">
+                <div class="dashboard-panel-title"><i data-lucide="activity"></i><strong>自动化状态</strong><span>下载、订阅与同步任务</span></div>
+                <span class="dashboard-automation-health{% if not automation.healthy %} has-issues{% endif %}">{% if automation.error %}暂不可用{% elif automation.healthy %}运行正常{% else %}{{ automation.issues }} 项待处理{% endif %}</span>
+            </header>
+            <div class="dashboard-fact-list">
+                <a class="dashboard-fact-item" href="{{ url_for('pages.downloads') }}{% if automation.downloads_review %}?view=issues{% endif %}"><span class="dashboard-fact-icon"><i data-lucide="download"></i></span><div><strong>下载处理中 {{ automation.downloads_active }} 项</strong><span>{% if automation.downloads_review %}{{ automation.downloads_review }} 项下载或后处理异常{% else %}队列提交与转存状态正常{% endif %}</span></div><small>任务</small></a>
+                <a class="dashboard-fact-item" href="{{ url_for('pages.rss') }}"><span class="dashboard-fact-icon is-blue"><i data-lucide="rss"></i></span><div><strong>RSS 待处理 {{ automation.rss_pending }} 项</strong><span>{% if automation.rss_failed %}{{ automation.rss_failed }} 项处理失败{% else %}订阅队列暂无失败{% endif %}</span></div><small>订阅</small></a>
+                <a class="dashboard-fact-item" href="{{ url_for('pages.organize') }}"><span class="dashboard-fact-icon is-orange"><i data-lucide="folder-check"></i></span><div><strong>整理异常 {{ automation.organize_issues }} 项</strong><span>{% if automation.organize_issues %}包含失败、中断或部分失败{% else %}整理记录状态正常{% endif %}</span></div><small>整理</small></a>
+                <a class="dashboard-fact-item" href="{{ url_for('pages.guangya_strm') }}#diagnostics"><span class="dashboard-fact-icon"><i data-lucide="refresh-cw"></i></span><div><strong>STRM 待重试 {{ automation.strm_failures }} 项</strong><span>{% if automation.strm_last_at %}最近运行 {{ automation.strm_last_at[:16]|replace('T', ' ') }} · {{ automation.strm_last_status or '未知' }}{% else %}尚无同步运行记录{% endif %}</span></div><small>同步</small></a>
+            </div>
+        </article>
+    </section>
+</section>
+{% endfor %}
+</div>
+
+<div class="app-modal media-config-modal" id="mediaConfigModal" hidden>
+    <div class="card media-config-dialog" role="dialog" aria-modal="true" aria-labelledby="mediaConfigTitle">
+        <header class="media-config-head">
+            <div><span class="server-kicker">媒体连接</span><h2 id="mediaConfigTitle">配置媒体服务器</h2><p>每个节点独立保存，不会覆盖另一台服务器。</p></div>
+            <button type="button" class="icon-btn" data-modal-close aria-label="关闭" title="关闭"><i data-lucide="x"></i></button>
+        </header>
+        <div class="tab-bar media-config-tabs" id="mediaConfigTabs" role="tablist">
+            <button type="button" class="tab-btn active" role="tab" data-tab-target="jellyfin"><i data-lucide="film"></i>Jellyfin</button>
+            <button type="button" class="tab-btn" role="tab" data-tab-target="emby"><i data-lucide="clapperboard"></i>兼容节点</button>
+        </div>
+        <div class="media-config-body">
+            <form class="media-config-panel" data-tab-panel="jellyfin" onsubmit="return false;" novalidate>
+                <div class="media-node-summary"><div><strong>Jellyfin 12</strong><span data-media-detected>新版 Jellyfin API · API Key 鉴权</span></div><label class="toggle" title="启用 Jellyfin"><input type="checkbox" data-key="JELLYFIN_ENABLED"><span class="toggle-slider"></span></label></div>
+                <label class="form-group"><span class="form-label">服务地址</span><input type="url" class="form-input" data-key="JELLYFIN_URL" placeholder="http://192.168.1.100:8096"></label>
+                <div class="form-group"><label class="form-label" for="jellyfinApiKey">API Key</label><input id="jellyfinApiKey" type="password" class="form-input" data-key="JELLYFIN_API_KEY" autocomplete="new-password" placeholder="保留 ******** 表示不修改"></div>
+                <div class="media-config-footer"><span class="inline-save-state" data-save-state></span><div class="media-config-actions"><button type="button" class="jump-btn" data-test-media="jellyfin"><i data-lucide="activity"></i>测试连接</button><button type="button" class="btn btn-primary" data-save-media="jellyfin"><i data-lucide="save"></i>保存 Jellyfin</button></div></div>
+            </form>
+            <form class="media-config-panel" data-tab-panel="emby" onsubmit="return false;" novalidate hidden>
+                <div class="media-node-summary"><div><strong>Emby / Jellyfin 10.x</strong><span data-media-detected>传统 MediaBrowser API · 自动识别产品</span></div><label class="toggle" title="启用兼容节点"><input type="checkbox" data-key="EMBY_ENABLED"><span class="toggle-slider"></span></label></div>
+                <label class="form-group"><span class="form-label">服务地址</span><input type="url" class="form-input" data-key="EMBY_URL" placeholder="http://192.168.1.100:8096"></label>
+                <div class="form-group"><label class="form-label" for="embyToken">Token / API Key</label><input id="embyToken" type="password" class="form-input" data-key="EMBY_TOKEN" autocomplete="new-password" placeholder="保留 ******** 表示不修改"></div>
+                <div class="media-config-footer"><span class="inline-save-state" data-save-state></span><div class="media-config-actions"><button type="button" class="jump-btn" data-test-media="emby"><i data-lucide="activity"></i>测试连接</button><button type="button" class="btn btn-primary" data-save-media="emby"><i data-lucide="save"></i>保存兼容节点</button></div></div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    const shell=document.querySelector('.dashboard-shell');
+    const isCached=shell?.dataset.isCached==='true';
+    const serverSelect=document.querySelector('[data-server-select]');
+    const serverPanels=[...document.querySelectorAll('[data-server-panel]')];
+    const serverConnection=document.querySelector('[data-server-connection]');
+    const configButton=document.querySelector('.dashboard-config-button');
+    const dashboardIssuesLink=document.querySelector('[data-dashboard-issues-link]');
+
+    function esc(s){
+        return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function applyDashboardProgress(root=document){
+        root.querySelectorAll('[data-progress-width]').forEach(fill=>{
+            const raw=Number(fill.dataset.progressWidth);
+            const width=Number.isFinite(raw)?Math.max(0,Math.min(100,raw)):0;
+            fill.style.width=`${width}%`;
+        });
+    }
+
+    function animateDashboardMetrics(root=document){
+        if(!window.MFAnim) return;
+        root.querySelectorAll('[data-count-target]').forEach(el=>{
+            const target=Number(el.dataset.countTarget);
+            if(!isNaN(target)){
+                window.MFAnim.countUp(el, target, {
+                    startValue: 0,
+                    duration: 0.6,
+                    formatter: (v)=>Math.round(v).toLocaleString('zh-CN')
+                });
+            }
+        });
+    }
+
+    function animateDashboardEntry(panel){
+        if(!panel) return;
+        if(window.MFAnim){
+            const metrics=panel.querySelectorAll('.dashboard-metric');
+            if(metrics.length) window.MFAnim.staggerIn(metrics, { y: 10, duration: 0.26, stagger: 0.035 });
+
+            const rows=panel.querySelectorAll('.dashboard-playback-row');
+            if(rows.length) window.MFAnim.staggerIn(rows, { y: 8, duration: 0.22, stagger: 0.025 });
+
+            const posters=panel.querySelectorAll('.dashboard-poster-card');
+            if(posters.length) window.MFAnim.staggerIn(posters, { y: 10, duration: 0.25, stagger: 0.03 });
+        }
+        animateDashboardMetrics(panel);
+    }
+
+    function updateServerConnection(board){
+        if(!board || !serverSelect) return;
+        const option=[...serverSelect.options].find(item=>item.value===board.server_type);
+        if(option){
+            const name=board.server_name||board.server_type||'媒体服务';
+            const product=board.server_product||String(board.server_type||'').toUpperCase();
+            option.dataset.online=board.online?'true':'false';
+            option.dataset.name=name;
+            option.dataset.product=product;
+            option.textContent=`${name} · ${product}`;
+        }
+        if(serverSelect.value===board.server_type){
+            serverConnection?.classList.remove('is-hydrating');
+            serverConnection?.classList.toggle('is-offline',!board.online);
+            serverConnection?.querySelector('.dashboard-connection-dot')?.classList.toggle('is-offline',!board.online);
+        }
+    }
+
+    function ensurePanelEmpty(container,icon,message,extraClass=''){
+        if(!container) return null;
+        let empty=container.querySelector(':scope > .dashboard-panel-empty');
+        if(!empty){
+            empty=document.createElement('div');
+            empty.className=`dashboard-panel-empty${extraClass?` ${extraClass}`:''}`;
+            container.appendChild(empty);
+        }
+        empty.innerHTML=`<i data-lucide="${esc(icon)}"></i><span>${esc(message)}</span>`;
+        return empty;
+    }
+
+    function setDashboardRequestError(message){
+        const panel=serverPanels.find(item=>!item.hidden) || serverPanels[0];
+        if(!panel) return;
+        panel.classList.remove('is-hydrating');
+        const statusVal=panel.querySelector('.dashboard-status-value');
+        const statusFoot=panel.querySelector('.dashboard-summary-strip .dashboard-metric:last-child .dashboard-metric-foot');
+        if(statusVal) statusVal.textContent='刷新失败';
+        if(statusFoot){
+            statusFoot.className='dashboard-metric-foot is-orange';
+            statusFoot.textContent=`保留现有数据 · ${message||'稍后重试'}`;
+        }
+        serverConnection?.classList.remove('is-hydrating');
+    }
+
+    function hydrateServerPanel(panel, board){
+        if(!panel || !board) return;
+        panel.classList.remove('is-hydrating');
+        updateServerConnection(board);
+
+        let errorCard=panel.querySelector('.dashboard-error-card');
+        const primaryGrid=panel.querySelector('.dashboard-primary-grid');
+        const lowerGrid=panel.querySelector('.dashboard-lower-grid');
+        const partialErrors=Array.isArray(board.partial_errors)?board.partial_errors:[];
+        const statusVal=panel.querySelector('.dashboard-status-value');
+        const statusFoot=panel.querySelector('.dashboard-summary-strip .dashboard-metric:last-child .dashboard-metric-foot');
+        if(statusVal) statusVal.textContent=!board.online?'异常':(partialErrors.length?'部分异常':'正常');
+        if(statusFoot){
+            statusFoot.className='dashboard-metric-foot '+(board.online&&!partialErrors.length?'is-status':'is-orange');
+            statusFoot.textContent=partialErrors.length?`${partialErrors.length} 项数据未同步`:`${board.server_name||board.server_type} · ${board.server_product||String(board.server_type||'').toUpperCase()}`;
+        }
+
+        if(board.error){
+            if(primaryGrid) primaryGrid.hidden=true;
+            if(lowerGrid) lowerGrid.hidden=true;
+            if(!errorCard){
+                errorCard=document.createElement('section');
+                errorCard.className='dashboard-panel dashboard-error-card';
+                panel.appendChild(errorCard);
+            }
+            errorCard.hidden=false;
+            errorCard.innerHTML=`
+                <span class="dashboard-error-icon"><i data-lucide="circle-alert"></i></span>
+                <div><strong>节点连接失败</strong><p>${esc(board.error)}</p><small>检查服务地址、凭证与网络可达性后重新保存。</small></div>
+                <button type="button" class="secondary-btn" data-open-media-config="${esc(board.server_type)}"><i data-lucide="wrench"></i>修复配置</button>
+            `;
+            errorCard.querySelector('[data-open-media-config]')?.addEventListener('click',()=>openConfig(board.server_type||''));
+            applyDashboardProgress(panel);
+            window.renderLucideIcons?.(panel);
+            return;
+        }
+
+        if(errorCard) errorCard.hidden=true;
+        if(primaryGrid) primaryGrid.hidden=false;
+        if(lowerGrid) lowerGrid.hidden=false;
+
+        const totalItems=Number(board.total_items)||0;
+        const libraries=Array.isArray(board.libraries)?board.libraries:[];
+        const recentAdded=Array.isArray(board.recent_added)?board.recent_added:[];
+        const recentPlayed=Array.isArray(board.recent_played)?board.recent_played:[];
+        const metricValues=[
+            [panel.querySelector('[data-metric="total_items"]'),totalItems],
+            [panel.querySelector('[data-metric="libraries"]'),libraries.length],
+            [panel.querySelector('[data-metric="recent_added"]'),recentAdded.length],
+        ];
+        metricValues.forEach(([element,value])=>{
+            if(!element) return;
+            element.dataset.countTarget=String(value);
+            if(window.MFAnim){
+                window.MFAnim.countUp(element,value,{duration:0.6});
+            }else{
+                element.textContent=Number(value).toLocaleString('zh-CN');
+            }
+        });
+
+        const playbackScroll=panel.querySelector('.dashboard-table-scroll');
+        const playbackBody=panel.querySelector('.dashboard-playback-table tbody');
+        const primaryFirstPanel=panel.querySelector('.dashboard-primary-grid .dashboard-panel:first-child');
+        if(recentPlayed.length && playbackBody){
+            primaryFirstPanel?.querySelector(':scope > .dashboard-panel-empty')?.remove();
+            playbackBody.innerHTML=recentPlayed.slice(0,4).map(item=>{
+                const thumb=item.primary_image?`<img src="${esc(item.primary_image)}" alt="" loading="lazy">`:`<span class="dashboard-media-thumb"><i data-lucide="film"></i></span>`;
+                const subLabel=item.episode_label||item.year||item.type||'';
+                const progress=Math.min(100,Math.max(0,Number(item.progress)||0));
+                const lastPlayed=item.last_played?item.last_played.slice(0,10):'暂无播放时间';
+                const stateTag=item.episode_label?'剧集':'电影';
+                return `
+                    <tr class="dashboard-playback-row">
+                        <td><a class="dashboard-media-name" href="${esc(item.web_url||'#')}" target="_blank" rel="noopener">${thumb}<span><strong>${esc(item.display_name)}</strong><small>${esc(subLabel)}</small></span></a></td>
+                        <td><div class="dashboard-progress"><span><i data-progress-width="${progress}"></i></span><b>${Math.round(progress)}%</b></div><small class="dashboard-progress-note">${esc(lastPlayed)}</small></td>
+                        <td><span class="dashboard-state-tag">${stateTag}</span></td>
+                        <td><a class="dashboard-row-action" href="${esc(item.web_url||'#')}" target="_blank" rel="noopener" aria-label="打开 ${esc(item.display_name)}"><i data-lucide="external-link"></i></a></td>
+                    </tr>
+                `;
+            }).join('');
+            if(playbackScroll) playbackScroll.hidden=false;
+        }else{
+            if(playbackBody) playbackBody.innerHTML='';
+            if(playbackScroll) playbackScroll.hidden=true;
+            ensurePanelEmpty(primaryFirstPanel,'history','暂无最近播放记录');
+        }
+
+        const libBody=panel.querySelector('.dashboard-library-body');
+        const libContainer=panel.querySelector('.dashboard-library-status');
+        const libraryTotal=libraries.reduce((sum,library)=>sum+(Number(library.count)||0),0);
+        const libraryCountLabel=panel.querySelector('[data-library-count-label]');
+        const libraryFooterCount=panel.querySelector('[data-library-footer-count]');
+        const libraryFooterTotal=panel.querySelector('[data-library-footer-total]');
+        const libraryFooterHealth=panel.querySelector('[data-library-footer-health]');
+        if(libraryCountLabel) libraryCountLabel.textContent=`${libraries.length} 个分区`;
+        if(libraryFooterCount) libraryFooterCount.textContent=`${libraries.length} 个媒体库`;
+        if(libraryFooterTotal) libraryFooterTotal.textContent=`${totalItems.toLocaleString('zh-CN')} 项内容`;
+        if(libraryFooterHealth) libraryFooterHealth.innerHTML=`<i data-lucide="${board.online?'check':'circle-alert'}"></i>${esc(board.server_product||String(board.server_type||'').toUpperCase())} ${board.online?'正常':'异常'}`;
+        if(libraries.length && libBody){
+            libContainer?.querySelector(':scope > .dashboard-panel-empty')?.remove();
+            libBody.hidden=false;
+            libBody.innerHTML=libraries.map(library=>{
+                const share=libraryTotal?Math.min(100,Math.round((Number(library.count)||0)/libraryTotal*100)):0;
+                return `
+                    <a class="dashboard-library-row" href="${esc(library.web_url||'#')}" target="_blank" rel="noopener">
+                        <div class="dashboard-library-row-head"><span><i data-lucide="folder"></i>${esc(library.name)}</span><strong>${Number(library.count||0).toLocaleString('zh-CN')} 项</strong></div>
+                        <div class="dashboard-library-track"><i data-progress-width="${share}"></i></div>
+                    </a>
+                `;
+            }).join('');
+        }else{
+            if(libBody){libBody.innerHTML='';libBody.hidden=true;}
+            ensurePanelEmpty(libContainer,'library-big','暂无媒体库数据');
+        }
+
+        const posterList=panel.querySelector('.dashboard-poster-list');
+        const lowerFirstPanel=panel.querySelector('.dashboard-lower-grid .dashboard-panel:first-child');
+        const recentAddedCountLabel=panel.querySelector('[data-recent-added-count-label]');
+        if(recentAddedCountLabel) recentAddedCountLabel.textContent=`${recentAdded.length} 项新内容`;
+        if(recentAdded.length && posterList){
+            lowerFirstPanel?.querySelector(':scope > .dashboard-panel-empty')?.remove();
+            posterList.hidden=false;
+            posterList.innerHTML=recentAdded.slice(0,5).map((item,index)=>{
+                const image=item.primary_image?`<img src="${esc(item.primary_image)}" alt="${esc(item.display_name)}" loading="lazy">`:`<span><i data-lucide="film"></i></span>`;
+                const indexLabel=String(index+1).padStart(2,'0');
+                const tagRight=item.episode_label||(item.runtime?`${item.runtime} 分钟`:'新入库');
+                return `
+                    <a class="dashboard-poster-card" href="${esc(item.web_url||'#')}" target="_blank" rel="noopener" title="${esc(item.display_name)}">
+                        <div class="dashboard-poster-art">${image}<small>${indexLabel} / ${esc(item.type||'').toUpperCase()}</small></div>
+                        <div class="dashboard-poster-copy"><strong>${esc(item.display_name)}</strong><span><b>${esc(item.year||item.type||'')}</b><b>${esc(tagRight)}</b></span></div>
+                    </a>
+                `;
+            }).join('');
+        }else{
+            if(posterList){posterList.innerHTML='';posterList.hidden=true;}
+            ensurePanelEmpty(lowerFirstPanel,'package-open','暂无最近入库内容','is-poster');
+        }
+
+        applyDashboardProgress(panel);
+        window.renderLucideIcons?.(panel);
+    }
+
+    let dashboardRequestSerial=0;
+    async function fetchDashboardAsync(force=false){
+        const requestSerial=++dashboardRequestSerial;
+        try{
+            const url=force?'/api/dashboard?refresh=1':'/api/dashboard';
+            const response=await fetch(url,{headers:{Accept:'application/json'},cache:'no-store'});
+            if(!response.ok) throw new Error(`看板请求失败（HTTP ${response.status}）`);
+            const boards=await response.json();
+            if(!Array.isArray(boards)) throw new Error('看板返回数据格式无效');
+            if(requestSerial!==dashboardRequestSerial) return false;
+            boards.forEach(board=>{
+                const panel=serverPanels.find(item=>item.dataset.serverPanel===board.server_type);
+                if(panel) hydrateServerPanel(panel,board);
+            });
+            return true;
+        }catch(error){
+            if(requestSerial!==dashboardRequestSerial || error?.name==='AbortError') return false;
+            setDashboardRequestError(error?.message||'看板读取失败');
+            return false;
+        }
+    }
+    applyDashboardProgress();
+    animateDashboardMetrics(document.querySelector('.dashboard-quick-status') || document);
+    const initialPanel=document.querySelector('.dashboard-server-panel.active');
+    if(initialPanel) animateDashboardEntry(initialPanel);
+
+    if(!isCached){
+        fetchDashboardAsync();
+    }
+
+    function activateServer(type){
+        const oldPanel=serverPanels.find(p=>!p.hidden);
+        const nextPanel=serverPanels.find(p=>p.dataset.serverPanel===type);
+
+        if(oldPanel && nextPanel && oldPanel !== nextPanel){
+            if(window.MFAnim && !window.MFAnim.reducedMotion){
+                window.MFAnim.crossfade(oldPanel, nextPanel, {
+                    duration: 0.22,
+                    onComplete: ()=>{
+                        serverPanels.forEach(p=>p.classList.toggle('active', p===nextPanel));
+                        animateDashboardEntry(nextPanel);
+                    }
+                });
+            } else {
+                oldPanel.hidden=true;
+                oldPanel.classList.remove('active');
+                nextPanel.hidden=false;
+                nextPanel.classList.add('active');
+                animateDashboardEntry(nextPanel);
+            }
+        } else if(nextPanel){
+            serverPanels.forEach(panel=>{
+                const active=panel.dataset.serverPanel===type;
+                panel.hidden=!active;
+                panel.classList.toggle('active', active);
+            });
+            animateDashboardEntry(nextPanel);
+        }
+
+        if(serverSelect){
+            serverSelect.value=type;
+            const selected=serverSelect.selectedOptions[0];
+            const offline=selected?.dataset.online!=='true';
+            serverConnection?.classList.toggle('is-offline',offline);
+            serverConnection?.querySelector('.dashboard-connection-dot')?.classList.toggle('is-offline',offline);
+        }
+        if(configButton) configButton.dataset.openMediaConfig=type;
+    }
+    serverSelect?.addEventListener('change',()=>activateServer(serverSelect.value));
+    dashboardIssuesLink?.addEventListener('click',event=>{
+        if(dashboardIssuesLink.getAttribute('href')!=='#dashboardAutomationStatus') return;
+        const activePanel=serverPanels.find(panel=>!panel.hidden);
+        const target=activePanel?.querySelector('.dashboard-automation-status');
+        if(!target) return;
+        event.preventDefault();
+        target.scrollIntoView({behavior:'auto',block:'start'});
+        const url=new URL(window.location.href);
+        url.hash='dashboardAutomationStatus';
+        window.history.replaceState(window.history.state,'',`${url.pathname}${url.search}${url.hash}`);
+    });
+
+    async function refreshDashboardPanel(button){
+        if(button.getAttribute('aria-busy')==='true') return;
+        button.disabled=true;
+        button.setAttribute('aria-busy','true');
+        button.classList.add('is-refreshing');
+        try{
+            await fetchDashboardAsync(true);
+        }finally{
+            button.disabled=false;
+            button.setAttribute('aria-busy','false');
+            button.classList.remove('is-refreshing');
+        }
+    }
+    document.addEventListener('click',event=>{
+        const button=event.target.closest('[data-dashboard-refresh]');
+        if(button) refreshDashboardPanel(button);
+    });
+
+    const dashboardSearch=document.querySelector('.dashboard-global-search');
+    const dashboardSearchInput=document.getElementById('dashboardSearchInput');
+    dashboardSearch?.addEventListener('submit',event=>{
+        if(dashboardSearch.dataset.searchEnabled!=='true') event.preventDefault();
+    });
+    document.addEventListener('keydown',event=>{
+        if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'&&dashboardSearchInput&&!dashboardSearchInput.disabled){
+            event.preventDefault();
+            dashboardSearchInput.focus();
+        }
+    });
+
+    const modalEl=document.getElementById('mediaConfigModal');
+    const modal=createAppModal(modalEl);
+    const configTabs=setupTabGroup(modalEl);
+    let configLoaded=false;
+    async function openConfig(type){
+        modal.open(document.activeElement);
+        if(type) configTabs.activate(type);
+        if(configLoaded) return;
+        try{
+            const config=await loadAppConfig();
+            fillConfigFields(modalEl,config);
+            configLoaded=true;
+        }catch(error){
+            const state=modalEl.querySelector('[data-save-state]');
+            state.className='inline-save-state is-error';
+            state.textContent=error.message;
+        }
+    }
+    document.querySelectorAll('[data-open-media-config]').forEach(btn=>btn.addEventListener('click',()=>openConfig(btn.dataset.openMediaConfig||'')));
+    modalEl.querySelectorAll('[data-test-media]').forEach(btn=>btn.addEventListener('click',async()=>{
+        const type=btn.dataset.testMedia;
+        const panel=modalEl.querySelector(`[data-tab-panel="${type}"]`);
+        const state=panel.querySelector('[data-save-state]');
+        const urlField=panel.querySelector(`[data-key="${type==='jellyfin'?'JELLYFIN_URL':'EMBY_URL'}"]`);
+        const tokenField=panel.querySelector(`[data-key="${type==='jellyfin'?'JELLYFIN_API_KEY':'EMBY_TOKEN'}"]`);
+        btn.disabled=true;
+        state.className='inline-save-state';
+        state.textContent='正在测试连接...';
+        try{
+            const response=await fetch('/api/media/test',{
+                method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({server_type:type,url:urlField.value,token:tokenField.value}),
+            });
+            const data=await response.json();
+            if(!response.ok) throw new Error(data.error||'连接测试失败');
+            state.className='inline-save-state is-success';
+            state.textContent=`${data.server_name} · ${data.product} ${data.version} · ${data.latency_ms} ms`;
+            const detected=panel.querySelector('[data-media-detected]');
+            if(detected) detected.textContent=`已识别：${data.product} ${data.version}`;
+        }catch(error){
+            state.className='inline-save-state is-error';
+            state.textContent=error.message;
+        }finally{
+            btn.disabled=false;
+        }
+    }));
+    modalEl.querySelectorAll('[data-save-media]').forEach(btn=>btn.addEventListener('click',async()=>{
+        const panel=modalEl.querySelector(`[data-tab-panel="${btn.dataset.saveMedia}"]`);
+        const state=panel.querySelector('[data-save-state]');
+        btn.disabled=true;
+        state.className='inline-save-state';
+        state.textContent='正在保存...';
+        try{
+            await saveAppConfig(panel);
+            state.className='inline-save-state is-success';
+            state.textContent='已保存，正在刷新看板';
+            window.setTimeout(()=>window.location.reload(),450);
+        }catch(error){
+            state.className='inline-save-state is-error';
+            state.textContent=error.message;
+            btn.disabled=false;
+        }
+    }));
+})();
+</script>
+{% endblock %}

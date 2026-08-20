@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% from "_ui_macros.html" import theme_toggle %}
+{% block title %}全局搜索 - MediaFlux{% endblock %}
+{% block body_class %}dashboard-page media-hub-page global-search-page{% endblock %}
+{% block page_styles %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/dashboard-workbench.css') }}?v=20260818c">
+<link rel="stylesheet" href="{{ url_for('static', path='css/media-hub.css') }}?v=20260818c">
+{% endblock %}
+{% block workspace_bar %}
+<header class="dashboard-topbar media-hub-topbar">
+    <button class="icon-btn workspace-menu-btn dashboard-mobile-menu" id="toggleSidebar" type="button" aria-label="打开导航" title="打开导航" aria-expanded="false"><i data-lucide="menu"></i></button>
+    <form class="dashboard-global-search media-hub-search" role="search" action="{{ url_for('pages.global_search') }}" method="get">
+        <i data-lucide="search"></i>
+        <input id="globalSearchInput" name="q" type="search" maxlength="120" autocomplete="off" placeholder="搜索媒体、订阅、任务或日志" value="{{ result.query }}" required {{ 'autofocus' if not result.query else '' }}>
+        <kbd>Ctrl K</kbd>
+    </form>
+    <div class="dashboard-top-actions">
+        <a class="icon-btn" href="{{ url_for('pages.dashboard') }}" aria-label="返回看板" title="返回看板"><i data-lucide="layout-dashboard"></i></a>
+        {{ theme_toggle('global-search') }}
+    </div>
+</header>
+{% endblock %}
+{% block content %}
+{% set section_map = result.get('section_map', {}) %}
+{% set media_items = result.get('media_items', []) %}
+{% set top_match = result.get('top_match') %}
+{% set secondary_media_items = media_items[1:] if top_match else media_items %}
+{% set counts = result.get('counts', {'media': 0, 'rss': 0, 'downloads': 0, 'logs': 0}) %}
+<div class="media-hub-shell">
+    {% if search_error %}
+    <section class="media-hub-notice is-error"><i data-lucide="circle-alert"></i><div><strong>无法执行搜索</strong><span>{{ search_error }}</span></div></section>
+    {% elif not result.query %}
+    <section class="media-hub-empty media-hub-search-empty"><span><i data-lucide="search"></i></span><strong>输入关键词开始搜索</strong><p>一次检索媒体库、探索结果、RSS 订阅、下载任务和整理记录。</p></section>
+    {% else %}
+    {% if top_match %}
+    <section class="global-top-hit" data-global-search-section="media">
+        <div class="global-top-poster">
+            {% if top_match.image_url %}<img src="{{ top_match.image_url }}" alt="{{ top_match.title }}" loading="eager">{% else %}<span><i data-lucide="film"></i></span>{% endif %}
+            <small>{{ top_match.source_label or top_match.provider|upper }}</small>
+        </div>
+        <div class="global-top-primary">
+            <span class="global-best-match"><i></i>首选媒体 · 共 {{ counts.media }} 项媒体结果</span>
+            <h1 title="{{ top_match.title }}">{{ top_match.title }}</h1>
+            {% if top_match.original_title %}<p class="global-original-title">{{ top_match.original_title }}{% if top_match.year %} · {{ top_match.year }}{% endif %}</p>{% elif top_match.year %}<p class="global-original-title">{{ top_match.year }}</p>{% endif %}
+            <div class="global-top-tags">
+                {% if top_match.is_local %}<span class="is-local"><i data-lucide="server"></i>已在 {{ top_match.source_label }}</span>{% endif %}
+                <span class="is-type">{{ top_match.type_label or top_match.meta }}</span>
+                {% if top_match.rating %}<span class="is-rating">{{ top_match.rating_source|upper if top_match.rating_source else '评分' }} {{ '%.1f'|format(top_match.rating) }}</span>{% endif %}
+            </div>
+            <div class="global-top-context">
+                {% if top_match.overview %}<p>{{ top_match.overview }}</p>{% else %}<p>找到与“{{ result.query }}”匹配度较高的媒体条目。</p>{% endif %}
+            </div>
+        </div>
+        <div class="global-top-actions">
+            <a class="global-primary-action" href="{{ top_match.url }}" {{ 'target="_blank" rel="noopener"' if top_match.external else '' }}>{% if top_match.is_local %}<i data-lucide="play"></i>打开媒体{% else %}<i data-lucide="book-open"></i>查看媒体档案{% endif %}</a>
+            {% if discovery_enabled and top_match.is_local %}<a class="global-secondary-action" href="{{ top_match.resource_url or url_for('pages.discovery') ~ '?q=' ~ result.query|urlencode }}"><i data-lucide="search"></i>搜索资源</a>{% endif %}
+        </div>
+    </section>
+    {% endif %}
+
+    <section class="global-media-panel" data-global-search-section="media">
+        <header class="global-module-head"><div><i data-lucide="film"></i><strong>相关媒体</strong><span>{{ secondary_media_items|length }}</span></div><a href="{{ url_for('pages.discovery') if discovery_enabled else url_for('pages.media_recent') }}?q={{ result.query|urlencode }}">{{ '打开媒体探索' if discovery_enabled else '打开媒体库' }}<i data-lucide="chevron-right"></i></a></header>
+        {% if section_map.get('local', {}).get('error') %}<div class="media-hub-inline-warning"><i data-lucide="server-off"></i><span>本地媒体：{{ section_map.get('local', {}).get('error') }}</span></div>{% endif %}
+        {% if section_map.get('discovery', {}).get('error') %}<div class="media-hub-inline-warning"><i data-lucide="radio-tower"></i><span>探索来源：{{ section_map.get('discovery', {}).get('error') }}</span></div>{% endif %}
+        {% if secondary_media_items %}
+        <div class="global-media-grid">
+            {% for item in secondary_media_items %}
+            <a class="global-media-card" href="{{ item.url }}" {{ 'target="_blank" rel="noopener"' if item.external else '' }} title="{{ item.title }}">
+                <span class="global-media-poster">{% if item.image_url %}<img src="{{ item.image_url }}" alt="{{ item.title }}" loading="lazy">{% else %}<span><i data-lucide="film"></i></span>{% endif %}<small>{{ item.provider|upper }}</small><em class="global-media-type">{{ item.type_label }}</em>{% if item.is_local %}<b><i data-lucide="server"></i></b>{% endif %}</span>
+                <span class="global-media-copy"><strong>{{ item.title }}</strong><small>{{ item.episode_context or item.original_title or item.subtitle }}</small></span>
+                <span class="global-media-meta"><em>{{ item.year or item.type_label }}</em><b>{% if item.rating %}{{ '%.1f'|format(item.rating) }}{% else %}{{ item.type_label }}{% endif %}</b></span>
+            </a>
+            {% endfor %}
+        </div>
+        {% else %}<div class="media-hub-section-state"><span class="media-hub-state-icon"><i data-lucide="film"></i></span><span><strong>相关媒体已全部呈现</strong><small>可以继续前往媒体探索检索更多来源。</small></span></div>{% endif %}
+    </section>
+
+    <div class="global-automation-grid">
+        {% set rss_section = section_map.get('rss', {}) %}
+        <section class="global-automation-panel is-subscriptions" data-global-search-section="rss">
+            <header class="global-module-head"><div><i data-lucide="rss"></i><strong>订阅规则</strong><span>{{ counts.rss }}</span></div><a href="{{ rss_section.get('target_url', url_for('pages.rss')) }}">管理订阅<i data-lucide="chevron-right"></i></a></header>
+            <div class="global-automation-body">
+                {% if rss_section.get('error') %}<div class="media-hub-section-state is-error"><i data-lucide="triangle-alert"></i><span>{{ rss_section.error }}</span></div>{% elif rss_section.get('items') %}
+                <div class="global-subscription-list">
+                    {% for item in rss_section['items'] %}
+                    <a class="global-subscription-card" href="{{ item.url }}">
+                        <span class="global-subscription-icon"><i data-lucide="rss"></i></span>
+                        <span class="global-subscription-copy"><strong>{{ item.title }}</strong><small>{{ item.parser }}</small><span>{% for rule in item.rules %}<em>{{ rule }}</em>{% endfor %}</span></span>
+                        <b class="{{ 'is-running' if item.enabled else '' }}"><i></i>{{ '运行中' if item.enabled else '已停用' }}</b>
+                    </a>
+                    {% endfor %}
+                </div>
+                {% else %}<div class="media-hub-section-state"><span class="media-hub-state-icon"><i data-lucide="rss"></i></span><span><strong>订阅区安静待命</strong><small>当前关键词未命中订阅规则。</small></span></div>{% endif %}
+            </div>
+        </section>
+
+        {% set task_section = section_map.get('downloads', {}) %}
+        <section class="global-automation-panel is-downloads" data-global-search-section="downloads">
+            <header class="global-module-head"><div><i data-lucide="download"></i><strong>下载与转存</strong><span>{{ counts.downloads }}</span></div><a href="{{ task_section.get('target_url', url_for('pages.downloads')) }}">打开任务<i data-lucide="chevron-right"></i></a></header>
+            <div class="global-automation-body">
+                {% if task_section.get('error') %}<div class="media-hub-section-state is-error"><i data-lucide="triangle-alert"></i><span>{{ task_section.error }}</span></div>{% elif task_section.get('items') %}
+                <div class="global-task-list">
+                    {% for item in task_section['items'] %}
+                    <a class="global-task-card" href="{{ item.url }}">
+                        <span class="global-task-head"><strong>{{ item.title }}</strong><b>{{ item.progress_percent }}%</b></span>
+                        <span class="global-task-progress"><i style="width: {{ item.progress_percent }}%"></i></span>
+                        <span class="global-task-meta"><small>{{ item.source_label }} · {{ item.status_label }}</small><em>{{ item.path or item.created_at }}</em></span>
+                    </a>
+                    {% endfor %}
+                </div>
+                {% else %}<div class="media-hub-section-state"><span class="media-hub-state-icon"><i data-lucide="download"></i></span><span><strong>任务队列暂无关联项</strong><small>新的下载或转存任务会在这里出现。</small></span></div>{% endif %}
+            </div>
+        </section>
+
+        {% set log_section = section_map.get('logs', {}) %}
+        <section class="global-automation-panel is-logs" data-global-search-section="logs">
+            <header class="global-module-head"><div><i data-lucide="file-text"></i><strong>操作记录</strong><span>{{ counts.logs }}</span></div><a href="{{ log_section.get('target_url', url_for('pages.logs')) }}">查看日志<i data-lucide="chevron-right"></i></a></header>
+            <div class="global-automation-body">
+                {% if log_section.get('error') %}<div class="media-hub-section-state is-error"><i data-lucide="triangle-alert"></i><span>{{ log_section.error }}</span></div>{% elif log_section.get('items') %}
+                <div class="global-timeline">
+                    {% for item in log_section['items'] %}
+                    <a href="{{ item.url }}"><i class="{{ 'is-success' if item.tone == 'success' else 'is-error' if item.tone == 'error' else '' }}"></i><span><strong>{{ item.title }}</strong><small>{{ item.path }}</small></span><time>{{ item.created_at[:16] if item.created_at else item.status_label }}</time></a>
+                    {% endfor %}
+                </div>
+                {% else %}<div class="media-hub-section-state"><span class="media-hub-state-icon"><i data-lucide="file-clock"></i></span><span><strong>记录区保持安静</strong><small>当前关键词没有关联的操作轨迹。</small></span></div>{% endif %}
+            </div>
+        </section>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+(function(){
+    const input=document.getElementById('globalSearchInput');
+    document.addEventListener('keydown',event=>{
+        if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'&&input){
+            event.preventDefault(); input.focus(); input.select();
+        }
+    });
+})();
+</script>
+{% endblock %}

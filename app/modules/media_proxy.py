@@ -1,0 +1,2308 @@
+"""多实例 Emby / Jellyfin HTTP 媒体反代运行时。"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import ipaddress
+import mimetypes
+import re
+import secrets
+import socket
+import threading
+import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import formatdate
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
+
+import httpx
+import uvicorn
+from aiohttp import ClientSession, TCPConnector, WSMsgType
+from aiohttp.abc import AbstractResolver
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
+
+from app import database
+from app.clients.guangya import GuangYaClient
+from app.config import get
+from app.logger import get_logger
+from app.modules.media_proxy_recorder import PlaybackRecordWriter
+from app.modules.media_server_profiles import resolve_proxy_instance
+
+logger = get_logger(__name__)
+_STREAM_RE = re.compile(r"^(?:/emby)?/Videos/([^/]+)/stream(?:\.[^/]+)?/?$", re.IGNORECASE)
+_PLAYBACK_INFO_RE = re.compile(r"^(?:/emby)?/Items/([^/]+)/PlaybackInfo/?$", re.IGNORECASE)
+_PLAYGY_RE = re.compile(r"^(?:/emby)?/playgy/([^/]+)(?:/.*)?$", re.IGNORECASE)
+_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+}
+_ALLOWED_HOSTS = {"127.0.0.1", "0.0.0.0", "::1", "::"}
+_BLOCKED_METADATA_HOSTS = {
+    "instance-data.ec2.internal",
+    "metadata.google.internal",
+    "metadata.google.internal.",
+    "metadata.tencentyun.com",
+}
+_BLOCKED_METADATA_IPS = {
+    ipaddress.ip_address("100.100.100.200"),
+    ipaddress.ip_address("169.254.169.254"),
+    ipaddress.ip_address("fd00:ec2::254"),
+}
+_PLAYBACK_SESSION_QUERY_KEY = "_mfps"
+_SENSITIVE_QUERY_KEYS = {
+    "api_key", "x-emby-token", "x-mediabrowser-token", _PLAYBACK_SESSION_QUERY_KEY,
+}
+_AUTH_SCOPE_SECRET = secrets.token_bytes(32)
+_AUTH_TOKEN_RE = re.compile(
+    r'(?:^|[,\s])Token\s*=\s*(?:"([^"]+)"|([^,\s]+))',
+    re.IGNORECASE,
+)
+_HLS_PATH_RE = re.compile(r"(?:\.m3u8$|/(?:hls|master|main)/|\.ts$|\.m4s$)", re.IGNORECASE)
+_signed_url_caches: dict[int, SignedUrlCache] = {}
+_signed_url_caches_lock = threading.RLock()
+
+_PROXY_CONNECT_TIMEOUT_SECONDS = 10.0
+PLAYGY_SIGNED_URL_TIMEOUT_SECONDS = 8.0
+_PROXY_WRITE_TIMEOUT_SECONDS = 30.0
+_PROXY_POOL_TIMEOUT_SECONDS = 5.0
+
+
+class ProxyRequestBodyTooLarge(ValueError):
+    """反代请求体超过安全上限。"""
+
+
+class ProxyUpstreamBodyTooLarge(ValueError):
+    """需要缓冲处理的上游响应超过运行时上限。"""
+
+
+def _bounded_megabytes_setting(key: str, default: int, hard_max: int) -> int:
+    try:
+        configured_mb = int(get(key, str(default)) or default)
+    except (TypeError, ValueError):
+        configured_mb = default
+    return max(1, min(configured_mb, hard_max)) * 1024 * 1024
+
+
+def _proxy_request_body_limit() -> int:
+    return _bounded_megabytes_setting("MEDIA_PROXY_MAX_REQUEST_BODY_MB", 64, 1024)
+
+
+def _playback_info_response_limit() -> int:
+    return _bounded_megabytes_setting("MEDIA_PROXY_MAX_PLAYBACK_INFO_MB", 8, 64)
+
+
+def _proxy_websocket_message_limit() -> int:
+    return _bounded_megabytes_setting("MEDIA_PROXY_MAX_WEBSOCKET_MESSAGE_MB", 4, 64)
+
+
+def _upstream_timeout() -> httpx.Timeout:
+    # 视频响应读取必须允许长时间持续；只限制建连、写入和连接池等待。
+    return httpx.Timeout(
+        connect=_PROXY_CONNECT_TIMEOUT_SECONDS,
+        read=None,
+        write=_PROXY_WRITE_TIMEOUT_SECONDS,
+        pool=_PROXY_POOL_TIMEOUT_SECONDS,
+    )
+
+
+async def _read_proxy_request_body(request: Request) -> bytes:
+    limit = _proxy_request_body_limit()
+    raw_length = str(request.headers.get("content-length", "") or "").strip()
+    if raw_length:
+        try:
+            declared_length = int(raw_length)
+        except ValueError as exc:
+            raise ProxyRequestBodyTooLarge from exc
+        if declared_length < 0 or declared_length > limit:
+            raise ProxyRequestBodyTooLarge
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise ProxyRequestBodyTooLarge
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _read_bounded_upstream_body(response: httpx.Response, limit: int) -> bytes:
+    """有界读取需要改写的控制面响应；媒体流仍保持零拷贝式转发。"""
+    raw_length = str(response.headers.get("content-length", "") or "").strip()
+    if raw_length:
+        try:
+            declared_length = int(raw_length)
+        except ValueError as exc:
+            raise ProxyUpstreamBodyTooLarge from exc
+        if declared_length < 0 or declared_length > limit:
+            raise ProxyUpstreamBodyTooLarge
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > limit:
+            raise ProxyUpstreamBodyTooLarge
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _register_signed_url_cache(instance_id: int, cache: SignedUrlCache) -> None:
+    with _signed_url_caches_lock:
+        _signed_url_caches[int(instance_id)] = cache
+
+
+def _release_signed_url_cache(instance_id: int, cache: SignedUrlCache) -> int:
+    """清理指定 runtime 的缓存；仅在仍为当前代际时移除全局映射。"""
+    removed = cache.entry_count
+    cache.clear()
+    with _signed_url_caches_lock:
+        if _signed_url_caches.get(int(instance_id)) is cache:
+            _signed_url_caches.pop(int(instance_id), None)
+    return removed
+
+
+def classify_proxy_route(path: str, method: str = "GET") -> str:
+    normalized = "/" + str(path or "").lstrip("/")
+    if _PLAYGY_RE.match(normalized):
+        return "guangya_direct"
+    if _PLAYBACK_INFO_RE.match(normalized):
+        return "playback_info"
+    if _HLS_PATH_RE.search(normalized):
+        return "upstream_hls"
+    if _STREAM_RE.match(normalized):
+        return "stream"
+    return "upstream"
+
+
+def _range_diagnostic(value: str) -> str:
+    """只记录 Range 形态，不记录可能含敏感偏移信息的原始值。"""
+    text = str(value or "").strip()
+    if not text:
+        return "none"
+    if re.fullmatch(r"bytes=(?:\d+-\d*|-\d+)", text, re.IGNORECASE):
+        return "single"
+    return "invalid"
+
+
+def clear_signed_url_cache(instance_id: int | None = None) -> int:
+    with _signed_url_caches_lock:
+        if instance_id is None:
+            caches = list(_signed_url_caches.values())
+        else:
+            cache = _signed_url_caches.get(int(instance_id))
+            caches = [cache] if cache else []
+        removed = sum(cache.entry_count for cache in caches)
+        for cache in caches:
+            cache.clear()
+        return removed
+
+
+def signed_url_cache_metrics(instance_id: int | None = None) -> dict:
+    with _signed_url_caches_lock:
+        if instance_id is not None:
+            cache = _signed_url_caches.get(int(instance_id))
+            return cache.metrics() if cache else {
+                "hits": 0, "misses": 0, "expired": 0, "fetches": 0,
+                "failures": 0, "evictions": 0, "entries": 0, "capacity": 2048,
+            }
+        instances = {
+            str(key): cache.metrics()
+            for key, cache in sorted(_signed_url_caches.items())
+        }
+        keys = ("hits", "misses", "expired", "fetches", "failures", "evictions", "entries", "capacity")
+        return {
+            **{key: sum(int(value.get(key, 0)) for value in instances.values()) for key in keys},
+            "instances": instances,
+        }
+
+
+def _resolved_instance(instance_id: int) -> dict[str, Any] | None:
+    row = database.get_media_proxy_instance(instance_id)
+    if not row:
+        return None
+    return resolve_proxy_instance(row)
+
+
+@dataclass(frozen=True)
+class _DynamicGuangYaMapping:
+    file_id: str
+    expires_at: float
+
+
+class DynamicGuangYaMappings:
+    """按代理实例隔离的短时光鸭来源映射。"""
+
+    def __init__(
+        self,
+        ttl_seconds: float = 15 * 60,
+        clock: Callable[[], float] = time.monotonic,
+        max_entries: int = 4096,
+    ) -> None:
+        self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._clock = clock
+        self._max_entries = max(1, int(max_entries))
+        self._entries: OrderedDict[
+            tuple[int, str, str], _DynamicGuangYaMapping
+        ] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def register(
+        self,
+        instance_id: int,
+        item_id: str,
+        source_id: str,
+        file_id: str,
+    ) -> None:
+        normalized_item = str(item_id or "").strip()
+        normalized_file = str(file_id or "").strip()
+        if not normalized_item or not normalized_file:
+            return
+        key = (int(instance_id), normalized_item, str(source_id or "").strip())
+        with self._lock:
+            now = self._clock()
+            self._prune_expired_locked(now)
+            self._entries.pop(key, None)
+            self._entries[key] = _DynamicGuangYaMapping(
+                file_id=normalized_file,
+                expires_at=now + self._ttl_seconds,
+            )
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def _prune_expired_locked(self, now: float) -> None:
+        expired = [
+            key for key, entry in self._entries.items()
+            if entry.expires_at <= now
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
+
+    def get(self, instance_id: int, item_id: str, source_id: str = "") -> str | None:
+        now = self._clock()
+        instance_key = int(instance_id)
+        item_key = str(item_id or "").strip()
+        source_key = str(source_id or "").strip()
+        with self._lock:
+            self._prune_expired_locked(now)
+            if source_key:
+                key = (instance_key, item_key, source_key)
+                entry = self._entries.get(key)
+                if entry:
+                    self._entries.move_to_end(key)
+                    return entry.file_id
+                return None
+
+            matching = [
+                (key, entry.file_id)
+                for key, entry in self._entries.items()
+                if key[0] == instance_key and key[1] == item_key
+            ]
+            candidates = {file_id for _, file_id in matching}
+            if len(candidates) == 1:
+                for key, _ in matching:
+                    self._entries.move_to_end(key)
+                return next(iter(candidates))
+            return None
+
+    @property
+    def entry_count(self) -> int:
+        with self._lock:
+            self._prune_expired_locked(self._clock())
+            return len(self._entries)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+class SignedUrlCache:
+    """签名 URL 短缓存；失败结果不缓存，同一文件并发请求只取一次。"""
+
+    def __init__(
+        self,
+        ttl_seconds: float = 60,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        lock_stripes: int = 64,
+        max_entries: int = 2048,
+        expiry_margin_seconds: float = 10,
+    ) -> None:
+        self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._clock = clock
+        self._wall_clock = wall_clock
+        self._expiry_margin_seconds = max(0.0, float(expiry_margin_seconds))
+        self._max_entries = max(1, int(max_entries))
+        self._entries: OrderedDict[tuple[str, str, str], tuple[str, float]] = OrderedDict()
+        stripe_count = max(1, int(lock_stripes))
+        self._locks = tuple(asyncio.Lock() for _ in range(stripe_count))
+        self._sync_locks = tuple(threading.Lock() for _ in range(stripe_count))
+        self._guard = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+        self._expired = 0
+        self._fetches = 0
+        self._failures = 0
+        self._evictions = 0
+
+    @staticmethod
+    def _key(file_id: str, scope: str, user_agent: str, ua_bound: bool) -> tuple[str, str, str]:
+        return (
+            str(scope or "").strip(),
+            str(file_id or "").strip(),
+            str(user_agent or "").strip() if ua_bound else "",
+        )
+
+    def _provider_expiry(self, url: str) -> float | None:
+        """解析常见签名 URL 的绝对到期时间；不保存或输出 URL。"""
+        try:
+            query = {key.lower(): value for key, value in parse_qsl(urlsplit(url).query)}
+            for key in ("expires", "x-oss-expires", "oss-expires", "expiry", "exp"):
+                value = query.get(key)
+                if value:
+                    parsed = float(value)
+                    if parsed > self._wall_clock():
+                        return parsed
+            amz_date = query.get("x-amz-date")
+            amz_ttl = query.get("x-amz-expires")
+            if amz_date and amz_ttl:
+                issued = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(
+                    tzinfo=timezone.utc
+                ).timestamp()
+                return issued + float(amz_ttl)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return None
+
+    def _cache_expiry(self, url: str, now: float) -> float:
+        expiry = now + self._ttl_seconds
+        provider_expiry = self._provider_expiry(url)
+        if provider_expiry is not None:
+            remaining = provider_expiry - self._wall_clock() - self._expiry_margin_seconds
+            expiry = min(expiry, now + max(0.0, remaining))
+        return expiry
+
+    def _prune_expired_locked(self, now: float) -> None:
+        expired = [
+            key for key, entry in self._entries.items()
+            if entry[1] <= now
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
+        self._expired += len(expired)
+
+    def _cached(self, key: tuple[str, str, str]) -> str | None:
+        now = self._clock()
+        with self._guard:
+            entry = self._entries.get(key)
+            if entry and entry[1] > now:
+                self._entries.move_to_end(key)
+                return entry[0]
+            if entry:
+                self._expired += 1
+            self._entries.pop(key, None)
+        return None
+
+    def _file_lock(self, key: tuple[str, str, str]) -> asyncio.Lock:
+        return self._locks[hash(key) % len(self._locks)]
+
+    def _sync_file_lock(self, key: tuple[str, str, str]) -> threading.Lock:
+        return self._sync_locks[hash(key) % len(self._sync_locks)]
+
+    def _remember(self, key: tuple[str, str, str], url: str) -> bool:
+        with self._guard:
+            now = self._clock()
+            self._prune_expired_locked(now)
+            expiry = self._cache_expiry(str(url), now)
+            if expiry <= now:
+                return False
+            self._entries.pop(key, None)
+            self._entries[key] = (str(url), expiry)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+                self._evictions += 1
+        return True
+
+    @property
+    def lock_count(self) -> int:
+        return len(self._locks)
+
+    async def get_or_fetch(
+        self,
+        file_id: str,
+        fetcher: Callable[[], Awaitable[str | None]],
+        *,
+        scope: str = "",
+        user_agent: str = "",
+        ua_bound: bool = False,
+    ) -> str | None:
+        result = await self.get_or_fetch_result(
+            file_id,
+            fetcher,
+            scope=scope,
+            user_agent=user_agent,
+            ua_bound=ua_bound,
+        )
+        return result.url
+
+    async def get_or_fetch_result(
+        self,
+        file_id: str,
+        fetcher: Callable[[], Awaitable[str | None]],
+        *,
+        scope: str = "",
+        user_agent: str = "",
+        ua_bound: bool = False,
+    ) -> "SignedUrlCacheResult":
+        normalized = str(file_id or "").strip()
+        if not normalized:
+            return SignedUrlCacheResult(None, False)
+        key = self._key(normalized, scope, user_agent, ua_bound)
+        cached = self._cached(key)
+        if cached:
+            with self._guard:
+                self._hits += 1
+            return SignedUrlCacheResult(cached, True)
+        with self._guard:
+            self._misses += 1
+        async with self._file_lock(key):
+            cached = self._cached(key)
+            if cached:
+                with self._guard:
+                    self._hits += 1
+                return SignedUrlCacheResult(cached, True)
+            with self._guard:
+                self._fetches += 1
+            try:
+                url = await fetcher()
+            except Exception:
+                with self._guard:
+                    self._failures += 1
+                raise
+            if url:
+                self._remember(key, str(url))
+            else:
+                with self._guard:
+                    self._failures += 1
+            return SignedUrlCacheResult(str(url) if url else None, False)
+
+    def get_or_fetch_sync_result(
+        self,
+        file_id: str,
+        fetcher: Callable[[], str | None],
+        *,
+        scope: str = "",
+        user_agent: str = "",
+        ua_bound: bool = False,
+    ) -> "SignedUrlCacheResult":
+        """同步路由使用的短缓存入口，保持与异步入口相同的单飞语义。"""
+        normalized = str(file_id or "").strip()
+        if not normalized:
+            return SignedUrlCacheResult(None, False)
+        key = self._key(normalized, scope, user_agent, ua_bound)
+        cached = self._cached(key)
+        if cached:
+            with self._guard:
+                self._hits += 1
+            return SignedUrlCacheResult(cached, True)
+        with self._guard:
+            self._misses += 1
+        with self._sync_file_lock(key):
+            cached = self._cached(key)
+            if cached:
+                with self._guard:
+                    self._hits += 1
+                return SignedUrlCacheResult(cached, True)
+            with self._guard:
+                self._fetches += 1
+            try:
+                url = fetcher()
+            except Exception:
+                with self._guard:
+                    self._failures += 1
+                raise
+            if url:
+                self._remember(key, str(url))
+            else:
+                with self._guard:
+                    self._failures += 1
+            return SignedUrlCacheResult(str(url) if url else None, False)
+
+    @property
+    def entry_count(self) -> int:
+        with self._guard:
+            self._prune_expired_locked(self._clock())
+            return len(self._entries)
+
+    def clear(self) -> None:
+        with self._guard:
+            self._entries.clear()
+
+    def clear_scope(self, scope_prefix: str) -> int:
+        prefix = str(scope_prefix or "")
+        with self._guard:
+            keys = [key for key in self._entries if key[0].startswith(prefix)]
+            for key in keys:
+                self._entries.pop(key, None)
+            return len(keys)
+
+    def metrics(self) -> dict[str, int]:
+        with self._guard:
+            self._prune_expired_locked(self._clock())
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "expired": self._expired,
+                "fetches": self._fetches,
+                "failures": self._failures,
+                "evictions": self._evictions,
+                "entries": len(self._entries),
+                "capacity": self._max_entries,
+            }
+
+
+@dataclass(frozen=True)
+class SignedUrlCacheResult:
+    url: str | None
+    cache_hit: bool
+
+
+@dataclass(frozen=True)
+class _ItemBindingScope:
+    binding_signature: str
+    expires_at: float
+
+
+class ItemLevelBindingScopes:
+    """只允许已在单 MediaSource PlaybackInfo 中确认过的 Item 级绑定。"""
+
+    def __init__(
+        self,
+        ttl_seconds: float = 15 * 60,
+        clock: Callable[[], float] = time.monotonic,
+        max_entries: int = 4096,
+    ) -> None:
+        self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._clock = clock
+        self._max_entries = max(1, int(max_entries))
+        self._entries: OrderedDict[
+            tuple[str, int, str, str], _ItemBindingScope
+        ] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def _prune_expired_locked(self, now: float) -> None:
+        expired = [
+            key for key, entry in self._entries.items()
+            if entry.expires_at <= now
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
+
+    def register(
+        self,
+        instance_id: int,
+        item_id: str,
+        source_id: str,
+        binding_signature: str,
+        auth_scope: str = "",
+    ) -> None:
+        key = (str(auth_scope or ""), int(instance_id), str(item_id or ""), str(source_id or ""))
+        with self._lock:
+            now = self._clock()
+            self._prune_expired_locked(now)
+            self._entries.pop(key, None)
+            self._entries[key] = _ItemBindingScope(
+                binding_signature=str(binding_signature),
+                expires_at=now + self._ttl_seconds,
+            )
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def matches(
+        self,
+        instance_id: int,
+        item_id: str,
+        source_id: str,
+        binding_signature: str,
+        auth_scope: str = "",
+    ) -> bool:
+        key = (str(auth_scope or ""), int(instance_id), str(item_id or ""), str(source_id or ""))
+        with self._lock:
+            self._prune_expired_locked(self._clock())
+            entry = self._entries.get(key)
+            if entry and entry.binding_signature == str(binding_signature):
+                self._entries.move_to_end(key)
+                return True
+            return False
+
+    def matches_item(
+        self,
+        instance_id: int,
+        item_id: str,
+        binding_signature: str,
+        auth_scope: str = "",
+    ) -> bool:
+        with self._lock:
+            self._prune_expired_locked(self._clock())
+            matches = [
+                key for key, entry in self._entries.items()
+                if key[0] == str(auth_scope or "")
+                and key[1] == int(instance_id)
+                and key[2] == str(item_id or "")
+                and entry.binding_signature == str(binding_signature)
+            ]
+            if len(matches) == 1:
+                self._entries.move_to_end(matches[0])
+                return True
+            return False
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_dynamic_guangya_mappings = DynamicGuangYaMappings()
+_item_level_binding_scopes = ItemLevelBindingScopes()
+
+@dataclass(frozen=True)
+class _PlaybackGrant:
+    source_type: str
+    file_id: str
+    binding_signature: str
+    expires_at: float
+
+
+class PlaybackGrantRegistry:
+    """按不可逆认证 scope 隔离的短时播放授权；不保存原始凭据。"""
+
+    def __init__(self, ttl_seconds: float = 15 * 60, max_entries: int = 8192,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_entries = max(1, int(max_entries))
+        self._clock = clock
+        self._entries: OrderedDict[tuple[str, int, str, str], _PlaybackGrant] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def _prune_locked(self, now: float) -> None:
+        for key in [key for key, value in self._entries.items() if value.expires_at <= now]:
+            self._entries.pop(key, None)
+
+    def register(self, auth_scope: str, instance_id: int, item_id: str, source_id: str,
+                 *, source_type: str, file_id: str = "", binding_signature: str = "") -> None:
+        if not auth_scope:
+            return
+        key = (auth_scope, int(instance_id), str(item_id or ""), str(source_id or ""))
+        with self._lock:
+            now = self._clock(); self._prune_locked(now); self._entries.pop(key, None)
+            self._entries[key] = _PlaybackGrant(str(source_type), str(file_id or ""),
+                                                str(binding_signature or ""), now + self._ttl_seconds)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def matches(self, auth_scope: str, instance_id: int, item_id: str, source_id: str,
+                *, file_id: str = "", binding_signature: str = "") -> bool:
+        if not auth_scope:
+            return False
+        with self._lock:
+            self._prune_locked(self._clock())
+            keys = [(auth_scope, int(instance_id), str(item_id or ""), str(source_id or ""))]
+            if not source_id:
+                keys = [key for key in self._entries if key[:3] == (auth_scope, int(instance_id), str(item_id or ""))]
+            matches = []
+            for key in keys:
+                grant = self._entries.get(key)
+                if not grant: continue
+                if file_id and grant.file_id != str(file_id): continue
+                if binding_signature and grant.binding_signature != str(binding_signature): continue
+                matches.append(key)
+            if len(matches) == 1:
+                self._entries.move_to_end(matches[0]); return True
+            return False
+
+    def allows_file(self, auth_scope: str, instance_id: int, file_id: str) -> bool:
+        if not auth_scope or not file_id: return False
+        with self._lock:
+            self._prune_locked(self._clock())
+            for key, grant in self._entries.items():
+                if key[0] == auth_scope and key[1] == int(instance_id) and grant.file_id == str(file_id):
+                    self._entries.move_to_end(key); return True
+            return False
+
+    def clear(self) -> None:
+        with self._lock: self._entries.clear()
+
+
+_playback_grants = PlaybackGrantRegistry()
+
+
+@dataclass
+class _PlaybackSessionLink:
+    token: str
+    auth_scope: str
+    instance_id: int
+    item_id: str
+    source_id: str
+    file_id: str
+    expires_at: float
+
+
+class PlaybackSessionRegistry:
+    """把一次 PlaybackInfo/stream/HLS 请求链关联为不含原始凭据的短时会话。"""
+
+    def __init__(self, ttl_seconds: float = 30 * 60, max_entries: int = 8192,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_entries = max(1, int(max_entries))
+        self._clock = clock
+        self._entries: OrderedDict[tuple[str, int, str], _PlaybackSessionLink] = OrderedDict()
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _token(value: str) -> str:
+        token = str(value or "").strip()
+        return token if 0 < len(token) <= 256 else ""
+
+    def _prune_locked(self, now: float) -> None:
+        for key in [key for key, value in self._entries.items() if value.expires_at <= now]:
+            self._entries.pop(key, None)
+
+    def _touch_locked(self, key: tuple[str, int, str], entry: _PlaybackSessionLink,
+                      *, item_id: str = "", source_id: str = "",
+                      file_id: str = "") -> _PlaybackSessionLink:
+        if item_id:
+            entry.item_id = str(item_id)
+        if source_id:
+            entry.source_id = str(source_id)
+        if file_id:
+            entry.file_id = str(file_id)
+        entry.expires_at = self._clock() + self._ttl_seconds
+        self._entries.move_to_end(key)
+        return entry
+
+    def begin(self, auth_scope: str, instance_id: int, *, token: str = "",
+              item_id: str = "", source_id: str = "",
+              file_id: str = "") -> _PlaybackSessionLink:
+        normalized_token = self._token(token) or secrets.token_urlsafe(24)
+        key = (str(auth_scope or ""), int(instance_id), normalized_token)
+        with self._lock:
+            now = self._clock()
+            self._prune_locked(now)
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _PlaybackSessionLink(
+                    token=normalized_token,
+                    auth_scope=key[0],
+                    instance_id=key[1],
+                    item_id=str(item_id or ""),
+                    source_id=str(source_id or ""),
+                    file_id=str(file_id or ""),
+                    expires_at=now + self._ttl_seconds,
+                )
+                self._entries[key] = entry
+            else:
+                self._touch_locked(
+                    key, entry, item_id=item_id, source_id=source_id, file_id=file_id
+                )
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+            return entry
+
+    def resolve(self, auth_scope: str, instance_id: int, *, token: str = "",
+                item_id: str = "", source_id: str = "", file_id: str = "",
+                create: bool = False) -> _PlaybackSessionLink | None:
+        normalized_scope = str(auth_scope or "")
+        normalized_instance = int(instance_id)
+        normalized_token = self._token(token)
+        with self._lock:
+            self._prune_locked(self._clock())
+            if normalized_token:
+                key = (normalized_scope, normalized_instance, normalized_token)
+                entry = self._entries.get(key)
+                if entry is not None:
+                    return self._touch_locked(
+                        key, entry, item_id=item_id, source_id=source_id, file_id=file_id
+                    )
+                if create:
+                    return self.begin(
+                        normalized_scope, normalized_instance, token=normalized_token,
+                        item_id=item_id, source_id=source_id, file_id=file_id,
+                    )
+                return None
+
+            candidates = [
+                (key, entry) for key, entry in self._entries.items()
+                if key[0] == normalized_scope and key[1] == normalized_instance
+            ]
+            preferred: list[tuple[tuple[str, int, str], _PlaybackSessionLink]] = []
+            if file_id:
+                preferred = [(key, entry) for key, entry in candidates if entry.file_id == str(file_id)]
+            elif item_id and source_id:
+                pending = [
+                    (key, entry) for key, entry in candidates
+                    if entry.item_id == str(item_id) and not entry.source_id
+                ]
+                exact = [
+                    (key, entry) for key, entry in candidates
+                    if entry.item_id == str(item_id) and entry.source_id == str(source_id)
+                ]
+                if len(pending) == 1:
+                    preferred = pending
+                elif len(exact) == 1:
+                    preferred = exact
+            elif item_id:
+                preferred = [(key, entry) for key, entry in candidates if entry.item_id == str(item_id)]
+            elif len(candidates) == 1:
+                preferred = candidates
+
+            if len(preferred) == 1:
+                key, entry = preferred[0]
+                return self._touch_locked(
+                    key, entry, item_id=item_id, source_id=source_id, file_id=file_id
+                )
+
+        if create and (item_id or file_id):
+            return self.begin(
+                normalized_scope, normalized_instance,
+                item_id=item_id, source_id=source_id, file_id=file_id,
+            )
+        return None
+
+    @staticmethod
+    def persistent_key(entry: _PlaybackSessionLink) -> str:
+        payload = (
+            f"mediaflux-playback-session\0{entry.auth_scope}\0"
+            f"{entry.instance_id}\0{entry.token}"
+        ).encode("utf-8")
+        return hmac.new(_AUTH_SCOPE_SECRET, payload, hashlib.sha256).hexdigest()[:48]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_playback_sessions = PlaybackSessionRegistry()
+
+
+def _apply_playback_session(request: Request, entry: _PlaybackSessionLink | None) -> None:
+    if entry is None:
+        return
+    request.state.proxy_playback_session_token = entry.token
+    request.state.proxy_playback_session_key = _playback_sessions.persistent_key(entry)
+    request.state.proxy_media_item_id = entry.item_id
+    request.state.proxy_media_source_id = entry.source_id
+    request.state.proxy_guangya_file_id = entry.file_id
+
+
+def _request_query_value(request: Request, *names: str) -> str:
+    accepted = {str(name).lower() for name in names}
+    for key, value in request.query_params.multi_items():
+        if str(key).lower() in accepted and str(value or "").strip():
+            return str(value).strip()
+    return ""
+
+
+def _extract_guangya_file_id(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlsplit(raw)
+        path = parsed.path
+    except ValueError:
+        return None
+    if not path.startswith("/"):
+        path = f"/{path}"
+    match = _PLAYGY_RE.match(path)
+    if not match:
+        return None
+    file_id = unquote(match.group(1)).strip()
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if query.get("enc") == "b64":
+        try:
+            from app.modules.playgy_signing import decode_playgy_path_token
+            file_id = decode_playgy_path_token(file_id)
+        except ValueError:
+            return None
+    return file_id or None
+
+
+def _route_prefix(path: str) -> str:
+    return "/emby" if str(path or "").lower().startswith("/emby/") else ""
+
+
+def _direct_stream_path(
+    item_id: str,
+    source_id: str = "",
+    prefix: str = "",
+    playback_session_token: str = "",
+) -> str:
+    path = f"{prefix}/Videos/{quote(str(item_id), safe='')}/stream"
+    query: list[str] = []
+    if source_id:
+        query.append(f"MediaSourceId={quote(str(source_id), safe='')}")
+    if playback_session_token:
+        query.append(
+            f"{_PLAYBACK_SESSION_QUERY_KEY}={quote(str(playback_session_token), safe='')}"
+        )
+    return f"{path}?{'&'.join(query)}" if query else path
+
+
+def _mark_direct_source(
+    source: dict[str, Any],
+    stream_path: str,
+    direct_stream_url: str | None = None,
+) -> None:
+    source["SupportsDirectPlay"] = True
+    source["SupportsDirectStream"] = True
+    source["SupportsTranscoding"] = False
+    source["IsRemote"] = False
+    source["Protocol"] = "Http"
+    source["RequiresOpening"] = False
+    source["RequiresClosing"] = False
+    source["RequiresLooping"] = False
+    source["ReadAtNativeFramerate"] = False
+    source["Path"] = stream_path
+    source["DirectStreamUrl"] = direct_stream_url or stream_path
+    source.pop("TranscodingUrl", None)
+
+
+def validate_listen_host(value: str) -> str:
+    host = str(value or "127.0.0.1").strip()
+    if host not in _ALLOWED_HOSTS:
+        raise ValueError("监听地址只允许 127.0.0.1、0.0.0.0、::1 或 ::")
+    return host
+
+
+def _validate_upstream_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    if address in _BLOCKED_METADATA_IPS:
+        raise ValueError("上游地址不能指向云元数据服务")
+    if address.is_link_local or address.is_multicast or address.is_unspecified:
+        raise ValueError("上游地址不能使用链路本地、组播或未指定地址")
+
+
+def _parse_upstream_url(value: str) -> tuple[str, httpx.URL]:
+    url = str(value or "").strip().rstrip("/")
+    try:
+        parsed = httpx.URL(url)
+    except (httpx.InvalidURL, TypeError, ValueError) as exc:
+        raise ValueError("上游地址必须是有效的 HTTP/HTTPS URL") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.host:
+        raise ValueError("上游地址必须是有效的 HTTP/HTTPS URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("上游地址不能包含凭据、查询参数或片段")
+    host = str(parsed.host).strip().lower()
+    if host in _BLOCKED_METADATA_HOSTS:
+        raise ValueError("上游地址不能指向云元数据服务")
+    return url, parsed
+
+
+def _resolve_upstream_addresses(
+    parsed: httpx.URL,
+    *,
+    allow_dns_failure: bool,
+) -> tuple[str, ...]:
+    """解析并验证一次地址快照；运行时必须把连接固定到该快照。"""
+    host = str(parsed.host).strip().lower()
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        _validate_upstream_address(literal)
+        return (str(literal),)
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        if allow_dns_failure:
+            return ()
+        raise ValueError("无法解析上游地址") from exc
+
+    addresses: list[str] = []
+    for _, _, _, _, socket_address in resolved:
+        if not socket_address:
+            continue
+        raw_address = str(socket_address[0]).split("%", 1)[0]
+        try:
+            resolved_address = ipaddress.ip_address(raw_address)
+        except ValueError:
+            continue
+        _validate_upstream_address(resolved_address)
+        normalized = str(resolved_address)
+        if normalized not in addresses:
+            addresses.append(normalized)
+    if not addresses and not allow_dns_failure:
+        raise ValueError("上游域名没有可用地址")
+    return tuple(addresses)
+
+
+def validate_upstream_url(value: str) -> str:
+    """校验管理端保存的固定上游地址。
+
+    配置阶段允许暂时无法解析的离线域名；实际代理请求会重新取得一次
+    受控地址快照，并把 TCP/WebSocket 连接固定到该快照。
+    """
+    url, parsed = _parse_upstream_url(value)
+    _resolve_upstream_addresses(parsed, allow_dns_failure=True)
+    return url
+
+
+def _join_upstream_url(parsed: httpx.URL, request_path: str) -> httpx.URL:
+    """拼接固定上游路径，避免 upstream 与请求同时带 /emby 时重复。"""
+    base_path = parsed.path.rstrip("/")
+    path = "/" + str(request_path or "").lstrip("/")
+    if base_path and base_path != "/" and (
+        path.lower() == base_path.lower()
+        or path.lower().startswith(base_path.lower() + "/")
+    ):
+        joined_path = path
+    else:
+        joined_path = f"{base_path}{path}" if base_path and base_path != "/" else path
+    return parsed.copy_with(path="/" if joined_path == "/" else joined_path)
+
+
+def _upstream_target(upstream: str, request_path: str) -> str:
+    _, parsed = _parse_upstream_url(upstream)
+    _resolve_upstream_addresses(parsed, allow_dns_failure=True)
+    target = str(_join_upstream_url(parsed, request_path))
+    return target.rstrip("/") if httpx.URL(target).path == "/" else target
+
+
+@dataclass(frozen=True)
+class _PinnedUpstreamTarget:
+    logical_url: str
+    connect_url: str
+    host_header: str
+    sni_hostname: str
+    addresses: tuple[str, ...]
+
+
+class _UpstreamClientPool:
+    """按逻辑上游 authority 复用连接，并由代理应用生命周期统一关闭。"""
+
+    def __init__(self) -> None:
+        self._clients: dict[tuple[str, str, int], httpx.AsyncClient] = {}
+
+    @staticmethod
+    def _key(pinned: _PinnedUpstreamTarget) -> tuple[str, str, int]:
+        logical = httpx.URL(pinned.logical_url)
+        default_port = 443 if logical.scheme == "https" else 80
+        return (logical.scheme, str(logical.host or ""), int(logical.port or default_port))
+
+    def get(self, pinned: _PinnedUpstreamTarget) -> httpx.AsyncClient:
+        key = self._key(pinned)
+        client = self._clients.get(key)
+        if client is None:
+            client = httpx.AsyncClient(
+                follow_redirects=False,
+                timeout=_upstream_timeout(),
+            )
+            self._clients[key] = client
+        return client
+
+    async def aclose(self) -> None:
+        clients = tuple(self._clients.values())
+        self._clients.clear()
+        if not clients:
+            return
+        results = await asyncio.gather(
+            *(client.aclose() for client in clients),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(
+                    "媒体反代上游连接池关闭失败 type=%s",
+                    type(result).__name__,
+                )
+
+
+def _pin_upstream_target(upstream: str, request_path: str) -> _PinnedUpstreamTarget:
+    """把逻辑 Host/SNI 与一次性验证后的物理连接地址绑定。"""
+    _, parsed = _parse_upstream_url(upstream)
+    addresses = _resolve_upstream_addresses(parsed, allow_dns_failure=False)
+    logical = _join_upstream_url(parsed, request_path)
+    connect = logical.copy_with(host=addresses[0])
+    return _PinnedUpstreamTarget(
+        logical_url=str(logical),
+        connect_url=str(connect),
+        host_header=logical.netloc.decode("ascii"),
+        sni_hostname=str(parsed.host),
+        addresses=addresses,
+    )
+
+
+async def probe_media_proxy_instance(
+    instance_id: int,
+    *,
+    timeout_seconds: float = 8.0,
+) -> dict[str, int]:
+    """安全探测一个已保存实例；固定 DNS 快照且不返回地址或凭据。"""
+    row = await asyncio.to_thread(database.get_media_proxy_instance, int(instance_id))
+    if row is None:
+        raise LookupError("media proxy instance not found")
+    resolved = resolve_proxy_instance(row)
+    pinned = await asyncio.to_thread(
+        _pin_upstream_target,
+        str(resolved.get("upstream_url") or ""),
+        "/System/Info/Public",
+    )
+    headers = {"Accept": "application/json", "Host": pinned.host_header}
+    credential = str(resolved.get("api_key") or "").strip()
+    if credential:
+        headers["X-Emby-Token"] = credential
+
+    timeout_value = max(1.0, min(float(timeout_seconds), 15.0))
+    started = time.monotonic()
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout_value),
+        follow_redirects=False,
+    ) as client:
+        request = client.build_request(
+            "GET",
+            pinned.connect_url,
+            headers=headers,
+            extensions={"sni_hostname": pinned.sni_hostname},
+        )
+        response = await client.send(request, stream=True)
+        try:
+            await _read_bounded_upstream_body(
+                response, _playback_info_response_limit()
+            )
+            status_code = int(response.status_code)
+        finally:
+            await response.aclose()
+    return {
+        "status_code": status_code,
+        "latency_ms": max(0, round((time.monotonic() - started) * 1000)),
+    }
+
+
+class _PinnedResolver(AbstractResolver):
+    """aiohttp WebSocket resolver：仅返回已校验的 DNS 快照。"""
+
+    def __init__(self, hostname: str, addresses: tuple[str, ...]) -> None:
+        self.hostname = str(hostname).rstrip(".").lower()
+        self.addresses = tuple(addresses)
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET,
+    ) -> list[dict[str, object]]:
+        if str(host).rstrip(".").lower() != self.hostname:
+            raise OSError("Unexpected upstream hostname")
+        results: list[dict[str, object]] = []
+        for raw in self.addresses:
+            address = ipaddress.ip_address(raw)
+            address_family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+            if family not in {socket.AF_UNSPEC, address_family}:
+                continue
+            results.append({
+                "hostname": host,
+                "host": raw,
+                "port": port,
+                "family": address_family,
+                "proto": socket.IPPROTO_TCP,
+                "flags": 0,
+            })
+        if not results:
+            raise OSError("No pinned upstream address for requested family")
+        return results
+
+    async def close(self) -> None:
+        return None
+
+
+def resolve_local_binding(local_root: str, relative_path: str) -> Path:
+    root = Path(str(local_root or "")).expanduser().resolve(strict=False)
+    relative = Path(str(relative_path or ""))
+    if not str(local_root or "").strip() or relative.is_absolute():
+        raise ValueError("本地绑定必须使用已配置根目录下的相对路径")
+    candidate = (root / relative).resolve(strict=False)
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("本地绑定路径越界") from exc
+    return candidate
+
+
+def _response_headers(headers: httpx.Headers) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in _HOP_HEADERS
+    }
+
+
+def _decoded_response_headers(headers: httpx.Headers) -> dict[str, str]:
+    result = _response_headers(headers)
+    result.pop("content-encoding", None)
+    result.pop("Content-Encoding", None)
+    result.pop("content-length", None)
+    result.pop("Content-Length", None)
+    return result
+
+
+def _request_headers(request: Request) -> dict[str, str]:
+    return {key: value for key, value in request.headers.items() if key.lower() not in _HOP_HEADERS}
+
+
+def _request_auth_credential(request: Any) -> str:
+    headers = request.headers
+    query = request.query_params
+    return str(
+        headers.get("X-Emby-Token")
+        or headers.get("X-MediaBrowser-Token")
+        or query.get("api_key")
+        or query.get("X-Emby-Token")
+        or query.get("X-MediaBrowser-Token")
+        or _authorization_token(headers.get("Authorization", ""))
+        or _authorization_token(headers.get("X-Emby-Authorization", ""))
+        or ""
+    ).strip()
+
+
+def _auth_scope_fingerprint(credential: str) -> str:
+    value = str(credential or "").encode("utf-8")
+    return hmac.new(_AUTH_SCOPE_SECRET, value, hashlib.sha256).hexdigest() if value else ""
+
+
+def _request_auth_scope(request: Any) -> str:
+    return _auth_scope_fingerprint(_request_auth_credential(request))
+
+
+def _upstream_request_headers(request: Any) -> dict[str, str]:
+    headers = _request_headers(request)
+    credential = _request_auth_credential(request)
+    if credential and not any(key.lower() in {"x-emby-token", "x-mediabrowser-token"} for key in headers):
+        headers["X-Emby-Token"] = credential
+    return headers
+
+
+def _sanitized_query_string(request: Any) -> str:
+    query_params = getattr(request, "query_params", None)
+    if query_params is not None and hasattr(query_params, "multi_items"):
+        pairs = query_params.multi_items()
+    else:
+        pairs = parse_qsl(str(getattr(getattr(request, "url", None), "query", "")), keep_blank_values=True)
+    return urlencode([(key, value) for key, value in pairs if key.lower() not in _SENSITIVE_QUERY_KEYS], doseq=True)
+
+
+def _parse_range(value: str, size: int) -> tuple[int, int] | None:
+    if not value:
+        return None
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("仅支持单段 bytes Range")
+    start_text, separator, end_text = value[6:].partition("-")
+    if not separator:
+        raise ValueError("Range 格式无效")
+    if not start_text:
+        suffix = int(end_text)
+        if suffix <= 0:
+            raise ValueError("Range 后缀无效")
+        start = max(0, size - suffix)
+        end = size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else size - 1
+    if start < 0 or start >= size or end < start:
+        raise ValueError("Range 超出文件范围")
+    return start, min(end, size - 1)
+
+
+def _file_chunks(path: Path, start: int, length: int, chunk_size: int = 1024 * 1024):
+    remaining = length
+    with path.open("rb") as handle:
+        handle.seek(start)
+        while remaining > 0:
+            chunk = handle.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def local_file_response(request: Request, path: Path) -> Response:
+    if not path.is_file():
+        return JSONResponse({"error": "本地媒体文件不存在"}, status_code=404)
+    stat = path.stat()
+    size = stat.st_size
+    etag = f'"{stat.st_mtime_ns:x}-{size:x}"'
+    common = {
+        "Accept-Ranges": "bytes",
+        "ETag": etag,
+        "Last-Modified": formatdate(stat.st_mtime, usegmt=True),
+        "Content-Type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+    }
+    try:
+        selected = _parse_range(request.headers.get("range", ""), size)
+    except (ValueError, TypeError):
+        return Response(
+            status_code=416,
+            headers={**common, "Content-Range": f"bytes */{size}"},
+        )
+    if selected is None:
+        headers = {**common, "Content-Length": str(size)}
+        if request.method == "HEAD":
+            return Response(status_code=200, headers=headers)
+        return StreamingResponse(
+            _file_chunks(path, 0, size),
+            status_code=200,
+            headers=headers,
+            media_type=common["Content-Type"],
+        )
+    start, end = selected
+    length = end - start + 1
+    headers = {
+        **common,
+        "Content-Length": str(length),
+        "Content-Range": f"bytes {start}-{end}/{size}",
+    }
+    if request.method == "HEAD":
+        return Response(status_code=206, headers=headers)
+    return StreamingResponse(
+        _file_chunks(path, start, length),
+        status_code=206,
+        headers=headers,
+        media_type=common["Content-Type"],
+    )
+
+
+async def _close_upstream(response: httpx.Response) -> None:
+    await response.aclose()
+
+
+def _binding_value(binding: Any, key: str) -> Any:
+    try:
+        return binding[key]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _binding_has_field(binding: Any, key: str) -> bool:
+    try:
+        keys = binding.keys()
+    except (AttributeError, TypeError):
+        return False
+    return key in keys
+
+
+def _binding_signature(binding: Any) -> str:
+    binding_id = _binding_value(binding, "id")
+    if binding_id not in (None, ""):
+        return f"id:{binding_id}"
+    return "|".join([
+        str(_binding_value(binding, "source_type") or ""),
+        str(_binding_value(binding, "guangya_file_id") or ""),
+        str(_binding_value(binding, "local_relative_path") or ""),
+    ])
+
+
+def _media_proxy_binding(
+    instance_id: int,
+    item_id: str,
+    source_id: str,
+    *,
+    allow_item_level: bool = False,
+    auth_scope: str = "",
+) -> Any:
+    """精确绑定直接返回；Item 级绑定必须先在单源 PlaybackInfo 中登记。"""
+    binding = database.get_media_proxy_binding(instance_id, item_id, source_id)
+    if not binding:
+        return None
+    if str(_binding_value(binding, "source_type") or "").strip().lower() != "guangya":
+        return None
+    requested_source = str(source_id or "").strip()
+    bound_source = str(_binding_value(binding, "media_source_id") or "").strip()
+    if bound_source:
+        if requested_source and bound_source != requested_source:
+            return None
+        return binding
+    if allow_item_level:
+        return binding
+    signature = _binding_signature(binding)
+    if requested_source:
+        return binding if _item_level_binding_scopes.matches(
+            instance_id, item_id, requested_source, signature, auth_scope
+        ) else None
+    return binding if _item_level_binding_scopes.matches_item(
+        instance_id, item_id, signature, auth_scope
+    ) else None
+
+
+def rewrite_playback_info(
+    payload: Any,
+    instance_id: int,
+    item_id: str,
+    *,
+    route_prefix: str = "",
+    dynamic_mappings: DynamicGuangYaMappings | None = None,
+    auth_scope: str = "",
+    playback_session_token: str = "",
+) -> tuple[Any, bool]:
+    if not isinstance(payload, dict):
+        return payload, False
+    media_sources = payload.get("MediaSources")
+    if not isinstance(media_sources, list):
+        return payload, False
+    mappings = dynamic_mappings or _dynamic_guangya_mappings
+    changed = False
+    allow_item_level = len(media_sources) == 1
+    for source in media_sources:
+        if not isinstance(source, dict):
+            continue
+        source_id = str(source.get("Id") or "")
+        binding = _media_proxy_binding(
+            instance_id,
+            item_id,
+            source_id,
+            allow_item_level=allow_item_level,
+            auth_scope=auth_scope,
+        )
+        if binding:
+            direct_url = _direct_stream_path(
+                item_id, source_id, route_prefix, playback_session_token
+            )
+            # 真实数据库绑定始终含 media_source_id；旧式无该字段的绑定对象保留旧 Path。
+            path = direct_url if _binding_has_field(binding, "media_source_id") else _direct_stream_path(
+                item_id,
+                prefix=route_prefix,
+                playback_session_token=playback_session_token,
+            )
+            _mark_direct_source(source, path, direct_url)
+            if not str(_binding_value(binding, "media_source_id") or "").strip():
+                _item_level_binding_scopes.register(
+                    instance_id,
+                    item_id,
+                    source_id,
+                    _binding_signature(binding),
+                    auth_scope,
+                )
+            _playback_grants.register(
+                auth_scope, instance_id, item_id, source_id,
+                source_type=str(_binding_value(binding, "source_type") or ""),
+                file_id=str(_binding_value(binding, "guangya_file_id") or ""),
+                binding_signature=_binding_signature(binding),
+            )
+            changed = True
+            continue
+
+        file_id = _extract_guangya_file_id(source.get("Path"))
+        if not file_id:
+            continue
+        mappings.register(instance_id, item_id, source_id, file_id)
+        _playback_grants.register(
+            auth_scope, instance_id, item_id, source_id,
+            source_type="dynamic", file_id=file_id,
+        )
+        _mark_direct_source(
+            source,
+            _direct_stream_path(
+                item_id, source_id, route_prefix, playback_session_token
+            ),
+        )
+        changed = True
+    return payload, changed
+
+
+def _authorization_token(value: str) -> str:
+    match = _AUTH_TOKEN_RE.search(str(value or ""))
+    if not match:
+        return ""
+    return str(match.group(1) or match.group(2) or "").strip()
+
+
+async def _client_is_authorized(instance, request: Request) -> bool:
+    token = _request_auth_credential(request)
+    if not token:
+        return False
+    try:
+        pinned = await asyncio.to_thread(
+            _pin_upstream_target, str(instance["upstream_url"]), "/Users/Me"
+        )
+    except ValueError:
+        return False
+    headers = _request_headers(request)
+    headers["Host"] = pinned.host_header
+    if not any(key.lower() == "x-emby-token" for key in headers):
+        headers["X-Emby-Token"] = token
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=10) as client:
+            upstream_request = client.build_request(
+                "GET",
+                pinned.connect_url,
+                headers=headers,
+                extensions={"sni_hostname": pinned.sni_hostname},
+            )
+            response = await client.send(upstream_request)
+        return 200 <= response.status_code < 300
+    except Exception as exc:
+        logger.warning(
+            f"媒体反代鉴权校验失败 instance={instance['id']}: {type(exc).__name__}"
+        )
+        return False
+
+
+def _websocket_upstream_url(upstream: str, websocket: WebSocket, path: str) -> str:
+    target = httpx.URL(_upstream_target(upstream, "/" + str(path).lstrip("/")))
+    scheme = "wss" if target.scheme == "https" else "ws"
+    websocket_target = str(target.copy_with(scheme=scheme))
+    query = _sanitized_query_string(websocket) if hasattr(websocket, "query_params") else websocket.url.query
+    return f"{websocket_target}?{query}" if query else websocket_target
+
+
+def create_proxy_app(
+    instance_id: int,
+    signed_urls: SignedUrlCache | None = None,
+    playback_record_writer: PlaybackRecordWriter | None = None,
+) -> FastAPI:
+    recorder = playback_record_writer or PlaybackRecordWriter(
+        task_name=f"media-proxy-playback-records-{instance_id}"
+    )
+    upstream_clients = _UpstreamClientPool()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        await recorder.start()
+        try:
+            yield
+        finally:
+            try:
+                await upstream_clients.aclose()
+            finally:
+                await recorder.stop()
+
+    app = FastAPI(
+        title=f"MediaFlux Media Proxy {instance_id}",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=lifespan,
+    )
+    app.state.playback_record_writer = recorder
+    app.state.upstream_clients = upstream_clients
+    signed_urls = signed_urls or SignedUrlCache()
+    _register_signed_url_cache(instance_id, signed_urls)
+
+    @app.middleware("http")
+    async def record_playback_attempt(request: Request, call_next):
+        route_class = classify_proxy_route(request.url.path, request.method)
+        auth_scope = _auth_scope_fingerprint(_request_auth_credential(request))
+        playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
+        stream_match = _STREAM_RE.match(request.url.path)
+        item_id = (playback_match or stream_match).group(1) if (playback_match or stream_match) else ""
+        source_id = _request_query_value(request, "MediaSourceId")
+        file_id = _extract_guangya_file_id(str(request.url)) or ""
+        session_token = _request_query_value(
+            request, _PLAYBACK_SESSION_QUERY_KEY, "PlaySessionId"
+        )
+        if route_class == "playback_info":
+            playback_session = _playback_sessions.begin(
+                auth_scope, instance_id, token=session_token, item_id=item_id
+            )
+        elif route_class == "guangya_direct" and not session_token:
+            playback_session = _playback_sessions.begin(
+                auth_scope, instance_id, file_id=file_id
+            )
+        else:
+            playback_session = _playback_sessions.resolve(
+                auth_scope,
+                instance_id,
+                token=session_token,
+                item_id=item_id,
+                source_id=source_id,
+                file_id=file_id,
+                create=bool(session_token) or route_class in {"stream", "guangya_direct"},
+            )
+        request.state.proxy_auth_scope = auth_scope
+        request.state.proxy_playback_session_token = ""
+        request.state.proxy_playback_session_key = ""
+        request.state.proxy_media_item_id = item_id
+        request.state.proxy_media_source_id = source_id
+        request.state.proxy_guangya_file_id = file_id
+        _apply_playback_session(request, playback_session)
+        request.state.proxy_route_class = route_class
+        request.state.proxy_source = {
+            "guangya_direct": "guangya",
+            "playback_info": "playback_info",
+            "upstream_hls": "hls",
+        }.get(route_class, "upstream")
+        request.state.proxy_action = {
+            "guangya_direct": "guangya_302",
+            "playback_info": "playback_passthrough",
+            "upstream_hls": "upstream_hls",
+            "stream": "upstream_stream",
+        }.get(route_class, "upstream_passthrough")
+        request.state.proxy_cache_hit = False
+        request.state.proxy_upstream_latency_ms = 0
+        request.state.proxy_failure_stage = ""
+        started = time.monotonic()
+        response: Response | None = None
+        error_type = ""
+        try:
+            response = await call_next(request)
+            return response
+        except Exception as exc:
+            error_type = type(exc).__name__
+            request.state.proxy_failure_stage = (
+                getattr(request.state, "proxy_failure_stage", "") or "proxy"
+            )
+            raise
+        finally:
+            total_latency_ms = round((time.monotonic() - started) * 1000)
+            status_code = int(
+                getattr(response, "status_code", 500 if error_type else 0) or 0
+            )
+            if status_code >= 400 and not request.state.proxy_failure_stage:
+                request.state.proxy_failure_stage = "proxy"
+            diagnostic = {
+                "route": getattr(request.state, "proxy_route_class", route_class),
+                "action": getattr(request.state, "proxy_action", "upstream_passthrough"),
+                "method": str(request.method or "GET").upper(),
+                "status": status_code,
+                "range": _range_diagnostic(request.headers.get("range", "")),
+                "if_range": int(bool(request.headers.get("if-range", ""))),
+                "ua": int(bool(request.headers.get("user-agent", ""))),
+                "cache_hit": int(bool(getattr(request.state, "proxy_cache_hit", False))),
+                "upstream_ms": int(
+                    getattr(request.state, "proxy_upstream_latency_ms", 0) or 0
+                ),
+                "total_ms": total_latency_ms,
+                "failure_stage": getattr(request.state, "proxy_failure_stage", "") or "none",
+            }
+            logger.debug(
+                "media_proxy_diag instance=%s route=%s action=%s method=%s "
+                "status=%s range=%s if_range=%s ua=%s cache_hit=%s "
+                "upstream_ms=%s total_ms=%s failure_stage=%s",
+                instance_id,
+                diagnostic["route"], diagnostic["action"], diagnostic["method"],
+                diagnostic["status"], diagnostic["range"], diagnostic["if_range"],
+                diagnostic["ua"], diagnostic["cache_hit"], diagnostic["upstream_ms"],
+                diagnostic["total_ms"], diagnostic["failure_stage"],
+            )
+            if route_class != "upstream":
+                recorder.enqueue({
+                    "instance_id": instance_id,
+                    "route_class": diagnostic["route"],
+                    "method": diagnostic["method"],
+                    "status_code": status_code,
+                    "source": getattr(request.state, "proxy_source", "upstream"),
+                    "cache_hit": bool(diagnostic["cache_hit"]),
+                    "upstream_latency_ms": diagnostic["upstream_ms"],
+                    "total_latency_ms": total_latency_ms,
+                    "failure_stage": (
+                        "" if diagnostic["failure_stage"] == "none"
+                        else diagnostic["failure_stage"]
+                    ),
+                    "error": error_type,
+                    "playback_session_key": getattr(
+                        request.state, "proxy_playback_session_key", ""
+                    ),
+                    "media_item_id": getattr(request.state, "proxy_media_item_id", ""),
+                    "media_source_id": getattr(
+                        request.state, "proxy_media_source_id", ""
+                    ),
+                    "guangya_file_id": getattr(
+                        request.state, "proxy_guangya_file_id", ""
+                    ),
+                })
+
+    async def guangya_redirect(instance, request: Request, file_id: str) -> Response:
+        auth_scope = getattr(request.state, "proxy_auth_scope", "")
+        playback_session = _playback_sessions.resolve(
+            auth_scope,
+            instance_id,
+            token=getattr(request.state, "proxy_playback_session_token", ""),
+            item_id=getattr(request.state, "proxy_media_item_id", ""),
+            source_id=getattr(request.state, "proxy_media_source_id", ""),
+            file_id=file_id,
+            create=True,
+        )
+        _apply_playback_session(request, playback_session)
+        request.state.proxy_route_class = "guangya_direct"
+        request.state.proxy_source = "guangya"
+        request.state.proxy_action = "guangya_302"
+        if not await _client_is_authorized(instance, request):
+            request.state.proxy_failure_stage = "client_auth"
+            return JSONResponse({"error": "媒体服务器鉴权失败"}, status_code=401)
+
+        client = GuangYaClient()
+        if not client.logged_in:
+            request.state.proxy_failure_stage = "provider_auth"
+            signed_urls.clear()
+            return JSONResponse({"error": "光鸭未登录"}, status_code=503)
+        try:
+            raw_client = client.raw
+        except AttributeError:  # 兼容测试替身与旧包装器
+            raw_client = getattr(client, "_raw", None)
+        provider_token = str(getattr(raw_client, "token", "") or "")
+        provider_scope = _auth_scope_fingerprint(provider_token)
+        scope = f"{int(instance_id)}:{provider_scope}"
+        ua_bound = bool(
+            getattr(getattr(client, "_raw", None), "download_url_user_agent_bound", False)
+        )
+
+        async def fetch_url() -> str | None:
+            return await asyncio.to_thread(
+                client.get_download_url,
+                file_id,
+                timeout=PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
+                raise_timeout=True,
+            )
+
+        try:
+            result = await signed_urls.get_or_fetch_result(
+                file_id,
+                fetch_url,
+                scope=scope,
+                user_agent=request.headers.get("user-agent", ""),
+                ua_bound=ua_bound,
+            )
+        except TimeoutError:
+            request.state.proxy_failure_stage = "signed_url_timeout"
+            return JSONResponse({"error": "光鸭播放地址获取超时"}, status_code=504)
+        request.state.proxy_cache_hit = result.cache_hit
+        if not result.url:
+            request.state.proxy_failure_stage = "signed_url"
+            return JSONResponse({"error": "无法获取光鸭直链"}, status_code=502)
+        return RedirectResponse(
+            result.url,
+            status_code=302,
+            headers={
+                "Cache-Control": "private, no-store, no-cache, max-age=0",
+                "Pragma": "no-cache",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
+
+    @app.websocket("/{path:path}")
+    async def proxy_websocket(websocket: WebSocket, path: str):
+        message_limit = _proxy_websocket_message_limit()
+        try:
+            instance = await asyncio.to_thread(_resolved_instance, instance_id)
+        except ValueError as exc:
+            await websocket.close(code=1013, reason=str(exc))
+            return
+        if not instance or not int(instance["enabled"] or 0):
+            await websocket.close(code=1013, reason="Media proxy disabled")
+            return
+        headers = _upstream_request_headers(websocket)
+        headers = {key: value for key, value in headers.items() if not key.lower().startswith("sec-websocket-")}
+        protocols = websocket.scope.get("subprotocols") or []
+        session: ClientSession | None = None
+        try:
+            pinned = await asyncio.to_thread(
+                _pin_upstream_target,
+                str(instance["upstream_url"]),
+                "/" + str(path).lstrip("/"),
+            )
+            logical = httpx.URL(pinned.logical_url)
+            scheme = "wss" if logical.scheme == "https" else "ws"
+            target = str(logical.copy_with(scheme=scheme))
+            query = _sanitized_query_string(websocket) if hasattr(websocket, "query_params") else websocket.url.query
+            if query:
+                target = f"{target}?{query}"
+            connector = TCPConnector(
+                resolver=_PinnedResolver(pinned.sni_hostname, pinned.addresses),
+                use_dns_cache=True,
+            )
+            session = ClientSession(connector=connector)
+            upstream_ws = await session.ws_connect(
+                target,
+                headers=headers,
+                protocols=protocols,
+                autoping=True,
+                heartbeat=30,
+                max_msg_size=message_limit,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"媒体反代 WebSocket 上游连接失败 instance={instance_id}: "
+                f"{type(exc).__name__}"
+            )
+            if session is not None:
+                await session.close()
+            await websocket.close(code=1011, reason="Upstream WebSocket unavailable")
+            return
+        await websocket.accept(subprotocol=upstream_ws.protocol or None)
+
+        async def client_to_upstream():
+            while True:
+                message = await websocket.receive()
+                kind = message.get("type")
+                if kind == "websocket.disconnect":
+                    break
+                if message.get("text") is not None:
+                    text = message["text"]
+                    if len(text.encode("utf-8")) > message_limit:
+                        await websocket.close(code=1009, reason="WebSocket message too large")
+                        break
+                    await upstream_ws.send_str(text)
+                elif message.get("bytes") is not None:
+                    payload = message["bytes"]
+                    if len(payload) > message_limit:
+                        await websocket.close(code=1009, reason="WebSocket message too large")
+                        break
+                    await upstream_ws.send_bytes(payload)
+
+        async def upstream_to_client():
+            async for message in upstream_ws:
+                if message.type == WSMsgType.TEXT:
+                    if len(message.data.encode("utf-8")) > message_limit:
+                        await websocket.close(code=1009, reason="Upstream message too large")
+                        break
+                    await websocket.send_text(message.data)
+                elif message.type == WSMsgType.BINARY:
+                    if len(message.data) > message_limit:
+                        await websocket.close(code=1009, reason="Upstream message too large")
+                        break
+                    await websocket.send_bytes(message.data)
+                elif message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
+                    break
+
+        tasks = {
+            asyncio.create_task(client_to_upstream()),
+            asyncio.create_task(upstream_to_client()),
+        }
+        try:
+            done, _pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                try:
+                    task.result()
+                except Exception:
+                    pass
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await upstream_ws.close()
+            finally:
+                await session.close()
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+    @app.api_route(
+        "/{path:path}",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    async def proxy_request(request: Request, path: str):
+        try:
+            instance = await asyncio.to_thread(_resolved_instance, instance_id)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        if not instance or not int(instance["enabled"] or 0):
+            return JSONResponse({"error": "媒体反代实例已停用"}, status_code=503)
+
+        credential = _request_auth_credential(request)
+        auth_scope = _auth_scope_fingerprint(credential)
+        playgy_file_id = _extract_guangya_file_id(str(request.url))
+        if playgy_file_id and request.method in {"GET", "HEAD"}:
+            if auth_scope and not _playback_grants.allows_file(auth_scope, instance_id, playgy_file_id):
+                return JSONResponse({"error": "当前凭据没有该文件的播放授权"}, status_code=403)
+            return await guangya_redirect(instance, request, playgy_file_id)
+
+        match = _STREAM_RE.match(request.url.path)
+        if match and request.method in {"GET", "HEAD"}:
+            item_id = match.group(1)
+            source_id = request.query_params.get("MediaSourceId", "")
+            binding = await asyncio.to_thread(
+                _media_proxy_binding,
+                instance_id,
+                item_id,
+                source_id,
+                auth_scope=auth_scope,
+            )
+            binding_allowed = bool(binding and _playback_grants.matches(
+                auth_scope, instance_id, item_id, source_id,
+                binding_signature=_binding_signature(binding),
+            ))
+            if binding_allowed:
+                if binding["source_type"] == "guangya":
+                    return await guangya_redirect(
+                        instance,
+                        request,
+                        str(binding["guangya_file_id"] or ""),
+                    )
+            if not binding_allowed:
+                dynamic_file_id = _dynamic_guangya_mappings.get(instance_id, item_id, source_id)
+                if dynamic_file_id and _playback_grants.matches(
+                    auth_scope, instance_id, item_id, source_id, file_id=dynamic_file_id
+                ):
+                    return await guangya_redirect(instance, request, dynamic_file_id)
+
+        try:
+            pinned = await asyncio.to_thread(
+                _pin_upstream_target,
+                str(instance["upstream_url"]),
+                request.url.path,
+            )
+        except ValueError as exc:
+            request.state.proxy_failure_stage = "upstream_resolution"
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        target = pinned.connect_url
+        sanitized_query = _sanitized_query_string(request)
+        if sanitized_query:
+            target = f"{target}?{sanitized_query}"
+        try:
+            body = await _read_proxy_request_body(request)
+        except ProxyRequestBodyTooLarge:
+            request.state.proxy_failure_stage = "request_body"
+            return JSONResponse({"error": "请求体过大"}, status_code=413)
+        client = upstream_clients.get(pinned)
+        upstream_headers = _upstream_request_headers(request)
+        upstream_headers["Host"] = pinned.host_header
+        upstream_request = client.build_request(
+            request.method,
+            target,
+            headers=upstream_headers,
+            content=body,
+            extensions={"sni_hostname": pinned.sni_hostname},
+        )
+        upstream_started = time.monotonic()
+        try:
+            response = await client.send(upstream_request, stream=True)
+        except Exception as exc:
+            request.state.proxy_failure_stage = "upstream_connect"
+            logger.warning(
+                f"媒体反代上游请求失败 instance={instance_id}: {type(exc).__name__}"
+            )
+            return JSONResponse({"error": "上游服务不可用"}, status_code=502)
+        request.state.proxy_upstream_latency_ms = round(
+            (time.monotonic() - upstream_started) * 1000
+        )
+
+        playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
+        if playback_match and 200 <= response.status_code < 300:
+            request.state.proxy_source = "playback_info"
+            try:
+                raw = await _read_bounded_upstream_body(
+                    response,
+                    _playback_info_response_limit(),
+                )
+                headers = _decoded_response_headers(response.headers)
+            except ProxyUpstreamBodyTooLarge:
+                request.state.proxy_failure_stage = "upstream_response_body"
+                logger.warning(
+                    "媒体反代 PlaybackInfo 响应过大 instance=%s",
+                    instance_id,
+                )
+                return JSONResponse({"error": "上游响应过大"}, status_code=502)
+            finally:
+                await response.aclose()
+            try:
+                payload = httpx.Response(
+                    status_code=200,
+                    content=raw,
+                    headers={"content-type": headers.get("content-type", "application/json")},
+                ).json()
+            except ValueError:
+                return Response(content=raw, status_code=response.status_code, headers=headers)
+            response_session_token = ""
+            if isinstance(payload, dict):
+                response_session_token = str(payload.get("PlaySessionId") or "").strip()
+            playback_session = _playback_sessions.begin(
+                auth_scope,
+                instance_id,
+                token=(
+                    response_session_token
+                    or getattr(request.state, "proxy_playback_session_token", "")
+                ),
+                item_id=playback_match.group(1),
+            )
+            _apply_playback_session(request, playback_session)
+            if auth_scope:
+                payload, changed = rewrite_playback_info(
+                    payload,
+                    instance_id,
+                    playback_match.group(1),
+                    route_prefix=_route_prefix(request.url.path),
+                    auth_scope=auth_scope,
+                    playback_session_token=playback_session.token,
+                )
+            else:
+                changed = False
+            if changed:
+                request.state.proxy_action = "playback_rewrite"
+                return JSONResponse(payload, status_code=response.status_code)
+            request.state.proxy_action = "playback_passthrough"
+            return Response(content=raw, status_code=response.status_code, headers=headers)
+
+        return StreamingResponse(
+            response.aiter_raw(),
+            status_code=response.status_code,
+            headers=_response_headers(response.headers),
+            background=BackgroundTask(_close_upstream, response),
+        )
+
+    return app
+
+
+@dataclass
+class ProxyRuntime:
+    instance_id: int
+    bind: tuple[str, int]
+    server: uvicorn.Server
+    task: asyncio.Task
+    sock: socket.socket
+    signed_urls: SignedUrlCache
+
+
+class MediaProxyManager:
+    def __init__(self):
+        self._runtimes: dict[int, ProxyRuntime] = {}
+        self._lock = asyncio.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stopping = False
+
+    async def start(self) -> None:
+        async with self._lock:
+            self._stopping = False
+            self._loop = asyncio.get_running_loop()
+        await self.reconcile()
+
+    async def stop(self) -> None:
+        async with self._lock:
+            self._stopping = True
+            self._loop = None
+            runtimes = list(self._runtimes.values())
+            tasks = [
+                asyncio.create_task(
+                    self._stop_runtime(runtime),
+                    name=f"media-proxy-stop-{runtime.instance_id}",
+                )
+                for runtime in runtimes
+            ]
+            try:
+                if tasks:
+                    await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            finally:
+                self._runtimes.clear()
+
+    def request_reconcile(self) -> bool:
+        """从同步配置接口线程安全地请求热重载；返回是否已成功排队。"""
+        loop = self._loop
+        if self._stopping or loop is None or loop.is_closed() or not loop.is_running():
+            return False
+        future = asyncio.run_coroutine_threadsafe(self.reconcile(), loop)
+        future.add_done_callback(self._report_reconcile_failure)
+        return True
+
+    @staticmethod
+    def _report_reconcile_failure(future) -> None:
+        if future.cancelled():
+            return
+        try:
+            future.result()
+        except Exception as exc:
+            logger.warning("媒体反代热重载失败 type=%s", type(exc).__name__)
+
+    async def reconcile(self) -> dict[str, Any]:
+        async with self._lock:
+            if self._stopping:
+                return {"started": [], "stopped": [], "failed": {}}
+            instance_rows = await asyncio.to_thread(
+                database.list_media_proxy_instances
+            )
+            raw_rows = {int(row["id"]): row for row in instance_rows}
+            rows: dict[int, Any] = {}
+            stopped: list[int] = []
+            started: list[int] = []
+            failed: dict[int, str] = {}
+
+            for instance_id, row in raw_rows.items():
+                if not int(row["enabled"] or 0):
+                    rows[instance_id] = row
+                    continue
+                try:
+                    rows[instance_id] = resolve_proxy_instance(row)
+                except ValueError as exc:
+                    message = str(exc)
+                    failed[instance_id] = message
+                    await asyncio.to_thread(
+                        database.update_media_proxy_instance,
+                        instance_id,
+                        {"status": "error", "last_error": message},
+                    )
+                    runtime = self._runtimes.pop(instance_id, None)
+                    if runtime:
+                        await self._stop_runtime(runtime)
+                        stopped.append(instance_id)
+
+            for instance_id, runtime in list(self._runtimes.items()):
+                row = rows.get(instance_id)
+                if not row or not int(row["enabled"] or 0):
+                    await self._stop_runtime(runtime)
+                    self._runtimes.pop(instance_id, None)
+                    stopped.append(instance_id)
+                    if row:
+                        await asyncio.to_thread(
+                            database.update_media_proxy_instance,
+                            instance_id,
+                            {"status": "stopped", "last_error": ""},
+                        )
+                    continue
+                if runtime.task.done():
+                    try:
+                        runtime_error = runtime.task.exception()
+                    except asyncio.CancelledError:
+                        runtime_error = None
+                    logger.warning(
+                        "媒体反代运行任务意外退出 id=%s type=%s",
+                        instance_id,
+                        type(runtime_error).__name__ if runtime_error else "CancelledError",
+                    )
+                    await self._stop_runtime(runtime)
+                    self._runtimes.pop(instance_id, None)
+                    stopped.append(instance_id)
+                    await asyncio.to_thread(
+                        database.update_media_proxy_instance,
+                        instance_id,
+                        {"status": "error", "last_error": "媒体反代运行任务意外退出"},
+                    )
+                    continue
+                desired = (validate_listen_host(row["listen_host"]), int(row["listen_port"]))
+                if desired == runtime.bind:
+                    await asyncio.to_thread(
+                        database.update_media_proxy_instance,
+                        instance_id,
+                        {"status": "running", "last_error": ""},
+                    )
+                    continue
+                try:
+                    replacement = await self._start_runtime(row)
+                except Exception as exc:
+                    message = str(exc)
+                    failed[instance_id] = message
+                    await asyncio.to_thread(
+                        database.update_media_proxy_instance,
+                        instance_id,
+                        {"status": "error", "last_error": message},
+                    )
+                    continue
+                await self._stop_runtime(runtime)
+                self._runtimes[instance_id] = replacement
+                started.append(instance_id)
+
+            for instance_id, row in rows.items():
+                if instance_id in self._runtimes or not int(row["enabled"] or 0):
+                    continue
+                try:
+                    runtime = await self._start_runtime(row)
+                except Exception as exc:
+                    message = str(exc)
+                    failed[instance_id] = message
+                    await asyncio.to_thread(
+                        database.update_media_proxy_instance,
+                        instance_id,
+                        {"status": "error", "last_error": message},
+                    )
+                    continue
+                self._runtimes[instance_id] = runtime
+                started.append(instance_id)
+
+            return {"started": started, "stopped": stopped, "failed": failed}
+
+    async def _start_runtime(self, row) -> ProxyRuntime:
+        row = resolve_proxy_instance(row)
+        instance_id = int(row["id"])
+        host = validate_listen_host(str(row["listen_host"]))
+        port = int(row["listen_port"])
+        if port < 1024 or port > 65535:
+            raise ValueError("监听端口必须在 1024 到 65535 之间")
+        validate_upstream_url(str(row["upstream_url"]))
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+            sock.listen(2048)
+            sock.setblocking(False)
+        except OSError as exc:
+            sock.close()
+            raise RuntimeError(f"监听端口 {host}:{port} 被占用") from exc
+        signed_urls = SignedUrlCache()
+        config = uvicorn.Config(
+            create_proxy_app(instance_id, signed_urls),
+            host=host,
+            port=port,
+            log_level="warning",
+            log_config=None,
+            access_log=False,
+            lifespan="on",
+            ws_max_size=_proxy_websocket_message_limit(),
+        )
+        server = uvicorn.Server(config)
+        task = asyncio.create_task(server.serve(sockets=[sock]), name=f"media-proxy-{instance_id}")
+        await asyncio.sleep(0)
+        if task.done():
+            sock.close()
+            _release_signed_url_cache(instance_id, signed_urls)
+            error = task.exception()
+            raise RuntimeError(f"媒体反代启动失败: {error or 'unknown error'}")
+        await asyncio.to_thread(
+            database.update_media_proxy_instance,
+            instance_id,
+            {"status": "running", "last_error": ""},
+        )
+        logger.info(f"媒体反代实例启动 id={instance_id} listen={host}:{port}")
+        return ProxyRuntime(instance_id, (host, port), server, task, sock, signed_urls)
+
+    @staticmethod
+    async def _stop_runtime(runtime: ProxyRuntime) -> None:
+        _release_signed_url_cache(runtime.instance_id, runtime.signed_urls)
+        runtime.server.should_exit = True
+        try:
+            await asyncio.wait_for(asyncio.shield(runtime.task), timeout=5)
+        except asyncio.TimeoutError:
+            runtime.task.cancel()
+            await asyncio.gather(runtime.task, return_exceptions=True)
+        except asyncio.CancelledError:
+            runtime.task.cancel()
+            await asyncio.gather(runtime.task, return_exceptions=True)
+            raise
+        except Exception as exc:
+            logger.warning(
+                "媒体反代运行任务停止时已失败 id=%s type=%s",
+                runtime.instance_id,
+                type(exc).__name__,
+            )
+        finally:
+            try:
+                runtime.sock.close()
+            except OSError:
+                pass
+        logger.info(f"媒体反代实例停止 id={runtime.instance_id}")
+
+    def status(self) -> dict[int, dict[str, Any]]:
+        return {
+            instance_id: {
+                "running": not runtime.task.done(),
+                "listen_host": runtime.bind[0],
+                "listen_port": runtime.bind[1],
+            }
+            for instance_id, runtime in self._runtimes.items()
+        }
+
+
+_manager: MediaProxyManager | None = None
+
+
+def get_media_proxy_manager() -> MediaProxyManager:
+    global _manager
+    if _manager is None:
+        _manager = MediaProxyManager()
+    return _manager

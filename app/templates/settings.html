@@ -1,0 +1,566 @@
+{% extends "base.html" %}
+{% block title %}设置 - MediaFlux{% endblock %}
+{% block body_class %}settings-page{% endblock %}
+{% block page_title %}设置{% endblock %}
+{% block page_styles %}
+<script>
+(() => {
+    const target=location.hash.slice(1);
+    if(target&&target!=='console'&&['telegram','agent','metadata','discovery','downloads','network'].includes(target))document.documentElement.dataset.settingsBoot='pending';
+})();
+</script>
+<link rel="stylesheet" href="{{ url_for('static', path='css/settings-agent.css') }}?v=20260818c">
+{% endblock %}
+
+{% block content %}
+
+<div class="settings-workspace">
+    <nav class="settings-index" id="settingsTabs" role="tablist" aria-label="设置分区">
+        <button type="button" class="settings-tab active" id="settings-tab-console" data-settings-target="console" role="tab" aria-controls="settings-panel-console" aria-selected="true"><i data-lucide="panel-top"></i><span>控制台</span><small>登录与会话</small></button>
+        <button type="button" class="settings-tab" id="settings-tab-telegram" data-settings-target="telegram" role="tab" aria-controls="settings-panel-telegram" aria-selected="false" tabindex="-1"><i data-lucide="send"></i><span>Telegram</span><small>Bot 与通知</small></button>
+        <button type="button" class="settings-tab" id="settings-tab-agent" data-settings-target="agent" role="tab" aria-controls="settings-panel-agent" aria-selected="false" tabindex="-1"><i data-lucide="bot"></i><span>Media Agent</span><small>模型、搜索与巡检</small></button>
+        <button type="button" class="settings-tab" id="settings-tab-metadata" data-settings-target="metadata" role="tab" aria-controls="settings-panel-metadata" aria-selected="false" tabindex="-1"><i data-lucide="scan-search"></i><span>刮削识别</span><small>TMDB 与命名</small></button>
+        <button type="button" class="settings-tab" id="settings-tab-discovery" data-settings-target="discovery" role="tab" aria-controls="settings-panel-discovery" aria-selected="false" tabindex="-1"><i data-lucide="compass"></i><span>媒体探索</span><small>Provider 与缓存</small></button>
+        <button type="button" class="settings-tab" id="settings-tab-downloads" data-settings-target="downloads" role="tab" aria-controls="settings-panel-downloads" aria-selected="false" tabindex="-1"><i data-lucide="download"></i><span>下载器</span><small>qBittorrent</small></button>
+        <button type="button" class="settings-tab" id="settings-tab-network" data-settings-target="network" role="tab" aria-controls="settings-panel-network" aria-selected="false" tabindex="-1"><i data-lucide="network"></i><span>网络代理</span><small>批量连通性</small></button>
+    </nav>
+
+    <div class="settings-stage">
+        <div class="card card-pad" id="settingsForm">
+            <form class="settings-panel settings-panel-split active" id="settings-panel-console" data-settings-panel="console" role="tabpanel" aria-labelledby="settings-tab-console" onsubmit="return false;" novalidate>
+                <div class="settings-layout-2col">
+                    <div class="settings-main-col">
+                        <div class="settings-section settings-surface-card">
+                            <div class="settings-surface-card-heading">
+                                <h3><i data-lucide="panel-top"></i>Web 控制台</h3>
+                            </div>
+                            <p class="desc">管理控制台登录凭证与登录页展示。Docker 发布地址和宿主机端口请在部署目录的 .env 中配置。</p>
+                            <div class="form-row"><div class="field-label"><div class="name">用户名</div><div class="hint">登录控制台使用</div></div><div class="field-control"><input type="text" class="form-input" data-key="ENV_WEB_PASSPORT"></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">密码</div><div class="hint">留空不会覆盖现有密码</div></div><div class="field-control field-control-password"><input type="password" class="form-input" data-key="ENV_WEB_PASSWORD" data-secret-clearable="false"></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">登录页壁纸</div><div class="hint">TMDB 每日电影需先在「刮削识别」配置 API Key</div></div><div class="field-control"><select class="form-select" data-key="LOGIN_WALLPAPER_MODE"><option value="default">当前默认</option><option value="tmdb">TMDB 每日电影</option></select></div></div>
+                        </div>
+                    </div>
+                    <aside class="settings-side-col" aria-label="控制台运行遥测">
+                        <div class="settings-telemetry-card">
+                            <div class="settings-telemetry-head">
+                                <div class="settings-telemetry-title"><i data-lucide="activity"></i><span>运行状态与端点</span></div>
+                                <div class="telemetry-head-actions">
+                                    <span class="telemetry-status-badge" id="telemetryStatusBadge" data-current-version="{{ app_version }}"><span class="telemetry-dot"></span>v{{ app_version }} · 在线</span>
+                                    <button type="button" class="telemetry-update-btn" id="telemetryCheckUpdateBtn" title="检查软件更新" aria-label="检查软件更新"><i data-lucide="refresh-cw"></i></button>
+                                </div>
+                            </div>
+                            <div class="telemetry-data-list">
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label" id="telemetryEndpointLabel">当前访问端点</span>
+                                    <span class="telemetry-data-val"><span id="telemetryLocalUrl"></span><button type="button" class="telemetry-copy-btn" id="copyLocalUrlBtn" title="复制当前访问地址" aria-label="复制当前访问地址"><i data-lucide="copy"></i></button></span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">运行架构</span>
+                                    <span class="telemetry-data-val">FastAPI / ASGI</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">安全会话</span>
+                                    <span class="telemetry-data-val">HttpOnly Cookie</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">发布策略</span>
+                                    <span class="telemetry-data-val" id="telemetryFirewallScope">由 Docker 发布配置控制</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="settings-telemetry-card">
+                            <div class="settings-telemetry-head">
+                                <div class="settings-telemetry-title"><i data-lucide="shield-check"></i><span>控制台安全</span></div>
+                                <span class="telemetry-status-badge is-idle">同源会话</span>
+                            </div>
+                            <div class="telemetry-data-list">
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">配置保存</span>
+                                    <span class="telemetry-data-val">即时写入</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">网络发布</span>
+                                    <span class="telemetry-data-val">Compose .env 管理</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">服务运行</span>
+                                    <span class="telemetry-data-val">单 Worker ASGI</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">跨域安全</span>
+                                    <span class="telemetry-data-val">同源隔离约束</span>
+                                </div>
+                            </div>
+                        </div>
+                    </aside>
+                </div>
+                <div class="settings-savebar"><span data-settings-state aria-live="polite" data-ready-message="仅保存当前分区">正在读取当前分区配置…</span><button type="button" class="btn btn-primary" data-save-settings disabled aria-disabled="true"><i data-lucide="save"></i>保存控制台设置</button></div>
+            </form>
+
+            <form class="settings-panel settings-panel-split" id="settings-panel-telegram" data-settings-panel="telegram" role="tabpanel" aria-labelledby="settings-tab-telegram" hidden onsubmit="return false;" novalidate>
+                <div class="settings-layout-2col">
+                    <div class="settings-main-col">
+                        <div class="settings-section settings-surface-card">
+                            <div class="settings-surface-card-heading">
+                                <h3><i data-lucide="send"></i>Telegram Bot</h3>
+                            </div>
+                            <p class="desc">通知、下载交互和管理命令的统一入口。</p>
+                            <div class="form-row"><div class="field-label"><div class="name">Bot Token</div><div class="hint">从 @BotFather 获取</div></div><div class="field-control field-control-password"><input type="password" class="form-input" data-key="TG_BOT_TOKEN"></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">通知 Chat ID</div><div class="hint">接收通知的会话 ID</div></div><div class="field-control"><input type="text" class="form-input" data-key="TG_CHAT_ID"></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">启用 Media Agent</div><div class="hint">普通文本将进入 Agent；下载链接仍优先按原流程处理</div></div><div class="field-control"><label class="toggle"><input type="checkbox" data-key="TG_AGENT_ENABLED" data-bool="1"><span class="toggle-slider"></span></label></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">受信任用户白名单</div><div class="hint">启用 Agent 时必填；群组资源搜索同样按此限制 Telegram User ID，逗号分隔</div></div><div class="field-control"><input type="text" class="form-input" data-key="TG_AGENT_ALLOWED_USER_IDS" placeholder="例如 123456789"></div></div>
+                        </div>
+                    </div>
+                    <aside class="settings-side-col" aria-label="Telegram 连通诊断与指令">
+                        <div class="settings-telemetry-card">
+                            <div class="settings-telemetry-head">
+                                <div class="settings-telemetry-title"><i data-lucide="radio"></i><span>通道连通诊断</span></div>
+                                <span id="tgConnectionBadge" class="telemetry-status-badge is-idle">待测</span>
+                            </div>
+                            <div class="telemetry-data-list">
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">会话目标</span>
+                                    <span class="telemetry-data-val" id="tgChatIdPreview">未配置</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">Agent 路由</span>
+                                    <span class="telemetry-data-val" id="tgAgentRoutePreview">关闭</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">鉴权模式</span>
+                                    <span class="telemetry-data-val">白名单过滤</span>
+                                </div>
+                            </div>
+                            <div class="telemetry-actions">
+                                <button type="button" class="jump-btn" id="testTelegramBtn" style="width: 100%; justify-content: center;"><i data-lucide="send-horizontal"></i>发送测试消息</button>
+                            </div>
+                        </div>
+                        <div class="settings-telemetry-card">
+                            <div class="settings-telemetry-head">
+                                <div class="settings-telemetry-title"><i data-lucide="terminal"></i><span>常用交互指令</span></div>
+                                <span class="telemetry-status-badge is-idle">速查</span>
+                            </div>
+                            <div class="telemetry-command-grid">
+                                <div class="telemetry-command-item"><span class="telemetry-command-code">/media_search</span><span class="telemetry-command-desc">资源搜索</span></div>
+                                <div class="telemetry-command-item"><span class="telemetry-command-code">/sync_gy</span><span class="telemetry-command-desc">STRM 完整同步</span></div>
+                                <div class="telemetry-command-item"><span class="telemetry-command-code">/organize</span><span class="telemetry-command-desc">统一整理</span></div>
+                                <div class="telemetry-command-item"><span class="telemetry-command-code">/status</span><span class="telemetry-command-desc">状态遥测</span></div>
+                            </div>
+                            <div class="telemetry-data-list" style="margin-top: auto;">
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">消息分流</span>
+                                    <span class="telemetry-data-val">直链下载优先</span>
+                                </div>
+                            </div>
+                        </div>
+                    </aside>
+                </div>
+                <div class="settings-savebar"><span data-settings-state aria-live="polite" data-ready-message="仅保存当前分区">正在读取当前分区配置…</span><button type="button" class="btn btn-primary" data-save-settings disabled aria-disabled="true"><i data-lucide="save"></i>保存 Telegram 设置</button></div>
+            </form>
+
+            <form class="settings-panel settings-panel-agent" id="settings-panel-agent" data-settings-panel="agent" role="tabpanel" aria-labelledby="settings-tab-agent" hidden onsubmit="return false;" novalidate>
+                <div class="agent-settings-shell">
+                    <div class="agent-settings-stack">
+                        <section class="agent-settings-card agent-settings-card-global" aria-labelledby="agent-global-heading">
+                            <header class="agent-settings-card-head">
+                                <div><h3 id="agent-global-heading">Media Agent</h3><p>关闭后隐藏 Agent 页面，并暂停 Web API、Telegram 接入与后台巡检；现有配置和历史不会删除。</p></div>
+                                <label class="toggle agent-settings-master-toggle"><input type="checkbox" data-key="AGENT_ENABLED" data-bool="1" aria-label="启用 Media Agent"><span class="toggle-slider"></span></label>
+                            </header>
+                            <p class="settings-managed-note agent-managed-badge" data-managed-note data-managed-keys="AGENT_ENABLED" hidden></p>
+                        </section>
+                        <section class="agent-settings-card agent-settings-card-model" aria-labelledby="agent-model-heading">
+                            <header class="agent-settings-card-head">
+                                <div><h3 id="agent-model-heading">模型路由</h3><p>规则未命中时用于只读工具选择和自然语言答疑；模型不能直接执行写操作。</p></div>
+                                <label class="toggle agent-settings-master-toggle"><input type="checkbox" data-key="AGENT_LLM_ENABLED" data-bool="1" aria-label="启用 LLM 路由"><span class="toggle-slider"></span></label>
+                            </header>
+                            <p class="settings-managed-note agent-managed-badge" data-managed-note data-managed-keys="AGENT_LLM_ENABLED,AGENT_LLM_API_URL,AGENT_LLM_API_KEY,AGENT_LLM_PROTOCOL,AGENT_LLM_MODEL,AGENT_LLM_TIMEOUT_SECONDS,AGENT_LLM_REQUESTS_PER_MINUTE" hidden></p>
+                            <div class="agent-settings-fields">
+                                <label class="agent-field agent-field-wide"><span>API Base URL</span><input type="url" class="form-input" data-key="AGENT_LLM_API_URL" aria-label="AI API Base URL" placeholder="https://api.example.com/v1" autocomplete="off"></label>
+                                <label class="agent-field"><span>API Key</span><span class="field-control-password"><input type="password" autocomplete="new-password" class="form-input" data-key="AGENT_LLM_API_KEY" aria-label="Agent LLM API Key"></span></label>
+                                <label class="agent-field"><span>接口协议</span><select class="form-select" data-key="AGENT_LLM_PROTOCOL" aria-label="Agent LLM 接口协议"><option value="auto">自动（Responses → Chat Completions）</option><option value="responses">OpenAI Responses API</option><option value="chat_completions">OpenAI Chat Completions API</option><option value="anthropic_messages">Anthropic Messages API</option></select></label>
+                                <label class="agent-field agent-field-wide agent-model-field"><span>模型</span><span class="agent-model-control"><input type="text" class="form-input" data-key="AGENT_LLM_MODEL" id="agentLlmModel" list="agentLlmModelOptions" aria-label="Agent LLM 模型" placeholder="输入或获取模型" maxlength="200" autocomplete="off"><span class="agent-model-actions"><button type="button" class="jump-btn agent-model-icon-btn" id="openAgentModelPickerBtn" aria-label="选择模型" title="选择模型"><i data-lucide="list"></i></button><button type="button" class="jump-btn agent-model-icon-btn" id="fetchAgentModelsBtn" aria-label="获取模型列表" title="获取模型列表" aria-describedby="agentModelState" aria-busy="false"><i data-lucide="refresh-cw" aria-hidden="true"></i></button><button type="button" class="jump-btn agent-model-icon-btn agent-model-test-btn" id="testAgentModelBtn" aria-label="测试模型连接" title="测试模型连接" aria-describedby="agentModelState" aria-busy="false"><i data-lucide="plug-zap" aria-hidden="true"></i></button></span></span><datalist id="agentLlmModelOptions"></datalist><small class="agent-model-hint" id="agentModelState" role="status" aria-live="polite" data-tone="idle">获取列表只读取 /models；测试会发送一条不含业务数据的最小结构化请求</small></label>
+                                <label class="agent-field agent-timeout-field"><span>请求超时（2–30 秒）</span><span class="agent-input-unit"><input type="number" min="2" max="30" step="1" value="12" class="form-input" data-key="AGENT_LLM_TIMEOUT_SECONDS" aria-label="Agent LLM 请求超时（秒）"><b>秒</b></span></label>
+                                <label class="agent-field"><span>每用户速率</span><span class="agent-input-unit"><input type="number" min="1" max="30" step="1" value="6" class="form-input" data-key="AGENT_LLM_REQUESTS_PER_MINUTE" aria-label="Agent LLM 每用户每分钟请求上限"><b>次/分</b></span></label>
+                            </div>
+                        </section>
+
+                        <section class="agent-settings-card agent-settings-card-search" aria-labelledby="agent-search-heading">
+                            <header class="agent-settings-card-head">
+                                <div><h3 id="agent-search-heading">网页搜索</h3><p>通过 Tavily 补充公开网页信息，缓存、超时、结果数和每日额度均由本机约束。</p></div>
+                                <label class="toggle agent-settings-master-toggle"><input type="checkbox" data-key="WEB_SEARCH_ENABLED" data-bool="1" aria-label="启用 Tavily 网络搜索"><span class="toggle-slider"></span></label>
+                            </header>
+                            <p class="settings-managed-note agent-managed-badge" data-managed-note data-managed-keys="WEB_SEARCH_ENABLED,TAVILY_API_KEY,TAVILY_SEARCH_DEPTH,TAVILY_MAX_RESULTS,TAVILY_CACHE_TTL_SECONDS,TAVILY_DAILY_CREDIT_LIMIT,TAVILY_TIMEOUT_SECONDS" hidden></p>
+                            <div class="agent-settings-fields">
+                                <label class="agent-field agent-field-wide"><span>Tavily API Key</span><span class="field-control-password"><input type="password" autocomplete="new-password" class="form-input" data-key="TAVILY_API_KEY" aria-label="Tavily API Key" placeholder="********"></span></label>
+                                <label class="agent-field"><span>搜索深度（Advanced 消耗 2 额度）</span><select class="form-select" data-key="TAVILY_SEARCH_DEPTH" aria-label="Tavily 搜索深度"><option value="basic">Basic</option><option value="advanced">Advanced</option></select></label>
+                                <label class="agent-field"><span>结果上限（每次返回 1–10 条）</span><span class="agent-input-unit"><input type="number" min="1" max="10" step="1" value="5" class="form-input" data-key="TAVILY_MAX_RESULTS" aria-label="Tavily 单次结果上限"><b>条</b></span></label>
+                                <label class="agent-field"><span>缓存时间（复用结果）</span><span class="agent-input-unit"><input type="number" min="30" max="86400" step="1" value="900" class="form-input" data-key="TAVILY_CACHE_TTL_SECONDS" aria-label="Tavily 搜索缓存时间（秒）"><b>秒</b></span></label>
+                                <label class="agent-field"><span>请求超时（2–30 秒）</span><span class="agent-input-unit"><input type="number" min="2" max="30" step="1" value="10" class="form-input" data-key="TAVILY_TIMEOUT_SECONDS" aria-label="Tavily 请求超时（秒）"><b>秒</b></span></label>
+                                <label class="agent-field"><span>每日额度（防止失效调用）</span><span class="agent-input-unit"><input type="number" min="1" max="100000" step="1" value="100" class="form-input" data-key="TAVILY_DAILY_CREDIT_LIMIT" aria-label="Tavily 每日额度"><b>额度</b></span></label>
+                            </div>
+                        </section>
+
+                        <section class="agent-settings-card agent-settings-card-patrol" aria-labelledby="agent-patrol-heading">
+                            <header class="agent-settings-card-head">
+                                <div><h3 id="agent-patrol-heading">全库缺集巡检</h3><p>周期性只读核对 Jellyfin / Emby 剧集完整性；保存设置只会重排下一次检查。</p></div>
+                                <label class="toggle agent-settings-master-toggle"><input type="checkbox" data-key="AGENT_LIBRARY_PATROL_ENABLED" data-bool="1" aria-label="启用自动巡检"><span class="toggle-slider"></span></label>
+                            </header>
+                            <p class="settings-managed-note agent-managed-badge" data-managed-note data-managed-keys="AGENT_LIBRARY_PATROL_ENABLED,AGENT_LIBRARY_PATROL_NOTIFY_ENABLED,AGENT_LIBRARY_PATROL_INTERVAL_HOURS,AGENT_LIBRARY_PATROL_MAX_SERIES" hidden></p>
+                            <div class="agent-settings-option">
+                                <span><strong>发送巡检通知</strong><small>需要先配置 Telegram 通知</small></span>
+                                <label class="toggle"><input type="checkbox" data-key="AGENT_LIBRARY_PATROL_NOTIFY_ENABLED" data-bool="1" aria-label="发送巡检通知"><span class="toggle-slider"></span></label>
+                            </div>
+                            <div class="agent-settings-fields agent-settings-fields-patrol">
+                                <label class="agent-field"><span>巡检间隔（1–168 小时）</span><span class="agent-input-unit"><input type="number" min="1" max="168" step="1" value="24" class="form-input" data-key="AGENT_LIBRARY_PATROL_INTERVAL_HOURS" aria-label="巡检间隔（小时）"><b>小时</b></span></label>
+                                <label class="agent-field"><span>单次剧集上限</span><span class="agent-input-unit"><input type="number" min="1" max="100" step="1" value="50" class="form-input" data-key="AGENT_LIBRARY_PATROL_MAX_SERIES" aria-label="单次巡检剧集上限"><b>部</b></span></label>
+                            </div>
+                        </section>
+
+                        <section class="agent-settings-card agent-settings-card-notify" aria-labelledby="agent-notify-heading">
+                            <header class="agent-settings-card-head">
+                                <div><h3 id="agent-notify-heading">任务复核通知</h3><p>缺集下载完成后持续核对目标是否已在媒体库可见，并发送最终状态。</p></div>
+                            </header>
+                            <p class="settings-managed-note agent-managed-badge" data-managed-note data-managed-keys="AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED" hidden></p>
+                            <div class="agent-settings-option agent-settings-option-notify">
+                                <span><strong>发送下载后入库复核通知</strong><small>仅发送媒体名、季集与固定结果</small></span>
+                                <label class="toggle"><input type="checkbox" data-key="AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED" data-bool="1" aria-label="发送下载后入库复核通知"><span class="toggle-slider"></span></label>
+                            </div>
+                        </section>
+                    </div>
+
+                    <div class="settings-savebar agent-settings-savebar"><span data-settings-state aria-live="polite" data-ready-message="保存后更新 Agent 运行配置，不会立即扫描全库">正在读取当前分区配置…</span><button type="button" class="btn btn-primary" data-save-settings disabled aria-disabled="true"><i data-lucide="save"></i>保存 Agent 设置</button></div>
+                </div>
+            </form>
+
+            <form class="settings-panel settings-panel-metadata" id="settings-panel-metadata" data-settings-panel="metadata" role="tabpanel" aria-labelledby="settings-tab-metadata" hidden onsubmit="return false;" novalidate>
+                <div class="metadata-settings-shell">
+                    <div class="metadata-settings-grid">
+                        <section class="metadata-settings-card" aria-labelledby="metadata-tmdb-heading">
+                            <header class="metadata-card-head">
+                                <span class="metadata-card-icon"><i data-lucide="eye"></i></span>
+                                <h3 id="metadata-tmdb-heading">TMDB 核心配置</h3>
+                                <button type="button" class="jump-btn" id="openLocksBtn"><i data-lucide="lock-keyhole"></i>管理映射锁</button>
+                            </header>
+                            <div class="metadata-card-body">
+                                <div class="metadata-field metadata-field-wide"><div class="field-label"><div class="name">TMDB API Key</div><div class="hint">从 themoviedb.org 申请</div></div><div class="field-control field-control-password"><input type="password" class="form-input" data-key="TMDB_API_KEY"></div></div>
+                                <div class="metadata-field metadata-field-wide"><div class="field-label"><div class="name">TMDB API URL</div><div class="hint">使用官方反代或私有网关时可修改</div></div><div class="field-control"><input type="url" class="form-input" data-key="TMDB_API_URL" placeholder="https://api.themoviedb.org/3"></div></div>
+                                <div class="metadata-field metadata-field-wide"><div class="field-label"><div class="name">TMDB 候选召回模式</div><div class="hint">控制标题候选的基础检索门槛；严格更稳，宽松只扩大候选，不代表自动入库</div></div><div class="field-control"><select class="form-select" data-key="TMDB_MATCH_MODE"><option value="strict">严格</option><option value="loose">宽松</option></select></div></div>
+                            </div>
+                        </section>
+
+                        <section class="metadata-settings-card" aria-labelledby="metadata-ai-heading">
+                            <header class="metadata-card-head">
+                                <span class="metadata-card-icon"><i data-lucide="lightbulb"></i></span>
+                                <div class="metadata-card-title-shell">
+                                    <h3 id="metadata-ai-heading">AI 结构化回退</h3>
+                                    <span class="ai-recognition-badge">默认关闭</span>
+                                </div>
+                            </header>
+                            <div class="metadata-card-body">
+                                <div class="metadata-option"><span><strong>启用 AI 回退</strong><small>只在确定性 TMDB 匹配失败时复用 Media Agent 的模型连接</small></span><label class="toggle"><input type="checkbox" data-key="AI_RECOGNITION_ENABLED" data-bool="1"><span class="toggle-slider"></span></label></div>
+                                <label class="metadata-field metadata-field-wide"><span class="field-label"><span class="name">AI 线索可信门槛</span><span class="hint">0.5–0.99；仅决定 AI 修正是否进入 TMDB 复核，不能绕过自动入库门槛</span></span><span class="field-control"><input type="number" min="0.5" max="0.99" step="0.01" value="0.8" class="form-input" data-key="AI_RECOGNITION_CONFIDENCE_THRESHOLD"></span></label>
+                                <div class="metadata-compact-section" aria-labelledby="metadata-ai-governance-heading">
+                                    <div class="metadata-compact-heading" id="metadata-ai-governance-heading"><strong>请求治理</strong><span>限制自动回退的频率、并发和故障重试</span></div>
+                                    <div class="metadata-control-grid">
+                                        <label class="metadata-field"><span class="field-label"><span class="name">每分钟请求</span><span class="hint">1–30 次</span></span><span class="field-control"><input type="number" min="1" max="30" step="1" value="6" class="form-input" data-key="AI_RECOGNITION_REQUESTS_PER_MINUTE"></span></label>
+                                        <label class="metadata-field"><span class="field-label"><span class="name">每日请求上限</span><span class="hint">按真实 Provider 请求计数</span></span><span class="field-control"><input type="number" min="1" max="100000" step="1" value="100" class="form-input" data-key="AI_RECOGNITION_DAILY_REQUEST_LIMIT"></span></label>
+                                        <label class="metadata-field"><span class="field-label"><span class="name">最大并发</span><span class="hint">1–8 个任务</span></span><span class="field-control"><input type="number" min="1" max="8" step="1" value="2" class="form-input" data-key="AI_RECOGNITION_MAX_CONCURRENCY"></span></label>
+                                        <label class="metadata-field"><span class="field-label"><span class="name">熔断时间</span><span class="hint">连续故障后暂停 10–600 秒</span></span><span class="field-control"><input type="number" min="10" max="600" step="1" value="60" class="form-input" data-key="AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS"></span></label>
+                                    </div>
+                                </div>
+                                <div class="metadata-option"><span><strong>Tavily 标题线索</strong><small>仅在 AI Provider 网络不可用时查询标题，并重新通过 TMDB 严格校验</small></span><label class="toggle"><input type="checkbox" data-key="ORGANIZE_TAVILY_HINTS_ENABLED" data-bool="1"><span class="toggle-slider"></span></label></div>
+                                <label class="metadata-field metadata-field-wide"><span class="field-label"><span class="name">Tavily 每日识别额度</span><span class="hint">与 Agent 日常网页搜索额度分开计数；默认关闭且最多每次扣 1 额度</span></span><span class="field-control"><input type="number" min="1" max="100000" step="1" value="20" class="form-input" data-key="ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT"></span></label>
+                                <p class="ai-recognition-boundary"><strong>安全边界：</strong>AI 仅接收清洗后的标题、年份、媒体类型和季集信息；Tavily 只返回标题字符串。两者都不能直接指定 TMDB ID 或绕过 TMDB 复核。</p>
+                            </div>
+                        </section>
+                    </div>
+
+                </div>
+                <div class="settings-savebar"><span data-settings-state aria-live="polite" data-ready-message="仅保存当前分区的配置，修改后不会改变已有媒体的历史刮削映射。">正在读取当前分区配置…</span><button type="button" class="btn btn-primary" data-save-settings disabled aria-disabled="true"><i data-lucide="save"></i>保存刮削设置</button></div>
+            </form>
+
+            <form class="settings-panel" id="settings-panel-discovery" data-settings-panel="discovery" role="tabpanel" aria-labelledby="settings-tab-discovery" hidden onsubmit="return false;" novalidate>
+                <div class="settings-section discovery-settings-shell">
+                    <div class="discovery-settings-grid">
+                        <article class="discovery-card discovery-card-permissions">
+                            <div class="discovery-card-head">
+                                <span class="discovery-card-icon"><i data-lucide="sliders-horizontal"></i></span>
+                                <h3>探索权限控制</h3>
+                            </div>
+                            <div class="discovery-card-body">
+                                <div class="form-row"><div class="field-label"><div class="name">启用媒体探索</div><div class="hint">总开关；全局关闭后不再发起探索 Provider 请求</div></div><div class="field-control"><label class="toggle"><input type="checkbox" data-key="DISCOVERY_ENABLED" data-bool="1"><span class="toggle-slider"></span></label></div></div>
+                                <div class="form-row">
+                                    <div class="field-label">
+                                        <div class="name">启用多站资源索引</div>
+                                        <div class="hint">资源搜索总开关；关闭后 Web 与 Telegram 均不再检索站点</div>
+                                    </div>
+                                    <div class="field-control"><label class="toggle"><input type="checkbox" data-key="INDEXER_SEARCH_ENABLED" data-bool="1" checked><span class="toggle-slider"></span></label></div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="field-label">
+                                        <div class="name">在媒体档案中显示站点资源</div>
+                                        <div class="hint">控制打开媒体详情时的后台静默检索与资源展示</div>
+                                    </div>
+                                    <div class="field-control">
+                                        <label class="toggle">
+                                            <input type="checkbox" data-key="DISCOVERY_RESOURCE_RESULTS_ENABLED" data-bool="1"{% if resource_results_enabled %} checked{% endif %}>
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </div>
+                        </article>
+
+                        <article class="discovery-card discovery-card-cache">
+                            <div class="discovery-card-head">
+                                <span class="discovery-card-icon"><i data-lucide="clock-3"></i></span>
+                                <h3>数据缓存生存策略</h3>
+                            </div>
+                            <div class="discovery-card-body">
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">通用缓存 TTL <span class="field-default">默认 6 小时</span></div><div class="hint">探索接口返回结果在本地的生命周期，区间：60–604800 秒</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="60" max="604800" step="1" value="21600" class="form-input" data-key="DISCOVERY_CACHE_TTL_SECONDS"><span>秒</span></div></div></div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">旧缓存保留 TTL <span class="field-default">默认 7 天</span></div><div class="hint">过期失效数据保留时长，供网络连接波动时作为备用策略读取</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="300" max="2592000" step="1" value="604800" class="form-input" data-key="DISCOVERY_STALE_TTL_SECONDS"><span>秒</span></div></div></div>
+                            </div>
+                        </article>
+
+                        <div class="indexer-site-box" data-indexer-site-box{% if not resource_results_enabled %} hidden{% endif %} aria-hidden="{{ 'false' if resource_results_enabled else 'true' }}">
+                            <input type="hidden" data-key="INDEXER_ENABLED_SITES" value="nyaa,mikan,btbtla,1lou,animetosho,tpb">
+                            <div class="discovery-card-head">
+                                <span class="discovery-card-icon"><i data-lucide="archive"></i></span>
+                                <h3>索引源站点配置</h3>
+                            </div>
+                            <div class="discovery-card-body">
+                                <div class="discovery-field-title">参与资源检索的站点</div>
+                                <div class="indexer-site-selector" data-indexer-site-selector role="group" aria-label="参与资源检索的站点">
+                                    <label class="indexer-site-option" title="动漫与综合资源"><input type="checkbox" data-indexer-site="nyaa" checked><span data-indexer-site-chip><strong>Nyaa</strong></span></label>
+                                    <label class="indexer-site-option" title="动漫资源"><input type="checkbox" data-indexer-site="mikan" checked><span data-indexer-site-chip><strong>Mikan</strong></span></label>
+                                    <label class="indexer-site-option" title="影视资源"><input type="checkbox" data-indexer-site="btbtla" checked><span data-indexer-site-chip><strong>BTBTLA</strong></span></label>
+                                    <label class="indexer-site-option" title="影视论坛资源"><input type="checkbox" data-indexer-site="1lou" checked><span data-indexer-site-chip><strong>1LOU</strong></span></label>
+                                    <label class="indexer-site-option" title="动漫聚合资源"><input type="checkbox" data-indexer-site="animetosho" checked><span data-indexer-site-chip><strong>AnimeTosho</strong></span></label>
+                                    <label class="indexer-site-option" title="公共磁力索引"><input type="checkbox" data-indexer-site="tpb" checked><span data-indexer-site-chip><strong>The Pirate Bay</strong></span></label>
+                                    <label class="indexer-site-option is-sensitive" title="成人内容，默认关闭"><input type="checkbox" data-indexer-site="sukebei"><span data-indexer-site-chip><strong>Sukebei</strong><small>成人</small></span></label>
+                                </div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">BTBTLA 最小请求间隔</div><div class="hint">0–60 秒；默认 5 秒，避免高频检索触发临时封禁</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="0" max="60" step="1" value="5" class="form-input" data-key="INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"><span>秒</span></div></div></div>
+                                <div class="form-row"><div class="field-label"><div class="name">1LOU 优先使用 Google</div><div class="hint">使用“标题 site:1lou.me”检索；预检最多 3 秒且不占用原生站点超时，失败时自动回退原生 API 与 .pro 镜像</div></div><div class="field-control"><label class="toggle"><input type="checkbox" data-key="INDEXER_1LOU_GOOGLE_ENABLED" data-bool="1" checked><span class="toggle-slider"></span></label></div></div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">1LOU 最小搜索间隔</div><div class="hint">0–10 秒；默认 5 秒，等待不占用单站点请求超时</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="0" max="10" step="1" value="5" class="form-input" data-key="INDEXER_1LOU_MIN_INTERVAL_SECONDS"><span>秒</span></div></div></div>
+                            </div>
+                        </div>
+
+                        <div class="naming-template-box discovery-card discovery-card-douban">
+                            <div class="discovery-card-head">
+                                <span class="discovery-card-icon"><i data-lucide="link-2"></i></span>
+                                <h3>豆瓣公共探索</h3>
+                                <span class="discovery-recommended">推荐启用</span>
+                            </div>
+                            <div class="discovery-card-body">
+                                <p class="discovery-card-note">公共源始终优先；异常少量首页结果会自动切换到服务端兼容回退。</p>
+                                <div class="form-row"><div class="field-label"><div class="name">启用豆瓣公共探索</div><div class="hint">启用后优先以公网豆瓣进行元数据探索</div></div><div class="field-control"><label class="toggle"><input type="checkbox" data-key="DISCOVERY_DOUBAN_ENABLED" data-bool="1" checked><span class="toggle-slider"></span></label></div></div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">豆瓣独立缓存 TTL</div><div class="hint">300–604800 秒；默认 21600（6 小时）</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="300" max="604800" step="1" value="21600" class="form-input" data-key="DOUBAN_CACHE_TTL_SECONDS"><span>秒</span></div></div></div>
+                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">豆瓣 dbcl2 Cookie</div><div class="hint">可粘贴单独值或完整 Cookie；系统会自动解析并保留该密钥值</div></div><div class="field-control field-control-password"><input type="password" autocomplete="new-password" class="form-input" data-key="DOUBAN_DBCL2" placeholder="留空则不启用登录态回退"></div></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="settings-savebar"><span data-settings-state aria-live="polite" data-ready-message="仅保存当前分区的配置，缓存时间修改后会在下一次查询时生效。">正在读取当前分区配置…</span><button type="button" class="btn btn-primary" data-save-settings disabled aria-disabled="true"><i data-lucide="save"></i>保存探索设置</button></div>
+            </form>
+
+            <form class="settings-panel" id="settings-panel-downloads" data-settings-panel="downloads" role="tabpanel" aria-labelledby="settings-tab-downloads" hidden onsubmit="return false;" novalidate>
+                <div class="settings-layout-2col">
+                    <div class="settings-main-col">
+                        <div class="settings-section settings-surface-card">
+                            <div class="settings-surface-card-heading qb-card-heading">
+                                <h3><i data-lucide="download"></i>qBittorrent</h3>
+                            </div>
+                            <p class="desc">支持密码或 API Key 认证。API Key 优先。</p>
+                            <div class="form-row"><div class="field-label"><div class="name">qB WebUI 地址</div><div class="hint">如 http://192.168.1.100:8080</div></div><div class="field-control"><input type="url" class="form-input" data-key="QB_URL"></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">用户名</div><div class="hint">密码认证模式使用</div></div><div class="field-control"><input type="text" class="form-input" data-key="QB_USERNAME"></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">密码</div><div class="hint">留空不会覆盖现有密码</div></div><div class="field-control field-control-password"><input type="password" class="form-input" data-key="QB_PASSWORD"></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">API Key</div><div class="hint">Bearer 认证；留空不会覆盖现有密钥</div></div><div class="field-control field-control-password"><input type="password" class="form-input" data-key="QB_API_KEY"></div></div>
+                            <div class="form-row"><div class="field-label"><div class="name">Telegram qB 分类</div><div class="hint">Bot 提交任务时使用</div></div><div class="field-control"><input type="text" class="form-input" data-key="TG_QB_CATEGORY" placeholder="telegram"></div></div>
+                        </div>
+                    </div>
+                    <aside class="settings-side-col" aria-label="qBittorrent 连接遥测与测试">
+                        <div class="settings-telemetry-card">
+                            <div class="settings-telemetry-head">
+                                <div class="settings-telemetry-title"><i data-lucide="gauge"></i><span>引擎连接遥测</span></div>
+                                <span id="qbConnectionState" role="status" aria-live="polite" aria-atomic="true" data-tone="idle" class="telemetry-status-badge is-idle"><span data-qb-state-label>待测试</span></span>
+                            </div>
+                            <div class="telemetry-data-list">
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">WebUI 目标</span>
+                                    <span class="telemetry-data-val" id="qbTargetPreview">未配置</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">鉴权协议</span>
+                                    <span class="telemetry-data-val" id="qbAuthModePreview">密码 / Key</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">任务分类</span>
+                                    <span class="telemetry-data-val" id="qbCategoryPreview">telegram</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">联机诊断</span>
+                                    <span class="telemetry-data-val" id="qbDiagnosticText">尚未发起</span>
+                                </div>
+                            </div>
+                            <div class="telemetry-actions">
+                                <button type="button" class="jump-btn qb-test-button" id="testQbBtn" aria-busy="false"><i data-lucide="plug-zap" aria-hidden="true"></i><span>测试客户端连接</span></button>
+                            </div>
+                        </div>
+                        <div class="settings-telemetry-card">
+                            <div class="settings-telemetry-head">
+                                <div class="settings-telemetry-title"><i data-lucide="workflow"></i><span>下载自动化流</span></div>
+                                <span class="telemetry-status-badge"><span class="telemetry-dot"></span>自动管道</span>
+                            </div>
+                            <div class="telemetry-data-list">
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">任务投递</span>
+                                    <span class="telemetry-data-val">API 自动推送</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">状态追踪</span>
+                                    <span class="telemetry-data-val">Tracker 异步轮询</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">完成动作</span>
+                                    <span class="telemetry-data-val">自动触发整理入库</span>
+                                </div>
+                            </div>
+                        </div>
+                    </aside>
+                </div>
+                <div class="settings-savebar"><span data-settings-state aria-live="polite" data-ready-message="仅保存当前分区">正在读取当前分区配置…</span><button type="button" class="btn btn-primary" data-save-settings disabled aria-disabled="true"><i data-lucide="save"></i>保存下载器设置</button></div>
+            </form>
+
+            <form class="settings-panel" id="settings-panel-network" data-settings-panel="network" role="tabpanel" aria-labelledby="settings-tab-network" hidden onsubmit="return false;" novalidate>
+                <div class="settings-layout-2col">
+                    <div class="settings-main-col">
+                        <div class="settings-section settings-surface-card settings-network-card">
+                            <div class="settings-surface-card-heading">
+                                <h3><i data-lucide="network"></i>网络代理</h3>
+                            </div>
+                            <p class="desc">网络代理与外网请求分流。点击一次，服务端并行测试固定外部目标，并自动加入已配置的 Jellyfin、Emby 和 qBittorrent。</p>
+                            <div class="network-config-grid">
+                                <label class="network-config-card network-address-card"><span class="network-config-icon"><i data-lucide="route"></i></span><span><strong>代理地址</strong><small>支持 HTTP 代理，如 127.0.0.1:7890；自动补全 http://</small></span><input type="text" class="form-input" data-key="PROXY_URL" placeholder="127.0.0.1:7890"></label>
+                                <label class="network-config-card network-mode-card"><span class="network-config-icon"><i data-lucide="shield-check"></i></span><span><strong>测试模式</strong><small>开启时通过当前已保存代理测试；关闭后全部目标直连。</small></span><span class="toggle"><input type="checkbox" id="proxyUseProxy" checked><span class="toggle-slider"></span></span></label>
+                            </div>
+                            <div class="network-test-box">
+                                <div class="network-test-head"><div><strong>固定目标连通性</strong><span>TMDB、TVDB、Telegram、GitHub、光鸭及已配置服务</span></div><button type="button" class="jump-btn" id="proxyTestBtn"><i data-lucide="activity"></i>一键测试全部目标</button></div>
+                                <div id="proxyResult" class="proxy-result proxy-result-list" hidden></div>
+                            </div>
+                        </div>
+                    </div>
+                    <aside class="settings-side-col" aria-label="网络代理遥测与探针">
+                        <div class="settings-telemetry-card">
+                            <div class="settings-telemetry-head">
+                                <div class="settings-telemetry-title"><i data-lucide="activity"></i><span>代理策略与分流</span></div>
+                                <span class="telemetry-status-badge"><span class="telemetry-dot"></span>自动分流</span>
+                            </div>
+                            <div class="telemetry-data-list">
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">外网分流</span>
+                                    <span class="telemetry-data-val">TMDB / TG / TVDB</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">局域网旁路</span>
+                                    <span class="telemetry-data-val">自动直连内网</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">协议支持</span>
+                                    <span class="telemetry-data-val">HTTP / HTTPS</span>
+                                </div>
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">请求池优化</span>
+                                    <span class="telemetry-data-val">连接复用与重试</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="settings-telemetry-card">
+                            <div class="settings-telemetry-head">
+                                <div class="settings-telemetry-title"><i data-lucide="crosshair"></i><span>固定检测目标</span></div>
+                                <span class="telemetry-status-badge is-idle">探针列表</span>
+                            </div>
+                            <div class="telemetry-command-grid">
+                                <div class="telemetry-command-item"><span class="telemetry-command-code">TMDB</span><span class="telemetry-command-desc">元数据索引</span></div>
+                                <div class="telemetry-command-item"><span class="telemetry-command-code">TVDB</span><span class="telemetry-command-desc">剧集索引</span></div>
+                                <div class="telemetry-command-item"><span class="telemetry-command-code">Telegram</span><span class="telemetry-command-desc">通知通道</span></div>
+                                <div class="telemetry-command-item"><span class="telemetry-command-code">GitHub</span><span class="telemetry-command-desc">版本更新</span></div>
+                            </div>
+                            <div class="telemetry-data-list" style="margin-top: auto;">
+                                <div class="telemetry-data-row">
+                                    <span class="telemetry-data-label">媒体服务</span>
+                                    <span class="telemetry-data-val">Jellyfin / Emby / qB</span>
+                                </div>
+                            </div>
+                        </div>
+                    </aside>
+                </div>
+                <div class="settings-savebar"><span data-settings-state aria-live="polite" data-ready-message="测试使用已保存的代理配置">正在读取当前分区配置…</span><button type="button" class="btn btn-primary" data-save-settings disabled aria-disabled="true"><i data-lucide="save"></i>保存网络设置</button></div>
+            </form>
+        </div>
+    </div>
+</div>
+<script>
+(() => {
+    const allowed=new Set(['console','telegram','agent','metadata','discovery','downloads','network']);
+    const target=allowed.has(location.hash.slice(1))?location.hash.slice(1):'console';
+    document.querySelectorAll('[data-settings-target]').forEach(button=>{
+        const active=button.dataset.settingsTarget===target;
+        button.classList.toggle('active',active);
+        button.setAttribute('aria-selected',active?'true':'false');
+        button.tabIndex=active?0:-1;
+    });
+    document.querySelectorAll('[data-settings-panel]').forEach(panel=>{
+        const active=panel.dataset.settingsPanel===target;
+        panel.hidden=!active;
+        panel.classList.toggle('active',active);
+    });
+    window.__mediafluxInitialSettingsTarget=target;
+    delete document.documentElement.dataset.settingsBoot;
+})();
+</script>
+
+<div id="tmdbLocksModal" class="media-config-modal" hidden>
+    <div class="media-config-dialog tmdb-lock-dialog" role="dialog" aria-modal="true" aria-labelledby="tmdbLocksTitle">
+        <div class="media-config-head">
+            <div><span>IDENTITY OVERRIDES</span><h3 id="tmdbLocksTitle">TMDB 映射锁</h3></div>
+            <button type="button" class="icon-btn" data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+        </div>
+        <div class="media-config-body">
+            <p class="tmdb-lock-note">人工确认结果仅作用于相同文件名、父目录、媒体类型和季号；旧版无上下文映射仅保留审计，不再自动命中。</p>
+            <div class="tmdb-lock-search"><input type="search" class="form-input" id="lockSearch" placeholder="搜索文件名、标题或 TMDB ID"><button type="button" class="jump-btn" id="loadLocksBtn"><i data-lucide="search"></i>搜索</button></div>
+            <div class="table-wrap tmdb-lock-table-wrap"><table class="download-table lock-table"><thead><tr><th>原始文件名</th><th>适用范围</th><th>TMDB</th><th>标题</th><th>年份</th><th>操作</th></tr></thead><tbody id="lockList"><tr><td colspan="6" class="table-empty">打开后读取</td></tr></tbody></table></div>
+        </div>
+        <div class="media-config-footer"><span class="inline-save-state" id="lockState"></span><div class="media-config-actions"><button type="button" class="jump-btn" data-modal-close>关闭</button></div></div>
+    </div>
+</div>
+
+<div id="agentModelPickerModal" class="app-modal agent-model-picker-modal" hidden>
+    <div class="card agent-model-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="agentModelPickerTitle">
+        <div class="agent-model-picker-head">
+            <div class="agent-model-picker-title-group">
+                <span class="server-kicker">MODEL CATALOG</span>
+                <h3 id="agentModelPickerTitle">选择模型</h3>
+                <p id="agentModelPickerSub">点击任意模型即可快速填入，支持关键字过滤搜索</p>
+            </div>
+            <button type="button" class="icon-btn" data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+        </div>
+        <div class="agent-model-picker-search-bar">
+            <div class="agent-model-search-shell">
+                <i data-lucide="search"></i>
+                <input type="text" class="form-input" id="agentModelSearchInput" placeholder="输入关键字快速过滤模型..." autocomplete="off">
+            </div>
+            <span class="agent-model-count-badge" id="agentModelCountBadge">共 0 个模型</span>
+        </div>
+        <div class="agent-model-picker-list" id="agentModelPickerList" role="listbox" aria-label="可用模型列表">
+            <div class="agent-model-picker-empty">暂无可用模型，请先点击「获取模型」</div>
+        </div>
+        <div class="agent-model-picker-foot">
+            <button type="button" class="jump-btn" data-modal-close>取消</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='js/settings.js') }}?v=20260820a"></script>
+{% endblock %}

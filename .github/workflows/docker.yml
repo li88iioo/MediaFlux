@@ -1,0 +1,345 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  SOURCE_SHA: ${{ github.sha }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v6
+        with: {node-version: "24", package-manager-cache: false}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-release-runtime.lock
+
+      - name: Install dependencies
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          python -m pip install --require-hashes -r requirements-release-runtime.lock
+          python -m pip check
+
+      - name: Run tests
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python -m unittest discover -s tests -t . -p "test_*.py" -v
+
+  smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Build amd64 smoke image
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$SOURCE_SHA")
+          docker build \
+            --build-arg VERSION_REF=v0.0.0-ci \
+            --build-arg GIT_SHA="$SOURCE_SHA" \
+            --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            --tag mediaflux:smoke .
+      - name: Start image and wait for health check
+        env:
+          WEB_SECRET_KEY: ci-smoke-secret-key-with-more-than-32-bytes
+          MEDIAFLUX_INITIALIZED: "1"
+          ENV_WEB_PASSPORT: admin
+          ENV_WEB_PASSWORD: ci-smoke-password-with-more-than-16-bytes
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mediaflux-db" "$RUNNER_TEMP/mediaflux-strm"
+          sudo chown -R 10001:10001 "$RUNNER_TEMP/mediaflux-db" "$RUNNER_TEMP/mediaflux-strm"
+          docker run --detach --name mediaflux-smoke \
+            --publish 127.0.0.1:1258:1258 \
+            --env WEB_SECRET_KEY --env MEDIAFLUX_INITIALIZED \
+            --env ENV_WEB_PASSPORT --env ENV_WEB_PASSWORD \
+            --volume "$RUNNER_TEMP/mediaflux-db:/app/db" \
+            --volume "$RUNNER_TEMP/mediaflux-strm:/data/strm" \
+            mediaflux:smoke
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:1258/readyz >/dev/null; then
+              docker exec mediaflux-smoke python mediaflux.py version --json > "$RUNNER_TEMP/docker-version.json"
+              jq -e --arg sha "$SOURCE_SHA" \
+                '.version == "0.0.0-ci" and .package == "docker" and .commit == $sha' \
+                "$RUNNER_TEMP/docker-version.json"
+              curl --fail --silent --show-error \
+                http://127.0.0.1:1258/static/js/app.js >/dev/null
+              source_app_js_bytes=$(wc -c < app/static/js/app.js)
+              image_app_js_bytes=$(docker exec mediaflux-smoke sh -c \
+                'wc -c < /app/app/static/js/app.js')
+              test "$image_app_js_bytes" -lt "$source_app_js_bytes"
+              docker exec mediaflux-smoke sh -c '! command -v node >/dev/null 2>&1'
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs mediaflux-smoke
+          exit 1
+      - name: Stop smoke container
+        if: always()
+        run: docker rm --force mediaflux-smoke >/dev/null 2>&1 || true
+
+  build:
+    needs: [test, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Prepare build context
+        id: context
+        env:
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          TAG_NAME: ${{ github.ref_name }}
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE_REPOSITORY=$(printf '%s' "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          if [[ "$IS_TAG" == "true" ]]; then
+            VERSION_REF="$TAG_NAME"
+            RELEASE_BUILD=true
+          else
+            VERSION_REF=v0.0.0-dev
+            RELEASE_BUILD=false
+          fi
+          BUILD_INFO_ARGS=()
+          if [[ "$RELEASE_BUILD" != "true" ]]; then
+            BUILD_INFO_ARGS+=(--development)
+          fi
+          python packaging/scripts/generate_build_info.py \
+            --ref "$VERSION_REF" --commit "$BUILD_SHA" \
+            --platform docker --arch multi --package runtime \
+            --output "$RUNNER_TEMP/BUILD-INFO.json" \
+            "${BUILD_INFO_ARGS[@]}"
+          VERSION=$(jq -r '.version' "$RUNNER_TEMP/BUILD-INFO.json")
+          STABLE=$(jq -r '(.prerelease | not)' "$RUNNER_TEMP/BUILD-INFO.json")
+          DOCKER_VERSION=$(python packaging/scripts/docker_version_tag.py "$VERSION")
+          SERIES=${VERSION%%[-+]*}
+          SERIES=$(printf '%s' "$SERIES" | cut -d. -f1,2)
+          SHORT_SHA=${BUILD_SHA:0:12}
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$BUILD_SHA")
+          {
+            echo "image_repository=$IMAGE_REPOSITORY"
+            echo "version_ref=$VERSION_REF"
+            echo "version=$VERSION"
+            echo "docker_version=$DOCKER_VERSION"
+            echo "source_sha=$BUILD_SHA"
+            echo "short_sha=$SHORT_SHA"
+            echo "source_date_epoch=$SOURCE_DATE_EPOCH"
+            echo "stable=$STABLE"
+            echo "series=$SERIES"
+            echo "release_build=$RELEASE_BUILD"
+            echo "candidate_tag=$IMAGE_REPOSITORY:sha-$SHORT_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build candidate image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.context.outputs.candidate_tag }}
+          build-args: |
+            VERSION_REF=${{ steps.context.outputs.version_ref }}
+            GIT_SHA=${{ steps.context.outputs.source_sha }}
+            SOURCE_DATE_EPOCH=${{ steps.context.outputs.source_date_epoch }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify candidate multi-architecture manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          IMAGE_REPOSITORY: ${{ steps.context.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE_REPOSITORY@$IMAGE_DIGEST" --raw > "$RUNNER_TEMP/manifest.json"
+          jq -e '
+            [.manifests[].platform | "\(.os)/\(.architecture)"] as $platforms
+            | ($platforms | index("linux/amd64")) != null
+              and ($platforms | index("linux/arm64")) != null
+          ' "$RUNNER_TEMP/manifest.json"
+
+      - name: Smoke test candidate arm64 image
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          IMAGE_REPOSITORY: ${{ steps.context.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_VERSION: ${{ steps.context.outputs.version }}
+          EXPECTED_SHA: ${{ steps.context.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/arm64 --entrypoint python \
+            "$IMAGE_REPOSITORY@$IMAGE_DIGEST" mediaflux.py version --json \
+            > "$RUNNER_TEMP/docker-arm64-version.json"
+          jq -e --arg version "$EXPECTED_VERSION" --arg sha "$EXPECTED_SHA" \
+            '.version == $version and .arch == "aarch64" and .package == "docker" and .commit == $sha' \
+            "$RUNNER_TEMP/docker-arm64-version.json"
+
+      - name: Re-verify release tag before promotion
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          VERSION_REF: ${{ steps.context.outputs.version_ref }}
+          EXPECTED_SHA: ${{ steps.context.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin \
+            "+refs/tags/$VERSION_REF:refs/tags/$VERSION_REF"
+          test "$(git rev-list -n 1 "$VERSION_REF")" = "$EXPECTED_SHA"
+
+      - name: Promote verified image tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          IMAGE_REPOSITORY: ${{ steps.context.outputs.image_repository }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.context.outputs.version }}
+          DOCKER_VERSION: ${{ steps.context.outputs.docker_version }}
+          SERIES: ${{ steps.context.outputs.series }}
+          STABLE: ${{ steps.context.outputs.stable }}
+          EXPECTED_SHA: ${{ steps.context.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          exact="$IMAGE_REPOSITORY:$DOCKER_VERSION"
+          promotion_digest="$IMAGE_DIGEST"
+          existing_digest=$(docker buildx imagetools inspect "$exact" 2>/dev/null \
+            | awk '$1 == "Digest:" {print $2; exit}' || true)
+          if [[ -n "$existing_digest" && "$existing_digest" != "$IMAGE_DIGEST" ]]; then
+            docker buildx imagetools inspect "$exact" --raw > "$RUNNER_TEMP/existing-exact-manifest.json"
+            if jq -e '
+              [.manifests[].platform | "\(.os)/\(.architecture)"] as $platforms
+              | ($platforms | index("linux/amd64")) != null
+                and ($platforms | index("linux/arm64")) != null
+            ' "$RUNNER_TEMP/existing-exact-manifest.json" >/dev/null 2>&1; then
+              reusable=true
+              for platform_arch in "linux/amd64:x86_64" "linux/arm64:aarch64"; do
+                platform=${platform_arch%%:*}
+                expected_arch=${platform_arch##*:}
+                safe_arch=${platform#linux/}
+                docker run --rm --platform "$platform" --entrypoint python \
+                  "$exact" mediaflux.py version --json \
+                  > "$RUNNER_TEMP/existing-exact-$safe_arch-version.json" 2>/dev/null || true
+                if ! jq -e \
+                  --arg version "$VERSION" \
+                  --arg sha "$EXPECTED_SHA" \
+                  --arg arch "$expected_arch" \
+                  '.version == $version and .arch == $arch and .package == "docker" and .commit == $sha' \
+                  "$RUNNER_TEMP/existing-exact-$safe_arch-version.json" >/dev/null 2>&1; then
+                  echo "Immutable version tag $exact on registry does not match current commit $EXPECTED_SHA; promoting candidate $IMAGE_DIGEST" >&2
+                  reusable=false
+                  break
+                fi
+              done
+              if [[ "$reusable" == "true" ]]; then
+                promotion_digest="$existing_digest"
+                echo "Reuse previously verified immutable tag $exact at $promotion_digest"
+              fi
+            fi
+          fi
+
+          tags=("$exact")
+          if [[ "$STABLE" == "true" ]]; then
+            for mutable_tag in "$IMAGE_REPOSITORY:$SERIES" "$IMAGE_REPOSITORY:latest"; do
+              allow_mutable=true
+              if docker buildx imagetools inspect "$mutable_tag" >/dev/null 2>&1; then
+                safe_name=$(printf '%s' "$mutable_tag" | tr '/:.' '____')
+                docker run --rm --platform linux/amd64 --entrypoint python \
+                  "$mutable_tag" mediaflux.py version --json \
+                  > "$RUNNER_TEMP/docker-current-$safe_name.json"
+                current_version=$(jq -r '.version' "$RUNNER_TEMP/docker-current-$safe_name.json")
+                if ! python packaging/scripts/check_version_promotion.py "$VERSION" "$current_version"; then
+                  allow_mutable=false
+                  echo "Keep $mutable_tag on newer version $current_version"
+                fi
+              fi
+              if [[ "$allow_mutable" == "true" ]]; then
+                tags+=("$mutable_tag")
+              fi
+            done
+          fi
+
+          for tag in "${tags[@]}"; do
+            docker buildx imagetools create --tag "$tag" "$IMAGE_REPOSITORY@$promotion_digest"
+            promoted_digest=""
+            for _ in {1..10}; do
+              promoted_digest=$(docker buildx imagetools inspect "$tag" 2>/dev/null \
+                | awk '$1 == "Digest:" {print $2; exit}' || true)
+              if [[ "$promoted_digest" == "$promotion_digest" ]]; then
+                break
+              fi
+              sleep 1
+            done
+            test "$promoted_digest" = "$promotion_digest"
+          done
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_REF: ${{ steps.context.outputs.version_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/release-notes
+          python - <<'PY'
+          import importlib.util, os
+          from pathlib import Path
+          p = Path('packaging/scripts/generate_build_info.py')
+          s = importlib.util.spec_from_file_location('g', p)
+          m = importlib.util.module_from_spec(s)
+          import sys
+          sys.modules[s.name] = m
+          s.loader.exec_module(m)
+          m.generate_release_notes(os.environ['VERSION_REF'], os.environ['GITHUB_REPOSITORY'], Path('CHANGELOG.md'), Path('/tmp/release-notes/RELEASE-NOTES.txt'))
+          PY
+          PRERELEASE=()
+          if jq -e '.prerelease == true' "$RUNNER_TEMP/BUILD-INFO.json" >/dev/null; then
+            PRERELEASE=(--prerelease)
+          fi
+          if ! gh release view "$VERSION_REF" >/dev/null 2>&1; then
+            gh release create "$VERSION_REF" \
+              --title "MediaFlux $VERSION_REF" \
+              --notes-file /tmp/release-notes/RELEASE-NOTES.txt \
+              "${PRERELEASE[@]}"
+          fi

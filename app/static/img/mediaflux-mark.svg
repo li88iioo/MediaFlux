@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="MediaFlux">
+  <style>
+    .flux-gate-upper { fill: #087f5b; }
+    .flux-gate-lower { fill: #2b6f9f; }
+    @media (prefers-color-scheme: dark) {
+      .flux-gate-upper { fill: #65f0c2; }
+      .flux-gate-lower { fill: #9de8ff; }
+    }
+  </style>
+  <defs>
+    <mask id="flux-gate-cut" maskUnits="userSpaceOnUse">
+      <rect width="64" height="64" fill="#fff"/>
+      <path fill="#000" d="m26 22 18 10-18 10V22Z"/>
+    </mask>
+  </defs>
+  <g mask="url(#flux-gate-cut)">
+    <path class="flux-gate-upper" d="M7 11h13l12 9 12-9h13v12h-9L32 35 16 23H7V11Z"/>
+    <path class="flux-gate-lower" d="M7 53V41h9l16-12 16 12h9v12H44l-12-9-12 9H7Z"/>
+  </g>
+</svg>

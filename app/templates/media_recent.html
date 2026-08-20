@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% from "_ui_macros.html" import theme_toggle %}
+{% block title %}最近入库 - MediaFlux{% endblock %}
+{% block body_class %}dashboard-page media-hub-page media-recent-page{% endblock %}
+{% block page_styles %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/dashboard-workbench.css') }}?v=20260818c">
+<link rel="stylesheet" href="{{ url_for('static', path='css/media-hub.css') }}?v=20260818c">
+{% endblock %}
+{% block workspace_bar %}
+<header class="dashboard-topbar media-hub-topbar">
+    <button class="icon-btn workspace-menu-btn dashboard-mobile-menu" id="toggleSidebar" type="button" aria-label="打开导航" title="打开导航" aria-expanded="false"><i data-lucide="menu"></i></button>
+    <div class="media-recent-overview" aria-label="最近入库，共 {{ items|length }} 项内容">
+        <span class="media-recent-overview-icon"><i data-lucide="library-big" data-recent-idle-icon></i><i data-lucide="loader-circle" data-recent-loading-icon></i></span>
+        <span class="media-recent-overview-copy"><strong>最近入库</strong><small><b>{{ items|length }}</b> 项内容</small></span>
+    </div>
+    <form class="media-recent-toolbar" method="get" action="{{ url_for('pages.media_recent') }}" role="search" data-media-recent-filter aria-busy="false">
+        <label class="media-hub-filter-search"><i data-lucide="search"></i><input name="q" type="search" maxlength="120" value="{{ query }}" autocomplete="off" placeholder="按标题、剧名或年份筛选"></label>
+        <label class="media-recent-select"><span>服务器</span><select name="server" data-auto-submit aria-label="筛选媒体服务器">
+            <option value="all"{% if selected_server == 'all' %} selected{% endif %}>全部服务器</option>
+            {% for source in sources %}<option value="{{ source.server_type }}"{% if selected_server == source.server_type %} selected{% endif %}>{{ source.server_name }}</option>{% endfor %}
+        </select></label>
+        <label class="media-recent-select"><span>类型</span><select name="type" data-auto-submit aria-label="筛选媒体类型">
+            <option value="all"{% if selected_type == 'all' %} selected{% endif %}>全部类型</option>
+            <option value="movie"{% if selected_type == 'movie' %} selected{% endif %}>电影</option>
+            <option value="series"{% if selected_type == 'series' %} selected{% endif %}>剧集</option>
+            <option value="episode"{% if selected_type == 'episode' %} selected{% endif %}>单集</option>
+        </select></label>
+        {% set has_recent_filters = query or selected_server != 'all' or selected_type != 'all' %}<a class="media-hub-filter-reset{% if not has_recent_filters %} is-hidden{% endif %}" href="{{ url_for('pages.media_recent') }}" aria-label="重置筛选" title="重置筛选"{% if not has_recent_filters %} aria-hidden="true" tabindex="-1"{% endif %}><i data-lucide="filter-x"></i><span>重置</span></a>
+    </form>
+    <div class="dashboard-top-actions">
+        <a class="icon-btn" href="{{ url_for('pages.dashboard') }}" aria-label="返回看板" title="返回看板"><i data-lucide="layout-dashboard"></i></a>
+        {{ theme_toggle('media-recent') }}
+    </div>
+</header>
+{% endblock %}
+{% block content %}
+<div class="media-hub-shell">
+    {% if search_error %}<section class="media-hub-notice is-error"><i data-lucide="circle-alert"></i><div><strong>筛选条件无效</strong><span>{{ search_error }}</span></div></section>{% endif %}
+    {% for source in errors %}<section class="media-hub-notice is-warning"><i data-lucide="server-off"></i><div><strong>{{ source.server_name }} 暂时不可用</strong><span>{{ source.error }}</span></div></section>{% endfor %}
+
+    <section class="media-recent-shell">
+        {% if items %}
+        <section class="media-recent-grid" aria-label="最近入库内容">
+            {% for entry in items %}
+            {% set item = entry.media %}{% set source = entry.source %}
+            <a class="media-recent-card" href="{{ item.web_url or source.web_url }}" target="_blank" rel="noopener" title="{{ item.display_name }}">
+                <span class="media-recent-poster">
+                    {% if item.primary_image %}<img src="{{ item.primary_image }}" alt="{{ item.display_name }}" loading="lazy">{% else %}<span><i data-lucide="film"></i></span>{% endif %}
+                    <em class="media-recent-type">{{ '电影' if item.type|lower == 'movie' else '剧集' if item.type|lower in ['series', 'tv'] else '单集' if item.type|lower == 'episode' else item.type }}</em>
+                </span>
+                <span class="media-recent-copy">
+                    <strong>{% if item.type|lower == 'episode' and item.series_name %}{{ item.series_name }}{% else %}{{ item.display_name }}{% endif %}</strong>
+                    <small>{% if item.episode_number is not none %}{% if item.season_number is not none %}第 {{ item.season_number }} 季 · {% endif %}第 {{ item.episode_number }} 集{% if item.name and item.name != item.series_name %} · {{ item.name }}{% endif %}{% else %}{{ '电影' if item.type|lower == 'movie' else '剧集' if item.type|lower in ['series', 'tv'] else item.type }}{% if item.year %} · {{ item.year }}{% endif %}{% endif %}</small>
+                </span>
+                <span class="media-recent-foot"><b><i></i>{{ source.server_name }}</b><time>{{ item.date_added[:10] if item.date_added else '最近入库' }}</time></span>
+            </a>
+            {% endfor %}
+        </section>
+        {% elif all_sources_failed %}
+        <section class="media-hub-empty"><span><i data-lucide="server-off"></i></span><strong>媒体服务器暂时不可用</strong><p>连接恢复后刷新页面即可重新获取最近入库内容。</p></section>
+        {% elif not has_sources %}
+        <section class="media-hub-empty"><span><i data-lucide="server-cog"></i></span><strong>尚未配置媒体服务器</strong><p>先在看板连接 Jellyfin 或 Emby，最近入库会自动汇总到这里。</p><a class="media-hub-empty-action" href="/"><i data-lucide="sliders-horizontal"></i>前往看板配置</a></section>
+        {% else %}
+        <section class="media-hub-empty"><span><i data-lucide="inbox"></i></span><strong>没有符合条件的入库内容</strong><p>调整服务器、类型或关键词后重新筛选。</p></section>
+        {% endif %}
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    const form=document.querySelector('[data-media-recent-filter]');
+    const topbar=form?.closest('.media-hub-topbar');
+    let requestController=null;
+    let requestGeneration=0;
+    const setBusy=busy=>{
+        form?.classList.toggle('is-submitting',busy);
+        topbar?.classList.toggle('is-submitting',busy);
+        form?.setAttribute('aria-busy',busy?'true':'false');
+    };
+    async function updateResults(url){
+        const generation=++requestGeneration;
+        requestController?.abort();
+        requestController=new AbortController();
+        setBusy(true);
+        try{
+            const response=await fetch(url,{headers:{'X-Requested-With':'MediaFlux'},signal:requestController.signal});
+            if(!response.ok) throw new Error(`筛选失败 (${response.status})`);
+            const nextDocument=new DOMParser().parseFromString(await response.text(),'text/html');
+            const nextShell=nextDocument.querySelector('.media-recent-shell');
+            const currentShell=document.querySelector('.media-recent-shell');
+            if(!nextShell||!currentShell) throw new Error('筛选结果结构无效');
+            const stableHeight=Math.ceil(currentShell.getBoundingClientRect().height);
+            currentShell.style.minHeight=`${stableHeight}px`;
+            currentShell.classList.add('is-updating');
+            nextShell.style.minHeight=`${stableHeight}px`;
+            const applyResult=()=>{
+                currentShell.replaceWith(nextShell);
+                const nextOverview=nextDocument.querySelector('.media-recent-overview-copy small');
+                const currentOverview=document.querySelector('.media-recent-overview-copy small');
+                if(nextOverview&&currentOverview) currentOverview.innerHTML=nextOverview.innerHTML;
+                history.replaceState({},'',url);
+                renderLucideIcons(nextShell);
+                requestAnimationFrame(()=>requestAnimationFrame(()=>{
+                    nextShell.style.minHeight='';
+                    nextShell.classList.remove('is-updating');
+                }));
+            };
+            const reduceMotion=matchMedia('(prefers-reduced-motion: reduce)').matches;
+            if(document.startViewTransition&&!reduceMotion) document.startViewTransition(applyResult);
+            else applyResult();
+        }catch(error){
+            if(error.name!=='AbortError'&&generation===requestGeneration) location.assign(url);
+        }finally{
+            if(generation===requestGeneration){ requestController=null; setBusy(false); }
+        }
+    }
+    form?.addEventListener('submit',event=>{
+        event.preventDefault();
+        const url=new URL(form.action,location.origin);
+        const values=new FormData(form);
+        for(const [key,value] of values.entries()) if(String(value).trim()&&value!=='all') url.searchParams.set(key,String(value));
+        updateResults(url);
+    });
+    form?.querySelectorAll('select[data-auto-submit]').forEach(select=>select.addEventListener('change',()=>form.requestSubmit()));
+})();
+</script>
+{% endblock %}

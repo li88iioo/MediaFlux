@@ -1,0 +1,456 @@
+{% extends "base.html" %}
+{% block title %}STRM 同步 - MediaFlux{% endblock %}
+{% block page_title %}光鸭 STRM 同步{% endblock %}
+{% block body_class %}strm-sync-page persistent-savebar-page{% endblock %}
+
+{% block page_styles %}
+<script>
+(() => {
+    const initialTab = window.location.hash.slice(1);
+    if (new Set(['schedule', 'diagnostics']).has(initialTab)) {
+        document.documentElement.dataset.strmInitialTab = initialTab;
+    }
+    try {
+        const rows = Math.min(12, Math.max(1, Number(sessionStorage.getItem('mediaflux:strm-source-rows')) || 1));
+        document.documentElement.style.setProperty('--strm-source-reserved-height', `${rows * 60 - 8}px`);
+    } catch (_) {}
+})();
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="strm-settings-shell" id="strmForm">
+    <!-- Top Nav Tabs Switcher -->
+    <div class="strm-nav-tabs" role="tablist" aria-label="STRM 同步页面">
+        <button type="button" class="strm-tab-btn active" id="strmTabButton_config" data-tab="config" role="tab" aria-controls="strmTab_config" aria-selected="true">
+            <i data-lucide="sliders"></i>同步源与规则
+        </button>
+        <button type="button" class="strm-tab-btn" id="strmTabButton_schedule" data-tab="schedule" role="tab" aria-controls="strmTab_schedule" aria-selected="false" tabindex="-1">
+            <i data-lucide="calendar-clock"></i>自动调度与运行
+        </button>
+        <button type="button" class="strm-tab-btn" id="strmTabButton_diagnostics" data-tab="diagnostics" role="tab" aria-controls="strmTab_diagnostics" aria-selected="false" tabindex="-1">
+            <i data-lucide="shield-check"></i>索引诊断与台账
+        </button>
+    </div>
+
+    <!-- Tab 1: Configuration (Spacious Vertical Stack Form Layout) -->
+    <div class="strm-tab-panel" id="strmTab_config" role="tabpanel" aria-labelledby="strmTabButton_config">
+        <div class="strm-settings-grid">
+            <!-- Left Card: Source Dirs, Server URL & Storage Paths -->
+            <section class="card settings-section strm-settings-section strm-source-section">
+                <header class="strm-section-head">
+                    <div class="title-group">
+                        <h3><i data-lucide="folder-tree"></i>同步来源与存储路径</h3>
+                        <p class="desc">设置网盘扫描目录范围、播放服务地址与本地 STRM 生成路径。</p>
+                    </div>
+                </header>
+
+                <div class="strm-card-body">
+                    <div class="strm-field-group">
+                        <div class="strm-field-header">
+                            <label class="strm-field-label">光鸭源目录</label>
+                            <span class="strm-field-hint">可一次勾选多个目录，按目录名隔离本地路径</span>
+                        </div>
+                        <div class="strm-field-control">
+                            <input type="hidden" data-key="GY_STRM_SOURCE_DIRS" id="strmSourceDirs">
+                            <div id="strmSourceList" class="strm-source-list" aria-live="polite" aria-busy="true"></div>
+                            <div class="strm-source-actions">
+                                <button type="button" class="jump-btn" id="addStrmSourceBtn">
+                                    <i data-lucide="folders"></i>批量选择源目录
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="strm-field-group">
+                        <div class="strm-field-header">
+                            <label class="strm-field-label">播放服务地址</label>
+                            <span class="strm-field-hint">STRM 内写入、且媒体服务器可访问的本服务地址</span>
+                        </div>
+                        <div class="strm-field-control">
+                            <input type="text" class="form-input" id="strmBaseUrl" data-key="GY_STRM_BASE_URL" placeholder="http://192.168.88.195:1258">
+                            <div class="strm-base-url-tools">
+                                <button type="button" class="jump-btn" id="detectStrmBaseUrlBtn" aria-busy="false"><i data-lucide="scan-search" aria-hidden="true"></i><span>检测可用地址</span></button>
+                                <select class="form-input" id="strmBaseUrlCandidates" aria-label="播放服务地址候选" disabled><option value="">检测后选择地址</option></select>
+                            </div>
+                            <span class="strm-base-url-state" id="strmBaseUrlState" role="status" aria-live="polite">不会自动覆盖当前配置；请选择媒体服务器能够访问的地址。</span>
+                        </div>
+                    </div>
+
+                    <div class="strm-field-group">
+                        <div class="strm-field-header">
+                            <label class="strm-field-label">STRM 本地根目录</label>
+                            <span class="strm-field-hint">Jellyfin/Emby 能扫描到的本机或共享目录</span>
+                        </div>
+                        <div class="strm-field-control">
+                            <input type="text" class="form-input" data-key="STRM_ROOT" placeholder="/data/strm">
+                        </div>
+                    </div>
+
+                    <div class="strm-field-group">
+                        <div class="strm-field-header">
+                            <label class="strm-field-label">小文件阈值 (MB)</label>
+                            <span class="strm-field-hint">小于该值不生成，0 表示不限文件大小</span>
+                        </div>
+                        <div class="strm-field-control">
+                            <input type="number" min="0" class="form-input" data-key="STRM_SKIP_THRESHOLD_MB" value="0">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Card: File Extensions & Metadata Rules -->
+            <section class="card settings-section strm-settings-section">
+                <header class="strm-section-head">
+                    <div class="title-group">
+                        <h3><i data-lucide="file-video"></i>格式过滤与伴随元数据</h3>
+                        <p class="desc">设置 STRM 生成的扩展名过滤与伴随元数据下载规则。</p>
+                    </div>
+                </header>
+
+                <div class="strm-card-body">
+                    <div class="strm-field-group">
+                        <div class="strm-field-header">
+                            <label class="strm-field-label">视频扩展名</label>
+                            <span class="strm-field-hint">按回车添加 Tag 标签；留空使用默认格式</span>
+                        </div>
+                        <div class="strm-field-control">
+                            <input type="hidden" data-key="STRM_VIDEO_EXTS" id="strmVideoExts">
+                            <div class="strm-tag-input-box" id="strmVideoExtsTagBox">
+                                <div class="strm-tag-list"></div>
+                                <input type="text" class="strm-tag-field" placeholder="输入扩展名后按回车添加 (如 mkv)">
+                            </div>
+                            <div class="strm-preset-bar">
+                                <span class="preset-label">快捷预设：</span>
+                                <button type="button" data-video-ext-preset="mkv,mp4,ts,m2ts">常用格式 (mkv, mp4, ts, m2ts)</button>
+                                <button type="button" data-video-ext-preset="mkv,mp4,ts,m2ts,iso,mov,avi,flv">全量格式 (+ iso, mov, avi)</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="strm-toggle-card">
+                        <div class="strm-toggle-copy">
+                            <label for="strmMetadataEnabled">同步伴随元数据</label>
+                            <span>扫描结束后由后台队列同步 NFO、字幕和图片，不阻塞 STRM</span>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" data-key="STRM_METADATA_ENABLED" id="strmMetadataEnabled">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="strm-field-group" id="strmMetadataExtRow">
+                        <div class="strm-field-header">
+                            <label class="strm-field-label">元数据扩展名</label>
+                            <span class="strm-field-hint">按回车添加 Tag 标签</span>
+                        </div>
+                        <div class="strm-field-control">
+                            <input type="hidden" data-key="STRM_METADATA_EXTS" id="strmMetadataExts">
+                            <div class="strm-tag-input-box" id="strmMetadataExtsTagBox">
+                                <div class="strm-tag-list"></div>
+                                <input type="text" class="strm-tag-field" id="strmMetadataExtField" placeholder="输入扩展名后按回车添加 (如 nfo)">
+                            </div>
+                            <div class="strm-preset-bar">
+                                <span class="preset-label">快捷预设：</span>
+                                <button type="button" data-ext-preset="nfo,srt,ass,ssa,sub,idx">NFO + 字幕</button>
+                                <button type="button" data-ext-preset="nfo,srt,ass,ssa,sub,idx,jpg,jpeg,png,webp">全量元数据</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Tab 2: Scheduler & Runtime Status (50/50 Grid) -->
+    <div class="strm-tab-panel" id="strmTab_schedule" role="tabpanel" aria-labelledby="strmTabButton_schedule" hidden>
+        <div class="strm-two-col-grid">
+            <!-- Left Card: Schedule Rules & Notification -->
+            <section class="card settings-section strm-settings-section">
+                <header class="strm-section-head">
+                    <div class="title-group">
+                        <h3><i data-lucide="clock"></i>定时计划与任务通知</h3>
+                        <p class="desc">配置周期性完整校准计划与 Telegram 通知选项。</p>
+                    </div>
+                </header>
+
+                <div class="strm-card-body">
+                    <div class="strm-toggle-card">
+                        <div class="strm-toggle-copy">
+                            <label for="strmScheduleEnabledSwitch">启用定时扫描</label>
+                            <span>配置完整后保存生效，按 Cron 计划并发扫描全库并校准外部变化</span>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" data-key="STRM_SCHEDULE_ENABLED" id="strmScheduleEnabledSwitch">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="strm-field-card">
+                        <div class="strm-field-card-head">
+                            <label for="strmCron" class="strm-field-label">Cron 表达式</label>
+                            <span class="strm-field-hint">标准 5 段：分 时 日 月 周</span>
+                        </div>
+                        <div class="strm-field-card-body">
+                            <div class="cron-input-wrapper">
+                                <i data-lucide="terminal" class="cron-icon"></i>
+                                <input type="text" class="form-input strm-cron-input" data-key="STRM_SCHEDULE_CRON" id="strmCron" placeholder="0 4 * * *">
+                            </div>
+                            <div class="cron-preview-badge" id="cronPreview"></div>
+                        </div>
+                    </div>
+
+                    <div class="strm-toggle-card">
+                        <div class="strm-toggle-copy">
+                            <label for="strmNotifySwitch">TG 任务通知</label>
+                            <span>自动、网页或整理联动任务完成/失败时发送统计推送；不影响 TG 指令回执</span>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" data-key="STRM_NOTIFY_ENABLED" id="strmNotifySwitch" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Card: Modern Dashboard Runtime Status Monitoring -->
+            <section class="card settings-section strm-settings-section">
+                <header class="strm-section-head">
+                    <div class="title-group">
+                        <h3><i data-lucide="activity"></i>即时运行状态监控</h3>
+                        <p class="desc">查看当前同步进度、最近运行日志与控制手动同步。</p>
+                    </div>
+                    <span class="share-status-badge" id="strmStateTag"><i data-lucide="activity"></i><span>读取状态</span></span>
+                </header>
+
+                <div class="strm-card-body strm-runtime-dashboard">
+                    <!-- Metric Cards Grid -->
+                    <div class="strm-runtime-metrics">
+                        <div class="runtime-metric-tile">
+                            <span class="tile-label"><i data-lucide="history"></i> 最近同步</span>
+                            <strong class="tile-value" id="strmLastRun">暂无运行记录</strong>
+                        </div>
+                        <div class="runtime-metric-tile">
+                            <span class="tile-label"><i data-lucide="calendar"></i> 下次调度</span>
+                            <strong class="tile-value" id="strmNextRun">无定时计划</strong>
+                        </div>
+                    </div>
+
+                    <!-- Progress & Live Status Box -->
+                    <div class="strm-runtime-status-box">
+                        <div class="status-box-head">
+                            <div class="status-indicator">
+                                <span class="status-dot" id="strmStatusDot"></span>
+                                <strong id="strmProgressStage">等待任务</strong>
+                            </div>
+                            <span class="status-count" id="strmProgressCount">0 / 0 · 0%</span>
+                        </div>
+                        <div class="strm-runtime-progress-line">
+                            <i id="strmProgressBar" style="transform: scaleX(0);"></i>
+                        </div>
+                        <div class="strm-source-runtime-list" id="strmSourceRuntime">
+                            <span class="text-muted">暂无来源运行状态</span>
+                        </div>
+                        <div class="strm-last-run-metrics" id="strmLastRunMetrics">
+                            最近扫描指标将在任务完成后显示
+                        </div>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div class="strm-runtime-actions">
+                        <button type="button" class="btn btn-primary" id="runStrmNowBtn">
+                            <i data-lucide="zap"></i>快速同步
+                        </button>
+                        <button type="button" class="btn btn-secondary" id="runStrmFullBtn">
+                            <i data-lucide="scan-search"></i>完整校准
+                        </button>
+                        <button type="button" class="btn btn-secondary" id="refreshStrmStatusBtn">
+                            <i data-lucide="refresh-cw"></i>刷新状态
+                        </button>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Tab 3: Diagnostics & Failure Ledger (Clean Stacked Panels) -->
+    <div class="strm-tab-panel" id="strmTab_diagnostics" role="tabpanel" aria-labelledby="strmTabButton_diagnostics" hidden>
+        <div class="strm-stacked-grid">
+            <!-- Card 1: Index Isolation Diagnostics -->
+            <section class="card settings-section strm-settings-section strm-index-diagnostic" id="strmIndexDiagnosticCard">
+                <header class="strm-index-diagnostic-head">
+                    <div class="title-group">
+                        <h3><i data-lucide="scan-search"></i>索引隔离诊断</h3>
+                        <p class="desc">识别二次确认缺失的临时 UUID 测试索引，不展示播放地址。</p>
+                    </div>
+                    <button type="button" class="jump-btn strm-index-diagnostic-refresh" id="refreshStrmIndexDiagnosticBtn">
+                        <i data-lucide="refresh-cw"></i><span>刷新诊断</span>
+                    </button>
+                </header>
+                <div class="strm-index-diagnostic-result" id="strmIndexDiagnosticResult" aria-live="polite" aria-busy="true" style="min-height: 96px">
+                    <div class="strm-diagnostic-stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-card-head">
+                                <span class="stat-label">视频 STRM 总数</span>
+                                <i data-lucide="video" class="stat-icon-subtle is-blue"></i>
+                            </div>
+                            <div class="stat-value" data-strm-diagnostic="video.total">0</div>
+                            <div class="stat-foot">视频 .strm 索引条目</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card-head">
+                                <span class="stat-label">STRM 已落盘</span>
+                                <i data-lucide="check-circle-2" class="stat-icon-subtle is-green"></i>
+                            </div>
+                            <div class="stat-value" data-strm-diagnostic="video.existing">0</div>
+                            <div class="stat-foot">本地 .strm 文件存在</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card-head">
+                                <span class="stat-label">STRM 文件缺失</span>
+                                <i data-lucide="alert-triangle" class="stat-icon-subtle is-amber"></i>
+                            </div>
+                            <div class="stat-value" data-strm-diagnostic="video.missing">0</div>
+                            <div class="stat-foot">数据库索引对应的本地 .strm 不存在</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card-head">
+                                <span class="stat-label">元数据索引</span>
+                                <i data-lucide="file-text" class="stat-icon-subtle is-purple"></i>
+                            </div>
+                            <div class="stat-value" data-strm-diagnostic="metadata.total">0</div>
+                            <div class="stat-foot">海报/NFO等元数据</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card-head">
+                                <span class="stat-label">元数据未落盘</span>
+                                <i data-lucide="clock" class="stat-icon-subtle is-blue"></i>
+                            </div>
+                            <div class="stat-value" data-strm-diagnostic="metadata.missing">0</div>
+                            <div class="stat-foot">数据库索引对应的本地元数据文件不存在</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card-head">
+                                <span class="stat-label">配置来源目录</span>
+                                <i data-lucide="folder-kanban" class="stat-icon-subtle is-blue"></i>
+                            </div>
+                            <div class="stat-value" data-strm-diagnostic="configured_source_count">0</div>
+                            <div class="stat-foot">个已生效来源目录</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card-head">
+                                <span class="stat-label">归属有效来源</span>
+                                <i data-lucide="folder-check" class="stat-icon-subtle is-green"></i>
+                            </div>
+                            <div class="stat-value" data-strm-diagnostic="real_source">0</div>
+                            <div class="stat-foot">有效来源索引条数</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card-head">
+                                <span class="stat-label">确认测试残留</span>
+                                <i data-lucide="shield-alert" class="stat-icon-subtle is-red"></i>
+                            </div>
+                            <div class="stat-value" data-strm-diagnostic="confirmed_test_artifact">0</div>
+                            <div class="stat-foot">可安全清理的隔离项</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Clean Banner Notice for Diagnostics -->
+                    <div class="strm-diagnostic-banner" data-tone="info">
+                        <div class="banner-text">
+                            <i data-lucide="info"></i>
+                            <span id="strmIndexDiagnosticState">正在读取索引统计…</span>
+                        </div>
+                        <div class="strm-index-diagnostic-cleanup-slot">
+                            <button type="button" class="jump-btn danger strm-index-diagnostic-cleanup is-unavailable" id="cleanupStrmTestIndexesBtn" disabled aria-hidden="true">
+                                <i data-lucide="shield-x"></i><span>清理测试索引</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Card 2: Failure Ledger -->
+            <section class="card settings-section strm-settings-section strm-failure-ledger" id="strmFailureLedgerCard">
+                <header class="strm-failure-head">
+                    <div class="strm-failure-head-left">
+                        <h3><i data-lucide="alert-triangle"></i>失败台账</h3>
+                        <div class="strm-failure-summary-badges" id="strmFailureSummary">
+                            <span class="strm-stat-badge open"><i data-lucide="alert-circle"></i>待处理 <strong>0</strong></span>
+                            <span class="strm-stat-badge resolved"><i data-lucide="check-circle-2"></i>已解决 <strong>0</strong></span>
+                        </div>
+                    </div>
+                    <button type="button" class="jump-btn" id="refreshStrmFailuresBtn"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+                </header>
+
+                <!-- Failure Ledger Toolbar -->
+                <div class="strm-failure-inline-bar">
+                    <div class="strm-filter-group">
+                        <label class="strm-select-all-box" title="全选/取消全选">
+                            <input type="checkbox" id="selectAllStrmFailures">
+                            <span id="selectAllLabel">全选</span>
+                        </label>
+                        <div class="strm-filter-divider"></div>
+                        <select class="strm-select-input" id="strmFailureSourceFilter"><option value="">全部来源</option></select>
+                        <select class="strm-select-input" id="strmFailureActionFilter"><option value="">全部类型</option><option value="generate">STRM 生成</option><option value="metadata">元数据</option></select>
+                        <select class="strm-select-input" id="strmFailureStatusFilter"><option value="open">待处理</option><option value="resolved">已解决</option><option value="all">全部</option></select>
+                    </div>
+                    <div class="strm-action-group">
+                        <button type="button" class="jump-btn primary" id="retrySelectedStrmFailuresBtn" disabled>
+                            <i data-lucide="rotate-cw"></i><span>重试选中</span><span class="count-badge" id="selectedFailuresCount" style="display:none">0</span>
+                        </button>
+                        <button type="button" class="jump-btn" id="retryAllStrmFailuresBtn" disabled>
+                            <i data-lucide="play"></i><span>重试全部</span>
+                        </button>
+                        <button type="button" class="jump-btn danger" id="clearStrmFailuresBtn" disabled>
+                            <i data-lucide="trash-2"></i><span>清除记录</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="dl-table-container strm-failure-table-wrap" style="height: 360px; overflow-y: auto;">
+                    <table class="dl-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 44%;">任务与详情</th>
+                                <th style="width: 34%;">失败原因</th>
+                                <th style="width: 10%;">状态</th>
+                                <th style="width: 12%; text-align: right;">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="strmFailureList" aria-live="polite" aria-busy="true">
+                            <tr><td colspan="4" class="table-empty">正在读取失败台账…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="strm-failure-foot">
+                    <div class="strm-failure-foot-info">
+                        <i data-lucide="info"></i>
+                        <span class="strm-failure-state" id="strmFailureState">失败项只保存稳定标识与脱敏错误；重试会重新读取云端状态。</span>
+                    </div>
+                    <div class="strm-failure-foot-stats" id="strmFailureSelectionStats">已选 0 项</div>
+                </div>
+                <div class="table-pagination" id="strmFailurePagination" aria-label="失败台账分页" style="margin-top: 14px;">
+                    <span class="table-pagination-info" id="strmFailurePageInfo">共 0 条 · 第 1 / 1 页</span>
+                    <div class="table-pagination-actions">
+                        <button type="button" class="rss-btn" id="strmFailurePrev" disabled><i data-lucide="chevron-left"></i><span>上一页</span></button>
+                        <button type="button" class="rss-btn" id="strmFailureNext" disabled><span>下一页</span><i data-lucide="chevron-right"></i></button>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Bottom Savebar -->
+    <div class="strm-settings-savebar settings-savebar workspace-savebar">
+        <span id="strmSaveState" aria-live="polite">尚未修改</span>
+        <button type="button" class="btn btn-primary" id="saveStrmBtn">
+            <i data-lucide="save"></i>保存 STRM 设置
+        </button>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='js/guangya-strm.js') }}?v=20260820a"></script>
+{% endblock %}

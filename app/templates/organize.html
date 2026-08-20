@@ -1,0 +1,644 @@
+{% extends "base.html" %}
+{% block title %}{{ "整理规则" if organize_view == "rules" else "光鸭整理" }} - MediaFlux{% endblock %}
+{% block body_class %}organize-page{% if organize_view == "rules" %} organize-rules-page{% endif %} persistent-savebar-page{% endblock %}
+{% block page_title %}{{ "整理规则" if organize_view == "rules" else "光鸭整理" }}{% endblock %}
+{% block page_styles %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/organize.css') }}?v=20260820a">
+{% endblock %}
+
+{% block content %}
+<div class="organize-workspace" id="organizeWorkspace">
+    {% if organize_view == 'rules' %}
+    <nav class="organize-rules-nav-card" id="organizeRulesNav" aria-label="整理规则导航">
+        <div class="organize-flow-tabs" role="tablist" aria-label="整理规则分类">
+            <button type="button" class="organize-flow-tab active" role="tab" data-tab-target="naming" aria-selected="true"><i data-lucide="scan-search"></i><span>识别与命名</span></button>
+            <button type="button" class="organize-flow-tab" role="tab" data-tab-target="policy" aria-selected="false" tabindex="-1"><i data-lucide="layers-3"></i><span>分类与覆盖</span></button>
+            <button type="button" class="organize-flow-tab" role="tab" data-tab-target="delivery" aria-selected="false" tabindex="-1"><i data-lucide="send"></i><span>通知与入库</span></button>
+        </div>
+    </nav>
+    {% endif %}
+
+    <form class="card card-pad organize-config-card" id="organizeConfigForm" onsubmit="return false;" novalidate>
+        {% if organize_view == 'execute' %}
+        <div class="panel-head">
+            <div><h3>来源与执行</h3><p>选择光鸭扫描范围，预览后启动整理任务</p></div>
+            <span class="tag" id="organizeStateTag">空闲</span>
+        </div>
+        {% endif %}
+
+
+        {% if organize_view == 'execute' %}
+        <section class="organize-config-panel active" data-tab-panel="source">
+            <div class="organize-panel-intro"><span>STEP 01 / STORAGE SCOPE</span><h4>先确定从哪里扫描、整理到哪里</h4><p>源目录支持多选，归档目标保持唯一。目录配置可固定保存并在下一次自动回填。</p></div>
+            <div class="section-title">扫描来源与归档目标</div>
+            <div class="grid-2 organize-dir-grid">
+                <div>
+                    <label class="form-label">源目录</label>
+                    <input type="hidden" id="organizeSourceDirs" data-key="GY_ORGANIZE_SOURCE_DIRS">
+                    <div class="strm-source-list" id="organizeSourceList"></div>
+                    <button type="button" class="jump-btn" id="addOrganizeSourceBtn"><i data-lucide="folders"></i>批量选择源目录</button>
+                </div>
+                <div>
+                    <label class="form-label">归档目标目录</label>
+                    <input type="hidden" id="dstDirId" data-key="GY_ORGANIZE_TARGET_DIR">
+                    <input type="hidden" id="dstDirName" data-key="GY_ORGANIZE_TARGET_DIR_NAME">
+                    <div class="organize-target-value" id="organizeTargetValue"><strong>未选择</strong><span>整理后文件归档到这里</span></div>
+                    <button type="button" class="jump-btn" id="pickOrganizeTargetBtn"><i data-lucide="folder-output"></i>选择目标目录</button>
+                </div>
+            </div>
+        </section>
+        {% else %}
+
+        <section class="organize-config-panel active" data-tab-panel="naming" data-panel-step="STEP 02 / MATCHING &amp; NAMING" data-panel-title="把识别结果变成稳定的媒体目录" data-panel-description="电影始终建立独立 TMDB 目录；自动整理、人工识别与 STRM 镜像共用这套命名规则。">
+            <div class="section-title">识别与命名</div>
+        <div class="form-row"><div class="field-label"><div class="name">无人值守自动入库门槛</div><div class="hint">控制 TG、定时和下载联动最终是否自动移动；人工刮削仍由你确认</div></div><div class="field-control"><select class="form-select" id="r_automatic_match_preset" data-key="GY_ORGANIZE_AUTOMATIC_MATCH_PRESET"><option value="conservative">保守 · 严格匹配 ≥ 93%</option><option value="balanced" selected>均衡 · 严格匹配 ≥ 90%</option><option value="aggressive">积极 · 强证据匹配 ≥ 86%</option></select></div></div>
+        <div class="form-row organize-ext-row"><div class="field-label"><div class="name">视频文件类型</div><div class="hint">参与整理的视频扩展名；回车或逗号添加，点击标签可移除</div></div><div class="field-control"><input type="hidden" id="r_video_exts" data-key="GY_ORGANIZE_VIDEO_EXTS"><div class="organize-ext-editor" data-extension-editor="video"><div class="organize-ext-list" aria-live="polite">{% for ext in organize_video_exts %}<span class="organize-ext-chip" data-extension-value="{{ ext }}">{{ ext }}<button type="button" title="移除 {{ ext }}" aria-label="移除 {{ ext }}">×</button></span>{% endfor %}</div><input type="text" class="organize-ext-input" aria-label="添加视频扩展名" placeholder="输入扩展名"><button type="button" class="organize-ext-reset" title="恢复推荐值">恢复推荐</button></div></div></div>
+        <div class="form-row organize-ext-row"><div class="field-label"><div class="name">伴随文件类型</div><div class="hint">与视频同目录、同基础名称时一起归档的字幕、NFO 与图片</div></div><div class="field-control"><input type="hidden" id="r_metadata_exts" data-key="GY_ORGANIZE_METADATA_EXTS"><div class="organize-ext-editor" data-extension-editor="metadata"><div class="organize-ext-list" aria-live="polite">{% for ext in organize_metadata_exts %}<span class="organize-ext-chip" data-extension-value="{{ ext }}">{{ ext }}<button type="button" title="移除 {{ ext }}" aria-label="移除 {{ ext }}">×</button></span>{% endfor %}</div><input type="text" class="organize-ext-input" aria-label="添加伴随文件扩展名" placeholder="输入扩展名"><button type="button" class="organize-ext-reset" title="恢复推荐值">恢复推荐</button></div></div></div>
+        <div class="section-title">外部标题辅助</div>
+        <div class="organize-grid-2 organize-hint-switches">
+            <div class="strm-toggle-card organize-toggle-tile">
+                <div class="organize-toggle-top">
+                    <div class="organize-toggle-title"><div class="organize-toggle-icon"><i data-lucide="clapperboard"></i></div><label for="r_douban_hints">豆瓣辅助识别</label></div>
+                    <label class="toggle"><input type="checkbox" id="r_douban_hints" data-key="ORGANIZE_DOUBAN_HINTS_ENABLED" data-bool="1"><span class="toggle-slider"></span></label>
+                </div>
+                <span class="organize-toggle-hint">普通 TMDB 失败后使用豆瓣标题与年份重试；已配置 dbcl2 时会随请求使用</span>
+            </div>
+            <div class="strm-toggle-card organize-toggle-tile">
+                <div class="organize-toggle-top">
+                    <div class="organize-toggle-title"><div class="organize-toggle-icon"><i data-lucide="book-open-check"></i></div><label for="r_bangumi_hints">Bangumi 辅助识别</label></div>
+                    <label class="toggle"><input type="checkbox" id="r_bangumi_hints" data-key="ORGANIZE_BANGUMI_HINTS_ENABLED" data-bool="1"><span class="toggle-slider"></span></label>
+                </div>
+                <span class="organize-toggle-hint">仅用于剧集与动漫；外部结果只改写搜索词，不能直接成为 TMDB 结果</span>
+            </div>
+        </div>
+
+
+        <div class="section-title">成人内容识别</div>
+        <div class="nsfw-provider-panel{% if not organize_nsfw_enabled %} is-disabled is-collapsed{% endif %}" id="nsfwProviderPanel">
+            <div class="nsfw-provider-head">
+                <button type="button" class="nsfw-provider-disclosure" id="nsfwProviderDisclosure" aria-expanded="{{ 'true' if organize_nsfw_enabled else 'false' }}" aria-controls="nsfwProviderBody">
+                    <span class="nsfw-provider-icon"><i data-lucide="shield-alert"></i></span>
+                    <span class="nsfw-provider-copy"><strong>MetaTube 番号识别</strong><span>仅在文件名或父目录命中明确番号时查询；普通影视不会发送到该服务</span></span>
+                    <i class="nsfw-provider-chevron" data-lucide="chevron-down"></i>
+                </button>
+                <div class="nsfw-provider-actions">
+                    <span class="nsfw-provider-state" id="nsfwProviderState">{{ '已启用' if organize_nsfw_enabled else '未启用' }}</span>
+                    <label class="toggle" title="启用成人内容番号识别"><input type="checkbox" id="r_nsfw" data-key="GY_ORGANIZE_NSFW_ENABLED" data-bool="1" aria-label="启用 MetaTube 番号识别"{% if organize_nsfw_enabled %} checked{% endif %}><span class="toggle-slider"></span></label>
+                </div>
+            </div>
+            <div class="nsfw-provider-body" id="nsfwProviderBody"{% if not organize_nsfw_enabled %} hidden{% endif %}>
+                <div class="nsfw-provider-fields">
+                    <label class="is-wide"><span>MetaTube 服务地址</span><input type="url" class="form-input nsfw-dependent" id="r_nsfw_endpoint" data-key="GY_ORGANIZE_NSFW_METATUBE_ENDPOINT" placeholder="http://192.168.1.10:8080" autocomplete="url"></label>
+                    <label><span>Bearer Token（可选）</span><input type="password" class="form-input nsfw-dependent" id="r_nsfw_token" data-key="GY_ORGANIZE_NSFW_METATUBE_TOKEN" placeholder="服务未设置 Token 可留空" autocomplete="new-password"></label>
+                    <label><span>归档分类</span><input type="text" class="form-input nsfw-dependent" id="r_nsfw_category" data-key="GY_ORGANIZE_NSFW_CATEGORY_NAME" value="成人内容" maxlength="40"></label>
+                    <label><span>请求超时（秒）</span><input type="number" class="form-input nsfw-dependent" id="r_nsfw_timeout" data-key="GY_ORGANIZE_NSFW_TIMEOUT_SECONDS" value="8" min="2" max="30"></label>
+                    <label class="is-wide"><span>额外清理域名</span><input type="text" class="form-input nsfw-dependent" id="r_nsfw_domains" data-key="GY_ORGANIZE_NSFW_STRIP_DOMAINS" placeholder="例如：example.com, example.tv"></label>
+                </div>
+                <div class="nsfw-provider-note"><i data-lucide="shield-check"></i><span>自动整理只接受“提取番号与 MetaTube 返回番号完全一致”的结果；服务超时、无结果或弱匹配时会安全回退现有 TMDB 链路，不会凭首条结果移动文件。</span></div>
+            </div>
+        </div>
+
+        <div class="organize-recognition-rule-grid">
+            <div class="tmdb-regex-launch">
+                <div><strong>识别预处理规则</strong><span>在普通 TMDB 搜索前清理标题噪声，或为指定来源覆盖、偏移季集位置。</span><span class="preprocess-launch-summary" id="preprocessRuleSummary">推荐规则准备中</span></div>
+                <button type="button" class="jump-btn" id="openPreprocessRulesBtn"><i data-lucide="wand-sparkles"></i>管理预处理</button>
+            </div>
+            <div class="tmdb-regex-launch">
+                <div><strong>TMDB 强制匹配规则</strong><span>仅用于长期命名异常的固定资源；命中后跳过普通搜索与 AI，直接采用已校验的 TMDB 条目。</span></div>
+                <button type="button" class="jump-btn" id="openTmdbRegexRulesBtn"><i data-lucide="list-filter"></i>管理强制匹配</button>
+            </div>
+
+            <div class="tmdb-regex-launch">
+                <div><strong>本地识别词库</strong><span>发布组与尾部制作组从本机热加载；AI 仅在严格复核通过后积累低风险词条。</span><span class="preprocess-launch-summary" id="recognitionKnowledgeSummary">本地词库准备中</span></div>
+                <button type="button" class="jump-btn" id="openRecognitionKnowledgeBtn"><i data-lucide="book-open-check"></i>管理识别词库</button>
+            </div>
+        </div>
+
+
+        </section>
+
+        <section class="organize-config-panel" data-tab-panel="policy" data-panel-step="STEP 03 / ARCHIVE POLICY" data-panel-title="定义目录层级、版本优先级和冲突处理" data-panel-description="覆盖模式使用临时备份与失败回滚保护，执行前仍建议先查看整理计划。" hidden>
+
+            <div class="section-title">目录分类层级</div>
+            <div class="organize-grid-2">
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="globe-2"></i></div>
+                            <label for="r_region">地区二次分类</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_region" data-key="GY_ORGANIZE_REGION_SPLIT" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">国产 / 欧美 / 日韩 / 其他分类目录</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="calendar"></i></div>
+                            <label for="r_year">年份三次分类</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_year" data-key="GY_ORGANIZE_YEAR_SPLIT" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">按发行年份拆分独立二级目录</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="baby"></i></div>
+                            <label for="r_kids">儿童节目独立分类</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_kids" data-key="GY_ORGANIZE_ADD_KIDS" data-bool="1">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">识别动画儿童剧集归入 Kids 目录</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="disc"></i></div>
+                            <label for="r_concert">演唱会独立分类</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_concert" data-key="GY_ORGANIZE_ADD_CONCERT" data-bool="1">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">识别 Live 演唱会与音乐会归入 Concert</span>
+                </div>
+            </div>
+
+            <div class="section-title">冲突与过滤参数</div>
+            <div class="organize-grid-2">
+                <div class="strm-toggle-card organize-toggle-tile organize-field-card">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="git-compare"></i></div>
+                            <label for="r_conflict">冲突处理策略</label>
+                        </div>
+                    </div>
+                    <select class="form-select" id="r_conflict" data-key="GY_ORGANIZE_CONFLICT_STRATEGY">
+                        <option value="1">不覆盖</option>
+                        <option value="2">覆盖：大文件优先</option>
+                        <option value="3">覆盖：小文件优先</option>
+                    </select>
+                    <span class="organize-toggle-hint">目标位置存在同名文件时的覆盖规则</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile organize-field-card">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="filter"></i></div>
+                            <label for="r_small">小文件过滤 (MB)</label>
+                        </div>
+                    </div>
+                    <input type="number" min="0" class="form-input" id="r_small" data-key="GY_ORGANIZE_SMALL_FILE_MB" value="10">
+                    <span class="organize-toggle-hint">小于该值的视频自动跳过（默认 10 MB）</span>
+                </div>
+            </div>
+
+            <div class="section-title">版本与优先级策略</div>
+            <div class="organize-grid-3">
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="disc-3"></i></div>
+                            <label for="r_remux">Remux / 蓝光优先</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_remux" data-key="GY_ORGANIZE_REMUX_FIRST" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">冲突时优先保留 Remux 原盘源</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="monitor"></i></div>
+                            <label for="r_res">大分辨率优先</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_res" data-key="GY_ORGANIZE_RESOLUTION_FIRST" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">4K > 1080p > 720p 依次递减</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="sparkles"></i></div>
+                            <label for="r_dolby">杜比优先</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_dolby" data-key="GY_ORGANIZE_DOLBY_FIRST" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">优先保留 DoVi 视界 / Atmos 轨</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="layers"></i></div>
+                            <label for="r_keep_multi">保留影音多版本</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_keep_multi" data-key="GY_ORGANIZE_KEEP_MULTI_VERSIONS" data-bool="1">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">多版本按稳定后缀分别归档</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile" id="keepRemuxRow">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="hard-drive"></i></div>
+                            <label for="r_keep_remux">保留 Remux 版本</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_keep_remux" data-key="GY_ORGANIZE_KEEP_REMUX_VARIANT" data-bool="1">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">多版本模式下允许 Remux 共存</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile" id="recycleReplacedRow">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="archive"></i></div>
+                            <label for="r_recycle_replaced">替换后移入回收站</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_recycle_replaced" data-key="GY_ORGANIZE_RECYCLE_REPLACED_ENABLED" data-bool="1">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">同版本替换后移入光鸭回收站</span>
+                </div>
+            </div>
+
+            <div class="section-title">清理策略</div>
+            <div class="organize-grid-2">
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="folder-minus"></i></div>
+                            <label for="r_clean">执行后清理空目录</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_clean" data-key="GY_ORGANIZE_CLEAN_EMPTY" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">整理完成后清理本轮扫描到的空子目录</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="organize-config-panel" data-tab-panel="delivery" data-panel-step="STEP 04 / DELIVERY CHAIN" data-panel-title="决定整理完成后如何通知、同步与入库" data-panel-description="STRM 统一经过调度器执行；没有实际增量时不会触发媒体库刷新。" hidden>
+
+            <div class="section-title">定时整理设置</div>
+            <div class="organize-schedule-card">
+                <div class="organize-toggle-top">
+                    <div class="organize-toggle-title">
+                        <div class="organize-toggle-icon"><i data-lucide="clock"></i></div>
+                        <div>
+                            <label for="r_schedule_enabled" style="font-size:13px;font-weight:600;color:var(--text-primary);cursor:pointer;display:block;">Cron 自动定时整理</label>
+                            <span class="organize-toggle-hint" style="margin-top:2px;">按已保存的源目录与整理规则后台定时自动扫描</span>
+                        </div>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="r_schedule_enabled" data-key="GY_ORGANIZE_SCHEDULE_ENABLED" data-bool="1">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="organize-schedule-body" id="organizeCronRow" style="display: none;">
+                    <div class="organize-cron-flex-row">
+                        <div class="organize-cron-field">
+                            <label for="r_schedule_cron" class="organize-cron-label">Cron 表达式 <span class="organize-toggle-hint" style="display:inline;margin-left:6px;font-weight:400;">(标准 5 段：分 时 日 月 周)</span></label>
+                            <input type="text" class="form-input" id="r_schedule_cron" data-key="GY_ORGANIZE_SCHEDULE_CRON" placeholder="0 4 * * *" autocomplete="off">
+                            <div class="cron-chips-inline">
+                                <button type="button" class="cron-chip cron-preset-btn" data-cron="0 4 * * *">每天 04:00</button>
+                                <button type="button" class="cron-chip cron-preset-btn" data-cron="0 */6 * * *">每 6 小时</button>
+                                <button type="button" class="cron-chip cron-preset-btn" data-cron="0 3 * * 0">每周日 03:00</button>
+                            </div>
+                        </div>
+                        <div class="organize-cron-status-field">
+                            <label class="organize-cron-label">调度器运行状态</label>
+                            <div class="organize-status-box" id="organizeScheduleStatus" aria-live="polite">
+                                <strong id="organizeScheduleNext">自动整理未启用</strong>
+                                <span id="organizeScheduleLast">最近结果：暂无 Cron 运行记录</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-title">消息通知策略</div>
+            <div class="organize-grid-3">
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="send"></i></div>
+                            <label for="r_notify">Telegram 通知</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_notify" data-key="GY_ORGANIZE_NOTIFY_ENABLED" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">整理及 STRM 消息推送总开关</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile" id="libraryNotifyRow">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="bell"></i></div>
+                            <label for="r_library_notify">整理入库通知</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_library_notify" data-key="GY_ORGANIZE_LIBRARY_NOTIFY" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">发送目录明细统计与整轮运行汇总</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile" id="strmNotifyRow">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="message-square-text"></i></div>
+                            <label for="r_strm_notify">STRM 明细通知</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_strm_notify" data-key="GY_ORGANIZE_STRM_DETAIL_NOTIFY" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">STRM 增量同步完成后推送变动明细</span>
+                </div>
+            </div>
+
+            <div class="section-title">下游服务联动</div>
+            <div class="organize-grid-2">
+                <div class="strm-toggle-card organize-toggle-tile">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="file-symlink"></i></div>
+                            <label for="r_strm">联动生成 STRM</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_strm" data-key="GY_ORGANIZE_LINK_STRM" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">整理完成后通过调度器触发 STRM 同步</span>
+                </div>
+
+                <div class="strm-toggle-card organize-toggle-tile" id="embyRow">
+                    <div class="organize-toggle-top">
+                        <div class="organize-toggle-title">
+                            <div class="organize-toggle-icon"><i data-lucide="refresh-cw"></i></div>
+                            <label for="r_emby">通知Emby&amp;Jellyfin 入库</label>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" id="r_emby" data-key="GY_ORGANIZE_EMBY_REFRESH" data-bool="1" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <span class="organize-toggle-hint">STRM 增量完成后自动触发 Emby&amp;Jellyfin 刷新</span>
+                </div>
+            </div>
+        </section>
+        {% endif %}
+
+        <div class="organize-savebar settings-savebar workspace-savebar">
+            <span id="organizeSaveState" aria-live="polite">正在读取当前配置…</span>
+            <button type="button" class="btn btn-primary" id="saveOrganizeConfigBtn" disabled aria-busy="true"><i data-lucide="save"></i>{{ '保存整理规则' if organize_view == 'rules' else '保存目录配置' }}</button>
+        </div>
+    </form>
+
+    {% if organize_view == 'execute' %}
+    <aside class="card card-pad organize-control-card">
+        <div class="panel-head">
+            <div>
+                <h3><i data-lucide="sliders" class="panel-head-icon"></i>执行控制</h3>
+                <p>预览计划、立即整理与协作式管控</p>
+            </div>
+        </div>
+
+        <div class="organize-status-tile" id="organizeStatusBox">
+            <div class="organize-status-icon" id="organizeStatusIcon" data-icon-name="sparkles"><i data-lucide="sparkles"></i></div>
+            <div class="organize-status-content">
+                <strong id="organizeStatusTitle">暂无任务</strong>
+                <span id="organizeStatusDetail">建议先预览识别结果再执行</span>
+                <span id="organizeGroupProgress" class="organize-group-progress" aria-live="polite" hidden></span>
+            </div>
+        </div>
+
+        <div class="organize-control-field">
+            <label for="r_maxfiles" class="control-field-label">
+                <span><i data-lucide="list-ordered"></i> 预览数量上限</span>
+                <small>1-1000 条</small>
+            </label>
+            <input type="number" class="form-input" id="r_maxfiles" value="100" min="1" max="1000">
+        </div>
+
+        <div class="organize-action-group">
+            <button type="button" class="btn btn-primary organize-btn-preview" id="previewBtn">
+                <i data-lucide="scan-search"></i>预览整理计划
+            </button>
+            <button type="button" class="btn btn-danger organize-btn-run" id="runOrganizeBtn">
+                <i data-lucide="play"></i>立即整理
+            </button>
+        </div>
+
+        <div class="organize-subactions-grid">
+            <button type="button" class="jump-btn organize-stop-btn" id="stopOrganizeBtn" disabled>
+                <i data-lucide="square"></i>停止整理
+            </button>
+            <button type="button" class="jump-btn organize-clean-btn" id="cleanEmptyBtn">
+                <i data-lucide="folder-x"></i>清理空目录
+            </button>
+        </div>
+
+        <div class="share-safety-note">
+            <i data-lucide="info"></i>
+            <span>停止为协作式停止：当前正在提交的移动操作会完成，已完成操作不可回滚。</span>
+        </div>
+    </aside>
+    {% endif %}
+</div>
+
+{% if organize_view == 'execute' %}
+<section class="card card-pad" id="previewCard" hidden>
+    <div class="panel-head"><div><h3>整理计划</h3><p id="previewStats"></p><p>版本分类只区分 DoVi / 标准版、Atmos / 非 Atmos 与可选 Remux / Encode；同版本仍按冲突策略处理。</p></div></div>
+    <div id="planList" class="organize-plan-list"></div>
+</section>
+{% endif %}
+
+{% if organize_view == 'rules' %}
+<div id="preprocessRulesModal" class="media-config-modal" hidden>
+    <div class="media-config-dialog tmdb-regex-dialog" role="dialog" aria-modal="true" aria-labelledby="preprocessRulesTitle">
+        <div class="media-config-head">
+            <div><span>RECOGNITION PREPROCESS</span><h3 id="preprocessRulesTitle">识别预处理规则</h3><p>常见与复合发布组由本地识别词库清洗；这里用于特殊来源、别名和季集纠偏，危险模板默认停用。</p></div>
+            <button type="button" class="icon-btn" data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+        </div>
+        <div class="media-config-body tmdb-regex-body">
+            <section class="tmdb-regex-ledger" aria-label="预处理规则列表">
+                <div class="tmdb-regex-toolbar">
+                    <div><strong>规则台账</strong><span id="preprocessRuleListState">打开后读取规则</span></div>
+                    <div class="preprocess-toolbar-actions"><button type="button" class="jump-btn" id="restorePreprocessRulesBtn"><i data-lucide="rotate-ccw"></i>恢复推荐</button><button type="button" class="jump-btn" id="newPreprocessRuleBtn"><i data-lucide="plus"></i>新建规则</button></div>
+                </div>
+                <div class="tmdb-regex-table-frame tmdb-regex-rule-list" id="preprocessRuleTableBody" aria-live="polite"><div class="tmdb-regex-rule-empty">打开后读取规则</div></div>
+            </section>
+            <section class="tmdb-regex-editor" aria-label="预处理规则编辑器">
+                <div class="tmdb-regex-toolbar"><div><strong id="preprocessEditorTitle">新建规则</strong><span>标题动作先执行，季集动作只调整已解析出的数字</span></div></div>
+                <form id="preprocessRuleForm">
+                    <input type="hidden" id="preprocessRuleId">
+                    <div class="tmdb-regex-editor-scroll">
+                        <div class="preprocess-safety-note"><i data-lucide="shield-check"></i><span>显式 TMDB ID、人工锁与 TMDB 强制匹配仍优先；预处理不会改写网盘原文件，只影响识别、命名和归档计划。</span></div>
+                        <section class="tmdb-regex-editor-section">
+                            <div class="tmdb-regex-editor-section-head"><strong>命中条件</strong><span>高优先级规则先执行，后续规则看到前一条的清洗结果</span></div>
+                            <div class="tmdb-regex-form-grid">
+                                <label class="span-2"><span>规则名称</span><input class="form-input" id="preprocessRuleName" maxlength="120" required placeholder="例如：清理站点前缀"></label>
+                                <label><span>匹配方式</span><select class="form-select" id="preprocessMatcherType"><option value="text">文本包含</option><option value="regex">安全正则</option></select></label>
+                                <label><span>匹配范围</span><select class="form-select" id="preprocessScope"><option value="filename">文件名</option><option value="parent">父路径</option><option value="both">父路径 + 文件名</option></select></label>
+                                <label class="span-2"><span>匹配内容</span><textarea class="form-input" id="preprocessPattern" maxlength="500" required placeholder="文本或正则表达式"></textarea></label>
+                            </div>
+                        </section>
+                        <section class="tmdb-regex-editor-section">
+                            <div class="tmdb-regex-editor-section-head"><strong>处理动作</strong><span>偏移只作用于已经识别出的季号或集数，不会凭空生成</span></div>
+                            <div class="tmdb-regex-form-grid">
+                                <label><span>动作</span><select class="form-select" id="preprocessAction"><option value="delete">删除命中内容</option><option value="replace">替换命中内容</option><option value="season_override">覆盖季号</option><option value="season_offset">季号偏移</option><option value="episode_offset">集数偏移</option></select></label>
+                                <label id="preprocessReplacementField"><span>替换为</span><input class="form-input" id="preprocessReplacement" maxlength="500" placeholder="替换文本"></label>
+                                <label id="preprocessNumericField"><span id="preprocessNumericLabel">数值</span><input type="number" class="form-input" id="preprocessNumericValue" min="-999" max="999" value="1"></label>
+                                <label><span>优先级</span><input type="number" class="form-input" id="preprocessPriority" min="-10000" max="10000" value="0"></label>
+                                <label class="span-2"><span>规则状态</span><select class="form-select" id="preprocessDisabled"><option value="0">启用</option><option value="1">停用</option></select></label>
+                            </div>
+                        </section>
+                        <section class="tmdb-regex-editor-section">
+                            <div class="tmdb-regex-editor-section-head"><strong>无副作用预览</strong><span>只运行当前表单，不访问 TMDB、不写入数据库</span></div>
+                            <div class="tmdb-regex-inline"><label><span>样例文件名</span><input class="form-input" id="preprocessSampleFilename" placeholder="Show.S01E01.mkv"></label><label><span>样例父路径</span><input class="form-input" id="preprocessSampleParent" placeholder="/TV/Show/Season 01"></label></div>
+                            <div class="tmdb-regex-inline"><label><span>原季号</span><input type="number" min="0" max="999" class="form-input" id="preprocessSampleSeason" placeholder="可留空"></label><label><span>原集数</span><input type="number" min="0" max="999" class="form-input" id="preprocessSampleEpisode" placeholder="可留空"></label></div>
+                            <div class="tmdb-regex-preview-frame" id="preprocessSamplePreview" aria-live="polite"><strong>等待样例预览</strong><span>填写样例后可检查标题与季集变化。</span><code>NO SAMPLE / NO WRITE</code></div>
+                        </section>
+                    </div>
+                    <div class="tmdb-regex-editor-actions"><span id="preprocessRuleFormState" aria-live="polite"></span><div><button type="button" class="jump-btn" id="previewPreprocessRuleBtn">预览变化</button><button type="submit" class="btn btn-primary" id="savePreprocessRuleBtn">保存规则</button></div></div>
+                </form>
+            </section>
+        </div>
+    </div>
+</div>
+
+
+<div id="recognitionKnowledgeModal" class="media-config-modal" hidden>
+    <div class="media-config-dialog recognition-knowledge-dialog" role="dialog" aria-modal="true" aria-labelledby="recognitionKnowledgeTitle">
+        <div class="media-config-head">
+            <div><span>LOCAL RECOGNITION KNOWLEDGE</span><h3 id="recognitionKnowledgeTitle">本地识别词库</h3><p>精确管理发布组和尾部制作组；内置词条可停用，AI 学习词条需两个不同样本后才会自动启用。</p></div>
+            <button type="button" class="icon-btn" data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+        </div>
+        <div class="media-config-body recognition-knowledge-body">
+            <section class="recognition-knowledge-ledger" aria-label="识别知识列表">
+                <div class="tmdb-regex-toolbar"><div><strong>词条台账</strong><span id="recognitionKnowledgeListState">打开后读取词库</span></div><button type="button" class="jump-btn" id="newRecognitionKnowledgeBtn"><i data-lucide="plus"></i>新建词条</button></div>
+                <div class="recognition-knowledge-search"><input class="form-input" id="recognitionKnowledgeSearch" maxlength="160" placeholder="搜索标准名称或别名"><select class="form-select" id="recognitionKnowledgeFilter"><option value="">全部类型</option><option value="release_group">前置发布组</option><option value="release_suffix">尾部制作组</option></select></div>
+                <div class="tmdb-regex-table-frame tmdb-regex-rule-list recognition-knowledge-list" id="recognitionKnowledgeTableBody" aria-live="polite"><div class="tmdb-regex-rule-empty">打开后读取词库</div></div>
+            </section>
+            <section class="recognition-knowledge-editor" aria-label="识别知识编辑器">
+                <div class="tmdb-regex-toolbar"><div><strong id="recognitionKnowledgeEditorTitle">新建词条</strong><span>只保存精确别名，不接受可执行正则</span></div></div>
+                <form id="recognitionKnowledgeForm">
+                    <input type="hidden" id="recognitionKnowledgeId">
+                    <div class="recognition-knowledge-editor-scroll">
+                        <div class="recognition-knowledge-form">
+                            <label><span>词条类型</span><select class="form-select" id="recognitionKnowledgeType"><option value="release_group">前置发布组</option><option value="release_suffix">尾部制作组</option></select></label>
+                            <label><span>状态</span><select class="form-select" id="recognitionKnowledgeDisabled"><option value="0">启用</option><option value="1">停用</option></select></label>
+                            <label class="span-2"><span>标准名称</span><input class="form-input" id="recognitionKnowledgeCanonical" maxlength="160" required placeholder="例如：LoliHouse"></label>
+                            <label class="span-2"><span>别名</span><textarea class="form-input" id="recognitionKnowledgeAliases" maxlength="1200" placeholder="逗号分隔，例如：Loli-House, Loli House"></textarea></label>
+                        </div>
+                        <div class="recognition-knowledge-note" id="recognitionKnowledgeEvidence">用户词条保存后立即热加载。AI 学习词条必须同时通过高置信发布组分类与 TMDB 严格复核，且需要两个不同样本才会自动启用。</div>
+                    </div>
+                    <div class="recognition-knowledge-actions"><span id="recognitionKnowledgeFormState" aria-live="polite"></span><button type="submit" class="btn btn-primary" id="saveRecognitionKnowledgeBtn">保存词条</button></div>
+                </form>
+            </section>
+        </div>
+    </div>
+</div>
+
+<div id="tmdbRegexRulesModal" class="media-config-modal" hidden>
+    <div class="media-config-dialog tmdb-regex-dialog" role="dialog" aria-modal="true" aria-labelledby="tmdbRegexRulesTitle">
+        <div class="media-config-head">
+            <div><span>DETERMINISTIC RECOGNITION</span><h3 id="tmdbRegexRulesTitle">TMDB 强制匹配规则</h3><p>仅为固定发布组或异常命名建立规则；高优先级规则先执行，保存前会校验 TMDB 目标。</p></div>
+            <button type="button" class="icon-btn" data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+        </div>
+        <div class="media-config-body tmdb-regex-body">
+            <section class="tmdb-regex-ledger" aria-label="强制匹配规则列表">
+                <div class="tmdb-regex-toolbar">
+                    <div><strong>规则列表</strong><span id="tmdbRegexRuleListState">打开后读取规则</span></div>
+                    <button type="button" class="jump-btn" id="newTmdbRegexRuleBtn"><i data-lucide="plus"></i>新建规则</button>
+                </div>
+                <div class="tmdb-regex-table-frame tmdb-regex-rule-list" id="tmdbRegexRuleTableBody" aria-live="polite">
+                    <div class="tmdb-regex-rule-empty">打开后读取规则</div>
+                </div>
+            </section>
+            <section class="tmdb-regex-editor" aria-label="规则编辑器">
+                <div class="tmdb-regex-toolbar"><div><strong id="tmdbRegexEditorTitle">新建规则</strong><span>先定义命中条件，再锁定 TMDB 结果并用真实样例验证</span></div></div>
+                <form id="tmdbRegexRuleForm">
+                    <input type="hidden" id="tmdbRegexRuleId">
+                    <div class="tmdb-regex-editor-scroll">
+                        <section class="tmdb-regex-editor-section">
+                            <div class="tmdb-regex-editor-section-head"><strong>匹配条件</strong><span>规则名称仅用于管理，正则决定是否命中</span></div>
+                            <div class="tmdb-regex-form-grid">
+                                <label class="span-2"><span>规则名称</span><input class="form-input" id="tmdbRegexRuleName" maxlength="120" required placeholder="例如：纪录片季度包"></label>
+                                <label class="span-2"><span>正则表达式</span><textarea class="form-input" id="tmdbRegexRulePattern" maxlength="500" required placeholder="例如：(?i)Planet[ ._-]+Earth"></textarea></label>
+                                <label class="span-2"><span>匹配范围</span><select class="form-select" id="tmdbRegexMatchTarget"><option value="filename">文件名</option><option value="parent">父路径</option><option value="both">父路径 + 文件名</option></select></label>
+                            </div>
+                        </section>
+                        <section class="tmdb-regex-editor-section">
+                            <div class="tmdb-regex-editor-section-head"><strong>锁定结果</strong><span>命中后跳过普通搜索并使用指定媒体</span></div>
+                            <div class="tmdb-regex-form-grid">
+                                <label><span>TMDB ID</span><input class="form-input" id="tmdbRegexTmdbId" inputmode="numeric" maxlength="20" required placeholder="数字 ID"></label>
+                                <label><span>媒体类型</span><select class="form-select" id="tmdbRegexMediaType"><option value="any">按样例识别</option><option value="movie">电影</option><option value="tv">剧集</option></select></label>
+                                <label><span>季覆盖</span><input type="number" class="form-input" id="tmdbRegexSeasonOverride" min="0" max="999" placeholder="留空不覆盖"></label>
+                                <label><span>优先级</span><input type="number" class="form-input" id="tmdbRegexPriority" min="-10000" max="10000" value="0"></label>
+                                <label class="span-2"><span>规则状态</span><select class="form-select" id="tmdbRegexDisabled"><option value="0">启用</option><option value="1">停用</option></select></label>
+                            </div>
+                        </section>
+                        <section class="tmdb-regex-editor-section">
+                            <div class="tmdb-regex-editor-section-head"><strong>验证样例</strong><span>只校验当前表单，不会写入数据库</span></div>
+                            <div class="tmdb-regex-inline">
+                                <label><span>样例文件名</span><input class="form-input" id="tmdbRegexSampleFilename" placeholder="Show.S01E01.mkv"></label>
+                                <label><span>样例父路径</span><input class="form-input" id="tmdbRegexSampleParent" placeholder="/TV/Show/Season 01"></label>
+                            </div>
+                            <div class="tmdb-regex-preview-frame" id="tmdbRegexSamplePreview" aria-live="polite"><strong>等待样例预览</strong><span>填写样例文件名后可检查命中与目标。</span><code>NO SAMPLE / NO WRITE</code></div>
+                        </section>
+                    </div>
+                    <div class="tmdb-regex-editor-actions"><span id="tmdbRegexRuleFormState" aria-live="polite"></span><div><button type="button" class="jump-btn" id="previewTmdbRegexRuleBtn">预览命中</button><button type="submit" class="btn btn-primary" id="saveTmdbRegexRuleBtn">保存规则</button></div></div>
+                </form>
+            </section>
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', path='js/organize.js') }}?v=20260820a"></script>
+{% endblock %}
