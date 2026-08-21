@@ -87,6 +87,7 @@ _AGENT_LIBRARY_PATROL_KEYS = {
 _AGENT_SETTINGS_MANAGED_KEYS = (
     {"AGENT_ENABLED"} | _AGENT_LLM_KEYS | _WEB_SEARCH_KEYS | _AGENT_LIBRARY_PATROL_KEYS
 )
+_CONFIG_UI_MANAGED_KEYS = _AGENT_SETTINGS_MANAGED_KEYS | {"GY_STRM_BASE_URL"}
 _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_ENABLED": "0",
     "AGENT_LLM_ENABLED": "0",
@@ -874,7 +875,7 @@ def get_config(request: Request):
 
         items["OFFLINE_ALLOWED_EXTS"] = DEFAULT_MEDIA_EXTS_CSV
     managed_fields = sorted(
-        key for key in _AGENT_SETTINGS_MANAGED_KEYS
+        key for key in _CONFIG_UI_MANAGED_KEYS
         if config.has_external_override(key)
     )
     for key in managed_fields:

@@ -213,7 +213,7 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
             self.assertTrue(target.is_file())
             self.assertIn("/playgy/video-moved/fresh-etag/", target.read_text("utf-8"))
 
-    def test_base_url_change_rewrites_owned_strm_but_preserves_modified_content(self):
+    def test_base_url_change_rewrites_and_repairs_owned_strm(self):
         source_id = "source-url-change"
         video = GuangYaFile("video-url", "Movie.mkv", False, 100, "etag", source_id)
         client = _TreeClient({source_id: [video]})
@@ -234,12 +234,13 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
             self.assertTrue(target.read_text("utf-8").startswith("http://new-mediaflux.invalid/"))
 
             target.write_text("corrupted", encoding="utf-8")
-            protected = strm_module.sync_strm(
+            repaired = strm_module.sync_strm(
                 source_id, "http://new-mediaflux.invalid", root, client=client
             )
-            self.assertEqual(protected["generated"], 0)
-            self.assertEqual(protected["failed"], 1)
-            self.assertEqual(target.read_text("utf-8"), "corrupted")
+            self.assertEqual(repaired["generated"], 1)
+            self.assertEqual(repaired["updated"], 1)
+            self.assertEqual(repaired["failed"], 0)
+            self.assertTrue(target.read_text("utf-8").startswith("http://new-mediaflux.invalid/"))
 
     def test_unchanged_skipped_items_never_enter_failure_ledger(self):
         source_id = "source-skipped"
@@ -1333,6 +1334,7 @@ class StrmRetryBatchAndSchedulerSafetyTests(IsolatedDatabaseTestCase):
         ), patch("app.modules.scheduler.get_int", return_value=0):
             result = scheduler.run_blocking("manual")
 
+        self.assertEqual(result["base_url"], "http://mediaflux.invalid")
         self.assertEqual(
             [(row["id"], row["status"], row["completed"], row["total"]) for row in result["source_runtime"]],
             [("a", "completed", 1, 1), ("b", "completed", 1, 1)],

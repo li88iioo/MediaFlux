@@ -70,10 +70,18 @@
                         <div class="strm-field-control">
                             <input type="text" class="form-input" id="strmBaseUrl" data-key="GY_STRM_BASE_URL" placeholder="http://192.168.88.195:1258">
                             <div class="strm-base-url-tools">
-                                <button type="button" class="jump-btn" id="detectStrmBaseUrlBtn" aria-busy="false"><i data-lucide="scan-search" aria-hidden="true"></i><span>检测可用地址</span></button>
-                                <select class="form-input" id="strmBaseUrlCandidates" aria-label="播放服务地址候选" disabled><option value="">检测后选择地址</option></select>
+                                <button type="button" class="jump-btn" id="detectStrmBaseUrlBtn" aria-busy="false" disabled><i data-lucide="network" aria-hidden="true"></i><span>发现候选地址</span></button>
+                                <select class="form-input" id="strmBaseUrlCandidates" aria-label="播放服务地址候选" disabled><option value="">发现后选择地址</option></select>
                             </div>
-                            <span class="strm-base-url-state" id="strmBaseUrlState" role="status" aria-live="polite">不会自动覆盖当前配置；请选择媒体服务器能够访问的地址。</span>
+                            <span class="strm-base-url-state" id="strmBaseUrlState" role="status" aria-live="polite">这里只发现本机地址，不验证 Jellyfin / Emby 是否能够访问。</span>
+                            <div class="strm-base-url-refresh" id="strmBaseUrlRefresh" data-state="idle">
+                                <span class="strm-base-url-refresh-icon" aria-hidden="true"><i data-lucide="route"></i></span>
+                                <span class="strm-base-url-refresh-copy">
+                                    <strong id="strmBaseUrlRefreshTitle">现有 STRM 链接</strong>
+                                    <small id="strmBaseUrlRefreshText">播放地址变更并保存后，需要完整校准才能统一更新已有 STRM。</small>
+                                </span>
+                                <button type="button" class="jump-btn" id="refreshStrmBaseUrlBtn" disabled aria-disabled="true"><i data-lucide="scan-search"></i>完整刷新</button>
+                            </div>
                         </div>
                     </div>
 
@@ -258,10 +266,7 @@
 
                     <!-- Action Buttons -->
                     <div class="strm-runtime-actions">
-                        <button type="button" class="btn btn-primary" id="runStrmNowBtn">
-                            <i data-lucide="zap"></i>快速同步
-                        </button>
-                        <button type="button" class="btn btn-secondary" id="runStrmFullBtn">
+                        <button type="button" class="btn btn-primary" id="runStrmFullBtn">
                             <i data-lucide="scan-search"></i>完整校准
                         </button>
                         <button type="button" class="btn btn-secondary" id="refreshStrmStatusBtn">
@@ -444,7 +449,7 @@
     <!-- Bottom Savebar -->
     <div class="strm-settings-savebar settings-savebar workspace-savebar">
         <span id="strmSaveState" aria-live="polite">尚未修改</span>
-        <button type="button" class="btn btn-primary" id="saveStrmBtn">
+        <button type="button" class="btn btn-primary" id="saveStrmBtn" disabled aria-disabled="true">
             <i data-lucide="save"></i>保存 STRM 设置
         </button>
     </div>
@@ -452,5 +457,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/guangya-strm.js') }}?v=20260820a"></script>
+<script src="{{ url_for('static', path='js/guangya-strm.js') }}?v=20260821a"></script>
 {% endblock %}

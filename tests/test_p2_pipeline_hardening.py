@@ -126,6 +126,39 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "user-owned")
             self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
 
+    def test_full_sync_preserves_unindexed_tgto_strm_and_local_sidecars(self) -> None:
+        source_id = f"tgto-{uuid.uuid4().hex}"
+        video = GuangYaFile("video-1", "Movie.mkv", False, 1024, "etag-1", source_id)
+        with tempfile.TemporaryDirectory() as root:
+            target_dir = Path(root) / STRM_SUBDIR
+            target_dir.mkdir(parents=True)
+            strm_target = target_dir / "Movie.mkv.strm"
+            nfo_target = target_dir / "Movie.nfo"
+            poster_target = target_dir / "poster.jpg"
+            strm_target.write_text("https://tgto.invalid/play/video-1", encoding="utf-8")
+            nfo_target.write_text("<movie><title>Movie</title></movie>", encoding="utf-8")
+            poster_target.write_bytes(b"tgto-poster")
+
+            stats = sync_strm(
+                source_id, "http://localhost:1258", root,
+                client=_TreeClient({source_id: [video]}),
+                metadata_exts={"nfo", "jpg"},
+            )
+
+            self.assertEqual(stats["generated"], 0)
+            self.assertEqual(stats["failed"], 1)
+            self.assertEqual(
+                strm_target.read_text(encoding="utf-8"),
+                "https://tgto.invalid/play/video-1",
+            )
+            self.assertEqual(
+                nfo_target.read_text(encoding="utf-8"),
+                "<movie><title>Movie</title></movie>",
+            )
+            self.assertEqual(poster_target.read_bytes(), b"tgto-poster")
+            self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
+            self.assertEqual(db.list_strm_index(f"guangya-meta:{source_id}"), [])
+
     def test_incremental_rename_preserves_modified_old_path_and_index(self) -> None:
         from app.modules.strm import sync_strm_incremental
 

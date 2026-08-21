@@ -21,8 +21,9 @@ class PageAssetExtractionTests(unittest.TestCase):
                 marker = f"path='js/{asset_name}'"
 
                 self.assertIn(marker, template)
-                self.assertIn("?v=20260820a", template)
-                self.assertNotIn("defer", template.split(marker, 1)[1].split("</script>", 1)[0])
+                script_tag = template.split(marker, 1)[1].split("</script>", 1)[0]
+                self.assertRegex(script_tag, r"\?v=20\d{6}[a-z]")
+                self.assertNotIn("defer", script_tag)
                 self.assertGreater(len(source), 10_000)
                 self.assertNotIn("{{", source)
                 self.assertNotIn("{%", source)

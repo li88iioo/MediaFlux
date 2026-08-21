@@ -21,15 +21,21 @@ class GuangyaStrmUiTests(unittest.TestCase):
         self.assertIn('html[data-strm-initial-tab="schedule"]', self.css)
         self.assertIn('html[data-strm-initial-tab="diagnostics"]', self.css)
 
-    def test_base_url_detection_uses_stable_controls_and_never_silent_overwrites(self):
+    def test_base_url_discovery_is_explicit_and_requires_full_refresh(self):
         self.assertIn('id="detectStrmBaseUrlBtn"', self.template)
         self.assertIn('id="strmBaseUrlCandidates"', self.template)
+        self.assertIn('id="strmBaseUrlRefresh"', self.template)
+        self.assertIn('id="refreshStrmBaseUrlBtn"', self.template)
         self.assertIn("/api/strm/base-url-candidates", self.template)
-        self.assertIn("不会自动覆盖当前配置", self.template)
+        self.assertIn("发现候选地址", self.template)
+        self.assertIn("不验证 Jellyfin / Emby 是否能够访问", self.template)
         self.assertIn("return strmBaseUrlInput.value.trim()?Promise.resolve():loadStrmBaseUrlCandidates()", self.template)
         self.assertIn("strmBaseUrlInput.value=strmBaseUrlCandidates.value", self.template)
+        self.assertIn("baseUrlRefreshPending=true", self.template)
+        self.assertIn("完整刷新", self.template)
         self.assertIn("grid-template-columns: max-content minmax(0, 1fr)", self.css)
-        self.assertIn("min-height: 42px", self.css)
+        self.assertIn(".strm-base-url-refresh", self.css)
+        self.assertIn("min-height: 58px", self.css)
 
     def test_source_list_reserves_previous_height_across_refresh(self):
         self.assertIn("mediaflux:strm-source-rows", self.template)
@@ -39,17 +45,26 @@ class GuangyaStrmUiTests(unittest.TestCase):
         self.assertIn("min-height: var(--strm-source-reserved-height, 52px)", self.css)
         self.assertIn("overflow-anchor: none", self.css)
 
-    def test_fast_and_full_sync_actions_are_distinct_and_layout_stable(self):
-        self.assertIn('id="runStrmNowBtn"', self.template)
+    def test_frontend_exposes_only_full_sync_and_keeps_backend_fast_mode_hidden(self):
+        self.assertNotIn('id="runStrmNowBtn"', self.template)
         self.assertIn('id="runStrmFullBtn"', self.template)
-        self.assertIn("/api/strm/run/fast", self.template)
+        self.assertNotIn("/api/strm/run/fast", self.template)
         self.assertIn("/api/strm/run/full", self.template)
-        self.assertIn("快速同步", self.template)
+        self.assertNotIn("快速同步", self.template)
         self.assertIn("完整校准", self.template)
         self.assertIn('id="strmLastRunMetrics"', self.template)
-        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", self.css)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", self.css)
         self.assertIn(".strm-last-run-metrics", self.css)
         self.assertIn("min-height: 18px", self.css)
+
+    def test_config_loading_and_environment_management_lock_actions(self):
+        self.assertIn('id="saveStrmBtn" disabled aria-disabled="true"', self.template)
+        self.assertIn("strmConfigReady=true", self.template)
+        self.assertIn("saveStrmBtn.disabled=false", self.template)
+        self.assertIn("}).catch(error=>{", self.template)
+        self.assertIn("isBaseUrlManaged()", self.template)
+        self.assertIn("strmBaseUrlCandidates.disabled=!strmConfigReady||managed||!hasCandidates", self.template)
+        self.assertIn("播放地址由部署环境管理", self.template)
 
     def test_metadata_queue_status_is_explicit_and_keeps_polling_until_drained(self):
         self.assertIn("不阻塞 STRM", self.template)

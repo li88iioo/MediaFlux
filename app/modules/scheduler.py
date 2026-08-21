@@ -1295,6 +1295,7 @@ class STRMScheduler:
                 "elapsed_seconds": elapsed,
                 "source_runtime": [dict(row) for row in self._source_runtime],
                 "mode": mode,
+                "base_url": base_url.rstrip("/"),
                 "fallback_used": fallback_used,
                 "fallback_reason": fallback_reason,
             }

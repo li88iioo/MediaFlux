@@ -11,6 +11,12 @@
     const strmBaseUrlDetectBtn=document.getElementById('detectStrmBaseUrlBtn');
     const strmBaseUrlCandidates=document.getElementById('strmBaseUrlCandidates');
     const strmBaseUrlState=document.getElementById('strmBaseUrlState');
+    const strmBaseUrlRefresh=document.getElementById('strmBaseUrlRefresh');
+    const strmBaseUrlRefreshTitle=document.getElementById('strmBaseUrlRefreshTitle');
+    const strmBaseUrlRefreshText=document.getElementById('strmBaseUrlRefreshText');
+    const refreshStrmBaseUrlBtn=document.getElementById('refreshStrmBaseUrlBtn');
+    const saveStrmBtn=document.getElementById('saveStrmBtn');
+    const runStrmFullBtn=document.getElementById('runStrmFullBtn');
     const diagnosticResult=document.getElementById('strmIndexDiagnosticResult');
     const diagnosticState=document.getElementById('strmIndexDiagnosticState');
     const diagnosticRefreshBtn=document.getElementById('refreshStrmIndexDiagnosticBtn');
@@ -38,6 +44,11 @@
     const strmLoadedTabs=new Set();
     let activeStrmTab='config';
     let strmConfigReady=false;
+    let strmSyncRunning=false;
+    let baseUrlRefreshPending=false;
+    let baseUrlRefreshAwaitingRun=false;
+    let baseUrlRefreshBaselineRunId=0;
+    let lastKnownStrmRunId=0;
 
     const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -170,6 +181,65 @@
     function syncSourceReservation(count){const rows=Math.min(12,Math.max(1,Number(count)||1));document.documentElement?.style?.setProperty('--strm-source-reserved-height',`${rows*60-8}px`);try{sessionStorage.setItem('mediaflux:strm-source-rows',String(rows));}catch(_) {}}
     function renderSources(){input.value=JSON.stringify(sources);const list=document.getElementById('strmSourceList');syncSourceReservation(sources.length);list.setAttribute('aria-busy','false');if(!sources.length){list.innerHTML='<div class="strm-source-empty"><i data-lucide="folder-plus" style="width:16px;height:16px;vertical-align:-3px;margin-right:6px;color:var(--text-muted);"></i>暂未设置网盘扫描目录</div>';window.renderLucideIcons?.(list);return;}list.innerHTML=sources.map((source,index)=>`<div class="strm-source-item"><div class="strm-source-info"><i data-lucide="folder-check" class="strm-source-icon"></i><div><strong>${esc(source.name)}</strong><span>ID ${esc(source.id)}</span></div></div><button type="button" data-remove-source="${index}" title="移除目录"><i data-lucide="x"></i></button></div>`).join('');window.renderLucideIcons?.(list);list.querySelectorAll('[data-remove-source]').forEach(btn=>btn.addEventListener('click',()=>{sources.splice(Number(btn.dataset.removeSource),1);renderSources();}));}
 
+    const normalizeBaseUrl=value=>String(value??'').trim().replace(/\/+$/,'');
+    const isBaseUrlManaged=()=>strmBaseUrlInput.dataset.managedByEnvironment==='true';
+    function setBaseUrlRefreshState(state,message=''){
+        const copy={
+            idle:['现有 STRM 链接','播放地址变更并保存后，需要完整校准才能统一更新已有 STRM。'],
+            pending:['等待完整刷新','新播放地址已保存；完整校准后，已有 STRM 才会统一改用该地址。'],
+            running:['正在完整刷新','完整校准已启动，可在“自动调度与运行”中查看实时进度。'],
+            current:['链接地址已校准','最近一次完整校准已使用当前播放服务地址。'],
+            error:['完整刷新未完成','上次完整校准未完全成功，请查看运行记录后重试。'],
+        }[state]||['现有 STRM 链接','播放地址变更并保存后，需要完整校准才能统一更新已有 STRM。'];
+        strmBaseUrlRefresh.dataset.state=state;
+        strmBaseUrlRefreshTitle.textContent=copy[0];
+        strmBaseUrlRefreshText.textContent=message||copy[1];
+        const actionable=(state==='pending'||state==='error')&&strmConfigReady&&!strmSyncRunning&&!isBaseUrlManaged();
+        refreshStrmBaseUrlBtn.disabled=!actionable;
+        refreshStrmBaseUrlBtn.setAttribute('aria-disabled',String(!actionable));
+    }
+    function syncBaseUrlControlAvailability(){
+        const managed=isBaseUrlManaged();
+        const hasCandidates=strmBaseUrlCandidates.dataset.hasCandidates==='true';
+        strmBaseUrlDetectBtn.disabled=!strmConfigReady||managed;
+        strmBaseUrlCandidates.disabled=!strmConfigReady||managed||!hasCandidates;
+        if(managed){
+            strmBaseUrlState.dataset.tone='warning';
+            strmBaseUrlState.textContent='播放地址由部署环境管理，请修改环境变量后重启服务。';
+        }
+        setBaseUrlRefreshState(strmBaseUrlRefresh.dataset.state||'idle');
+    }
+    function syncBaseUrlRefreshFromStatus(status){
+        const last=status.last_run&&typeof status.last_run==='object'?status.last_run:{};
+        const result=last.result&&typeof last.result==='object'?last.result:{};
+        const lastRunId=Math.max(0,Number(last.id||0));
+        const lastMode=String(result.mode||'');
+        const lastBaseUrl=normalizeBaseUrl(result.base_url||'');
+        const currentBaseUrl=normalizeBaseUrl(strmBaseUrlInput.dataset.configInitialValue||strmBaseUrlInput.value);
+        lastKnownStrmRunId=lastRunId;
+        strmSyncRunning=!!status.running;
+        if(baseUrlRefreshAwaitingRun){
+            if(status.running){setBaseUrlRefreshState('running');return;}
+            if(lastRunId&&lastRunId!==baseUrlRefreshBaselineRunId){
+                baseUrlRefreshAwaitingRun=false;
+                if(last.status==='success'&&(lastMode==='full'||lastMode==='full_fallback')&&lastBaseUrl===currentBaseUrl){
+                    baseUrlRefreshPending=false;
+                    setBaseUrlRefreshState('current');
+                }else{
+                    baseUrlRefreshPending=true;
+                    setBaseUrlRefreshState('error');
+                }
+                return;
+            }
+        }
+        if(last.status==='success'&&(lastMode==='full'||lastMode==='full_fallback')&&lastBaseUrl&&currentBaseUrl){
+            baseUrlRefreshPending=lastBaseUrl!==currentBaseUrl;
+            setBaseUrlRefreshState(baseUrlRefreshPending?'pending':'current');
+            return;
+        }
+        setBaseUrlRefreshState(baseUrlRefreshPending?'pending':'idle');
+    }
+
     const strmAddressWarningText={
         lan_binding_disabled:'当前服务仅监听本机；如需局域网播放，请先在控制台设置中允许专用网络访问。',
         container_address_unreliable:'容器内无法可靠识别宿主机地址，请优先使用当前访问地址、宿主机 IP 或反向代理域名。',
@@ -192,22 +262,23 @@
         strmBaseUrlCandidates.replaceChildren();
         const placeholder=document.createElement('option');
         placeholder.value='';
-        placeholder.textContent=unique.length?'选择检测到的地址':'未检测到可用地址';
+        placeholder.textContent=unique.length?'选择发现的候选地址':'未发现候选地址';
         strmBaseUrlCandidates.appendChild(placeholder);
         unique.forEach(item=>{const option=document.createElement('option');option.value=item.url;option.textContent=`${item.label||'候选地址'} · ${item.url}`;strmBaseUrlCandidates.appendChild(option);});
-        strmBaseUrlCandidates.disabled=unique.length===0;
+        strmBaseUrlCandidates.dataset.hasCandidates=unique.length?'true':'false';
+        syncBaseUrlControlAvailability();
         const warnings=(payload.warnings||[]).map(code=>strmAddressWarningText[code]).filter(Boolean);
         if(browser&&['localhost','127.0.0.1','0.0.0.0'].includes(window.location.hostname)){warnings.unshift('当前浏览器地址仅适合本机访问，其他设备请不要选择 localhost。');}
         strmBaseUrlState.dataset.tone=warnings.length?'warning':'success';
-        strmBaseUrlState.textContent=warnings[0]||(unique.length?`已找到 ${unique.length} 个候选地址，请确认后选择。`:'请手动填写媒体服务器可访问的地址。');
+        strmBaseUrlState.textContent=warnings[0]||(unique.length?`已发现 ${unique.length} 个候选地址；请选择媒体服务器实际可达的一项。`:'未发现候选地址，请手动填写媒体服务器可访问的地址。');
     }
     async function loadStrmBaseUrlCandidates(){
-        if(strmBaseUrlDetectBtn.disabled)return;
+        if(strmBaseUrlDetectBtn.disabled||!strmConfigReady||isBaseUrlManaged())return;
         strmBaseUrlDetectBtn.disabled=true;strmBaseUrlDetectBtn.classList.add('is-loading');strmBaseUrlDetectBtn.setAttribute('aria-busy','true');
-        strmBaseUrlState.dataset.tone='testing';strmBaseUrlState.textContent='正在检查监听状态与局域网地址…';
-        try{const response=await fetch('/api/strm/base-url-candidates');const data=await response.json();if(!response.ok)throw new Error(data.error||'地址检测失败');renderStrmBaseUrlCandidates(data);}
-        catch(error){strmBaseUrlState.dataset.tone='error';strmBaseUrlState.textContent=error.message||'地址检测失败，请手动填写。';}
-        finally{strmBaseUrlDetectBtn.disabled=false;strmBaseUrlDetectBtn.classList.remove('is-loading');strmBaseUrlDetectBtn.setAttribute('aria-busy','false');}
+        strmBaseUrlState.dataset.tone='testing';strmBaseUrlState.textContent='正在发现监听配置与局域网候选地址…';
+        try{const response=await fetch('/api/strm/base-url-candidates');const data=await response.json();if(!response.ok)throw new Error(data.error||'候选地址读取失败');renderStrmBaseUrlCandidates(data);}
+        catch(error){strmBaseUrlState.dataset.tone='error';strmBaseUrlState.textContent=error.message||'候选地址读取失败，请手动填写。';}
+        finally{strmBaseUrlDetectBtn.classList.remove('is-loading');strmBaseUrlDetectBtn.setAttribute('aria-busy','false');syncBaseUrlControlAvailability();}
     }
 
     function syncMetadata(){
@@ -232,7 +303,7 @@
         const lastStats=last.result&&last.result.stats&&typeof last.result.stats==='object'?last.result.stats:{};
         const lastMode=String(last.result?.mode||'');
         const metricNode=document.getElementById('strmLastRunMetrics');
-        if(lastMode==='fast_noop')metricNode.textContent='最近快速同步：没有待处理的增量变化';
+        if(lastMode==='fast_noop')metricNode.textContent='最近增量联动：没有待处理的整理变化';
         else if(Number(lastStats.directories||0)>0)metricNode.textContent=`最近完整扫描：${Number(lastStats.directories||0)} 个目录 · ${Number(lastStats.directory_requests||0)} 次请求 · 峰值 ${Number(lastStats.scan_workers_peak||0)} 线程 · ${Number(lastStats.scan_elapsed_seconds||0).toFixed(1)} 秒`;
         else metricNode.textContent='最近扫描指标将在任务完成后显示';
         const progress=s.progress||{};
@@ -246,13 +317,10 @@
         if(dot)dot.className='status-dot'+(s.running||metadataActive?' active':'');
         const runtime=Array.isArray(s.source_runtime)?s.source_runtime:[];
         document.getElementById('strmSourceRuntime').innerHTML=runtime.length?runtime.map(row=>`<div><strong>${esc(row.name||row.id)}</strong> · ${esc(row.status||'pending')} · ${Number(row.completed||0)}/${Number(row.total||0)}</div>`).join(''):'<span class="text-muted">暂无来源运行状态</span>';
-        const btn=document.getElementById('runStrmNowBtn');
-        const fullBtn=document.getElementById('runStrmFullBtn');
-        btn.disabled=!!s.running;
-        fullBtn.disabled=!!s.running;
-        btn.innerHTML=s.running?'<i data-lucide="loader-2" class="spin"></i>同步中...':'<i data-lucide="zap"></i>快速同步';
-        fullBtn.innerHTML=s.running?'<i data-lucide="scan-search"></i>完整校准':'<i data-lucide="scan-search"></i>完整校准';
-        window.renderLucideIcons?.(btn.parentElement);
+        runStrmFullBtn.disabled=!!s.running;
+        runStrmFullBtn.innerHTML=s.running?'<i data-lucide="loader-2" class="spin"></i>校准中...':'<i data-lucide="scan-search"></i>完整校准';
+        syncBaseUrlRefreshFromStatus(s);
+        window.renderLucideIcons?.(runStrmFullBtn.parentElement);
         const shouldPoll=!!s.running||(metadataPending>0&&metadataQueue.enabled!==false);
         if(shouldPoll&&!pollTimer)pollTimer=setInterval(loadStatus,2500);
         if(!shouldPoll&&pollTimer){clearInterval(pollTimer);pollTimer=null;}
@@ -595,17 +663,32 @@
         renderSources();
         syncMetadata();
         strmConfigReady=true;
+        saveStrmBtn.disabled=false;
+        saveStrmBtn.setAttribute('aria-disabled','false');
+        syncBaseUrlControlAvailability();
         void ensureStrmTabLoaded(activeStrmTab);
+    }).catch(error=>{
+        strmConfigReady=false;
+        saveStrmBtn.disabled=true;
+        saveStrmBtn.setAttribute('aria-disabled','true');
+        syncBaseUrlControlAvailability();
+        const state=document.getElementById('strmSaveState');
+        state.className='is-error';
+        state.textContent=error.message||'配置读取失败，请刷新页面后重试';
     });
 
     strmBaseUrlDetectBtn.addEventListener('click',loadStrmBaseUrlCandidates);
     strmBaseUrlCandidates.addEventListener('change',()=>{
-        if(!strmBaseUrlCandidates.value)return;
+        if(!strmConfigReady||isBaseUrlManaged()||!strmBaseUrlCandidates.value)return;
         strmBaseUrlInput.value=strmBaseUrlCandidates.value;
         strmBaseUrlInput.dispatchEvent(new Event('input',{bubbles:true}));
-        const saveState=document.getElementById('strmSaveState');
-        saveState.className='is-dirty';saveState.textContent='播放地址已选择，等待保存';
-        strmBaseUrlState.dataset.tone='success';strmBaseUrlState.textContent='已填入候选地址；保存后下次同步会更新 STRM 播放链接。';
+        strmBaseUrlState.dataset.tone='success';strmBaseUrlState.textContent='候选地址已填入；保存后请执行一次完整刷新。';
+    });
+    strmBaseUrlInput.addEventListener('input',()=>{
+        if(!strmConfigReady||isBaseUrlManaged())return;
+        const state=document.getElementById('strmSaveState');
+        const changed=normalizeBaseUrl(strmBaseUrlInput.value)!==normalizeBaseUrl(strmBaseUrlInput.dataset.configInitialValue||'');
+        if(changed){state.className='is-dirty';state.textContent='播放地址已修改，等待保存';}
     });
 
     document.getElementById('addStrmSourceBtn').addEventListener('click',()=>openGuangYaDirectoryPicker({modalId:'strmStandaloneDirModal',title:'批量选择 STRM 源目录',multiple:true,selected:sources,allowRoot:false,onSelect:dirs=>{sources=dirs.map(item=>({id:item.id,name:item.name}));renderSources();}}));
@@ -646,8 +729,49 @@
             syncFailureActions();
         });
     }
-    document.getElementById('runStrmNowBtn').addEventListener('click',async event=>{const confirmed=await appConfirm({trigger:event.currentTarget,title:'快速同步 STRM',message:'仅处理整理链路登记的待同步变化；若快照不一致会提示执行完整校准，不会自动扫描全库或清理失效文件。',confirmText:'快速同步'});if(!confirmed)return;fetch('/api/strm/run/fast',{method:'POST'}).then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.error||'启动失败');loadStatus();}).catch(error=>appAlert({type:'error',title:'启动失败',message:error.message||'无法启动快速同步'}));});
-    document.getElementById('runStrmFullBtn').addEventListener('click',async event=>{const confirmed=await appConfirm({trigger:event.currentTarget,title:'完整校准 STRM',message:'将按当前并发设置（默认 15 个扫描线程）遍历全部已配置目录，校准 STRM、执行安全清理，并按实际文件变化刷新媒体库。',confirmText:'开始完整校准'});if(!confirmed)return;fetch('/api/strm/run/full',{method:'POST'}).then(async response=>{const data=await response.json();if(!response.ok)throw new Error(data.error||'启动失败');loadStatus();}).catch(error=>appAlert({type:'error',title:'启动失败',message:error.message||'无法启动完整校准'}));});
-    document.getElementById('saveStrmBtn').addEventListener('click',async event=>{const btn=event.currentTarget;const state=document.getElementById('strmSaveState');btn.disabled=true;state.textContent='保存中...';try{await saveAppConfig(form);state.className='is-success';state.textContent='STRM 设置已保存';validateCron();loadStatus();}catch(error){state.className='is-error';state.textContent=error.message;}finally{btn.disabled=false;}});
+    async function runFullStrmSync(event){
+        const confirmed=await appConfirm({trigger:event.currentTarget,title:'完整校准 STRM',message:'将按当前并发设置（默认 15 个扫描线程）遍历全部已配置目录，校准播放链接、执行安全清理，并按实际文件变化刷新媒体库。',confirmText:'开始完整校准'});
+        if(!confirmed)return;
+        const tracksBaseUrl=baseUrlRefreshPending;
+        if(tracksBaseUrl){
+            baseUrlRefreshAwaitingRun=true;
+            baseUrlRefreshBaselineRunId=lastKnownStrmRunId;
+            setBaseUrlRefreshState('running','正在启动完整校准…');
+        }
+        try{
+            const response=await fetch('/api/strm/run/full',{method:'POST'});
+            const data=await response.json();
+            if(!response.ok)throw new Error(data.error||'启动失败');
+            await loadStatus();
+        }catch(error){
+            if(tracksBaseUrl){baseUrlRefreshAwaitingRun=false;baseUrlRefreshPending=true;setBaseUrlRefreshState('error',error.message||'完整校准启动失败，请重试。');}
+            await appAlert({type:'error',title:'启动失败',message:error.message||'无法启动完整校准'});
+        }
+    }
+    runStrmFullBtn.addEventListener('click',runFullStrmSync);
+    refreshStrmBaseUrlBtn.addEventListener('click',runFullStrmSync);
+    saveStrmBtn.addEventListener('click',async event=>{
+        if(!strmConfigReady)return;
+        const btn=event.currentTarget;
+        const state=document.getElementById('strmSaveState');
+        const previousBaseUrl=normalizeBaseUrl(strmBaseUrlInput.dataset.configInitialValue||'');
+        const nextBaseUrl=normalizeBaseUrl(strmBaseUrlInput.value);
+        const baseUrlChanged=!isBaseUrlManaged()&&previousBaseUrl!==nextBaseUrl;
+        btn.disabled=true;btn.setAttribute('aria-disabled','true');state.className='';state.textContent='保存中...';
+        try{
+            await saveAppConfig(form);
+            state.className='is-success';
+            if(baseUrlChanged){
+                baseUrlRefreshPending=true;
+                baseUrlRefreshAwaitingRun=false;
+                state.textContent='播放地址已保存，待完整刷新 STRM';
+                setBaseUrlRefreshState('pending');
+            }else{
+                state.textContent='STRM 设置已保存';
+            }
+            validateCron();loadStatus();
+        }catch(error){state.className='is-error';state.textContent=error.message;}
+        finally{btn.disabled=!strmConfigReady;btn.setAttribute('aria-disabled',String(!strmConfigReady));}
+    });
     if(globalThis.__MEDIAFLUX_STRM_TEST_HOOK__)globalThis.__MEDIAFLUX_STRM_TEST_API__={renderFailures,retryFailures,loadFailures,clearFailures,renderStatus,snapshot:()=>failureSnapshot};
 })();
