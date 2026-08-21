@@ -14,7 +14,7 @@ from app.indexers.config import build_indexer_site_updates, encode_indexer_site_
 from app.logger import configure_telebot_logging, get_logger
 from app.security import redact_config
 from app.services import build_dashboards
-from app.web import api_error, require_api_login
+from app.web import api_error, config_write_api_error, require_api_login
 
 router = APIRouter(prefix="/api")
 logger = get_logger(__name__)
@@ -1215,8 +1215,12 @@ def save_config(request: Request, data: Any = Body(default=None)):
     persist_started = time.perf_counter()
     try:
         config.set_and_save(persisted_updates)
-    except config.ExternalConfigOverrideError as exc:
-        return api_error(str(exc), 409)
+    except (config.AtomicPublishError, OSError) as exc:
+        return config_write_api_error(
+            exc,
+            logger=logger,
+            operation="save_settings",
+        )
     persist_ms = max(1, round((time.perf_counter() - persist_started) * 1000))
 
     retired_source_ids: list[str] = []

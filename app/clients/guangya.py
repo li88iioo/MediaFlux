@@ -30,6 +30,7 @@ from urllib.parse import urlparse, parse_qs
 from app.config import PATHS
 from app.logger import get_logger
 from app.modules.process_lock import CrossProcessLock
+from app.private_files import protect_private_file
 
 logger = get_logger(__name__)
 
@@ -173,7 +174,8 @@ def _atomic_write_text(path: Path, value: str) -> None:
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temp_file, 0o600)
+        if not protect_private_file(temp_file):
+            raise PermissionError("无法收紧光鸭凭据状态文件权限")
         temp_file.replace(path)
     finally:
         try:
@@ -627,7 +629,8 @@ class GuangYaClient:
                     self._credential_fingerprint = ""
                     return
                 try:
-                    os.chmod(self.token_file, 0o600)
+                    if not protect_private_file(self.token_file):
+                        raise PermissionError("光鸭 token 文件权限不安全")
                     self._credential_fingerprint = _token_file_fingerprint(self.token_file)
                     token_text = self.token_file.read_text(encoding="utf-8")
                     data = json.loads(token_text)
@@ -746,7 +749,8 @@ class GuangYaClient:
                 json.dump(data, handle, ensure_ascii=False, default=str, indent=2)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(temp_file, 0o600)
+            if not protect_private_file(temp_file):
+                raise PermissionError("无法收紧光鸭 token 临时文件权限")
             temp_file.replace(self.token_file)
         finally:
             try:

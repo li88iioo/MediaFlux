@@ -38,6 +38,8 @@ _logger = logging.getLogger(__name__)
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LITERAL_MARKER = " # mediaflux-literal"
 _LINE_SEPARATORS = frozenset("\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+_NON_OWNER_MODE = stat.S_IRWXG | stat.S_IRWXO
+_PRIVATE_PERMISSION_FALLBACK_DEVICES: set[int] = set()
 
 
 class AtomicPublishError(RuntimeError):
@@ -301,7 +303,28 @@ def _apply_private_permissions(path: Path) -> None:
     if not _is_windows():
         descriptor = _open_verified_config_file(path, writable=True)
         try:
-            os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+            try:
+                os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError as exc:
+                if exc.errno != errno.EPERM:
+                    raise
+                metadata = os.fstat(descriptor)
+                mode = stat.S_IMODE(metadata.st_mode)
+                if mode & _NON_OWNER_MODE:
+                    raise
+                # 部分 NAS/CIFS/FUSE 挂载拒绝 chmod，但仍能正确保留创建时
+                # 的私有 mode。按设备仅提示一次，避免每次配置保存打印三遍。
+                with _lock:
+                    should_log = metadata.st_dev not in _PRIVATE_PERMISSION_FALLBACK_DEVICES
+                    _PRIVATE_PERMISSION_FALLBACK_DEVICES.add(metadata.st_dev)
+                if should_log:
+                    _logger.warning(
+                        "配置挂载拒绝 fchmod；已验证现有权限仍为私有模式后继续 "
+                        "directory=%s mode=%04o errno=%s",
+                        path.parent,
+                        mode,
+                        exc.errno,
+                    )
         finally:
             os.close(descriptor)
         return
@@ -313,7 +336,7 @@ def _apply_private_permissions(path: Path) -> None:
     try:
         current_user_sid = _windows_current_user_sid()
     except Exception as exc:
-        logger.warning("获取当前用户 SID 异常，使用基础安全 ACL: %s", exc)
+        _logger.warning("获取当前用户 SID 异常，使用基础安全 ACL: %s", exc)
 
     grants = ["*S-1-5-18:(F)", "*S-1-5-32-544:(F)"]
     if current_user_sid:

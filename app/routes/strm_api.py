@@ -6,11 +6,13 @@ import json
 from fastapi import APIRouter, Body, Request
 
 from app import config, database as db
+from app.logger import get_logger
 from app.modules.scheduler import STRMScheduler, get_scheduler
 from app.modules.strm import retry_all_strm_failures, retry_strm_failures
-from app.web import api_error, api_response, require_api_login
+from app.web import api_error, api_response, config_write_api_error, require_api_login
 
 router = APIRouter(prefix="/api/strm")
+logger = get_logger(__name__)
 
 
 _MAX_DIAGNOSTIC_CLEANUP_IDS = 100
@@ -209,8 +211,12 @@ def update_schedule(request: Request, data: dict = Body(...)):
         updates["STRM_NOTIFY_ENABLED"] = "1" if data["notify_enabled"] else "0"
     try:
         config.set_and_save(updates)
-    except config.ExternalConfigOverrideError as exc:
-        return api_error(str(exc), 409)
+    except (config.AtomicPublishError, OSError) as exc:
+        return config_write_api_error(
+            exc,
+            logger=logger,
+            operation="save_strm_schedule",
+        )
     get_scheduler().reload()
     return api_response({"success": True, "status": get_scheduler().status()})
 

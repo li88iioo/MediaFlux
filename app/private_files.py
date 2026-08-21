@@ -5,12 +5,14 @@ Windows 的 POSIX mode 位不代表真实 ACL，因此保持安全 no-op，避�
 """
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from pathlib import Path
 from typing import IO
 
 _PRIVATE_MODE = stat.S_IRUSR | stat.S_IWUSR
+_NON_OWNER_MODE = stat.S_IRWXG | stat.S_IRWXO
 
 
 def _is_posix() -> bool:
@@ -18,14 +20,28 @@ def _is_posix() -> bool:
 
 
 def protect_private_fd(fd: int) -> bool:
-    """尽力把已打开的普通文件收紧为 0600。"""
+    """尽力把已打开的普通文件收紧为 0600。
+
+    某些 NAS/CIFS/FUSE 挂载会拒绝 ``fchmod``，即使文件创建时已经是私有
+    模式。仅在错误为 EPERM 且重新读取的 mode 仍确认 group/other 无任何
+    权限时接受该挂载限制；实际为 0644 等模式时继续报告失败。
+    """
     if not _is_posix():
         return True
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
             return False
-        os.fchmod(fd, _PRIVATE_MODE)
+        try:
+            os.fchmod(fd, _PRIVATE_MODE)
+        except OSError as exc:
+            if exc.errno != errno.EPERM:
+                return False
+            current = os.fstat(fd)
+            return (
+                stat.S_ISREG(current.st_mode)
+                and stat.S_IMODE(current.st_mode) & _NON_OWNER_MODE == 0
+            )
         return stat.S_IMODE(os.fstat(fd).st_mode) == _PRIVATE_MODE
     except (OSError, ValueError):
         return False

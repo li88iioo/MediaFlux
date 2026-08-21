@@ -21,6 +21,11 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s | %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
+_TELEBOT_CONFLICT_SUMMARY = (
+    "Telegram Bot 轮询冲突（HTTP 409）：检测到另一实例正在使用同一 Bot Token；"
+    "请只保留一个 Bot 实例"
+)
+_TELEBOT_CONFLICT_LOG_INTERVAL_SECONDS = 300.0
 
 _configured = False
 
@@ -35,6 +40,8 @@ def normalize_telebot_polling_error(value: object) -> str | None:
     )
     if not any(lowered.startswith(prefix) for prefix in prefixes):
         return None
+    if "409" in lowered and "conflict" in lowered and "getupdates" in lowered:
+        return _TELEBOT_CONFLICT_SUMMARY
     if any(key in lowered for key in ("connecttimeout", "connect timeout", "connecttimedouterror")):
         return "Telegram Bot 连接超时（ConnectTimeout），将在后台自动重试"
     if any(key in lowered for key in ("readtimeout", "read timed out", "readtimeouterror")):
@@ -92,13 +99,29 @@ class _WindowsSafeTimedRotatingFileHandler(TimedRotatingFileHandler):
 
 
 class _RedactFilter(logging.Filter):
+    def __init__(self) -> None:
+        super().__init__()
+        self._last_telebot_conflict_at: float | None = None
+
     def filter(self, record: logging.LogRecord) -> bool:
         raw_message = record.getMessage()
         if record.name.lower() == "telebot":
             if raw_message.startswith("Exception traceback:"):
                 return False
+            lowered = raw_message.casefold()
+            if lowered.startswith("waiting for ") and " until retry" in lowered:
+                return False
             normalized = normalize_telebot_polling_error(raw_message)
             if normalized is not None:
+                if normalized == _TELEBOT_CONFLICT_SUMMARY:
+                    now = time.monotonic()
+                    if (
+                        self._last_telebot_conflict_at is not None
+                        and now - self._last_telebot_conflict_at
+                        < _TELEBOT_CONFLICT_LOG_INTERVAL_SECONDS
+                    ):
+                        return False
+                    self._last_telebot_conflict_at = now
                 record.msg = normalized
                 record.args = ()
                 record.exc_info = None

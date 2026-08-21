@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import re
 import unittest
@@ -593,6 +594,27 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertIn("STRM_SCHEDULE_ENABLED", self._payload(response)["error"])
+        scheduler.reload.assert_not_called()
+        scheduler.status.assert_not_called()
+
+    def test_strm_schedule_maps_storage_error_without_reloading(self):
+        scheduler = MagicMock()
+        with patch.object(strm_api, "require_api_login", return_value=None), patch.object(
+            strm_api.config,
+            "set_and_save",
+            side_effect=PermissionError(errno.EPERM, "operation not permitted"),
+        ), patch.object(
+            strm_api, "get_scheduler", return_value=scheduler
+        ), self.assertLogs("app.routes.strm_api", level="ERROR") as captured:
+            response = strm_api.update_schedule(
+                self._request(),
+                {"enabled": True, "cron": "0 4 * * *", "notify_enabled": True},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("数据目录权限", self._payload(response)["error"])
+        self.assertEqual(len(captured.records), 1)
+        self.assertIsNone(captured.records[0].exc_info)
         scheduler.reload.assert_not_called()
         scheduler.status.assert_not_called()
 

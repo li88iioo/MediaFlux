@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -821,6 +822,23 @@ class GuangYaTokenClientTests(unittest.TestCase):
                 second_orphan.write_text("secret-token", encoding="utf-8")
                 client.clear_tokens()
             self.assertFalse(second_orphan.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX fchmod 挂载兼容合同")
+    def test_load_private_token_survives_mount_fchmod_eperm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory)
+            token_file.chmod(0o600)
+            with patch(
+                "app.private_files.os.fchmod",
+                side_effect=PermissionError(errno.EPERM, "operation not permitted"),
+            ), patch(
+                "app.clients.guangya._load_raw",
+                return_value=_RotatingRawClient,
+            ):
+                client = GuangYaClient(token_file=token_file)
+
+            self.assertTrue(client.logged_in)
+            self.assertEqual(client.raw.token, "access-secret-7890")
 
     def test_login_replaces_existing_token_without_revocation_error(self):
         with tempfile.TemporaryDirectory() as directory:

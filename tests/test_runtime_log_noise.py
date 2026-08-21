@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import unittest
@@ -57,6 +58,34 @@ class PrivateFileRaceTests(unittest.TestCase):
 
             # 只有主库存在，-wal/-shm 缺席属于正常状态。
             self.assertTrue(protect_sqlite_files(database))
+
+    @unittest.skipIf(os.name == "nt", "POSIX fchmod 挂载兼容合同")
+    def test_fchmod_eperm_accepts_a_file_that_is_already_private(self):
+        with TemporaryDirectory() as root:
+            target = Path(root) / "private.db"
+            target.write_text("db", encoding="utf-8")
+            target.chmod(0o600)
+
+            with patch.object(
+                private_files.os,
+                "fchmod",
+                side_effect=PermissionError(errno.EPERM, "operation not permitted"),
+            ):
+                self.assertTrue(protect_private_file(target))
+
+    @unittest.skipIf(os.name == "nt", "POSIX fchmod 挂载兼容合同")
+    def test_fchmod_eperm_rejects_a_file_visible_to_other_users(self):
+        with TemporaryDirectory() as root:
+            target = Path(root) / "public.db"
+            target.write_text("db", encoding="utf-8")
+            target.chmod(0o644)
+
+            with patch.object(
+                private_files.os,
+                "fchmod",
+                side_effect=PermissionError(errno.EPERM, "operation not permitted"),
+            ):
+                self.assertFalse(protect_private_file(target))
 
 
 class GuangYaTokenLogNoiseTests(unittest.TestCase):

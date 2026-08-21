@@ -596,7 +596,14 @@ def create_app(*, start_background: bool = False) -> FastAPI:
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, exc: Exception):
-        logger.exception(f"未处理异常 {request.method} {request.url.path}: {exc}")
+        # ServerErrorMiddleware 在调用此 handler 后仍会重新抛出异常，Uvicorn 会
+        # 记录一份完整 traceback。应用侧只保留请求摘要，避免同一堆栈打印两遍。
+        logger.error(
+            "未处理请求异常 method=%s path=%s type=%s",
+            request.method,
+            request.url.path,
+            type(exc).__name__,
+        )
         if request.url.path.startswith("/api/"):
             return JSONResponse({"error": "internal server error"}, status_code=500)
         return PlainTextResponse("Internal Server Error", status_code=500)

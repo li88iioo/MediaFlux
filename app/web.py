@@ -1,6 +1,8 @@
 """FastAPI Web 公共层：模板、会话认证、JSON 响应与阻塞任务辅助。"""
 from __future__ import annotations
 
+import errno
+import logging
 import secrets
 from pathlib import Path
 from typing import Any
@@ -80,3 +82,47 @@ def api_error(message: str, status_code: int = 400) -> JSONResponse:
 
 def api_response(data: Any, status_code: int = 200) -> JSONResponse:
     return JSONResponse(data, status_code=status_code)
+
+
+def config_write_api_error(
+    exc: Exception,
+    *,
+    logger: logging.Logger,
+    operation: str,
+) -> JSONResponse:
+    """把配置持久化异常转换为稳定响应和单行结构化日志。
+
+    这类异常通常来自并发更新、只读卷、宿主目录权限或挂载文件系统能力，
+    属于可诊断的运行环境错误，不应进入全局 ASGI traceback 链路。
+    """
+    from app import config
+
+    if isinstance(exc, config.ExternalConfigOverrideError):
+        return api_error(str(exc), 409)
+    if isinstance(exc, config.ConcurrentConfigUpdateError):
+        logger.warning(
+            "配置写入冲突 operation=%s type=%s",
+            operation,
+            type(exc).__name__,
+        )
+        return api_error("配置已被其他操作修改，请刷新页面后重试", 409)
+
+    error_number = getattr(exc, "errno", None)
+    permission_errnos = {errno.EACCES, errno.EPERM, errno.EROFS}
+    storage_full_errnos = {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}
+    if error_number in permission_errnos:
+        reason = "permission_denied"
+    elif error_number in storage_full_errnos:
+        reason = "storage_full"
+    elif isinstance(exc, OSError):
+        reason = "storage_io_error"
+    else:
+        reason = "atomic_publish_failed"
+    logger.error(
+        "配置写入失败 operation=%s reason=%s type=%s errno=%s",
+        operation,
+        reason,
+        type(exc).__name__,
+        error_number if error_number is not None else "none",
+    )
+    return api_error("配置暂时无法保存，请检查数据目录权限或存储状态后重试", 503)

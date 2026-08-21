@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import hashlib
 import logging
 import os
@@ -17,7 +18,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app import database as db
+from app import config, database as db
 from app.clients.base import DashboardData
 from app.clients.guangya import GuangYaFile
 from app.clients.qbittorrent import TorrentAddResult, TorrentTask
@@ -4053,6 +4054,52 @@ class SecurityTests(InitializedWebTestCase):
             "JELLYFIN_ENABLED": "1",
             "JELLYFIN_URL": "http://jellyfin.local",
         })
+
+    def test_config_endpoint_maps_concurrent_save_to_single_line_conflict(self):
+        headers = self._authenticated()
+        with patch(
+            "app.routes.api.config.set_and_save",
+            side_effect=config.ConcurrentConfigUpdateError("secret conflict detail"),
+        ), self.assertLogs("app.routes.api", level="WARNING") as captured:
+            response = self.client.post(
+                "/api/config",
+                json={"TG_CHAT_ID": "87654321"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json(),
+            {"error": "配置已被其他操作修改，请刷新页面后重试"},
+        )
+        self.assertEqual(len(captured.records), 1)
+        self.assertIsNone(captured.records[0].exc_info)
+        self.assertNotIn("secret conflict detail", "\n".join(captured.output))
+
+    def test_config_endpoint_maps_mount_permission_error_to_safe_503(self):
+        headers = self._authenticated()
+        failure = PermissionError(errno.EPERM, "SECRET-TOKEN operation not permitted")
+        with patch(
+            "app.routes.api.config.set_and_save",
+            side_effect=failure,
+        ), self.assertLogs("app.routes.api", level="ERROR") as captured:
+            response = self.client.post(
+                "/api/config",
+                json={"TG_CHAT_ID": "87654322"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(),
+            {"error": "配置暂时无法保存，请检查数据目录权限或存储状态后重试"},
+        )
+        self.assertEqual(len(captured.records), 1)
+        self.assertIsNone(captured.records[0].exc_info)
+        rendered = "\n".join(captured.output)
+        self.assertIn("reason=permission_denied", rendered)
+        self.assertIn("errno=1", rendered)
+        self.assertNotIn("SECRET-TOKEN", rendered)
 
     def test_config_endpoint_exposes_runtime_strm_default_without_persisting_it(self):
         headers = self._authenticated()

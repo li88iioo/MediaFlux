@@ -22,6 +22,7 @@ class ConfigAtomicWriteTests(unittest.TestCase):
         self.cache_patch = patch.object(config, "_cache", None)
         self.env_patch.start()
         self.cache_patch.start()
+        config._PRIVATE_PERMISSION_FALLBACK_DEVICES.clear()
         app_keys = {
             k for k in os.environ
             if k.startswith((
@@ -37,6 +38,7 @@ class ConfigAtomicWriteTests(unittest.TestCase):
         os.environ.update(self.environment)
         self.cache_patch.stop()
         self.env_patch.stop()
+        config._PRIVATE_PERMISSION_FALLBACK_DEVICES.clear()
         self.temp.cleanup()
 
     def test_web_port_defaults_to_project_default_when_unconfigured(self):
@@ -271,6 +273,67 @@ class ConfigAtomicWriteTests(unittest.TestCase):
         self.assertEqual(len(leaked), 1)
         self.assertEqual(leaked[0].read_bytes(), b"")
         real_unlink(leaked[0])
+
+    @unittest.skipIf(os.name == "nt", "POSIX fchmod 挂载兼容合同")
+    def test_fchmod_eperm_allows_recovery_update_when_reported_mode_is_private(self):
+        self.env_file.parent.mkdir(parents=True)
+        original = b"TMDB_API_KEY=original\n"
+        self.env_file.write_bytes(original)
+        self.env_file.chmod(0o600)
+        error = PermissionError(errno.EPERM, "operation not permitted")
+
+        with patch("app.config.os.fchmod", side_effect=error), patch(
+            "app.config._logger.warning"
+        ) as warning:
+            result = config.update_env_file(
+                self.env_file,
+                {"ENV_WEB_PASSPORT": "admin"},
+                expected=original,
+            )
+
+        self.assertEqual(result.payload, self.env_file.read_bytes())
+        self.assertEqual(result["ENV_WEB_PASSPORT"], "admin")
+        self.assertEqual(list(self.env_file.parent.glob(".user.env.recovery.*.bak")), [])
+        self.assertEqual(list(self.env_file.parent.glob(".user.env.*.tmp")), [])
+        warning.assert_called_once()
+        self.assertIn("拒绝 fchmod", str(warning.call_args))
+
+    @unittest.skipIf(os.name == "nt", "POSIX fchmod 挂载兼容合同")
+    def test_fchmod_eperm_rejects_public_backup_and_restores_original(self):
+        self.env_file.parent.mkdir(parents=True)
+        original = b"TMDB_API_KEY=original\n"
+        self.env_file.write_bytes(original)
+        self.env_file.chmod(0o644)
+        error = PermissionError(errno.EPERM, "operation not permitted")
+
+        with patch("app.config.os.fchmod", side_effect=error):
+            with self.assertRaises(PermissionError) as raised:
+                config.update_env_file(
+                    self.env_file,
+                    {"ENV_WEB_PASSPORT": "admin"},
+                    expected=original,
+                )
+
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+        self.assertEqual(self.env_file.read_bytes(), original)
+        self.assertEqual(list(self.env_file.parent.glob(".user.env.recovery.*.bak")), [])
+        self.assertEqual(list(self.env_file.parent.glob(".user.env.*.tmp")), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX fchmod 挂载兼容合同")
+    def test_non_eperm_fchmod_error_is_not_downgraded(self):
+        self.env_file.parent.mkdir(parents=True)
+        self.env_file.write_text("SAFE_VALUE=old\n", encoding="utf-8")
+        self.env_file.chmod(0o600)
+
+        with patch(
+            "app.config.os.fchmod",
+            side_effect=OSError(errno.EIO, "storage failure"),
+        ):
+            with self.assertRaises(OSError) as raised:
+                config._apply_private_permissions(self.env_file)
+
+        self.assertEqual(raised.exception.errno, errno.EIO)
+
     def test_apply_runtime_values_serializes_with_initial_cache_load(self):
         started = threading.Event()
         release = threading.Event()
