@@ -34,6 +34,8 @@ class LocalStorageTests(unittest.TestCase):
             (root / "Show.S01E01.mkv").write_bytes(b"video")
             (root / "Show.S01E01.zh.ass").write_text("subtitle")
             (root / "poster.jpg").write_bytes(b"image")
+            (root / "readme.txt").write_text("not media")
+            (root / "archive.zip").write_bytes(b"archive")
             (root / "empty.mkv").touch()
             (root / "downloading.mkv.!qB").write_bytes(b"partial")
             outside = Path(outside_raw) / "outside.mkv"
@@ -52,6 +54,24 @@ class LocalStorageTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(snapshot_digest(snapshots), snapshot_digest(list(reversed(snapshots))))
+
+    def test_contains_video_filters_non_media_only_directories(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            non_media = root / "Documents"
+            nested_media = root / "Show" / "Season 01"
+            non_media.mkdir()
+            nested_media.mkdir(parents=True)
+            (non_media / "readme.txt").write_text("notes")
+            (non_media / "archive.zip").write_bytes(b"archive")
+            (nested_media / "Show.S01E01.mkv").write_bytes(b"video")
+
+            adapter = LocalFilesystemAdapter(root)
+
+            self.assertFalse(adapter.contains_video(non_media))
+            self.assertTrue(adapter.contains_video(nested_media.parent))
+            self.assertFalse(adapter.contains_video(non_media / "readme.txt"))
+            self.assertTrue(adapter.contains_video(nested_media / "Show.S01E01.mkv"))
 
     def test_scan_prunes_system_and_temporary_directories_by_exact_name(self):
         with tempfile.TemporaryDirectory() as root_raw:

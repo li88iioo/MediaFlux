@@ -317,6 +317,31 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertEqual(scraper.parents, ["The Ghost in the Shell"])
 
 
+    def test_inspection_filters_non_media_files_from_snapshot(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "downloads-filter"
+            target_root = root / "library"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "Movie.2026.mkv").write_bytes(b"movie")
+            (source_root / "Movie.2026.zh.ass").write_text("subtitle")
+            (source_root / "readme.txt").write_text("ignored")
+            (source_root / "archive.zip").write_bytes(b"ignored")
+            source_id = self._source(source_root, target_root, "movie")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="42", title="Movie", year="2026", media_type="movie", confidence=1.0,
+            )))
+
+            inspection = service.inspect_source("admin", source_id, source_root)
+
+            self.assertEqual(inspection["file_count"], 2)
+            self.assertEqual(inspection["video_count"], 1)
+            self.assertEqual(
+                {item["name"] for item in inspection["files"]},
+                {"Movie.2026.mkv", "Movie.2026.zh.ass"},
+            )
+
     def test_single_tv_file_can_override_season_and_keep_parsed_episode(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source_root = root / "downloads-season-override"; target_root = root / "tv"

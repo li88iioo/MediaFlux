@@ -145,6 +145,52 @@ class LocalFilesystemAdapter:
             raise LocalContentChanged(f"源文件在处理期间发生变化: {snapshot.relative_path}")
         return current
 
+    def contains_video(self, path: Path | None = None) -> bool:
+        """有界检查路径是否包含可整理视频，用于目录条目与自动扫描预筛选。"""
+        start = assert_within(Path(path) if path is not None else self.allowed_root, self.allowed_root)
+        relative_parts = start.relative_to(self.allowed_root).parts
+        if any(is_ignored_local_media_directory(part) for part in relative_parts):
+            return False
+        if start.is_symlink():
+            return False
+        def is_video(candidate: Path) -> bool:
+            if self.is_temporary(candidate) or candidate.is_symlink():
+                return False
+            try:
+                snapshot = self.snapshot(candidate)
+            except (LocalStorageError, OSError):
+                return False
+            return (
+                snapshot.role == "video"
+                and snapshot.size >= self.min_video_size
+                and snapshot.size > 0
+            )
+
+        if start.is_file():
+            return is_video(start)
+        if not start.is_dir():
+            return False
+
+        base_depth = len(start.parts)
+        scanned = 0
+        for current_root, dirs, files in os.walk(start, followlinks=False):
+            current = Path(current_root)
+            depth = len(current.parts) - base_depth
+            if depth > self.depth_limit:
+                raise LocalScanLimitExceeded("目录扫描深度超过安全上限")
+            dirs[:] = [
+                name for name in dirs
+                if not is_ignored_local_media_directory(name)
+                and not (current / name).is_symlink()
+            ]
+            for name in files:
+                scanned += 1
+                if scanned > self.item_limit:
+                    raise LocalScanLimitExceeded("目录文件数量超过安全上限")
+                if is_video(current / name):
+                    return True
+        return False
+
     def scan(self, path: Path | None = None) -> list[LocalFileSnapshot]:
         start = assert_within(Path(path) if path is not None else self.allowed_root, self.allowed_root)
         relative_parts = start.relative_to(self.allowed_root).parts
@@ -182,6 +228,8 @@ class LocalFilesystemAdapter:
                 continue
             snapshot = self.snapshot(candidate)
             if snapshot.size <= 0:
+                continue
+            if snapshot.role == "other":
                 continue
             if snapshot.role == "video" and snapshot.size < self.min_video_size:
                 continue

@@ -290,6 +290,10 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         (movie_dir / "Movie.2026.mkv").write_bytes(b"movie")
         loose_video = self.local_root / "Loose.Movie.2026.mkv"
         loose_video.write_bytes(b"loose")
+        (self.local_root / "readme.txt").write_text("not media")
+        non_media_dir = self.local_root / "Documents"
+        non_media_dir.mkdir()
+        (non_media_dir / "archive.zip").write_bytes(b"archive")
         trash = self.local_root / ".mediaflux-trash"
         trash.mkdir()
         (trash / "ignored").mkdir()
@@ -311,6 +315,9 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual([item["name"] for item in items], ["Loose.Movie.2026.mkv", "Movie.2026"])
         self.assertTrue(all(item["organize_ready"] for item in items))
         self.assertEqual({item["kind"] for item in items}, {"directory", "video"})
+        self.assertNotIn("readme.txt", listed.text)
+        self.assertNotIn("Documents", listed.text)
+        self.assertNotIn("archive.zip", listed.text)
         self.assertNotIn(".mediaflux-trash", listed.text)
         for ignored_name in ("@eaDir", "temp", "TMP", "#recycle"):
             self.assertNotIn(ignored_name, listed.text)
