@@ -99,6 +99,8 @@ class ToolSpec:
     llm_read_plan: bool = False
     llm_confirmation: bool = False
     native_alias: str = ""
+    # 只用于模型候选召回与能力说明，不参与权限、风险、确认或限流判定。
+    llm_examples: tuple[str, ...] = ()
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -108,3 +110,14 @@ class ToolSpec:
             "parameters": self.parameters,
             "requires_confirmation": self.requires_confirmation,
         }
+
+    def llm_capability_dict(self) -> dict[str, Any]:
+        capability = self.public_dict()
+        examples = [
+            str(item).strip()[:160]
+            for item in self.llm_examples[:6]
+            if str(item).strip()
+        ]
+        if examples:
+            capability["examples"] = examples
+        return capability

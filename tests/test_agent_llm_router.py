@@ -258,6 +258,53 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in capabilities], ["workspace.health"])
         self.assertEqual(capabilities[0]["risk"], "read")
 
+    def test_llm_examples_are_private_routing_metadata(self):
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="alpha.inspect",
+            description="读取演示状态",
+            risk=RiskLevel.READ,
+            parameters={"type": "object", "properties": {}},
+            validator=_identity,
+            handler=lambda arguments: ToolResult(True, "ok", "done"),
+            llm_read=True,
+            llm_examples=("看看演示有没有变化",),
+        ))
+
+        public = registry.capabilities()[0]
+        llm_capability = registry.llm_read_capabilities()[0]
+
+        self.assertEqual(
+            set(public),
+            {"name", "description", "risk", "parameters", "requires_confirmation"},
+        )
+        self.assertNotIn("examples", public)
+        self.assertEqual(llm_capability["examples"], ["看看演示有没有变化"])
+        self.assertIs(
+            registry.llm_disposition_for("alpha.inspect"),
+            LLMToolDisposition.EXECUTE_READ,
+        )
+
+    def test_registry_rejects_invalid_llm_examples(self):
+        invalid_examples = (
+            ("bad\nexample",),
+            ("x" * 161,),
+            tuple(str(i) for i in range(7)),
+        )
+        for examples in invalid_examples:
+            with self.subTest(examples=examples), self.assertRaises(ValueError):
+                registry = ToolRegistry()
+                registry.register(ToolSpec(
+                    name="alpha.inspect",
+                    description="读取演示状态",
+                    risk=RiskLevel.READ,
+                    parameters={"type": "object", "properties": {}},
+                    validator=_identity,
+                    handler=lambda arguments: ToolResult(True, "ok", "done"),
+                    llm_read=True,
+                    llm_examples=examples,
+                ))
+
     def test_confirmation_capabilities_expose_registry_declared_tools(self):
         capabilities = confirmation_tool_capabilities(_confirmation_registry())
 
@@ -477,6 +524,39 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertIn("library.search", default_names)
         self.assertNotIn("library.audit_library_episodes", default_names)
         self.assertLessEqual(len(default_caps), 14)
+
+    def test_native_semantic_recall_is_independent_of_tool_prefix(self):
+        registry = ToolRegistry()
+        specs = (
+            (
+                "alpha.queue_probe",
+                "诊断 qBittorrent 下载传输是否卡住",
+                ("qB 下载为什么一直卡住",),
+            ),
+            ("beta.catalog", "读取影片目录摘要", ()),
+            ("gamma.weather", "读取天气快照", ()),
+            ("delta.notes", "读取维护备注", ()),
+            ("epsilon.profile", "读取用户界面偏好", ()),
+        )
+        for name, description, examples in specs:
+            registry.register(ToolSpec(
+                name=name,
+                description=description,
+                risk=RiskLevel.READ,
+                parameters={"type": "object", "properties": {}},
+                validator=_identity,
+                handler=lambda arguments: ToolResult(True, "ok", "done"),
+                llm_read=True,
+                llm_examples=examples,
+            ))
+
+        capabilities = _native_read_capabilities(
+            registry, "帮我看看 qB 下载为什么一直卡住"
+        )
+        names = [registry.native_tool_name(item["name"]) for item in capabilities]
+
+        self.assertEqual(names, ["alpha.queue_probe"])
+        self.assertIn("qB 下载为什么一直卡住", capabilities[0]["description"])
 
     def test_capabilities_expose_registry_declared_web_search(self):
         registry = _read_registry()
@@ -1166,18 +1246,22 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertIsNotNone(reply)
         assert reply is not None
         self.assertFalse(reply.completed)
-        self.assertEqual(reply.stop_reason, "request_budget_exhausted")
-        self.assertEqual(len(captured["urls"]), 4)
-        self.assertEqual(captured["chat_requests"], 3)
-        self.assertEqual(budget_calls, [True, True, True])
-        self.assertEqual(executed, [{"n": 1}, {"n": 2}, {"n": 3}])
+        self.assertEqual(reply.stop_reason, "provider_round_limit")
+        self.assertEqual(len(captured["urls"]), 6)
+        self.assertEqual(captured["chat_requests"], 5)
+        self.assertEqual(budget_calls, [True, True, True, True, True])
+        self.assertEqual(executed, [
+            {"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}
+        ])
 
-    def test_native_read_agent_allows_final_text_on_fourth_provider_request(self):
+    def test_native_read_agent_allows_final_text_on_sixth_provider_request(self):
         scripted = [
             _chat_tool_turn(("call_1", 1)),
             _chat_tool_turn(("call_2", 2)),
             _chat_tool_turn(("call_3", 3)),
-            _chat_text_turn("三项计数均已读取，结果完整。"),
+            _chat_tool_turn(("call_4", 4)),
+            _chat_tool_turn(("call_5", 5)),
+            _chat_text_turn("五项计数均已读取，结果完整。"),
         ]
         captured = {"requests": 0}
 
@@ -1206,7 +1290,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
             side_effect=lambda key, default="": values.get(key, default),
         ):
             reply = asyncio.run(_request_native_read_agent(
-                "连续读取三项计数后总结",
+                "连续读取五项计数后总结",
                 _counter_read_registry(),
                 lambda name, arguments: executed.append(dict(arguments)) or {
                     "tool_call": {"name": name, "arguments": arguments},
@@ -1220,16 +1304,20 @@ class AgentLLMSelectionTests(unittest.TestCase):
 
         self.assertIsNotNone(reply)
         self.assertTrue(reply.completed)
-        self.assertEqual(reply.answer, "三项计数均已读取,结果完整。")
-        self.assertEqual(captured["requests"], 4)
-        self.assertEqual(executed, [{"n": 1}, {"n": 2}, {"n": 3}])
+        self.assertEqual(reply.answer, "五项计数均已读取,结果完整。")
+        self.assertEqual(captured["requests"], 6)
+        self.assertEqual(executed, [
+            {"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}, {"n": 5}
+        ])
 
-    def test_native_read_agent_does_not_execute_tool_turn_on_fourth_request(self):
+    def test_native_read_agent_does_not_execute_tool_turn_on_sixth_request(self):
         scripted = [
             _chat_tool_turn(("call_1", 1)),
             _chat_tool_turn(("call_2", 2)),
             _chat_tool_turn(("call_3", 3)),
             _chat_tool_turn(("call_4", 4)),
+            _chat_tool_turn(("call_5", 5)),
+            _chat_tool_turn(("call_6", 6)),
         ]
         captured = {"requests": 0}
 
@@ -1273,15 +1361,18 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertIsNotNone(reply)
         self.assertFalse(reply.completed)
         self.assertEqual(reply.stop_reason, "provider_round_limit")
-        self.assertEqual(captured["requests"], 4)
-        self.assertEqual(executed, [{"n": 1}, {"n": 2}, {"n": 3}])
+        self.assertEqual(captured["requests"], 6)
+        self.assertEqual(executed, [
+            {"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}, {"n": 5}
+        ])
 
     def test_native_read_agent_rejects_over_limit_tool_batch_before_execution(self):
         scripted = [
             _chat_tool_turn(("call_1", 1)),
             _chat_tool_turn(
-                ("call_2", 2), ("call_3", 3),
-                ("call_4", 4), ("call_5", 5),
+                ("call_2", 2), ("call_3", 3), ("call_4", 4),
+                ("call_5", 5), ("call_6", 6), ("call_7", 7),
+                ("call_8", 8), ("call_9", 9),
             ),
         ]
         captured = {"requests": 0}
@@ -1679,15 +1770,18 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertEqual(response["confirmation"]["risk"], "low_write")
         self.assertEqual(calls, [])
 
-    def test_unified_read_selection_executes_only_validated_read_handler(self):
+    def test_llm_first_read_selection_executes_only_validated_read_handler(self):
         calls = []
         registry = _read_registry(calls=calls)
         selection = LLMToolSelection("workspace.health", {})
 
         with patch(
-            "app.agent.orchestrator.select_orchestration_tool",
-            return_value=selection,
+            "app.agent.orchestrator.run_native_read_agent", return_value=None
         ), patch(
+            "app.agent.orchestrator.select_read_tool", return_value=selection
+        ), patch(
+            "app.agent.orchestrator.select_orchestration_tool"
+        ) as orchestration_selector, patch(
             "app.agent.orchestrator.compose_tool_answer", return_value=None
         ):
             response = AgentOrchestrator(registry).query(
@@ -1696,6 +1790,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(response["tool_call"]["name"], "workspace.health")
         self.assertEqual(calls, [{}])
+        orchestration_selector.assert_not_called()
 
     def test_native_multi_tool_reply_precedes_single_tool_selection_and_is_not_rewritten(self):
         registry = _read_registry()
@@ -1881,7 +1976,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertIn("user: 为什么？", content)
         self.assertLessEqual(len(content), 4_500)
 
-    def test_deterministic_route_has_priority_over_llm(self):
+    def test_llm_first_read_falls_back_to_deterministic_library_search(self):
         registry = ToolRegistry()
         registry.register(ToolSpec(
             name="library.search",
@@ -1891,12 +1986,22 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             validator=_identity,
             handler=lambda arguments: ToolResult(True, "ok", "found", data=arguments),
         ))
-        with patch("app.agent.orchestrator.select_read_tool") as selector:
-            response = AgentOrchestrator(registry).query("帮我找《沙丘》", owner="web-session")
+        agent = AgentOrchestrator(registry)
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model_router:
+            response = agent.query("帮我找《沙丘》", owner="web-session")
         self.assertEqual(response["tool_call"]["name"], "library.search")
-        selector.assert_not_called()
+        model_router.assert_called_once_with(
+            "帮我找《沙丘》",
+            owner="web-session",
+            llm_rate_owner="",
+            llm_tool_rate_identity="",
+            conversation_context=None,
+            read_only=True,
+        )
 
-    def test_deterministic_download_diagnosis_precedes_model_routing(self):
+    def test_llm_first_read_falls_back_to_deterministic_download_diagnosis(self):
         registry = ToolRegistry()
         registry.register(ToolSpec(
             name="downloads.diagnose_queue",
@@ -1909,7 +2014,9 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             ),
         ))
         agent = AgentOrchestrator(registry)
-        with patch.object(agent, "_query_with_model_tools") as model_router:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model_router:
             response = agent.query(
                 "检查下载队列有没有异常",
                 owner="web-session",
@@ -1917,7 +2024,39 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             )
 
         self.assertEqual(response["tool_call"]["name"], "downloads.diagnose_queue")
-        model_router.assert_not_called()
+        model_router.assert_called_once()
+        self.assertTrue(model_router.call_args.kwargs["read_only"])
+
+    def test_llm_first_read_response_precedes_deterministic_handler(self):
+        deterministic_calls = []
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="downloads.diagnose_queue",
+            description="检查下载队列",
+            risk=RiskLevel.READ,
+            parameters={"type": "object", "additionalProperties": False},
+            validator=_identity,
+            handler=lambda arguments: deterministic_calls.append(arguments) or ToolResult(
+                True, "healthy", "下载队列正常"
+            ),
+        ))
+        model_response = {
+            "request_id": "model-first",
+            "mode": "conversation",
+            "tool_call": None,
+            "result": ToolResult(True, "answered", "模型已完成只读检查").to_dict(),
+        }
+        agent = AgentOrchestrator(registry)
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=model_response
+        ) as model_router:
+            response = agent.query(
+                "检查下载队列有没有异常", owner="web-session", present=False
+            )
+
+        self.assertIs(response, model_response)
+        self.assertEqual(deterministic_calls, [])
+        self.assertTrue(model_router.call_args.kwargs["read_only"])
 
     def test_fallback_executes_only_valid_read_selection(self):
         calls = []

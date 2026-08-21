@@ -374,7 +374,13 @@ class WorkspaceNextActionsRoutingTests(IsolatedDatabaseTestCase):
         self.addCleanup(agent_rate_limiter.reset)
         agent = self._agent()
         selection = LLMToolSelection("workspace.next_actions", {})
-        with patch("app.agent.orchestrator.select_orchestration_tool", return_value=selection):
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent", return_value=None
+        ), patch(
+            "app.agent.orchestrator.select_read_tool", return_value=selection
+        ), patch(
+            "app.agent.orchestrator.select_orchestration_tool"
+        ) as orchestration_selector:
             for _ in range(4):
                 response = agent.query(
                     "请帮我安排工作顺序",
@@ -383,6 +389,7 @@ class WorkspaceNextActionsRoutingTests(IsolatedDatabaseTestCase):
                 self.assertEqual(
                     response["tool_call"]["name"], "workspace.next_actions"
                 )
+            orchestration_selector.assert_not_called()
         with self.assertRaisesRegex(AgentToolError, "请求过于频繁"):
             agent.query(
                 "工作区下一步做什么",
@@ -390,7 +397,11 @@ class WorkspaceNextActionsRoutingTests(IsolatedDatabaseTestCase):
             )
 
         invalid = LLMToolSelection("workspace.next_actions", {"token": "PRIVATE"})
-        with patch("app.agent.orchestrator.select_orchestration_tool", return_value=invalid):
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent", return_value=None
+        ), patch(
+            "app.agent.orchestrator.select_read_tool", return_value=invalid
+        ):
             response = agent.query(
                 "请重新安排工作顺序",
                 llm_tool_rate_identity="another-owner",

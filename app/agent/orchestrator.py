@@ -71,6 +71,20 @@ _QUERY_CONFIRMATION_EPOCH: ContextVar[tuple[str, int] | None] = ContextVar(
 _QUERY_TOOL_RATE_IDENTITY: ContextVar[str] = ContextVar(
     "agent_query_tool_rate_identity", default=""
 )
+_LLM_FIRST_CONTEXT_MARKERS = (
+    "这部", "这集", "这个", "它", "刚才", "上一个", "继续", "重试",
+    "再来", "刷新一下", "打开它", "关闭它", "有多少", "缺不缺",
+)
+
+
+def _prefer_deterministic_context_route(
+    message: str, conversation_context: list[dict[str, Any]] | None
+) -> bool:
+    """强指代继续由服务端绑定已验证上下文，模型不负责猜测对象。"""
+    if not conversation_context:
+        return False
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    return any(marker in normalized for marker in _LLM_FIRST_CONTEXT_MARKERS)
 
 
 class AgentInputError(ValueError):
@@ -5302,12 +5316,14 @@ class AgentOrchestrator:
         llm_rate_owner: str,
         llm_tool_rate_identity: str,
         conversation_context: list[dict[str, Any]] | None,
+        read_only: bool = False,
     ) -> dict[str, Any] | None:
         """让模型在注册表边界内理解请求，失败时返回 ``None`` 继续确定性回退。
 
         普通查询优先进入原生多工具只读循环，使模型可以围绕同一目标连续读取多个
-        数据源并自行归纳；明确动作则只允许统一选择器命中注册表公开的确认型工具，
-        不会误入只读循环。任何非法工具名、越权风险或参数错误均按失败关闭处理。
+        数据源并自行归纳。``read_only`` 模式不会向模型暴露确认型工具；明确动作
+        仍只能通过既有统一选择器创建确认票据。非法名称、越权风险或参数错误均
+        按失败关闭处理。
         """
         rate_identity = llm_tool_rate_identity or llm_rate_owner or owner
         action_request = is_agent_action_request(message)
@@ -5372,19 +5388,20 @@ class AgentOrchestrator:
             if not action_request and is_compound_read_request(message):
                 return None
 
-            selection = select_orchestration_tool(
-                message,
-                self.registry,
-                owner=owner,
-                rate_owner=llm_rate_owner or owner,
-                **(
-                    {"conversation_context": conversation_context}
-                    if conversation_context else {}
-                ),
-            )
-            selected_response = _execute_selection(selection)
-            if selected_response is not None:
-                return selected_response
+            if not read_only:
+                selection = select_orchestration_tool(
+                    message,
+                    self.registry,
+                    owner=owner,
+                    rate_owner=llm_rate_owner or owner,
+                    **(
+                        {"conversation_context": conversation_context}
+                        if conversation_context else {}
+                    ),
+                )
+                selected_response = _execute_selection(selection)
+                if selected_response is not None:
+                    return selected_response
 
             # 明确动作但统一路由无法可靠匹配时，交回针对候选对象、确认票据和
             # 业务上下文的确定性解析器；不能把“刷新/下载/修改”当成普通对话。
@@ -6102,6 +6119,44 @@ class AgentOrchestrator:
         if recent_download_followup is not None:
             return recent_download_followup
 
+        # 最近巡检资源接力依赖 owner-scoped 快照，必须在模型前由服务端绑定。
+        if (
+            is_recent_library_patrol_resource_message(lower)
+            or _is_recent_library_patrol_resource_reference(lower)
+        ):
+            patrol_followup = self._handle_patrol_and_schedule_requests(
+                message, lower=lower, owner=owner
+            )
+            if patrol_followup is not None:
+                return patrol_followup
+
+        action_request = is_agent_action_request(message)
+        has_resource_continuation = bool(
+            owner
+            and self.recent_resource_store.get(owner=owner) is not None
+            and recent_resource_submit_request(message, allow_implicit=True) is not None
+        )
+        model_routing_attempted = False
+        if (
+            allow_model_routing
+            and not action_request
+            and not has_resource_continuation
+            and not _prefer_deterministic_context_route(
+                message, conversation_context
+            )
+        ):
+            model_routing_attempted = True
+            model_read = self._query_with_model_tools(
+                message,
+                owner=owner,
+                llm_rate_owner=llm_rate_owner,
+                llm_tool_rate_identity=llm_tool_rate_identity,
+                conversation_context=conversation_context,
+                read_only=True,
+            )
+            if model_read is not None:
+                return model_read
+
         history_request = agent_action_history_request(message)
         if history_request is not None:
             return self._invoke_query_read("agent.action_history", history_request, owner=owner)
@@ -6142,11 +6197,9 @@ class AgentOrchestrator:
             return automation_response
 
         compound_plan_request = is_compound_read_request(message)
-        model_routing_attempted = False
-        if compound_plan_request and allow_model_routing:
-            # 复合只读请求仍在确定性单域路由之后处理，但需要先给原生多工具
-            # 循环一次机会；否则“同时检查下载队列和项目配置”会被后面的宽泛
-            # “配置”关键词错误截成单个 config.diagnose。
+        if compound_plan_request and allow_model_routing and not model_routing_attempted:
+            # 只有前置 read-only 模型层因强上下文等原因未尝试时，才在这里
+            # 为复合只读请求补一次模型机会；随后仍可回退严格 JSON read plan。
             model_routing_attempted = True
             model_compound = self._query_with_model_tools(
                 message,
@@ -6574,9 +6627,8 @@ class AgentOrchestrator:
                     recent_resource_request, owner=owner
                 )
 
-        # 到达这里说明所有专用领域意图均未命中。对“帮我找《片名》”这类
-        # 明确、带引号的本地库查询保留零模型快速路径；它位于专用路由之后，
-        # 因而不会再抢占下载控制、缺集审计、更新检查或全局搜索。
+        # 模型不可用或未可靠完成时，对“帮我找《片名》”这类明确、带引号的
+        # 本地库查询保留零模型回退。
         explicit_library_query = _extract_search_query(message)
         if explicit_library_query and re.search(
             r"[《「『\"']([^》」』\"']{1,120})[》」』\"']", message
@@ -6587,9 +6639,8 @@ class AgentOrchestrator:
                 owner=owner,
             )
 
-        # 明确的下载控制、缺集审计、更新检查、索引检索等确定性业务路由
-        # 始终优先。仅在这些专用意图均未命中时，才让模型从注册表公开的
-        # 安全工具中选择：READ 可执行，LOW_WRITE 只生成确认票据。
+        # 动作请求或强上下文请求不会进入前置 read-only 模型层；仅在确定性
+        # 业务路由也未命中时使用兼容选择器。READ 可执行，写工具只生成确认票据。
         model_routed = None
         if allow_model_routing and not model_routing_attempted:
             model_routed = self._query_with_model_tools(
@@ -6598,6 +6649,7 @@ class AgentOrchestrator:
                 llm_rate_owner=llm_rate_owner,
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
+                read_only=not action_request,
             )
         if model_routed is not None:
             return model_routed

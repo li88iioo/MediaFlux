@@ -111,9 +111,9 @@ def is_confirmation_planning_request(message: str) -> bool:
     )
 
 
-_NATIVE_MAX_PROVIDER_CALLS = 4
-_NATIVE_MAX_TOOL_ROUNDS = 3
-_NATIVE_MAX_TOOL_CALLS = 4
+_NATIVE_MAX_PROVIDER_CALLS = 6
+_NATIVE_MAX_TOOL_ROUNDS = 5
+_NATIVE_MAX_TOOL_CALLS = 8
 _NATIVE_MAX_CAPABILITIES = 14
 _STREAM_MAX_ANSWER_CHARS = 1800
 _STREAM_FORBIDDEN_MARKERS = (
@@ -539,7 +539,8 @@ async def _request_selection(
     compact_tools = [
         {
             "name": item["name"],
-            "description": str(item["description"])[:300],
+            "description": _capability_prompt_description(item, limit=420),
+            "examples": list(_capability_examples(item)),
             "operation": (
                 "prepare_confirmation"
                 if item.get("requires_confirmation")
@@ -593,7 +594,12 @@ async def _request_read_plan(
 ) -> LLMReadPlan | None:
     names = [item["name"] for item in capabilities]
     compact_tools = [
-        {"name": item["name"], "description": str(item["description"])[:300], "parameters": item["parameters"]}
+        {
+            "name": item["name"],
+            "description": _capability_prompt_description(item, limit=420),
+            "examples": list(_capability_examples(item)),
+            "parameters": item["parameters"],
+        }
         for item in capabilities
     ]
     step_schema = {
@@ -1162,32 +1168,9 @@ async def stream_existing_answer(
         yield delta
 
 
-_NATIVE_READ_DOMAIN_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("rss", "订阅源", "订阅列表", "订阅条目"), ("rss.",)),
-    (("追更", "媒体订阅", "订阅的媒体", "我的订阅"), ("media.",)),
-    (("下载队列", "下载任务", "qb", "qbittorrent", "传输"), ("downloads.",)),
-    (("strm", "播放链接"), ("strm.",)),
-    (("光鸭", "云盘"), ("guangya.",)),
-    (("资源站", "索引器", "索引站点", "磁力", "种子", "资源搜索"), ("indexer.",)),
-    (("媒体库", "jellyfin", "emby", "剧集", "集数", "缺集", "季数", "更新"), ("library.",)),
-    (("本地媒体", "本地整理", "媒体来源"), ("local_media.",)),
-    (("评分", "豆瓣", "tmdb", "bangumi", "上映", "推荐", "探索"), ("discovery.", "bangumi.")),
-    (("网页", "联网", "网上", "互联网", "最新消息"), ("web.search",)),
-    (("反代", "代理实例", "播放代理"), ("media_proxy.",)),
-    (("整理", "刮削", "识别", "自动化链路"), ("organize.", "automation.")),
-    (("配置", "设置", "环境变量", "服务配置"), ("config.",)),
-    (("工作区", "系统简报", "系统状态", "整体状态", "整体健康", "健康检查", "能做什么"), ("workspace.", "agent.capabilities")),
-    (("操作历史", "执行历史", "做过什么"), ("agent.action_history",)),
-)
-_NATIVE_GENERIC_SEARCH_TOOLS = (
-    "library.search",
-    "discovery.search",
-    "indexer.search_resources",
-    "web.search",
-)
-# 没有明显领域词时仍给模型一个受限的“常用只读工具箱”。
-# 这让“列出列表”“这部剧评分”“现在什么情况”一类自然续问可以由模型
-# 结合最近上下文自主选择工具，同时避免把全量工具 schema 注入每次请求。
+# 没有可辨识语义词时仍给模型一个受限的“常用只读工具箱”。
+# 这让“列出列表”“现在什么情况”一类自然续问可以由模型结合最近上下文
+# 自主选择工具，同时避免把全量工具 schema 注入每次请求。
 _NATIVE_DEFAULT_READ_TOOLS = (
     "workspace.briefing",
     "workspace.health",
@@ -1231,7 +1214,7 @@ def _native_context_text(
                 parts.append(text)
             tool_name = str(item.get("tool_name") or "").strip()
             if tool_name and len(tool_name) <= 120:
-                # 只参与服务端领域裁剪，不写入传给 Provider 的用户内容。
+                # 只参与服务端语义召回，不写入传给 Provider 的用户内容。
                 parts.append(tool_name)
             media = _safe_media_context_for_llm(item.get("media_context"))
             if media:
@@ -1239,83 +1222,177 @@ def _native_context_text(
     return unicodedata.normalize("NFKC", " ".join(parts)).casefold()
 
 
+def _semantic_tokens(value: object) -> frozenset[str]:
+    """生成稳定的中英文词项；不依赖外部分词器。"""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", normalized):
+        if len(token) >= 2:
+            tokens.add(token)
+    for run in re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]+", normalized):
+        if 2 <= len(run) <= 12:
+            tokens.add(run)
+        for size in (2, 3):
+            if len(run) < size:
+                continue
+            tokens.update(
+                run[index:index + size]
+                for index in range(len(run) - size + 1)
+            )
+    return frozenset(tokens)
+
+
+def _parameter_semantic_text(parameters: object) -> str:
+    if not isinstance(parameters, dict):
+        return ""
+    parts: list[str] = []
+    properties = parameters.get("properties")
+    if isinstance(properties, dict):
+        for name, schema in properties.items():
+            parts.append(str(name).replace("_", " "))
+            if not isinstance(schema, dict):
+                continue
+            enum = schema.get("enum")
+            if isinstance(enum, list):
+                parts.extend(str(item) for item in enum[:20])
+            description = str(schema.get("description") or "").strip()
+            if description:
+                parts.append(description[:160])
+    return " ".join(parts)
+
+
+def _capability_examples(capability: Mapping[str, Any]) -> tuple[str, ...]:
+    raw_examples = capability.get("examples")
+    if not isinstance(raw_examples, list):
+        return ()
+    return tuple(
+        str(item).strip()[:160]
+        for item in raw_examples[:6]
+        if str(item).strip()
+    )
+
+
+def _semantic_capability_weights(capability: Mapping[str, Any]) -> dict[str, float]:
+    weighted_parts = (
+        (str(capability.get("name") or "").replace(".", " ").replace("_", " "), 1.5),
+        (str(capability.get("description") or ""), 2.0),
+        (_parameter_semantic_text(capability.get("parameters")), 0.75),
+        (" ".join(_capability_examples(capability)), 4.0),
+    )
+    weights: dict[str, float] = {}
+    for value, weight in weighted_parts:
+        for token in _semantic_tokens(value):
+            weights[token] = max(weights.get(token, 0.0), weight)
+    return weights
+
+
+def _rank_read_capabilities(
+    capabilities: list[dict[str, Any]],
+    context_text: str,
+    *,
+    max_candidates: int = _NATIVE_MAX_CAPABILITIES,
+) -> list[dict[str, Any]]:
+    """按工具自身语义排序候选，同时保留昂贵能力的显式范围门。"""
+    if not capabilities:
+        return []
+
+    allow_full_library_audit = any(
+        marker in context_text for marker in _NATIVE_FULL_LIBRARY_MARKERS
+    )
+    eligible = [
+        item for item in capabilities
+        if str(item.get("name") or "").strip() != "library.audit_library_episodes"
+        or allow_full_library_audit
+    ]
+    if len(eligible) <= 4:
+        return eligible[:max_candidates]
+
+    query_tokens = _semantic_tokens(context_text)
+    documents = [_semantic_capability_weights(item) for item in eligible]
+    document_frequency: dict[str, int] = {}
+    for document in documents:
+        for token in document:
+            document_frequency[token] = document_frequency.get(token, 0) + 1
+
+    normalized_context = unicodedata.normalize("NFKC", context_text).casefold()
+    ranked: list[tuple[float, str, dict[str, Any]]] = []
+    total_documents = len(documents)
+    for item, document in zip(eligible, documents):
+        score = 0.0
+        for token in query_tokens:
+            weight = document.get(token)
+            if weight is None:
+                continue
+            inverse_frequency = math.log(
+                (total_documents + 1) / (document_frequency.get(token, 0) + 1)
+            ) + 1.0
+            score += weight * inverse_frequency
+        for example in _capability_examples(item):
+            normalized_example = unicodedata.normalize("NFKC", example).casefold()
+            if normalized_example and (
+                normalized_example in normalized_context
+                or normalized_context in normalized_example
+            ):
+                score += 12.0
+        name = str(item.get("name") or "").strip()
+        if score > 0 and name:
+            ranked.append((score, name, item))
+
+    if ranked:
+        ranked.sort(key=lambda entry: (-entry[0], entry[1]))
+        best_score = ranked[0][0]
+        minimum_score = max(1.0, best_score * 0.30)
+        return [
+            item for score, _, item in ranked
+            if score >= minimum_score
+        ][:max_candidates]
+
+    by_name = {
+        str(item.get("name") or "").strip(): item
+        for item in eligible
+    }
+    defaults = [
+        by_name[name] for name in _NATIVE_DEFAULT_READ_TOOLS if name in by_name
+    ]
+    if defaults:
+        return defaults[:max_candidates]
+    return sorted(
+        eligible, key=lambda item: str(item.get("name") or "")
+    )[:max_candidates]
+
+
+def _capability_prompt_description(
+    capability: Mapping[str, Any], *, limit: int
+) -> str:
+    description = str(capability.get("description") or "").strip()
+    examples = _capability_examples(capability)
+    if examples:
+        description += " 适用示例：" + "；".join(examples)
+    return description[:limit]
+
+
 def _native_read_capabilities(
     registry: ToolRegistry,
     message: str = "",
     conversation_context: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """按当前领域裁剪原生工具，避免把完整注册表塞给每次模型请求。"""
+    """基于工具自身语义召回有界只读候选，不再按名称前缀硬门控。"""
     context_text = _native_context_text(message, conversation_context)
-    all_capabilities = read_tool_capabilities(registry)
-    selected_names: list[str] = []
-
-    def _add(name: str) -> None:
-        if name not in selected_names:
-            selected_names.append(name)
-
-    for markers, prefixes in _NATIVE_READ_DOMAIN_RULES:
-        if not any(marker in context_text for marker in markers):
-            continue
-        for item in all_capabilities:
-            name = str(item.get("name") or "").strip()
-            if any(name == prefix or name.startswith(prefix) for prefix in prefixes):
-                _add(name)
-
-    media_subscription_update = bool(
-        "rss" not in context_text
-        and "订阅" in context_text
-        and "更新" in context_text
-        and any(
-            marker in context_text
-            for marker in ("有没有", "有无", "了吗", "吗", "么", "情况", "检查", "看看", "查询", "又更新")
-        )
-        and not any(
-            marker in context_text
-            for marker in ("订阅源", "刷新", "间隔", "频率", "设置", "配置", "修改", "暂停", "停用", "恢复", "启用")
-        )
+    selected = _rank_read_capabilities(
+        read_tool_capabilities(registry),
+        context_text,
+        max_candidates=_NATIVE_MAX_CAPABILITIES,
     )
-    if media_subscription_update:
-        selected_names = [
-            name for name in selected_names if name.startswith("media.")
-        ]
-        _add("media.subscription_updates")
-
-    if any(marker in context_text for marker in ("搜索", "查找", "找一下", "搜一下")):
-        for name in _NATIVE_GENERIC_SEARCH_TOOLS:
-            _add(name)
-
-    # 全库巡检成本高，只在用户明确表达全库范围时交给模型选择。
-    if not any(marker in context_text for marker in _NATIVE_FULL_LIBRARY_MARKERS):
-        selected_names = [
-            name for name in selected_names if name != "library.audit_library_episodes"
-        ]
-
-    if not selected_names:
-        if len(all_capabilities) <= 4:
-            selected_names = [
-                str(item.get("name") or "").strip() for item in all_capabilities
-            ]
-        else:
-            # 生产注册表也必须允许模型处理没有关键词、但可以通过上下文理解的
-            # 自然语言。这里只暴露常用只读能力，不包含全库巡检等昂贵工具。
-            selected_names = list(_NATIVE_DEFAULT_READ_TOOLS)
-
-    by_name = {
-        str(item.get("name") or "").strip(): item
-        for item in all_capabilities
-    }
     capabilities: list[dict[str, Any]] = []
-    for tool_name in selected_names[:_NATIVE_MAX_CAPABILITIES]:
-        item = by_name.get(tool_name)
-        if not isinstance(item, dict):
-            continue
+    for item in selected:
+        tool_name = str(item.get("name") or "").strip()
         alias = registry.native_alias_for(tool_name)
         parameters = item.get("parameters")
         if not alias or not isinstance(parameters, dict):
             continue
         capabilities.append({
             "name": alias,
-            "description": str(item.get("description") or "").strip()[:600],
+            "description": _capability_prompt_description(item, limit=600),
             "parameters": parameters,
         })
     return capabilities
@@ -1585,7 +1662,9 @@ async def _request_native_read_agent(
                         )
                     return state.partial("invalid_final_answer")
 
-                if request_index + 1 >= _NATIVE_MAX_PROVIDER_CALLS:
+                # 最后一个全局 Provider 请求只允许返回最终文本；协议回退不会
+                # 重新获得一个可执行工具的末轮。
+                if state.provider_requests >= _NATIVE_MAX_PROVIDER_CALLS:
                     logger.warning(
                         "Agent LLM native event outcome=round_limit protocol=%s", protocol
                     )
@@ -2133,7 +2212,11 @@ def select_read_tool(
         or contains_sensitive_credential(normalized)
     ):
         return None
-    capabilities = read_tool_capabilities(registry)
+    capabilities = _rank_read_capabilities(
+        read_tool_capabilities(registry),
+        _native_context_text(normalized, conversation_context),
+        max_candidates=_NATIVE_MAX_CAPABILITIES,
+    )
     if not capabilities:
         return None
     if not _allow_llm_request(owner):
@@ -2167,7 +2250,11 @@ def select_read_plan(
         or contains_sensitive_credential(normalized)
     ):
         return None
-    capabilities = read_plan_capabilities(registry)
+    capabilities = _rank_read_capabilities(
+        read_plan_capabilities(registry),
+        _native_context_text(normalized, conversation_context),
+        max_candidates=_NATIVE_MAX_CAPABILITIES,
+    )
     if len(capabilities) < 2:
         return None
     if not _allow_llm_request(owner):

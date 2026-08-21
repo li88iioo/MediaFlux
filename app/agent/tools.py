@@ -1081,6 +1081,10 @@ def build_tool_registry() -> ToolRegistry:
         validator=download_diagnosis_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "检查下载队列有没有异常",
+            "qBittorrent 里有没有卡住的任务",
+        ),
     ))
     download_task_parameters = {
         "type": "object",
@@ -1248,6 +1252,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=list_media_subscription_summaries,
         validator=media_subscription_summaries_arguments,
         llm_read=True,
+        llm_examples=(
+            "我订阅了哪些媒体",
+            "列出当前的追更订阅",
+        ),
     ))
     registry.register(ToolSpec(
         name="media.subscription_updates",
@@ -1260,6 +1268,11 @@ def build_tool_registry() -> ToolRegistry:
         handler=inspect_media_subscription_updates,
         validator=media_subscription_updates_arguments,
         llm_read=True,
+        llm_examples=(
+            "我订阅的媒体又更新吗",
+            "检查追更订阅有没有新集",
+            "看看订阅缺哪些集并搜索资源",
+        ),
     ))
     registry.register(ToolSpec(
         name="media.get_subscription_summary",
@@ -1865,6 +1878,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=search_web,
         validator=web_search_arguments,
         llm_read=True,
+        llm_examples=(
+            "搜索网上的最新消息",
+            "联网查公开网页信息",
+        ),
     ))
     registry.register(ToolSpec(
         name="discovery.search",
@@ -1894,6 +1911,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=search_discovery,
         validator=discovery_search_arguments,
         llm_read=True,
+        llm_examples=(
+            "从 TMDB 或豆瓣搜索影视资料",
+            "查一部电影的外部元数据",
+        ),
     ))
     registry.register(ToolSpec(
         name="discovery.lookup_rating",
@@ -2051,6 +2072,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=search_resources,
         validator=indexer_search_arguments,
         llm_read=True,
+        llm_examples=(
+            "搜索《某片》的下载资源",
+            "找种子或磁力资源",
+        ),
     ))
     registry.register(ToolSpec(
         name="indexer.submit_resource",
@@ -2080,6 +2105,10 @@ def build_tool_registry() -> ToolRegistry:
         validator=workspace_briefing_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "给我一份系统简报",
+            "现在有哪些事情需要处理",
+        ),
     ))
     registry.register(ToolSpec(
         name="workspace.health",
@@ -2090,6 +2119,10 @@ def build_tool_registry() -> ToolRegistry:
         validator=workspace_health_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "检查整个媒体系统是否健康",
+            "排查配置和媒体服务器连通性",
+        ),
     ))
     registry.register(ToolSpec(
         name="workspace.todo",
@@ -2153,6 +2186,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=search_library,
         validator=_search_arguments,
         llm_read=True,
+        llm_examples=(
+            "媒体库里有没有《某片》",
+            "在 Jellyfin 或 Emby 搜索这个标题",
+        ),
     ))
 
     registry.register(ToolSpec(
@@ -2255,6 +2292,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=check_library_updates,
         validator=_library_update_arguments,
         llm_read=True,
+        llm_examples=(
+            "检查《某剧》有没有更新",
+            "这部剧最新播到哪里而本地有多少",
+        ),
     ))
 
     registry.register(ToolSpec(
@@ -2272,6 +2313,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=audit_library_episodes,
         validator=_library_episode_audit_arguments,
         llm_read=True,
+        llm_examples=(
+            "巡检整个媒体库有没有缺集",
+            "检查全部剧集的完整性",
+        ),
     ))
 
     registry.register(ToolSpec(
@@ -2396,6 +2441,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=count_series_episodes,
         validator=count_series_episodes_arguments,
         llm_read=True,
+        llm_examples=(
+            "媒体库中《某剧》一共有多少集",
+            "这部剧本地有几季几集",
+        ),
     ))
 
     registry.register(ToolSpec(

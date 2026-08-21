@@ -24,6 +24,7 @@ from app.logger import get_logger
 
 logger = get_logger(__name__)
 _NATIVE_ALIAS_RE = re.compile(r"^mf_[A-Za-z0-9_-]{1,61}$")
+_LLM_EXAMPLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 
@@ -84,6 +85,17 @@ class ToolRegistry:
             if item.llm_read
         ):
             raise ValueError(f"duplicate native tool alias: {alias}")
+        if (
+            len(spec.llm_examples) > 6
+            or any(
+                not isinstance(example, str)
+                or not example.strip()
+                or len(example.strip()) > 160
+                or _LLM_EXAMPLE_CONTROL_RE.search(example)
+                for example in spec.llm_examples
+            )
+        ):
+            raise ValueError(f"invalid LLM routing examples: {name}")
         self._tools[name] = spec
 
     def capabilities(self) -> list[dict[str, Any]]:
@@ -91,21 +103,21 @@ class ToolRegistry:
 
     def llm_read_capabilities(self) -> list[dict[str, Any]]:
         return [
-            self._tools[name].public_dict()
+            self._tools[name].llm_capability_dict()
             for name in sorted(self._tools)
             if self._tools[name].llm_read
         ]
 
     def llm_read_plan_capabilities(self) -> list[dict[str, Any]]:
         return [
-            self._tools[name].public_dict()
+            self._tools[name].llm_capability_dict()
             for name in sorted(self._tools)
             if self._tools[name].llm_read_plan
         ]
 
     def llm_confirmation_capabilities(self) -> list[dict[str, Any]]:
         return [
-            self._tools[name].public_dict()
+            self._tools[name].llm_capability_dict()
             for name in sorted(self._tools)
             if self._tools[name].llm_confirmation
         ]
@@ -115,7 +127,7 @@ class ToolRegistry:
     ) -> list[dict[str, Any]]:
         """返回统一语义路由可见工具；匿名调用方只能获得只读能力。"""
         return [
-            self._tools[name].public_dict()
+            self._tools[name].llm_capability_dict()
             for name in sorted(self._tools)
             if self._tools[name].llm_read
             or (include_confirmations and self._tools[name].llm_confirmation)
