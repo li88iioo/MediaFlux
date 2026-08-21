@@ -168,7 +168,7 @@ class ScraperAndOrganizerTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(
             organizer.build_new_name(match, file, {"season": 1, "episode": 2}, rules),
-            "Show_ Name.2026.S01E02-1080p.H.265.mkv",
+            "Show_ Name.2026.S01E02-WEB-DL.1080p.H.265.mkv",
         )
         self.assertEqual(
             organizer.build_show_dir(match, rules),

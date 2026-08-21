@@ -286,6 +286,30 @@ CREATE TABLE IF NOT EXISTS organize_operation_steps (
 );
 CREATE INDEX IF NOT EXISTS idx_organize_operation_steps_log_id ON organize_operation_steps(log_id, id);
 
+CREATE TABLE IF NOT EXISTS organize_probe_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organize_log_id INTEGER NOT NULL UNIQUE,
+    provider TEXT NOT NULL DEFAULT 'guangya',
+    source_id TEXT NOT NULL DEFAULT '',
+    rel_dir TEXT NOT NULL DEFAULT '',
+    rules_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued','running','retry_wait','completed','failed','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    max_attempts INTEGER NOT NULL DEFAULT 2 CHECK(max_attempts >= 1),
+    next_attempt_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_until REAL NOT NULL DEFAULT 0,
+    last_error_type TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (organize_log_id) REFERENCES organize_log(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_organize_probe_queue_due
+    ON organize_probe_queue(status,next_attempt_at,id);
+
 CREATE TABLE IF NOT EXISTS organize_delete_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     organize_log_id INTEGER,
@@ -1928,6 +1952,20 @@ from app.repositories.media_probe import (  # noqa: E402
     get_media_probe_cache_many,
     upsert_media_probe_cache,
     upsert_media_probe_failure_cache,
+)
+
+
+# ===== 整理后媒体规格补全队列 =====
+from app.repositories.organize_probe import (  # noqa: E402
+    cancel_organize_probe_job,
+    claim_due_organize_probe_jobs,
+    commit_organize_probe_rename,
+    complete_organize_probe_job,
+    count_organize_probe_jobs,
+    enqueue_organize_probe_completion,
+    fail_or_retry_organize_probe_job,
+    recover_stale_organize_probe_jobs,
+    release_organize_probe_job,
 )
 
 

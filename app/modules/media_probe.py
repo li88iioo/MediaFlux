@@ -207,7 +207,7 @@ class MediaProfile:
     def render(self) -> str:
         return ".".join(value for value in (
             self.source, self.resolution, self.dynamic_range, self.video_codec, self.bit_depth,
-            _render_bitrate(self.video_bitrate_bps), self.fps,
+            _render_bitrate(self.video_bitrate_bps or self.overall_bitrate_bps), self.fps,
             self.audio_codec, self.audio_channels,
         ) if value)
 
@@ -248,6 +248,108 @@ def infer_media_source(value: object) -> str:
         if re.search(pattern, text, flags=re.I):
             return label
     return ""
+
+
+def infer_media_profile(value: object) -> MediaProfile:
+    """从发布名/路径提取强证据，作为 ffprobe 缺失字段的无网络降级。"""
+    text = str(value or "")
+    lowered = text.casefold()
+    compact = re.sub(r"[^a-z0-9+]", "", lowered)
+    resolution = next(
+        (token for token in ("2160p", "1080p", "720p", "480p") if token in lowered),
+        "",
+    )
+    if "dolbyvision" in compact or "dovi" in compact:
+        dynamic_range = "DoVi"
+        dolby_vision: bool | None = True
+    elif "hdr10+" in lowered or "hdr10plus" in compact:
+        dynamic_range = "HDR10+"
+        dolby_vision = None
+    elif "hdr10" in compact:
+        dynamic_range = "HDR10"
+        dolby_vision = None
+    elif re.search(r"(?:^|[._ /-])hdr(?:[._ /-]|$)", lowered):
+        dynamic_range = "HDR"
+        dolby_vision = None
+    elif re.search(r"(?:^|[._ /-])sdr(?:[._ /-]|$)", lowered):
+        dynamic_range = "SDR"
+        dolby_vision = None
+    else:
+        dynamic_range = ""
+        dolby_vision = None
+
+    if any(token in compact for token in ("h265", "x265", "hevc")):
+        video_codec = "H.265"
+    elif any(token in compact for token in ("h264", "x264", "avc")):
+        video_codec = "H.264"
+    elif "av1" in compact:
+        video_codec = "AV1"
+    else:
+        video_codec = ""
+
+    bit_depth_match = re.search(
+        r"(?<!\d)(10|12|14|16)\s*[-_. ]?\s*bit(?:s)?(?!\d)",
+        lowered,
+        re.I,
+    )
+    fps_match = re.search(r"(?<!\d)(\d{2}(?:\.\d+)?)\s*fps", lowered)
+    audio_codec = ""
+    for pattern, label in (
+        (r"truehd", "TrueHD"), (r"e-?ac-?3|eac3|ddp", "EAC3"),
+        (r"dts-?hd", "DTS-HD"), (r"dts", "DTS"),
+        (r"flac", "FLAC"), (r"aac", "AAC"), (r"ac-?3", "AC3"),
+    ):
+        if re.search(pattern, lowered):
+            audio_codec = label
+            break
+    channel_match = re.search(r"(?<!\d)([257]\.1|[12]\.0)(?!\d)", lowered)
+    atmos_evidence = re.sub(r"non[^a-z0-9]*atmos", "", lowered, flags=re.I)
+    atmos = True if (
+        re.search(r"(?:^|[^a-z0-9])atmos(?:[^a-z0-9]|$)", atmos_evidence)
+        or re.search(r"(?:^|[^a-z0-9])joc(?:[^a-z0-9]|$)", atmos_evidence)
+    ) else None
+    return MediaProfile(
+        resolution=resolution,
+        dynamic_range=dynamic_range,
+        video_codec=video_codec,
+        bit_depth=(f"{bit_depth_match.group(1)}-bit" if bit_depth_match else ""),
+        fps=(f"{fps_match.group(1)}fps" if fps_match else ""),
+        audio_codec=audio_codec,
+        audio_channels=(channel_match.group(1) if channel_match and audio_codec else ""),
+        source=infer_media_source(text),
+        dolby_vision=dolby_vision,
+        atmos=atmos,
+    )
+
+
+def merge_media_profiles(
+    primary: MediaProfile | None, fallback: MediaProfile | None,
+) -> MediaProfile:
+    """逐字段合并媒体证据；探测结果优先，发布名仅补空缺。"""
+    preferred = primary or MediaProfile()
+    secondary = fallback or MediaProfile()
+    return MediaProfile(
+        resolution=preferred.resolution or secondary.resolution,
+        dynamic_range=preferred.dynamic_range or secondary.dynamic_range,
+        video_codec=preferred.video_codec or secondary.video_codec,
+        bit_depth=preferred.bit_depth or secondary.bit_depth,
+        fps=preferred.fps or secondary.fps,
+        audio_codec=preferred.audio_codec or secondary.audio_codec,
+        audio_channels=preferred.audio_channels or secondary.audio_channels,
+        source=preferred.source or secondary.source,
+        dolby_vision=(
+            preferred.dolby_vision
+            if preferred.dolby_vision is not None else secondary.dolby_vision
+        ),
+        atmos=preferred.atmos if preferred.atmos is not None else secondary.atmos,
+        video_bitrate_bps=(
+            preferred.video_bitrate_bps or secondary.video_bitrate_bps
+        ),
+        overall_bitrate_bps=(
+            preferred.overall_bitrate_bps or secondary.overall_bitrate_bps
+        ),
+        bitrate_source=preferred.bitrate_source or secondary.bitrate_source,
+    )
 
 
 def _resolution(width, height) -> str:
@@ -366,7 +468,7 @@ def parse_ffprobe_payload(payload: dict, *, source_hint: object = "") -> MediaPr
     format_info = format_info if isinstance(format_info, dict) else {}
     video_bitrate = _positive_int(video.get("bit_rate"))
     overall_bitrate = _positive_int(format_info.get("bit_rate"))
-    return MediaProfile(
+    probed = MediaProfile(
         resolution=_resolution(video.get("width"), video.get("height")),
         dynamic_range=dynamic,
         video_codec=codec,
@@ -374,13 +476,13 @@ def parse_ffprobe_payload(payload: dict, *, source_hint: object = "") -> MediaPr
         fps=_fps(video.get("avg_frame_rate") or video.get("r_frame_rate")),
         audio_codec=audio_codec,
         audio_channels=channel_text,
-        source=infer_media_source(source_hint),
         video_bitrate_bps=video_bitrate,
         overall_bitrate_bps=overall_bitrate,
         bitrate_source="video_stream" if video_bitrate else ("container" if overall_bitrate else ""),
         dolby_vision=dolby_vision,
         atmos=atmos,
     )
+    return merge_media_profiles(probed, infer_media_profile(source_hint))
 
 
 def media_profile_from_cache(
@@ -394,9 +496,10 @@ def media_profile_from_cache(
             return None
         profile = MediaProfile(**data)
         if source_hint is not None:
-            # 来源标签来自当前路径而非媒体比特流。内容指纹缓存可以跨 file_id
-            # 复用规格，但不能把旧文件名中的 WEB-DL/Remux 等标签带到新名称。
-            profile = replace(profile, source=infer_media_source(source_hint))
+            # 来源/发布标签来自当前路径而非媒体比特流。内容指纹缓存可以跨
+            # file_id 复用技术规格，但不能把旧文件名证据带到新名称。
+            profile = replace(profile, source="")
+            profile = merge_media_profiles(profile, infer_media_profile(source_hint))
         return profile
     except (TypeError, ValueError):
         return None

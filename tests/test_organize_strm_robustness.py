@@ -162,6 +162,7 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
             match=MatchResult(tmdb_id="1", title="Movie", year="2026", media_type="movie"),
             main_category="电影", new_name="Movie.2026.mkv",
             target_path="电影/Movie (2026) {tmdb-1}",
+            media_probe_pending=True,
         )
         stats = {
             "moved": 0, "renamed": 0, "rename_failed": 0,
@@ -171,9 +172,16 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
             "scan_errors": [], "strm_changes": [], "strm_force_full": False,
         }
         organizer = Organizer(client=Client(), scraper=object())
+        probe_worker = unittest.mock.Mock()
         with patch.object(organizer, "_ensure_dir_chain", return_value="target-id"), patch.object(
             organizer, "_resolve_variant_conflict", return_value=(None, "none", "")
-        ), patch.object(organizer, "_write_organize_audit", return_value=1):
+        ), patch.object(organizer, "_write_organize_audit", return_value=1), patch(
+            "app.modules.organize.db.enqueue_organize_probe_completion",
+            return_value=9,
+        ) as enqueue_probe, patch(
+            "app.modules.organize_probe_worker.get_organize_probe_worker",
+            return_value=probe_worker,
+        ):
             execute_organize_plans(organizer,
                 [plan],
                 OrganizeRules(target_dir_id="archive", rename_enabled=True),
@@ -181,7 +189,17 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
             )
 
         self.assertEqual(stats["moved"], 1)
+        self.assertEqual(stats["media_probe_background_queued"], 1)
         self.assertFalse(stats["strm_force_full"])
+        enqueue_probe.assert_called_once()
+        self.assertEqual(enqueue_probe.call_args.args, (1,))
+        self.assertEqual(enqueue_probe.call_args.kwargs["source_id"], "archive")
+        self.assertEqual(
+            enqueue_probe.call_args.kwargs["rel_dir"],
+            "电影/Movie (2026) {tmdb-1}",
+        )
+        self.assertTrue(enqueue_probe.call_args.kwargs["rules"]["media_probe_enabled"])
+        probe_worker.wake.assert_called_once_with()
         self.assertEqual(stats["strm_changes"], [{
             "source_id": "archive", "kind": "video", "action": "upsert",
             "file_id": "video", "rel_dir": "电影/Movie (2026) {tmdb-1}",

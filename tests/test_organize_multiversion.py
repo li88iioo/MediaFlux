@@ -214,7 +214,9 @@ class MultiVersionNamingTests(unittest.TestCase):
 
         name = organizer.build_new_name(match, file, {"season": None, "episode": None}, rules)
 
-        self.assertTrue(name.endswith(".DoVi.Atmos.Remux.mkv"), name)
+        self.assertIn(".Remux.", name)
+        self.assertIn(".DoVi.", name)
+        self.assertTrue(name.endswith(".Atmos.mkv"), name)
 
     def test_build_new_name_uses_probe_flags_for_variant_tags(self):
         organizer = Organizer(client=object(), scraper=object())

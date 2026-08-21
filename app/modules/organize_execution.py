@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Callable
 
 from app.modules.organize_postprocess import (
@@ -617,6 +618,31 @@ def execute_organize_plans(
                     db.update_organize_delete_audit(
                         delete_audit_id, organize_log_id=log_id
                     )
+                if p.media_probe_pending and isinstance(log_id, int):
+                    try:
+                        db.enqueue_organize_probe_completion(
+                            log_id,
+                            source_id=str(rules.target_dir_id or ""),
+                            rel_dir=str(p.target_path or ""),
+                            rules=asdict(rules),
+                            delay_seconds=130,
+                            max_attempts=2,
+                        )
+                        stats["media_probe_background_queued"] = int(
+                            stats.get("media_probe_background_queued", 0) or 0
+                        ) + 1
+                        from app.modules.organize_probe_worker import (
+                            get_organize_probe_worker,
+                        )
+                        get_organize_probe_worker().wake()
+                    except Exception as queue_exc:
+                        stats["media_probe_background_queue_failed"] = int(
+                            stats.get("media_probe_background_queue_failed", 0) or 0
+                        ) + 1
+                        logger.warning(
+                            "媒体规格后台补全入队失败 file=%s type=%s",
+                            p.file_id, type(queue_exc).__name__,
+                        )
                 stats.setdefault("strm_changes", []).append({
                     "source_id": str(rules.target_dir_id),
                     "kind": "video",

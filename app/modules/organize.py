@@ -552,6 +552,9 @@ class OrganizePlan:
     # 追加在末尾以保持历史位置参数构造的语义兼容。
     source_group_id: str = ""
     source_group_path: str = ""
+    media_profile: object | None = field(default=None, repr=False, compare=False)
+    media_probe_complete: bool = False
+    media_probe_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -1033,53 +1036,11 @@ class Organizer:
 
     @staticmethod
     def _extract_media_info(filename: str) -> str:
-        f = str(filename or "").lower()
-        compact = re.sub(r"[^a-z0-9+]", "", f)
-        tags: list[str] = []
-        for token in ("2160p", "1080p", "720p", "480p"):
-            if token in f:
-                tags.append(token)
-                break
-        if "dolbyvision" in compact or "dovi" in compact:
-            tags.append("DoVi")
-        elif "hdr10+" in f or "hdr10plus" in compact:
-            tags.append("HDR10+")
-        elif "hdr10" in compact:
-            tags.append("HDR10")
-        elif re.search(r"(?:^|[._ -])hdr(?:[._ -]|$)", f):
-            tags.append("HDR")
-        elif re.search(r"(?:^|[._ -])sdr(?:[._ -]|$)", f):
-            tags.append("SDR")
-        if any(token in compact for token in ("h265", "x265", "hevc")):
-            tags.append("H.265")
-        elif any(token in compact for token in ("h264", "x264", "avc")):
-            tags.append("H.264")
-        elif "av1" in compact:
-            tags.append("AV1")
-        # 在线 ffprobe 临时不可用时，仍从发布名保留明确位深证据。
-        # 8-bit 是常规默认值，不额外写入，避免历史媒体发生无意义重命名。
-        bit_depth = re.search(
-            r"(?<!\d)(10|12|14|16)\s*[-_. ]?\s*bit(?:s)?(?!\d)", f, re.I,
-        )
-        if bit_depth:
-            tags.append(f"{bit_depth.group(1)}-bit")
-        fps = re.search(r"(?<!\d)(\d{2}(?:\.\d+)?)\s*fps", f)
-        if fps:
-            tags.append(f"{fps.group(1)}fps")
-        audio = ""
-        for pattern, label in (
-            (r"truehd", "TrueHD"), (r"e-?ac-?3|eac3|ddp", "EAC3"),
-            (r"dts-?hd", "DTS-HD"), (r"dts", "DTS"),
-            (r"flac", "FLAC"), (r"aac", "AAC"), (r"ac-?3", "AC3"),
-        ):
-            if re.search(pattern, f):
-                audio = label
-                tags.append(label)
-                break
-        channel = re.search(r"(?<!\d)([257]\.1|[12]\.0)(?!\d)", f)
-        if channel and audio:
-            tags.append(channel.group(1))
-        return ".".join(tags)
+        # 与在线探测使用同一套结构化回退，确保 ffprobe 失败时仍保留
+        # WEB-DL/BluRay、分辨率、编码、音轨等文件名强证据。
+        from app.modules.media_probe import infer_media_profile
+
+        return infer_media_profile(filename).render()
 
     # ===== 覆盖策略 =====
     def should_replace(self, existing: GuangYaFile, new_file: GuangYaFile,
@@ -1696,6 +1657,9 @@ class Organizer:
             cache_only=probe_cache_only,
             stats=stats,
             cancel_event=context.cancel_event,
+        )
+        self._apply_media_source_consensus(
+            plans, source_files_by_id, rules=rules, stats=stats,
         )
         subtitle_plans_by_video: dict[str, list] = {}
         for rel, candidates in companion_files.items():
@@ -3657,6 +3621,7 @@ class Organizer:
                 cache_prefetched=media_probe_cache_prefetched,
                 budget=self._probe_budget,
             )
+        plan.media_probe_complete = media_profile is not None
         self._apply_media_profile_to_move_plan(
             plan, file, rules, match, parsed, media_profile,
         )
@@ -3699,11 +3664,23 @@ class Organizer:
         parsed: dict,
         media_profile,
     ) -> None:
-        """按媒体规格重算名称与版本身份，不改变已验证的归档路径。"""
-        media_info_override = media_profile.render() if media_profile else ""
+        """按字段合并探测与发布名证据，再重算名称和版本身份。"""
+        from app.modules.media_probe import infer_media_profile, merge_media_profiles
+
+        source_hint = "/".join(
+            part for part in (
+                str(plan.original_path or ""), str(plan.original_name or ""),
+                str(file.name or ""),
+            ) if part
+        )
+        effective_profile = merge_media_profiles(
+            media_profile, infer_media_profile(source_hint),
+        )
+        media_info_override = effective_profile.render()
+        plan.media_profile = effective_profile
         plan.season = parsed.get("season")
         plan.episode = parsed.get("episode")
-        plan.variant = classify_variant(file.name, media_profile or media_info_override)
+        plan.variant = classify_variant(file.name, effective_profile)
         variant_tags = plan.variant.filename_tags(rules)
         plan.variant_label = " / ".join(variant_tags) if variant_tags else "未识别版本"
         plan.variant_suffix = ".".join(variant_tags)
@@ -3718,8 +3695,68 @@ class Organizer:
             parsed,
             rules,
             media_info_override=media_info_override,
-            media_variant_override=media_profile,
+            media_variant_override=effective_profile,
         )
+
+    def _apply_media_source_consensus(
+        self,
+        plans: list[OrganizePlan],
+        source_files_by_id: dict[str, GuangYaFile],
+        *,
+        rules: OrganizeRules,
+        stats: dict,
+    ) -> None:
+        """同父目录、同媒体、同季的来源强证据一致时补齐未知集。"""
+        from app.modules.media_probe import MediaProfile, infer_media_source
+
+        groups: dict[tuple[str, str, int], list[OrganizePlan]] = {}
+        for plan in plans:
+            if (
+                plan.action != "move"
+                or plan.match is None
+                or plan.match.media_type != "tv"
+                or plan.season is None
+            ):
+                continue
+            identity = self._match_identity_key(plan.match)
+            if not identity:
+                continue
+            key = (str(plan.original_parent_id or ""), identity, int(plan.season))
+            groups.setdefault(key, []).append(plan)
+
+        applied_groups = 0
+        applied_items = 0
+        for group_plans in groups.values():
+            explicit_sources = [
+                infer_media_source(
+                    "/".join(part for part in (plan.original_path, plan.original_name) if part)
+                )
+                for plan in group_plans
+            ]
+            explicit_sources = [source for source in explicit_sources if source]
+            if len(explicit_sources) < 2 or len(set(explicit_sources)) != 1:
+                continue
+            consensus = explicit_sources[0]
+            changed = 0
+            for plan in group_plans:
+                file = source_files_by_id.get(str(plan.file_id or ""))
+                profile = plan.media_profile
+                if file is None or (profile is not None and getattr(profile, "source", "")):
+                    continue
+                effective = replace(
+                    profile if profile is not None else MediaProfile(),
+                    source=consensus,
+                )
+                self._apply_media_profile_to_move_plan(
+                    plan, file, rules, plan.match,
+                    {"season": plan.season, "episode": plan.episode}, effective,
+                )
+                changed += 1
+            if changed:
+                applied_groups += 1
+                applied_items += changed
+        stats["media_source_consensus_groups"] = applied_groups
+        stats["media_source_consensus_items"] = applied_items
 
     def _probe_move_plan_profiles(
         self,
@@ -3738,11 +3775,20 @@ class Organizer:
         stats["media_probe_online_candidates"] = 0
         stats["media_probe_online_profiles"] = 0
         stats["media_probe_elapsed_seconds"] = 0.0
-        if (
-            cache_only
-            or not rules.media_info_enabled
-            or not rules.media_probe_enabled
-        ):
+
+        def mark_pending() -> None:
+            for plan in plans:
+                if plan.action == "move" and plan.match is not None:
+                    plan.media_probe_pending = not plan.media_probe_complete
+
+        if not rules.media_info_enabled or not rules.media_probe_enabled:
+            # 用户显式关闭媒体详情或在线探测时必须保持关闭语义，不能在
+            # 整理完成后又由后台 worker 悄悄发起 ffprobe。
+            for plan in plans:
+                plan.media_probe_pending = False
+            return
+        if cache_only:
+            mark_pending()
             return
 
         candidates: list[GuangYaFile] = []
@@ -3757,6 +3803,7 @@ class Organizer:
             seen.add(file_id)
             candidates.append(file)
         if not candidates:
+            mark_pending()
             return
 
         from app.modules.media_probe import (
@@ -3788,8 +3835,6 @@ class Organizer:
             time.monotonic() - started, 3
         )
         stats["media_probe_online_profiles"] = len(profiles)
-        if not profiles:
-            return
 
         plans_by_file_id = {
             str(plan.file_id): plan
@@ -3802,9 +3847,11 @@ class Organizer:
             if plan is None or file is None or plan.match is None:
                 continue
             parsed = {"season": plan.season, "episode": plan.episode}
+            plan.media_probe_complete = True
             self._apply_media_profile_to_move_plan(
                 plan, file, rules, plan.match, parsed, profile,
             )
+        mark_pending()
 
     def _plan_one(
         self,

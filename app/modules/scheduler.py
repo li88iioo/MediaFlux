@@ -155,8 +155,10 @@ class STRMScheduler:
         self._recover_change_queue()
         self._recover_notification_outbox()
         from app.modules.strm_metadata_worker import get_strm_metadata_worker
+        from app.modules.organize_probe_worker import get_organize_probe_worker
 
         get_strm_metadata_worker().start()
+        get_organize_probe_worker().start()
         logger.info("STRM 调度器已启动")
 
     @staticmethod
@@ -217,7 +219,9 @@ class STRMScheduler:
         else:
             logger.warning("STRM 工作线程未能在关闭超时内结束 trigger=%s", self._current_trigger)
         from app.modules.strm_metadata_worker import get_strm_metadata_worker
+        from app.modules.organize_probe_worker import get_organize_probe_worker
 
+        get_organize_probe_worker().stop(timeout=timeout)
         get_strm_metadata_worker().stop(timeout=timeout)
 
     def reload(self) -> None:
@@ -532,6 +536,13 @@ class STRMScheduler:
         except Exception:
             logger.exception("读取 STRM 元数据队列状态失败")
             metadata_queue = db.count_strm_metadata_jobs()
+        try:
+            from app.modules.organize_probe_worker import get_organize_probe_worker
+
+            organize_probe_queue = get_organize_probe_worker().status()
+        except Exception:
+            logger.exception("读取整理媒体规格补全队列状态失败")
+            organize_probe_queue = db.count_organize_probe_jobs()
         return {
             "enabled": enabled,
             "cron": cron_expr,
@@ -548,6 +559,7 @@ class STRMScheduler:
             "progress": progress,
             "source_runtime": source_runtime,
             "metadata_queue": metadata_queue,
+            "organize_probe_queue": organize_probe_queue,
             "next_run": next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "",
             "last_run": self._row_to_dict(last),
         }
