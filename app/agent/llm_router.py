@@ -1164,7 +1164,7 @@ async def stream_existing_answer(
 
 _NATIVE_READ_DOMAIN_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("rss", "订阅源", "订阅列表", "订阅条目"), ("rss.",)),
-    (("追更", "媒体订阅"), ("media.",)),
+    (("追更", "媒体订阅", "订阅的媒体", "我的订阅"), ("media.",)),
     (("下载队列", "下载任务", "qb", "qbittorrent", "传输"), ("downloads.",)),
     (("strm", "播放链接"), ("strm.",)),
     (("光鸭", "云盘"), ("guangya.",)),
@@ -1260,6 +1260,25 @@ def _native_read_capabilities(
             name = str(item.get("name") or "").strip()
             if any(name == prefix or name.startswith(prefix) for prefix in prefixes):
                 _add(name)
+
+    media_subscription_update = bool(
+        "rss" not in context_text
+        and "订阅" in context_text
+        and "更新" in context_text
+        and any(
+            marker in context_text
+            for marker in ("有没有", "有无", "了吗", "吗", "么", "情况", "检查", "看看", "查询", "又更新")
+        )
+        and not any(
+            marker in context_text
+            for marker in ("订阅源", "刷新", "间隔", "频率", "设置", "配置", "修改", "暂停", "停用", "恢复", "启用")
+        )
+    )
+    if media_subscription_update:
+        selected_names = [
+            name for name in selected_names if name.startswith("media.")
+        ]
+        _add("media.subscription_updates")
 
     if any(marker in context_text for marker in ("搜索", "查找", "找一下", "搜一下")):
         for name in _NATIVE_GENERIC_SEARCH_TOOLS:

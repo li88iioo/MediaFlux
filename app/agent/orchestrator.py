@@ -1229,6 +1229,13 @@ _MEDIA_SUBSCRIPTION_LIST_TOKENS = (
 _MEDIA_SUBSCRIPTION_WRITE_TOKENS = (
     "暂停", "停用", "禁用", "关闭", "恢复", "启用", "开启",
 )
+_MEDIA_SUBSCRIPTION_UPDATE_QUERY_TOKENS = (
+    "有没有", "有无", "了吗", "吗", "么", "情况", "检查", "看看", "查询", "又更新",
+)
+_MEDIA_SUBSCRIPTION_UPDATE_EXCLUDED_TOKENS = (
+    "rss", "订阅源", "刷新", "间隔", "频率", "设置", "配置", "修改",
+    *_MEDIA_SUBSCRIPTION_WRITE_TOKENS,
+)
 
 
 def _has_media_subscription_scope(message: str) -> bool:
@@ -1260,6 +1267,18 @@ def is_media_subscription_summaries_message(message: str) -> bool:
     return any(token in normalized for token in _MEDIA_SUBSCRIPTION_LIST_TOKENS) and any(
         token in normalized for token in _MEDIA_SUBSCRIPTION_READ_TOKENS
     )
+
+
+def is_media_subscription_updates_message(message: str) -> bool:
+    """识别“我的订阅有更新吗”一类实时媒体追更核对，不与 RSS 配置混淆。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not normalized or any(
+        token in normalized for token in _MEDIA_SUBSCRIPTION_UPDATE_EXCLUDED_TOKENS
+    ):
+        return False
+    if "订阅" not in normalized or "更新" not in normalized:
+        return False
+    return any(token in normalized for token in _MEDIA_SUBSCRIPTION_UPDATE_QUERY_TOKENS)
 
 
 def media_subscription_control_request(
@@ -4272,6 +4291,7 @@ class AgentOrchestrator:
             "library.search_missing_episode_resources",
             "library.search_missing_season_resources",
             "indexer.search_resources",
+            "media.subscription_updates",
         } and owner:
             self.recent_resource_store.capture(owner=owner, result=result)
         if tool_name in {"discovery.search", "discovery.recommend"} and owner:
@@ -5741,6 +5761,8 @@ class AgentOrchestrator:
         media_summary_request = media_subscription_summary_request(message)
         if media_summary_request is not None:
             return self._invoke_query_read("media.get_subscription_summary", media_summary_request, owner=owner)
+        if is_media_subscription_updates_message(message):
+            return self._invoke_query_read("media.subscription_updates", {}, owner=owner)
         if is_media_subscription_summaries_message(message):
             return self._invoke_query_read("media.subscription_summaries", {}, owner=owner)
 

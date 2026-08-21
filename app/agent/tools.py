@@ -84,10 +84,12 @@ from app.agent.rss_subscription_control_actions import (
 )
 from app.agent.media_subscription_actions import (
     get_media_subscription_summary,
+    inspect_media_subscription_updates,
     list_media_subscription_summaries,
     media_subscription_enabled_arguments,
     media_subscription_summaries_arguments,
     media_subscription_summary_arguments,
+    media_subscription_updates_arguments,
     prepare_set_media_subscription_enabled,
     set_media_subscription_enabled,
     set_media_subscription_enabled_confirmed,
@@ -1245,6 +1247,18 @@ def build_tool_registry() -> ToolRegistry:
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         handler=list_media_subscription_summaries,
         validator=media_subscription_summaries_arguments,
+        llm_read=True,
+    ))
+    registry.register(ToolSpec(
+        name="media.subscription_updates",
+        description=(
+            "实时检查全部媒体追更订阅：逐条比较 TMDB 已播清单与 Jellyfin/Emby 本地库存，"
+            "并对确认缺失项执行有界多站资源搜索；只返回下载建议，不提交 qBittorrent 或光鸭。"
+        ),
+        risk=RiskLevel.READ,
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=inspect_media_subscription_updates,
+        validator=media_subscription_updates_arguments,
         llm_read=True,
     ))
     registry.register(ToolSpec(

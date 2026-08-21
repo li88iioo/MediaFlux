@@ -457,6 +457,17 @@ class AgentLLMSelectionTests(unittest.TestCase):
         patrol_names = {registry.native_tool_name(item["name"]) for item in patrol}
         self.assertIn("library.audit_library_episodes", patrol_names)
 
+        media_updates = _native_read_capabilities(
+            registry, "我订阅的媒体又更新吗"
+        )
+        media_update_names = {
+            registry.native_tool_name(item["name"]) for item in media_updates
+        }
+        self.assertIn("media.subscription_updates", media_update_names)
+        self.assertNotIn("library.patrol_policy", media_update_names)
+        self.assertNotIn("library.patrol_status", media_update_names)
+        self.assertTrue(all(name.startswith("media.") for name in media_update_names))
+
         default_caps = _native_read_capabilities(registry, "你好")
         default_names = {
             registry.native_tool_name(item["name"]) for item in default_caps

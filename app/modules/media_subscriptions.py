@@ -30,6 +30,8 @@ logger = get_logger(__name__)
 
 _MAX_SEARCH_EPISODES = 12
 _MAX_CANDIDATES_PER_MEDIA = 8
+_PREVIEW_MAX_SEARCH_EPISODES = 3
+_PREVIEW_MAX_CANDIDATES_PER_MEDIA = 3
 _AUTO_RELEVANCE_THRESHOLD = 90
 _ALLOWED_MEDIA_TYPES = frozenset({"movie", "tv"})
 _ALLOWED_MONITOR_MODES = frozenset({"missing", "future", "selected"})
@@ -465,6 +467,71 @@ class MediaSubscriptionService:
             if str(row["status"] or "") in {"available", "submitted"}
         ]
 
+    async def preview_subscription_updates(
+        self,
+        subscription_id: int,
+        *,
+        max_search_episodes: int = 1,
+        limit_per_media: int = _PREVIEW_MAX_CANDIDATES_PER_MEDIA,
+    ) -> dict[str, Any]:
+        """实时核对单条订阅，但不持久化候选、不改调度、也不提交下载。"""
+        subscription_id = int(subscription_id)
+        max_search_episodes = max(
+            0,
+            min(int(max_search_episodes), _PREVIEW_MAX_SEARCH_EPISODES),
+        )
+        limit_per_media = max(
+            1,
+            min(int(limit_per_media), _PREVIEW_MAX_CANDIDATES_PER_MEDIA),
+        )
+        row = db.get_media_subscription(subscription_id)
+        if row is None:
+            raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
+
+        revision = int(row["revision"] or 1)
+        if not bool(row["enabled"]):
+            missing = _loads(row["missing_json"], [])
+            return {
+                "subscription_number": subscription_id,
+                "title": str(row["title"] or ""),
+                "media_type": str(row["media_type"] or ""),
+                "enabled": False,
+                "status": "paused",
+                "summary": "订阅已暂停，本次未访问媒体库或资源站",
+                "expected_count": max(0, int(row["expected_count"] or 0)),
+                "local_count": max(0, int(row["local_count"] or 0)),
+                "missing_count": max(0, int(row["missing_count"] or 0)),
+                "missing": list(missing)[:12] if isinstance(missing, list) else [],
+                "inventory_complete": False,
+                "sources": [],
+                "resource_search": self._empty_preview_search("not_run"),
+                "delivery": self._preview_delivery(row, missing_count=0, resources=[]),
+                "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+
+        if str(row["media_type"] or "") == "tv":
+            result = await self._preview_tv(
+                row,
+                max_search_episodes=max_search_episodes,
+                limit_per_media=limit_per_media,
+            )
+        else:
+            result = await self._preview_movie(row, limit_per_media=limit_per_media)
+
+        current = db.get_media_subscription(subscription_id)
+        if (
+            current is None
+            or int(current["revision"] or 1) != revision
+            or not bool(current["enabled"])
+        ):
+            return {
+                **result,
+                "status": "inconclusive",
+                "summary": "订阅配置在检查期间发生变化，本次结果未用于后续操作",
+                "delivery": self._preview_delivery(row, missing_count=0, resources=[]),
+            }
+        return result
+
     def update_subscription(self, subscription_id: int, data: dict[str, Any]) -> dict[str, Any]:
         current = db.get_media_subscription(int(subscription_id))
         if current is None:
@@ -733,6 +800,7 @@ class MediaSubscriptionService:
         detail: dict[str, Any],
         *,
         cancel_event: threading.Event | None = None,
+        require_active_check: bool = True,
     ) -> tuple[list[_ExpectedMedia], int, int]:
         raw_seasons = detail.get("seasons", [])
         if not isinstance(raw_seasons, list):
@@ -761,7 +829,10 @@ class MediaSubscriptionService:
             payload = await asyncio.to_thread(client.tv_season_detail, str(row["tmdb_id"]), season)
             # 已开始的同步 HTTP 请求无法被 asyncio 取消；每季返回后立即复核，
             # 避免停机/配置变更后继续请求其余最多 29 季。
-            self._ensure_active_check(int(row["id"]), int(row["revision"] or 1), cancel_event)
+            if require_active_check:
+                self._ensure_active_check(
+                    int(row["id"]), int(row["revision"] or 1), cancel_event
+                )
             episodes = payload.get("episodes", [])
             if not isinstance(episodes, list):
                 raise MediaSubscriptionError("TMDB 集数数据无效", status_code=502, code="invalid_response")
@@ -790,6 +861,198 @@ class MediaSubscriptionService:
                     air_date=aired.isoformat(),
                 ))
         return expected, future_count, unknown_dates
+
+    async def _preview_tv(
+        self,
+        row: Any,
+        *,
+        max_search_episodes: int,
+        limit_per_media: int,
+    ) -> dict[str, Any]:
+        tmdb_id = str(row["tmdb_id"])
+        title = str(row["title"])
+        include_specials = bool(row["include_specials"])
+        try:
+            detail = await asyncio.to_thread(TMDBClient().detail, tmdb_id, "tv")
+            expected, future_count, unknown_dates = await self._expected_tv(
+                row,
+                detail,
+                require_active_check=False,
+            )
+        except ProviderNotConfigured as exc:
+            raise MediaSubscriptionError(
+                "请先配置 TMDB API Key", status_code=503, code="not_configured"
+            ) from exc
+        except ProviderError as exc:
+            raise MediaSubscriptionError(
+                exc.safe_message, status_code=exc.status_code, code=exc.code
+            ) from exc
+
+        sources = await asyncio.to_thread(
+            inspect_series_episode_sources,
+            title,
+            tmdb_id=tmdb_id,
+            max_episodes=2000,
+            include_specials=include_specials,
+        )
+        inventory_complete, inventory_reason = self._inventory_complete(sources)
+        local_positions: set[tuple[int, int]] = set()
+        for source in sources:
+            if source.get("status") != "ready":
+                continue
+            local_positions.update(
+                (int(item[0]), int(item[1]))
+                for item in source.get("episodes", [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            )
+        local_keys = {
+            build_media_key(tmdb_id, "tv", season, episode)
+            for season, episode in local_positions
+        }
+        active_keys = {
+            str(item["media_key"])
+            for item in db.list_active_media_download_admissions(int(row["id"]))
+            if str(item["media_key"] or "") not in local_keys
+        }
+        missing_items = [
+            item
+            for item in expected
+            if (item.season, item.episode) not in local_positions
+            and item.media_key not in active_keys
+        ]
+        missing = [item.public_dict() for item in missing_items]
+        expected_keys = {item.media_key for item in expected}
+        local_count = sum(
+            build_media_key(tmdb_id, "tv", *position) in expected_keys
+            for position in local_positions
+        )
+        search = self._empty_preview_search("not_run")
+        if inventory_complete and missing_items and max_search_episodes > 0:
+            search = await self._preview_search_missing_tv(
+                row,
+                detail,
+                missing_items,
+                max_search_episodes=max_search_episodes,
+                limit_per_media=limit_per_media,
+            )
+        if not inventory_complete:
+            status = "inconclusive"
+            summary = inventory_reason
+        elif missing_items:
+            status = "missing"
+            summary = f"发现 {len(missing_items)} 集已播但尚未收录"
+        else:
+            status = "satisfied"
+            summary = "已播剧集均已收录或正在下载"
+        resources = self._preview_resource_items(search)
+        return {
+            "subscription_number": int(row["id"]),
+            "title": title,
+            "media_type": "tv",
+            "enabled": True,
+            "status": status,
+            "summary": summary,
+            "expected_count": len(expected),
+            "local_count": int(local_count),
+            "missing_count": len(missing),
+            "missing": missing[:12],
+            "missing_truncated": len(missing) > 12,
+            "inflight_count": len(active_keys),
+            "future_count": future_count,
+            "unknown_air_date_count": unknown_dates,
+            "inventory_complete": inventory_complete,
+            "inventory_reason": inventory_reason,
+            "sources": self._public_sources(sources),
+            "resource_search": search,
+            "delivery": self._preview_delivery(
+                row,
+                missing_count=len(missing),
+                resources=resources,
+                media_type="tv",
+            ),
+            "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+
+    async def _preview_movie(
+        self,
+        row: Any,
+        *,
+        limit_per_media: int,
+    ) -> dict[str, Any]:
+        tmdb_id = str(row["tmdb_id"])
+        try:
+            detail = await asyncio.to_thread(TMDBClient().detail, tmdb_id, "movie")
+        except ProviderNotConfigured as exc:
+            raise MediaSubscriptionError(
+                "请先配置 TMDB API Key", status_code=503, code="not_configured"
+            ) from exc
+        except ProviderError as exc:
+            raise MediaSubscriptionError(
+                exc.safe_message, status_code=exc.status_code, code=exc.code
+            ) from exc
+
+        sources = await asyncio.to_thread(inspect_media_identity_sources, tmdb_id, "movie")
+        inventory_complete, inventory_reason = self._inventory_complete(sources, identity=True)
+        present = any(
+            bool(source.get("present"))
+            for source in sources
+            if source.get("status") == "ready"
+        )
+        media_key = build_media_key(tmdb_id, "movie")
+        active = any(
+            str(item["media_key"] or "") == media_key
+            for item in db.list_active_media_download_admissions(int(row["id"]))
+        ) and not present
+        release = _parse_air_date(detail.get("release_date"))
+        release_known = release is not None
+        released = bool(release and release <= date.today())
+        missing_count = int(bool(inventory_complete and released and not present and not active))
+        search = self._empty_preview_search("not_run")
+        if missing_count:
+            search = await self._preview_search_movie(
+                row,
+                detail,
+                limit_per_media=limit_per_media,
+            )
+        if not inventory_complete:
+            status = "inconclusive"
+            summary = inventory_reason
+        elif not release_known and not present and not active:
+            status = "inconclusive"
+            summary = "TMDB 未提供上映日期，本次未搜索资源站"
+        elif missing_count:
+            status = "missing"
+            summary = "电影已上映但媒体库尚未收录"
+        else:
+            status = "satisfied"
+            summary = "电影尚未上映" if not released else "媒体已收录或正在下载"
+        resources = self._preview_resource_items(search)
+        return {
+            "subscription_number": int(row["id"]),
+            "title": str(row["title"]),
+            "media_type": "movie",
+            "enabled": True,
+            "status": status,
+            "summary": summary,
+            "expected_count": int(released),
+            "local_count": int(present),
+            "missing_count": missing_count,
+            "missing": ([{"label": "电影"}] if missing_count else []),
+            "inflight_count": int(active),
+            "future_count": int(release_known and not released),
+            "unknown_air_date_count": int(not release_known),
+            "inventory_complete": inventory_complete,
+            "inventory_reason": inventory_reason,
+            "sources": self._public_sources(sources),
+            "resource_search": search,
+            "delivery": self._preview_delivery(
+                row,
+                missing_count=missing_count,
+                resources=resources,
+                media_type="movie",
+            ),
+            "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
 
     async def _check_movie(
         self, row: Any, *, cancel_event: threading.Event | None = None
@@ -878,6 +1141,253 @@ class MediaSubscriptionService:
                 "error": str(source.get("error") or ""),
             })
         return result
+
+    @staticmethod
+    def _empty_preview_search(status: str) -> dict[str, Any]:
+        return {
+            "status": str(status or "not_run"),
+            "attempted_count": 0,
+            "candidate_count": 0,
+            "truncated": False,
+            "items": [],
+        }
+
+    @staticmethod
+    def _preview_candidate(
+        item: dict[str, Any],
+        *,
+        quality: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        safe_quality = quality if isinstance(quality, dict) else {}
+        return {
+            "result_id": str(item.get("result_id") or ""),
+            "site_id": str(item.get("site_id") or "")[:32],
+            "site_name": str(item.get("site_name") or "")[:80],
+            "title": " ".join(str(item.get("title") or "").split())[:300],
+            "size_text": str(item.get("size_text") or "")[:32],
+            "seeders": item.get("seeders"),
+            "published_at": str(item.get("published_at") or "")[:40],
+            "download_state": str(item.get("download_state") or "")[:24],
+            "download_kinds": [
+                kind
+                for kind in item.get("download_kinds", [])
+                if kind in {"magnet", "torrent"}
+            ][:2],
+            "relevance_score": item.get("relevance_score"),
+            "rank": safe_quality.get("rank"),
+            "score": safe_quality.get("score"),
+            "confidence": str(safe_quality.get("confidence") or ""),
+            "match": str(safe_quality.get("match") or ""),
+            "eligible": bool(safe_quality.get("eligible", True)),
+        }
+
+    @staticmethod
+    def _preview_resource_items(search: dict[str, Any]) -> list[dict[str, Any]]:
+        resources: list[dict[str, Any]] = []
+        for entry in search.get("items", []):
+            if not isinstance(entry, dict):
+                continue
+            for candidate in entry.get("candidates", []):
+                if isinstance(candidate, dict):
+                    resources.append(candidate)
+        return resources
+
+    @staticmethod
+    def _preview_delivery(
+        row: Any,
+        *,
+        missing_count: int,
+        resources: list[dict[str, Any]],
+        media_type: str = "tv",
+    ) -> dict[str, Any]:
+        mode = str(row["action"] or "confirm")
+        target = str(row["download_target"] or "guangya")
+        mode_label = {
+            "notify": "仅通知",
+            "confirm": "确认后提交",
+            "auto": "自动提交",
+        }.get(mode, "确认后提交")
+        target_label = {
+            "qb": "qBittorrent",
+            "guangya": "光鸭",
+            "both": "qBittorrent + 光鸭",
+        }.get(target, "光鸭")
+
+        if missing_count <= 0:
+            state = "no_action"
+            summary = "当前不需要提交下载"
+        elif not resources:
+            state = "no_candidate"
+            summary = "已确认缺失，但本次没有可提交候选"
+        elif mode == "notify":
+            state = "notify_only"
+            summary = f"当前策略只通知，不会自动推送到{target_label}"
+        elif mode == "confirm":
+            state = "confirmation_required"
+            summary = f"找到候选；提交到{target_label}前需要确认"
+        else:
+            def _auto_eligible(candidate: dict[str, Any]) -> bool:
+                relevance = int(candidate.get("relevance_score") or 0)
+                if media_type == "movie":
+                    return relevance >= _AUTO_RELEVANCE_THRESHOLD
+                return bool(
+                    candidate.get("match") == "exact_episode"
+                    and candidate.get("confidence") == "high"
+                    and relevance >= _AUTO_RELEVANCE_THRESHOLD
+                    and candidate.get("download_state") in {"ready", "resolvable"}
+                )
+
+            if any(_auto_eligible(candidate) for candidate in resources):
+                state = "auto_eligible"
+                summary = f"存在满足自动准入条件的候选；实时查询本身不会推送到{target_label}"
+            else:
+                state = "review_required"
+                summary = f"找到候选，但质量不足以自动推送到{target_label}"
+        return {
+            "mode": mode,
+            "mode_label": mode_label,
+            "target": target,
+            "target_label": target_label,
+            "state": state,
+            "summary": summary,
+        }
+
+    async def _preview_search_missing_tv(
+        self,
+        row: Any,
+        detail: dict[str, Any],
+        missing: list[_ExpectedMedia],
+        *,
+        max_search_episodes: int,
+        limit_per_media: int,
+    ) -> dict[str, Any]:
+        if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+            return self._empty_preview_search("disabled")
+        service = get_indexer_service()
+        sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service)
+        original = str(detail.get("original_name") or row["original_title"] or "")
+        aliases = [value for value in (str(row["title"]), original) if value]
+        targets = sorted(
+            (
+                item
+                for item in missing
+                if item.season is not None and item.episode is not None
+            ),
+            key=lambda item: (int(item.season or 0), int(item.episode or 0)),
+        )[:max_search_episodes]
+        items: list[dict[str, Any]] = []
+        partial = False
+        candidate_total = 0
+        for target in targets:
+            assert target.season is not None and target.episode is not None
+            request = IndexerMediaSearchRequest.create(
+                title=f"{row['title']} S{target.season:02d}E{target.episode:02d}",
+                original_title=original,
+                aliases=aliases,
+                year=row["year"],
+                media_type="tv",
+            )
+            try:
+                aggregated = await run_indexer_awaitable(
+                    service.search_media(request, sites or None)
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                partial = True
+                logger.warning(
+                    "媒体订阅实时资源搜索失败 subscription=%s episode=S%02dE%02d type=%s",
+                    row["id"], target.season, target.episode, type(exc).__name__,
+                )
+                items.append({
+                    "season": target.season,
+                    "episode": target.episode,
+                    "label": f"S{target.season:02d}E{target.episode:02d}",
+                    "status": "unavailable",
+                    "candidate_count": 0,
+                    "candidates": [],
+                })
+                continue
+            public = {"items": [item.to_public_dict() for item in aggregated.items]}
+            ranked = rank_episode_search(
+                public, season=target.season, episode=target.episode
+            )
+            candidates: list[dict[str, Any]] = []
+            for item in ranked.get("items", []):
+                quality = item.get("quality") if isinstance(item.get("quality"), dict) else {}
+                if not quality.get("eligible") or quality.get("match") == "conflict":
+                    continue
+                candidates.append(self._preview_candidate(item, quality=quality))
+                if len(candidates) >= limit_per_media:
+                    break
+            candidate_total += len(candidates)
+            partial = partial or bool(aggregated.partial)
+            items.append({
+                "season": target.season,
+                "episode": target.episode,
+                "label": f"S{target.season:02d}E{target.episode:02d}",
+                "status": "success" if candidates else "empty",
+                "candidate_count": len(candidates),
+                "candidates": candidates,
+            })
+        status = "partial" if partial else ("success" if candidate_total else "empty")
+        return {
+            "status": status,
+            "attempted_count": len(targets),
+            "candidate_count": candidate_total,
+            "truncated": len(missing) > len(targets),
+            "items": items,
+        }
+
+    async def _preview_search_movie(
+        self,
+        row: Any,
+        detail: dict[str, Any],
+        *,
+        limit_per_media: int,
+    ) -> dict[str, Any]:
+        if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+            return self._empty_preview_search("disabled")
+        service = get_indexer_service()
+        request = IndexerMediaSearchRequest.create(
+            title=str(row["title"]),
+            original_title=str(detail.get("original_title") or row["original_title"] or ""),
+            year=row["year"],
+            media_type="movie",
+        )
+        try:
+            aggregated = await run_indexer_awaitable(
+                service.search_media(
+                    request,
+                    _resolve_search_sites(_loads(row["sites_json"], []), detail, service),
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "媒体订阅实时电影资源搜索失败 subscription=%s type=%s",
+                row["id"], type(exc).__name__,
+            )
+            return self._empty_preview_search("unavailable")
+        candidates = [
+            self._preview_candidate(item.to_public_dict())
+            for item in aggregated.items
+            if item.download_state in {"ready", "resolvable"}
+            and int(item.relevance_score or 0) >= 60
+        ][:limit_per_media]
+        return {
+            "status": "partial" if aggregated.partial else ("success" if candidates else "empty"),
+            "attempted_count": 1,
+            "candidate_count": len(candidates),
+            "truncated": len(aggregated.items) > len(candidates),
+            "items": [{
+                "label": "电影",
+                "status": "success" if candidates else "empty",
+                "candidate_count": len(candidates),
+                "candidates": candidates,
+            }],
+        }
 
     async def _sync_admissions(self, row: Any, local_keys: set[str]) -> None:
         # 该同步段原先按 admission 逐条开连接查询/更新；仓储现在在一个连接中

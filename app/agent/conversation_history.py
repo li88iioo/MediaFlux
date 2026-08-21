@@ -32,6 +32,7 @@ _MEDIA_CONTEXT_TOOL_TYPES: dict[str, str] = {
     "library.check_updates": "",
     "library.search_missing_episode_resources": "tv",
     "library.search_missing_season_resources": "tv",
+    "media.subscription_updates": "",
     "discovery.search": "",
     "discovery.recommend": "",
     "discovery.lookup_rating": "",

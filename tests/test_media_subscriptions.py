@@ -581,6 +581,89 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
             [int(row["id"]) for row in db.list_due_media_subscriptions()],
         )
 
+    def test_realtime_preview_is_read_only_and_never_auto_submits(self) -> None:
+        service = MediaSubscriptionService()
+        subscription_id = self._seed_subscription()
+        db.update_media_subscription_config(
+            subscription_id,
+            action="auto",
+            download_target="guangya",
+        )
+        before = dict(db.get_media_subscription(subscription_id))
+        expected = _ExpectedMedia(
+            media_key="tmdb:86034:tv:S01E003",
+            season=1,
+            episode=3,
+            air_date="2026-08-21",
+        )
+        search_result = {
+            "status": "success",
+            "attempted_count": 1,
+            "candidate_count": 1,
+            "truncated": False,
+            "items": [{
+                "season": 1,
+                "episode": 3,
+                "label": "S01E03",
+                "status": "success",
+                "candidate_count": 1,
+                "candidates": [{
+                    "result_id": "abcdefghijklmnop",
+                    "title": "平凡职业造就世界最强 S01E03",
+                    "download_state": "ready",
+                    "download_kinds": ["magnet"],
+                    "relevance_score": 96,
+                    "confidence": "high",
+                    "match": "exact_episode",
+                }],
+            }],
+        }
+        sources = [{
+            "server_type": "jellyfin",
+            "server_name": "Jellyfin",
+            "status": "ready",
+            "episodes": [(1, 1), (1, 2)],
+            "truncated": False,
+        }]
+        sync_admissions = AsyncMock()
+        download_candidate = AsyncMock()
+        with patch(
+            "app.modules.media_subscriptions.TMDBClient.detail",
+            return_value={"name": "平凡职业造就世界最强", "seasons": []},
+        ), patch.object(
+            service,
+            "_expected_tv",
+            new=AsyncMock(return_value=([expected], 0, 0)),
+        ), patch(
+            "app.modules.media_subscriptions.inspect_series_episode_sources",
+            return_value=sources,
+        ), patch.object(
+            service,
+            "_preview_search_missing_tv",
+            new=AsyncMock(return_value=search_result),
+        ), patch.object(
+            service,
+            "_sync_admissions",
+            new=sync_admissions,
+        ), patch.object(
+            service,
+            "download_candidate",
+            new=download_candidate,
+        ):
+            result = asyncio.run(service.preview_subscription_updates(subscription_id))
+
+        after = dict(db.get_media_subscription(subscription_id))
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual(result["missing"][0]["label"], "S01E03")
+        self.assertEqual(result["resource_search"]["candidate_count"], 1)
+        self.assertEqual(result["delivery"]["state"], "auto_eligible")
+        self.assertIn("不会推送", result["delivery"]["summary"])
+        self.assertEqual(before, after)
+        self.assertEqual(db.list_media_subscription_runs(subscription_id=subscription_id), [])
+        self.assertEqual(db.list_media_subscription_candidates(subscription_id, status="", limit=50), [])
+        sync_admissions.assert_not_awaited()
+        download_candidate.assert_not_awaited()
+
     def test_stale_cancel_cannot_release_new_configuration(self) -> None:
         subscription_id = self._seed_subscription()
         run_id = db.claim_media_subscription_check_run(subscription_id, "manual")

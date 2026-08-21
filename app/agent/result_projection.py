@@ -142,6 +142,7 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "local_media.history_summary": "本地媒体处理历史",
     "media.get_subscription_summary": "媒体追更订阅摘要",
     "media.subscription_summaries": "媒体追更订阅列表",
+    "media.subscription_updates": "媒体追更实时更新检查",
     "media.set_subscription_enabled": "媒体追更状态修改",
     "media_proxy.status_summary": "媒体反代状态",
     "media_proxy.test_instance": "媒体反代连接测试",

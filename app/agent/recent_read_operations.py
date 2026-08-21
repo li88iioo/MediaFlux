@@ -30,6 +30,7 @@ _REPLAYABLE_READ_TOOLS = frozenset({
     "rss.get_subscription_summary",
     "rss.recent_activity",
     "media.subscription_summaries",
+    "media.subscription_updates",
     "media.get_subscription_summary",
     "config.indexer_sites_summary",
     "indexer.diagnose_readiness",

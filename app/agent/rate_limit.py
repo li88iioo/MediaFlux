@@ -65,6 +65,7 @@ _TOOL_RATE_LIMIT_SCOPES = {
     "library.patrol_status": "library-patrol-status",
     "library.audit_episodes": "library-update-check",
     "library.check_updates": "library-update-check",
+    "media.subscription_updates": "media-subscription-updates",
     "discovery.recommend": "discovery-recommend",
     "discovery.watchlist_summaries": "discovery-watchlist-read",
     "discovery.get_watchlist_summary": "discovery-watchlist-read",
@@ -107,6 +108,7 @@ _TOOL_RATE_LIMITS = {
     "library.patrol_status": 12,
     "library.audit_episodes": 6,
     "library.check_updates": 6,
+    "media.subscription_updates": 4,
     "library.search_missing_episode_resources": 4,
     "library.search_missing_season_resources": 4,
     "library.missing_media_workflows": 12,
@@ -236,7 +238,10 @@ def tool_rate_limit_policy(tool_name: str) -> tuple[str, int, int]:
     name = str(tool_name or "").strip()
     scope = _TOOL_RATE_LIMIT_SCOPES.get(name, f"tool:{name}")
     limit = _TOOL_RATE_LIMITS.get(name, 30)
-    cost = 2 if name == "library.search_missing_season_resources" else 1
+    cost = 2 if name in {
+        "library.search_missing_season_resources",
+        "media.subscription_updates",
+    } else 1
     return scope, limit, cost
 
 
