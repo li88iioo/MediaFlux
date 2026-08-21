@@ -282,10 +282,11 @@ class DownloadTracker:
             return
         content_path = str(getattr(task, "content_path", "") or "")
         db.mark_download_request_local_media_skipped(
-            int(row["id"]), content_path, "未命中已启用的本地媒体来源"
+            int(row["id"]), content_path, "未命中可整理的本地媒体内容"
         )
         logger.info(
-            "qB 完成任务未命中本地媒体来源 request=%s path=%s", int(row["id"]), content_path,
+            "qB 完成任务未命中可整理的本地媒体内容 request=%s path=%s",
+            int(row["id"]), content_path,
         )
 
     @staticmethod

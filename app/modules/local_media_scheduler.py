@@ -102,6 +102,12 @@ class LocalMediaScheduler:
             mapping.local_root.joinpath(*mapping.relative_parts(raw_path)),
             mapping.local_root,
         )
+        try:
+            if not LocalFilesystemAdapter(mapping.local_root).contains_video(local_path):
+                return None
+        except Exception as exc:
+            logger.warning("qB 完成内容媒体检查失败 %s: %s", local_path.name, exc)
+            return None
         task_id = db.create_local_media_task(
             source.id, task.hash, str(local_path), owner=self.owner, trigger="qb_completed",
         )

@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from app.modules.local_path_mapping import PathMappingError, assert_within
-from app.modules.local_storage import LocalFilesystemAdapter, is_ignored_local_media_directory
+from app.modules.local_storage import (
+    LocalFilesystemAdapter,
+    LocalStorageError,
+    is_ignored_local_media_directory,
+)
 
 LOCAL_MEDIA_TRASH_DIR = ".mediaflux-trash"
 
@@ -53,6 +57,7 @@ def discover_local_media_directory_candidates(
         entries = sorted(selected.iterdir(), key=lambda item: item.name.casefold())
     except OSError:
         return [], "目录读取失败", None
+    adapter = LocalFilesystemAdapter(root)
     candidates: list[Path] = []
     for candidate in entries:
         if is_ignored_local_media_directory(candidate.name):
@@ -61,12 +66,15 @@ def discover_local_media_directory_candidates(
             info = candidate.lstat()
             if stat_module.S_ISLNK(info.st_mode):
                 continue
-            if stat_module.S_ISDIR(info.st_mode) or (
+            if stat_module.S_ISDIR(info.st_mode):
+                if adapter.contains_video(candidate):
+                    candidates.append(candidate)
+            elif (
                 stat_module.S_ISREG(info.st_mode)
-                and LocalFilesystemAdapter.role_for(candidate) == "video"
+                and adapter.contains_video(candidate)
             ):
                 candidates.append(candidate)
-        except OSError:
+        except (LocalStorageError, OSError):
             continue
     return candidates, "", selected
 

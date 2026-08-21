@@ -4,15 +4,26 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-21
+
+### Added
+- 新增本地媒体来源的多级子目录浏览、面包屑导航和整理任务详情，可查看文件映射与原子执行步骤（[`3471aac`](https://github.com/li88iioo/MediaFlux/commit/3471aac)）。
+- 本地媒体手动刮削支持覆盖剧集季号与集数，并复用统一的媒体刮削与位置识别弹窗（[`ae51076`](https://github.com/li88iioo/MediaFlux/commit/ae51076)）。
+- Media Agent 新增媒体追更订阅实时核对能力，可联动 TMDB、媒体库和索引器检查更新候选（[`689ed56`](https://github.com/li88iioo/MediaFlux/commit/689ed56)）。
+- Docker 镜像内置 `ffprobe`，无需额外安装即可进行音视频规格探测（[`baa4a94`](https://github.com/li88iioo/MediaFlux/commit/baa4a94)）。
+
 ### Changed
-- 重构光鸭整理、离线转存、STRM、媒体反代、分享转存与 GCID 工具的工作台布局、状态反馈和响应式样式。
-- 精简本地媒体人工处理页签的重复提示文案。
-- 涉及文件：`app/templates/` 下相关页面、`app/static/css/main.css`、`app/static/css/organize.css`、`app/static/js/guangya-strm.js` 与 `app/static/js/organize.js`。
+- 剧集季目录改为不补零的标准形式，例如 `Season 1`；特别篇仍使用 `Specials`（[`efbb911`](https://github.com/li88iioo/MediaFlux/commit/efbb911)）。
+- 重构光鸭整理、离线转存、STRM、媒体反代、分享转存、GCID 与本地媒体工作台的布局和响应式交互（[`de6d3ae`](https://github.com/li88iioo/MediaFlux/commit/de6d3ae)）。
+- STRM 页面将播放地址操作改为候选发现与完整刷新流程，移除用户侧快速同步入口，并保留整理链路内部精准增量能力（[`a7290df`](https://github.com/li88iioo/MediaFlux/commit/a7290df)）。
+- STRM 扫描增加并发校验与批量指纹补写，提升大规模目录同步和校准速度（[`6ed5cab`](https://github.com/li88iioo/MediaFlux/commit/6ed5cab)）。
+- 优化 README 的项目标识、徽章链接和标题间距（[`f2b1a55`](https://github.com/li88iioo/MediaFlux/commit/f2b1a55)、[`70e3211`](https://github.com/li88iioo/MediaFlux/commit/70e3211)）。
 
 ### Fixed
-- 修复整理执行页停止与清理操作不可见、状态标签样式被运行态覆盖的问题。
-- 修复 STRM 本地根目录浏览接口、播放地址完整刷新入口和来源列表稳定占位。
-- 恢复 GCID 导入预览区域的稳定高度，避免加载结果时页面跳动。
+- 修复 Telegram 富文本进度与终态消息换行被压缩的问题（[`76bb941`](https://github.com/li88iioo/MediaFlux/commit/76bb941)）。
+- 修复 Telegram Bot Token 保存后直接测试时被误判为空或无效的问题（[`2a665d5`](https://github.com/li88iioo/MediaFlux/commit/2a665d5)）。
+- 修复 Telegram 轮询冲突重复输出堆栈，并优化 NAS/CIFS 文件权限告警与错误提示（[`08dab05`](https://github.com/li88iioo/MediaFlux/commit/08dab05)）。
+- 修复侧边栏图标加载时的布局抖动（[`1f0bc1f`](https://github.com/li88iioo/MediaFlux/commit/1f0bc1f)）。
 
 ## [0.1.0] - 2026-08-18
 
@@ -48,3 +59,7 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **内置 `mediaflux` 命令行运维工具**：支持服务状态查询、环境权限诊断 (`doctor`)、一致性数据备份/校验/恢复以及脱敏支持包导出。
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
+
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/li88iioo/MediaFlux/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/li88iioo/MediaFlux/releases/tag/v0.1.0

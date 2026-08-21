@@ -23,6 +23,19 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn(".lm-task-table td.lm-task-select-cell", css)
         self.assertIn(".lm-task-detail-grid", css)
 
+    def test_mobile_tab_actions_stay_scoped_and_source_add_button_is_not_duplicated(self):
+        template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
+        css = Path("app/static/css/local-media.css").read_text(encoding="utf-8")
+
+        self.assertIn('.lm-tab-action-group[hidden] { display: none !important; }', css)
+        self.assertIn('.lm-tab-action-group[data-tab-action="tasks"] { display: grid;', css)
+        self.assertIn('html[data-local-media-initial-tab="sources"] .lm-tab-action-group[data-tab-action="sources"],', css)
+        self.assertIn('.lm-tab-action-group[data-tab-action="sources"] { display: none !important; }', css)
+        self.assertIn('.lm-panel-subhead { flex-direction: column; align-items: stretch;', css)
+        self.assertIn('id="lmAddSourceBtn"', template)
+        self.assertIn('id="lmAddSourceMobileBtn"', template)
+        self.assertEqual(template.count('新增来源</span>'), 2)
+
     def test_local_media_number_only_motion_contract(self):
         js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
         css = Path("app/static/css/local-media.css").read_text(encoding="utf-8")
@@ -69,7 +82,7 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn("opacity: 0", css)
         self.assertIn(".lm-initial-loading.is-visible", css)
         self.assertIn(".lm-initial-loading svg", css)
-        self.assertIn("?v=20260821i", template)
+        self.assertIn("?v=20260821j", template)
 
     def test_initial_hash_tab_is_prepainted_before_page_script_loads(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
