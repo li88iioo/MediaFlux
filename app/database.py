@@ -230,6 +230,7 @@ CREATE TABLE IF NOT EXISTS organize_notification_outbox (
     idempotency_key TEXT NOT NULL UNIQUE,
     chat_id TEXT NOT NULL DEFAULT '',
     body TEXT NOT NULL,
+    image_url TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK(status IN ('pending','sending','retry_wait','sent','failed')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
@@ -2186,6 +2187,101 @@ def add_organize_log_items(
         return insert(conn)
 
 
+def resolve_pending_organize_logs(
+    source: str,
+    file_id: str,
+    *,
+    before_log_id: int,
+    _conn: sqlite3.Connection | None = None,
+) -> int:
+    """把同一文件已完成的人工确认前置审计标记为已结算。
+
+    新版待确认记录使用 ``manual``；早期版本将其误记为 ``skipped``，
+    因此仅兼容包含人工确认语义的旧跳过记录。记录保留用于审计，但统一
+    时间线会隐藏 ``confirmed`` 前置记录，只展示最终成功入库结果。
+    """
+    normalized_source = str(source or "").strip()
+    normalized_file_id = str(file_id or "").strip()
+    upper_bound = max(0, int(before_log_id or 0))
+    if not normalized_source or not normalized_file_id or upper_bound <= 0:
+        return 0
+
+    def resolve(conn: sqlite3.Connection) -> int:
+        rows = conn.execute(
+            "SELECT id FROM organize_log WHERE source=? AND file_id=? AND id<? AND ("
+            "status='manual' OR (status='skipped' AND ("
+            "instr(COALESCE(error,''),'人工确认')>0 OR "
+            "instr(COALESCE(error,''),'待确认')>0)))",
+            (normalized_source, normalized_file_id, upper_bound),
+        ).fetchall()
+        log_ids = [int(row["id"]) for row in rows]
+        if not log_ids:
+            return 0
+        placeholders = ",".join("?" for _ in log_ids)
+        stamp = now()
+        conn.execute(
+            f"UPDATE organize_log SET status='confirmed',version=version+1,updated_at=? "
+            f"WHERE id IN ({placeholders})",
+            (stamp, *log_ids),
+        )
+        conn.execute(
+            f"UPDATE organize_log_items SET status='confirmed',error='',updated_at=? "
+            f"WHERE log_id IN ({placeholders}) AND status IN ('manual','skipped')",
+            (stamp, *log_ids),
+        )
+        return len(log_ids)
+
+    if _conn is not None:
+        return resolve(_conn)
+    with get_conn() as conn:
+        return resolve(conn)
+
+
+def finalize_pending_organize_logs(
+    source: str,
+    file_ids: Iterable[str],
+    *,
+    status: str,
+    error: str = "",
+) -> int:
+    """结束仍待人工处理的整理日志；用于取消或不可重试失败。"""
+    normalized_status = str(status or "").strip()
+    if normalized_status not in {"skipped", "failed"}:
+        raise ValueError("不支持的人工确认终态")
+    normalized_source = str(source or "").strip()
+    normalized_ids = list(dict.fromkeys(
+        str(item or "").strip() for item in file_ids if str(item or "").strip()
+    ))
+    if not normalized_source or not normalized_ids:
+        return 0
+    placeholders = ",".join("?" for _ in normalized_ids)
+    stamp = now()
+    message = str(error or "").strip()
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT id FROM organize_log WHERE source=? AND file_id IN ({placeholders}) "
+            "AND (status='manual' OR (status='skipped' AND ("
+            "instr(COALESCE(error,''),'人工确认')>0 OR "
+            "instr(COALESCE(error,''),'待确认')>0)))",
+            (normalized_source, *normalized_ids),
+        ).fetchall()
+        log_ids = [int(row["id"]) for row in rows]
+        if not log_ids:
+            return 0
+        log_placeholders = ",".join("?" for _ in log_ids)
+        conn.execute(
+            f"UPDATE organize_log SET status=?,error=?,version=version+1,updated_at=? "
+            f"WHERE id IN ({log_placeholders})",
+            (normalized_status, message, stamp, *log_ids),
+        )
+        conn.execute(
+            f"UPDATE organize_log_items SET status=?,error=?,updated_at=? "
+            f"WHERE log_id IN ({log_placeholders}) AND status IN ('manual','skipped')",
+            (normalized_status, message, stamp, *log_ids),
+        )
+        return len(log_ids)
+
+
 def _organize_log_filters(status: str | None = None, keyword: str = "") -> tuple[str, list]:
     sql = " WHERE 1=1"
     params: list = []
@@ -2237,6 +2333,12 @@ def _organize_timeline_query(*, owner: str = "admin", origin: str = "all",
                 CASE
                     WHEN l.status='success' THEN 'success'
                     WHEN l.status IN ('failed','interrupted','partial_failed','revert_failed','deleted') THEN 'failed'
+                    WHEN l.status='manual' OR (
+                        l.status='skipped' AND (
+                            instr(COALESCE(l.error,''),'人工确认')>0 OR
+                            instr(COALESCE(l.error,''),'待确认')>0
+                        )
+                    ) THEN 'manual'
                     WHEN l.status='skipped' THEN 'skipped'
                     WHEN l.status='reverted' THEN 'reverted'
                     ELSE 'processing'
@@ -2251,6 +2353,20 @@ def _organize_timeline_query(*, owner: str = "admin", origin: str = "all",
                 l.created_at AS created_at, COALESCE(l.updated_at,l.created_at) AS updated_at,
                 '' AS completed_at, l.version AS version, l.legacy_incomplete AS legacy_incomplete
             FROM organize_log l
+            WHERE l.status<>'confirmed' AND NOT (
+                (
+                    l.status='manual' OR (
+                        l.status='skipped' AND (
+                            instr(COALESCE(l.error,''),'人工确认')>0 OR
+                            instr(COALESCE(l.error,''),'待确认')>0
+                        )
+                    )
+                ) AND EXISTS (
+                    SELECT 1 FROM organize_log completed
+                    WHERE completed.source=l.source AND completed.file_id=l.file_id
+                      AND completed.id>l.id AND completed.status='success'
+                )
+            )
             UNION ALL
             SELECT
                 'local' AS origin, t.id AS id, COALESCE(s.name,'已删除来源') AS source_label,
@@ -2318,7 +2434,16 @@ def count_organize_timeline_by_status(*, owner: str = "admin") -> dict[str, int]
         rows = conn.execute(
             f"SELECT status, COUNT(*) AS count FROM ({sql}) GROUP BY status", params
         ).fetchall()
-    return {str(row["status"]): int(row["count"] or 0) for row in rows}
+    counts = {
+        "success": 0,
+        "failed": 0,
+        "skipped": 0,
+        "manual": 0,
+        "processing": 0,
+        "reverted": 0,
+    }
+    counts.update({str(row["status"]): int(row["count"] or 0) for row in rows})
+    return counts
 
 
 def get_agent_organize_audit(

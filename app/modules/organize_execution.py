@@ -169,6 +169,7 @@ def execute_organize_plans(
             continue
         if p.action != "move":
             match = p.match or MatchResult()
+            audit_status = "manual" if match.need_confirm else "skipped"
             parsed = organizer._parse_media_fields(p.original_name)
             position_season, position_episode = resolved_plan_position(p, parsed)
             companions = organizer._companions_for_plan(
@@ -176,7 +177,10 @@ def execute_organize_plans(
             )
             try:
                 organizer._write_organize_audit(
-                    ("guangya", p.original_path, "", p.file_id, "skipped", match.tmdb_id),
+                    (
+                        "guangya", p.original_path, "", p.file_id,
+                        audit_status, match.tmdb_id,
+                    ),
                     {
                         "source_dir_id": source_dir_id,
                         "original_parent_id": p.original_parent_id,
@@ -200,14 +204,14 @@ def execute_organize_plans(
                         "original_name": p.original_name,
                         "current_parent_id": p.original_parent_id,
                         "current_name": p.original_name, "size": p.size, "etag": p.etag,
-                        "status": "skipped", "error": p.note or match.error,
+                        "status": audit_status, "error": p.note or match.error,
                     }, *[{
                         "file_id": item.file_id, "role": media_role(item.name),
                         "original_parent_id": item.parent_id or p.original_parent_id,
                         "original_name": item.name,
                         "current_parent_id": item.parent_id or p.original_parent_id,
                         "current_name": item.name, "size": item.size, "etag": item.etag,
-                        "status": "skipped", "error": p.note or match.error,
+                        "status": audit_status, "error": p.note or match.error,
                     } for item in companions]],
                 )
             except Exception:

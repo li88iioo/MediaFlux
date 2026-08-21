@@ -309,6 +309,13 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["queue_position"], 1)
 
     def test_cancel_never_enters_dispatchable_queue(self):
+        log_id = db.add_organize_log(
+            "guangya", "长瀞同学 2nd Attack", "", "file-4", "manual", "",
+            original_parent_id="parent", original_name="Nagatoro - 04.mp4",
+            current_parent_id="parent", current_name="Nagatoro - 04.mp4",
+            media_type="tv", title="不要欺负我，长瀞同学",
+            error="需要人工确认", legacy_incomplete=False,
+        )
         actions = create_confirmation_actions(
             self._group(), OrganizeRules(), source_name="下载", chat_id="100"
         )
@@ -321,6 +328,9 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["status"], "cancelled")
         self.assertIsNone(row["queued_at"])
         self.assertIsNone(db.get_next_queued_organize_confirmation())
+        log = db.get_organize_log(log_id)
+        self.assertEqual(log["status"], "skipped")
+        self.assertEqual(log["error"], "用户选择暂不处理")
 
     def test_cancel_persists_terminal_receipt_when_telegram_is_unavailable(self):
         actions = create_confirmation_actions(

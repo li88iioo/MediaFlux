@@ -39,14 +39,18 @@ def _one_shot_key(body: str, chat_id: str) -> str:
     return f"organize-summary-once:{digest}:{uuid.uuid4().hex[:12]}"
 
 
-def _send(body: str, chat_id: str) -> TelegramSendResult:
+def _send(body: str, chat_id: str, *, image_url: str = "") -> TelegramSendResult:
     from app.notifier import send_result
 
+    if str(image_url or "").strip():
+        return send_result(
+            body, chat_id=chat_id or None, image_url=str(image_url).strip(),
+        )
     return send_result(body, chat_id=chat_id or None)
 
 
 def deliver_organize_notification(
-    idempotency_key: str, body: str, *, chat_id: str = "",
+    idempotency_key: str, body: str, *, chat_id: str = "", image_url: str = "",
 ) -> bool:
     """投递整理结果通知；失败留给持久队列按退避重试。"""
     text = str(body or "")
@@ -60,16 +64,21 @@ def deliver_organize_notification(
             logger.info("整理通知已成功投递，跳过重复发送 key=%s", key)
             return True
         if not state:
-            enqueue_organize_notification(key, text, chat_id=chat_id)
+            enqueue_organize_notification(
+                key, text, chat_id=chat_id, image_url=image_url,
+            )
         return drain_organize_notifications(limit=5)
 
     try:
-        outcome = _send(text, chat_id)
+        outcome = _send(text, chat_id, image_url=image_url)
         if outcome.ok:
             return True
     except Exception as exc:
         logger.warning("整理通知投递异常 type=%s", type(exc).__name__)
-    enqueue_organize_notification(_one_shot_key(text, chat_id), text, chat_id=chat_id)
+    enqueue_organize_notification(
+        _one_shot_key(text, chat_id), text,
+        chat_id=chat_id, image_url=image_url,
+    )
     return False
 
 
@@ -81,7 +90,9 @@ def drain_organize_notifications(*, limit: int = 20) -> bool:
     delivered = True
     for item in claimed:
         try:
-            outcome = _send(item["body"], item["chat_id"])
+            outcome = _send(
+                item["body"], item["chat_id"], image_url=item.get("image_url", ""),
+            )
         except Exception as exc:
             outcome = TelegramSendResult(
                 ok=False, error=f"{type(exc).__name__}: Telegram 投递异常",

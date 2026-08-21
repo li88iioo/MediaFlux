@@ -13,6 +13,11 @@ from tests.support import IsolatedDatabaseTestCase
 
 class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM local_media_task_items")
+            conn.execute("DELETE FROM local_media_tasks")
+            conn.execute("DELETE FROM local_media_sources")
+            conn.execute("DELETE FROM organize_log")
         self.client = TestClient(create_app(start_background=False))
         login = self.client.get("/login")
         token = re.search(r'name="csrf_token"\s+value="([^"]+)"', login.text).group(1)
@@ -168,6 +173,55 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
         self.assertEqual(filtered.status_code, 200)
         self.assertEqual(filtered.json()["total"], 1)
         self.assertEqual(filtered.json()["items"][0]["record_key"], f"local:{local_id}")
+
+    def test_guangya_manual_record_is_not_counted_as_skipped(self):
+        log_id = db.add_organize_log(
+            "guangya", "下载/待确认电影", "", "manual-file", "manual", "",
+            original_parent_id="parent", original_name="Pending.Movie.mkv",
+            current_parent_id="parent", current_name="Pending.Movie.mkv",
+            media_type="movie", title="待确认电影", error="需要人工确认",
+            legacy_incomplete=False,
+        )
+
+        counts = db.count_organize_timeline_by_status(owner="admin")
+        self.assertEqual(counts["manual"], 1)
+        self.assertEqual(counts["skipped"], 0)
+        self.assertEqual(counts["failed"], 0)
+        response = self.client.get(
+            "/api/logs/organize/timeline", params={"status": "manual"},
+        )
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["items"][0]
+        self.assertEqual(item["record_key"], f"guangya:{log_id}")
+        self.assertEqual(item["status"], "manual")
+        self.assertTrue(item["actions"]["detail"])
+        self.assertFalse(item["actions"]["batch"])
+
+    def test_legacy_manual_skip_is_collapsed_after_later_success(self):
+        pending_id = db.add_organize_log(
+            "guangya", "下载/旧待确认电影", "", "legacy-manual", "skipped", "",
+            original_parent_id="parent", original_name="Legacy.Movie.mkv",
+            current_parent_id="parent", current_name="Legacy.Movie.mkv",
+            media_type="movie", title="旧待确认电影", error="TMDB 匹配结果需人工确认",
+            legacy_incomplete=False,
+        )
+        success_id = db.add_organize_log(
+            "guangya", "下载/旧待确认电影",
+            "电影/旧待确认电影 (2026) {tmdb-9}/Legacy.Movie.mkv",
+            "legacy-manual", "success", "9",
+            original_parent_id="parent", original_name="Legacy.Movie.mkv",
+            current_parent_id="target", current_name="Legacy.Movie.mkv",
+            target_parent_id="target", media_type="movie", title="旧待确认电影",
+            legacy_incomplete=False,
+        )
+
+        rows = db.list_organize_timeline(owner="admin", origin="guangya", limit=20)
+        self.assertNotIn(pending_id, [int(row["id"]) for row in rows])
+        self.assertEqual([int(row["id"]) for row in rows], [success_id])
+        counts = db.count_organize_timeline_by_status(owner="admin")
+        self.assertEqual(counts["success"], 1)
+        self.assertEqual(counts["manual"], 0)
+        self.assertEqual(counts["skipped"], 0)
 
     def test_timeline_rejects_unknown_filters_and_page_uses_read_only_endpoint(self):
         self.assertEqual(

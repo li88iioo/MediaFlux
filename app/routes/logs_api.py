@@ -279,7 +279,8 @@ def organize_timeline(
             "completed_at": row["completed_at"] or "",
             "actions": {
                 "detail": row_origin == "guangya",
-                "batch": row_origin == "guangya",
+                # 待确认项尚未产生可回退的云端写操作，只允许查看详情。
+                "batch": row_origin == "guangya" and row["status"] != "manual",
             },
         })
     return {

@@ -105,6 +105,29 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertEqual(result.error, "Too Many Requests: retry later")
         self.assertFalse(notifier.send("兼容布尔接口"))
 
+    def test_send_result_uses_cover_and_falls_back_to_text(self):
+        bot = FakeBot()
+        self._install_bot(bot, "test-chat")
+
+        result = notifier.send_result(
+            "<b>整理完成</b>", image_url="https://image.example/poster.jpg",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(bot.photos, [(
+            "test-chat", "https://image.example/poster.jpg", "<b>整理完成</b>",
+        )])
+        self.assertEqual(bot.messages, [])
+
+        fallback = FakeBot(photo_error=RuntimeError("image unavailable"))
+        self._install_bot(fallback, "test-chat")
+        result = notifier.send_result(
+            "<b>整理完成</b>", image_url="https://image.example/missing.jpg",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(fallback.messages, [("test-chat", "<b>整理完成</b>")])
+
     def test_edit_event_updates_existing_message_with_structured_markup(self):
         bot = FakeBot()
         self._install_bot(bot, "configured-chat")

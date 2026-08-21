@@ -235,12 +235,55 @@ class ScraperAndOrganizerTests(IsolatedDatabaseTestCase):
                 [plan], OrganizeRules(), stats, {"source": [companion]}, None,
                 source_dir_id="configured-source",
             )
-        self.assertEqual(add_log.call_args.args[4], "skipped")
+        self.assertEqual(add_log.call_args.args[4], "manual")
         self.assertEqual(add_log.call_args.kwargs["source_dir_id"], "configured-source")
         saved = add_items.call_args.args[1]
         self.assertEqual([(item["role"], item["file_id"]) for item in saved], [
             ("video", "video"), ("subtitle", "sub")
         ])
+        self.assertTrue(all(item["status"] == "manual" for item in saved))
+
+    def test_success_audit_resolves_previous_manual_record(self):
+        pending_id = db.add_organize_log(
+            "guangya", "source", "", "video", "manual", "",
+            original_parent_id="source-id", original_name="Unknown.S01E01.mkv",
+            current_parent_id="source-id", current_name="Unknown.S01E01.mkv",
+            media_type="tv", title="Unknown", error="需要人工确认",
+            legacy_incomplete=False,
+        )
+        db.add_organize_log_items(pending_id, [{
+            "file_id": "video", "role": "video",
+            "original_parent_id": "source-id", "original_name": "Unknown.S01E01.mkv",
+            "current_parent_id": "source-id", "current_name": "Unknown.S01E01.mkv",
+            "status": "manual", "error": "需要人工确认",
+        }])
+
+        success_id = Organizer._write_organize_audit(
+            ("guangya", "source", "剧集/Unknown/Season 1/Unknown.S01E01.mkv", "video", "success", "1"),
+            {
+                "original_parent_id": "source-id",
+                "original_name": "Unknown.S01E01.mkv",
+                "current_parent_id": "target-id",
+                "current_name": "Unknown.S01E01.mkv",
+                "target_parent_id": "target-id",
+                "media_type": "tv",
+                "title": "Unknown",
+                "legacy_incomplete": False,
+            },
+            [{
+                "file_id": "video", "role": "video",
+                "original_parent_id": "source-id", "original_name": "Unknown.S01E01.mkv",
+                "current_parent_id": "target-id", "current_name": "Unknown.S01E01.mkv",
+                "target_parent_id": "target-id", "target_name": "Unknown.S01E01.mkv",
+                "status": "success",
+            }],
+        )
+
+        self.assertGreater(success_id, pending_id)
+        self.assertEqual(db.get_organize_log(pending_id)["status"], "confirmed")
+        self.assertEqual(db.list_organize_log_items(pending_id)[0]["status"], "confirmed")
+        timeline = db.list_organize_timeline(origin="guangya", limit=10)
+        self.assertEqual([row["id"] for row in timeline], [success_id])
 
     def test_safe_replacement_keeps_existing_until_incoming_succeeds(self):
         operations = []

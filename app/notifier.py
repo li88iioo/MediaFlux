@@ -653,14 +653,33 @@ def _telegram_send_error(exc: Exception) -> TelegramSendResult:
     )
 
 
-def send_result(text: str, chat_id: Optional[str] = None) -> TelegramSendResult:
-    """发送兼容 HTML 文本，并保留 429 等可重试信息。"""
+def send_result(
+    text: str,
+    chat_id: Optional[str] = None,
+    *,
+    image_url: str = "",
+) -> TelegramSendResult:
+    """发送兼容 HTML 结果，可选封面并保留 429 等可重试信息。"""
     bot = get_bot()
     target = str(chat_id or _chat_id or "").strip()
     if not bot or not target:
         logger.info(f"[通知降级] {text}")
         return TelegramSendResult(ok=False, error="Telegram Bot 或 Chat ID 未配置")
     try:
+        image = str(image_url or "").strip()
+        if image:
+            chunks = split_message(text, _CAPTION_LIMIT)
+            try:
+                bot.send_photo(target, image, caption=chunks[0])
+            except Exception as exc:
+                logger.warning(
+                    "Telegram 结果封面发送失败，回退文本 type=%s",
+                    type(exc).__name__,
+                )
+                return TelegramSendResult(ok=bool(_send_text(bot, target, text)))
+            for chunk in chunks[1:]:
+                bot.send_message(target, chunk)
+            return TelegramSendResult(ok=True)
         return TelegramSendResult(ok=bool(_send_text(bot, target, text)))
     except Exception as exc:
         result = _telegram_send_error(exc)

@@ -280,12 +280,39 @@ def _decode_row(row) -> dict:
     return payload
 
 
+def _finalize_guangya_manual_logs(
+    payload: dict, *, status: str, error: str,
+) -> None:
+    """同步确认终态到光鸭整理时间线；本地媒体使用自身任务状态机。"""
+    try:
+        if _confirmation_kind(payload) != "guangya":
+            return
+        file_ids = [
+            str(item.get("file_id") or "").strip()
+            for item in (payload.get("files") or [])
+            if isinstance(item, dict) and str(item.get("file_id") or "").strip()
+        ]
+        if file_ids:
+            db.finalize_pending_organize_logs(
+                "guangya", file_ids, status=status, error=error,
+            )
+    except Exception as exc:
+        # 确认操作的终态已经持久化，日志投影同步失败只能降级告警，
+        # 不能让用户收到“取消/失败处理失败”的错误回执。
+        logger.warning(
+            "同步人工确认日志终态失败 status=%s type=%s",
+            status,
+            type(exc).__name__,
+        )
+
+
 def cancel_confirmation(
     token: str, *, chat_id: str, message_id: int | str | None = None
 ) -> dict:
     current = db.get_organize_confirmation(token)
     if current is None:
         raise ValueError("确认操作不存在或已失效")
+    payload = _decode_row(current)
     directory = str(current["directory_path"] or "/")
     try:
         resolved_message_id = int(message_id or 0)
@@ -302,6 +329,9 @@ def cancel_confirmation(
         chat_id=chat_id,
         event_json=_serialize_notification_event(terminal_event),
         message_id=resolved_message_id or None,
+    )
+    _finalize_guangya_manual_logs(
+        payload, status="skipped", error="用户选择暂不处理",
     )
     if not _deliver_persisted_confirmation_terminal(token):
         logger.warning(
@@ -1129,6 +1159,10 @@ def _execute_guangya_confirmation(
             message_id=_confirmation_message_id(payload),
             retryable=retryable,
         )
+        if not retryable:
+            _finalize_guangya_manual_logs(
+                payload, status="failed", error=message,
+            )
         if not _deliver_persisted_confirmation_terminal(token):
             logger.warning(
                 "Telegram 确认整理失败回执暂未送达，已进入重试队列 token=%s", token[:6]

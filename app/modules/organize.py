@@ -2545,15 +2545,19 @@ class Organizer:
                 ),
                 layout="relaxed",
             )
-            sections = [render_event(summary)]
-            sections.extend(
-                render_event(event)
-                for event in build_media_events(
-                    stats.get("media_items") or [], layout="relaxed",
-                    inventory_final=not bool(attention or stopped),
-                )
+            media_events = build_media_events(
+                stats.get("media_items") or [], layout="relaxed",
+                inventory_final=not bool(attention or stopped),
             )
+            sections = [render_event(summary)]
+            sections.extend(render_event(event) for event in media_events)
             summary_body = "\n\n".join(sections)
+            # 单一媒体身份可用同一张封面承载整条任务汇总；多个不同媒体
+            # 继续保持一条纯文本汇总，避免批量整理时连续刷出多张图片。
+            summary_image_url = (
+                str(media_events[0].image_url or "").strip()
+                if len(media_events) == 1 else ""
+            )
             # 汇总与媒体卡走持久化 outbox：临时网络失败可重试，已成功的
             # 事件不会因重试而重复发送。带按钮的待确认卡另有确认投递队列。
             from app.modules.organize_notification_outbox import (
@@ -2561,12 +2565,15 @@ class Organizer:
                 summary_idempotency_key,
             )
 
+            delivery_kwargs = {"chat_id": chat_id or ""}
+            if summary_image_url:
+                delivery_kwargs["image_url"] = summary_image_url
             summary_sent = bool(deliver_organize_notification(
                 summary_idempotency_key(
                     str(stats.get("task_id") or ""), chat_id=chat_id,
                 ),
                 summary_body,
-                chat_id=chat_id or "",
+                **delivery_kwargs,
             ))
 
             confirmation_failures = 0
@@ -5218,6 +5225,22 @@ class Organizer:
             log_id = add_organize_log(*log_args, **log_kwargs, _conn=conn)
             try:
                 add_organize_log_items(log_id, items, _conn=conn)
+                if len(log_args) >= 5 and str(log_args[4] or "") == "success":
+                    try:
+                        db.resolve_pending_organize_logs(
+                            str(log_args[0] or ""),
+                            str(log_args[3] or ""),
+                            before_log_id=log_id,
+                            _conn=conn,
+                        )
+                    except Exception as resolve_exc:
+                        # 前置待确认记录的展示结算不能反向污染已经成功的
+                        # 云端移动；时间线仍可通过兼容查询折叠旧记录。
+                        logger.warning(
+                            "结算人工确认前置日志失败 log_id=%s type=%s",
+                            log_id,
+                            type(resolve_exc).__name__,
+                        )
             except Exception as exc:
                 item_error = exc
                 try:
