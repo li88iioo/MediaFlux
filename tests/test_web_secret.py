@@ -78,6 +78,16 @@ class WebSecretTests(unittest.TestCase):
             middleware_secret,
         )
 
+    def test_fallback_secret_survives_module_reload_and_is_private(self):
+        first = self.web_secret.get_web_secret()
+        fallback = self.paths.config_dir / ".web-secret-key"
+        self.assertTrue(fallback.is_file())
+        if os.name == "posix":
+            self.assertEqual(fallback.stat().st_mode & 0o777, 0o600)
+
+        importlib.reload(self.web_secret)
+        self.assertEqual(self.web_secret.get_web_secret(), first)
+
     def test_existing_development_install_without_secret_persists_generated_secret(self):
         self.paths.config_dir.mkdir(parents=True)
         self.paths.env_file.write_text(

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -261,7 +261,7 @@ class RssDiagnosisUnitTests(IsolatedDatabaseTestCase):
         response = agent.query("诊断 RSS 订阅")
         self.assertEqual(response["tool_call"]["name"], "rss.diagnose")
         registry.execute.assert_called_once_with(
-            "rss.diagnose", {}, context=ToolContext(owner="")
+            "rss.diagnose", {}, context=ToolContext(owner="", request_id=ANY)
         )
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -223,7 +223,7 @@ class StrmFailureTriageUnitTests(IsolatedDatabaseTestCase):
         response = agent.query("查看 STRM 失败状态")
         self.assertEqual(response["tool_call"]["name"], "strm.triage_failures")
         registry.execute.assert_called_once_with(
-            "strm.triage_failures", {}, context=ToolContext(owner="")
+            "strm.triage_failures", {}, context=ToolContext(owner="", request_id=ANY)
         )
 
         for message in (

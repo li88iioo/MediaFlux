@@ -225,3 +225,375 @@ class ConfirmationStore:
             if token and token not in self._tickets:
                 return token
         raise AgentToolError("暂时无法创建确认请求", code="confirmation_unavailable")
+
+class SQLiteConfirmationStore(ConfirmationStore):
+    """SQLite-backed confirmation tickets shared by restarts and Web workers."""
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int = 60,
+        max_entries: int = 256,
+        clock: Callable[[], float] = time.time,
+        token_factory: Callable[[], str] | None = None,
+    ) -> None:
+        self.ttl_seconds = max(1, int(ttl_seconds))
+        self.max_entries = max(1, int(max_entries))
+        self._clock = clock
+        self._token_factory = token_factory or (lambda: secrets.token_urlsafe(24))
+
+    @staticmethod
+    def _ensure_schema(conn: Any) -> None:
+        # Web worker/CLI may construct the Agent service before the application-wide
+        # init hook runs. Keep this repository independently idempotent.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_confirmation_epochs("
+            "owner_digest TEXT PRIMARY KEY,generation INTEGER NOT NULL "
+            "CHECK(generation>0),touched_at REAL NOT NULL,updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_confirmation_epochs_touched "
+            "ON agent_confirmation_epochs(touched_at)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_confirmations("
+            "confirmation_id TEXT PRIMARY KEY,owner_digest TEXT NOT NULL,"
+            "tool_name TEXT NOT NULL,arguments_json TEXT NOT NULL DEFAULT '{}',"
+            "context_fingerprint TEXT NOT NULL DEFAULT '',expires_at REAL NOT NULL,"
+            "owner_generation INTEGER NOT NULL CHECK(owner_generation>0),"
+            "followup_context_json TEXT NOT NULL DEFAULT '{}',"
+            "confirmation_contract_json TEXT NOT NULL DEFAULT '{}',"
+            "created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_confirmations_owner_expiry "
+            "ON agent_confirmations(owner_digest,expires_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_confirmations_expiry "
+            "ON agent_confirmations(expires_at)"
+        )
+
+    @staticmethod
+    def _owner_digest(owner: str) -> str:
+        import hashlib
+        import hmac
+
+        from app.modules.web_secret import get_web_secret
+
+        return hmac.new(
+            get_web_secret().encode("utf-8"),
+            b"mediaflux-agent-confirmation:v1\0" + owner.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
+    def _timestamp() -> str:
+        from datetime import datetime
+
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    @staticmethod
+    def _json_object(value: dict[str, Any] | None) -> str:
+        import json
+
+        return json.dumps(deepcopy(value or {}), ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _load_json_object(value: Any) -> dict[str, Any]:
+        import json
+
+        try:
+            decoded = json.loads(str(value or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return deepcopy(decoded) if isinstance(decoded, dict) else {}
+
+    def issue(
+        self,
+        *,
+        owner: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        context_fingerprint: str = "",
+        followup_context: dict[str, Any] | None = None,
+        confirmation_contract: dict[str, Any] | None = None,
+        expected_owner_generation: int | None = None,
+    ) -> ConfirmationTicket:
+        from app import database as db
+        import sqlite3
+
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+        owner_digest = self._owner_digest(owner_key)
+        now = self._clock()
+        expires_at = now + self.ttl_seconds
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+            owner_generation = self._owner_generation(
+                conn, owner_digest, now=now, touch=True
+            )
+            if (
+                expected_owner_generation is not None
+                and int(expected_owner_generation) != owner_generation
+            ):
+                raise AgentToolError(
+                    "会话已重置，请重新生成确认请求",
+                    code="confirmation_invalid",
+                )
+            count = int(conn.execute(
+                "SELECT COUNT(*) FROM agent_confirmations"
+            ).fetchone()[0] or 0)
+            overflow = max(0, count - (self.max_entries - 1))
+            if overflow > 0:
+                conn.execute(
+                    "DELETE FROM agent_confirmations WHERE confirmation_id IN ("
+                    "SELECT confirmation_id FROM agent_confirmations "
+                    "ORDER BY expires_at ASC, created_at ASC LIMIT ?)",
+                    (overflow,),
+                )
+            confirmation_id = ""
+            for _ in range(8):
+                candidate = str(self._token_factory() or "").strip()
+                if not candidate:
+                    continue
+                try:
+                    conn.execute(
+                        "INSERT INTO agent_confirmations("
+                        "confirmation_id,owner_digest,tool_name,arguments_json,"
+                        "context_fingerprint,expires_at,owner_generation,"
+                        "followup_context_json,confirmation_contract_json,created_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            candidate,
+                            owner_digest,
+                            str(tool_name or "").strip(),
+                            self._json_object(arguments),
+                            str(context_fingerprint or ""),
+                            expires_at,
+                            owner_generation,
+                            self._json_object(followup_context),
+                            self._json_object(confirmation_contract),
+                            self._timestamp(),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    continue
+                confirmation_id = candidate
+                break
+            if not confirmation_id:
+                raise AgentToolError(
+                    "暂时无法创建确认请求", code="confirmation_unavailable"
+                )
+        return ConfirmationTicket(
+            confirmation_id=confirmation_id,
+            owner=owner_key,
+            tool_name=str(tool_name or "").strip(),
+            arguments=deepcopy(arguments),
+            context_fingerprint=str(context_fingerprint or ""),
+            expires_at=expires_at,
+            owner_generation=owner_generation,
+            followup_context=deepcopy(followup_context or {}),
+            confirmation_contract=deepcopy(confirmation_contract or {}),
+        )
+
+    def claim(self, *, owner: str, confirmation_id: str) -> ConfirmationTicket:
+        from app import database as db
+
+        owner_key = str(owner or "").strip()
+        ticket_id = str(confirmation_id or "").strip()
+        if not owner_key or not ticket_id:
+            raise AgentToolError("确认请求无效或已过期", code="confirmation_invalid")
+        owner_digest = self._owner_digest(owner_key)
+        now = self._clock()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+            row = conn.execute(
+                "SELECT confirmation_id,tool_name,arguments_json,context_fingerprint,"
+                "expires_at,owner_generation,followup_context_json,"
+                "confirmation_contract_json FROM agent_confirmations "
+                "WHERE confirmation_id=? AND owner_digest=?",
+                (ticket_id, owner_digest),
+            ).fetchone()
+            epoch = conn.execute(
+                "SELECT generation FROM agent_confirmation_epochs WHERE owner_digest=?",
+                (owner_digest,),
+            ).fetchone()
+            if (
+                row is None
+                or epoch is None
+                or float(row["expires_at"]) <= now
+                or int(row["owner_generation"]) != int(epoch["generation"])
+            ):
+                raise AgentToolError(
+                    "确认请求无效或已过期", code="confirmation_invalid"
+                )
+            deleted = conn.execute(
+                "DELETE FROM agent_confirmations WHERE confirmation_id=? AND owner_digest=?",
+                (ticket_id, owner_digest),
+            )
+            if deleted.rowcount != 1:
+                raise AgentToolError(
+                    "确认请求无效或已过期", code="confirmation_invalid"
+                )
+            conn.execute(
+                "UPDATE agent_confirmation_epochs SET touched_at=?,updated_at=? "
+                "WHERE owner_digest=?",
+                (now, self._timestamp(), owner_digest),
+            )
+        return ConfirmationTicket(
+            confirmation_id=str(row["confirmation_id"]),
+            owner=owner_key,
+            tool_name=str(row["tool_name"]),
+            arguments=self._load_json_object(row["arguments_json"]),
+            context_fingerprint=str(row["context_fingerprint"] or ""),
+            expires_at=float(row["expires_at"]),
+            owner_generation=int(row["owner_generation"]),
+            followup_context=self._load_json_object(row["followup_context_json"]),
+            confirmation_contract=self._load_json_object(
+                row["confirmation_contract_json"]
+            ),
+        )
+
+    def discard(self, *, owner: str, confirmation_id: str) -> bool:
+        from app import database as db
+
+        owner_key = str(owner or "").strip()
+        ticket_id = str(confirmation_id or "").strip()
+        if not owner_key or not ticket_id:
+            return False
+        owner_digest = self._owner_digest(owner_key)
+        now = self._clock()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+            deleted = conn.execute(
+                "DELETE FROM agent_confirmations WHERE confirmation_id=? AND owner_digest=?",
+                (ticket_id, owner_digest),
+            )
+            return deleted.rowcount == 1
+
+    def rotate_owner(self, *, owner: str) -> tuple[int, int]:
+        from app import database as db
+
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+        owner_digest = self._owner_digest(owner_key)
+        now = self._clock()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+            generation = self._new_owner_generation(conn)
+            conn.execute(
+                "INSERT INTO agent_confirmation_epochs("
+                "owner_digest,generation,touched_at,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(owner_digest) DO UPDATE SET "
+                "generation=excluded.generation,touched_at=excluded.touched_at,"
+                "updated_at=excluded.updated_at",
+                (owner_digest, generation, now, self._timestamp()),
+            )
+            deleted = conn.execute(
+                "DELETE FROM agent_confirmations WHERE owner_digest=?", (owner_digest,)
+            )
+            return max(0, int(deleted.rowcount)), generation
+
+    def revoke_owner(self, *, owner: str) -> int:
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return 0
+        revoked, _generation = self.rotate_owner(owner=owner_key)
+        return revoked
+
+    def owner_generation(self, *, owner: str) -> int:
+        from app import database as db
+
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+        owner_digest = self._owner_digest(owner_key)
+        now = self._clock()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+            return self._owner_generation(conn, owner_digest, now=now, touch=True)
+
+    def reset(self) -> None:
+        from app import database as db
+
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            conn.execute("DELETE FROM agent_confirmations")
+            conn.execute("DELETE FROM agent_confirmation_epochs")
+
+    def _prune(self, conn: Any, now: float) -> None:
+        conn.execute("DELETE FROM agent_confirmations WHERE expires_at<=?", (now,))
+        cutoff = now - (self.ttl_seconds * 2)
+        conn.execute(
+            "DELETE FROM agent_confirmation_epochs WHERE touched_at<=? AND "
+            "NOT EXISTS(SELECT 1 FROM agent_confirmations c "
+            "WHERE c.owner_digest=agent_confirmation_epochs.owner_digest)",
+            (cutoff,),
+        )
+        max_epochs = max(32, self.max_entries * 4)
+        count = int(conn.execute(
+            "SELECT COUNT(*) FROM agent_confirmation_epochs"
+        ).fetchone()[0] or 0)
+        overflow = count - max_epochs
+        if overflow > 0:
+            conn.execute(
+                "DELETE FROM agent_confirmation_epochs WHERE owner_digest IN ("
+                "SELECT e.owner_digest FROM agent_confirmation_epochs e "
+                "WHERE NOT EXISTS(SELECT 1 FROM agent_confirmations c "
+                "WHERE c.owner_digest=e.owner_digest) "
+                "ORDER BY e.touched_at ASC LIMIT ?)",
+                (overflow,),
+            )
+
+    def _owner_generation(
+        self, conn: Any, owner_digest: str, *, now: float, touch: bool
+    ) -> int:
+        row = conn.execute(
+            "SELECT generation,touched_at FROM agent_confirmation_epochs "
+            "WHERE owner_digest=?",
+            (owner_digest,),
+        ).fetchone()
+        if row is None:
+            generation = self._new_owner_generation(conn)
+            conn.execute(
+                "INSERT INTO agent_confirmation_epochs("
+                "owner_digest,generation,touched_at,updated_at) VALUES(?,?,?,?)",
+                (owner_digest, generation, now, self._timestamp()),
+            )
+            return generation
+        generation = int(row["generation"])
+        if touch:
+            conn.execute(
+                "UPDATE agent_confirmation_epochs SET touched_at=?,updated_at=? "
+                "WHERE owner_digest=?",
+                (now, self._timestamp(), owner_digest),
+            )
+        return generation
+
+    @staticmethod
+    def _new_owner_generation(conn: Any) -> int:
+        for _ in range(8):
+            generation = secrets.randbits(63) or 1
+            exists = conn.execute(
+                "SELECT 1 FROM agent_confirmation_epochs WHERE generation=? LIMIT 1",
+                (generation,),
+            ).fetchone()
+            if exists is None:
+                return generation
+        raise AgentToolError(
+            "暂时无法创建确认请求", code="confirmation_unavailable"
+        )

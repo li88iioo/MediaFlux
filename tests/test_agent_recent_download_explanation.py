@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -91,7 +91,7 @@ class RecentDownloadExplanationIntentTests(unittest.TestCase):
             response = AgentOrchestrator(registry).query(message)
             self.assertEqual(response["tool_call"]["name"], "downloads.diagnose_queue")
             registry.execute.assert_called_once_with(
-                "downloads.diagnose_queue", {}, context=ToolContext(owner="")
+                "downloads.diagnose_queue", {}, context=ToolContext(owner="", request_id=ANY)
             )
 
 

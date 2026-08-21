@@ -20,6 +20,8 @@ from app.agent.models import (
     ToolResult,
     ToolSpec,
 )
+from app.agent.metrics import agent_metrics
+from app.agent.observability import safe_exception_summary
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -222,7 +224,7 @@ class ToolRegistry:
                 normalized,
                 context or ToolContext(),
             )
-        return self._call(spec.name, spec.handler, normalized)
+        return self._call(spec.name, spec.handler, normalized, context or ToolContext())
 
     def prepare_confirmation(
         self,
@@ -255,9 +257,12 @@ class ToolRegistry:
                 spec.name,
                 spec.confirmation_preparer,
                 normalized,
+                context or ToolContext(),
             )
         else:
-            result, elapsed_ms = self._call(spec.name, spec.preview_handler, normalized)
+            result, elapsed_ms = self._call(
+                spec.name, spec.preview_handler, normalized, context or ToolContext()
+            )
             context_fingerprint = ""
             if spec.confirmation_context is not None:
                 try:
@@ -310,9 +315,12 @@ class ToolRegistry:
                 spec.confirmed_handler,
                 normalized,
                 str(expected_context or ""),
+                context or ToolContext(),
             )
         else:
-            result, elapsed_ms = self._call(spec.name, spec.handler, normalized)
+            result, elapsed_ms = self._call(
+                spec.name, spec.handler, normalized, context or ToolContext()
+            )
         if result.ok and spec.post_write_verifier is not None:
             result, verify_elapsed_ms = self._call_post_write_verifier(
                 spec.name,
@@ -402,17 +410,22 @@ class ToolRegistry:
         try:
             result, fingerprint = handler(arguments, context)
         except AgentToolError:
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
             raise
         except Exception as exc:
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
             logger.warning(
-                "Agent 上下文确认预检失败 tool=%s type=%s",
-                tool_name,
-                type(exc).__name__,
+                "Agent 上下文确认预检失败 tool=%s request_id=%s session_id=%s error=%s",
+                tool_name, context.request_id, context.session_id,
+                safe_exception_summary(exc),
             )
             raise AgentToolError(
                 "暂时无法创建确认请求", code="confirmation_unavailable"
             ) from exc
         elapsed_ms = max(0, int((monotonic() - started) * 1000))
+        agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=result.ok)
         return result, str(fingerprint or ""), elapsed_ms
 
     @staticmethod
@@ -427,12 +440,14 @@ class ToolRegistry:
         try:
             result = handler(arguments, expected_context, context)
         except AgentToolError:
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
             raise
         except Exception as exc:
             logger.warning(
-                "Agent 上下文确认工具执行失败 tool=%s type=%s",
-                tool_name,
-                type(exc).__name__,
+                "Agent 上下文确认工具执行失败 tool=%s request_id=%s session_id=%s error=%s",
+                tool_name, context.request_id, context.session_id,
+                safe_exception_summary(exc),
             )
             result = ToolResult(
                 ok=False,
@@ -441,6 +456,7 @@ class ToolRegistry:
                 error="上游数据源暂时不可用，请稍后重试。",
             )
         elapsed_ms = max(0, int((monotonic() - started) * 1000))
+        agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=result.ok)
         return result, elapsed_ms
 
     @staticmethod
@@ -448,20 +464,30 @@ class ToolRegistry:
         tool_name: str,
         handler: ConfirmationPreparer,
         arguments: dict[str, Any],
+        context: ToolContext,
     ) -> tuple[ToolResult, str, int]:
         started = monotonic()
         try:
-            result, context = handler(arguments)
+            result, fingerprint = handler(arguments)
         except AgentToolError:
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
             raise
         except Exception as exc:
-            logger.warning("Agent 确认预检失败 tool=%s type=%s", tool_name, type(exc).__name__)
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
+            logger.warning(
+                "Agent 确认预检失败 tool=%s request_id=%s session_id=%s error=%s",
+                tool_name, context.request_id, context.session_id,
+                safe_exception_summary(exc),
+            )
             raise AgentToolError(
                 "暂时无法创建确认请求",
                 code="confirmation_unavailable",
             ) from exc
         elapsed_ms = max(0, int((monotonic() - started) * 1000))
-        return result, str(context or ""), elapsed_ms
+        agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=result.ok)
+        return result, str(fingerprint or ""), elapsed_ms
 
     @staticmethod
     def _call_confirmed(
@@ -469,14 +495,21 @@ class ToolRegistry:
         handler: ConfirmedToolHandler,
         arguments: dict[str, Any],
         expected_context: str,
+        context: ToolContext,
     ) -> tuple[ToolResult, int]:
         started = monotonic()
         try:
             result = handler(arguments, expected_context)
         except AgentToolError:
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
             raise
         except Exception as exc:
-            logger.warning("Agent 确认工具执行失败 tool=%s type=%s", tool_name, type(exc).__name__)
+            logger.warning(
+                "Agent 确认工具执行失败 tool=%s request_id=%s session_id=%s error=%s",
+                tool_name, context.request_id, context.session_id,
+                safe_exception_summary(exc),
+            )
             result = ToolResult(
                 ok=False,
                 status="unavailable",
@@ -484,6 +517,7 @@ class ToolRegistry:
                 error="上游数据源暂时不可用，请稍后重试。",
             )
         elapsed_ms = max(0, int((monotonic() - started) * 1000))
+        agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=result.ok)
         return result, elapsed_ms
 
     @staticmethod
@@ -497,12 +531,14 @@ class ToolRegistry:
         try:
             result = handler(arguments, context)
         except AgentToolError:
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
             raise
         except Exception as exc:
             logger.warning(
-                "Agent 上下文工具执行失败 tool=%s type=%s",
-                tool_name,
-                type(exc).__name__,
+                "Agent 上下文工具执行失败 tool=%s request_id=%s session_id=%s error=%s",
+                tool_name, context.request_id, context.session_id,
+                safe_exception_summary(exc),
             )
             result = ToolResult(
                 ok=False,
@@ -511,15 +547,25 @@ class ToolRegistry:
                 error="上游数据源暂时不可用，请稍后重试。",
             )
         elapsed_ms = max(0, int((monotonic() - started) * 1000))
+        agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=result.ok)
         return result, elapsed_ms
 
     @staticmethod
-    def _call(tool_name: str, handler: ToolHandler, arguments: dict[str, Any]) -> tuple[ToolResult, int]:
+    def _call(
+        tool_name: str,
+        handler: ToolHandler,
+        arguments: dict[str, Any],
+        context: ToolContext,
+    ) -> tuple[ToolResult, int]:
         started = monotonic()
         try:
             result = handler(arguments)
         except Exception as exc:
-            logger.warning("Agent 工具执行失败 tool=%s type=%s", tool_name, type(exc).__name__)
+            logger.warning(
+                "Agent 工具执行失败 tool=%s request_id=%s session_id=%s error=%s",
+                tool_name, context.request_id, context.session_id,
+                safe_exception_summary(exc),
+            )
             result = ToolResult(
                 ok=False,
                 status="unavailable",
@@ -527,4 +573,5 @@ class ToolRegistry:
                 error="上游数据源暂时不可用，请稍后重试。",
             )
         elapsed_ms = max(0, int((monotonic() - started) * 1000))
+        agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=result.ok)
         return result, elapsed_ms

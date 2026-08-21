@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 
 from app.agent.orchestrator import AgentOrchestrator
+from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.missing_media_workflows import SQLiteMissingMediaWorkflowRepository
 from app.agent.recent_download_submissions import (
     RecentDownloadSubmissionStore,
@@ -29,6 +30,7 @@ def get_agent_service() -> AgentOrchestrator:
                 missing_workflow_repository = SQLiteMissingMediaWorkflowRepository()
                 _service = AgentOrchestrator(
                     build_tool_registry(),
+                    confirmation_store=SQLiteConfirmationStore(),
                     recent_patrol_store=RecentPatrolStore(repository=context_repository),
                     # 候选安全投影可跨进程续接；若底层 result_id 已失效，
                     # 确认执行阶段仍会由资源存储返回明确的过期提示。

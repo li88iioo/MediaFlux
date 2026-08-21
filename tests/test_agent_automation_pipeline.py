@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -203,7 +203,7 @@ class AutomationPipelineUnitTests(IsolatedDatabaseTestCase):
         response = agent.query("诊断自动化链路")
         self.assertEqual(response["tool_call"]["name"], "automation.diagnose_pipeline")
         registry.execute.assert_called_once_with(
-            "automation.diagnose_pipeline", {}, context=ToolContext(owner="")
+            "automation.diagnose_pipeline", {}, context=ToolContext(owner="", request_id=ANY)
         )
 
         for message, expected_tool in (
@@ -218,7 +218,7 @@ class AutomationPipelineUnitTests(IsolatedDatabaseTestCase):
             response = agent.query(message)
             self.assertEqual(response["tool_call"]["name"], expected_tool, message)
             registry.execute.assert_called_once_with(
-                expected_tool, {}, context=ToolContext(owner="")
+                expected_tool, {}, context=ToolContext(owner="", request_id=ANY)
             )
 
 

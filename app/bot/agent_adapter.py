@@ -1001,6 +1001,11 @@ def _publish_telegram_io_if_current(
     return coordinator.is_current(operation), result
 
 
+def _trace_operation_id(operation: Any) -> str:
+    value = str(getattr(operation, "operation_id", "") or "").strip()
+    return value or f"tg_trace_{secrets.token_urlsafe(12)}"
+
+
 def _telegram_callback_operation_id(owner: str, call: Any, *, action: str) -> str:
     """为 callback 派生稳定且不泄露身份/票据的短操作标识。"""
     source = "\x00".join((owner, str(getattr(call, "id", "") or ""), action))
@@ -2101,10 +2106,13 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             return True
 
         conversation_context, history_generation = _telegram_conversation_context(owner)
+        _principal, trace_session_id = _telegram_history_identity(owner)
         query_kwargs: dict[str, Any] = {
             "owner": owner,
             "query_tool_rate_identity": owner,
             "llm_tool_rate_identity": owner,
+            "request_id": _trace_operation_id(operation),
+            "session_id": trace_session_id,
         }
         # 历史上下文同时服务于确定性追问消歧，不能与 LLM 开关耦合。
         if conversation_context:
@@ -2341,12 +2349,17 @@ def _agent_result_ok(response: Any) -> bool:
     return isinstance(result, dict) and bool(result.get("ok"))
 
 
-def _query_patrol_action(service: Any, action: str, *, owner: str) -> Any:
+def _query_patrol_action(
+    service: Any, action: str, *, owner: str, request_id: str = "",
+    session_id: str = "",
+) -> Any:
     """固定只读巡检动作；资源接力前先刷新同一 owner 的安全快照。"""
     query_kwargs = {
         "owner": owner,
         "query_tool_rate_identity": owner,
         "llm_tool_rate_identity": owner,
+        "request_id": request_id,
+        "session_id": session_id,
     }
     summary = service.query(_PATROL_CALLBACK_QUERIES["agp:summary"], **query_kwargs)
     if action == "agp:summary" or not _agent_result_ok(summary):
@@ -2391,10 +2404,13 @@ def handle_agent_patrol_callback(
         bot.answer_callback_query(call.id, "正在查询，请稍候")
         callback_answered = True
         history_generation = _telegram_history_generation(owner)
+        _principal, trace_session_id = _telegram_history_identity(owner)
         response = _query_patrol_action(
             get_agent_service(),
             action,
             owner=owner,
+            request_id=_trace_operation_id(operation),
+            session_id=trace_session_id,
         )
 
         def prepare_output() -> tuple[str, Any | None]:
@@ -2540,6 +2556,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                                 "target": action["target"],
                             },
                             owner=owner,
+                            request_id=_trace_operation_id(operation),
+                            session_id=_telegram_history_identity(owner)[1],
                         )
                     except AgentToolError as exc:
                         prepare_error = exc
@@ -2580,6 +2598,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                     response = service.confirm(
                         action["confirmation_id"],
                         owner=owner,
+                        request_id=_trace_operation_id(operation),
+                        session_id=_telegram_history_identity(owner)[1],
                     )
                     confirmed_action_completed = True
                     text = render_agent_response(response)
@@ -2684,6 +2704,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 action["tool_name"],
                 action["arguments"],
                 owner=owner,
+                request_id=_trace_operation_id(operation),
+                session_id=_telegram_history_identity(owner)[1],
             )
             label = public_tool_label(action["tool_name"])
 
@@ -2721,6 +2743,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 action["action_key"],
                 owner=owner,
                 rate_identity="",
+                request_id=_trace_operation_id(operation),
+                session_id=_telegram_history_identity(owner)[1],
             )
             label = sanitize_public_text(resolution.get("label"), limit=120) or "建议检查"
             _publish_telegram_callback_response(

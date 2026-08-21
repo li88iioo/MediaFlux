@@ -1231,6 +1231,32 @@ CREATE INDEX IF NOT EXISTS idx_agent_session_context_lookup
 CREATE INDEX IF NOT EXISTS idx_agent_session_context_expiry
     ON agent_session_context(expires_at);
 
+CREATE TABLE IF NOT EXISTS agent_confirmation_epochs (
+    owner_digest TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    touched_at REAL NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_confirmation_epochs_touched
+    ON agent_confirmation_epochs(touched_at);
+
+CREATE TABLE IF NOT EXISTS agent_confirmations (
+    confirmation_id TEXT PRIMARY KEY,
+    owner_digest TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    context_fingerprint TEXT NOT NULL DEFAULT '',
+    expires_at REAL NOT NULL,
+    owner_generation INTEGER NOT NULL CHECK(owner_generation > 0),
+    followup_context_json TEXT NOT NULL DEFAULT '{}',
+    confirmation_contract_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_confirmations_owner_expiry
+    ON agent_confirmations(owner_digest, expires_at);
+CREATE INDEX IF NOT EXISTS idx_agent_confirmations_expiry
+    ON agent_confirmations(expires_at);
+
 CREATE TABLE IF NOT EXISTS agent_missing_media_workflows (
     workflow_id TEXT PRIMARY KEY,
     owner_digest TEXT NOT NULL,
@@ -1662,6 +1688,10 @@ def init_db() -> None:
             )
             conn.execute(
                 "DELETE FROM agent_session_context WHERE expires_at<=?",
+                (time.time(),),
+            )
+            conn.execute(
+                "DELETE FROM agent_confirmations WHERE expires_at<=?",
                 (time.time(),),
             )
             timestamp = now()

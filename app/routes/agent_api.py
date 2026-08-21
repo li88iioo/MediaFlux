@@ -11,9 +11,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.agent.conversation_compaction import schedule_conversation_compaction
+from app.agent.metrics import agent_metrics
 from app.agent.conversation_history import get_agent_conversation_history_repository
 from app.agent.owner_routes import web_agent_owner
 from app.agent.local_media_intents import (
@@ -665,6 +666,20 @@ def capabilities(request: Request):
     return api_response(get_agent_service().capabilities())
 
 
+@router.get("/metrics")
+def metrics(request: Request, format: str = "json"):
+    require_api_login(request)
+    output_format = str(format or "json").strip().lower()
+    if output_format == "json":
+        return api_response(agent_metrics.snapshot())
+    if output_format in {"prometheus", "text"}:
+        return PlainTextResponse(
+            agent_metrics.prometheus(),
+            media_type="text/plain; version=0.0.4",
+        )
+    return api_error("format 仅支持 json 或 prometheus", 400)
+
+
 @router.post("/query")
 def query(request: Request, data: Any = Body(default=None)):
     require_api_login(request)
@@ -892,6 +907,8 @@ def query(request: Request, data: Any = Body(default=None)):
             "llm_rate_owner": _agent_llm_rate_owner(request),
             "query_tool_rate_identity": tool_rate_identity,
             "llm_tool_rate_identity": tool_rate_identity,
+            "request_id": request_key,
+            "session_id": session_key or "",
         }
         # 无会话或空历史时保持既有 service 调用契约；只有真实上下文才透传。
         if conversation_context:
@@ -1019,7 +1036,13 @@ def invoke_tool(request: Request, tool_name: str, data: Any = Body(default=None)
             if session_key is not None
             else None
         )
-        result = service.invoke(tool_name, arguments, owner=owner)
+        result = service.invoke(
+            tool_name,
+            arguments,
+            owner=owner,
+            request_id=f"tool_{secrets.token_urlsafe(12)}",
+            session_id=session_key or "",
+        )
         if session_key is not None:
             _record_query_history(
                 request,
@@ -1060,6 +1083,8 @@ def invoke_workspace_action(request: Request, data: Any = Body(default=None)):
             action_key,
             owner=owner,
             rate_identity=_agent_tool_rate_owner(request),
+            request_id=f"workspace_{secrets.token_urlsafe(12)}",
+            session_id=session_key or "",
         )
         if session_key is not None:
             tool_call = (
@@ -1093,6 +1118,9 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
         return api_error("arguments 必须是 JSON 对象", 400)
     try:
         owner = _agent_owner(request, data)
+        session_key = (
+            _session_id(data.get("session_id")) if "session_id" in data else None
+        )
         service = get_agent_service()
         if not service.has_tool(tool_name):
             raise AgentToolError("未知 Agent 工具", code="tool_not_found")
@@ -1108,7 +1136,11 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
             initialize=lambda: begin_query_confirmation_epoch(service, owner=owner),
         )
         try:
-            prepare_kwargs: dict[str, Any] = {"owner": owner}
+            prepare_kwargs: dict[str, Any] = {
+                "owner": owner,
+                "request_id": operation.operation_id,
+                "session_id": session_key or "",
+            }
             if confirmation_epoch is not None:
                 prepare_kwargs["expected_owner_generation"] = confirmation_epoch
             response = service.prepare(tool_name, arguments, **prepare_kwargs)
@@ -1154,7 +1186,12 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
         )
 
         def execute_confirmed_action() -> dict[str, Any]:
-            response = service.confirm(confirmation_id, owner=owner)
+            response = service.confirm(
+                confirmation_id,
+                owner=owner,
+                request_id=operation.operation_id,
+                session_id=session_key or "",
+            )
             if session_key is not None:
                 _record_query_history(
                     request,

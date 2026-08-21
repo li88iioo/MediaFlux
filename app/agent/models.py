@@ -64,6 +64,8 @@ class ToolContext:
     """仅由服务端注入的调用身份；绝不来自模型或工具参数。"""
 
     owner: str = ""
+    session_id: str = ""
+    request_id: str = ""
 
 
 ContextualToolHandler = Callable[[dict[str, Any], ToolContext], ToolResult]

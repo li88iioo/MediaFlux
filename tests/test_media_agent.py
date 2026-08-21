@@ -598,7 +598,7 @@ class _FakeAgentService:
 
     def query(
         self, message, *, owner="", llm_rate_owner="", query_tool_rate_identity="",
-        llm_tool_rate_identity=""
+        llm_tool_rate_identity="", **_kwargs
     ):
         if message == "结构化结果":
             return {
@@ -620,7 +620,7 @@ class _FakeAgentService:
     def has_tool(self, tool_name):
         return tool_name != "missing" and not str(tool_name).startswith("missing-")
 
-    def invoke(self, tool_name, arguments, *, owner=""):
+    def invoke(self, tool_name, arguments, *, owner="", **_kwargs):
         if not self.has_tool(tool_name):
             raise AgentToolError("未知 Agent 工具", code="tool_not_found")
         return {
@@ -630,7 +630,7 @@ class _FakeAgentService:
             "mode": "read_only",
         }
 
-    def prepare(self, tool_name, arguments, *, owner):
+    def prepare(self, tool_name, arguments, *, owner, **_kwargs):
         if tool_name == "missing":
             raise AgentToolError("未知 Agent 工具", code="tool_not_found")
         return {
@@ -641,7 +641,7 @@ class _FakeAgentService:
             "confirmation": {"confirmation_id": "x" * 24},
         }
 
-    def confirm(self, confirmation_id, *, owner):
+    def confirm(self, confirmation_id, *, owner, **_kwargs):
         if confirmation_id == "z" * 24:
             raise AgentToolError("确认请求无效或已过期", code="confirmation_invalid")
         return {

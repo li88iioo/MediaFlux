@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -262,14 +262,14 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
         response = agent.query("检查本地媒体自动化流程状态")
         self.assertEqual(response["tool_call"]["name"], "local_media.diagnose")
         registry.execute.assert_called_once_with(
-            "local_media.diagnose", {}, context=ToolContext(owner="")
+            "local_media.diagnose", {}, context=ToolContext(owner="", request_id=ANY)
         )
 
         registry.reset_mock()
         response = agent.query("检查本地媒体配置状态")
         self.assertEqual(response["tool_call"]["name"], "local_media.diagnose")
         registry.execute.assert_called_once_with(
-            "local_media.diagnose", {}, context=ToolContext(owner="")
+            "local_media.diagnose", {}, context=ToolContext(owner="", request_id=ANY)
         )
 
         for message in (

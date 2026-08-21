@@ -5,7 +5,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from app import database as db
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
@@ -1500,6 +1500,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             owner="tg:v1:100\x1f200",
             query_tool_rate_identity="tg:v1:100\x1f200",
             llm_tool_rate_identity="tg:v1:100\x1f200",
+            request_id=ANY,
+            session_id=ANY,
         )
         markup = bot.replies[0][2]["reply_markup"]
         self.assertEqual(len(markup.buttons), 2)
@@ -1697,6 +1699,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             owner="tg:v1:100\x1f200",
             query_tool_rate_identity="tg:v1:100\x1f200",
             llm_tool_rate_identity="tg:v1:100\x1f200",
+            request_id=ANY,
+            session_id=ANY,
             reply_context={
                 "text": "系统简报发现 67 项需要关注",
                 "message_id": 41,
@@ -1765,6 +1769,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                     owner="tg:v1:100\x1f200",
                     query_tool_rate_identity="tg:v1:100\x1f200",
                     llm_tool_rate_identity="tg:v1:100\x1f200",
+            request_id=ANY,
+            session_id=ANY,
                 )
 
     def test_message_prefers_native_rich_draft_stream_and_persists_final_message(self):
@@ -1853,6 +1859,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             owner="tg:v1:100\x1f200",
             query_tool_rate_identity="tg:v1:100\x1f200",
             llm_tool_rate_identity="tg:v1:100\x1f200",
+            request_id=ANY,
+            session_id=ANY,
             present=False,
         )
         # 半句话不会发布；只保留初始 thinking 与完整句子的末尾 flush。
@@ -2485,6 +2493,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 "limit": 20,
             },
             owner="tg:v1:100\x1f200",
+            request_id=ANY,
+            session_id=ANY,
         )
         service.prepare.assert_not_called()
         service.confirm.assert_not_called()
@@ -2677,6 +2687,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             "review_rss",
             owner="tg:v1:100\x1f200",
             rate_identity="",
+            request_id=ANY,
+            session_id=ANY,
         )
         self.assertEqual(len(bot.replies), 1)
         self.assertIn("RSS 状态已核对", bot.replies[0][1])
@@ -2739,7 +2751,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
 
         limiter.assert_called_once_with("tg:v1:100\x1f200", "rss.diagnose")
         service.invoke_workspace_action.assert_called_once_with(
-            "review_rss", owner="tg:v1:100\x1f200", rate_identity=""
+            "review_rss", owner="tg:v1:100\x1f200", rate_identity="",
+            request_id=ANY, session_id=ANY,
         )
         self.assertEqual(len(bot.replies), 1)
         self.assertEqual(
@@ -2849,7 +2862,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         release_callback = threading.Event()
 
         class LatestWinsService:
-            def invoke(self, _tool_name, _arguments, *, owner):
+            def invoke(self, _tool_name, _arguments, *, owner, **_kwargs):
                 self.owner = owner
                 callback_started.set()
                 if not release_callback.wait(timeout=5):
@@ -3086,6 +3099,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             owner="tg:v1:100\x1f200",
             query_tool_rate_identity="tg:v1:100\x1f200",
             llm_tool_rate_identity="tg:v1:100\x1f200",
+            request_id=ANY,
+            session_id=ANY,
         )
         service.prepare.assert_not_called()
         service.confirm.assert_not_called()
@@ -3164,12 +3179,16 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 owner=owner,
                 query_tool_rate_identity=owner,
                 llm_tool_rate_identity=owner,
+                request_id=ANY,
+                session_id=ANY,
             ),
             unittest.mock.call(
                 "把刚才巡检发现的缺集找资源",
                 owner=owner,
                 query_tool_rate_identity=owner,
                 llm_tool_rate_identity=owner,
+                request_id=ANY,
+                session_id=ANY,
             ),
         ])
         service.prepare.assert_not_called()
@@ -3357,6 +3376,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 "indexer.submit_resource",
                 {"result_id": "resource_result_123456", "target": "qb"},
                 owner="tg:v1:100\x1f200",
+                request_id=ANY,
+                session_id=ANY,
             )
             service.confirm.assert_not_called()
             confirmation_markup = bot.edits[0][3]["reply_markup"]
@@ -3386,7 +3407,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             handle_agent_callback(bot, confirm_call, _Telebot)
 
         service.confirm.assert_called_once_with(
-            "private-confirmation-ticket", owner="tg:v1:100\x1f200"
+            "private-confirmation-ticket", owner="tg:v1:100\x1f200",
+            request_id=ANY, session_id=ANY,
         )
         self.assertIn("下载任务已提交", bot.edits[-1][0])
         self.assertIsNone(bot.edits[-1][3]["reply_markup"])
@@ -3572,8 +3594,14 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(
             service.confirm.call_args_list,
             [
-                unittest.mock.call("ticket-1", owner="tg:v1:100\x1f200"),
-                unittest.mock.call("ticket-2", owner="tg:v1:100\x1f200"),
+                unittest.mock.call(
+                    "ticket-1", owner="tg:v1:100\x1f200",
+                    request_id=ANY, session_id=ANY,
+                ),
+                unittest.mock.call(
+                    "ticket-2", owner="tg:v1:100\x1f200",
+                    request_id=ANY, session_id=ANY,
+                ),
             ],
         )
 
@@ -3620,7 +3648,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             handle_agent_callback(bot, invalid_call)
             handle_agent_callback(bot, valid_call)
         service.confirm.assert_called_once_with(
-            "ticket", owner="tg:v1:100\x1f200"
+            "ticket", owner="tg:v1:100\x1f200",
+            request_id=ANY, session_id=ANY,
         )
         self.assertEqual(bot.answers[-1][1], "正在执行，请稍候")
 
@@ -3663,7 +3692,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         ):
             handle_agent_callback(bot, call)
             handle_agent_callback(bot, call)
-        service.confirm.assert_called_once_with("ticket", owner="tg:v1:100\x1f200")
+        service.confirm.assert_called_once_with(
+            "ticket", owner="tg:v1:100\x1f200", request_id=ANY, session_id=ANY
+        )
         self.assertEqual(len(bot.edits), 1)
         self.assertEqual(bot.answers[-1][1], "操作已过期或无效")
 
@@ -3694,7 +3725,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         ):
             handle_agent_callback(bot, call)
 
-        service.confirm.assert_called_once_with("ticket", owner="tg:v1:100\x1f200")
+        service.confirm.assert_called_once_with(
+            "ticket", owner="tg:v1:100\x1f200", request_id=ANY, session_id=ANY
+        )
         self.assertEqual(bot.answers[-1][1], "正在执行，请稍候")
         self.assertEqual(len(bot.edits), 1)
         self.assertIn("服务暂时不可用", bot.edits[0][0])
@@ -3734,7 +3767,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         ):
             handle_agent_callback(bot, call)
 
-        service.confirm.assert_called_once_with("ticket", owner="tg:v1:100\x1f200")
+        service.confirm.assert_called_once_with(
+            "ticket", owner="tg:v1:100\x1f200", request_id=ANY, session_id=ANY
+        )
         self.assertEqual(len(bot.edit_attempts), 1)
         self.assertEqual(len(bot.sent), 1)
         self.assertIn("操作已完成", bot.sent[0][1])
@@ -3777,7 +3812,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         ) as schedule_retry:
             handle_agent_callback(bot, call)
 
-        service.confirm.assert_called_once_with("ticket", owner="tg:v1:100\x1f200")
+        service.confirm.assert_called_once_with(
+            "ticket", owner="tg:v1:100\x1f200", request_id=ANY, session_id=ANY
+        )
         self.assertEqual(len(bot.edit_attempts), 1)
         self.assertNotIn("执行失败", bot.edit_attempts[0][0])
         pending = json.loads(db.kv_get("telegram_pending_operations_v1", "[]"))

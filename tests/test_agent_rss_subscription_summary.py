@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from app import database as db
 from app.agent.models import ToolContext, ToolResult
@@ -307,7 +307,7 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
         registry.execute.assert_called_once_with(
             "rss.get_subscription_summary",
             {"subscription_id": subscription_id},
-            context=ToolContext(owner=""),
+            context=ToolContext(owner="", request_id=ANY),
         )
 
     def test_named_summary_fails_closed_when_name_is_ambiguous(self):
@@ -345,7 +345,7 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
         registry.execute.assert_called_once_with(
             "rss.get_subscription_summary",
             {"subscription_id": 12},
-            context=ToolContext(owner=""),
+            context=ToolContext(owner="", request_id=ANY),
         )
 
         registry.reset_mock()
@@ -356,7 +356,7 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
         listed = agent.query("列出全部 RSS 订阅")
         self.assertEqual(listed["tool_call"]["name"], "rss.subscription_summaries")
         registry.execute.assert_called_once_with(
-            "rss.subscription_summaries", {}, context=ToolContext(owner="")
+            "rss.subscription_summaries", {}, context=ToolContext(owner="", request_id=ANY)
         )
 
     def test_rss_followups_keep_the_previous_topic(self):

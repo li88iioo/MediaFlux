@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -424,7 +424,7 @@ class WorkspaceTodoUnitTests(IsolatedDatabaseTestCase):
             response = agent.query(message)
             self.assertEqual(response["tool_call"]["name"], "workspace.todo", message)
             registry.execute.assert_called_once_with(
-                "workspace.todo", {}, context=ToolContext(owner="")
+                "workspace.todo", {}, context=ToolContext(owner="", request_id=ANY)
             )
 
         expected = (

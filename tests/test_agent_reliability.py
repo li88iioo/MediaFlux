@@ -1,0 +1,219 @@
+"""Agent 第10批：持久确认、链路追踪、异常脱敏与指标。"""
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import re
+import threading
+import unittest
+
+from fastapi.testclient import TestClient
+
+from app import database as db
+from app.agent.confirmation import SQLiteConfirmationStore
+from app.agent.metrics import AgentMetricsCollector, agent_metrics
+from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
+from app.agent.observability import safe_exception_summary
+from app.agent.orchestrator import AgentOrchestrator
+from app.agent.registry import AgentToolError, ToolRegistry
+from app.main import create_app
+from tests.support import IsolatedDatabaseTestCase
+
+
+class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        SQLiteConfirmationStore().reset()
+
+    def test_ticket_survives_store_recreation_and_owner_is_hashed(self) -> None:
+        first = SQLiteConfirmationStore(
+            token_factory=lambda: "persistent-ticket-1234567890"
+        )
+        ticket = first.issue(
+            owner="owner-a",
+            tool_name="write.test",
+            arguments={"items": ["one"]},
+            context_fingerprint="snapshot",
+            followup_context={"episode": 3},
+            confirmation_contract={"action": "测试写入"},
+        )
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT owner_digest FROM agent_confirmations WHERE confirmation_id=?",
+                (ticket.confirmation_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row["owner_digest"], "owner-a")
+        self.assertRegex(str(row["owner_digest"]), r"^[0-9a-f]{64}$")
+
+        claimed = SQLiteConfirmationStore().claim(
+            owner="owner-a", confirmation_id=ticket.confirmation_id
+        )
+        self.assertEqual(claimed.arguments, {"items": ["one"]})
+        self.assertEqual(claimed.context_fingerprint, "snapshot")
+        self.assertEqual(claimed.followup_context, {"episode": 3})
+        with self.assertRaises(AgentToolError):
+            first.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+
+    def test_concurrent_claim_is_atomic_across_store_instances(self) -> None:
+        issuer = SQLiteConfirmationStore(
+            token_factory=lambda: "concurrent-ticket-123456789"
+        )
+        ticket = issuer.issue(owner="owner-a", tool_name="write.test", arguments={})
+        barrier = threading.Barrier(2)
+
+        def claim_once() -> str:
+            barrier.wait(timeout=3)
+            try:
+                SQLiteConfirmationStore().claim(
+                    owner="owner-a", confirmation_id=ticket.confirmation_id
+                )
+            except AgentToolError as exc:
+                return exc.code
+            return "claimed"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = sorted(pool.map(lambda _index: claim_once(), range(2)))
+        self.assertEqual(outcomes, ["claimed", "confirmation_invalid"])
+
+    def test_owner_rotation_revokes_tickets_across_instances(self) -> None:
+        first = SQLiteConfirmationStore(
+            token_factory=lambda: "rotated-ticket-1234567890"
+        )
+        ticket = first.issue(owner="owner-a", tool_name="write.test", arguments={})
+        revoked, generation = SQLiteConfirmationStore().rotate_owner(owner="owner-a")
+        self.assertEqual(revoked, 1)
+        self.assertGreater(generation, 0)
+        with self.assertRaises(AgentToolError):
+            first.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+
+
+class AgentTraceAndMetricsTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        agent_metrics.reset()
+
+    def tearDown(self) -> None:
+        agent_metrics.reset()
+
+    def test_tool_context_receives_request_and_session_ids(self) -> None:
+        seen: list[ToolContext] = []
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="trace.read",
+            description="trace",
+            risk=RiskLevel.READ,
+            parameters={},
+            validator=lambda arguments: {},
+            handler=lambda _arguments: ToolResult(True, "completed", "ok"),
+            context_handler=lambda _arguments, context: (
+                seen.append(context) or ToolResult(True, "completed", "ok")
+            ),
+        ))
+        service = AgentOrchestrator(registry)
+        response = service.invoke(
+            "trace.read",
+            {},
+            owner="owner-a",
+            request_id="request-12345678",
+            session_id="session-1234567890",
+        )
+        self.assertEqual(response["request_id"], "request-12345678")
+        self.assertEqual(
+            seen,
+            [ToolContext(
+                owner="owner-a",
+                request_id="request-12345678",
+                session_id="session-1234567890",
+            )],
+        )
+
+    def test_query_response_preserves_supplied_request_id(self) -> None:
+        response = AgentOrchestrator(ToolRegistry()).query(
+            "你好",
+            request_id="query-request-123456",
+            session_id="session-1234567890",
+        )
+        self.assertEqual(response["request_id"], "query-request-123456")
+        self.assertEqual(response["mode"], "conversation")
+
+    def test_safe_exception_summary_redacts_and_truncates(self) -> None:
+        summary = safe_exception_summary(
+            RuntimeError(
+                "request failed https://example.invalid/api?token=super-secret-value "
+                + ("detail " * 100)
+            ),
+            limit=120,
+        )
+        self.assertLessEqual(len(summary), 120)
+        self.assertIn("RuntimeError", summary)
+        self.assertNotIn("super-secret-value", summary)
+        self.assertNotIn("\n", summary)
+
+    def test_metrics_collector_is_thread_safe_and_bounded(self) -> None:
+        collector = AgentMetricsCollector(max_latency_samples=32)
+
+        def record(index: int) -> None:
+            collector.record_query(elapsed_ms=index, ok=index % 2 == 0)
+            collector.record_tool("trace.read", elapsed_ms=index, ok=True)
+            collector.record_confirmation("issued")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(record, range(100)))
+        snapshot = collector.snapshot()
+        self.assertEqual(snapshot["queries"], {"success": 50, "error": 50})
+        self.assertEqual(snapshot["tools"]["by_name"]["trace.read"]["success"], 100)
+        self.assertEqual(snapshot["confirmations"]["issued"], 100)
+        self.assertEqual(snapshot["latency_ms"]["query"]["count"], 32)
+        self.assertGreaterEqual(snapshot["latency_ms"]["query"]["p95"], 90)
+
+
+class AgentMetricsApiTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        agent_metrics.reset()
+        self.client = TestClient(create_app(start_background=False))
+        self.client.__enter__()
+
+    def tearDown(self) -> None:
+        self.client.__exit__(None, None, None)
+        agent_metrics.reset()
+
+    @staticmethod
+    def _token(html: str) -> str:
+        match = re.search(r'name="csrf_token"\s+(?:value|content)="([^"]+)"', html)
+        if not match:
+            match = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
+        if not match:
+            raise AssertionError("CSRF token missing")
+        return match.group(1)
+
+    def _login(self) -> None:
+        token = self._token(self.client.get("/login").text)
+        response = self.client.post(
+            "/login",
+            data={"username": "admin", "password": "123456", "csrf_token": token},
+            follow_redirects=False,
+        )
+        self.assertEqual(response.status_code, 302, response.text)
+
+    def test_metrics_endpoint_requires_login_and_supports_json_and_prometheus(self) -> None:
+        unauthenticated = self.client.get("/api/agent/metrics")
+        self.assertEqual(unauthenticated.status_code, 401)
+        self._login()
+        agent_metrics.record_query(elapsed_ms=12, ok=True)
+        agent_metrics.record_tool("trace.read", elapsed_ms=7, ok=True)
+        agent_metrics.record_confirmation("issued")
+
+        json_response = self.client.get("/api/agent/metrics")
+        self.assertEqual(json_response.status_code, 200, json_response.text)
+        self.assertEqual(json_response.json()["queries"]["success"], 1)
+        self.assertEqual(
+            json_response.json()["tools"]["by_name"]["trace.read"]["success"], 1
+        )
+
+        text_response = self.client.get("/api/agent/metrics?format=prometheus")
+        self.assertEqual(text_response.status_code, 200, text_response.text)
+        self.assertIn("mediaflux_agent_queries_total", text_response.text)
+        self.assertIn('tool="trace.read"', text_response.text)
+        self.assertTrue(text_response.headers["content-type"].startswith("text/plain"))
+
+
+if __name__ == "__main__":
+    unittest.main()

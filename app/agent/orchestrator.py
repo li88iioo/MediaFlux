@@ -7,6 +7,8 @@ from datetime import date
 import logging
 import re
 import secrets
+import sys
+from time import monotonic
 import unicodedata
 from typing import Any, Callable
 
@@ -18,6 +20,13 @@ from app.agent.confirmation_contract import (
     sanitize_confirmation_contract,
 )
 from app.agent.models import LLMToolDisposition, RiskLevel, ToolContext, ToolResult
+from app.agent.metrics import agent_metrics
+from app.agent.observability import (
+    begin_trace_context,
+    current_request_id,
+    current_tool_context,
+    end_trace_context,
+)
 from app.agent.intents import ReadIntentSpec, match_read_intent
 from app.agent import local_media_intents
 from app.agent.indexer_config_actions import current_indexer_site_ids
@@ -4696,7 +4705,12 @@ class AgentOrchestrator:
         arguments: dict[str, Any] | None = None,
         *,
         owner: str = "",
+        request_id: str = "",
+        session_id: str = "",
     ) -> dict[str, Any]:
+        trace_context = current_tool_context(
+            owner=owner, request_id=request_id, session_id=session_id
+        )
         normalized_arguments = arguments or {}
         if isinstance(self.registry, ToolRegistry):
             # 最近重试必须保存 handler 实际收到的默认值/规范化参数；同时保留
@@ -4707,7 +4721,7 @@ class AgentOrchestrator:
         result, elapsed_ms = self.registry.execute(
             tool_name,
             arguments,
-            context=ToolContext(owner=owner),
+            context=trace_context,
         )
         if tool_name in {
             "library.audit_library_episodes",
@@ -4754,7 +4768,10 @@ class AgentOrchestrator:
             self.recent_read_store.capture(
                 owner=owner, tool_name=tool_name, arguments=normalized_arguments
             )
-        return self._response(tool_name, normalized_arguments, result, elapsed_ms)
+        return self._response(
+            tool_name, normalized_arguments, result, elapsed_ms,
+            request_id=trace_context.request_id,
+        )
 
     @staticmethod
     def _reserve_query_tool_budget(tool_name: str, *, rate_identity: str = "") -> None:
@@ -4927,6 +4944,8 @@ class AgentOrchestrator:
         *,
         owner: str = "",
         rate_identity: str = "",
+        request_id: str = "",
+        session_id: str = "",
     ) -> dict[str, Any]:
         resolution = resolve_workspace_action_handoff({"action_key": action_key})
         target_tool = str(resolution["target_tool"])
@@ -4940,7 +4959,9 @@ class AgentOrchestrator:
                 "Agent 请求过于频繁，请稍后重试",
                 code="rate_limited",
             )
-        return self.invoke(target_tool, {}, owner=owner)
+        return self.invoke(
+            target_tool, {}, owner=owner, request_id=request_id, session_id=session_id
+        )
 
     def _continue_recent_library_patrol(self, message: str, *, owner: str) -> dict[str, Any]:
         snapshot = self.recent_patrol_store.get(owner=owner)
@@ -5347,7 +5368,12 @@ class AgentOrchestrator:
         owner: str,
         followup_context: dict[str, Any] | None = None,
         expected_owner_generation: int | None = None,
+        request_id: str = "",
+        session_id: str = "",
     ) -> dict[str, Any]:
+        trace_context = current_tool_context(
+            owner=owner, request_id=request_id, session_id=session_id
+        )
         query_epoch = _QUERY_CONFIRMATION_EPOCH.get()
         if (
             expected_owner_generation is None
@@ -5363,7 +5389,7 @@ class AgentOrchestrator:
         spec, normalized, context, preview, elapsed_ms = self.registry.prepare_confirmation(
             tool_name,
             arguments,
-            context=ToolContext(owner=owner),
+            context=trace_context,
         )
         confirmation_contract = build_confirmation_contract(
             tool_name=spec.name,
@@ -5379,8 +5405,9 @@ class AgentOrchestrator:
             confirmation_contract=confirmation_contract,
             expected_owner_generation=owner_generation,
         )
+        agent_metrics.record_confirmation("issued")
         response = {
-            "request_id": secrets.token_urlsafe(12),
+            "request_id": trace_context.request_id,
             "mode": "confirmation_required",
             "tool_call": {"name": spec.name, "elapsed_ms": elapsed_ms},
             "result": preview.to_dict(),
@@ -5496,15 +5523,28 @@ class AgentOrchestrator:
                 )
         return None
 
-    def confirm(self, confirmation_id: str, *, owner: str) -> dict[str, Any]:
-        ticket = self.confirmation_store.claim(owner=owner, confirmation_id=confirmation_id)
+    def confirm(
+        self, confirmation_id: str, *, owner: str, request_id: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        trace_context = current_tool_context(
+            owner=owner, request_id=request_id, session_id=session_id
+        )
+        try:
+            ticket = self.confirmation_store.claim(
+                owner=owner, confirmation_id=confirmation_id
+            )
+        except AgentToolError:
+            agent_metrics.record_confirmation("invalid")
+            raise
+        agent_metrics.record_confirmation("claimed")
         risk = self.registry.risk_for(ticket.tool_name)
         try:
             result, elapsed_ms = self.registry.execute_confirmed(
                 ticket.tool_name,
                 ticket.arguments,
                 expected_context=ticket.context_fingerprint,
-                context=ToolContext(owner=owner),
+                context=trace_context,
             )
         except AgentToolError as exc:
             if self.record_actions:
@@ -5575,6 +5615,8 @@ class AgentOrchestrator:
                     "indexer.search_resources",
                     {"title": title, "limit": limit},
                     owner=owner,
+                    request_id=trace_context.request_id,
+                    session_id=trace_context.session_id,
                 )
                 followup_result = followup.get("result")
                 if isinstance(followup_result, dict):
@@ -5596,6 +5638,7 @@ class AgentOrchestrator:
             public_result,
             elapsed_ms,
             mode="confirmed_action",
+            request_id=trace_context.request_id,
         )
 
     def query(
@@ -5610,19 +5653,48 @@ class AgentOrchestrator:
         reply_context: dict[str, Any] | None = None,
         present: bool = True,
         confirmation_owner_generation: int | None = None,
+        request_id: str = "",
+        session_id: str = "",
     ) -> dict[str, Any]:
-        message = normalize_agent_message(value)
+        trace_token, _trace_context = begin_trace_context(
+            owner=owner, request_id=request_id, session_id=session_id
+        )
+        query_started = monotonic()
+        try:
+            message = normalize_agent_message(value)
+        except Exception:
+            agent_metrics.record_query(
+                elapsed_ms=max(0, int((monotonic() - query_started) * 1000)),
+                ok=False,
+            )
+            end_trace_context(trace_token)
+            raise
         confirmation_token = None
         rate_identity_token = None
-        llm_budget_token = begin_llm_request_budget(llm_rate_owner or owner)
-        owner_key = str(owner or "").strip()
-        if confirmation_owner_generation is not None and owner_key:
-            confirmation_token = _QUERY_CONFIRMATION_EPOCH.set(
-                (owner_key, int(confirmation_owner_generation))
+        llm_budget_token = None
+        try:
+            llm_budget_token = begin_llm_request_budget(llm_rate_owner or owner)
+            owner_key = str(owner or "").strip()
+            if confirmation_owner_generation is not None and owner_key:
+                confirmation_token = _QUERY_CONFIRMATION_EPOCH.set(
+                    (owner_key, int(confirmation_owner_generation))
+                )
+            query_rate_identity = str(query_tool_rate_identity or "").strip()
+            if query_rate_identity:
+                rate_identity_token = _QUERY_TOOL_RATE_IDENTITY.set(query_rate_identity)
+        except Exception:
+            if rate_identity_token is not None:
+                _QUERY_TOOL_RATE_IDENTITY.reset(rate_identity_token)
+            if confirmation_token is not None:
+                _QUERY_CONFIRMATION_EPOCH.reset(confirmation_token)
+            if llm_budget_token is not None:
+                reset_llm_request_budget(llm_budget_token)
+            agent_metrics.record_query(
+                elapsed_ms=max(0, int((monotonic() - query_started) * 1000)),
+                ok=False,
             )
-        query_rate_identity = str(query_tool_rate_identity or "").strip()
-        if query_rate_identity:
-            rate_identity_token = _QUERY_TOOL_RATE_IDENTITY.set(query_rate_identity)
+            end_trace_context(trace_token)
+            raise
         try:
             contextual_feature_request = feature_state_followup_request(
                 message, conversation_context
@@ -5748,11 +5820,17 @@ class AgentOrchestrator:
                 message, response, owner=llm_rate_owner or owner
             )
         finally:
-            reset_llm_request_budget(llm_budget_token)
+            if llm_budget_token is not None:
+                reset_llm_request_budget(llm_budget_token)
             if rate_identity_token is not None:
                 _QUERY_TOOL_RATE_IDENTITY.reset(rate_identity_token)
             if confirmation_token is not None:
                 _QUERY_CONFIRMATION_EPOCH.reset(confirmation_token)
+            agent_metrics.record_query(
+                elapsed_ms=max(0, int((monotonic() - query_started) * 1000)),
+                ok=sys.exc_info()[0] is None,
+            )
+            end_trace_context(trace_token)
 
     def _aggregate_native_read_executions(
         self,
@@ -6049,7 +6127,7 @@ class AgentOrchestrator:
 
         if response is None:
             response = {
-                "request_id": secrets.token_urlsafe(12),
+                "request_id": current_request_id(),
                 "mode": "conversation",
                 "tool_call": None,
                 "result": ToolResult(
@@ -7408,7 +7486,7 @@ class AgentOrchestrator:
         )
         if conversation is not None:
             response = {
-                "request_id": secrets.token_urlsafe(12),
+                "request_id": current_request_id(),
                 "mode": "conversation",
                 "tool_call": None,
                 "result": ToolResult(
@@ -7440,7 +7518,7 @@ class AgentOrchestrator:
         if not _is_casual_greeting(message):
             return None
         response = {
-            "request_id": secrets.token_urlsafe(12),
+            "request_id": current_request_id(),
             "mode": "conversation",
             "tool_call": None,
             "result": ToolResult(
@@ -7465,7 +7543,7 @@ class AgentOrchestrator:
             if (text := result_projection.sanitize_public_text(raw, limit=180))
         ]
         response = {
-            "request_id": secrets.token_urlsafe(12),
+            "request_id": current_request_id(),
             "mode": "conversation",
             "tool_call": None,
             "result": ToolResult(
@@ -7550,7 +7628,7 @@ class AgentOrchestrator:
     ) -> dict[str, Any]:
         safe_suggestions = list(suggestions[:3])
         response = {
-            "request_id": secrets.token_urlsafe(12),
+            "request_id": current_request_id(),
             "mode": "clarification",
             "tool_call": None,
             "result": ToolResult(
@@ -7649,9 +7727,10 @@ class AgentOrchestrator:
         elapsed_ms: int,
         *,
         mode: str = "read_only",
+        request_id: str = "",
     ) -> dict[str, Any]:
         response = {
-            "request_id": secrets.token_urlsafe(12),
+            "request_id": str(request_id or current_request_id()),
             "mode": mode,
             "tool_call": {"name": tool_name, "arguments": arguments, "elapsed_ms": elapsed_ms},
             "result": result.to_dict(),
@@ -7671,7 +7750,7 @@ class AgentOrchestrator:
             error="",
         )
         response = {
-            "request_id": secrets.token_urlsafe(12),
+            "request_id": current_request_id(),
             "mode": "read_only",
             "tool_call": None,
             "result": result.to_dict(),

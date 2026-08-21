@@ -467,7 +467,7 @@ class _FakeAgentService:
     def has_tool(self, tool_name: str) -> bool:
         return bool(str(tool_name or "").strip())
 
-    def invoke(self, tool_name: str, arguments: dict, *, owner: str = ""):
+    def invoke(self, tool_name: str, arguments: dict, *, owner: str = "", **_kwargs):
         self.invoke_calls.append((tool_name, dict(arguments), owner))
         return _response()
 
@@ -483,6 +483,7 @@ class _FakeAgentService:
         *,
         owner: str,
         expected_owner_generation: int | None = None,
+        **_kwargs,
     ) -> dict:
         self.prepare_calls.append(
             (tool_name, dict(arguments), owner, expected_owner_generation)
@@ -501,7 +502,7 @@ class _FakeAgentService:
             },
         }
 
-    def confirm(self, confirmation_id: str, *, owner: str):
+    def confirm(self, confirmation_id: str, *, owner: str, **_kwargs):
         self.confirm_calls.append((confirmation_id, owner))
         if self.confirm_hook is not None:
             self.confirm_hook()
