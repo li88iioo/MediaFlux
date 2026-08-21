@@ -969,6 +969,7 @@ class MediaSubscriptionService:
                 missing_count=len(missing),
                 resources=resources,
                 media_type="tv",
+                search_status=str(search.get("status") or ""),
             ),
             "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
@@ -1050,6 +1051,7 @@ class MediaSubscriptionService:
                 missing_count=missing_count,
                 resources=resources,
                 media_type="movie",
+                search_status=str(search.get("status") or ""),
             ),
             "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
@@ -1199,6 +1201,7 @@ class MediaSubscriptionService:
         missing_count: int,
         resources: list[dict[str, Any]],
         media_type: str = "tv",
+        search_status: str = "",
     ) -> dict[str, Any]:
         mode = str(row["action"] or "confirm")
         target = str(row["download_target"] or "guangya")
@@ -1213,9 +1216,13 @@ class MediaSubscriptionService:
             "both": "qBittorrent + 光鸭",
         }.get(target, "光鸭")
 
+        search_partial = str(search_status or "").strip().lower() == "partial"
         if missing_count <= 0:
             state = "no_action"
             summary = "当前不需要提交下载"
+        elif not resources and search_partial:
+            state = "partial_unavailable"
+            summary = "已确认缺失，但资源站核对未完整完成，暂不能判定没有候选"
         elif not resources:
             state = "no_candidate"
             summary = "已确认缺失，但本次没有可提交候选"
@@ -1250,6 +1257,7 @@ class MediaSubscriptionService:
             "target_label": target_label,
             "state": state,
             "summary": summary,
+            "partial": search_partial,
         }
 
     async def _preview_search_missing_tv(

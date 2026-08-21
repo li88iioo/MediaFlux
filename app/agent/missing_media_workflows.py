@@ -80,6 +80,14 @@ class MissingMediaWorkflowRepository(Protocol):
 
     def finish_verification(self, *, request_id: int, status: str, result: str) -> bool: ...
 
+    def release_confirmation(
+        self, *, owner: str, workflow_ref: dict[str, Any]
+    ) -> bool: ...
+
+    def reconcile_confirmations(
+        self, *, owner: str, active_refs: tuple[dict[str, Any], ...]
+    ) -> int: ...
+
     def list_for_owner(self, *, owner: str, limit: int = 10) -> tuple[Any, ...]: ...
 
 
@@ -297,6 +305,75 @@ class SQLiteMissingMediaWorkflowRepository:
             for workflow_id in {str(row["workflow_id"]) for row in rows}:
                 self._refresh_workflow(conn, workflow_id=workflow_id, updated_at=now)
             return cursor.rowcount > 0
+
+    def release_confirmation(
+        self, *, owner: str, workflow_ref: dict[str, Any]
+    ) -> bool:
+        owner_digest = self._owner_digest(owner)
+        ref = _workflow_ref_projection(workflow_ref)
+        if ref is None:
+            return False
+        now = db.now()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE agent_missing_media_workflow_items SET "
+                "state='selection_required',candidate_title='',target='',"
+                "revision=revision+1,last_error_code='',updated_at=? "
+                "WHERE item_id=? AND workflow_id=? AND revision=? "
+                "AND state='confirmation_required' AND workflow_id IN ("
+                "SELECT workflow_id FROM agent_missing_media_workflows WHERE owner_digest=?"
+                ")",
+                (now, ref.item_id, ref.workflow_id, ref.revision, owner_digest),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self._refresh_workflow(conn, workflow_id=ref.workflow_id, updated_at=now)
+            return True
+
+    def reconcile_confirmations(
+        self, *, owner: str, active_refs: tuple[dict[str, Any], ...]
+    ) -> int:
+        owner_digest = self._owner_digest(owner)
+        active = {
+            (ref.workflow_id, ref.item_id, ref.revision)
+            for value in active_refs
+            if (ref := _workflow_ref_projection(value)) is not None
+        }
+        now = db.now()
+        released = 0
+        touched: set[str] = set()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT i.workflow_id,i.item_id,i.revision FROM "
+                "agent_missing_media_workflow_items i JOIN agent_missing_media_workflows w "
+                "ON w.workflow_id=i.workflow_id WHERE w.owner_digest=? "
+                "AND i.state='confirmation_required'",
+                (owner_digest,),
+            ).fetchall()
+            for row in rows:
+                key = (
+                    str(row["workflow_id"]),
+                    str(row["item_id"]),
+                    int(row["revision"] or 0),
+                )
+                if key in active:
+                    continue
+                cursor = conn.execute(
+                    "UPDATE agent_missing_media_workflow_items SET "
+                    "state='selection_required',candidate_title='',target='',"
+                    "revision=revision+1,last_error_code='',updated_at=? "
+                    "WHERE workflow_id=? AND item_id=? AND revision=? "
+                    "AND state='confirmation_required'",
+                    (now, *key),
+                )
+                if cursor.rowcount == 1:
+                    released += 1
+                    touched.add(key[0])
+            for workflow_id in touched:
+                self._refresh_workflow(conn, workflow_id=workflow_id, updated_at=now)
+        return released
 
     def list_for_owner(self, *, owner: str, limit: int = 10) -> tuple[Any, ...]:
         owner_digest = self._owner_digest(owner)

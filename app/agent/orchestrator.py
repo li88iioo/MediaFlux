@@ -55,6 +55,7 @@ from app.agent.missing_media_workflows import (
     MissingMediaWorkflowRepository,
     is_missing_workflow_status_message,
     workflow_followup_context,
+    workflow_ref_from_context,
 )
 from app.agent.recent_patrol import RecentPatrolStore
 from app.agent.recent_read_operations import READ_PLAN_OPERATION, RecentReadOperationStore
@@ -4664,6 +4665,7 @@ class AgentOrchestrator:
         if not owner_key:
             raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
         _revoked, generation = self.confirmation_store.rotate_owner(owner=owner_key)
+        self._reconcile_missing_confirmations(owner_key, ())
         return generation
 
     def invalidate_query_confirmation_epoch(self, *, owner: str) -> int:
@@ -4672,6 +4674,7 @@ class AgentOrchestrator:
         if not owner_key:
             return 0
         revoked, _generation = self.confirmation_store.rotate_owner(owner=owner_key)
+        self._reconcile_missing_confirmations(owner_key, ())
         return revoked
 
     def reset_session(self, *, owner: str) -> dict[str, Any]:
@@ -4680,6 +4683,7 @@ class AgentOrchestrator:
         if not owner_key:
             raise AgentToolError("当前会话无法重置", code="confirmation_invalid")
         revoked = self.confirmation_store.revoke_owner(owner=owner_key)
+        self._reconcile_missing_confirmations(owner_key, ())
         self.recent_patrol_store.clear_owner(owner=owner_key)
         self.recent_resource_store.clear_owner(owner=owner_key)
         self.recent_discovery_store.clear_owner(owner=owner_key)
@@ -4699,10 +4703,48 @@ class AgentOrchestrator:
         }
 
     def discard_confirmation(self, confirmation_id: str, *, owner: str) -> bool:
-        return self.confirmation_store.discard(
+        ticket = next(
+            (
+                item
+                for item in self.confirmation_store.list_active_tickets(owner=owner)
+                if item.confirmation_id == confirmation_id
+            ),
+            None,
+        )
+        discarded = self.confirmation_store.discard(
             owner=owner,
             confirmation_id=confirmation_id,
         )
+        if discarded:
+            agent_metrics.record_confirmation("discarded")
+            ref = workflow_ref_from_context(
+                ticket.followup_context if ticket is not None else None
+            )
+            if ref is not None and self.missing_workflow_repository is not None:
+                self.missing_workflow_repository.release_confirmation(
+                    owner=owner, workflow_ref=ref
+                )
+        return discarded
+
+    def _reconcile_missing_confirmations(
+        self, owner: str, tickets: tuple[Any, ...] | list[Any]
+    ) -> int:
+        if self.missing_workflow_repository is None:
+            return 0
+        active_refs = tuple(
+            ref
+            for ticket in tickets
+            if (ref := workflow_ref_from_context(ticket.followup_context)) is not None
+        )
+        try:
+            return self.missing_workflow_repository.reconcile_confirmations(
+                owner=owner, active_refs=active_refs
+            )
+        except Exception as exc:
+            logger.warning(
+                "Agent 补库确认孤儿对账失败 type=%s", type(exc).__name__
+            )
+            return 0
 
     def resolve_confirmation_reply(
         self,
@@ -4720,6 +4762,7 @@ class AgentOrchestrator:
         if not owner_key:
             raise AgentToolError("当前会话无法处理确认请求", code="confirmation_invalid")
         tickets = self.confirmation_store.list_active_tickets(owner=owner_key)
+        self._reconcile_missing_confirmations(owner_key, tickets)
         if not tickets:
             return self._clarification_response(
                 "当前没有等待确认的操作，或者原确认窗口已经过期。",
@@ -5155,6 +5198,8 @@ class AgentOrchestrator:
             and self.missing_workflow_repository is not None
         ):
             try:
+                tickets = self.confirmation_store.list_active_tickets(owner=owner)
+                self._reconcile_missing_confirmations(owner, tickets)
                 workflow_ref = self.missing_workflow_repository.select_candidate(
                     owner=owner,
                     verification=verification_context,
@@ -5177,6 +5222,15 @@ class AgentOrchestrator:
                 ),
             )
         except AgentToolError as exc:
+            if workflow_ref is not None and self.missing_workflow_repository is not None:
+                self.missing_workflow_repository.release_confirmation(
+                    owner=owner,
+                    workflow_ref={
+                        "workflow_id": workflow_ref.workflow_id,
+                        "item_id": workflow_ref.item_id,
+                        "revision": workflow_ref.revision,
+                    },
+                )
             if exc.code != "confirmation_unavailable":
                 raise
             return self._response(

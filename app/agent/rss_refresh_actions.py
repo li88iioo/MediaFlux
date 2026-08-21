@@ -17,6 +17,11 @@ from app.modules.rss import rss_subscription_refresh_revision
 
 logger = get_logger(__name__)
 _CONFIRMATION_STATE = threading.local()
+
+
+def clear_confirmation_state() -> None:
+    _CONFIRMATION_STATE.preview = None
+    _CONFIRMATION_STATE.pending = None
 _BULK_EXPLICIT_LIMIT = 32
 _BULK_DISPLAY_LIMIT = 100
 _BULK_MAX_WORKERS = 4

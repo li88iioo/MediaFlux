@@ -187,6 +187,55 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
             result="visible",
         ))
 
+    def test_cancel_or_expiry_releases_confirmation_for_reselection(self):
+        self.repository.capture_search(
+            owner="session-a",
+            tool_name="library.search_missing_episode_resources",
+            result=_search_result(),
+        )
+        first = self.repository.select_candidate(
+            owner="session-a",
+            verification=_VERIFICATION,
+            candidate_title="The.Show.S02E03.1080p",
+            target="qb",
+        )
+        self.assertIsNotNone(first)
+        assert first is not None
+        ref = {
+            "workflow_id": first.workflow_id,
+            "item_id": first.item_id,
+            "revision": first.revision,
+        }
+        self.assertTrue(self.repository.release_confirmation(
+            owner="session-a", workflow_ref=ref
+        ))
+        second = self.repository.select_candidate(
+            owner="session-a",
+            verification=_VERIFICATION,
+            candidate_title="The.Show.S02E03.2160p",
+            target="guangya",
+        )
+        self.assertIsNotNone(second)
+        assert second is not None
+        active = ({
+            "workflow_id": second.workflow_id,
+            "item_id": second.item_id,
+            "revision": second.revision,
+        },)
+        self.assertEqual(self.repository.reconcile_confirmations(
+            owner="session-a", active_refs=active
+        ), 0)
+        self.assertEqual(self.repository.reconcile_confirmations(
+            owner="session-a", active_refs=()
+        ), 1)
+        third = self.repository.select_candidate(
+            owner="session-a",
+            verification=_VERIFICATION,
+            candidate_title="The.Show.S02E03.REPACK",
+            target="both",
+        )
+        self.assertIsNotNone(third)
+
     def test_new_search_stales_previous_active_workflow_and_public_view_is_safe(self):
         first_id = self.repository.capture_search(
             owner="session-a",

@@ -19,6 +19,11 @@ _MAX_ITEMS = 20
 _CONFIRMATION_STATE = threading.local()
 
 
+def clear_confirmation_state() -> None:
+    _CONFIRMATION_STATE.preview = None
+    _CONFIRMATION_STATE.pending = None
+
+
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 

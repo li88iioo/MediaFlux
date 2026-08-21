@@ -360,6 +360,45 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertNotIn("PRIVATE_ORIGINAL_TITLE", json.dumps(result, ensure_ascii=False))
         self.assertEqual(preview.await_count, 2)
 
+    def test_subscription_updates_preserve_successes_when_one_item_times_out(self) -> None:
+        rows = list(db.list_media_subscriptions(limit=8))
+        self.assertGreaterEqual(len(rows), 1)
+        good = {
+            "subscription_number": int(rows[0]["id"]),
+            "title": "已核对订阅",
+            "media_type": "tv",
+            "enabled": True,
+            "status": "missing",
+            "summary": "发现 1 集缺失",
+            "missing_count": 1,
+            "resource_search": {"status": "partial", "truncated": False, "items": []},
+            "delivery": {"state": "partial_unavailable", "partial": True},
+        }
+        unavailable = {
+            **good,
+            "subscription_number": int(rows[0]["id"]) + 1000,
+            "title": "超时订阅",
+            "status": "unavailable",
+            "resource_search": {"status": "not_run", "truncated": False, "items": []},
+        }
+        with patch(
+            "app.agent.media_subscription_actions.db.count_media_subscriptions",
+            return_value=2,
+        ), patch(
+            "app.agent.media_subscription_actions.db.list_media_subscriptions",
+            return_value=[rows[0], rows[0]],
+        ), patch(
+            "app.agent.media_subscription_actions._preview_media_subscription_rows",
+            new=AsyncMock(return_value=[good, unavailable]),
+        ):
+            result = inspect_media_subscription_updates({}).to_dict()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["data"]["updates_available_count"], 1)
+        self.assertEqual(result["data"]["inconclusive_count"], 1)
+        self.assertEqual(len(result["data"]["subscriptions"]), 2)
+
     def test_orchestrator_routes_subscription_update_questions_before_patrol_tools(self) -> None:
         preview = AsyncMock(return_value={
             "subscription_number": self.sid,

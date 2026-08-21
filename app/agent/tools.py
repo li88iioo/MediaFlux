@@ -52,12 +52,14 @@ from app.agent.rss_actions import (
     rss_subscription_summary_arguments,
 )
 from app.agent.rss_download_actions import (
+    clear_confirmation_state as clear_rss_download_confirmation_state,
     preview_rss_pending_download,
     rss_pending_download_arguments,
     rss_pending_download_confirmation_context,
     submit_pending_rss_to_qb,
 )
 from app.agent.rss_refresh_actions import (
+    clear_confirmation_state as clear_rss_refresh_confirmation_state,
     prepare_rss_subscriptions_refresh,
     preview_rss_subscription_refresh,
     preview_rss_subscriptions_refresh,
@@ -103,6 +105,7 @@ from app.agent.media_subscription_actions import (
     set_media_subscription_enabled_confirmed,
 )
 from app.agent.rss_retry_actions import (
+    clear_confirmation_state as clear_rss_retry_confirmation_state,
     preview_rss_failure_retry,
     retry_failed_rss_to_qb,
     rss_failure_retry_arguments,
@@ -113,6 +116,7 @@ from app.agent.strm_failure_actions import (
     triage_strm_failures,
 )
 from app.agent.strm_retry_actions import (
+    clear_confirmation_state as clear_strm_retry_confirmation_state,
     preview_strm_failure_retry,
     retry_strm_failure_records,
     strm_failure_retry_arguments,
@@ -209,6 +213,7 @@ from app.agent.episode_resource_actions import (
     search_missing_season_resources,
 )
 from app.agent.feature_actions import (
+    clear_confirmation_state as clear_feature_confirmation_state,
     feature_summary_arguments,
     feature_state_arguments,
     feature_state_confirmation_context,
@@ -1412,6 +1417,7 @@ def build_tool_registry() -> ToolRegistry:
         requires_confirmation=True,
         preview_handler=preview_rss_subscription_refresh,
         confirmation_context=rss_refresh_subscription_confirmation_context,
+        confirmation_state_cleaner=clear_rss_refresh_confirmation_state,
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -1465,6 +1471,7 @@ def build_tool_registry() -> ToolRegistry:
         requires_confirmation=True,
         preview_handler=preview_rss_pending_download,
         confirmation_context=rss_pending_download_confirmation_context,
+        confirmation_state_cleaner=clear_rss_download_confirmation_state,
     ))
     registry.register(ToolSpec(
         name="rss.retry_failed_to_qb",
@@ -1487,6 +1494,7 @@ def build_tool_registry() -> ToolRegistry:
         requires_confirmation=True,
         preview_handler=preview_rss_failure_retry,
         confirmation_context=rss_failure_retry_confirmation_context,
+        confirmation_state_cleaner=clear_rss_retry_confirmation_state,
     ))
     registry.register(ToolSpec(
         name="config.diagnose_media_servers",
@@ -1708,6 +1716,7 @@ def build_tool_registry() -> ToolRegistry:
         requires_confirmation=True,
         preview_handler=preview_set_feature_state,
         confirmation_context=feature_state_confirmation_context,
+        confirmation_state_cleaner=clear_feature_confirmation_state,
         post_write_verifier=verify_feature_state_write,
         llm_confirmation=True,
     ))
@@ -1755,6 +1764,7 @@ def build_tool_registry() -> ToolRegistry:
         requires_confirmation=True,
         preview_handler=preview_strm_failure_retry,
         confirmation_context=strm_failure_retry_confirmation_context,
+        confirmation_state_cleaner=clear_strm_retry_confirmation_state,
     ))
     registry.register(ToolSpec(
         name="strm.run_once",

@@ -374,7 +374,20 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
     current = sum(1 for item in subscriptions if item.get("status") == "satisfied")
     paused = sum(1 for item in subscriptions if item.get("status") == "paused")
     uncertain = len(subscriptions) - updates - current - paused
-    if updates:
+    partial_searches = sum(
+        1
+        for item in subscriptions
+        if isinstance(item.get("resource_search"), dict)
+        and item["resource_search"].get("status") == "partial"
+    )
+    if updates and (uncertain or partial_searches):
+        status = "partial"
+        ok = True
+        summary = (
+            f"已实时核对 {len(subscriptions)} 个媒体追更订阅："
+            f"{updates} 个有已播缺失，另有 {uncertain or partial_searches} 个检查未完整完成"
+        )
+    elif updates:
         status = "updates_available"
         ok = True
         summary = (
@@ -405,6 +418,8 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
         suggestions.append("有订阅包含多个缺失项；本次只搜索每个订阅最靠前的一项。")
     if uncertain:
         suggestions.append("暂无法确认的订阅应先检查 TMDB、媒体服务器或资源站连通性。")
+    elif partial_searches:
+        suggestions.append("部分资源站查询未完成；已返回候选仍可查看，未返回不代表没有资源。")
     return ToolResult(
         ok=ok,
         status=status,
@@ -417,6 +432,7 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
             "up_to_date_count": current,
             "paused_count": paused,
             "inconclusive_count": uncertain,
+            "partial_search_count": partial_searches,
             "candidate_count": len(candidate_items),
             "subscriptions": subscriptions,
             # 顶层 items 供会话绑定的“第 N 个到 qB/光鸭”安全续接使用。
