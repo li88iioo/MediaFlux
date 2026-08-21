@@ -728,7 +728,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
                 self.assertFalse(preview["cloud_write"])
                 self.assertEqual(
                     preview["target_path"],
-                    "剧集/正确节目 (2026) {tmdb-99}/Season 01",
+                    "剧集/正确节目 (2026) {tmdb-99}/Season 1",
                 )
                 self.assertEqual(preview["items"][1]["to_name"], "正确节目.2026.S01E01.zh.ass")
                 client.assert_not_called()
@@ -788,13 +788,13 @@ class OrganizeCorrectionTests(unittest.TestCase):
 
                 self.assertEqual(
                     preview["target_path"],
-                    "动漫/魔王学院的不适任者 (2020) {tmdb-97617}/Season 01",
+                    "动漫/魔王学院的不适任者 (2020) {tmdb-97617}/Season 1",
                 )
                 self.assertIn("S01E13", preview["file_name"])
 
                 self.assertEqual(
                     corrected["target_path"],
-                    "动漫/魔王学院的不适任者 (2020) {tmdb-97617}/Season 02",
+                    "动漫/魔王学院的不适任者 (2020) {tmdb-97617}/Season 2",
                 )
                 self.assertIn("S02E04", corrected["file_name"])
                 self.assertEqual((corrected["season"], corrected["episode"]), (2, 4))

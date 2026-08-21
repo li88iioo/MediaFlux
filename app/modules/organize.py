@@ -1018,13 +1018,13 @@ class Organizer:
             return ""
         if season_number == 0:
             return "Specials"
-        return f"Season {season_number:02d}"
+        return f"Season {season_number}"
 
     def build_media_path_parts(
         self, match: MatchResult, parsed: dict | None = None,
         rules: OrganizeRules | None = None,
     ) -> list[str]:
-        """统一生成媒体自身目录层级：电影目录，或剧集目录/Season XX。"""
+        """统一生成媒体自身目录层级：电影目录，或剧集目录/Season N。"""
         parts = [self.build_media_dir(match, rules)]
         season_dir = self.build_season_dir(match, parsed)
         if season_dir:
@@ -3654,7 +3654,7 @@ class Organizer:
             plan, file, rules, match, parsed, media_profile,
         )
 
-        # 目标路径：主类[/地区][/年份]/媒体目录[/Season XX]
+        # 目标路径：主类[/地区][/年份]/媒体目录[/Season N]
         parts = [main]
         if rules.region_split and self._match_provider(match) != "metatube":
             parts.append(region)

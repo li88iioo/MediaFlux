@@ -624,7 +624,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         self.assertEqual(plan.action, "move")
         self.assertEqual((plan.source_season, plan.source_episode), (2, 6))
         self.assertEqual((plan.season, plan.episode), (1, 18))
-        self.assertIn("Season 01", plan.target_path)
+        self.assertIn("Season 1", plan.target_path)
         self.assertIn("S01E18", plan.new_name)
         self.assertEqual(
             plan.episode_mapping.reason,

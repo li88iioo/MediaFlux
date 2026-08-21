@@ -545,7 +545,7 @@ class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["directory_identity_cache_hits"], 23)
         self.assertEqual(plans[10].source_episode, 11)
         self.assertEqual(plans[10].episode_mapping.mode, "absolute")
-        self.assertTrue(plans[10].target_path.endswith("/Season 02"))
+        self.assertTrue(plans[10].target_path.endswith("/Season 2"))
 
     def test_bare_episode_pack_rolls_over_across_tmdb_seasons(self):
         # Mapper 单测用真实长篇规模覆盖 001-156；这里用小季容量验证
@@ -602,8 +602,8 @@ class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(plans[2].source_episode, 3)
         self.assertEqual(plans[2].episode_mapping.mode, "absolute")
-        self.assertTrue(plans[2].target_path.endswith("/Season 02"))
-        self.assertTrue(plans[4].target_path.endswith("/Season 03"))
+        self.assertTrue(plans[2].target_path.endswith("/Season 2"))
+        self.assertTrue(plans[4].target_path.endswith("/Season 3"))
 
     def test_publisher_s02_pack_rebases_to_second_segment_of_merged_tmdb_season(self):
         show = GuangYaFile(

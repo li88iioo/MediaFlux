@@ -548,7 +548,7 @@ class _TvVariantTreeClient(_VariantTreeClient):
                 "show", "Better Show (2021) {tmdb-113256}", True,
                 parent_id="category",
             )],
-            "show": [GuangYaFile("season", "Season 03", True, parent_id="show")],
+            "show": [GuangYaFile("season", "Season 3", True, parent_id="show")],
             "season": [existing],
         }
         self.deleted = []
@@ -619,7 +619,7 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
             )
 
         self.assertEqual(plans[0].target_path, (
-            "动漫/Better Show (2021) {tmdb-113256}/Season 03"
+            "动漫/Better Show (2021) {tmdb-113256}/Season 3"
         ))
         self.assertEqual(stats["moved"], 1)
         self.assertEqual(stats["conflict"], 1)
@@ -896,7 +896,7 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
 
         self.assertTrue(all(
             plan.target_path == (
-                "动漫/Better Show (2021) {tmdb-113256}/Season 03"
+                "动漫/Better Show (2021) {tmdb-113256}/Season 3"
             )
             for plan in plans
         ))

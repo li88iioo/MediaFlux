@@ -117,7 +117,7 @@ class MovieFolderNamingTests(unittest.TestCase):
             "封神第二部：战火西岐.2025.1080p.SDR.H.265.AAC.2.0.mkv",
         )
 
-    def test_tv_plan_uses_zero_padded_season_directory(self):
+    def test_tv_plan_uses_unpadded_season_directory(self):
         rules = OrganizeRules(
             naming_scope="guangya", region_split=False, year_split=False,
         )
@@ -132,14 +132,18 @@ class MovieFolderNamingTests(unittest.TestCase):
 
         self.assertEqual(
             plan.target_path,
-            "动漫/约会大作战 (2013) {tmdb-46004}/Season 05",
+            "动漫/约会大作战 (2013) {tmdb-46004}/Season 5",
         )
         self.assertEqual(plan.new_name, "约会大作战.2013.S05E12-1080p.H.264.AAC.mp4")
         match = plan.match
         self.assertEqual(organizer.build_season_dir(match, {"season": 0}), "Specials")
         self.assertEqual(
             organizer.build_season_dir(match, {"season": None, "episode": 3}),
-            "Season 01",
+            "Season 1",
+        )
+        self.assertEqual(
+            organizer.build_season_dir(match, {"season": 10, "episode": 1}),
+            "Season 10",
         )
 
     def test_automatic_plan_places_movie_inside_movie_directory(self):

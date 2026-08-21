@@ -311,7 +311,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             subtitle_target = Path(preview["plans"][1]["target_path"])
             self.assertIn("S01E03", preview["plans"][0]["target_name"])
             self.assertTrue(preview["plans"][1]["target_name"].endswith(".zh.ass"))
-            self.assertEqual(video_target.parent.name, "Season 01")
+            self.assertEqual(video_target.parent.name, "Season 1")
             self.assertEqual(video_target.parent.parent.name, "攻壳机动队 (2026) {tmdb-255358}")
             self.assertEqual(subtitle_target.parent, video_target.parent)
             self.assertEqual(scraper.parents, ["The Ghost in the Shell"])

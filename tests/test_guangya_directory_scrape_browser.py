@@ -754,7 +754,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
                         file_id: `e${index + 1}`,
                         action: 'move',
                         new_name: `Example.Show.S01E${String(index + 1).padStart(2, '0')}.mkv`,
-                        target_path: '剧集/Example Show/Season 01',
+                        target_path: '剧集/Example Show/Season 1',
                     })),
                     companion_plans: [{
                         file_id: 'subtitle', role: 'subtitle',

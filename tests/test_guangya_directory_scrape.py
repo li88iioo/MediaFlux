@@ -2301,7 +2301,7 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
             "owner", inspected["inspection_id"], "86034", "tv"
         )
 
-        self.assertTrue(all("/Season 02" in plan["target_path"] for plan in preview["plans"]))
+        self.assertTrue(all("/Season 2" in plan["target_path"] for plan in preview["plans"]))
         self.assertEqual(
             [plan["new_name"] for plan in preview["plans"]],
             [
@@ -2361,8 +2361,8 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
                 ("s2e1", "平凡职业造就世界最强.2019.S02E01.mkv"),
             ],
         )
-        self.assertIn("/Season 01", preview["plans"][0]["target_path"])
-        self.assertIn("/Season 02", preview["plans"][1]["target_path"])
+        self.assertIn("/Season 1", preview["plans"][0]["target_path"])
+        self.assertIn("/Season 2", preview["plans"][1]["target_path"])
 
     def test_filename_season_and_bare_episode_preview_includes_episode_number(self):
         service, _store, _client = self._build(
@@ -2382,7 +2382,7 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         )
 
         self.assertEqual(len(preview["plans"]), 1)
-        self.assertIn("/Season 03", preview["plans"][0]["target_path"])
+        self.assertIn("/Season 3", preview["plans"][0]["target_path"])
         self.assertIn("S03E16", preview["plans"][0]["new_name"])
 
     def test_execute_reuses_created_target_chain_when_directory_listing_is_stale(self):
@@ -2443,7 +2443,7 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         )
 
         targets = {plan["file_id"]: plan for plan in preview["plans"]}
-        self.assertTrue(targets["episode-1"]["target_path"].endswith("/Season 01"))
+        self.assertTrue(targets["episode-1"]["target_path"].endswith("/Season 1"))
         self.assertIn("S01E01", targets["episode-1"]["new_name"])
         self.assertTrue(targets["ova-1"]["target_path"].endswith("/Specials"))
         self.assertIn("S00E01", targets["ova-1"]["new_name"])
@@ -2612,7 +2612,7 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         )
         plans = {plan["file_id"]: plan for plan in preview["plans"]}
 
-        self.assertTrue(plans["episode-1"]["target_path"].endswith("/Season 02"))
+        self.assertTrue(plans["episode-1"]["target_path"].endswith("/Season 2"))
         self.assertIn("S02E01", plans["episode-1"]["new_name"])
         self.assertTrue(plans["nced"]["target_path"].endswith("/Specials"))
         self.assertIn("S00E01", plans["nced"]["new_name"])
@@ -2728,7 +2728,7 @@ class SingleEpisodeOverrideTests(IsolatedDatabaseTestCase):
             "owner", inspected["inspection_id"], "255358", "tv"
         )
         self.assertIn("S01E03", preview["plans"][0]["new_name"])
-        self.assertTrue(preview["plans"][0]["target_path"].endswith("/Season 01"))
+        self.assertTrue(preview["plans"][0]["target_path"].endswith("/Season 1"))
 
     def test_season_only_hint_does_not_require_an_episode_override(self):
         service, _store, _client = self._build("The.Ghost.in.the.Shell.S01.mkv")
@@ -2770,7 +2770,7 @@ class SingleEpisodeOverrideTests(IsolatedDatabaseTestCase):
         )
         anime = client.create_dir("动漫", "archive")
         show = client.create_dir("攻壳机动队 (2026) {tmdb-255358}", anime)
-        season = client.create_dir("Season 02", show)
+        season = client.create_dir("Season 2", show)
         existing = [
             _file(
                 "existing-2",

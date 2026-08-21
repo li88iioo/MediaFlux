@@ -333,7 +333,7 @@ class AutomaticSpecialsTests(IsolatedDatabaseTestCase):
         by_id = {plan.file_id: plan for plan in plans}
 
         self.assertEqual(stats["total"], 3)
-        self.assertTrue(by_id["episode"].target_path.endswith("/Season 03"))
+        self.assertTrue(by_id["episode"].target_path.endswith("/Season 3"))
         self.assertTrue(by_id["nced"].target_path.endswith("/Specials"))
         self.assertTrue(by_id["ncop"].target_path.endswith("/Specials"))
         self.assertIn("S00E01", by_id["nced"].new_name)
