@@ -672,7 +672,9 @@ def test_telegram_message(request: Request, data: Any = Body(default=None)):
         return api_error("测试参数必须是 JSON 对象", 400)
     token = str(data.get("token") or "").strip()
     chat_id = str(data.get("chat_id") or "").strip()
-    if token == "********":
+    # 密钥字段保存后不会回填真实值，前端会提交空字符串或脱敏占位符。
+    # 两种情况都应测试当前已保存的 Bot Token；有新输入时仍优先使用新值。
+    if not token or token == "********":
         token = config.get("TG_BOT_TOKEN", "").strip()
     if not chat_id:
         chat_id = config.get("TG_CHAT_ID", "").strip()

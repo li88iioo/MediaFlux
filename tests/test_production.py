@@ -2856,6 +2856,32 @@ class SecurityTests(InitializedWebTestCase):
         self.assertNotIn("test-token", response.text)
         bot.send_message.assert_called_once()
 
+    def test_telegram_test_message_uses_saved_token_after_config_save(self):
+        headers = self._authenticated()
+        saved_token = "123456:saved-test-token"
+        sent = SimpleNamespace(message_id=109)
+        bot = Mock()
+        bot.send_message.return_value = sent
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": (
+                saved_token if key == "TG_BOT_TOKEN" else default
+            ),
+        ), patch("telebot.TeleBot", return_value=bot) as bot_factory:
+            response = self.client.post(
+                "/api/telegram/test",
+                json={"token": "", "chat_id": "10001"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message_id"], 109)
+        self.assertNotIn(saved_token, response.text)
+        bot_factory.assert_called_once_with(
+            saved_token, parse_mode="HTML", threaded=False
+        )
+        bot.send_message.assert_called_once()
+
     def test_media_connection_endpoint_returns_server_identity(self):
         headers = self._authenticated()
         response = Mock()
