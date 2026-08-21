@@ -28,6 +28,8 @@ _TOOL_LABELS = {
     "rss.set_subscription_enabled": "RSS 订阅状态修改",
     "rss.set_refresh_interval": "RSS 刷新周期修改",
     "rss.delete_subscription": "RSS 订阅删除",
+    "media.create_subscription": "媒体追更创建",
+    "media.delete_subscription": "媒体追更删除",
     "media.set_subscription_enabled": "媒体追更状态修改",
     "config.set_feature_state": "功能开关修改",
     "config.set_indexer_sites": "资源检索站点修改",
@@ -68,6 +70,13 @@ _SAFE_FIELDS = {
     "rss.set_subscription_enabled": {"operation", "enabled", "affected", "runtime_refreshed"},
     "rss.set_refresh_interval": {"operation", "refresh_interval_minutes", "affected", "runtime_refreshed"},
     "rss.delete_subscription": {"operation", "affected", "deleted_entries", "runtime_refreshed"},
+    "media.create_subscription": {
+        "operation", "subscription_number", "affected", "created", "season", "runtime_refreshed",
+    },
+    "media.delete_subscription": {
+        "operation", "subscription_number", "affected", "expired_candidates",
+        "cancelled_admissions", "cancelled_runs", "runtime_refreshed",
+    },
     "media.set_subscription_enabled": {
         "operation", "subscription_number", "enabled", "affected",
         "expired_candidates", "cancelled_admissions", "cancelled_runs", "runtime_refreshed",
@@ -130,7 +139,7 @@ _COUNT_FIELDS = {
     "total", "new", "skipped", "site_count", "affected",
     "refresh_interval_minutes", "deleted_entries",
     "max_series", "progress_current", "progress_total", "instance_number", "rule_id",
-    "subscription_number", "watchlist_number", "source_number", "expired_candidates", "cancelled_admissions", "cancelled_runs",
+    "subscription_number", "watchlist_number", "source_number", "season", "expired_candidates", "cancelled_admissions", "cancelled_runs",
 }
 _BOOL_FIELDS = {
     "accepted", "enabled", "runtime_refreshed", "created", "duplicate", "delete_files",
@@ -161,7 +170,7 @@ _ENUM_FIELDS = {
     "trigger": {"manual", "qb_completed", "scan"},
     "trigger_type": {"manual"},
     "rule_type": {"preprocess_rule", "tmdb_regex_rule", "knowledge_entry"},
-    "operation": {"pause", "resume", "delete", "enable", "disable", "set_interval", "add", "remove"},
+    "operation": {"pause", "resume", "delete", "enable", "disable", "set_interval", "add", "remove", "create", "restore"},
     "status": {"accepted", "submitted", "completed", "partial", "failed", "duplicate"},
 }
 

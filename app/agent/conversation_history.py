@@ -694,6 +694,15 @@ class SQLiteAgentConversationHistoryRepository:
             result["target"] = target
         return result
 
+    @staticmethod
+    def _validated_pending_subscription(value: Any) -> dict[str, int] | None:
+        if not isinstance(value, dict) or set(value) != {"season"}:
+            return None
+        season = value.get("season")
+        if isinstance(season, bool) or not isinstance(season, int) or not 1 <= season <= 100:
+            return None
+        return {"season": season}
+
     def _context_entry_from_row(
         self,
         row: Any,
@@ -733,6 +742,9 @@ class SQLiteAgentConversationHistoryRepository:
             pending_selection = self._validated_pending_selection(
                 data.get("pending_selection")
             )
+            pending_subscription = self._validated_pending_subscription(
+                data.get("pending_subscription")
+            )
             if tool_name:
                 entry["tool_name"] = tool_name
             if media_context:
@@ -741,6 +753,8 @@ class SQLiteAgentConversationHistoryRepository:
                 entry["tentative_media_context"] = tentative_media_context
             if pending_selection is not None:
                 entry["pending_selection"] = pending_selection
+            if pending_subscription is not None:
+                entry["pending_subscription"] = pending_subscription
             if status:
                 entry["status"] = status
             if isinstance(suggestions, list):
@@ -926,6 +940,11 @@ class SQLiteAgentConversationHistoryRepository:
             )
             if pending_selection is not None:
                 projection["pending_selection"] = pending_selection
+        pending_subscription = self._validated_pending_subscription(
+            result_data.get("pending_subscription")
+        )
+        if pending_subscription is not None:
+            projection["pending_subscription"] = pending_subscription
         return projection
 
     @staticmethod

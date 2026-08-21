@@ -1378,6 +1378,16 @@ _MEDIA_SUBSCRIPTION_UPDATE_EXCLUDED_TOKENS = (
     "rss", "订阅源", "刷新", "间隔", "频率", "设置", "配置", "修改",
     *_MEDIA_SUBSCRIPTION_WRITE_TOKENS,
 )
+_MEDIA_SUBSCRIPTION_DELETE_PATTERN = re.compile(
+    r"^(?:请(?:帮我)?\s*)?(?:删除|移除|取消)\s*"
+    r"(?:(?:媒体|影视)(?:追更)?订阅|追更订阅)\s*"
+    r"(?:(?:id|编号)\s*)?[#:]?\s*(\d{1,9})\s*(?:一下)?[.!。！]?$",
+    re.IGNORECASE,
+)
+_MEDIA_SUBSCRIPTION_CREATE_ACTIONS = ("订阅", "追更", "加入追更", "添加追更", "创建订阅")
+_MEDIA_SUBSCRIPTION_CONTEXT_REFERENCES = (
+    "它", "这个", "这部", "这部剧", "这个剧", "这部电影", "这个电影",
+)
 
 
 def _has_media_subscription_scope(message: str) -> bool:
@@ -1473,6 +1483,147 @@ def media_subscription_control_request(
             "enabled": matched.group(1) in {"恢复", "启用", "开启"},
         },
     )
+
+
+def media_subscription_delete_request(message: str) -> dict[str, int] | None:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if "rss" in normalized:
+        return None
+    matched = _MEDIA_SUBSCRIPTION_DELETE_PATTERN.fullmatch(normalized)
+    if matched is None:
+        return None
+    subscription_id = int(matched.group(1))
+    return {"subscription_id": subscription_id} if subscription_id > 0 else None
+
+
+def is_media_subscription_delete_write_message(message: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    return (
+        "rss" not in normalized
+        and any(token in normalized for token in ("删除", "移除", "取消"))
+        and bool(re.search(r"(?:媒体|影视|追更).{0,6}订阅|订阅.{0,6}追更", normalized))
+    )
+
+
+def media_subscription_candidate_request(message: str) -> dict[str, Any] | None:
+    """解析“订阅第 N 个/第 N 季”续句；身份仍由 owner 快照绑定。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if (
+        not normalized
+        or "rss" in normalized
+        or not any(action in normalized for action in _MEDIA_SUBSCRIPTION_CREATE_ACTIONS)
+        or any(token in normalized for token in ("删除", "移除", "暂停", "关闭", "状态", "更新吗"))
+        or _MEDIA_RATING_QUOTED_TITLE_RE.search(normalized)
+    ):
+        return None
+    position_match = re.search(r"第\s*(\d{1,2})\s*(?:个|项|部)", normalized)
+    season_match = re.search(r"第\s*(\d{1,3})\s*季", normalized)
+    has_context_reference = any(
+        token in normalized for token in _MEDIA_SUBSCRIPTION_CONTEXT_REFERENCES
+    )
+    if position_match is None and season_match is None and not has_context_reference:
+        return None
+    position = int(position_match.group(1)) if position_match else None
+    season = int(season_match.group(1)) if season_match else None
+    if position is not None and not 1 <= position <= 20:
+        return None
+    if season is not None and not 1 <= season <= 100:
+        return None
+    return {
+        "position": position,
+        "season": season,
+        "contextual": has_context_reference,
+    }
+
+
+def media_subscription_title_request(message: str) -> dict[str, Any] | None:
+    """解析按标题或当前媒体主题发起的订阅请求；标题需先走探索候选确认。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if (
+        not normalized
+        or "rss" in normalized
+        or not any(action in normalized for action in _MEDIA_SUBSCRIPTION_CREATE_ACTIONS)
+        or any(token in normalized for token in ("删除", "移除", "暂停", "关闭", "状态", "更新吗"))
+    ):
+        return None
+    season_match = re.search(r"第\s*(\d{1,3})\s*季", normalized)
+    season = int(season_match.group(1)) if season_match else None
+    if season is not None and not 1 <= season <= 100:
+        return None
+    title_match = _MEDIA_RATING_QUOTED_TITLE_RE.search(str(message or ""))
+    if title_match is not None:
+        query = " ".join(title_match.group(1).split()).strip()[:120]
+        return {"query": query, "season": season, "contextual": False} if query else None
+    if any(token in normalized for token in _MEDIA_SUBSCRIPTION_CONTEXT_REFERENCES) or (
+        season is not None and re.fullmatch(r"(?:请(?:帮我)?\s*)?(?:订阅|追更)\s*第\s*\d{1,3}\s*季[。！!]?", normalized)
+    ):
+        return {"query": "", "season": season, "contextual": True}
+    return None
+
+
+def _latest_pending_subscription_season(
+    conversation_context: list[dict[str, Any]] | None,
+) -> int | None:
+    for item in reversed(conversation_context or []):
+        if not isinstance(item, dict) or str(item.get("role") or "").casefold() not in {
+            "assistant", "summary"
+        }:
+            continue
+        pending = item.get("pending_subscription")
+        if isinstance(pending, dict):
+            season = pending.get("season")
+            if (
+                isinstance(season, int)
+                and not isinstance(season, bool)
+                and 1 <= season <= 100
+            ):
+                return season
+        tool_name = str(item.get("tool_name") or "").strip()
+        if tool_name and tool_name != "discovery.search":
+            return None
+    return None
+
+
+def _select_recent_subscription_candidate(
+    snapshot: Any,
+    request: dict[str, Any],
+    conversation_context: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    candidates = snapshot.get("candidates") if isinstance(snapshot, dict) else None
+    if not isinstance(candidates, list):
+        return None
+    position = request.get("position")
+    if isinstance(position, int) and not isinstance(position, bool):
+        return next(
+            (
+                item
+                for item in candidates
+                if isinstance(item, dict)
+                and int(item.get("position") or 0) == position
+            ),
+            None,
+        )
+    media_context = _latest_media_context(conversation_context)
+    title = str(media_context.get("title") or "").casefold()
+    year = str(media_context.get("year") or "")
+    media_type = str(media_context.get("media_type") or "")
+    matched = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        if media_type and str(item.get("media_type") or "") != media_type:
+            continue
+        if year and str(item.get("year") or "") not in {"", year}:
+            continue
+        candidate_title = str(item.get("title") or "").casefold()
+        if title and title != candidate_title:
+            continue
+        matched.append(item)
+    if len(matched) == 1:
+        return matched[0]
+    if not title and len(candidates) == 1 and isinstance(candidates[0], dict):
+        return candidates[0]
+    return None
 
 
 def is_media_subscription_control_write_message(message: str) -> bool:
@@ -5950,9 +6101,53 @@ class AgentOrchestrator:
         *,
         owner: str,
         query_tool_rate_identity: str,
+        conversation_context: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """处理最近探索结果与探索收藏的确定性续句。"""
         snapshot = self.recent_discovery_store.get(owner=owner) if owner else None
+        subscription_request = media_subscription_candidate_request(message)
+        if subscription_request is not None:
+            if not owner:
+                return self._unsupported(
+                    "创建媒体追更订阅需要在已登录会话中确认",
+                    ["请登录后重新搜索媒体并选择一个结果。"],
+                )
+            if snapshot is None:
+                if subscription_request.get("position") is None:
+                    return None
+                return self._clarification_response(
+                    "没有可用的最近媒体探索结果，请先搜索片名。",
+                    ["例如：订阅《庆余年》。"],
+                )
+            candidate = _select_recent_subscription_candidate(
+                snapshot, subscription_request, conversation_context
+            )
+            if candidate is None:
+                season = subscription_request.get("season")
+                suffix = f"的第 {season} 季" if isinstance(season, int) else ""
+                return self._clarification_response(
+                    "请明确要订阅最近探索结果中的第几个条目；Agent 不会猜测媒体身份。",
+                    [f"例如：订阅第 2 个{suffix}。"],
+                )
+            season = subscription_request.get("season")
+            if season is None:
+                season = _latest_pending_subscription_season(conversation_context)
+            if season is not None and str(candidate.get("media_type") or "") != "tv":
+                return self._clarification_response(
+                    "电影订阅不支持按季度筛选。",
+                    [f"订阅第 {int(candidate.get('position') or 1)} 个。"],
+                )
+            arguments = {
+                "provider": candidate["provider"],
+                "external_id": candidate["external_id"],
+                "media_type": candidate["media_type"],
+            }
+            if isinstance(season, int):
+                arguments["season"] = season
+            return self.prepare(
+                "media.create_subscription", arguments, owner=owner
+            )
+
         recent_discovery_request = recent_discovery_candidate_request(
             message, allow_implicit=snapshot is not None
         )
@@ -5993,6 +6188,7 @@ class AgentOrchestrator:
                     f"第 {position} 个是{label}《{candidate['title']}》{year_text}。",
                     [
                         f"收藏第 {position} 个",
+                        f"订阅第 {position} 个",
                         f"搜第 {position} 部资源",
                     ],
                 )
@@ -6204,6 +6400,7 @@ class AgentOrchestrator:
         *,
         lower: str,
         owner: str,
+        conversation_context: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """处理下载任务控制与媒体追更订阅请求。"""
         download_retry = download_retry_submission_request(message)
@@ -6242,6 +6439,65 @@ class AgentOrchestrator:
                 "请用书名号或引号提供一个完整任务名称；同名任务不会由 Agent 猜测选择。",
                 ["例如：暂停下载任务《Example.Show.S01E01》。"],
             )
+
+        media_delete_request = media_subscription_delete_request(message)
+        if media_delete_request is not None:
+            if not owner:
+                return self._unsupported(
+                    "删除媒体追更订阅需要在已登录会话中确认",
+                    ["请登录后重新提交，并在预检后确认删除。"],
+                )
+            return self.prepare(
+                "media.delete_subscription", media_delete_request, owner=owner
+            )
+        if is_media_subscription_delete_write_message(message):
+            return self._clarification_response(
+                "请提供一个精确媒体追更订阅编号；Agent 不会猜测或批量删除。",
+                [
+                    "例如：删除媒体订阅 12。",
+                    "如不知道编号，可先说：列出全部媒体追更订阅。",
+                ],
+            )
+
+        media_create_request = media_subscription_title_request(message)
+        if media_create_request is not None:
+            if not owner:
+                return self._unsupported(
+                    "创建媒体追更订阅需要在已登录会话中确认",
+                    ["请登录后重新提交。"],
+                )
+            query = str(media_create_request.get("query") or "").strip()
+            if not query and bool(media_create_request.get("contextual")):
+                query = str(
+                    _latest_media_context(conversation_context).get("title") or ""
+                ).strip()
+            if not query:
+                return self._clarification_response(
+                    "请先说明要订阅的片名，或在媒体搜索结果后选择第几个。",
+                    ["例如：订阅《庆余年》。", "例如：订阅第 2 个。"],
+                )
+            response = self._invoke_query_read(
+                "discovery.search", {"query": query, "limit": 20}, owner=owner
+            )
+            result = response.get("result") if isinstance(response, dict) else None
+            if isinstance(result, dict):
+                data = result.get("data")
+                if isinstance(data, dict):
+                    season = media_create_request.get("season")
+                    if isinstance(season, int):
+                        data["pending_subscription"] = {"season": season}
+                suggestions = result.get("suggestions")
+                if not isinstance(suggestions, list):
+                    suggestions = []
+                    result["suggestions"] = suggestions
+                season = media_create_request.get("season")
+                suffix = f"的第 {season} 季" if isinstance(season, int) else ""
+                prompt = f"从结果中选择一个，例如：订阅第 2 个{suffix}。"
+                if prompt not in suggestions:
+                    suggestions.insert(0, prompt)
+                    del suggestions[4:]
+                result_projection.attach_public_display(response)
+            return response
 
         media_summary_request = media_subscription_summary_request(message)
         if media_summary_request is not None:
@@ -6577,6 +6833,7 @@ class AgentOrchestrator:
             message,
             owner=owner,
             query_tool_rate_identity=query_tool_rate_identity,
+            conversation_context=conversation_context,
         )
         if discovery_followup is not None:
             return discovery_followup
@@ -6604,10 +6861,22 @@ class AgentOrchestrator:
             and self.recent_resource_store.get(owner=owner) is not None
             and recent_resource_submit_request(message, allow_implicit=True) is not None
         )
+        has_deterministic_media_subscription_action = bool(
+            action_request
+            and (
+                media_subscription_candidate_request(message) is not None
+                or media_subscription_title_request(message) is not None
+                or media_subscription_delete_request(message) is not None
+                or is_media_subscription_delete_write_message(message)
+                or media_subscription_control_request(message) is not None
+                or is_media_subscription_control_write_message(message)
+            )
+        )
         model_routing_attempted = False
         if (
             allow_model_routing
             and not has_resource_continuation
+            and not has_deterministic_media_subscription_action
             and not _prefer_deterministic_context_route(
                 message, conversation_context
             )
@@ -6639,7 +6908,10 @@ class AgentOrchestrator:
 
         download_and_subscription = (
             self._handle_download_and_media_subscription_requests(
-                message, lower=lower, owner=owner
+                message,
+                lower=lower,
+                owner=owner,
+                conversation_context=conversation_context,
             )
         )
         if download_and_subscription is not None:

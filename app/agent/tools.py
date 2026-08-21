@@ -83,13 +83,21 @@ from app.agent.rss_subscription_control_actions import (
     set_rss_subscription_enabled_confirmed,
 )
 from app.agent.media_subscription_actions import (
+    create_media_subscription,
+    create_media_subscription_confirmed,
+    delete_media_subscription,
+    delete_media_subscription_confirmed,
     get_media_subscription_summary,
     inspect_media_subscription_updates,
     list_media_subscription_summaries,
+    media_subscription_create_arguments,
+    media_subscription_delete_arguments,
     media_subscription_enabled_arguments,
     media_subscription_summaries_arguments,
     media_subscription_summary_arguments,
     media_subscription_updates_arguments,
+    prepare_create_media_subscription,
+    prepare_delete_media_subscription,
     prepare_set_media_subscription_enabled,
     set_media_subscription_enabled,
     set_media_subscription_enabled_confirmed,
@@ -1305,6 +1313,51 @@ def build_tool_registry() -> ToolRegistry:
         handler=get_media_subscription_summary,
         validator=media_subscription_summary_arguments,
         llm_read=True,
+    ))
+    registry.register(ToolSpec(
+        name="media.create_subscription",
+        description="预检并在用户确认后，为一个精确影视条目创建媒体追更订阅；不会立即搜索或下载资源。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["provider", "external_id", "media_type"],
+            "properties": {
+                "provider": {"type": "string", "enum": ["tmdb", "douban", "bangumi"]},
+                "external_id": {"type": "string", "minLength": 1, "maxLength": 180},
+                "media_type": {"type": "string", "enum": ["movie", "tv"]},
+                "season": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+            "additionalProperties": False,
+        },
+        handler=create_media_subscription,
+        validator=media_subscription_create_arguments,
+        requires_confirmation=True,
+        confirmed_handler=create_media_subscription_confirmed,
+        confirmation_preparer=prepare_create_media_subscription,
+        llm_confirmation=True,
+        llm_examples=(
+            "订阅这个 TMDB 剧集",
+            "为这部剧创建媒体追更",
+            "只追更这部剧第 2 季",
+        ),
+    ))
+    registry.register(ToolSpec(
+        name="media.delete_subscription",
+        description="预检并在用户明确确认后软删除一个精确编号的媒体追更订阅；不会删除已提交下载任务或媒体文件。",
+        risk=RiskLevel.DANGER,
+        parameters={
+            "type": "object",
+            "required": ["subscription_id"],
+            "properties": {
+                "subscription_id": {"type": "integer", "minimum": 1},
+            },
+            "additionalProperties": False,
+        },
+        handler=delete_media_subscription,
+        validator=media_subscription_delete_arguments,
+        requires_confirmation=True,
+        confirmed_handler=delete_media_subscription_confirmed,
+        confirmation_preparer=prepare_delete_media_subscription,
     ))
     registry.register(ToolSpec(
         name="media.set_subscription_enabled",

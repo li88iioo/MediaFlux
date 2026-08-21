@@ -172,6 +172,35 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(context[-1]["pending_selection"], {"position": 2})
 
+        subscription_response = {
+            "mode": "tool_result",
+            "tool_call": {
+                "name": "discovery.search",
+                "arguments": {"query": "庆余年", "limit": 20},
+            },
+            "result": {
+                "ok": True,
+                "status": "completed",
+                "summary": "找到候选",
+                "data": {
+                    "query": "庆余年",
+                    "items": [],
+                    "pending_subscription": {"season": 2},
+                },
+                "suggestions": ["订阅第 2 个的第 2 季"],
+            },
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="订阅《庆余年》第 2 季",
+            response=subscription_response,
+        )
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(context[-1]["pending_subscription"], {"season": 2})
+
     def test_tampered_payload_fails_closed_and_delete_is_owner_scoped(self):
         self.repository.append_query_turn(
             principal="browser-principal-a",

@@ -5,14 +5,18 @@ import asyncio
 from datetime import datetime
 import hashlib
 import json
+import re
 import secrets
 from typing import Any, Callable
+import unicodedata
 
 from app import database as db
 from app.agent.async_bridge import AsyncBridgeUnavailable, ensure_sync_bridge_available
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
 from app.agent.workspace_actions import _safe_title
+from app.discovery.models import MediaCard, ProviderError
+from app.discovery.service import get_discovery_service
 from app.indexers.runtime import run_indexer_awaitable_sync
 from app.logger import get_logger
 from app.modules.media_subscriptions import (
@@ -26,6 +30,10 @@ _MAX_UPDATE_SUBSCRIPTIONS = 8
 _MAX_UPDATE_CANDIDATES = 12
 _UPDATE_PREVIEW_TIMEOUT_SECONDS = 35.0
 _UPDATE_ITEM_TIMEOUT_SECONDS = 25.0
+_CREATE_TIMEOUT_SECONDS = 35.0
+_ALLOWED_PROVIDERS = frozenset({"tmdb", "douban", "bangumi"})
+_ALLOWED_MEDIA_TYPES = frozenset({"movie", "tv"})
+_PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,180}$")
 
 
 def _now() -> str:
@@ -76,6 +84,65 @@ def media_subscription_enabled_arguments(arguments: dict[str, Any]) -> dict[str,
         "subscription_id": _strict_subscription_id(arguments.get("subscription_id")),
         "enabled": enabled,
     }
+
+
+def _subscription_identity(
+    provider: Any, external_id: Any, media_type: Any
+) -> tuple[str, str, str]:
+    normalized_provider = unicodedata.normalize(
+        "NFKC", str(provider or "")
+    ).strip().casefold()
+    normalized_external_id = unicodedata.normalize(
+        "NFKC", str(external_id or "")
+    ).strip()
+    normalized_media_type = unicodedata.normalize(
+        "NFKC", str(media_type or "")
+    ).strip().casefold()
+    if normalized_provider not in _ALLOWED_PROVIDERS:
+        raise AgentToolError("provider 仅支持 tmdb、douban 或 bangumi")
+    if not _PUBLIC_ID_RE.fullmatch(normalized_external_id):
+        raise AgentToolError("external_id 格式无效")
+    if normalized_media_type not in _ALLOWED_MEDIA_TYPES:
+        raise AgentToolError("media_type 仅支持 movie 或 tv")
+    return normalized_provider, normalized_external_id, normalized_media_type
+
+
+def media_subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        raise AgentToolError("工具参数必须是 JSON 对象")
+    if not set(arguments).issubset({"provider", "external_id", "media_type", "season"}):
+        raise AgentToolError(
+            "media.create_subscription 只接受 provider、external_id、media_type 和可选 season 参数"
+        )
+    if not {"provider", "external_id", "media_type"}.issubset(arguments):
+        raise AgentToolError("创建媒体订阅需要精确来源、媒体 ID 和媒体类型")
+    provider, external_id, media_type = _subscription_identity(
+        arguments.get("provider"),
+        arguments.get("external_id"),
+        arguments.get("media_type"),
+    )
+    season = arguments.get("season")
+    if season is not None:
+        if isinstance(season, bool) or not isinstance(season, int) or not 1 <= season <= 100:
+            raise AgentToolError("season 必须是 1 到 100 的整数")
+        if media_type != "tv":
+            raise AgentToolError("电影订阅不支持季度筛选")
+    normalized = {
+        "provider": provider,
+        "external_id": external_id,
+        "media_type": media_type,
+    }
+    if season is not None:
+        normalized["season"] = int(season)
+    return normalized
+
+
+def media_subscription_delete_arguments(arguments: dict[str, Any]) -> dict[str, int]:
+    if not isinstance(arguments, dict):
+        raise AgentToolError("工具参数必须是 JSON 对象")
+    if set(arguments) != {"subscription_id"}:
+        raise AgentToolError("media.delete_subscription 只接受 subscription_id 参数")
+    return {"subscription_id": _strict_subscription_id(arguments.get("subscription_id"))}
 
 
 def _media_type_label(value: Any) -> str:
@@ -136,7 +203,7 @@ def list_media_subscription_summaries(_arguments: dict[str, Any]) -> ToolResult:
     else:
         status = "not_configured"
         summary = "尚未创建媒体追更订阅"
-        suggestions = ["可先从媒体探索页为一部电影或剧集创建追更订阅。"]
+        suggestions = ["可直接说：订阅《片名》，再从搜索结果中选择准确条目。"]
     return ToolResult(
         ok=True,
         status=status,
@@ -246,7 +313,7 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
             status="not_configured",
             summary="尚未创建媒体追更订阅",
             data={"total": 0, "returned": 0, "truncated": False, "subscriptions": [], "items": []},
-            suggestions=["可先从媒体探索页为电影或剧集创建追更订阅。"],
+            suggestions=["可直接说：订阅《片名》，再从搜索结果中选择准确条目。"],
         )
 
     try:
@@ -437,6 +504,321 @@ def _fingerprint(state: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _resolved_tmdb_id(provider: str, external_id: str, media_type: str) -> str:
+    if provider == "tmdb":
+        if not external_id.isascii() or not external_id.isdigit() or int(external_id) <= 0:
+            raise AgentToolError("TMDB 媒体 ID 无效", code="precondition_failed")
+        return external_id
+    mapping = db.get_media_external_id(provider, external_id, media_type)
+    tmdb_id = str(mapping["tmdb_id"] or "").strip() if mapping is not None else ""
+    if (
+        mapping is None
+        or not bool(mapping["confirmed"])
+        or not tmdb_id.isascii()
+        or not tmdb_id.isdigit()
+        or int(tmdb_id) <= 0
+    ):
+        raise AgentToolError(
+            "该来源尚未确认 TMDB 映射，请先在探索页确认媒体身份",
+            code="precondition_failed",
+        )
+    return tmdb_id
+
+
+def _create_snapshot(tmdb_id: str, media_type: str) -> dict[str, Any]:
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT id,enabled,status,revision,deleted_at,updated_at "
+            "FROM media_subscriptions WHERE tmdb_id=? AND media_type=?",
+            (tmdb_id, media_type),
+        ).fetchone()
+    if row is None:
+        return {"exists": False, "tmdb_id": tmdb_id, "media_type": media_type}
+    return {
+        "exists": True,
+        "subscription_id": int(row["id"]),
+        "tmdb_id": tmdb_id,
+        "media_type": media_type,
+        "enabled": bool(row["enabled"]),
+        "status": str(row["status"] or ""),
+        "revision": int(row["revision"] or 0),
+        "deleted_at": str(row["deleted_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }
+
+
+def _encode_create_context(value: dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _decode_create_context(value: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AgentToolError("确认上下文无效", code="confirmation_invalid") from exc
+    if not isinstance(payload, dict):
+        raise AgentToolError("确认上下文无效", code="confirmation_invalid")
+    return payload
+
+
+def prepare_create_media_subscription(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    provider = str(arguments["provider"])
+    external_id = str(arguments["external_id"])
+    media_type = str(arguments["media_type"])
+    season = arguments.get("season")
+    tmdb_id = _resolved_tmdb_id(provider, external_id, media_type)
+    snapshot = _create_snapshot(tmdb_id, media_type)
+    if snapshot.get("exists") and not snapshot.get("deleted_at"):
+        raise AgentToolError("该媒体已经在追更订阅中", code="precondition_failed")
+
+    try:
+        card = get_discovery_service().get_detail(provider, media_type, external_id)
+    except ProviderError as exc:
+        raise AgentToolError(
+            exc.safe_message or "暂时无法核对该影视条目",
+            code="precondition_failed",
+        ) from exc
+    except Exception as exc:
+        logger.warning("Agent 媒体订阅创建预检失败 type=%s", type(exc).__name__)
+        raise AgentToolError(
+            "暂时无法核对该影视条目", code="confirmation_unavailable"
+        ) from exc
+    if not isinstance(card, MediaCard) or (
+        card.provider, card.external_id, card.media_type
+    ) != (provider, external_id, media_type):
+        raise AgentToolError("影视数据源返回的条目标识不一致", code="precondition_failed")
+    title = _safe_title(card.title, fallback="该媒体")
+    year = str(card.year or "").strip()[:12]
+    season_label = f"第 {int(season)} 季" if season is not None else "全部缺失内容"
+    context = {
+        "operation": "create",
+        "provider": provider,
+        "external_id": external_id,
+        "media_type": media_type,
+        "tmdb_id": tmdb_id,
+        "season": int(season) if season is not None else None,
+        "snapshot": snapshot,
+    }
+    return ToolResult(
+        ok=True,
+        status="confirmation_required",
+        summary=f"确认后将为《{title}》创建媒体追更订阅",
+        data={
+            "operation": "create",
+            "title": title,
+            "year": year,
+            "media_type": _media_type_label(media_type),
+            "monitor_scope": season_label,
+            "season": int(season) if season is not None else None,
+            "affected": 1,
+            "effects": [
+                "确认后只会创建或恢复本地追更订阅，不会立即下载资源。",
+                "新订阅默认由下一次后台调度检查缺失内容，候选下载仍需按策略确认。",
+            ],
+        },
+        evidence=[Evidence(
+            "discovery_provider",
+            "预检时核对精确影视条目及已确认 TMDB 身份；未搜索资源或提交下载。",
+            _now(),
+        )],
+        suggestions=["确认票据只可使用一次；确认前请核对片名、类型和季度范围。"],
+    ), _encode_create_context(context)
+
+
+def create_media_subscription_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    context = _decode_create_context(expected_context)
+    identity = (
+        str(arguments["provider"]),
+        str(arguments["external_id"]),
+        str(arguments["media_type"]),
+    )
+    if (
+        context.get("operation") != "create"
+        or identity != (
+            str(context.get("provider") or ""),
+            str(context.get("external_id") or ""),
+            str(context.get("media_type") or ""),
+        )
+        or arguments.get("season") != context.get("season")
+    ):
+        raise AgentToolError("确认上下文与目标不一致", code="confirmation_invalid")
+    tmdb_id = _resolved_tmdb_id(*identity)
+    if tmdb_id != str(context.get("tmdb_id") or ""):
+        return ToolResult(
+            ok=False,
+            status="conflict",
+            summary="媒体身份映射已变化，请重新预检",
+            error="确认快照已失效。",
+        )
+    snapshot = _create_snapshot(tmdb_id, identity[2])
+    if snapshot != context.get("snapshot"):
+        return ToolResult(
+            ok=False,
+            status="conflict",
+            summary="媒体追更订阅状态已变化，请重新预检",
+            error="确认快照已失效。",
+        )
+    season = arguments.get("season")
+    payload: dict[str, Any] = {
+        "provider": identity[0],
+        "external_id": identity[1],
+        "tmdb_id": tmdb_id,
+        "media_type": identity[2],
+        "monitor_mode": "selected" if season is not None else "missing",
+        "seasons": [int(season)] if season is not None else [],
+        "include_specials": False,
+        "action": "confirm",
+        "download_target": "guangya",
+        "check_interval_minutes": 4320,
+        "enabled": True,
+    }
+    try:
+        ensure_sync_bridge_available()
+        created_result = run_indexer_awaitable_sync(
+            get_media_subscription_service().create_subscription(
+                payload,
+                identity_confirmed=identity[0] != "tmdb",
+            ),
+            timeout_seconds=_CREATE_TIMEOUT_SECONDS,
+        )
+    except MediaSubscriptionError as exc:
+        return ToolResult(
+            ok=False,
+            status=str(exc.code or "unavailable")[:40],
+            summary="媒体追更订阅创建失败",
+            error=str(exc)[:240],
+        )
+    except (AsyncBridgeUnavailable, TimeoutError, RuntimeError) as exc:
+        logger.warning("Agent 媒体订阅创建执行失败 type=%s", type(exc).__name__)
+        return ToolResult(
+            ok=False,
+            status="unavailable",
+            summary="媒体追更订阅暂时无法创建",
+            error="订阅服务暂时不可用。",
+        )
+    subscription = (
+        created_result.get("subscription")
+        if isinstance(created_result, dict) else None
+    )
+    subscription = subscription if isinstance(subscription, dict) else {}
+    subscription_id = int(subscription.get("id") or 0)
+    created = bool(created_result.get("created")) if isinstance(created_result, dict) else False
+    runtime_refreshed = _reload_scheduler()
+    return ToolResult(
+        ok=True,
+        status="completed",
+        summary="媒体追更订阅已创建" if created else "媒体追更订阅已恢复",
+        data={
+            "operation": "create" if created else "restore",
+            "subscription_number": subscription_id,
+            "title": _safe_title(subscription.get("title"), fallback="该媒体"),
+            "media_type": _media_type_label(identity[2]),
+            "season": int(season) if season is not None else None,
+            "affected": 1,
+            "created": created,
+            "runtime_refreshed": runtime_refreshed,
+        },
+        evidence=[Evidence(
+            "media_subscription_database",
+            "已使用一次性确认票据创建本地追更订阅；未立即搜索或下载资源。",
+            _now(),
+        )],
+        suggestions=(
+            ["订阅已进入后台调度，可继续查看媒体订阅更新。"]
+            if runtime_refreshed
+            else ["订阅已保存；请重启 MediaFlux 使当前进程重新加载调度。"]
+        ),
+    )
+
+
+def prepare_delete_media_subscription(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    subscription_id = int(arguments["subscription_id"])
+    state = _capture(subscription_id)
+    if not state.get("exists"):
+        raise AgentToolError("未找到指定的媒体追更订阅", code="precondition_failed")
+    row = db.get_media_subscription(subscription_id)
+    title = _safe_title(row["title"] if row is not None else "", fallback="该媒体")
+    return ToolResult(
+        ok=True,
+        status="confirmation_required",
+        summary=f"确认后将删除《{title}》的媒体追更订阅",
+        data={
+            "operation": "delete",
+            "subscription_number": subscription_id,
+            "title": title,
+            "affected": 1,
+            "available_candidates": int(state.get("available_candidates") or 0),
+            "claimed_admissions": int(state.get("claimed_admissions") or 0),
+            "running_checks": int(state.get("running_checks") or 0),
+            "effects": [
+                "订阅会被软删除并停止后续检查。",
+                "未提交候选、待处理准入和运行中检查会失效；已提交下载和媒体文件不会删除。",
+            ],
+        },
+        evidence=[Evidence(
+            "media_subscription_database",
+            "只核对目标订阅及未完成工作数量；不会删除下载任务或媒体文件。",
+            _now(),
+        )],
+        suggestions=["删除属于高风险操作；确认票据只可使用一次。"],
+    ), _fingerprint(state)
+
+
+def delete_media_subscription_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    subscription_id = int(arguments["subscription_id"])
+    state = _capture(subscription_id)
+    if not state.get("exists") or not secrets.compare_digest(
+        _fingerprint(state), str(expected_context or "")
+    ):
+        return ToolResult(
+            ok=False,
+            status="conflict",
+            summary="媒体追更订阅状态已变化，请重新预检",
+            error="确认快照已失效。",
+        )
+    removed = get_media_subscription_service().delete_subscription(subscription_id)
+    if not removed:
+        return ToolResult(
+            ok=False,
+            status="conflict",
+            summary="媒体追更订阅状态已变化，请重新预检",
+            error="目标订阅已不存在。",
+        )
+    runtime_refreshed = _reload_scheduler()
+    return ToolResult(
+        ok=True,
+        status="completed",
+        summary="媒体追更订阅已删除",
+        data={
+            "operation": "delete",
+            "subscription_number": subscription_id,
+            "affected": 1,
+            "expired_candidates": int(state.get("available_candidates") or 0),
+            "cancelled_admissions": int(state.get("claimed_admissions") or 0),
+            "cancelled_runs": int(state.get("running_checks") or 0),
+            "runtime_refreshed": runtime_refreshed,
+        },
+        evidence=[Evidence(
+            "media_subscription_database",
+            "已使用一次性确认票据软删除订阅；已提交下载与媒体文件未被删除。",
+            _now(),
+        )],
+        suggestions=(
+            ["订阅已删除，后续不会再安排检查。"]
+            if runtime_refreshed
+            else ["订阅已删除；请重启 MediaFlux 使当前进程重新加载调度。"]
+        ),
+    )
+
+
 def prepare_set_media_subscription_enabled(
     arguments: dict[str, Any],
 ) -> tuple[ToolResult, str]:
@@ -575,4 +957,6 @@ def _unconfirmed(_arguments: dict[str, Any]) -> ToolResult:
     raise AgentToolError("该媒体追更订阅操作需要确认", code="confirmation_required")
 
 
+create_media_subscription: Callable[[dict[str, Any]], ToolResult] = _unconfirmed
+delete_media_subscription: Callable[[dict[str, Any]], ToolResult] = _unconfirmed
 set_media_subscription_enabled: Callable[[dict[str, Any]], ToolResult] = _unconfirmed
