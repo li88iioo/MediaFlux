@@ -457,7 +457,8 @@ _RESOURCE_CANDIDATE_KEYS = frozenset({
     "recommendation",
 })
 _GUIDANCE_PREFIX_RE = re.compile(
-    r"^(?:可(?:询问|继续|尝试)|建议(?:先|继续)?|下一步(?:可以)?)[：:\s]*"
+    r"^(?:可以(?:继续)?(?:说|询问)|可(?:继续|(?:先|再次|继续)?(?:询问|说|尝试))|"
+    r"建议(?:先|继续)?|下一步(?:可以)?)[：:\s]*"
 )
 _GUIDANCE_TOOL_DETAIL_RE = re.compile(
     r"^可调用\s+(.+?)\s+查看(?:其)?(?:安全)?详情[。.]?$",
@@ -465,12 +466,19 @@ _GUIDANCE_TOOL_DETAIL_RE = re.compile(
 )
 _READ_GUIDANCE_PREFIXES = (
     "检查", "查看", "诊断", "搜索", "查找", "核对", "预览", "列出", "确认状态",
-    "在网上找", "帮我看看", "继续检查", "继续查看", "说明", "解释",
+    "在网上找", "帮我看看", "继续检查", "继续查看", "重新检查", "重新诊断",
+    "重新核对", "再次检查", "说明", "解释",
 )
 _WRITE_GUIDANCE_MARKERS = (
     "提交", "开始下载", "下载第", "重试", "刷新订阅", "保存设置", "修改配置",
     "启用", "关闭", "停止", "清理", "开始整理", "执行同步", "推送", "删除",
     "设置为", "切换为", "立即执行", "暂停", "恢复",
+)
+_INFORMATIONAL_GUIDANCE_MARKERS = (
+    "不会自动", "不会立即", "不会触发", "不会删除", "不会回滚",
+    "只代表", "只可使用一次", "每次请求会消耗", "结果仅按",
+    "确认前请核对", "请由管理员", "请在部署环境", "请先在设置页",
+    "请先在网盘整理页面",
 )
 
 _PUBLIC_STATUS_LABELS: dict[str, str] = {
@@ -526,6 +534,11 @@ _PUBLIC_STATUS_PROGRESS = frozenset({
     "accepted", "active", "pending", "retry_wait", "running", "waiting",
 })
 _PUBLIC_STATUS_ERROR = frozenset({"failed", "unavailable", "unsupported", "error"})
+_PUBLIC_STATUS_KEYS = frozenset(_PUBLIC_STATUS_LABELS)
+_PUBLIC_STATUS_VALUE_KEYS = frozenset({
+    "status", "state", "patrol_status", "task_status", "schedule_state",
+    "runtime_status", "connection_status",
+})
 
 
 def public_tool_label(tool_name: object) -> str:
@@ -613,6 +626,13 @@ def _display_chunks(value: str, *, max_length: int = 150) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
+def _replace_internal_field(match: re.Match[str]) -> str:
+    value = match.group(0)
+    if value.casefold() in _PUBLIC_STATUS_KEYS:
+        return value
+    return "内部状态"
+
+
 def _replace_internal_identifiers_in_text(text: str) -> str:
     text = _remove_internal_tool_guidance(text)
     for tool_name, label in sorted(_PUBLIC_TOOL_LABELS.items(), key=lambda item: -len(item[0])):
@@ -620,7 +640,7 @@ def _replace_internal_identifiers_in_text(text: str) -> str:
     text = _INTERNAL_TOOL_RE.sub("内部检查", text)
     text = _INTERNAL_CAMEL_RE.sub("内部状态", text)
     text = _INTERNAL_KEBAB_RE.sub("内部检查", text)
-    return _INTERNAL_FIELD_RE.sub("内部状态", text)
+    return _INTERNAL_FIELD_RE.sub(_replace_internal_field, text)
 
 
 def replace_internal_identifiers(value: object) -> str:
@@ -776,6 +796,11 @@ def sanitize_public_multiline_text(value: object, *, limit: int = 1200) -> str:
     return text[: max(1, int(limit))].rstrip()
 
 
+def _is_informational_guidance(prompt: str) -> bool:
+    normalized = prompt.strip().lstrip("-•· ")
+    return any(marker in normalized for marker in _INFORMATIONAL_GUIDANCE_MARKERS)
+
+
 def _guidance_kind(prompt: str) -> str:
     normalized = prompt.strip().lstrip("-•· ")
     if any(marker in normalized for marker in _WRITE_GUIDANCE_MARKERS):
@@ -805,10 +830,13 @@ def project_public_guidance(
         tool_detail_match = _GUIDANCE_TOOL_DETAIL_RE.match(prompt)
         if tool_detail_match:
             prompt = f"查看{tool_detail_match.group(1).strip()}详情"
-        prompt = _GUIDANCE_PREFIX_RE.sub("", prompt).strip()
+        prompt = _GUIDANCE_PREFIX_RE.sub("", prompt).strip().strip("“”‘’\"'")
         if not prompt or prompt in seen:
             continue
-        raw_kind = str(item.get("kind") or "") if isinstance(item, Mapping) else ""
+        explicit_item = isinstance(item, Mapping)
+        if not explicit_item and _is_informational_guidance(prompt):
+            continue
+        raw_kind = str(item.get("kind") or "") if explicit_item else ""
         kind = force_kind or (raw_kind if raw_kind in {"read", "draft"} else _guidance_kind(prompt))
         # 只有明确只读语句才允许一键发送；强制 draft 可用于模型生成建议。
         if kind == "read" and _guidance_kind(prompt) != "read":
@@ -852,6 +880,9 @@ def _safe_value(
     if isinstance(value, float):
         return value if value == value and abs(value) != float("inf") else None
     if isinstance(value, str):
+        normalized_status = value.strip().casefold()
+        if source_key in _PUBLIC_STATUS_VALUE_KEYS and normalized_status in _PUBLIC_STATUS_LABELS:
+            return _PUBLIC_STATUS_LABELS[normalized_status]
         text = sanitize_public_text(value, limit=240)
         if not text:
             return None

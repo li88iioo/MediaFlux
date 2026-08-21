@@ -16,6 +16,7 @@ from app.agent.media_subscription_actions import (
     media_subscription_updates_arguments,
 )
 from app.agent.orchestrator import (
+    is_library_update_check_message,
     is_media_subscription_control_write_message,
     is_media_subscription_summaries_message,
     is_media_subscription_updates_message,
@@ -163,11 +164,21 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             "订阅有更新吗",
             "我订阅的媒体有更新吗",
             "我的订阅更新了吗",
+            "我追的剧有没有更新",
+            "我的追番有没有更新",
+            "我追的番更新了吗",
+            "追番有新一集吗",
         ):
             with self.subTest(message=message):
                 self.assertTrue(is_media_subscription_updates_message(message))
         self.assertFalse(is_media_subscription_updates_message("RSS 订阅有更新吗"))
         self.assertFalse(is_media_subscription_updates_message("修改媒体订阅更新间隔"))
+        for message in ("我的订阅", "我的追番", "追更列表", "列出我追的剧", "查看我的追番"):
+            with self.subTest(summary_message=message):
+                self.assertTrue(is_media_subscription_summaries_message(message))
+        for message in ("我追的剧有没有更新", "我的追番有没有更新", "追番有新一集吗"):
+            with self.subTest(generic_title=message):
+                self.assertFalse(is_library_update_check_message(message))
         self.assertEqual(
             media_subscription_summary_request(f"查看媒体订阅 {self.sid} 状态"),
             {"subscription_id": self.sid},

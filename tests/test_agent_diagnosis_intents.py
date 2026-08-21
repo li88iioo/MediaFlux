@@ -3,7 +3,10 @@ from __future__ import annotations
 import unittest
 
 from app.agent.intents import ReadIntentSpec, match_read_intent
-from app.agent.orchestrator import _DIAGNOSTIC_READ_INTENTS
+from app.agent.orchestrator import (
+    _DIAGNOSTIC_READ_INTENTS,
+    is_config_diagnosis_message,
+)
 
 
 class DiagnosisIntentTableTests(unittest.TestCase):
@@ -19,6 +22,21 @@ class DiagnosisIntentTableTests(unittest.TestCase):
                 "workspace.health",
             ],
         )
+
+    def test_config_diagnosis_requires_explicit_read_intent(self):
+        for message in (
+            "检查项目配置", "检查配置", "环境诊断", "项目诊断", "请诊断",
+            "检查媒体服务器配置", "检查资源站配置",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(is_config_diagnosis_message(message))
+
+        for message in (
+            "配置", "设置", "怎么配置下载器", "如何设置代理", "设置自动整理",
+            "修改配置", "联网搜索配置文档", "搜索配置相关的资源",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(is_config_diagnosis_message(message))
 
     def test_first_match_wins(self):
         specs = (

@@ -252,6 +252,23 @@ _MEDIA_CONTEXT_REFERENCES = frozenset({
     "本电影", "该电影", "这个电影", "这部电影",
     "本作品", "该作品", "这个作品", "这部作品",
 })
+_GENERIC_MEDIA_COLLECTION_TERMS = frozenset({
+    "我追的剧", "我的追剧", "追剧", "在追的剧", "在追",
+    "我追的番", "我的追番", "追番", "在追的番",
+    "我追的", "我的追更", "追更", "追更列表",
+    "我的订阅", "已订阅", "订阅列表",
+    "想看", "想看的剧", "想看的电影", "我的想看", "想看列表",
+    "待看", "待看的剧", "更新", "最新更新", "最近更新", "新剧", "新番",
+})
+
+
+def _is_generic_media_collection_term(value: Any) -> bool:
+    normalized = re.sub(
+        r"[\s，。！？!?、；;：:~～]+",
+        "",
+        unicodedata.normalize("NFKC", str(value or "")).casefold(),
+    )
+    return normalized in _GENERIC_MEDIA_COLLECTION_TERMS
 
 
 def _contextual_media_reference_type(value: Any) -> str:
@@ -330,7 +347,8 @@ def _extract_media_rating_title(message: str) -> str:
     text = re.sub(r"(?:豆瓣|电视剧|电视连续剧|连续剧|剧集|电影|影片|这部剧|该剧|这部电影)", " ", text)
     text = re.sub(r"(?:是多少|多少分|是几分|几分|怎么样|如何|重试|再试一次|重新查询|重新查|继续查)", " ", text)
     text = re.sub(r"[\s，。！？!?、；;：:~～·•\-_/]+", " ", text).strip(" 的")
-    return " ".join(text.split()).strip()[:120]
+    title = " ".join(text.split()).strip()[:120]
+    return "" if _is_generic_media_collection_term(title) else title
 
 
 def _pending_rating_media_context(
@@ -736,6 +754,21 @@ _MEDIA_SERVER_DIAGNOSIS_REJECT_TOKENS = (
 _DOWNLOAD_DIAGNOSIS_SCOPES = ("下载队列", "下载任务", "下载自动化", "qbittorrent", "qb 下载", "qb下载", "下载器")
 _DOWNLOAD_DIAGNOSIS_INTENTS = ("诊断", "检查", "查看", "哪些", "状态", "卡住", "停滞", "异常", "失败", "排队")
 _DOWNLOAD_DIAGNOSIS_REJECT_TOKENS = ("配置", "设置")
+_CONFIG_DIAGNOSIS_EXACT_PHRASES = frozenset({
+    "项目诊断", "环境诊断", "系统诊断", "配置诊断", "诊断项目", "诊断配置",
+    "诊断系统", "请诊断", "进行诊断", "检查配置", "检查项目配置", "项目配置检查",
+    "检查系统配置",
+})
+_CONFIG_DIAGNOSIS_SCOPES = (
+    "项目配置", "系统配置", "环境配置", "服务配置", "配置", "设置", "项目", "环境", "系统",
+)
+_CONFIG_DIAGNOSIS_INTENTS = (
+    "检查", "诊断", "健康", "状态", "正常", "异常", "就绪", "完整性", "核对", "校验",
+)
+_CONFIG_DIAGNOSIS_REJECT_TOKENS = (
+    "怎么", "如何", "为什么", "修改", "更改", "设置成", "配置成", "保存", "开启", "关闭",
+    "启用", "停用", "联网搜索", "搜索", "找", "教程", "指南", "说明", "帮助", "重置",
+)
 _DOWNLOAD_CONTROL_PATTERN = re.compile(
     r"^(暂停|停止|恢复|继续|删除|移除)\s*(?:q(?:bittorrent|b)?\s*任务|下载任务)\s*[《「『\"'](.+?)[》」』\"']$",
     re.IGNORECASE,
@@ -791,6 +824,19 @@ def is_download_retry_submission_message(message: str) -> bool:
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
     return any(scope in normalized for scope in _DOWNLOAD_RETRY_SCOPES) and any(
         verb in normalized for verb in _DOWNLOAD_RETRY_VERBS
+    )
+
+
+def is_config_diagnosis_message(message: str) -> bool:
+    """只在用户明确要求检查系统配置时执行全局配置诊断。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    normalized = normalized.strip(" ，。！？!?、；;：:~～")
+    if not normalized or any(token in normalized for token in _CONFIG_DIAGNOSIS_REJECT_TOKENS):
+        return False
+    if normalized in _CONFIG_DIAGNOSIS_EXACT_PHRASES:
+        return True
+    return any(scope in normalized for scope in _CONFIG_DIAGNOSIS_SCOPES) and any(
+        intent in normalized for intent in _CONFIG_DIAGNOSIS_INTENTS
     )
 
 
@@ -1217,7 +1263,18 @@ def is_rss_subscription_control_write_message(message: str) -> bool:
     )
 
 
-_MEDIA_SUBSCRIPTION_SCOPE_PATTERN = r"(?:媒体|影视)(?:追更)?订阅|追更订阅"
+_MEDIA_SUBSCRIPTION_SCOPE_PATTERN = (
+    r"(?:(?:媒体|影视)(?:追更)?订阅|追更订阅|我追的剧|我的追剧|在追的剧|"
+    r"我追的番|我的追番|在追的番|我的追更|我的订阅|订阅列表|追番|追剧|追更)"
+)
+_MEDIA_SUBSCRIPTION_COLLECTION_SCOPES = (
+    "我追的剧", "我的追剧", "在追的剧", "我追的番", "我的追番",
+    "在追的番", "我的追更", "我的订阅", "订阅列表", "追番", "追剧", "追更",
+)
+_MEDIA_SUBSCRIPTION_BARE_SUMMARY_QUERIES = frozenset({
+    "我的订阅", "我的追番", "我的追剧", "我追的剧", "我追的番",
+    "追更列表", "订阅列表", "追番列表", "追剧列表",
+})
 _MEDIA_SUBSCRIPTION_SUMMARY_PATTERN = re.compile(
     rf"^(?:请(?:帮我)?\s*)?"
     rf"(?:(?:查看|检查|查询|诊断|看看|显示)\s*)?"
@@ -1278,8 +1335,16 @@ def is_media_subscription_summaries_message(message: str) -> bool:
         return False
     if re.search(r"(?:id|编号)?\s*[#:]?\s*\d{1,9}", normalized):
         return False
-    return any(token in normalized for token in _MEDIA_SUBSCRIPTION_LIST_TOKENS) and any(
-        token in normalized for token in _MEDIA_SUBSCRIPTION_READ_TOKENS
+    bare_query = normalized.strip(" ，。！？!?、；;：:~～")
+    if bare_query in _MEDIA_SUBSCRIPTION_BARE_SUMMARY_QUERIES:
+        return True
+    has_read_intent = any(token in normalized for token in _MEDIA_SUBSCRIPTION_READ_TOKENS)
+    has_collection_scope = any(
+        token in normalized for token in _MEDIA_SUBSCRIPTION_COLLECTION_SCOPES
+    )
+    return has_read_intent and (
+        any(token in normalized for token in _MEDIA_SUBSCRIPTION_LIST_TOKENS)
+        or has_collection_scope
     )
 
 
@@ -1290,7 +1355,9 @@ def is_media_subscription_updates_message(message: str) -> bool:
         token in normalized for token in _MEDIA_SUBSCRIPTION_UPDATE_EXCLUDED_TOKENS
     ):
         return False
-    if "订阅" not in normalized or "更新" not in normalized:
+    if not (_has_media_subscription_scope(normalized) or "订阅" in normalized):
+        return False
+    if not any(token in normalized for token in ("更新", "新一集", "新一季", "新内容")):
         return False
     return any(token in normalized for token in _MEDIA_SUBSCRIPTION_UPDATE_QUERY_TOKENS)
 
@@ -2668,6 +2735,58 @@ def _candidate_episode(candidate: Any) -> int | None:
     return None
 
 
+def _recent_resource_target(message: str) -> tuple[str | None, bool]:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    has_qb = bool(re.search(r"(?<![a-z])q(?:b|bittorrent)(?![a-z])", normalized))
+    has_guangya = "光鸭" in normalized
+    explicit_both = any(token in normalized for token in (
+        "两个后端", "两个目标", "两边", "两者", "都推送", "都下载", "全部推送", "同时推送",
+    ))
+    has_target = has_qb or has_guangya or explicit_both
+    if not has_target:
+        return None, False
+    ambiguous_dual = has_qb and has_guangya and any(
+        token in normalized for token in ("或", "还是", "任一", "任选")
+    )
+    linked_dual = has_qb and has_guangya and bool(re.search(
+        r"(?:q(?:b|bittorrent).{0,12}(?:和|与|及|以及|跟).{0,12}光鸭|"
+        r"光鸭.{0,12}(?:和|与|及|以及|跟).{0,12}q(?:b|bittorrent))",
+        normalized,
+    ))
+    if ambiguous_dual:
+        return None, True
+    if explicit_both or linked_dual:
+        return "both", True
+    if has_qb and not has_guangya:
+        return "qb", True
+    if has_guangya and not has_qb:
+        return "guangya", True
+    return None, True
+
+
+def _recent_resource_target_followup_request(
+    message: str,
+    conversation_context: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """承接上一轮已经选定候选、只缺下载目标的安全追问。"""
+    previous = _last_assistant_context(conversation_context)
+    if (
+        str(previous.get("tool_name") or "").strip() != "indexer.submit_resource"
+        or str(previous.get("status") or "").strip().casefold() != "selection_required"
+    ):
+        return None
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not normalized or any(token in normalized for token in _RECENT_RESOURCE_REJECT_TOKENS):
+        return None
+    target, has_target = _recent_resource_target(normalized)
+    if not has_target:
+        return None
+    position = _recent_resource_selection(previous.get("text"))
+    if position is None:
+        return None
+    return {"position": position, "target": target}
+
+
 def recent_resource_submit_request(
     message: str, *, allow_implicit: bool = False
 ) -> dict[str, Any] | None:
@@ -2688,29 +2807,7 @@ def recent_resource_submit_request(
     elif not allow_implicit or (selection is None and episode is None):
         return None
 
-    has_qb = bool(re.search(r"(?<![a-z])q(?:b|bittorrent)(?![a-z])", normalized))
-    has_guangya = "光鸭" in normalized
-    explicit_both = any(token in normalized for token in (
-        "两个后端", "两个目标", "两边", "两者", "都推送", "都下载", "全部推送", "同时推送",
-    ))
-    ambiguous_dual = has_qb and has_guangya and any(
-        token in normalized for token in ("或", "还是", "任一", "任选")
-    )
-    linked_dual = has_qb and has_guangya and bool(re.search(
-        r"(?:q(?:b|bittorrent).{0,12}(?:和|与|及|以及|跟).{0,12}光鸭|"
-        r"光鸭.{0,12}(?:和|与|及|以及|跟).{0,12}q(?:b|bittorrent))",
-        normalized,
-    ))
-    if ambiguous_dual:
-        target = None
-    elif explicit_both or linked_dual:
-        target = "both"
-    elif has_qb and not has_guangya:
-        target = "qb"
-    elif has_guangya and not has_qb:
-        target = "guangya"
-    else:
-        target = None
+    target, _ = _recent_resource_target(normalized)
     request = {"position": selection, "target": target}
     if episode is not None:
         request["episode"] = episode
@@ -2728,11 +2825,19 @@ _RECENT_RESOURCE_PRE_MODEL_REJECT_PATTERN = re.compile(
 )
 
 
-def _recent_resource_pre_model_submit_request(message: str) -> dict[str, Any] | None:
+def _recent_resource_pre_model_submit_request(
+    message: str,
+    conversation_context: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     """只抢占明确的最近候选提交续句，避免集数/序号误伤其他业务意图。"""
     explicit = recent_resource_submit_request(message)
     if explicit is not None:
         return explicit
+    contextual_target = _recent_resource_target_followup_request(
+        message, conversation_context
+    )
+    if contextual_target is not None:
+        return contextual_target
 
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
     if not normalized or _RECENT_RESOURCE_PRE_MODEL_REJECT_PATTERN.search(normalized):
@@ -3975,7 +4080,7 @@ def _extract_library_update_args(message: str) -> dict[str, Any]:
             query = matched.group(1).strip(" ，。！？?、:：")
             query = re.sub(r"^(?:帮我|请|检查|核对|看看|查一下)\s*", "", query).strip()
             query = re.sub(rf"^(?:{'|'.join(media_prefixes)})\s*", "", query).strip()
-            if query:
+            if query and not _is_generic_media_collection_term(query):
                 arguments["query"] = query[:120]
                 break
     return arguments
@@ -4060,7 +4165,11 @@ def _extract_episode_audit_args(message: str) -> dict[str, Any]:
             if matched:
                 query = matched.group(1).strip(" ，。！？?、:：")
                 query = re.sub(r"^(?:帮我|请|检查|核对|看看|查一下)\s*", "", query).strip()
-                if query and query not in {"有没有", "有无", "是否", "检查", "核对", "看看", "查一下"}:
+                if (
+                    query
+                    and query not in {"有没有", "有无", "是否", "检查", "核对", "看看", "查一下"}
+                    and not _is_generic_media_collection_term(query)
+                ):
                     arguments["query"] = query[:120]
                     break
     return arguments
@@ -4075,6 +4184,8 @@ def _clean_library_search_query(value: str) -> str:
         query,
         flags=re.IGNORECASE,
     ).strip(" ，。！？?、:：")
+    if _is_generic_media_collection_term(query):
+        return ""
     return query[:120]
 
 
@@ -5275,7 +5386,9 @@ class AgentOrchestrator:
             # 最近资源候选属于已经建立的强上下文。像“第 2 个到光鸭”或
             # “下载 34 集到 qB”必须先进入确认流程，不能再次交给模型猜测。
             if owner and self.recent_resource_store.get(owner=owner) is not None:
-                recent_resource_request = _recent_resource_pre_model_submit_request(message)
+                recent_resource_request = _recent_resource_pre_model_submit_request(
+                    message, conversation_context
+                )
                 if recent_resource_request is not None:
                     response = self._continue_recent_resource_submit(
                         recent_resource_request, owner=owner
@@ -6551,7 +6664,7 @@ class AgentOrchestrator:
                     "把网页搜索超时改为 15 秒",
                 ],
             )
-        if any(token in lower for token in ("配置", "设置", "环境诊断", "项目诊断", "请诊断", "诊断项目")):
+        if is_config_diagnosis_message(lower):
             return self._invoke_query_read("config.diagnose", {})
 
         if is_web_search_message(lower):

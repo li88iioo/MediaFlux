@@ -402,6 +402,59 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             "target": "guangya",
         }])
 
+    def test_target_only_followup_uses_pending_selection_and_keeps_confirmation(self):
+        for message, target in (("推到qB", "qb"), ("光鸭", "guangya"), ("两边", "both")):
+            with self.subTest(message=message):
+                service, preview_calls, execute_calls, _ = self._agent()
+                service.query("搜索光明之外资源", owner="session-a")
+                needs_target = service.query("下载第1个", owner="session-a")
+                context = [{
+                    "role": "assistant",
+                    "tool_name": "indexer.submit_resource",
+                    "status": "selection_required",
+                    "text": needs_target["result"]["summary"],
+                }]
+
+                prepared = service.query(
+                    message,
+                    owner="session-a",
+                    conversation_context=context,
+                )
+                self.assertEqual(prepared["mode"], "confirmation_required")
+                self.assertEqual(preview_calls[-1], {
+                    "result_id": "generic-resource-0001",
+                    "target": target,
+                })
+                self.assertEqual(execute_calls, [])
+
+        service, preview_calls, execute_calls, _ = self._agent()
+        service.query("搜索光明之外资源", owner="session-a")
+        needs_target = service.query("下载第1个", owner="session-a")
+        context = [{
+            "role": "assistant",
+            "tool_name": "indexer.submit_resource",
+            "status": "selection_required",
+            "text": needs_target["result"]["summary"],
+        }]
+        ambiguous = service.query(
+            "qB 或光鸭",
+            owner="session-a",
+            conversation_context=context,
+        )
+        self.assertEqual(ambiguous["result"]["status"], "selection_required")
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
+    def test_target_only_followup_without_pending_selection_does_not_guess(self):
+        service, preview_calls, execute_calls, _ = self._agent()
+        service.query("搜索光明之外资源", owner="session-a")
+
+        response = service.query("推到qB", owner="session-a")
+
+        self.assertNotEqual(response.get("mode"), "confirmation_required")
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
     def test_implicit_recent_selection_bypasses_model_routing(self):
         service, preview_calls, execute_calls, _ = self._agent()
         service.invoke(
