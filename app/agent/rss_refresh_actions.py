@@ -20,6 +20,7 @@ _CONFIRMATION_STATE = threading.local()
 _BULK_EXPLICIT_LIMIT = 32
 _BULK_DISPLAY_LIMIT = 100
 _BULK_MAX_WORKERS = 4
+_MAX_SAFE_ID = 2_147_483_647
 
 
 def _now() -> str:
@@ -32,7 +33,12 @@ def rss_refresh_subscription_arguments(arguments: dict[str, Any]) -> dict[str, i
     if set(arguments) != {"subscription_id"}:
         raise AgentToolError("rss.refresh_subscription 只接受 subscription_id 参数")
     subscription_id = arguments.get("subscription_id")
-    if isinstance(subscription_id, bool) or not isinstance(subscription_id, int) or subscription_id <= 0:
+    if (
+        isinstance(subscription_id, bool)
+        or not isinstance(subscription_id, int)
+        or subscription_id <= 0
+        or subscription_id > _MAX_SAFE_ID
+    ):
         raise AgentToolError("subscription_id 必须是正整数")
     return {"subscription_id": subscription_id}
 
@@ -216,7 +222,12 @@ def rss_refresh_subscriptions_arguments(arguments: dict[str, Any]) -> dict[str, 
         raise AgentToolError(f"显式选择单次最多刷新 {_BULK_EXPLICIT_LIMIT} 个 RSS 订阅")
     ids: list[int] = []
     for value in raw_ids:
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            or value > _MAX_SAFE_ID
+        ):
             raise AgentToolError("subscription_ids 必须是非空正整数数组")
         if value in ids:
             raise AgentToolError("subscription_ids 不允许重复")

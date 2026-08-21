@@ -1090,6 +1090,7 @@ def project_agent_response_for_llm(response: Mapping[str, Any]) -> dict[str, Any
 
     projection = {
         "tool": public_tool_label(tool_name),
+        "untrusted_content": True,
         "ok": bool(result.get("ok")),
         "status": sanitize_public_text(result.get("status") or "unknown", limit=64) or "unknown",
         "summary": summary or "检查已完成，但没有可安全展示的摘要。",

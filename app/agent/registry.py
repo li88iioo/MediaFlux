@@ -560,6 +560,10 @@ class ToolRegistry:
         started = monotonic()
         try:
             result = handler(arguments)
+        except AgentToolError:
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
+            raise
         except Exception as exc:
             logger.warning(
                 "Agent 工具执行失败 tool=%s request_id=%s session_id=%s error=%s",

@@ -24,6 +24,9 @@ class SensitiveDataTests(unittest.TestCase):
             "Cookie: sid=private-session; theme=dark",
             "session=private-session",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature_value",
+            "tvly-abcdefghijklmnopqrstuvwxyz123456",
+            "hf_abcdefghijklmnopqrstuvwxyz123456",
+            "glpat-abcdefghijklmnopqrstuvwxyz123456",
         )
         for value in cases:
             with self.subTest(value=value):

@@ -132,6 +132,7 @@ class AgentResultProjectionTests(unittest.TestCase):
         projected = project_agent_response_for_llm(response)
 
         self.assertIsNotNone(projected)
+        self.assertIs(projected["untrusted_content"], True)
         self.assertEqual(projected["tool"], "下载队列检查")
         self.assertEqual(projected["data"]["来源区域"], "下载队列")
         self.assertEqual(projected["data"]["数量"], 2)

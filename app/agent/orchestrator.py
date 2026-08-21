@@ -6100,7 +6100,7 @@ class AgentOrchestrator:
             self.registry,
             _execute_native_tool,
             owner=llm_rate_owner or owner,
-            include_confirmations=bool(owner and not read_only),
+            include_confirmations=bool(owner and not read_only and action_request),
             **(
                 {"conversation_context": conversation_context}
                 if conversation_context else {}

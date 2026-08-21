@@ -33,7 +33,12 @@ def _safe_text(value: Any, limit: int) -> str:
 
 
 def _positive_id(value: Any, *, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > 2_147_483_647
+    ):
         raise AgentToolError(f"{field} 必须是正整数")
     return int(value)
 

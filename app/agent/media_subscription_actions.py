@@ -34,6 +34,7 @@ _CREATE_TIMEOUT_SECONDS = 35.0
 _ALLOWED_PROVIDERS = frozenset({"tmdb", "douban", "bangumi"})
 _ALLOWED_MEDIA_TYPES = frozenset({"movie", "tv"})
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,180}$")
+_MAX_SAFE_ID = 2_147_483_647
 
 
 def _now() -> str:
@@ -41,7 +42,12 @@ def _now() -> str:
 
 
 def _strict_subscription_id(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > _MAX_SAFE_ID
+    ):
         raise AgentToolError("subscription_id 必须是正整数")
     return value
 

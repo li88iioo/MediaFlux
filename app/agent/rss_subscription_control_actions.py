@@ -15,6 +15,7 @@ from app.modules.rss import rss_subscription_refresh_revision
 
 logger = get_logger(__name__)
 _MAX_REFRESH_INTERVAL_MINUTES = 10_080
+_MAX_SAFE_ID = 2_147_483_647
 
 
 def _now() -> str:
@@ -22,7 +23,12 @@ def _now() -> str:
 
 
 def _strict_subscription_id(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > _MAX_SAFE_ID
+    ):
         raise AgentToolError("subscription_id 必须是正整数")
     return value
 

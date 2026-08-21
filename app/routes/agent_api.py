@@ -137,8 +137,17 @@ _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 
 def _client_key(request: Request, scope: str) -> str:
+    try:
+        principal = csrf_token(request)
+    except Exception:
+        principal = ""
+    if principal:
+        digest = hashlib.sha256(
+            b"mediaflux-agent-http-rate:v1\0" + principal.encode("utf-8")
+        ).hexdigest()[:32]
+        return f"principal:{digest}:{scope}"
     host = request.client.host if request.client else "unknown"
-    return f"{host}:{scope}"
+    return f"host:{host}:{scope}"
 
 
 def _check_rate_limit(request: Request, scope: str, *, limit: int, cost: int = 1) -> None:

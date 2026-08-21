@@ -119,7 +119,7 @@ def _serialize_organize_clean_empty_context(
     sources: list[dict[str, str]],
     credential_generation: int,
 ) -> str:
-    return json.dumps(
+    encoded = json.dumps(
         {
             "credential_generation": max(0, int(credential_generation)),
             "sources": sources,
@@ -127,7 +127,8 @@ def _serialize_organize_clean_empty_context(
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-    )
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def organize_clean_empty_confirmation_context(_arguments: dict[str, Any]) -> str:
@@ -407,43 +408,6 @@ def preview_guangya_organize_clean_empty(_arguments: dict[str, Any]) -> ToolResu
     return _preview_guangya_organize_clean_empty_sources(_configured_sources())
 
 
-def _parse_organize_clean_empty_context(
-    expected_context: str,
-) -> tuple[list[dict[str, str]], int]:
-    try:
-        payload = json.loads(str(expected_context or ""))
-    except (TypeError, ValueError) as exc:
-        raise AgentToolError("整理来源配置已变化，请重新预检", code="confirmation_stale") from exc
-    valid_payload = (
-        isinstance(payload, dict)
-        and set(payload) == {"credential_generation", "sources"}
-        and isinstance(payload.get("credential_generation"), int)
-        and payload["credential_generation"] >= 0
-    )
-    items = payload.get("sources") if valid_payload else None
-    if not isinstance(items, list) or not items or len(items) > 64:
-        raise AgentToolError("整理来源配置已变化，请重新预检", code="confirmation_stale")
-    sources: list[dict[str, str]] = []
-    for item in items:
-        if not isinstance(item, dict) or set(item) != {"id", "name"}:
-            raise AgentToolError("整理来源配置已变化，请重新预检", code="confirmation_stale")
-        source_id = item.get("id")
-        name = item.get("name")
-        if (
-            not isinstance(source_id, str)
-            or not source_id
-            or source_id == "0"
-            or len(source_id) > 1024
-            or not isinstance(name, str)
-            or not name
-            or len(name) > 1024
-            or any(row["id"] == source_id for row in sources)
-        ):
-            raise AgentToolError("整理来源配置已变化，请重新预检", code="confirmation_stale")
-        sources.append({"id": source_id, "name": name})
-    return sources, payload["credential_generation"]
-
-
 def _clean_empty_guangya_organize_sources(
     sources: list[dict[str, str]],
     *,
@@ -534,10 +498,15 @@ def clean_empty_guangya_organize_sources_confirmed(
     _arguments: dict[str, Any],
     expected_context: str,
 ) -> ToolResult:
-    """严格使用票据中已确认的不可变来源快照执行。"""
-    sources, credential_generation = _parse_organize_clean_empty_context(
-        expected_context
+    """重新读取一次当前快照并校验指纹；票据中不保存来源路径原文。"""
+    sources = _configured_sources()
+    client = GuangYaClient()
+    credential_generation = _credential_generation(client)
+    current_context = _serialize_organize_clean_empty_context(
+        sources, credential_generation
     )
+    if not secrets.compare_digest(current_context, str(expected_context or "")):
+        raise AgentToolError("整理来源配置已变化，请重新预检", code="confirmation_stale")
     return _clean_empty_guangya_organize_sources(
         sources,
         expected_credential_generation=credential_generation,

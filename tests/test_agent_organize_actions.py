@@ -175,14 +175,10 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             second = organize_clean_empty_confirmation_context({})
 
         self.assertNotEqual(first, second)
-        self.assertEqual(
-            json.loads(first),
-            {
-                "credential_generation": 7,
-                "sources": [{"id": "secret-source-one", "name": "Secret One"}],
-            },
-        )
-        self.assertEqual(len(json.loads(second)["sources"]), 2)
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertRegex(second, r"^[0-9a-f]{64}$")
+        self.assertNotIn("secret-source-one", first)
+        self.assertNotIn("Secret One", first)
 
     def test_clean_empty_preview_and_execution_return_only_safe_counts(self):
         sources = [{"id": "secret-source-id", "name": "Secret Source"}]
@@ -437,7 +433,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         )
         client.delete_empty_directory.assert_not_called()
 
-    def test_clean_empty_confirm_executes_ticket_snapshot_after_context_check(self):
+    def test_clean_empty_confirm_rejects_toctou_source_change(self):
         original_sources = [{"id": "source-old", "name": "Old Source"}]
         current_sources = list(original_sources)
         replacement_sources = [{"id": "source-new", "name": "New Source"}]
@@ -475,16 +471,15 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
                 {},
                 owner="owner-a",
             )
-            confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"],
-                owner="owner-a",
-            )
+            with self.assertRaises(AgentToolError) as stale:
+                service.confirm(
+                    prepared["confirmation"]["confirmation_id"],
+                    owner="owner-a",
+                )
 
-        self.assertEqual(confirmed["result"]["status"], "completed")
-        manager.clean_empty.assert_called_once()
-        self.assertEqual(manager.clean_empty.call_args.args, (original_sources,))
-        self.assertTrue(manager.clean_empty.call_args.kwargs["client"].logged_in)
-        self.assertEqual(calls, 2)
+        self.assertEqual(stale.exception.code, "confirmation_stale")
+        manager.clean_empty.assert_not_called()
+        self.assertEqual(calls, 3)
 
     def test_clean_empty_confirmation_rejects_credential_generation_change(self):
         sources = [{"id": "source", "name": "Source"}]
