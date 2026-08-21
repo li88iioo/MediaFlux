@@ -53,6 +53,25 @@ class LocalStorageTests(unittest.TestCase):
             )
             self.assertEqual(snapshot_digest(snapshots), snapshot_digest(list(reversed(snapshots))))
 
+    def test_scan_prunes_system_and_temporary_directories_by_exact_name(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            normal = root / "Tempest.Show"
+            normal.mkdir()
+            (normal / "Tempest.Show.S01E01.mkv").write_bytes(b"video")
+            for name in ("@eaDir", "temp", "TMP", ".mediaflux-trash", "#recycle"):
+                ignored = root / name
+                ignored.mkdir()
+                (ignored / "Ignored.mkv").write_bytes(b"ignored")
+
+            snapshots = LocalFilesystemAdapter(root).scan()
+
+            self.assertEqual(
+                [item.relative_path for item in snapshots],
+                ["Tempest.Show/Tempest.Show.S01E01.mkv"],
+            )
+            self.assertEqual(LocalFilesystemAdapter(root).scan(root / "temp"), [])
+
     def test_item_and_depth_limits_are_enforced(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)

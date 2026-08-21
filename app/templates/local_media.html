@@ -2,7 +2,19 @@
 {% block title %}本地媒体 - MediaFlux{% endblock %}
 {% block page_title %}本地媒体{% endblock %}
 {% block body_class %}local-media-page{% endblock %}
-{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260821a">{% endblock %}
+{% block page_styles %}
+<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260821i">
+<script>
+(() => {
+    const hashTab = (window.location.hash || '').replace('#', '').trim();
+    const params = new URLSearchParams(window.location.search);
+    const target = hashTab || params.get('tab') || params.get('view') || '';
+    if (['sources', 'review', 'manual'].includes(target)) {
+        document.documentElement.dataset.localMediaInitialTab = target;
+    }
+})();
+</script>
+{% endblock %}
 
 {% block content %}
 <div class="lm-page" data-windows-package="{{ '1' if package_type == 'windows' else '0' }}">
@@ -17,7 +29,7 @@
         <div class="dl-tab-header lm-tab-header">
             <div class="dl-tab-bar lm-tab-bar" role="tablist" aria-label="本地媒体视图切换">
                 <button type="button" class="dl-tab-btn lm-tab-btn active" data-tab-target="tasks" role="tab" id="lmTabTasksBtn">
-                    <i data-lucide="list-todo"></i><span>整理任务</span>
+                    <i data-lucide="scroll-text"></i><span>整理日志</span>
                     <span class="dl-tab-badge" id="lmTasksTabBadge">0</span>
                 </button>
                 <button type="button" class="dl-tab-btn lm-tab-btn" data-tab-target="sources" role="tab" id="lmTabSourcesBtn">
@@ -35,10 +47,15 @@
             </div>
             <div class="lm-tab-actions">
                 <div class="lm-tab-action-group" data-tab-action="tasks">
-                    <select class="form-select lm-filter" id="lmTaskFilter" aria-label="筛选整理任务状态">
+                    <label class="lm-task-search" aria-label="搜索整理日志">
+                        <i data-lucide="search"></i>
+                        <input class="form-input" id="lmTaskSearch" type="search" autocomplete="off" placeholder="搜索名称、来源、错误…">
+                    </label>
+                    <select class="form-select lm-filter" id="lmTaskFilter" aria-label="筛选整理日志状态">
                         <option value="">全部状态</option><option value="waiting_stable">等待稳定</option><option value="recognizing">识别中</option>
                         <option value="requires_manual">待确认</option><option value="moving">移动中</option><option value="completed">已完成</option><option value="failed">失败</option>
                     </select>
+                    <button class="jump-btn lm-clear-task-btn" type="button" id="lmClearTasksBtn" disabled title="仅清除选中的日志，不删除或移动媒体文件"><i data-lucide="trash-2"></i><span data-button-label>清除选中</span><span class="lm-selection-count" id="lmTaskSelectionCount">0</span></button>
                 </div>
                 <div class="lm-tab-action-group" data-tab-action="sources" hidden>
                     <button class="btn btn-primary lm-compact-btn" type="button" id="lmAddSourceBtn"><i data-lucide="plus"></i><span>新增来源</span></button>
@@ -50,11 +67,11 @@
         </div>
 
         <div class="lm-tab-panel active" data-tab-panel="tasks" id="lmTasksSection" aria-labelledby="lmTasksTitle">
-            <h2 id="lmTasksTitle" class="sr-only">整理任务</h2>
+            <h2 id="lmTasksTitle" class="sr-only">整理日志</h2>
             <div class="table-wrap lm-task-table-wrap">
                 <table class="lm-task-table">
-                    <thead><tr><th>任务</th><th>来源</th><th>触发</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
-                    <tbody id="lmTaskList"><tr class="is-empty-row"><td colspan="6" class="table-empty">正在读取任务…</td></tr></tbody>
+                    <thead><tr><th class="lm-task-select-cell"><label class="lm-task-select-all" id="lmTaskSelectAllLabel" hidden><input type="checkbox" id="lmTaskSelectAll" aria-label="全选当前筛选结果中可清除的整理日志"><span>全选</span></label></th><th>日志</th><th>来源</th><th>触发</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+                    <tbody id="lmTaskList"><tr class="is-empty-row lm-task-initial-row"><td colspan="7" class="table-empty"><div class="lm-table-empty-wrap lm-initial-loading" aria-hidden="true"><i data-lucide="loader-circle"></i><span>正在读取整理日志…</span></div></td></tr></tbody>
                 </table>
             </div>
             <div class="lm-task-more" id="lmTaskMore" hidden>
@@ -71,7 +88,7 @@
                 <button class="btn btn-primary lm-compact-btn lm-mobile-add-btn" type="button" id="lmAddSourceMobileBtn"><i data-lucide="plus"></i><span>新增来源</span></button>
             </div>
             <div class="lm-source-grid" id="lmSourceGrid" aria-live="polite">
-                <div class="lm-empty-state"><div class="lm-empty-icon"><i data-lucide="folder-git-2"></i></div><strong>正在读取来源配置…</strong></div>
+                <div class="lm-empty-state lm-initial-loading" aria-hidden="true"><div class="lm-empty-icon"><i data-lucide="loader-circle"></i></div><strong>正在读取来源配置…</strong></div>
             </div>
         </div>
 
@@ -82,7 +99,7 @@
                     <p>自动识别置信度不足或存在命名冲突的内容，人工指派 TMDB 后即可安全归档入库。</p>
                 </div>
             </div>
-            <div class="lm-review-list" id="lmReviewList"><div class="lm-empty-state"><div class="lm-empty-icon"><i data-lucide="circle-alert"></i></div><strong>正在读取待确认任务…</strong></div></div>
+            <div class="lm-review-list" id="lmReviewList"><div class="lm-empty-state lm-initial-loading" aria-hidden="true"><div class="lm-empty-icon"><i data-lucide="loader-circle"></i></div><strong>正在读取待确认任务…</strong></div></div>
         </div>
 
         <div class="lm-tab-panel lm-manual-panel" data-tab-panel="manual" id="lmManualSection" aria-labelledby="lmManualTitle" hidden>
@@ -91,7 +108,7 @@
                     <div>
                         <span class="subscription-eyebrow">LOCAL MEDIA INBOX</span>
                         <h2 id="lmManualTitle">本地媒体条目</h2>
-                        <p>直接读取已配置来源的一级目录与视频文件；右键条目即可搜索刮削、自动匹配或移入回收区。</p>
+                        <p>单击目录进入查看子目录与视频；右键条目可搜索刮削或自动匹配，根目录一级条目可移入回收区。</p>
                     </div>
                     <div class="lm-media-browser-tools">
                         <label class="lm-item-search">
@@ -105,11 +122,17 @@
                     </div>
                 </header>
                 <div class="lm-media-source-errors" id="lmMediaSourceErrors" hidden aria-live="polite"></div>
+                <nav class="lm-media-pathbar" id="lmMediaPathbar" aria-label="本地媒体目录导航">
+                    <button class="lm-media-home" type="button" id="lmMediaBrowseHome" disabled><i data-lucide="house"></i><span>全部来源</span></button>
+                    <i class="lm-media-path-divider" data-lucide="chevron-right"></i>
+                    <div class="lm-media-breadcrumb" id="lmMediaBreadcrumb"><span aria-current="page">所有已配置来源</span></div>
+                    <button class="jump-btn lm-media-up" type="button" id="lmMediaBrowseUp" disabled><i data-lucide="corner-left-up"></i><span>上一级</span></button>
+                </nav>
                 <div class="lm-media-list-head" aria-hidden="true">
                     <span>媒体条目</span><span>来源</span><span>类型</span><span>修改时间</span><span>大小</span><span></span>
                 </div>
                 <div class="lm-media-list" id="lmMediaItems" aria-live="polite">
-                    <div class="lm-empty-state"><div class="lm-empty-icon"><i data-lucide="folder-search-2"></i></div><strong>正在读取本地媒体条目…</strong></div>
+                    <div class="lm-empty-state lm-initial-loading" aria-hidden="true"><div class="lm-empty-icon"><i data-lucide="loader-circle"></i></div><strong>正在读取本地媒体条目…</strong></div>
                 </div>
             </section>
         </div>
@@ -145,6 +168,19 @@
     "cancel_id": "lmScrapeCancelBtn", "run_id": "lmExecuteBtn", "run_label": "确认并开始整理"
 } %}
 {% include "_media_scrape_modal.html" %}
+
+<div class="app-modal lm-modal" id="lmTaskDetailModal" hidden>
+    <section class="card lm-task-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="lmTaskDetailTitle">
+        <header class="lm-dialog-head">
+            <div><span class="subscription-eyebrow">LOCAL ORGANIZE LOG</span><h2 id="lmTaskDetailTitle">整理日志详情</h2><p id="lmTaskDetailSubtitle">查看任务状态、文件成员与执行步骤。</p></div>
+            <button class="icon-action" type="button" data-modal-close aria-label="关闭整理日志详情"><i data-lucide="x"></i></button>
+        </header>
+        <div class="lm-task-detail-body" id="lmTaskDetailBody" aria-live="polite">
+            <div class="lm-task-detail-loading"><i data-lucide="loader-circle"></i><span>正在读取日志详情…</span></div>
+        </div>
+        <footer class="lm-dialog-actions"><button class="jump-btn" type="button" data-modal-close>关闭</button></footer>
+    </section>
+</div>
 
 <div class="app-modal lm-modal" id="lmSourceModal" hidden>
     <div class="card lm-source-dialog" role="dialog" aria-modal="true" aria-labelledby="lmSourceDialogTitle">
@@ -196,5 +232,5 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260821a"></script>
-<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260821a"></script>
+<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260821i"></script>
 {% endblock %}

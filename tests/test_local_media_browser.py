@@ -26,12 +26,18 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
             'id="lmTaskList"', 'id="lmSourceModal"', 'id="lmItemContextMenu"',
             'id="lmScrapeModal"', 'id="lmSearchQuery"', 'id="lmExecuteBtn"',
             'id="lmScrapeEpisodeFields"', 'id="lmScrapeSeason"', 'id="lmScrapeEpisode"',
+            'id="lmTaskSearch"', 'id="lmTaskSelectAll"', 'id="lmClearTasksBtn"',
+            'id="lmTaskDetailModal"', 'id="lmTaskDetailBody"',
+            'id="lmMediaPathbar"', 'id="lmMediaBrowseHome"',
+            'id="lmMediaBreadcrumb"', 'id="lmMediaBrowseUp"',
             'id="lmPickLocalRootBtn"', 'id="lmSourceMediaType"', 'id="lmStableSeconds"',
             'id="lmScanMinutes"', 'class="lm-form-grid-3 lm-wide"',
             'js/local-media.js', 'css/local-media.css',
         ):
             self.assertIn(marker, page.text)
         self.assertIn("本地媒体", page.text)
+        self.assertIn("整理日志", page.text)
+        self.assertNotIn("<span>整理任务</span>", page.text)
         self.assertIn("正在读取来源配置", page.text)
         self.assertRegex(page.text, re.compile(r'class="[^"]*\blocal-media-page\b[^"]*"'))
         self.assertIn('class="app-modal lm-modal"', page.text)
@@ -45,6 +51,19 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn("/api/local-media/items", js)
         self.assertIn("/api/local-media/items/delete", js)
         self.assertIn("function openScrapeForItem", js)
+        self.assertIn("function loadMediaDirectory", js)
+        self.assertIn("data-open-directory", js)
+        self.assertIn("data-media-breadcrumb", js)
+        self.assertIn("mediaItemsUrl()", js)
+        self.assertIn("itemRequestSerial === mediaBrowseRequestSerial", js)
+        self.assertIn("仅来源根目录一级条目可移入回收区", js)
+        self.assertIn("function filteredTasks()", js)
+        self.assertIn("function updateTaskSelectionState", js)
+        self.assertIn("function openTaskDetail", js)
+        self.assertIn("function clearSelectedTasks", js)
+        self.assertIn("data-task-detail", js)
+        self.assertIn("method: 'DELETE'", js)
+        self.assertIn("confirm: 'CLEAR'", js)
         self.assertIn("library_id: libraryId, library_name: libraryName", js)
         self.assertIn("lmSourceMode", page.text)
         self.assertIn("row.dataset.libraryRequest", js)
@@ -70,7 +89,9 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
             "season: confirmedContext.season",
             "episode: confirmedContext.episode",
             "rules_snapshot: confirmedPreview.rules_snapshot",
-            "if (!hasLoadedLocalMedia) renderInitialLoadFailure",
+            "if (!hasLoadedLocalMedia) {",
+            "await settleInitialLoading()",
+            "renderInitialLoadFailure(error.message)",
             "if (currentManual && window.appAlert)",
         ):
             self.assertIn(contract, js)
@@ -84,6 +105,9 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn(".lm-item-context-menu", css)
         self.assertIn(".lm-scrape-workspace", css)
         self.assertIn(".lm-scrape-episode-fields", css)
+        self.assertIn(".lm-task-search", css)
+        self.assertIn(".lm-task-detail-dialog", css)
+        self.assertIn(".lm-task-actions", css)
         self.assertIn(".lm-form-grid-3", css)
         self.assertIn("grid-template-columns: minmax(340px, 35%) minmax(0, 1fr)", css)
         self.assertNotRegex(css, r"\.lm-media-row:hover\s*\{[^}]*transform")

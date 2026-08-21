@@ -85,6 +85,35 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             thread.join()
         self.assertEqual(sorted(results), [False, True])
 
+    def test_selected_log_clear_skips_busy_tasks_and_cascades_children(self):
+        source_id = db.create_local_media_source(
+            name="source-clear", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/downloads-clear", owner="admin",
+        )
+        completed_id = db.create_local_media_task(
+            source_id, "", "/tmp/downloads-clear/Done.mkv", owner="admin", trigger="manual",
+        )
+        db.add_local_media_task_item(
+            completed_id, "/tmp/downloads-clear/Done.mkv", "/tmp/library/Done.mkv",
+            role="video", owner="admin",
+        )
+        completed = db.get_local_media_task(completed_id, owner="admin")
+        db.add_local_media_operation_step(
+            completed_id, completed.operation_token, 0, "move", owner="admin",
+        )
+        db.update_local_media_task(completed_id, owner="admin", status="completed")
+        busy_id = db.create_local_media_task(
+            source_id, "", "/tmp/downloads-clear/Busy.mkv", owner="admin", trigger="scan",
+        )
+
+        result = db.delete_local_media_tasks([completed_id, busy_id, 999999], owner="admin")
+
+        self.assertEqual(result, {"requested": 3, "deleted": 1, "skipped_busy": 1, "missing": 1})
+        self.assertIsNone(db.get_local_media_task(completed_id, owner="admin"))
+        self.assertEqual(db.list_local_media_task_items(completed_id, owner="admin"), [])
+        self.assertEqual(db.list_local_media_operation_steps(completed_id, owner="admin"), [])
+        self.assertIsNotNone(db.get_local_media_task(busy_id, owner="admin"))
+
     def test_invalid_status_category_and_cross_owner_target_are_rejected(self):
         source_id = db.create_local_media_source(
             name="source-validation", qb_profile="", qb_path_prefix="",

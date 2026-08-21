@@ -28,8 +28,30 @@ class LocalScanLimitExceeded(LocalStorageError):
 _TEMP_SUFFIXES = {
     ".part", ".partial", ".tmp", ".temp", ".crdownload", ".download", ".!qb", ".aria2",
 }
+IGNORED_LOCAL_MEDIA_DIRECTORY_NAMES: frozenset[str] = frozenset(
+    {
+        ".mediaflux-trash",
+        ".appledouble",
+        ".temp",
+        ".tmp",
+        "#recycle",
+        "$recycle.bin",
+        "@eadir",
+        "__macosx",
+        "lost+found",
+        "system volume information",
+        "temp",
+        "tmp",
+    }
+)
 _SUBTITLE_SUFFIXES = {"srt", "ass", "ssa", "sub", "idx", "vtt", "sup"}
 _IMAGE_SUFFIXES = {"jpg", "jpeg", "png", "webp", "avif"}
+
+
+def is_ignored_local_media_directory(value: str | Path) -> bool:
+    """仅按完整目录名屏蔽系统目录与临时目录，避免误伤包含相同片段的媒体名。"""
+    name = value.name if isinstance(value, Path) else str(value)
+    return name.strip().casefold() in IGNORED_LOCAL_MEDIA_DIRECTORY_NAMES
 
 
 @dataclass(frozen=True)
@@ -125,6 +147,9 @@ class LocalFilesystemAdapter:
 
     def scan(self, path: Path | None = None) -> list[LocalFileSnapshot]:
         start = assert_within(Path(path) if path is not None else self.allowed_root, self.allowed_root)
+        relative_parts = start.relative_to(self.allowed_root).parts
+        if any(is_ignored_local_media_directory(part) for part in relative_parts):
+            return []
         if start.is_symlink():
             raise LocalStorageError("禁止扫描符号链接")
         candidates: list[Path] = []
@@ -140,7 +165,7 @@ class LocalFilesystemAdapter:
                 safe_dirs: list[str] = []
                 for name in dirs:
                     child = current / name
-                    if child.is_symlink():
+                    if is_ignored_local_media_directory(name) or child.is_symlink():
                         continue
                     safe_dirs.append(name)
                 dirs[:] = safe_dirs

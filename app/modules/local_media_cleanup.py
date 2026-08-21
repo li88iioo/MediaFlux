@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Iterable
 
 from app.modules.local_path_mapping import assert_within
-from app.modules.local_storage import LocalFileSnapshot, LocalFilesystemAdapter
+from app.modules.local_storage import (
+    LocalFileSnapshot,
+    LocalFilesystemAdapter,
+    is_ignored_local_media_directory,
+)
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,12 @@ def discover_cleanup_candidates(
     """在选择目录中发现明确垃圾；选择单文件时不扩展清理到兄弟文件。"""
     root = Path(allowed_root).expanduser().resolve(strict=False)
     selected = assert_within(Path(selected_path), root)
+    relative_selected = selected.relative_to(root)
+    selected_directory_parts = (
+        relative_selected.parts if selected.is_dir() else relative_selected.parts[:-1]
+    )
+    if any(is_ignored_local_media_directory(part) for part in selected_directory_parts):
+        return []
     if selected.is_file():
         paths = [selected]
     elif selected.is_dir():
@@ -139,6 +149,9 @@ def discover_cleanup_candidates(
         base_depth = len(selected.parts)
         for path in selected.rglob("*"):
             if path.is_symlink() or not path.is_file():
+                continue
+            relative_parts = path.relative_to(selected).parts[:-1]
+            if any(is_ignored_local_media_directory(part) for part in relative_parts):
                 continue
             if len(path.parts) - base_depth > max(1, int(depth_limit)):
                 continue

@@ -16,9 +16,12 @@ from app.modules.local_path_mapping import (
     PathMappingError, assert_within, validate_source_target_roots,
 )
 from app.modules.local_media_candidates import (
-    candidate_payload, discover_local_media_candidates, move_candidate_to_trash,
+    candidate_payload,
+    discover_local_media_candidates,
+    discover_local_media_directory_candidates,
+    move_candidate_to_trash,
 )
-from app.modules.local_media_models import LOCAL_MEDIA_CATEGORIES
+from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES, LOCAL_MEDIA_CATEGORIES
 from app.modules.media_server_profiles import list_configured_profiles
 from app.modules.local_media_notifications import notify_local_media_task
 from app.modules.local_media_scheduler import get_local_media_scheduler
@@ -117,9 +120,45 @@ def _task_payload(task) -> dict:
         "tmdb_id": getattr(task, "tmdb_id", ""), "media_type": getattr(task, "media_type", ""),
         "season": getattr(task, "season_override", None),
         "episode": getattr(task, "episode_override", None),
+        "clearable": task.status not in LOCAL_BUSY_TASK_STATUSES,
         "error": task.error, "warning": task.warning,
         "created_at": task.created_at, "updated_at": task.updated_at,
         "completed_at": task.completed_at,
+    }
+
+
+def _task_detail_payload(task) -> dict:
+    payload = _task_payload(task)
+    payload.update({
+        "content_path": task.content_path,
+        "qb_hash": task.qb_hash,
+        "snapshot_digest": task.snapshot_digest,
+        "rules_snapshot": task.rules_snapshot,
+        "title": task.title,
+        "year": task.year,
+        "version": task.version,
+        "stable_since": task.stable_since,
+    })
+    return payload
+
+
+def _task_item_payload(row) -> dict:
+    return {
+        key: row[key]
+        for key in (
+            "id", "source_path", "target_path", "role", "media_group", "action",
+            "size", "status", "error", "created_at", "updated_at",
+        )
+    }
+
+
+def _task_step_payload(row) -> dict:
+    return {
+        key: row[key]
+        for key in (
+            "id", "step_index", "action", "source_path", "target_path", "status",
+            "error", "started_at", "finished_at",
+        )
     }
 
 
@@ -403,10 +442,55 @@ def delete_source(source_id: int, request: Request):
 
 
 @router.get("/items")
-def list_media_items(request: Request):
-    """列出已配置来源根目录下的一级媒体条目，不创建整理任务。"""
+def list_media_items(request: Request, source_id: int = 0, path: str = ""):
+    """列出来源根条目，或安全浏览指定来源内某个目录的直接媒体子项。"""
     require_api_login(request)
     try:
+        if path and source_id <= 0:
+            raise ValueError("浏览目录时必须指定媒体来源")
+        if source_id > 0:
+            source = db.get_local_media_source(source_id, owner=_OWNER)
+            if source is None:
+                return api_error("本地媒体来源不存在", 404)
+            selected_path = _text({"path": path}, "path", max_length=4096) or source.local_root
+            candidates, error, current = discover_local_media_directory_candidates(
+                source, selected_path,
+            )
+            if error or current is None:
+                return api_error(error or "目录读取失败", 400)
+            targets = db.list_local_library_targets(source.id, owner=_OWNER)
+            organize_ready = bool(targets) and source.mode != "preview_only"
+            serialized: list[dict] = []
+            for candidate in candidates:
+                try:
+                    serialized.append(candidate_payload(
+                        source, candidate, organize_ready=organize_ready, allow_nested=True,
+                    ))
+                except (FileNotFoundError, OSError, PathMappingError):
+                    continue
+            root_candidate = Path(source.local_root).expanduser().absolute()
+            root = assert_within(root_candidate, root_candidate)
+            relative = current.relative_to(root)
+            breadcrumbs = [{"name": source.name, "path": str(root)}]
+            cursor = root
+            for part in relative.parts:
+                cursor /= part
+                breadcrumbs.append({"name": part, "path": str(cursor)})
+            return {
+                "items": serialized,
+                "sources": [{
+                    "id": source.id, "name": source.name, "count": len(serialized), "error": "",
+                }],
+                "browse": {
+                    "source_id": source.id,
+                    "source_name": source.name,
+                    "root_path": str(root),
+                    "current_path": str(current),
+                    "parent_path": "" if current == root else str(current.parent),
+                    "breadcrumbs": breadcrumbs,
+                },
+            }
+
         items: list[dict] = []
         source_results: list[dict] = []
         for source in db.list_local_media_sources(owner=_OWNER):
@@ -432,7 +516,7 @@ def list_media_items(request: Request):
                 "id": source.id, "name": source.name, "count": len(serialized), "error": "",
             })
         items.sort(key=lambda item: (item["source_name"].casefold(), item["name"].casefold()))
-        return {"items": items, "sources": source_results}
+        return {"items": items, "sources": source_results, "browse": None}
     except Exception as exc:
         return _safe_error(exc)
 
@@ -482,6 +566,56 @@ def list_tasks(request: Request, status: str = ""):
     try:
         tasks = db.list_local_media_tasks(owner=_OWNER, status=status, limit=500)
         return {"tasks": [_task_payload(item) for item in tasks]}
+    except Exception as exc:
+        return _safe_error(exc)
+
+
+@router.delete("/tasks")
+def clear_tasks(request: Request, data: dict | None = Body(default=None)):
+    require_api_login(request)
+    payload = data or {}
+    try:
+        if _text(payload, "confirm", max_length=16) != "CLEAR":
+            raise ValueError("清除本地整理日志需要确认")
+        raw_ids = payload.get("ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValueError("请选择需要清除的本地整理日志")
+        if len(raw_ids) > 500:
+            raise ValueError("单次最多清除 500 条本地整理日志")
+        task_ids: list[int] = []
+        for value in raw_ids:
+            if isinstance(value, bool):
+                raise ValueError("日志 ID 必须是正整数")
+            try:
+                task_id = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("日志 ID 必须是正整数") from exc
+            if task_id <= 0:
+                raise ValueError("日志 ID 必须是正整数")
+            task_ids.append(task_id)
+        return db.delete_local_media_tasks(task_ids, owner=_OWNER)
+    except Exception as exc:
+        return _safe_error(exc)
+
+
+@router.get("/tasks/{task_id}")
+def task_detail(task_id: int, request: Request):
+    require_api_login(request)
+    try:
+        task = db.get_local_media_task(task_id, owner=_OWNER)
+        if task is None:
+            return api_error("本地整理日志不存在", 404)
+        return {
+            "task": _task_detail_payload(task),
+            "items": [
+                _task_item_payload(row)
+                for row in db.list_local_media_task_items(task_id, owner=_OWNER)
+            ],
+            "steps": [
+                _task_step_payload(row)
+                for row in db.list_local_media_operation_steps(task_id, owner=_OWNER)
+            ],
+        }
     except Exception as exc:
         return _safe_error(exc)
 

@@ -4684,6 +4684,42 @@ def list_local_media_tasks(*, owner: str = "admin", status: str = "", limit: int
     return [LocalMediaTask.from_row(row) for row in rows]
 
 
+def delete_local_media_tasks(task_ids: list[int], *, owner: str = "admin") -> dict[str, int]:
+    """删除指定的非运行中本地整理日志；关联条目和步骤由外键级联清理。"""
+    from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES
+
+    safe_owner = _local_media_owner(owner)
+    normalized_ids: list[int] = []
+    for raw_task_id in task_ids:
+        task_id = int(raw_task_id)
+        if task_id > 0 and task_id not in normalized_ids:
+            normalized_ids.append(task_id)
+    if not normalized_ids:
+        return {"requested": 0, "deleted": 0, "skipped_busy": 0, "missing": 0}
+    if len(normalized_ids) > 500:
+        raise ValueError("单次最多清除 500 条本地整理日志")
+
+    placeholders = ",".join("?" for _ in normalized_ids)
+    busy_placeholders = ",".join("?" for _ in LOCAL_BUSY_TASK_STATUSES)
+    with get_conn() as conn:
+        deleted = int(conn.execute(
+            f"DELETE FROM local_media_tasks WHERE owner=? AND id IN ({placeholders}) "
+            f"AND status NOT IN ({busy_placeholders})",
+            [safe_owner, *normalized_ids, *LOCAL_BUSY_TASK_STATUSES],
+        ).rowcount)
+        remaining_rows = conn.execute(
+            f"SELECT id,status FROM local_media_tasks WHERE owner=? AND id IN ({placeholders})",
+            [safe_owner, *normalized_ids],
+        ).fetchall()
+        remaining = {int(row["id"]): str(row["status"]) for row in remaining_rows}
+    return {
+        "requested": len(normalized_ids),
+        "deleted": deleted,
+        "skipped_busy": sum(status in LOCAL_BUSY_TASK_STATUSES for status in remaining.values()),
+        "missing": len(normalized_ids) - deleted - len(remaining),
+    }
+
+
 
 def _agent_workspace_title_pattern(query: str) -> str:
     """为 Agent 标题搜索转义 LIKE 通配符，避免把用户输入解释为查询语法。"""

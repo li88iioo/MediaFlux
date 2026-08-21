@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.modules.local_path_mapping import PathMappingError, assert_within
-from app.modules.local_storage import LocalFilesystemAdapter
+from app.modules.local_storage import LocalFilesystemAdapter, is_ignored_local_media_directory
 
 LOCAL_MEDIA_TRASH_DIR = ".mediaflux-trash"
 
@@ -21,6 +21,14 @@ def _source_root(source) -> Path:
 
 def discover_local_media_candidates(source) -> tuple[list[Path], str]:
     """读取来源根目录的一级媒体候选，返回公开错误而不抛出路径细节。"""
+    candidates, error, _ = discover_local_media_directory_candidates(source)
+    return candidates, error
+
+
+def discover_local_media_directory_candidates(
+    source, directory: Path | str | None = None,
+) -> tuple[list[Path], str, Path | None]:
+    """读取来源内指定目录的直接媒体子项，供登录后的本地条目浏览使用。"""
     from app.modules.windows_smb import ensure_smb_connection, parse_unc_share_root
 
     if parse_unc_share_root(source.local_root):
@@ -30,20 +38,24 @@ def discover_local_media_candidates(source) -> tuple[list[Path], str]:
             getattr(source, "smb_pass", ""),
         )
         if not ok:
-            return [], str(err or "SMB 来源连接失败")
+            return [], str(err or "SMB 来源连接失败"), None
     try:
         root = _source_root(source)
+        selected = assert_within(Path(directory) if directory else root, root)
+        relative_parts = selected.relative_to(root).parts
+        if any(is_ignored_local_media_directory(part) for part in relative_parts):
+            raise PathMappingError("禁止浏览系统目录、临时目录或 MediaFlux 回收区")
     except PathMappingError:
-        return [], "来源路径不安全"
-    if not root.is_dir():
-        return [], "来源目录不存在或不可访问"
+        return [], "目录路径不安全", None
+    if selected.is_symlink() or not selected.is_dir():
+        return [], "目录不存在或不可访问", None
     try:
-        entries = sorted(root.iterdir(), key=lambda item: item.name.casefold())
+        entries = sorted(selected.iterdir(), key=lambda item: item.name.casefold())
     except OSError:
-        return [], "来源目录读取失败"
+        return [], "目录读取失败", None
     candidates: list[Path] = []
     for candidate in entries:
-        if candidate.name == LOCAL_MEDIA_TRASH_DIR:
+        if is_ignored_local_media_directory(candidate.name):
             continue
         try:
             info = candidate.lstat()
@@ -56,14 +68,19 @@ def discover_local_media_candidates(source) -> tuple[list[Path], str]:
                 candidates.append(candidate)
         except OSError:
             continue
-    return candidates, ""
+    return candidates, "", selected
 
 
-def candidate_payload(source, candidate: Path, *, organize_ready: bool) -> dict[str, Any]:
+def candidate_payload(
+    source, candidate: Path, *, organize_ready: bool, allow_nested: bool = False,
+) -> dict[str, Any]:
     """生成供已登录前端使用的条目快照。"""
     root = _source_root(source)
     selected = assert_within(Path(candidate), root)
-    if selected.parent != root:
+    relative_parts = selected.relative_to(root).parts
+    if any(is_ignored_local_media_directory(part) for part in relative_parts):
+        raise PathMappingError("禁止读取系统目录、临时目录或 MediaFlux 回收区")
+    if not allow_nested and selected.parent != root:
         raise PathMappingError("仅允许读取来源根目录下的一级条目")
     info = selected.lstat()
     if stat_module.S_ISLNK(info.st_mode):
@@ -79,7 +96,9 @@ def candidate_payload(source, candidate: Path, *, organize_ready: bool) -> dict[
         "source_name": str(source.name),
         "name": selected.name,
         "path": str(selected),
+        "relative_path": selected.relative_to(root).as_posix(),
         "kind": kind,
+        "deletable": selected.parent == root,
         "size": int(info.st_size) if kind == "video" else None,
         "modified_at": datetime.fromtimestamp(info.st_mtime, tz=timezone.utc).isoformat(),
         "organize_ready": bool(organize_ready),
@@ -98,8 +117,8 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
     selected = assert_within(Path(path), root)
     if selected == root or selected.parent != root:
         raise PathMappingError("仅允许删除来源根目录下的一级媒体条目")
-    if selected.name == LOCAL_MEDIA_TRASH_DIR:
-        raise PathMappingError("禁止操作 MediaFlux 回收区")
+    if is_ignored_local_media_directory(selected.name):
+        raise PathMappingError("禁止操作系统目录、临时目录或 MediaFlux 回收区")
 
     try:
         info = selected.lstat()

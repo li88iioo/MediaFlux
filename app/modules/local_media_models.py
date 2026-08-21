@@ -31,6 +31,17 @@ LOCAL_TASK_STATUSES: frozenset[str] = frozenset(
         "failed",
     }
 )
+LOCAL_BUSY_TASK_STATUSES: frozenset[str] = frozenset(
+    {
+        "waiting_stable",
+        "recognizing",
+        "planned",
+        "moving",
+        "verifying",
+        "refreshing",
+        "rolling_back",
+    }
+)
 LOCAL_MEDIA_CATEGORIES: frozenset[str] = frozenset(
     {"default", "movie", "tv", "anime", "documentary", "variety", "concert", "kids"}
 )

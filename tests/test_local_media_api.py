@@ -293,6 +293,10 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         trash = self.local_root / ".mediaflux-trash"
         trash.mkdir()
         (trash / "ignored").mkdir()
+        for ignored_name in ("@eaDir", "temp", "TMP", "#recycle"):
+            ignored = self.local_root / ignored_name
+            ignored.mkdir()
+            (ignored / "Ignored.mkv").write_bytes(b"ignored")
         source_id = db.create_local_media_source(
             name="本地下载", qb_profile="", qb_path_prefix="",
             local_root=str(self.local_root), owner="admin",
@@ -308,6 +312,8 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertTrue(all(item["organize_ready"] for item in items))
         self.assertEqual({item["kind"] for item in items}, {"directory", "video"})
         self.assertNotIn(".mediaflux-trash", listed.text)
+        for ignored_name in ("@eaDir", "temp", "TMP", "#recycle"):
+            self.assertNotIn(ignored_name, listed.text)
 
         target = next(item for item in items if item["name"] == "Movie.2026")
         deleted = self.client.post(
@@ -323,6 +329,80 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             item["name"] for item in self.client.get("/api/local-media/items").json()["items"]
         ]
         self.assertEqual(refreshed_names, ["Loose.Movie.2026.mkv"])
+
+    def test_media_items_can_browse_nested_directories_with_safe_navigation_metadata(self):
+        self.login()
+        show = self.local_root / "Show"
+        season = show / "Season 01"
+        ignored = show / "@eaDir"
+        season.mkdir(parents=True)
+        ignored.mkdir()
+        episode = season / "Show.S01E01.mkv"
+        episode.write_bytes(b"episode")
+        (show / "Show.Special.mkv").write_bytes(b"special")
+        (ignored / "Ignored.mkv").write_bytes(b"ignored")
+        source_id = db.create_local_media_source(
+            name="本地下载", qb_profile="", qb_path_prefix="",
+            local_root=str(self.local_root), owner="admin",
+        )
+        db.upsert_local_library_target(
+            source_id, "default", str(self.default_target), owner="admin",
+        )
+
+        root = self.client.get("/api/local-media/items", params={"source_id": source_id})
+        self.assertEqual(root.status_code, 200, root.text)
+        root_data = root.json()
+        self.assertEqual(root_data["browse"]["current_path"], str(self.local_root))
+        self.assertEqual(root_data["browse"]["parent_path"], "")
+        self.assertEqual(root_data["browse"]["breadcrumbs"], [
+            {"name": "本地下载", "path": str(self.local_root)},
+        ])
+        root_show = next(item for item in root_data["items"] if item["name"] == "Show")
+        self.assertTrue(root_show["deletable"])
+        self.assertEqual(root_show["relative_path"], "Show")
+
+        nested = self.client.get(
+            "/api/local-media/items",
+            params={"source_id": source_id, "path": str(show)},
+        )
+        self.assertEqual(nested.status_code, 200, nested.text)
+        nested_data = nested.json()
+        self.assertEqual(
+            [item["name"] for item in nested_data["items"]],
+            ["Season 01", "Show.Special.mkv"],
+        )
+        self.assertTrue(all(not item["deletable"] for item in nested_data["items"]))
+        self.assertNotIn("@eaDir", nested.text)
+        self.assertEqual(nested_data["browse"]["parent_path"], str(self.local_root))
+        self.assertEqual(
+            [crumb["name"] for crumb in nested_data["browse"]["breadcrumbs"]],
+            ["本地下载", "Show"],
+        )
+
+        season_result = self.client.get(
+            "/api/local-media/items",
+            params={"source_id": source_id, "path": str(season)},
+        )
+        self.assertEqual(season_result.status_code, 200, season_result.text)
+        season_item = season_result.json()["items"][0]
+        self.assertEqual(season_item["path"], str(episode))
+        self.assertEqual(season_item["relative_path"], "Show/Season 01/Show.S01E01.mkv")
+        self.assertFalse(season_item["deletable"])
+
+        missing_source = self.client.get(
+            "/api/local-media/items", params={"path": str(show)},
+        )
+        self.assertEqual(missing_source.status_code, 400, missing_source.text)
+        ignored_path = self.client.get(
+            "/api/local-media/items",
+            params={"source_id": source_id, "path": str(ignored)},
+        )
+        self.assertEqual(ignored_path.status_code, 400, ignored_path.text)
+        outside = self.client.get(
+            "/api/local-media/items",
+            params={"source_id": source_id, "path": str(self.default_target)},
+        )
+        self.assertEqual(outside.status_code, 400, outside.text)
 
     def test_media_item_delete_rejects_changed_snapshot_and_nested_path(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}
@@ -387,6 +467,60 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["inspection_id"], "inspect-task-1")
         service.inspect_task.assert_called_once_with("admin", 88)
+
+    def test_task_detail_and_selected_log_clear_are_owner_scoped_and_safe(self):
+        csrf = self.login(); headers = {"X-CSRF-Token": csrf}
+        source_id = db.create_local_media_source(
+            name="本地下载", qb_profile="", qb_path_prefix="",
+            local_root=str(self.local_root), owner="admin",
+        )
+        completed_id = db.create_local_media_task(
+            source_id, "", str(self.local_root / "Movie.2026.mkv"),
+            owner="admin", trigger="manual",
+        )
+        db.add_local_media_task_item(
+            completed_id, str(self.local_root / "Movie.2026.mkv"),
+            str(self.movie_target / "Movie (2026).mkv"), role="video", size=123, owner="admin",
+        )
+        task = db.get_local_media_task(completed_id, owner="admin")
+        db.add_local_media_operation_step(
+            completed_id, task.operation_token, 0, "move",
+            str(self.local_root / "Movie.2026.mkv"), str(self.movie_target / "Movie (2026).mkv"),
+            owner="admin",
+        )
+        db.update_local_media_task(
+            completed_id, owner="admin", status="completed", title="Movie", year="2026",
+        )
+        busy_id = db.create_local_media_task(
+            source_id, "", str(self.local_root / "Busy.mkv"), owner="admin", trigger="scan",
+        )
+
+        detail = self.client.get(f"/api/local-media/tasks/{completed_id}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["task"]["content_path"], str(self.local_root / "Movie.2026.mkv"))
+        self.assertEqual(detail.json()["task"]["title"], "Movie")
+        self.assertTrue(detail.json()["task"]["clearable"])
+        self.assertEqual(detail.json()["items"][0]["role"], "video")
+        self.assertEqual(detail.json()["steps"][0]["action"], "move")
+
+        rejected = self.client.request(
+            "DELETE", "/api/local-media/tasks",
+            json={"confirm": "", "ids": [completed_id]}, headers=headers,
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.text)
+        cleared = self.client.request(
+            "DELETE", "/api/local-media/tasks",
+            json={"confirm": "CLEAR", "ids": [completed_id, busy_id, 999999]},
+            headers=headers,
+        )
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(
+            cleared.json(),
+            {"requested": 3, "deleted": 1, "skipped_busy": 1, "missing": 1},
+        )
+        self.assertIsNone(db.get_local_media_task(completed_id, owner="admin"))
+        self.assertIsNotNone(db.get_local_media_task(busy_id, owner="admin"))
+        self.assertEqual(self.client.get(f"/api/local-media/tasks/{completed_id}").status_code, 404)
 
     def test_inspect_preview_execute_delegate_to_service_and_hide_private_plans(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}

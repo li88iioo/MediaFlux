@@ -5,11 +5,30 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.modules.local_media_cleanup import classify_cleanup_items, delete_cleanup_items
+from app.modules.local_media_cleanup import (
+    classify_cleanup_items,
+    delete_cleanup_items,
+    discover_cleanup_candidates,
+)
 from app.modules.local_storage import LocalFilesystemAdapter
 
 
 class LocalMediaCleanupTests(unittest.TestCase):
+    def test_cleanup_discovery_ignores_system_and_temporary_directories(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            group = root / "Movie"; group.mkdir()
+            normal = group / "广告说明.txt"; normal.write_bytes(b"ad")
+            for name in ("@eaDir", "temp"):
+                ignored = group / name
+                ignored.mkdir()
+                (ignored / "广告说明.txt").write_bytes(b"ad")
+
+            candidates = discover_cleanup_candidates(root, group)
+
+            self.assertEqual([item.snapshot.path for item in candidates], [normal])
+            self.assertEqual(discover_cleanup_candidates(root, group / "temp"), [])
+
     def test_only_confident_junk_is_classified_and_unknown_is_retained(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)
