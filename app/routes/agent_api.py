@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
+from app.agent.confirmation import confirmation_reply_intent
 from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.metrics import agent_metrics
 from app.agent.conversation_history import get_agent_conversation_history_repository
@@ -373,6 +374,65 @@ def _record_query_history(
         logger.warning("Agent 对话历史写入失败 type=%s", type(exc).__name__)
 
 
+def _natural_confirmation_query(
+    request: Request,
+    *,
+    data: dict[str, Any],
+    message: str,
+    owner: str,
+    request_id: str,
+):
+    """在普通 query 轮换 epoch 前消费唯一待确认票据。"""
+    _check_rate_limit(request, "action:natural-confirmation", limit=10)
+    session_key = (
+        _session_id(data.get("session_id")) if "session_id" in data else None
+    )
+    history_generation = (
+        _history_generation(request, session_id=session_key)
+        if session_key is not None
+        else None
+    )
+    service = get_agent_service()
+    coordinator = get_agent_operation_coordinator()
+    operation = coordinator.begin(owner=owner, operation_id=request_id)
+
+    def resolve() -> dict[str, Any]:
+        response = service.resolve_confirmation_reply(
+            message,
+            owner=owner,
+            request_id=operation.operation_id,
+            session_id=session_key or "",
+        )
+        if response is None:
+            raise AgentToolError(
+                "确认回复无法识别，请在确认卡片上操作",
+                code="confirmation_invalid",
+            )
+        if session_key is not None:
+            _record_query_history(
+                request,
+                session_id=session_key,
+                message=message,
+                response=response,
+                expected_generation=history_generation,
+            )
+        return response
+
+    try:
+        published, response = coordinator.finalize_if_current(operation, resolve)
+        if not published or response is None:
+            return api_error("会话状态已变化，请重新生成确认请求", 409)
+    finally:
+        coordinator.finish(operation)
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    if result.get("ok"):
+        return api_response(
+            response,
+            202 if result.get("status") == "accepted" else 200,
+        )
+    return api_response(response, 409)
+
+
 def _ndjson_event(event_type: str, **payload: Any) -> bytes:
     """编码单个 Agent 流事件；每行都是独立、有限的 UTF-8 JSON。"""
     body = {"type": event_type, **payload}
@@ -524,6 +584,46 @@ async def _stream_query_events(
 
         projector = PublicNarrativeProjector()
         emitted = False
+
+        def interrupted_event() -> bytes | None:
+            """在线性化窗口内保存已公开安全前缀，再发布中断事件。"""
+            partial_answer = projector.published_answer()
+            interrupted_response = _apply_streamed_answer(response, partial_answer)
+            result = interrupted_response.get("result")
+            if isinstance(result, dict):
+                interrupted_result = dict(result)
+                interrupted_result["status"] = "interrupted"
+                if partial_answer:
+                    interrupted_result["summary"] = partial_answer
+                interrupted_response["result"] = interrupted_result
+            presentation = interrupted_response.get("presentation")
+            if isinstance(presentation, dict):
+                interrupted_response["presentation"] = {
+                    **presentation,
+                    "status": "interrupted",
+                }
+            if session_id is not None:
+                _record_query_history(
+                    request,
+                    session_id=session_id,
+                    message=message,
+                    response=interrupted_response,
+                    expected_generation=history_generation,
+                )
+            return _ndjson_event(
+                "error",
+                request_id=operation.operation_id,
+                code="stream_interrupted",
+                message="回答生成中断，已保留当前内容；可立即重试或继续追问。",
+            )
+
+        def finalize_interrupted() -> bytes | None:
+            published, event = coordinator.finalize_if_current(
+                operation,
+                interrupted_event,
+            )
+            return event if published else None
+
         if stream is not None:
             event = current_event("status", phase="answering")
             if event is None:
@@ -565,11 +665,7 @@ async def _stream_query_events(
                     yield cancelled_event()
                     return
                 if emitted:
-                    event = current_event(
-                        "error",
-                        code="stream_interrupted",
-                        message="回答生成中断，已保留当前内容；请重试本次问题。",
-                    )
+                    event = finalize_interrupted()
                     if event is None:
                         yield cancelled_event()
                     else:
@@ -585,11 +681,7 @@ async def _stream_query_events(
                     logger.warning(
                         "Agent LLM 流式回答中断 type=%s", type(exc).__name__
                     )
-                    event = current_event(
-                        "error",
-                        code="stream_interrupted",
-                        message="回答生成中断，已保留当前内容；请重试本次问题。",
-                    )
+                    event = finalize_interrupted()
                     if event is None:
                         yield cancelled_event()
                     else:
@@ -697,6 +789,14 @@ def query(request: Request, data: Any = Body(default=None)):
         message = normalize_agent_message(data["message"])
         owner = _agent_owner(request, data)
         request_key = _request_id(data.get("request_id"))
+        if confirmation_reply_intent(message) is not None:
+            return _natural_confirmation_query(
+                request,
+                data=data,
+                message=message,
+                owner=owner,
+                request_id=request_key,
+            )
         action_history_request = agent_action_history_request(message)
         recent_resource_submit = is_recent_resource_submit_message(message)
         recent_download_explanation = is_recent_download_explanation_message(message)

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import secrets
 import threading
 import time
+import unicodedata
 from typing import Any, Callable
 
 from app.agent.registry import AgentToolError
@@ -22,6 +23,31 @@ class ConfirmationTicket:
     owner_generation: int = 0
     followup_context: dict[str, Any] = field(default_factory=dict)
     confirmation_contract: dict[str, Any] = field(default_factory=dict)
+
+
+_CONFIRMATION_REPLY_PHRASES = frozenset({
+    "确认", "确认执行", "确定", "确定执行", "同意", "执行", "开始执行",
+    "好的", "好的执行", "好的帮我执行", "好，执行", "好,执行",
+    "ok", "yes", "confirm",
+})
+_CANCELLATION_REPLY_PHRASES = frozenset({
+    "取消", "取消执行", "算了", "不要了", "不执行", "放弃",
+    "cancel", "no",
+})
+
+
+def confirmation_reply_intent(value: Any) -> str | None:
+    """只识别无附加条件的明确确认/取消短句，避免自然语言误触发写操作。"""
+    if not isinstance(value, str):
+        return None
+    normalized = unicodedata.normalize("NFKC", value).strip().casefold()
+    normalized = normalized.rstrip("。.!！")
+    normalized = " ".join(normalized.split())
+    if normalized in _CONFIRMATION_REPLY_PHRASES:
+        return "confirm"
+    if normalized in _CANCELLATION_REPLY_PHRASES:
+        return "cancel"
+    return None
 
 
 class ConfirmationStore:
@@ -115,6 +141,38 @@ class ConfirmationStore:
                 followup_context=deepcopy(ticket.followup_context),
                 confirmation_contract=deepcopy(ticket.confirmation_contract),
             )
+
+    def list_active_tickets(self, *, owner: str) -> list[ConfirmationTicket]:
+        """返回 owner 当前世代的有效票据快照，不消费票据。"""
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return []
+        now = self._clock()
+        with self._lock:
+            self._prune_locked(now)
+            generation = self._owner_generation_locked(owner_key, now=now, touch=True)
+            tickets = [
+                ticket
+                for ticket in self._tickets.values()
+                if ticket.owner_generation == generation
+                and secrets.compare_digest(ticket.owner, owner_key)
+                and ticket.expires_at > now
+            ]
+            tickets.sort(key=lambda item: (item.expires_at, item.confirmation_id))
+            return [
+                ConfirmationTicket(
+                    confirmation_id=ticket.confirmation_id,
+                    owner=ticket.owner,
+                    tool_name=ticket.tool_name,
+                    arguments=deepcopy(ticket.arguments),
+                    context_fingerprint=ticket.context_fingerprint,
+                    expires_at=ticket.expires_at,
+                    owner_generation=ticket.owner_generation,
+                    followup_context=deepcopy(ticket.followup_context),
+                    confirmation_contract=deepcopy(ticket.confirmation_contract),
+                )
+                for ticket in tickets
+            ]
 
     def discard(self, *, owner: str, confirmation_id: str) -> bool:
         """撤销属于指定会话且尚未消费的确认票据。"""
@@ -459,6 +517,55 @@ class SQLiteConfirmationStore(ConfirmationStore):
                 row["confirmation_contract_json"]
             ),
         )
+
+    def list_active_tickets(self, *, owner: str) -> list[ConfirmationTicket]:
+        """跨 Worker 查询 owner 当前世代的有效票据快照。"""
+        from app import database as db
+
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return []
+        owner_digest = self._owner_digest(owner_key)
+        now = self._clock()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+            epoch = conn.execute(
+                "SELECT generation FROM agent_confirmation_epochs WHERE owner_digest=?",
+                (owner_digest,),
+            ).fetchone()
+            if epoch is None:
+                return []
+            rows = conn.execute(
+                "SELECT confirmation_id,tool_name,arguments_json,context_fingerprint,"
+                "expires_at,owner_generation,followup_context_json,"
+                "confirmation_contract_json FROM agent_confirmations "
+                "WHERE owner_digest=? AND owner_generation=? AND expires_at>? "
+                "ORDER BY expires_at,confirmation_id",
+                (owner_digest, int(epoch["generation"]), now),
+            ).fetchall()
+            conn.execute(
+                "UPDATE agent_confirmation_epochs SET touched_at=?,updated_at=? "
+                "WHERE owner_digest=?",
+                (now, self._timestamp(), owner_digest),
+            )
+        return [
+            ConfirmationTicket(
+                confirmation_id=str(row["confirmation_id"]),
+                owner=owner_key,
+                tool_name=str(row["tool_name"]),
+                arguments=self._load_json_object(row["arguments_json"]),
+                context_fingerprint=str(row["context_fingerprint"] or ""),
+                expires_at=float(row["expires_at"]),
+                owner_generation=int(row["owner_generation"]),
+                followup_context=self._load_json_object(row["followup_context_json"]),
+                confirmation_contract=self._load_json_object(
+                    row["confirmation_contract_json"]
+                ),
+            )
+            for row in rows
+        ]
 
     def discard(self, *, owner: str, confirmation_id: str) -> bool:
         from app import database as db

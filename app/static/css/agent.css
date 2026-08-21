@@ -1133,10 +1133,12 @@ body.agent-page-body::after { display: none; }
 .agent-result-card.is-interrupted .agent-stream-head { color: var(--warning); }
 .agent-result-card.is-interrupted .agent-stream-head svg { color: var(--warning); }
 .agent-stream-error { margin: 10px 0 0; color: var(--text-muted); font-size: 11px; line-height: 1.55; }
-.agent-retry-draft { min-height: 38px; display: inline-flex; align-items: center; gap: 7px; margin-top: 14px; padding: 0 13px; color: var(--text-primary); background: var(--control-tint); border: 1px solid var(--agent-line); border-radius: 999px; cursor: pointer; font: inherit; font-size: 12px; font-weight: 650; transition: color .18s ease, background-color .18s ease, border-color .18s ease, transform .18s ease; }
-.agent-retry-draft:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); transform: translateY(-1px); }
-.agent-retry-draft:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: 2px; }
-.agent-retry-draft svg { width: 15px; height: 15px; }
+.agent-retry-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.agent-retry-draft, .agent-retry-immediate { min-height: 38px; display: inline-flex; align-items: center; gap: 7px; padding: 0 13px; color: var(--text-primary); background: var(--control-tint); border: 1px solid var(--agent-line); border-radius: 999px; cursor: pointer; font: inherit; font-size: 12px; font-weight: 650; transition: color .18s ease, background-color .18s ease, border-color .18s ease, transform .18s ease; }
+.agent-retry-immediate { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); }
+.agent-retry-draft:hover, .agent-retry-immediate:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); transform: translateY(-1px); }
+.agent-retry-draft:focus-visible, .agent-retry-immediate:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 62%, transparent); outline-offset: 2px; }
+.agent-retry-draft svg, .agent-retry-immediate svg, .agent-confirmation-reprepare svg { width: 15px; height: 15px; }
 
 .agent-composer { width: min(100%, var(--agent-reading-width, 980px)); position: relative; margin: 0 auto 24px; padding: 16px 20px 18px; background: var(--bg-card); border: 1px solid var(--agent-glass-border); border-radius: var(--agent-radius); box-shadow: 0 8px 32px rgba(0,0,0,0.08); transition: box-shadow .2s ease, border-color .2s ease; flex-shrink: 0; }
 .agent-composer:focus-within { box-shadow: 0 12px 48px color-mix(in srgb, var(--accent) 15%, transparent); border-color: var(--accent-border); }
@@ -1525,7 +1527,7 @@ body.agent-page-body::after { display: none; }
     .agent-timeline-node { left: -36px; width: 26px; height: 26px; }
     .agent-action-btn { flex-basis: 40px; width: 40px; height: 40px; }
     .agent-action-btn.agent-resume-session { flex-basis: auto; width: auto; padding-inline: 11px; }
-    .agent-retry-draft { min-height: 44px; padding-inline: 14px; }
+    .agent-retry-draft, .agent-retry-immediate { min-height: 44px; padding-inline: 14px; }
     .agent-history-drawer { width: min(92vw, 380px); }
     .agent-confirmation-actions button { flex: 1 1 0; min-width: 0; }
     .agent-confirmation-executing { width: 100%; }

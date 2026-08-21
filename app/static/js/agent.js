@@ -35,6 +35,7 @@
     let latestSessionId = '';
     let restoringHistory = false;
     const directToolActions = new WeakMap();
+    const confirmationPrepareActions = new WeakMap();
 
     function createAgentSessionId() {
         if (globalThis.crypto?.randomUUID) {
@@ -1781,7 +1782,7 @@
         const resultCard = renderResultCard(payload);
         view.body.append(resultCard);
         if (payload?.mode === 'confirmation_required' && payload.confirmation?.confirmation_id) {
-            view.body.append(renderConfirmation(payload.confirmation));
+            view.body.append(renderConfirmation(payload.confirmation, payload.tool_call));
         }
         refreshIcons(view.article);
         if (window.MFAnim && typeof window.MFAnim.popIn === 'function' && !restoringHistory) {
@@ -1794,11 +1795,24 @@
     function createRetryDraftButton(draft) {
         const normalized = String(draft || '').trim();
         if (!normalized) return null;
-        const button = node('button', 'agent-retry-draft');
-        button.type = 'button';
-        button.dataset.agentDraft = normalized;
-        button.append(icon('edit-3'), node('span', '', '编辑后重试'));
-        return button;
+        const edit = node('button', 'agent-retry-draft');
+        edit.type = 'button';
+        edit.dataset.agentDraft = normalized;
+        edit.append(icon('edit-3'), node('span', '', '编辑指令'));
+        return edit;
+    }
+
+    function createRetryActions(draft) {
+        const normalized = String(draft || '').trim();
+        if (!normalized) return null;
+        const actions = node('div', 'agent-retry-actions');
+        const retry = node('button', 'agent-retry-immediate');
+        retry.type = 'button';
+        retry.dataset.agentPrompt = normalized;
+        retry.append(icon('refresh-cw'), node('span', '', '立即重试'));
+        const edit = createRetryDraftButton(normalized);
+        actions.append(retry, edit);
+        return actions;
     }
 
     function appendRequestError(error, pendingNode, draft = '') {
@@ -1810,8 +1824,8 @@
                 ? '请求频率已达到限制，请稍后再试。'
                 : '现有对话已保留，你可以修改指令后重试。'),
         );
-        const retryButton = createRetryDraftButton(draft);
-        if (retryButton) card.append(retryButton);
+        const retryActions = createRetryActions(draft);
+        if (retryActions) card.append(retryActions);
         view.body.append(card);
         refreshIcons(view.article);
         if (window.MFAnim && typeof window.MFAnim.shake === 'function') {
@@ -1880,8 +1894,8 @@
         streamView.card.classList.add('is-interrupted');
         streamView.head.replaceChildren(icon('triangle-alert'), node('span', '', '生成中断'));
         streamView.card.append(node('p', 'agent-stream-error', message || '当前内容未完成，请重试。'));
-        const retryButton = createRetryDraftButton(draft);
-        if (retryButton) streamView.card.append(retryButton);
+        const retryActions = createRetryActions(draft);
+        if (retryActions) streamView.card.append(retryActions);
         refreshIcons(streamView.article);
         scrollToLatest();
     }
@@ -2380,7 +2394,7 @@
         }
     }
 
-    function renderConfirmation(confirmation) {
+    function renderConfirmation(confirmation, toolCall = {}) {
         const confirmationId = String(confirmation.confirmation_id || '');
         const contract = confirmation?.contract && typeof confirmation.contract === 'object'
             ? confirmation.contract
@@ -2391,6 +2405,13 @@
         const card = node('section', 'agent-confirmation-card');
         card.dataset.confirmationId = confirmationId;
         card.dataset.confirmationAction = action;
+        const toolName = String(toolCall?.name || '').trim();
+        const toolArguments = toolCall?.arguments && typeof toolCall.arguments === 'object'
+            ? {...toolCall.arguments}
+            : null;
+        if (toolName && toolArguments) {
+            confirmationPrepareActions.set(card, {toolName, arguments: toolArguments});
+        }
         const head = node('div', 'agent-confirmation-head');
         const title = node('div');
         title.append(node('span', '', '写操作确认'), node('strong', '', action));
@@ -2475,6 +2496,58 @@
         confirmationTimers.clear();
     }
 
+    function renderReprepareAction(card, message) {
+        const actions = card.querySelector('.agent-confirmation-actions');
+        if (!actions) return;
+        const status = node('span', 'agent-result-meta', message);
+        const prepare = confirmationPrepareActions.get(card);
+        if (!prepare) {
+            actions.replaceChildren(status);
+            return;
+        }
+        const button = node('button', 'agent-confirmation-reprepare');
+        button.type = 'button';
+        button.append(icon('refresh-cw'), node('span', '', '重新预检'));
+        button.addEventListener('click', () => reprepareConfirmation(card, button));
+        actions.replaceChildren(status, button);
+        refreshIcons(actions);
+    }
+
+    async function reprepareConfirmation(card, button) {
+        const prepare = confirmationPrepareActions.get(card);
+        if (!prepare || requestInFlight || confirmationInFlight || sessionResetInFlight) return;
+        const generation = conversationGeneration;
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+        setConfirmationBusy(true);
+        try {
+            const payload = await fetchJSON(`/api/agent/actions/${encodeURIComponent(prepare.toolName)}/prepare`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(sessionPayload({arguments: prepare.arguments})),
+            });
+            if (generation !== conversationGeneration) {
+                await discardStaleConfirmation(payload);
+                return;
+            }
+            if (payload?.mode !== 'confirmation_required' || !payload.confirmation?.confirmation_id) {
+                throw new Error('重新预检未返回有效确认票据');
+            }
+            const replacement = renderConfirmation(payload.confirmation, payload.tool_call);
+            card.replaceWith(replacement);
+            focusResult(replacement);
+        } catch (error) {
+            if (generation !== conversationGeneration) return;
+            button.disabled = false;
+            button.setAttribute('aria-busy', 'false');
+            const oldError = card.querySelector('.agent-result-error');
+            oldError?.remove();
+            card.append(node('p', 'agent-result-error', error?.message || '重新预检失败，请稍后重试。'));
+        } finally {
+            if (generation === conversationGeneration) setConfirmationBusy(false);
+        }
+    }
+
     function startConfirmationCountdown(card, countdown, confirmButton, cancelButton, expiresIn) {
         const deadline = Date.now() + Math.max(1, Number(expiresIn)) * 1000;
         const update = () => {
@@ -2489,8 +2562,7 @@
             confirmButton.disabled = true;
             cancelButton.disabled = true;
             countdown.textContent = '确认窗口已过期。请重新提交原任务生成新的预检。';
-            const status = node('span', 'agent-result-meta', '票据已失效，未执行任何写操作。');
-            card.querySelector('.agent-confirmation-actions')?.replaceChildren(status);
+            renderReprepareAction(card, '票据已失效，未执行任何写操作。');
         };
         update();
         if (!card.classList.contains('is-expired')) {
@@ -2572,12 +2644,10 @@
             }
             if (error?.status === 409) {
                 clearConfirmationTimer(card);
-                card.classList.add('is-cancelled');
+                card.classList.add('is-expired');
                 card.dataset.confirmationId = '';
-                const actions = card.querySelector('.agent-confirmation-actions');
-                const status = node('span', 'agent-result-meta', '确认票据已失效，请重新提交原任务生成新的预检。');
-                actions?.replaceChildren(status);
-                focusResult(status);
+                renderReprepareAction(card, '确认票据已失效，请重新提交原任务生成新的预检。');
+                focusResult(card.querySelector('.agent-confirmation-actions'));
                 return;
             }
             card.classList.add('is-cancelled');

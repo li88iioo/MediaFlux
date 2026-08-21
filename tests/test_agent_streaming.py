@@ -204,6 +204,44 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertNotIn("当前已生成一部分", response.text)
         history.assert_called_once()
 
+    def test_partial_stream_interruption_persists_public_prefix_and_tool_state(self):
+        csrf = self._login()
+        service = _FakeService(_tool_response())
+        history = Mock()
+
+        async def broken_stream(*_args, **_kwargs):
+            yield "下载队列已完成检查。"
+            raise ProviderStreamError("upstream interrupted")
+
+        with (
+            patch("app.routes.agent_api.get_agent_service", return_value=service),
+            patch("app.routes.agent_api.stream_tool_answer", broken_stream),
+            patch("app.routes.agent_api._record_query_history", history),
+        ):
+            response = self.client.post(
+                "/api/agent/query",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "message": "检查下载队列状态",
+                    "session_id": SESSION_ID,
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        events = self._events(response)
+        self.assertEqual(
+            [item["type"] for item in events],
+            ["status", "status", "status", "delta", "error"],
+        )
+        self.assertEqual(events[-1]["code"], "stream_interrupted")
+        history.assert_called_once()
+        saved = history.call_args.kwargs["response"]
+        self.assertEqual(saved["result"]["status"], "interrupted")
+        self.assertEqual(saved["result"]["summary"], "下载队列已完成检查。")
+        self.assertEqual(saved["tool_call"]["name"], "downloads.diagnose_queue")
+        self.assertEqual(saved["presentation"]["status"], "interrupted")
+
     def test_split_unsafe_stream_token_is_never_publicly_emitted(self):
         csrf = self._login()
         service = _FakeService(_tool_response())

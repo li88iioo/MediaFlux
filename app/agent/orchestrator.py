@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from app import database as db
 from app.agent.action_history import record_confirmation_error, record_confirmed_result
-from app.agent.confirmation import ConfirmationStore
+from app.agent.confirmation import ConfirmationStore, confirmation_reply_intent
 from app.agent.confirmation_contract import (
     build_confirmation_contract,
     sanitize_confirmation_contract,
@@ -4690,6 +4690,68 @@ class AgentOrchestrator:
         return self.confirmation_store.discard(
             owner=owner,
             confirmation_id=confirmation_id,
+        )
+
+    def resolve_confirmation_reply(
+        self,
+        value: Any,
+        *,
+        owner: str,
+        request_id: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any] | None:
+        """在新查询轮换确认世代前，确定性处理唯一待确认票据。"""
+        intent = confirmation_reply_intent(value)
+        if intent is None:
+            return None
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            raise AgentToolError("当前会话无法处理确认请求", code="confirmation_invalid")
+        tickets = self.confirmation_store.list_active_tickets(owner=owner_key)
+        if not tickets:
+            return self._clarification_response(
+                "当前没有等待确认的操作，或者原确认窗口已经过期。",
+                ["重新提交原任务生成新的预检"],
+            )
+        if len(tickets) != 1:
+            return self._clarification_response(
+                "当前有多个等待确认的操作。为避免执行错误，请在对应确认卡片上选择确认或取消。",
+                ["在目标确认卡片上点击确认并执行", "取消不需要的确认卡片"],
+            )
+        ticket = tickets[0]
+        if intent == "confirm":
+            return self.confirm(
+                ticket.confirmation_id,
+                owner=owner_key,
+                request_id=request_id,
+                session_id=session_id,
+            )
+
+        discarded = self.discard_confirmation(
+            ticket.confirmation_id,
+            owner=owner_key,
+        )
+        if not discarded:
+            return self._clarification_response(
+                "确认票据已经失效，没有执行任何写操作。",
+                ["重新提交原任务生成新的预检"],
+            )
+        action = result_projection.sanitize_public_text(
+            ticket.confirmation_contract.get("action"), limit=120
+        ) or "本次受控操作"
+        result = ToolResult(
+            ok=True,
+            status="cancelled",
+            summary=f"已取消“{action}”，没有执行任何写操作。",
+            suggestions=["需要时可以重新提交原任务生成新的预检。"],
+        )
+        return self._response(
+            ticket.tool_name,
+            {},
+            result,
+            0,
+            mode="cancelled_action",
+            request_id=request_id,
         )
 
     def capabilities(self) -> dict[str, Any]:

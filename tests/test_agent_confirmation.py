@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app.agent.confirmation import ConfirmationStore
+from app.agent.confirmation import ConfirmationStore, confirmation_reply_intent
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import AgentOrchestrator, _is_strm_run_action
 from app.agent.registry import AgentToolError, ToolRegistry
@@ -20,6 +20,25 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class ConfirmationStoreTests(unittest.TestCase):
+    def test_confirmation_reply_intent_is_explicit_and_non_ambiguous(self):
+        for value in ("确认", "好的帮我执行。", "YES", "取消", "算了！"):
+            with self.subTest(value=value):
+                self.assertIsNotNone(confirmation_reply_intent(value))
+        for value in ("请确认状态", "确认第三个", "好的，但是先检查", "不要取消"):
+            with self.subTest(value=value):
+                self.assertIsNone(confirmation_reply_intent(value))
+
+    def test_list_active_tickets_returns_current_generation_without_consuming(self):
+        store = ConfirmationStore(token_factory=lambda: "ticket-list-active-123456")
+        ticket = store.issue(owner="owner-a", tool_name="write.test", arguments={"id": 1})
+
+        first = store.list_active_tickets(owner="owner-a")
+        second = store.list_active_tickets(owner="owner-a")
+
+        self.assertEqual([item.confirmation_id for item in first], [ticket.confirmation_id])
+        self.assertEqual([item.confirmation_id for item in second], [ticket.confirmation_id])
+        self.assertEqual(store.claim(owner="owner-a", confirmation_id=ticket.confirmation_id).arguments, {"id": 1})
+
     def test_ticket_is_single_use_and_arguments_are_copied(self):
         store = ConfirmationStore(token_factory=lambda: "ticket-1234567890abcdef")
         arguments = {"items": ["one"]}
@@ -592,6 +611,88 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             scheduler.trigger.assert_called_once_with("manual")
+
+    def test_query_accepts_natural_language_confirmation_without_rotating_ticket(self):
+        csrf = self.login()
+        scheduler = Mock()
+        scheduler.validate_config.return_value = ""
+        scheduler.status.return_value = {"running": False}
+        scheduler.trigger.return_value = {"ok": True, "message": "done"}
+        values = {
+            "AGENT_ENABLED": "1",
+            "GY_STRM_SOURCE_DIRS": '[{"id":"one","name":"One"}]',
+            "GY_STRM_BASE_URL": "http://service",
+            "STRM_ROOT": "/root/one",
+        }
+        headers = {"X-CSRF-Token": csrf}
+        session_id = "test_session_identifier_0002"
+        with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch(
+            "app.agent.tools.config.get", side_effect=self._config_get(values)
+        ):
+            prepared = self.client.post(
+                "/api/agent/query",
+                headers=headers,
+                json={"session_id": session_id, "message": "立即执行 STRM 同步"},
+            )
+            self.assertEqual(prepared.status_code, 200, prepared.text)
+            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+
+            confirmed = self.client.post(
+                "/api/agent/query",
+                headers=headers,
+                json={"session_id": session_id, "message": "好的帮我执行", "stream": True},
+            )
+
+            self.assertEqual(confirmed.status_code, 202, confirmed.text)
+            self.assertEqual(confirmed.json()["mode"], "confirmed_action")
+            self.assertEqual(confirmed.json()["result"]["status"], "accepted")
+            scheduler.trigger.assert_called_once_with("manual")
+
+            replay = self.client.post(
+                "/api/agent/actions/confirm",
+                headers=headers,
+                json={"session_id": session_id, "confirmation_id": confirmation_id},
+            )
+            self.assertEqual(replay.status_code, 409, replay.text)
+
+    def test_query_accepts_natural_language_cancellation(self):
+        csrf = self.login()
+        scheduler = Mock()
+        scheduler.validate_config.return_value = ""
+        scheduler.status.return_value = {"running": False}
+        values = {
+            "AGENT_ENABLED": "1",
+            "GY_STRM_SOURCE_DIRS": '[{"id":"one","name":"One"}]',
+            "GY_STRM_BASE_URL": "http://service",
+            "STRM_ROOT": "/root/one",
+        }
+        headers = {"X-CSRF-Token": csrf}
+        session_id = "test_session_identifier_0003"
+        with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch(
+            "app.agent.tools.config.get", side_effect=self._config_get(values)
+        ):
+            prepared = self.client.post(
+                "/api/agent/query",
+                headers=headers,
+                json={"session_id": session_id, "message": "立即执行 STRM 同步"},
+            )
+            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+
+            cancelled = self.client.post(
+                "/api/agent/query",
+                headers=headers,
+                json={"session_id": session_id, "message": "取消"},
+            )
+
+            self.assertEqual(cancelled.status_code, 200, cancelled.text)
+            self.assertEqual(cancelled.json()["result"]["status"], "cancelled")
+            scheduler.trigger.assert_not_called()
+            stale = self.client.post(
+                "/api/agent/actions/confirm",
+                headers=headers,
+                json={"session_id": session_id, "confirmation_id": confirmation_id},
+            )
+            self.assertEqual(stale.status_code, 409, stale.text)
 
     def test_explicit_prepare_rejects_arguments_and_stale_configuration(self):
         csrf = self.login()
