@@ -90,6 +90,65 @@ def execute_organize_plans(
                     plan.note or plan.conflict_note or (plan.match.error if plan.match else "")
                     or "未进入整理执行",
                 )
+
+    def record_runtime_skip(plan, target_parent_id: str, reason: str) -> None:
+        stats["skipped"] += 1
+        current = directory_stats[plan.original_path or "/"]
+        current["skipped"] += 1
+        organizer._append_reason(stats, "skip_reasons", reason)
+        organizer._append_reason(current, "skip_reasons", reason)
+        match = plan.match or MatchResult()
+        parsed = organizer._parse_media_fields(plan.original_name)
+        position_season, position_episode = resolved_plan_position(plan, parsed)
+        target_name = plan.new_name or plan.original_name
+        companions = organizer._companions_for_plan(
+            plan, companion_files.get(plan.original_path, [])
+        )
+        organizer._write_organize_audit(
+            (
+                "guangya", plan.original_path,
+                plan.target_path + "/" + target_name,
+                plan.file_id, "skipped", match.tmdb_id,
+            ),
+            {
+                "source_dir_id": source_dir_id,
+                "original_parent_id": plan.original_parent_id,
+                "original_name": plan.original_name,
+                "current_parent_id": plan.original_parent_id,
+                "current_name": plan.original_name,
+                "target_parent_id": target_parent_id,
+                "media_type": match.media_type,
+                "provider": organizer._match_provider(match),
+                "external_id": organizer._match_external_id(match),
+                "title": match.title,
+                "year": match.year,
+                "season": position_season,
+                "episode": position_episode,
+                "error": reason,
+                "release_parse": _release_parse_diagnostic(match),
+                "legacy_incomplete": False,
+            },
+            [{
+                "file_id": plan.file_id, "role": "video",
+                "original_parent_id": plan.original_parent_id,
+                "original_name": plan.original_name,
+                "current_parent_id": plan.original_parent_id,
+                "current_name": plan.original_name,
+                "target_parent_id": target_parent_id,
+                "target_name": target_name, "size": plan.size, "etag": plan.etag,
+                "status": "skipped", "error": reason,
+            }, *[{
+                "file_id": item.file_id, "role": media_role(item.name),
+                "original_parent_id": item.parent_id or plan.original_parent_id,
+                "original_name": item.name,
+                "current_parent_id": item.parent_id or plan.original_parent_id,
+                "current_name": item.name,
+                "target_parent_id": target_parent_id,
+                "target_name": item.name, "size": item.size, "etag": item.etag,
+                "status": "skipped", "error": reason,
+            } for item in companions]],
+        )
+
     active_group_key = ""
     completed_group_keys: set[str] = set()
     halted_group_reasons: dict[str, str] = {}
@@ -259,6 +318,17 @@ def execute_organize_plans(
                 p.target_path,
                 directory_chain_cache,
             )
+            if (
+                p.original_parent_id
+                and target_id
+                and str(p.original_parent_id) == str(target_id)
+            ):
+                reason = "文件已位于目标目录，未执行重复移动、覆盖或回收"
+                p.conflict_decision = "already_organized"
+                p.conflict_note = reason
+                record_runtime_skip(p, target_id, reason)
+                continue
+
             # 每个计划都重新读取目标目录，避免前一项移动/用户外部操作后
             # 继续使用过期冲突视图。
             target_files_cache[target_id] = organizer.client.list_dir(target_id)
@@ -296,50 +366,10 @@ def execute_organize_plans(
                     organizer.client.rename(existing.file_id, replacement_backup_name)
                     stats["conflict"] += 1
                 else:
-                    stats["skipped"] += 1
-                    directory_stats[p.original_path or "/"]["skipped"] += 1
-                    runtime_skip_reason = conflict_note or "目标存在同媒体文件，按冲突策略跳过"
-                    organizer._append_reason(stats, "skip_reasons", runtime_skip_reason)
-                    organizer._append_reason(
-                        directory_stats[p.original_path or "/"],
-                        "skip_reasons", runtime_skip_reason,
+                    runtime_skip_reason = (
+                        conflict_note or "目标存在同媒体文件，按冲突策略跳过"
                     )
-                    parsed = organizer._parse_media_fields(p.original_name)
-                    position_season, position_episode = resolved_plan_position(p, parsed)
-                    organizer._write_organize_audit(
-                        (
-                            "guangya", p.original_path,
-                            p.target_path + "/" + p.new_name,
-                            p.file_id, "skipped", p.match.tmdb_id,
-                        ),
-                        {
-                            "source_dir_id": source_dir_id,
-                            "original_parent_id": p.original_parent_id,
-                            "original_name": p.original_name,
-                            "current_parent_id": p.original_parent_id,
-                            "current_name": p.original_name,
-                            "target_parent_id": target_id,
-                            "media_type": p.match.media_type,
-                            "provider": organizer._match_provider(p.match),
-                            "external_id": organizer._match_external_id(p.match),
-                            "title": p.match.title,
-                            "year": p.match.year,
-                            "season": position_season,
-                            "episode": position_episode,
-                            "error": conflict_note,
-                            "release_parse": _release_parse_diagnostic(p.match),
-                            "legacy_incomplete": False,
-                        },
-                        [{
-                            "file_id": p.file_id, "role": "video",
-                            "original_parent_id": p.original_parent_id,
-                            "original_name": p.original_name,
-                            "current_parent_id": p.original_parent_id,
-                            "current_name": p.original_name, "target_parent_id": target_id,
-                            "target_name": p.new_name, "size": p.size, "etag": p.etag,
-                            "status": "skipped", "error": conflict_note,
-                        }],
-                    )
+                    record_runtime_skip(p, target_id, runtime_skip_reason)
                     continue
             video_move_attempted = False
             video_moved_to_target = False

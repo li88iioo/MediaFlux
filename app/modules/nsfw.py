@@ -91,7 +91,10 @@ class MetaTubeMetadata:
     def display_title(self) -> str:
         number = normalize_code(self.number)
         title = re.sub(r"\s+", " ", str(self.title or "")).strip()
-        if number and title and normalize_code(title).startswith(normalize_code(number)):
+        title_key = _code_comparison_key(title)
+        if number and title and any(
+            alias and alias in title_key for alias in _code_alias_keys(number)
+        ):
             return title
         return " ".join(part for part in (number, title) if part).strip()
 
@@ -99,10 +102,31 @@ class MetaTubeMetadata:
 def normalize_code(value: str) -> str:
     text = re.sub(r"[^A-Za-z0-9]+", "-", str(value or "").upper()).strip("-")
     text = re.sub(r"-+", "-", text)
+    compact = text.replace("-", "")
+    if compact.startswith("FC2PPV"):
+        digits = re.sub(r"\D", "", compact[6:])
+        return f"FC2-PPV-{digits}" if digits else text
     if text.startswith("FC2-") and not text.startswith("FC2-PPV-"):
         digits = re.sub(r"\D", "", text[4:])
         return f"FC2-PPV-{digits}" if digits else text
     return text
+
+
+def _code_comparison_key(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", normalize_code(value))
+
+
+def _code_alias_keys(number: str) -> tuple[str, ...]:
+    """返回常见番号写法的紧凑比较键，避免标题重复追加番号。"""
+    key = _code_comparison_key(number)
+    aliases = [key] if key else []
+    for prefix in ("1PONDO", "CARIB", "CARIBBEANCOM", "10MUSUME", "PACOPACOMAMA"):
+        if key.startswith(prefix):
+            remainder = key[len(prefix):]
+            if len(remainder) >= 6:
+                aliases.append(remainder)
+            break
+    return tuple(dict.fromkeys(aliases))
 
 
 def clean_nsfw_release_text(value: str, strip_domains: str = "") -> str:

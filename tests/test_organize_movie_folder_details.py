@@ -378,11 +378,11 @@ class StrmChangeLedgerIntegrationTests(IsolatedDatabaseTestCase):
                 self.assertEqual(stats["changes"], [{
                     "action": "generated",
                     "directory": "根目录",
-                    "filename": "电影.mkv.strm",
+                    "filename": "电影.strm",
                     "error": "",
                 }])
                 self.assertNotIn(root, str(stats["changes"]))
-                self.assertTrue((Path(root) / STRM_SUBDIR / "电影.mkv.strm").is_file())
+                self.assertTrue((Path(root) / STRM_SUBDIR / "电影.strm").is_file())
         finally:
             from app import database as db
             rows = db.list_strm_index(f"guangya:{source_id}")
@@ -440,7 +440,7 @@ class StrmSchedulerDetailNotificationTests(unittest.TestCase):
         stats = {"changes": [{
             "action": "generated",
             "directory": "电影/测试<&>",
-            "filename": "测试<&>.mkv.strm",
+            "filename": "测试<&>.strm",
         }]}
         sent = []
         with patch.object(scheduler, "get_bool", return_value=True), patch.object(

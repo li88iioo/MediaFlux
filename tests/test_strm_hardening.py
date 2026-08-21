@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import threading
 import time
@@ -119,7 +120,79 @@ def _cleanup_source_indexes(source_id: str) -> None:
 
 
 class StrmHardeningTests(IsolatedDatabaseTestCase):
-    def test_long_utf8_names_are_hashed_stably_and_keep_media_extension(self):
+    def test_standard_strm_name_matches_sidecar_basename(self):
+        video = GuangYaFile("video", "Show.S01E01.mkv", False, 100, "etag")
+        sidecar = GuangYaFile("nfo", "Show.S01E01.nfo", False, 10, "meta")
+
+        with tempfile.TemporaryDirectory() as root:
+            strm_path = generate_strm(video, "剧集/Show/Season 1", "http://example", root)
+            metadata_path = strm_module._metadata_target(
+                sidecar, "剧集/Show/Season 1", root
+            )
+
+        self.assertEqual(strm_path.name, "Show.S01E01.strm")
+        self.assertEqual(metadata_path.name, "Show.S01E01.nfo")
+        self.assertEqual(strm_path.stem, metadata_path.stem)
+
+    def test_metatube_identity_is_hidden_from_local_strm_and_metadata_paths(self):
+        tag = "{metatube-javbus-ssis001}"
+        video = GuangYaFile(
+            "video", f"SSIS-001 (2024) {tag}.mp4", False, 100, "etag"
+        )
+        sidecar = GuangYaFile(
+            "nfo", f"SSIS-001 (2024) {tag}.nfo", False, 10, "meta"
+        )
+        rel_dir = f"成人内容/SSIS-001 (2024) {tag}"
+
+        with tempfile.TemporaryDirectory() as root:
+            strm_path = generate_strm(video, rel_dir, "http://example", root)
+            metadata_path = strm_module._metadata_target(sidecar, rel_dir, root)
+
+        self.assertEqual(
+            strm_path.relative_to(Path(root)).as_posix(),
+            "光鸭云盘/成人内容/SSIS-001 (2024)/SSIS-001 (2024).strm",
+        )
+        self.assertEqual(
+            metadata_path.relative_to(Path(root)).as_posix(),
+            "光鸭云盘/成人内容/SSIS-001 (2024)/SSIS-001 (2024).nfo",
+        )
+
+    def test_full_sync_migrates_indexed_double_suffix_strm(self):
+        source_id = f"source-migrate-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        video = GuangYaFile("video", "Movie.mkv", False, 100, "etag", source_id)
+        client = _TreeClient({source_id: [video]})
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                old_path = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                old_path.parent.mkdir(parents=True)
+                payload = strm_module.build_play_url(
+                    "http://example", video.file_id, video.etag,
+                    video.size, video.name,
+                )
+                old_path.write_text(payload, encoding="utf-8")
+                fingerprint = f"sha256:{hashlib.sha256(payload.encode()).hexdigest()}"
+                db.upsert_strm_index(
+                    source_key, video.file_id, video.etag, video.size,
+                    video.name, str(old_path), fingerprint,
+                )
+
+                result = sync_strm(
+                    source_id, "http://example", root, client=client,
+                    clean_invalid=False,
+                )
+                new_path = Path(root) / STRM_SUBDIR / "Movie.strm"
+                row = db.list_strm_index(source_key)[0]
+
+                self.assertTrue(new_path.is_file())
+                self.assertFalse(old_path.exists())
+                self.assertEqual(row["strm_path"], str(new_path))
+                self.assertEqual(result["generated"], 1)
+                self.assertEqual(result["cleaned"], 1)
+        finally:
+            _cleanup_source_indexes(source_id)
+
+    def test_long_utf8_names_are_hashed_stably_and_keep_strm_extension(self):
         prefix = "超长中文影视名称" * 40
         first = GuangYaFile("f1", f"{prefix}甲.mkv", False, 100, "e1")
         second = GuangYaFile("f2", f"{prefix}乙.mkv", False, 100, "e2")
@@ -132,8 +205,8 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
             self.assertEqual(path1, again)
             self.assertNotEqual(path1.name, path2.name)
             self.assertLessEqual(len(path1.name.encode("utf-8")), 255)
-            self.assertTrue(path1.name.endswith(".mkv.strm"), path1.name)
-            self.assertRegex(path1.name, r"~[0-9a-f]{12}\.mkv\.strm$")
+            self.assertTrue(path1.name.endswith(".strm"), path1.name)
+            self.assertRegex(path1.name, r"~[0-9a-f]{12}\.strm$")
             self.assertFalse(list(path1.parent.glob("*.part")))
 
     def test_remote_directory_components_cannot_escape_root(self):
@@ -150,7 +223,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertEqual(len(generated), 1)
                 self.assertTrue(generated[0].resolve().is_relative_to((Path(root) / STRM_SUBDIR).resolve()))
                 self.assertNotIn("..", generated[0].relative_to(Path(root) / STRM_SUBDIR).parts)
-                self.assertRegex(generated[0].name, r"^片名_正片~[0-9a-f]{12}\.mkv\.strm$")
+                self.assertRegex(generated[0].name, r"^片名_正片~[0-9a-f]{12}\.strm$")
         finally:
             _cleanup_source_indexes(source_id)
 
@@ -166,7 +239,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         try:
             with tempfile.TemporaryDirectory() as root:
                 result = sync_strm(source_id, "http://example", root, client=client)
-                target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                target = Path(root) / STRM_SUBDIR / "Movie.strm"
                 self.assertEqual(result["total"], 3)
                 self.assertEqual(result["generated"], 1)
                 self.assertEqual(result["duplicates_skipped"], 2)
@@ -235,7 +308,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 tree[source_id] = [GuangYaFile("new", "Movie.mkv", False, 200, "new", source_id)]
                 result = sync_strm(source_id, "http://example", root, client=client)
 
-                target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                target = Path(root) / STRM_SUBDIR / "Movie.strm"
                 self.assertTrue(target.exists())
                 self.assertIn("/playgy/new/", target.read_text(encoding="utf-8"))
                 self.assertEqual(result["cleaned"], 0)
@@ -418,7 +491,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     with tempfile.TemporaryDirectory() as root:
                         first = sync_strm(source_id, "http://example", root, client=client)
                         self.assertEqual(first["generated"], 1)
-                        target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                        target = Path(root) / STRM_SUBDIR / "Movie.strm"
                         old_text = target.read_text(encoding="utf-8")
                         tree[source_id] = [
                             GuangYaFile("new", "Movie.mkv", False, 200, "new-etag", source_id)
@@ -489,9 +562,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         try:
             with tempfile.TemporaryDirectory() as root:
                 sync_strm(source_id, "http://example", root, client=client)
-                old_path = Path(root) / STRM_SUBDIR / "Old.mkv.strm"
+                old_path = Path(root) / STRM_SUBDIR / "Old.strm"
                 old_text = old_path.read_text(encoding="utf-8")
-                new_path = Path(root) / STRM_SUBDIR / "New.mkv.strm"
+                new_path = Path(root) / STRM_SUBDIR / "New.strm"
                 tree[source_id] = [
                     GuangYaFile("same-id", "New.mkv", False, 120, "new-etag", source_id)
                 ]
@@ -863,7 +936,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     source_id, "http://example", root, client=client,
                     metadata_exts={"jpg"},
                 )
-                video_path = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                video_path = Path(root) / STRM_SUBDIR / "Movie.strm"
                 metadata_path = Path(root) / STRM_SUBDIR / "poster.jpg"
                 tree[source_id] = []
 
@@ -903,7 +976,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     source_id, "http://example", root, client=client,
                     metadata_exts={"jpg"},
                 )
-                video_path = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+                video_path = Path(root) / STRM_SUBDIR / "Movie.strm"
                 metadata_path = Path(root) / STRM_SUBDIR / "poster.jpg"
                 tree[source_id] = [
                     GuangYaFile("broken-dir", "Broken", True, parent_id=source_id)
@@ -1018,7 +1091,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
             self.assertEqual(first, second)
             self.assertTrue(first.exists())
             self.assertLessEqual(len(str(relative).encode("utf-8")), budget)
-            self.assertTrue(first.name.endswith(".mkv.strm"))
+            self.assertTrue(first.name.endswith(".strm"))
             self.assertTrue(any(part.startswith("~path-") for part in relative.parts))
 
     def test_any_directory_scan_failure_disables_stale_cleanup_for_whole_round(self):
@@ -1043,7 +1116,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertTrue(result["clean_skipped"])
                 self.assertTrue(result["scan_incomplete"])
                 self.assertEqual(result["generated"], 0)
-                self.assertFalse((Path(root) / STRM_SUBDIR / "New.mkv.strm").exists())
+                self.assertFalse((Path(root) / STRM_SUBDIR / "New.strm").exists())
                 self.assertTrue(stale_path.exists())
                 self.assertEqual([row["file_id"] for row in db.list_strm_index(source_key)], [stale_id])
         finally:
@@ -1073,7 +1146,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["generated"], 0)
                 self.assertTrue(result["clean_skipped"])
                 self.assertTrue(stale_path.exists())
-                self.assertFalse((Path(root) / STRM_SUBDIR / "A.mkv.strm").exists())
+                self.assertFalse((Path(root) / STRM_SUBDIR / "A.strm").exists())
                 self.assertEqual(
                     [row["file_id"] for row in db.list_strm_index(source_key)],
                     ["stale"],

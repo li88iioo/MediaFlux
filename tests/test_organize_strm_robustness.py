@@ -372,7 +372,7 @@ class StrmRobustnessTests(IsolatedDatabaseTestCase):
                 row = db.list_strm_index(source_key)[0]
                 self.assertEqual(
                     Path(row["strm_path"]),
-                    Path(root) / STRM_SUBDIR / "Renamed.mkv.strm",
+                    Path(root) / STRM_SUBDIR / "Renamed.strm",
                 )
         finally:
             self._cleanup(source_id)
@@ -416,7 +416,7 @@ class StrmRobustnessTests(IsolatedDatabaseTestCase):
 
     def test_notification_change_redacts_signed_url_and_secret(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+            target = Path(root) / STRM_SUBDIR / "Movie.strm"
             change = relative_change(
                 "failed",
                 target,

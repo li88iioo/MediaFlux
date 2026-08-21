@@ -1495,7 +1495,7 @@ class STRMIndexTests(IsolatedDatabaseTestCase):
                 tree[source_id] = tree[source_id][:1]
                 second = sync_strm(source_id, "http://example", root, client=client)
                 self.assertEqual(second["cleaned"], 1)
-                self.assertFalse((Path(root) / STRM_SUBDIR / "Gone.mkv.strm").exists())
+                self.assertFalse((Path(root) / STRM_SUBDIR / "Gone.strm").exists())
         finally:
             db.delete_strm_index_ids(source_key, ["keep", "gone"])
 

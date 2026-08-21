@@ -863,10 +863,10 @@ class Organizer:
         elif rules.add_kids and kids_match:
             main = "儿童节目"
         elif match.media_type == "movie":
+            # 动画电影仍属于电影；“动漫”专用于具有季集结构的动画剧集。
+            # 这样输出目录的分类语义与再次识别时的 movie/tv 语义保持一致。
             main = "电影"
-            if GENRE_ANIME in genres:
-                main = "动漫"
-            elif GENRE_DOC in genres:
+            if GENRE_DOC in genres:
                 main = "纪录片"
         else:
             main = "剧集"
@@ -4932,6 +4932,13 @@ class Organizer:
         same_variant: list[GuangYaFile] = []
         coexist_count = 0
         for candidate in target_files:
+            # 归档目录被再次作为待整理来源时，目标列表可能包含计划文件自身。
+            # 自身绝不能参与版本替换，否则会把同一 file_id 当旧版本回收。
+            if (
+                plan.file_id
+                and str(candidate.file_id or "") == str(plan.file_id)
+            ):
+                continue
             if not self._same_media_identity(plan, candidate, rules):
                 continue
             existing_variant = self._existing_variant(
@@ -5093,6 +5100,17 @@ class Organizer:
                         target_id, target_files, evidence_names
                     )
                 _target_id, target_files, evidence_names = directory_cache[plan.target_path]
+                if (
+                    plan.original_parent_id
+                    and _target_id
+                    and str(plan.original_parent_id) == str(_target_id)
+                ):
+                    note = "文件已位于目标目录，未执行重复移动、覆盖或回收"
+                    plan.action = "skip"
+                    plan.conflict_decision = "already_organized"
+                    plan.conflict_note = note
+                    plan.note = note
+                    continue
                 existing, decision, note = self._resolve_variant_conflict(
                     plan, target_files, rules, evidence_names
                 )

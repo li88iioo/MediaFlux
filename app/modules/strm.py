@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -350,9 +351,22 @@ def safe_path_component(
     return result
 
 
+_METATUBE_IDENTITY_TAG = re.compile(
+    r"\s*[\{\(]metatube-[A-Za-z0-9._-]+[\}\)]\s*",
+    re.IGNORECASE,
+)
+
+
+def _jellyfin_visible_name(value: str) -> str:
+    """移除 Jellyfin 不识别的 MetaTube 内部身份标记。"""
+    cleaned = _METATUBE_IDENTITY_TAG.sub(" ", str(value or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return re.sub(r"\s+(?=\.[A-Za-z0-9]{1,8}$)", "", cleaned)
+
+
 def _safe_rel_parts(rel_dir: str) -> list[str]:
     parts = [part for part in str(rel_dir or "").replace("\\", "/").split("/") if part]
-    return [safe_path_component(part) for part in parts]
+    return [safe_path_component(_jellyfin_visible_name(part)) for part in parts]
 
 
 def _relative_size(parts: list[str]) -> int:
@@ -405,15 +419,21 @@ def _safe_indexed_path(path_text: object, strm_root: str) -> Path | None:
 
 
 def _strm_target(file: GuangYaFile, rel_dir: str, strm_root: str) -> Path:
+    # 本地 STRM 使用媒体主文件名，而不是 ``.mkv.strm`` 双扩展名。
+    # 原始容器类型仍保留在 STRM 内容的 /playgy/.../{filename} URL 中。
+    visible_name = _jellyfin_visible_name(file.name)
+    suffix = Path(visible_name).suffix
+    stem = visible_name[:-len(suffix)] if suffix else visible_name
     return _target_path(
         strm_root,
         rel_dir,
-        safe_path_component(file.name, extra_suffix=".strm"),
+        safe_path_component(stem, extra_suffix=".strm"),
     )
 
 
 def _metadata_target(file: GuangYaFile, rel_dir: str, strm_root: str) -> Path:
-    return _target_path(strm_root, rel_dir, safe_path_component(file.name))
+    visible_name = _jellyfin_visible_name(file.name)
+    return _target_path(strm_root, rel_dir, safe_path_component(visible_name))
 
 
 def _metadata_queue_payload(
