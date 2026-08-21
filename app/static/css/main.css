@@ -6160,9 +6160,34 @@ html[data-subscription-initial-tab="runs"] #subscriptionPanelRuns { display: blo
     .subscription-section-toolbar { gap: 10px; }
     .subscription-section-toolbar .subscription-rss-create { width: 38px; min-width: 38px; padding: 0; font-size: 0; }
     .subscription-section-toolbar .subscription-rss-create svg { width: 16px; height: 16px; }
-    .rss-sub-actions { width: 100%; justify-content: flex-end; }
+    .subscription-rss-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .subscription-rss-stats .stat-card { min-width: 0; min-height: 88px; padding: 12px; }
+    .subscription-rss-stats .stat-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .subscription-rss-stats .stat-value { margin-block: 6px 2px; font-size: 23px; }
+    .subscription-rss-card,
+    .rss-sub-card,
+    .rss-entry-card { min-width: 0; }
+    .rss-sub-card { padding: 12px; }
+    .rss-sub-left,
+    .rss-sub-details,
+    .rss-sub-title-row { max-width: 100%; }
+    .rss-sub-title-row { flex-wrap: wrap; }
+    .rss-sub-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }
     .rss-sub-actions .rss-btn:not(.rss-sub-toggle) { width: 36px; min-width: 36px; padding: 0; }
     .rss-sub-actions .rss-btn:not(.rss-sub-toggle) span { display: none; }
+    .rss-sub-body-row { align-items: stretch; }
+    .rss-sub-url-inline { width: 100%; flex-basis: 100%; }
+    .rss-sub-url-inline > span:first-of-type { max-width: none; }
+    .rss-sub-meta-group { width: 100%; }
+    .rss-meta-pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+    .rss-entry-head { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+    .rss-entry-filters { grid-template-columns: minmax(0, 1fr); width: 100%; }
+    .rss-batchbar { align-items: stretch; flex-direction: column; }
+    .rss-batch-actions { display: grid; grid-template-columns: minmax(0, 1fr); width: 100%; margin-left: 0; }
+    .rss-batch-actions .jump-btn { width: 100%; min-width: 0; }
+    .rss-entry-card { grid-template-columns: auto 32px minmax(0, 1fr); align-items: start; gap: 9px; padding: 11px; }
+    .rss-entry-actions { grid-column: 2 / -1; width: 100%; justify-content: flex-end; }
+    .rss-entry-actions .rss-btn { width: 100%; min-width: 0; }
     .rss-modal-footer { align-items: stretch; flex-direction: column; }
     .rss-modal-footer-btns { width: 100%; }
     .rss-modal-footer-btns .rss-btn { flex: 1; min-width: 0; }

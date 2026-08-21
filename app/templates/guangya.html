@@ -2,7 +2,7 @@
 {% block title %}光鸭云盘 - MediaFlux{% endblock %}
 {% block page_title %}光鸭云盘{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/guangya-directory-scrape.css') }}?v=20260808a">
+<link rel="stylesheet" href="{{ url_for('static', path='css/guangya-directory-scrape.css') }}?v=20260821a">
 {% endblock %}
 
 {% block content %}
@@ -498,7 +498,11 @@ const gySortModes = new Set([
 ]);
 let gySortMode = localStorage.getItem('mediaflux_gy_sort_mode') || 'name_asc';
 if (!gySortModes.has(gySortMode)) gySortMode = 'name_asc';
+const GY_DIR_RENDER_BATCH_SIZE = 200;
 let gyDirectoryItems = [];
+let gyOrderedDirectoryItems = [];
+let gyRenderedItemCount = 0;
+let gyRenderVersion = 0;
 
 function gyFileExtension(item){
     if(item.is_dir) return 'folder';
@@ -652,18 +656,53 @@ function gyMediaRow(item, isDirectory){
     return row;
 }
 
+function gyLoadMoreRow(remaining){
+    const box = document.createElement('div');
+    box.className = 'gy-dir-load-more';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'jump-btn';
+    button.textContent = `继续加载（剩余 ${remaining.toLocaleString('zh-CN')} 项）`;
+    button.addEventListener('click', ()=>gyRenderNextBatch(gyRenderVersion));
+    box.appendChild(button);
+    return box;
+}
+
+function gyRenderNextBatch(version){
+    if(version !== gyRenderVersion) return;
+    gyDirList.querySelector('.gy-dir-load-more')?.remove();
+    const end = Math.min(gyRenderedItemCount + GY_DIR_RENDER_BATCH_SIZE, gyOrderedDirectoryItems.length);
+    const fragment = document.createDocumentFragment();
+    for(let index = gyRenderedItemCount; index < end; index += 1){
+        const item = gyOrderedDirectoryItems[index];
+        fragment.appendChild(gyMediaRow(item, item.is_dir === true));
+    }
+    gyRenderedItemCount = end;
+    window.renderLucideIcons?.(fragment);
+    gyDirList.appendChild(fragment);
+    if(gyRenderedItemCount < gyOrderedDirectoryItems.length){
+        gyDirList.appendChild(gyLoadMoreRow(gyOrderedDirectoryItems.length - gyRenderedItemCount));
+    }
+}
+
 function gyRenderItems(items){
     gyDirectoryItems = Array.from(items || []);
+    gyRenderVersion += 1;
+    gyRenderedItemCount = 0;
     gyDirList.replaceChildren();
     if(!gyDirectoryItems.length){
+        gyOrderedDirectoryItems = [];
         gyDirList.appendChild(gyEmptyState('空目录'));
         return;
     }
     const dirs = gyDirectoryItems.filter(item=>item.is_dir).sort(gyCompareItems);
     const files = gyDirectoryItems.filter(item=>!item.is_dir).sort(gyCompareItems);
-    dirs.forEach(item=>gyDirList.appendChild(gyMediaRow(item, true)));
-    files.forEach(item=>gyDirList.appendChild(gyMediaRow(item, false)));
-    if(!dirs.length && !files.length) gyDirList.appendChild(gyEmptyState('无文件'));
+    gyOrderedDirectoryItems = [...dirs, ...files];
+    if(!gyOrderedDirectoryItems.length){
+        gyDirList.appendChild(gyEmptyState('无文件'));
+        return;
+    }
+    gyRenderNextBatch(gyRenderVersion);
 }
 
 const gyNavigator = createGuangYaDirectoryNavigator({

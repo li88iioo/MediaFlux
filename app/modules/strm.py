@@ -231,6 +231,8 @@ MAX_RELATIVE_PATH_BYTES = 3072
 MAX_METADATA_WORKERS = 4
 DEFAULT_SCAN_WORKERS = 15
 MAX_SCAN_WORKERS = 32
+DEFAULT_VERIFY_WORKERS = 8
+MAX_VERIFY_WORKERS = 32
 DEFAULT_SCAN_MAX_DIRECTORIES = 100_000
 DEFAULT_SCAN_MAX_ENTRIES = 2_000_000
 DEFAULT_SCAN_MAX_CANDIDATES = 500_000
@@ -584,6 +586,15 @@ def _require_owned_file(path: Path, rows, action: str) -> None:
     )
 
 
+def _require_file_snapshot(path: Path, fingerprint: str, action: str) -> None:
+    """覆盖前复核文件仍是本轮检查到的内容，避免吞掉并发外部写入。"""
+    if fingerprint and _fingerprint_matches(path, fingerprint):
+        return
+    raise _STRMOwnershipError(
+        f"{action}：已停止，本地文件在同步期间再次变化，请重新执行同步 {path}"
+    )
+
+
 def _row_snapshot(row) -> dict:
     return {
         "file_id": str(row["file_id"]),
@@ -652,10 +663,8 @@ def build_play_url(base_url: str, file_id: str, etag: str,
 def _read_strm_state(path: Path, expected_url: str) -> tuple[bool, str]:
     """一次读取同时校验播放地址并计算内容指纹。"""
     try:
-        if not path.is_file():
-            return False, ""
         payload = path.read_bytes()
-    except OSError:
+    except (OSError, ValueError):
         return False, ""
     if payload != expected_url.encode("utf-8"):
         return False, ""
@@ -843,6 +852,29 @@ def _build_video_index_maps(existing_rows: list) -> tuple[dict[str, object], dic
     return by_id, by_path
 
 
+def _current_fingerprint_backfills(
+    items: list[dict[str, object]],
+    existing_by_id: dict[str, object],
+) -> list[dict[str, object]]:
+    """只保留仍与最终内存索引一致的指纹补写，避免旧路径覆盖新快照。"""
+    current_items = []
+    for item in items:
+        current = existing_by_id.get(str(item["file_id"]))
+        if not current:
+            continue
+        if (
+            str(_row_field(current, "strm_path", "") or "")
+            != str(item["strm_path"])
+            or str(_row_field(current, "etag", "") or "")
+            != str(item["etag"] or "")
+            or int(_row_field(current, "size", 0) or 0)
+            != int(item["size"] or 0)
+        ):
+            continue
+        current_items.append(item)
+    return current_items
+
+
 def _update_video_index_snapshot(
     existing_by_id: dict[str, object],
     existing_by_path: dict[str, dict[str, object]],
@@ -903,7 +935,18 @@ def _install_video_candidate(
         current["strm_path"] if current else "", strm_root
     )
     target_owners = list(existing_by_path.get(str(expected), {}).values())
-    _require_owned_file(expected, target_owners, "覆盖 STRM")
+    indexed_target = bool(
+        current
+        and str(current.get("strm_path") or "") == str(expected)
+    )
+    repair_fingerprint = ""
+    if expected.is_file() and indexed_target:
+        # 同 file_id、同目标路径的索引足以证明这是 MediaFlux 管理的 STRM。
+        # 指纹不一致表示文件被误改，应在完整/增量同步中自动修复；但仍记录
+        # 当前实际内容，原子替换前再次复核，避免覆盖同步期间的新外部写入。
+        repair_fingerprint = _content_fingerprint(expected)
+    else:
+        _require_owned_file(expected, target_owners, "覆盖 STRM")
     if previous_path and previous_path != expected:
         _require_owned_file(previous_path, [current], "删除旧 STRM")
     target_backup = _copy_backup(expected)
@@ -917,8 +960,14 @@ def _install_video_candidate(
     try:
         generate_strm(
             file, rel_dir, base_url, strm_root,
-            before_replace=lambda target: _require_owned_file(
-                target, target_owners, "覆盖 STRM"
+            before_replace=(
+                (lambda target: _require_file_snapshot(
+                    target, repair_fingerprint, "修复已索引 STRM"
+                ))
+                if repair_fingerprint
+                else (lambda target: _require_owned_file(
+                    target, target_owners, "覆盖 STRM"
+                ))
             ),
             on_replaced=lambda _target, fingerprint: state.__setitem__(
                 "installed_fingerprint", fingerprint
@@ -1650,6 +1699,7 @@ def _sync_strm_impl(
     deferred_cleanup_actions: list[Callable[[], None]] | None = None,
     metadata_workers: int = MAX_METADATA_WORKERS,
     scan_workers: int | None = None,
+    verify_workers: int | None = None,
     source_name: str = "",
     on_progress=None,
     should_stop: Callable[[], bool] | None = None,
@@ -1666,6 +1716,16 @@ def _sync_strm_impl(
         min(
             int(scan_workers or get_int("STRM_SCAN_WORKERS", DEFAULT_SCAN_WORKERS)),
             MAX_SCAN_WORKERS,
+        ),
+    )
+    verify_worker_count = max(
+        1,
+        min(
+            int(
+                verify_workers
+                or get_int("STRM_VERIFY_WORKERS", DEFAULT_VERIFY_WORKERS)
+            ),
+            MAX_VERIFY_WORKERS,
         ),
     )
     max_directories, max_entries, max_candidates, scan_deadline_seconds = _scan_limits()
@@ -1686,6 +1746,8 @@ def _sync_strm_impl(
         "request_p99_ms": 0.0,
         "scan_workers_configured": scan_worker_count,
         "scan_workers_peak": 0, "scan_queue_peak": 0,
+        "verify_workers_configured": verify_worker_count,
+        "verified_candidates": 0, "verify_prefiltered": 0,
         "scan_incomplete": False, "scan_limit_reason": "",
         "generate_elapsed_seconds": 0.0, "metadata_elapsed_seconds": 0.0,
         "cleanup_elapsed_seconds": 0.0,
@@ -1928,86 +1990,164 @@ def _sync_strm_impl(
         stats["skipped"] += duplicate_count
     generate_started = time.monotonic()
     progress.emit("generate", 0, video_progress_total, "生成 STRM")
-    for video_completed, target_text in enumerate(sorted(video_candidates), 1):
-        file, rel_dir, _duplicate_count = video_candidates[target_text]
-        expected = Path(target_text)
-        if stop_requested("generate"):
-            _flush_failure_resolutions(
-                stats, source_dir_id, pending_resolutions, "generate"
-            )
-            stats["generate_elapsed_seconds"] = round(
-                time.monotonic() - generate_started, 3
-            )
-            return stats
-        current = existing_by_id.get(str(file.file_id))
-        expected_url = build_play_url(
-            base_url, file.file_id, file.etag, file.size, file.name
-        )
-        content_matches, content_fingerprint = _read_strm_state(
-            expected, expected_url
-        )
-        is_current = bool(
-            current
-            and str(current["strm_path"] or "") == str(expected)
-            and str(current["etag"] or "") == str(file.etag or "")
-            and int(current["size"] or 0) == int(file.size or 0)
-            and content_matches
-        )
-        if is_current:
-            if str(_row_field(current, "content_fingerprint", "") or "") != content_fingerprint:
-                fingerprint_backfills.append({
-                    "file_id": file.file_id,
-                    "etag": file.etag,
-                    "size": file.size,
-                    "filename": file.name,
-                    "strm_path": str(expected),
-                    "content_fingerprint": content_fingerprint,
-                })
-                _update_video_index_snapshot(
-                    existing_by_id, existing_by_path, file, expected,
-                    content_fingerprint,
+    sorted_video_targets = sorted(video_candidates)
+    with ThreadPoolExecutor(
+        max_workers=verify_worker_count,
+        thread_name_prefix="strm-verify",
+    ) as verify_executor:
+        for batch_start in range(0, video_progress_total, verify_worker_count):
+            prepared_candidates = []
+            for target_text in sorted_video_targets[
+                batch_start:batch_start + verify_worker_count
+            ]:
+                file, rel_dir, _duplicate_count = video_candidates[target_text]
+                expected = Path(target_text)
+                current = existing_by_id.get(str(file.file_id))
+                expected_url = build_play_url(
+                    base_url, file.file_id, file.etag, file.size, file.name
                 )
-            seen_ids.add(str(file.file_id))
-            stats["skipped"] += 1
-            pending_resolutions["generate"].add(str(file.file_id))
-            progress.emit("generate", video_completed, video_progress_total, "生成 STRM")
-            continue
-        try:
-            existed_before = expected.is_file()
-            install_result = _install_video_candidate(
-                file, rel_dir, expected, base_url, strm_root, source_key,
-                existing_by_id, existing_by_path,
-            )
-            cleaned, installed_fingerprint = _video_install_result(
-                install_result, expected
-            )
-            stats["cleaned"] += cleaned
-            seen_ids.add(str(file.file_id))
-            stats["generated"] += 1
-            stats["updated" if existed_before else "created"] += 1
-            pending_resolutions["generate"].add(str(file.file_id))
-            _track_change(stats, "generated", expected, strm_root)
-            _update_video_index_snapshot(
-                existing_by_id, existing_by_path, file, expected,
-                installed_fingerprint,
-            )
-        except Exception as exc:
-            logger.warning(f"生成 STRM 失败 {file.name}: {exc}")
-            stats["failed"] += 1
-            consistency_errors += 1
-            _append_error_sample(stats, "生成 STRM", file.name, exc)
-            _record_failure(
-                source_id=source_dir_id, source_name=display_source_name, file=file,
-                action="generate", rel_dir=rel_dir, target=expected,
-                strm_root=strm_root, error=exc,
-            )
-            append_change(
-                stats, relative_change("failed", expected, strm_root, error=exc)
-            )
-        progress.emit("generate", video_completed, video_progress_total, "生成 STRM")
+                index_matches = bool(
+                    current
+                    and str(current["strm_path"] or "") == str(expected)
+                    and str(current["etag"] or "") == str(file.etag or "")
+                    and int(current["size"] or 0) == int(file.size or 0)
+                )
+                verify_future = (
+                    verify_executor.submit(
+                        _read_strm_state, expected, expected_url
+                    )
+                    if index_matches
+                    else None
+                )
+                if verify_future is None:
+                    stats["verify_prefiltered"] += 1
+                prepared_candidates.append((
+                    target_text, file, rel_dir, expected, current,
+                    index_matches, verify_future,
+                ))
+
+            # 先等待本批所有只读校验结束，再开始任何文件替换，避免同批
+            # 路径迁移或冲突清理与仍在执行的读取互相干扰。
+            verification_results = {}
+            for prepared in prepared_candidates:
+                target_text = prepared[0]
+                verify_future = prepared[-1]
+                if verify_future is None:
+                    continue
+                verification_results[target_text] = verify_future.result()
+                stats["verified_candidates"] += 1
+
+            for batch_offset, prepared in enumerate(prepared_candidates, 1):
+                (
+                    target_text, file, rel_dir, expected, current,
+                    index_matches, verify_future,
+                ) = prepared
+                video_completed = batch_start + batch_offset
+                if stop_requested("generate"):
+                    for remaining in prepared_candidates[batch_offset - 1:]:
+                        future = remaining[-1]
+                        if future is not None:
+                            future.cancel()
+                    _flush_failure_resolutions(
+                        stats, source_dir_id, pending_resolutions, "generate"
+                    )
+                    stats["generate_elapsed_seconds"] = round(
+                        time.monotonic() - generate_started, 3
+                    )
+                    return stats
+                if verify_future is not None:
+                    content_matches, content_fingerprint = (
+                        verification_results[target_text]
+                    )
+                else:
+                    content_matches, content_fingerprint = False, ""
+                # 同一批内更早候选可能更新或清理冲突索引，因此提交判定必须
+                # 重新读取内存快照；并发线程只负责文件读取，不拥有业务状态。
+                current = existing_by_id.get(str(file.file_id))
+                index_matches = bool(
+                    current
+                    and str(current["strm_path"] or "") == str(expected)
+                    and str(current["etag"] or "") == str(file.etag or "")
+                    and int(current["size"] or 0) == int(file.size or 0)
+                )
+                is_current = bool(index_matches and content_matches)
+                if is_current:
+                    if str(
+                        _row_field(current, "content_fingerprint", "") or ""
+                    ) != content_fingerprint:
+                        fingerprint_backfills.append({
+                            "file_id": file.file_id,
+                            "etag": file.etag,
+                            "size": file.size,
+                            "filename": file.name,
+                            "strm_path": str(expected),
+                            "content_fingerprint": content_fingerprint,
+                        })
+                        _update_video_index_snapshot(
+                            existing_by_id, existing_by_path, file, expected,
+                            content_fingerprint,
+                        )
+                    seen_ids.add(str(file.file_id))
+                    stats["skipped"] += 1
+                    pending_resolutions["generate"].add(str(file.file_id))
+                    progress.emit(
+                        "generate", video_completed, video_progress_total,
+                        "生成 STRM",
+                    )
+                    continue
+                try:
+                    existed_before = expected.is_file()
+                    install_result = _install_video_candidate(
+                        file, rel_dir, expected, base_url, strm_root, source_key,
+                        existing_by_id, existing_by_path,
+                    )
+                    cleaned, installed_fingerprint = _video_install_result(
+                        install_result, expected
+                    )
+                    stats["cleaned"] += cleaned
+                    seen_ids.add(str(file.file_id))
+                    stats["generated"] += 1
+                    stats["updated" if existed_before else "created"] += 1
+                    pending_resolutions["generate"].add(str(file.file_id))
+                    _track_change(stats, "generated", expected, strm_root)
+                    _update_video_index_snapshot(
+                        existing_by_id, existing_by_path, file, expected,
+                        installed_fingerprint,
+                    )
+                except Exception as exc:
+                    logger.warning(f"生成 STRM 失败 {file.name}: {exc}")
+                    stats["failed"] += 1
+                    consistency_errors += 1
+                    _append_error_sample(stats, "生成 STRM", file.name, exc)
+                    _record_failure(
+                        source_id=source_dir_id,
+                        source_name=display_source_name,
+                        file=file,
+                        action="generate",
+                        rel_dir=rel_dir,
+                        target=expected,
+                        strm_root=strm_root,
+                        error=exc,
+                    )
+                    append_change(
+                        stats,
+                        relative_change(
+                            "failed", expected, strm_root, error=exc
+                        ),
+                    )
+                progress.emit(
+                    "generate", video_completed, video_progress_total,
+                    "生成 STRM",
+                )
 
     if fingerprint_backfills:
-        db.upsert_strm_index_batch(source_key, fingerprint_backfills)
+        # 同一远端 file_id 若在本轮后续候选中发生路径迁移，较早缓存的
+        # 指纹补写不得覆盖新索引；仅提交仍与最终内存快照一致的项目。
+        current_backfills = _current_fingerprint_backfills(
+            fingerprint_backfills, existing_by_id
+        )
+        if current_backfills:
+            db.upsert_strm_index_batch(source_key, current_backfills)
     _flush_failure_resolutions(stats, source_dir_id, pending_resolutions, "generate")
     stats["generate_elapsed_seconds"] = round(
         time.monotonic() - generate_started, 3
@@ -2520,6 +2660,7 @@ def sync_strm(
     deferred_cleanup_actions: list[Callable[[], None]] | None = None,
     metadata_workers: int = MAX_METADATA_WORKERS,
     scan_workers: int | None = None,
+    verify_workers: int | None = None,
     source_name: str = "",
     on_progress=None,
     should_stop: Callable[[], bool] | None = None,
@@ -2543,6 +2684,7 @@ def sync_strm(
             deferred_cleanup_actions=deferred_cleanup_actions,
             metadata_workers=metadata_workers,
             scan_workers=scan_workers,
+            verify_workers=verify_workers,
             source_name=source_name,
             on_progress=on_progress,
             should_stop=should_stop,

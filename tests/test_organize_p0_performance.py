@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -9,7 +11,7 @@ from app import database as db
 from app.clients.guangya import GuangYaFile
 from app.modules.organize import OrganizeRules, Organizer, _OrganizeAuditWriteError
 from app.modules.scraper import TMDBScraper
-from app.modules.strm import sync_strm
+from app.modules.strm import _current_fingerprint_backfills, sync_strm
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -251,6 +253,125 @@ class StrmBatchPerformanceTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(db.summarize_strm_failures()["open"], 0)
 
+    def test_full_sync_prefilters_changed_index_before_local_read(self):
+        source_id = "verify-prefilter-source"
+        original = GuangYaFile(
+            "video", "Movie.mkv", False, 100, "etag-1", source_id
+        )
+        changed = GuangYaFile(
+            "video", "Movie.mkv", False, 200, "etag-2", source_id
+        )
+        with tempfile.TemporaryDirectory() as root:
+            sync_strm(
+                source_id, "http://example", root,
+                client=_TreeClient(source_id, [original]), clean_invalid=False,
+            )
+            with patch(
+                "app.modules.strm._read_strm_state",
+                side_effect=AssertionError("索引已变化时不应预读旧 STRM"),
+            ):
+                stats = sync_strm(
+                    source_id, "http://example", root,
+                    client=_TreeClient(source_id, [changed]),
+                    clean_invalid=False,
+                )
+
+        self.assertEqual(stats["generated"], 1)
+        self.assertEqual(stats["updated"], 1)
+        self.assertEqual(stats["verified_candidates"], 0)
+        self.assertEqual(stats["verify_prefiltered"], 1)
+
+    def test_full_sync_verifies_stable_strm_with_bounded_concurrency(self):
+        source_id = "verify-concurrency-source"
+        files = [
+            GuangYaFile(
+                f"video-{index}", f"Episode-{index}.mkv", False,
+                100 + index, f"etag-{index}", source_id,
+            )
+            for index in range(8)
+        ]
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        with tempfile.TemporaryDirectory() as root:
+            first = sync_strm(
+                source_id, "http://example", root,
+                client=_TreeClient(source_id, files), clean_invalid=False,
+            )
+            from app.modules import strm as strm_module
+            original_read = strm_module._read_strm_state
+
+            def tracked_read(path, expected_url):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    time.sleep(0.02)
+                    return original_read(path, expected_url)
+                finally:
+                    with lock:
+                        active -= 1
+
+            with patch(
+                "app.modules.strm._read_strm_state", side_effect=tracked_read
+            ) as read_state:
+                second = sync_strm(
+                    source_id, "http://example", root,
+                    client=_TreeClient(source_id, files), clean_invalid=False,
+                    verify_workers=4,
+                )
+
+        self.assertEqual(first["generated"], len(files))
+        self.assertEqual(second["generated"], 0)
+        self.assertEqual(second["skipped"], len(files))
+        self.assertEqual(second["verify_workers_configured"], 4)
+        self.assertEqual(second["verified_candidates"], len(files))
+        self.assertEqual(second["verify_prefiltered"], 0)
+        self.assertEqual(read_state.call_count, len(files))
+        self.assertGreaterEqual(peak, 2)
+        self.assertLessEqual(peak, 4)
+
+    def test_stale_fingerprint_backfill_does_not_overwrite_later_index(self):
+        source_id = "verify-stale-backfill-source"
+        source_key = f"guangya:{source_id}"
+        first = GuangYaFile(
+            "video", "A.mkv", False, 100, "etag", source_id
+        )
+        second = GuangYaFile(
+            "video", "B.mkv", False, 100, "etag", source_id
+        )
+        with tempfile.TemporaryDirectory() as root:
+            first_path = Path(root) / "first.strm"
+            first_path.write_text("managed", encoding="utf-8")
+            db.upsert_strm_index(
+                source_key, first.file_id, first.etag, first.size,
+                first.name, str(first_path), "",
+            )
+            stale_backfill = {
+                "file_id": first.file_id,
+                "etag": first.etag,
+                "size": first.size,
+                "filename": first.name,
+                "strm_path": str(first_path),
+                "content_fingerprint": "sha256:stale",
+            }
+            current_snapshot = {
+                "file_id": second.file_id,
+                "etag": second.etag,
+                "size": second.size,
+                "filename": second.name,
+                "strm_path": str(Path(root) / "second.strm"),
+                "content_fingerprint": "sha256:new",
+            }
+            existing_by_id = {second.file_id: current_snapshot}
+            current_backfills = _current_fingerprint_backfills(
+                [stale_backfill], existing_by_id
+            )
+
+        self.assertEqual(current_backfills, [])
+
     def test_strm_stage_timings_are_exposed(self):
         source_id = "stage-timing-source"
         client = _TreeClient(source_id, [
@@ -272,3 +393,6 @@ class StrmBatchPerformanceTests(IsolatedDatabaseTestCase):
         ):
             self.assertIn(key, stats)
             self.assertGreaterEqual(stats[key], 0)
+        self.assertEqual(stats["verify_workers_configured"], 8)
+        self.assertEqual(stats["verified_candidates"], 0)
+        self.assertEqual(stats["verify_prefiltered"], 1)

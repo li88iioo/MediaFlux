@@ -617,7 +617,8 @@ class STRMScheduler:
             "request_p50_ms": 0.0, "request_p95_ms": 0.0,
             "request_p99_ms": 0.0,
             "scan_workers_configured": 0, "scan_workers_peak": 0,
-            "scan_queue_peak": 0,
+            "scan_queue_peak": 0, "verify_workers_configured": 0,
+            "verified_candidates": 0, "verify_prefiltered": 0,
             "scan_elapsed_seconds": 0.0, "generate_elapsed_seconds": 0.0,
             "metadata_elapsed_seconds": 0.0, "cleanup_elapsed_seconds": 0.0,
             "refresh_elapsed_seconds": 0.0,
@@ -649,9 +650,10 @@ class STRMScheduler:
             if key in {
                 "request_p50_ms", "request_p95_ms", "request_p99_ms",
                 "scan_workers_configured", "scan_workers_peak", "scan_queue_peak",
+                "verify_workers_configured",
             }:
                 aggregate[key] = max(float(aggregate[key]), float(value))
-                if key.startswith("scan_"):
+                if key.startswith("scan_") or key.endswith("_configured"):
                     aggregate[key] = int(aggregate[key])
                 continue
             aggregate[key] += (

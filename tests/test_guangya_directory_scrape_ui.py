@@ -131,7 +131,7 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
             "updated_desc", "updated_asc", "type_asc", "size_desc", "size_asc",
         ):
             self.assertIn(f'value="{value}"', response.text)
-        self.assertIn("guangya-directory-scrape.css?v=20260808a", response.text)
+        self.assertIn("guangya-directory-scrape.css?v=20260821a", response.text)
         self.assertIn("guangya-directory-scrape.js?v=20260810a", response.text)
         self.assertIn('aria-label="列表视图" aria-pressed="true"', response.text)
         self.assertIn('aria-label="网格视图" aria-pressed="false"', response.text)
@@ -143,6 +143,18 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
         self.assertIn("void dirList.offsetWidth", response.text)
         self.assertIn("dirList.classList.remove('is-view-switching')", response.text)
         self.assertNotIn("dirList.className =", response.text)
+
+    def test_large_directories_render_in_bounded_batches(self):
+        response = self.client.get("/guangya")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("const GY_DIR_RENDER_BATCH_SIZE = 200", response.text)
+        self.assertIn("function gyRenderNextBatch(version)", response.text)
+        self.assertIn("document.createDocumentFragment()", response.text)
+        self.assertIn("gyDirList.querySelector('.gy-dir-load-more')?.remove()", response.text)
+        self.assertIn("继续加载（剩余 ${remaining.toLocaleString('zh-CN')} 项）", response.text)
+        self.assertNotIn("dirs.forEach(item=>gyDirList.appendChild", response.text)
+        self.assertNotIn("files.forEach(item=>gyDirList.appendChild", response.text)
 
     def test_cloud_file_rows_keep_the_complete_original_filename(self):
         response = self.client.get("/guangya")
@@ -349,7 +361,8 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
         self.assertIn("localStorage.getItem('mediaflux_gy_sort_mode')", html)
         self.assertIn("gyDirectoryItems.filter(item=>item.is_dir).sort(gyCompareItems)", html)
         self.assertIn("gyDirectoryItems.filter(item=>!item.is_dir).sort(gyCompareItems)", html)
-        self.assertIn("files.forEach(item=>gyDirList.appendChild(gyMediaRow(item, false)))", html)
+        self.assertIn("gyOrderedDirectoryItems = [...dirs, ...files]", html)
+        self.assertIn("gyRenderNextBatch(gyRenderVersion)", html)
         self.assertNotIn("files.slice(0, 20)", html)
         self.assertNotIn("个文件未显示", html)
         self.assertIn("created_at", html)

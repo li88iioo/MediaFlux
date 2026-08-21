@@ -15,6 +15,7 @@ from app.modules.organize_tasks import OrganizeTaskManager
 from app.modules.scheduler import STRMScheduler
 from app.modules.strm import (
     STRM_SUBDIR,
+    build_play_url,
     clean_invalid_strm,
     clean_retired_strm_sources,
     generate_strm,
@@ -77,30 +78,53 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             self.assertEqual(len(db.list_strm_index(f"guangya-meta:{source_id}")), 1)
             self.assertTrue(any(row["source_id"] == source_id for row in db.list_strm_retired_sources()))
 
-    def test_sync_preserves_locally_modified_strm_instead_of_overwriting(self) -> None:
+    def test_sync_repairs_locally_modified_indexed_strm(self) -> None:
         source_id = f"modified-{uuid.uuid4().hex}"
-        original = GuangYaFile("video-1", "Movie.mkv", False, 1024, "etag-1", source_id)
-        changed = GuangYaFile("video-1", "Movie.mkv", False, 2048, "etag-2", source_id)
+        video = GuangYaFile("video-1", "Movie.mkv", False, 1024, "etag-1", source_id)
         source_key = f"guangya:{source_id}"
         with tempfile.TemporaryDirectory() as root:
             first = sync_strm(
                 source_id, "http://localhost:1258", root,
-                client=_TreeClient({source_id: [original]}),
+                client=_TreeClient({source_id: [video]}),
             )
             target = next((Path(root) / STRM_SUBDIR).rglob("*.strm"))
-            target.write_text("user-owned", encoding="utf-8")
+            target.write_text("broken-address", encoding="utf-8")
 
             second = sync_strm(
                 source_id, "http://localhost:1258", root,
-                client=_TreeClient({source_id: [changed]}),
+                client=_TreeClient({source_id: [video]}),
             )
             row = db.list_strm_index(source_key)[0]
+            expected = build_play_url(
+                "http://localhost:1258", video.file_id, video.etag,
+                video.size, video.name,
+            )
 
             self.assertEqual(first["generated"], 1)
-            self.assertEqual(second["generated"], 0)
-            self.assertEqual(second["failed"], 1)
-            self.assertEqual(target.read_text(encoding="utf-8"), "user-owned")
+            self.assertEqual(second["generated"], 1)
+            self.assertEqual(second["updated"], 1)
+            self.assertEqual(second["failed"], 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), expected)
             self.assertEqual(row["etag"], "etag-1")
+            self.assertEqual(row["content_fingerprint"], self._fingerprint(expected.encode()))
+
+    def test_sync_preserves_unknown_same_name_strm_without_index(self) -> None:
+        source_id = f"unknown-{uuid.uuid4().hex}"
+        video = GuangYaFile("video-1", "Movie.mkv", False, 1024, "etag-1", source_id)
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+            target.parent.mkdir(parents=True)
+            target.write_text("user-owned", encoding="utf-8")
+
+            stats = sync_strm(
+                source_id, "http://localhost:1258", root,
+                client=_TreeClient({source_id: [video]}),
+            )
+
+            self.assertEqual(stats["generated"], 0)
+            self.assertEqual(stats["failed"], 1)
+            self.assertEqual(target.read_text(encoding="utf-8"), "user-owned")
+            self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
 
     def test_incremental_rename_preserves_modified_old_path_and_index(self) -> None:
         from app.modules.strm import sync_strm_incremental

@@ -31,6 +31,15 @@ class RSSMediaDedupeUITests(unittest.TestCase):
         self.assertIn('.subscription-section-toolbar .subscription-rss-create { width: 38px;', self.css)
         self.assertIn('.rss-sub-actions .rss-btn:not(.rss-sub-toggle) span { display: none; }', self.css)
 
+    def test_rss_panel_reflows_without_mobile_horizontal_overflow(self) -> None:
+        self.assertIn('.subscription-rss-stats { grid-template-columns: repeat(2, minmax(0, 1fr));', self.css)
+        self.assertIn('.rss-sub-actions { width: 100%; justify-content: flex-end; flex-wrap: wrap; }', self.css)
+        self.assertIn('.rss-sub-url-inline { width: 100%; flex-basis: 100%; }', self.css)
+        self.assertIn('.rss-entry-head { grid-template-columns: minmax(0, 1fr);', self.css)
+        self.assertIn('.rss-batch-actions { display: grid; grid-template-columns: minmax(0, 1fr);', self.css)
+        self.assertIn('.rss-entry-card { grid-template-columns: auto 32px minmax(0, 1fr);', self.css)
+        self.assertIn('.rss-entry-actions { grid-column: 2 / -1; width: 100%;', self.css)
+
     def test_rss_lists_keep_cards_static_and_animate_numbers_only(self) -> None:
         self.assertIn("function lockRssListHeight(list)", self.template)
         self.assertIn("requestAnimationFrame(()=>requestAnimationFrame", self.template)

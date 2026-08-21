@@ -342,6 +342,16 @@
 .gy-dir-row:hover {
     background: var(--bg-card-hover);
 }
+.gy-dir-load-more {
+    display: flex;
+    justify-content: center;
+    padding: 14px;
+    border-top: 1px solid var(--border-soft);
+}
+#gyDirList.is-grid .gy-dir-load-more {
+    grid-column: 1 / -1;
+    border: 0;
+}
 
 .gy-dir-summary {
     flex: 1;
