@@ -314,7 +314,66 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(result["candidate_count"], 1)
             self.assertEqual(result["queued_count"], 1)
             task = db.get_local_media_task(result["task_ids"][0], owner="admin")
-            self.assertEqual(Path(task.content_path), media_dir)
+            self.assertEqual(Path(task.content_path), media_dir / "Movie.2026.mkv")
+
+    def test_manual_scan_splits_mixed_collection_into_independent_media_units(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "downloads"
+            target_root = root / "library"
+            source_root.mkdir()
+            target_root.mkdir()
+
+            loose_root = source_root / "Loose.Movie.2026.mkv"
+            loose_root.write_bytes(b"movie")
+            movie_dir = source_root / "Movie (2026)"
+            movie_dir.mkdir()
+            (movie_dir / "Movie.2026.mkv").write_bytes(b"movie")
+
+            anime = source_root / "动漫"
+            anime.mkdir()
+            loose_anime = anime / "Loose.Anime.S01E03.mkv"
+            loose_anime.write_bytes(b"episode")
+            show_a = anime / "Show A (2026) {tmdb-101}"
+            show_b = anime / "Show B (2026) {tmdb-102}"
+            (show_a / "Season 01").mkdir(parents=True)
+            (show_b / "Season 02").mkdir(parents=True)
+            (show_a / "Season 01" / "Show.A.S01E01.mkv").write_bytes(b"episode")
+            (show_b / "Season 02" / "Show.B.S02E02.mkv").write_bytes(b"episode")
+
+            wrapper = source_root / "Unsorted"
+            wrapped_show = wrapper / "Show C (2026)"
+            (wrapped_show / "Season 01").mkdir(parents=True)
+            (wrapped_show / "Season 01" / "Show.C.S01E04.mkv").write_bytes(b"episode")
+
+            source_id = db.create_local_media_source(
+                name="混合下载", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), enabled=False, scan_enabled=False,
+                stable_seconds=0, owner="admin",
+            )
+            db.upsert_local_library_target(
+                source_id, "default", str(target_root), owner="admin",
+            )
+
+            result = LocalMediaScheduler(service=FakeService()).enqueue_manual_scan_candidates()
+
+            expected = {
+                loose_root,
+                movie_dir / "Movie.2026.mkv",
+                loose_anime,
+                show_a / "Season 01" / "Show.A.S01E01.mkv",
+                show_b / "Season 02" / "Show.B.S02E02.mkv",
+                wrapped_show / "Season 01" / "Show.C.S01E04.mkv",
+            }
+            tasks = [
+                db.get_local_media_task(task_id, owner="admin")
+                for task_id in result["task_ids"]
+            ]
+            self.assertEqual(result["candidate_count"], len(expected))
+            self.assertEqual(result["queued_count"], len(expected))
+            self.assertEqual({Path(task.content_path) for task in tasks}, expected)
+            self.assertNotIn(anime, {Path(task.content_path) for task in tasks})
+            self.assertNotIn(wrapper, {Path(task.content_path) for task in tasks})
 
     def test_manual_scan_skips_preview_and_missing_targets_without_false_errors(self):
         with tempfile.TemporaryDirectory() as root_raw:

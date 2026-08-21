@@ -75,6 +75,28 @@ class LocalStorageTests(unittest.TestCase):
             self.assertFalse(adapter.contains_video(non_media / "readme.txt"))
             self.assertTrue(adapter.contains_video(nested_media / "Show.S01E01.mkv"))
 
+    def test_single_video_scan_includes_only_its_uniquely_matched_subtitles(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            episode_one = root / "Show.S01E01.mkv"
+            episode_two = root / "Show.S01E02.mkv"
+            episode_one.write_bytes(b"episode-one")
+            episode_two.write_bytes(b"episode-two")
+            (root / "Show.S01E01.zh-Hans.ass").write_bytes(b"subtitle-one")
+            (root / "Show.S01E02.en.srt").write_bytes(b"subtitle-two")
+            (root / "unmatched.srt").write_bytes(b"unmatched")
+            (root / "poster.jpg").write_bytes(b"poster")
+
+            snapshots = LocalFilesystemAdapter(root).scan(episode_one)
+
+            self.assertEqual(
+                [(item.path.name, item.role) for item in snapshots],
+                [
+                    ("Show.S01E01.mkv", "video"),
+                    ("Show.S01E01.zh-Hans.ass", "subtitle"),
+                ],
+            )
+
     def test_contains_video_distinguishes_missing_and_unreadable_paths(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)

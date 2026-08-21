@@ -11,6 +11,7 @@ from typing import Iterable
 
 from app.modules.local_path_mapping import PathMappingError, assert_within
 from app.modules.organize import METADATA_EXTS, VIDEO_EXTS
+from app.modules.subtitle_identity import plan_subtitle_companions
 
 
 class LocalStorageError(RuntimeError):
@@ -67,6 +68,13 @@ class LocalFileSnapshot:
     @property
     def identity(self) -> tuple[int, int, int, int]:
         return self.size, self.mtime_ns, self.device, self.inode
+
+
+@dataclass(frozen=True)
+class _SiblingMediaFile:
+    path: Path
+    name: str
+    file_id: str
 
 
 class LocalFilesystemAdapter:
@@ -221,7 +229,7 @@ class LocalFilesystemAdapter:
             raise LocalStorageError("禁止扫描符号链接")
         candidates: list[Path] = []
         if start.is_file():
-            candidates = [start]
+            candidates = self._single_video_candidates(start)
         elif start.is_dir():
             base_depth = len(start.parts)
             for current_root, dirs, files in os.walk(start, followlinks=False):
@@ -256,6 +264,48 @@ class LocalFilesystemAdapter:
                 continue
             snapshots.append(snapshot)
         return snapshots
+
+    def _single_video_candidates(self, video: Path) -> list[Path]:
+        """单视频任务只附带能唯一匹配该视频的同级字幕。"""
+        if self.role_for(video) != "video":
+            return [video]
+        try:
+            entries = sorted(video.parent.iterdir(), key=lambda item: item.name.casefold())
+        except OSError:
+            return [video]
+
+        videos: list[_SiblingMediaFile] = []
+        subtitles: list[_SiblingMediaFile] = []
+        for candidate in entries:
+            if self.is_temporary(candidate):
+                continue
+            try:
+                info = candidate.lstat()
+            except OSError:
+                continue
+            if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+                continue
+            if info.st_size <= 0:
+                continue
+            role = self.role_for(candidate)
+            item = _SiblingMediaFile(
+                path=candidate,
+                name=candidate.name,
+                file_id=candidate.as_posix(),
+            )
+            if role == "video" and info.st_size >= self.min_video_size:
+                videos.append(item)
+            elif role == "subtitle":
+                subtitles.append(item)
+
+        selected_id = video.as_posix()
+        subtitle_result = plan_subtitle_companions(videos, subtitles)
+        matched = [
+            item.file.path
+            for item in subtitle_result.plans
+            if item.video_file_id == selected_id
+        ]
+        return [video, *matched]
 
     @staticmethod
     def same_filesystem(source: Path, target: Path) -> bool:

@@ -110,12 +110,26 @@ def _source_payload(source) -> dict:
     }
 
 
+def _task_display_name(task) -> str:
+    content_name = Path(task.content_path).name
+    error = str(getattr(task, "error", "") or "")
+    missing_episode_marker = "剧集文件缺少集数，不能自动归档:"
+    if str(getattr(task, "status", "") or "") == "requires_manual" and missing_episode_marker in error:
+        failed_video = error.partition(missing_episode_marker)[2].strip()
+        if failed_video:
+            return Path(failed_video).name
+    return str(getattr(task, "title", "") or "").strip() or content_name
+
+
 def _task_payload(task) -> dict:
     source = db.get_local_media_source(task.source_id, owner=_OWNER)
     return {
         "id": task.id, "source_id": task.source_id,
         "source_name": source.name if source else "已删除来源",
         "content_name": Path(task.content_path).name,
+        "display_name": _task_display_name(task),
+        "title": str(getattr(task, "title", "") or ""),
+        "year": str(getattr(task, "year", "") or ""),
         "trigger": task.trigger, "status": task.status, "attempts": task.attempts,
         "tmdb_id": getattr(task, "tmdb_id", ""), "media_type": getattr(task, "media_type", ""),
         "season": getattr(task, "season_override", None),
@@ -496,7 +510,7 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
         for source in db.list_local_media_sources(owner=_OWNER):
             targets = db.list_local_library_targets(source.id, owner=_OWNER)
             organize_ready = bool(targets) and source.mode != "preview_only"
-            candidates, error = discover_local_media_candidates(source)
+            candidates, error, _ = discover_local_media_directory_candidates(source)
             if error:
                 source_results.append({
                     "id": source.id, "name": source.name, "count": 0, "error": error,

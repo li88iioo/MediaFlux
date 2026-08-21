@@ -465,6 +465,29 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         scheduler.start.assert_called_once_with()
         scheduler.enqueue_manual_scan_candidates.assert_called_once_with(silent=True)
 
+    def test_requires_manual_directory_task_displays_the_specific_failed_episode(self):
+        self.login()
+        source_id = db.create_local_media_source(
+            name="本地下载", qb_profile="", qb_path_prefix="",
+            local_root=str(self.local_root), owner="admin",
+        )
+        show = self.local_root / "Show (2026)"
+        show.mkdir()
+        task_id = db.create_local_media_task(
+            source_id, "", str(show), owner="admin", trigger="scan",
+        )
+        db.update_local_media_task(
+            task_id, owner="admin", status="requires_manual",
+            error="剧集文件缺少集数，不能自动归档: Show.S01.mkv",
+        )
+
+        response = self.client.get("/api/local-media/tasks?status=requires_manual")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        task = response.json()["tasks"][0]
+        self.assertEqual(task["content_name"], "Show (2026)")
+        self.assertEqual(task["display_name"], "Show.S01.mkv")
+
     def test_requires_manual_task_inspection_delegates_to_service(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}
         service = Mock()

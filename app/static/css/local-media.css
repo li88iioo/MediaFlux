@@ -1361,7 +1361,7 @@ body.lm-scrape-open { overflow: hidden; }
     background: var(--footer-surface);
 }
 .lm-dialog-actions .jump-btn,
-.lm-dialog-actions .btn { min-width: 132px; min-height: var(--modal-action-height); padding-inline: 18px; border-radius: var(--modal-action-radius); }
+.lm-dialog-actions .btn { width: auto; min-width: 132px; min-height: var(--modal-action-height); padding-inline: 18px; border-radius: var(--modal-action-radius); }
 .lm-source-dialog .form-input,
 .lm-source-dialog .form-select,
 .lm-source-dialog .form-textarea { border-radius: var(--modal-control-radius); }

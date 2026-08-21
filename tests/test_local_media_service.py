@@ -414,7 +414,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertIn("S02E07", result["preview"]["plans"][0]["target_name"])
             self.assertTrue(episode.exists())
 
-    def test_directory_scope_rejects_one_episode_override(self):
+    def test_single_video_directory_allows_one_episode_override(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source_root = root / "downloads-directory-override"; target_root = root / "tv"
             show = source_root / "Show"
@@ -426,7 +426,31 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             )))
             inspection = service.inspect_source("admin", source_id, show)
             self.assertEqual(inspection["selected_kind"], "directory")
-            with self.assertRaisesRegex(Exception, "目录整理只能指定归档季"):
+            self.assertTrue(inspection["single_video"])
+            self.assertEqual(inspection["primary_video_name"], "Show.S01E01.mkv")
+            self.assertEqual(inspection["parsed_season"], 1)
+            self.assertEqual(inspection["parsed_episode"], 1)
+            preview = service.preview(
+                "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                episode_override=2,
+            )
+            self.assertEqual(preview["status"], "planned")
+            self.assertIn("S01E02", preview["plans"][0]["target_name"])
+
+    def test_multi_video_directory_rejects_one_episode_override(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); source_root = root / "downloads-multi-override"; target_root = root / "tv"
+            show = source_root / "Show"
+            show.mkdir(parents=True); target_root.mkdir()
+            (show / "Show.S01E01.mkv").write_bytes(b"video-one")
+            (show / "Show.S01E02.mkv").write_bytes(b"video-two")
+            source_id = self._source(source_root, target_root, "tv")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="42", title="Show", year="2026", media_type="tv", confidence=1.0
+            )))
+            inspection = service.inspect_source("admin", source_id, show)
+            self.assertFalse(inspection["single_video"])
+            with self.assertRaisesRegex(Exception, "包含多个视频的目录只能指定归档季"):
                 service.preview(
                     "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
                     episode_override=2,
@@ -520,6 +544,33 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertEqual(preview["files"], [{"name": "Show.mkv"}])
             self.assertTrue(preview["snapshot_digest"])
             self.assertEqual(list(target_root.rglob("*")), [])
+
+    def test_requires_manual_task_review_targets_episode_file(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); source_root = root / "review-downloads"; target_root = root / "tv"
+            source_root.mkdir(); target_root.mkdir()
+            episode = source_root / "Show.mkv"
+            episode.write_bytes(b"video")
+            source_id = self._source(source_root, target_root, "tv")
+            task_id = db.create_local_media_task(
+                source_id, "", str(episode), owner="admin", trigger="scan",
+            )
+            self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="1", title="Show", year="2026", media_type="tv", confidence=1.0
+            )))
+
+            result = service.execute_task("admin", task_id)
+
+            self.assertEqual(result["status"], "requires_manual")
+            task = db.get_local_media_task(task_id, owner="admin")
+            self.assertEqual(task.status, "requires_manual")
+            self.assertEqual(task.content_path, str(episode))
+            self.assertEqual(task.tmdb_id, "")
+            inspection = service.inspect_task("admin", task_id)
+            self.assertEqual(inspection["primary_video_name"], "Show.mkv")
+            self.assertEqual(inspection["suggested_query"], "Show")
+            self.assertIn("缺少集数", inspection["task_error"])
 
 
     def test_local_media_ignores_legacy_scope_and_template_overrides(self):
