@@ -86,19 +86,39 @@
                 </div>
             </div>
 
-            <!-- Cache Metrics Tiles -->
+            <!-- Cache Metrics Tiles (Aligned with Dashboard Design) -->
             <div class="proxy-cache-metrics" id="proxyCacheMetrics" aria-live="polite">
                 <div class="metric-tile" data-tone="safe">
-                    <span>缓存命中</span><strong>—</strong>
+                    <div class="metric-tile-head">
+                        <span class="metric-tile-label">缓存命中</span>
+                        <span class="metric-tile-icon is-safe"><i data-lucide="check-circle-2"></i></span>
+                    </div>
+                    <strong class="metric-tile-value">—</strong>
+                    <span class="metric-tile-desc">302 直链快速复用</span>
                 </div>
                 <div class="metric-tile" data-tone="warning">
-                    <span>缓存未命中</span><strong>—</strong>
+                    <div class="metric-tile-head">
+                        <span class="metric-tile-label">缓存未命中</span>
+                        <span class="metric-tile-icon is-warning"><i data-lucide="zap-off"></i></span>
+                    </div>
+                    <strong class="metric-tile-value">—</strong>
+                    <span class="metric-tile-desc">触发直链拉取/上游解析</span>
                 </div>
                 <div class="metric-tile" data-tone="info">
-                    <span>当前条目</span><strong>—</strong>
+                    <div class="metric-tile-head">
+                        <span class="metric-tile-label">当前条目</span>
+                        <span class="metric-tile-icon is-info"><i data-lucide="database"></i></span>
+                    </div>
+                    <strong class="metric-tile-value">—</strong>
+                    <span class="metric-tile-desc">内存活跃直链缓存</span>
                 </div>
                 <div class="metric-tile" data-tone="neutral">
-                    <span>已过期</span><strong>—</strong>
+                    <div class="metric-tile-head">
+                        <span class="metric-tile-label">已过期</span>
+                        <span class="metric-tile-icon is-neutral"><i data-lucide="clock"></i></span>
+                    </div>
+                    <strong class="metric-tile-value">—</strong>
+                    <span class="metric-tile-desc">已失效或自动淘汰</span>
                 </div>
             </div>
 
@@ -146,13 +166,6 @@
     <!-- Tab 3: Advanced Mappings -->
     <div class="proxy-tab-panel" id="proxyTab_advanced" role="tabpanel" aria-labelledby="proxyTabButton_advanced" hidden>
         <section class="card card-pad proxy-advanced-panel">
-            <div class="proxy-work-mode">
-                <i data-lucide="workflow"></i>
-                <div>
-                    <strong>工作方式</strong>
-                    <p>普通请求固定转发到所选 Jellyfin/Emby。本地媒体由媒体服务器负责直放、转封装或转码；确认属于光鸭的原画请求返回 302 直链。</p>
-                </div>
-            </div>
             <div class="proxy-compat-note">
                 <i data-lucide="badge-info"></i>
                 <p>光鸭 302 以原画直链为主。强制转码、字幕烧录或 HLS 分片由 Jellyfin/Emby 处理，此时不保证继续使用光鸭直链。</p>
@@ -472,11 +485,40 @@
         const root=document.getElementById('proxyCacheMetrics');
         const value=metrics&&typeof metrics.hits==='number'?metrics:{hits:0,misses:0,entries:0,expired:0};
         root.innerHTML=`
-            <div class="metric-tile" data-tone="safe"><span>缓存命中</span><strong>${value.hits}</strong></div>
-            <div class="metric-tile" data-tone="warning"><span>缓存未命中</span><strong>${value.misses}</strong></div>
-            <div class="metric-tile" data-tone="info"><span>当前条目</span><strong>${value.entries}</strong></div>
-            <div class="metric-tile" data-tone="neutral"><span>已过期</span><strong>${value.expired}</strong></div>
+            <div class="metric-tile" data-tone="safe">
+                <div class="metric-tile-head">
+                    <span class="metric-tile-label">缓存命中</span>
+                    <span class="metric-tile-icon is-safe"><i data-lucide="check-circle-2"></i></span>
+                </div>
+                <strong class="metric-tile-value">${value.hits}</strong>
+                <span class="metric-tile-desc">302 直链快速复用</span>
+            </div>
+            <div class="metric-tile" data-tone="warning">
+                <div class="metric-tile-head">
+                    <span class="metric-tile-label">缓存未命中</span>
+                    <span class="metric-tile-icon is-warning"><i data-lucide="zap-off"></i></span>
+                </div>
+                <strong class="metric-tile-value">${value.misses}</strong>
+                <span class="metric-tile-desc">触发直链拉取/上游解析</span>
+            </div>
+            <div class="metric-tile" data-tone="info">
+                <div class="metric-tile-head">
+                    <span class="metric-tile-label">当前条目</span>
+                    <span class="metric-tile-icon is-info"><i data-lucide="database"></i></span>
+                </div>
+                <strong class="metric-tile-value">${value.entries}</strong>
+                <span class="metric-tile-desc">内存活跃直链缓存</span>
+            </div>
+            <div class="metric-tile" data-tone="neutral">
+                <div class="metric-tile-head">
+                    <span class="metric-tile-label">已过期</span>
+                    <span class="metric-tile-icon is-neutral"><i data-lucide="clock"></i></span>
+                </div>
+                <strong class="metric-tile-value">${value.expired}</strong>
+                <span class="metric-tile-desc">已失效或自动淘汰</span>
+            </div>
         `;
+        renderLucideIcons(root);
     }
     function proxyRecordMarkup(record){const source=sourceBadge(record.source);const status=statusBadge(record.status_code);const latency=Number(record.total_latency_ms||0);const cache=record.source==='guangya'?`<span class="proxy-record-cache ${record.cache_hit?'hit':'miss'}">${record.cache_hit?'HIT':'MISS'}</span>`:'<span class="proxy-record-cache neutral">—</span>';return `<article class="proxy-record-card" data-record-id="${record.id}"><div class="proxy-record-primary"><time>${esc(record.created_at||'—')}</time><strong>${esc(routeLabel(record.route_class))}</strong><small>${esc(record.method||'GET')} · 实例 #${record.instance_id}</small></div><span class="proxy-record-source"><i data-lucide="${source[0]}"></i>${source[1]}</span><span class="status-pill ${status[0]}">${status[1]}</span>${cache}<div class="proxy-record-latency"><strong>${latency} ms</strong><small>${record.failure_stage?esc(record.failure_stage):'总耗时'}</small></div>${record.error?`<p class="proxy-record-error">${esc(record.error)}</p>`:''}</article>`;}
     function proxySessionDetailsMarkup(data){const rows=Array.isArray(data?.items)?data.items:[];if(!rows.length)return '<div class="proxy-session-detail-empty"><i data-lucide="list-tree"></i><span>该会话暂无可展开的请求明细</span></div>';return `<div class="proxy-session-detail-head"><span>请求链路</span><small>最近 ${rows.length} / ${Number(data.total||rows.length)} 条</small></div><div class="proxy-record-table-head"><span>时间 / 路由</span><span>来源</span><span>状态</span><span>缓存</span><span>耗时</span></div>${rows.map(proxyRecordMarkup).join('')}`;}

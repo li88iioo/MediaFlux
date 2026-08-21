@@ -435,48 +435,83 @@
     function syncSources(){if(sourceInput)sourceInput.value=JSON.stringify(sources);}
     function renderSources(){
         const list=document.getElementById('organizeSourceList');
+        if(!list)return;
         list.replaceChildren();
-        if(!sources.length){const empty=document.createElement('div');empty.className='strm-source-empty';empty.innerHTML='<i data-lucide="folder-dashed"></i><span>尚未选择源目录</span>';list.appendChild(empty);renderLucideIcons(list);return;}
-        sources.forEach(source=>{
-            const row=document.createElement('div');row.className='strm-source-item';
-            const copy=document.createElement('div');const name=document.createElement('strong');const id=document.createElement('span');
-            name.textContent=source.name;id.textContent=source.id;copy.append(name,id);
-            const remove=document.createElement('button');remove.type='button';remove.title='移除';remove.innerHTML='<i data-lucide="x"></i>';
-            remove.addEventListener('click',()=>{sources=sources.filter(item=>item.id!==source.id);syncSources();renderSources();});
-            row.append(copy,remove);list.appendChild(row);
+        const countText=document.getElementById('organizeSourceCountText');
+        if(countText)countText.textContent=`(支持多选 · 已选 ${sources.length} 项)`;
+        if(!sources.length){
+            const empty=document.createElement('div');
+            empty.className='organize-source-empty';
+            empty.innerHTML='<i data-lucide="folder-dashed"></i><span>尚未选择源目录，请点击右上角批量选择</span>';
+            list.appendChild(empty);
+            renderLucideIcons(list);
+            return;
+        }
+        sources.forEach((source,index)=>{
+            const row=document.createElement('div');
+            row.className='organize-source-row';
+            const badge=document.createElement('span');
+            badge.className='organize-src-badge';
+            badge.textContent=`SRC-${index+1}`;
+            const icon=document.createElement('i');
+            icon.dataset.lucide='folder';
+            icon.className='organize-folder-icon';
+            const textWrap=document.createElement('div');
+            textWrap.className='organize-source-text-wrap';
+            const idSpan=document.createElement('span');
+            idSpan.className='organize-source-id';
+            idSpan.textContent=source.name?`${source.name} (ID: ${source.id})`:source.id;
+            textWrap.appendChild(idSpan);
+            const remove=document.createElement('button');
+            remove.type='button';
+            remove.className='organize-row-remove';
+            remove.title='移除';
+            remove.setAttribute('aria-label',`移除 ${source.name||source.id}`);
+            remove.innerHTML='<i data-lucide="x"></i>';
+            remove.addEventListener('click',()=>{
+                sources=sources.filter(item=>item.id!==source.id);
+                syncSources();
+                renderSources();
+                saveConfig();
+            });
+            row.append(badge,icon,textWrap,remove);
+            list.appendChild(row);
         });
         renderLucideIcons(list);
     }
     function renderTarget(id,name){
-        document.getElementById('dstDirId').value=id||'';document.getElementById('dstDirName').value=name||'';
-        const box=document.getElementById('organizeTargetValue');box.replaceChildren();
+        document.getElementById('dstDirId').value=id||'';
+        document.getElementById('dstDirName').value=name||'';
+        const box=document.getElementById('organizeTargetValue');
+        if(!box)return;
+        box.replaceChildren();
         if(id){
-            box.className='organize-target-value active-target';
-            const copy=document.createElement('div');
             const strong=document.createElement('strong');
-            const span=document.createElement('span');
-            strong.textContent=name||'已选择目标目录';
-            span.textContent=id;
-            copy.append(strong,span);
-            const badge=document.createElement('div');
-            badge.className='organize-target-badge';
-            badge.innerHTML='<i data-lucide="folder-check"></i>';
-            box.append(copy,badge);
+            strong.textContent=name?`${name} (ID: ${id})`:id;
+            box.appendChild(strong);
         }else{
-            box.className='organize-target-value';
             const strong=document.createElement('strong');
+            strong.textContent='未选择归档目标目录';
             const span=document.createElement('span');
-            strong.textContent='未选择';
             span.textContent='整理后文件归档到这里';
             box.append(strong,span);
         }
-        renderLucideIcons(box);
     }
     function pickDirectory(mode){
         openGuangYaDirectoryPicker({
             modalId:'organizeDirModal',title:mode==='source'?'批量选择整理源目录':'选择归档目标目录',
             multiple:mode==='source',selected:mode==='source'?sources:[],allowRoot:false,
-            onSelect:directory=>{if(mode==='source'){sources=directory.map(item=>({id:item.id,name:item.name}));syncSources();renderSources();}else renderTarget(directory.id,directory.name);},
+            onSelect:directory=>{
+                if(mode==='source'){
+                    sources=directory.map(item=>({id:item.id,name:item.name}));
+                    syncSources();
+                    renderSources();
+                    saveConfig();
+                }else{
+                    renderTarget(directory.id,directory.name);
+                    saveConfig();
+                }
+            },
         });
     }
     function bool(id){return document.getElementById(id).checked;}
@@ -623,7 +658,8 @@
         const tag=document.getElementById('organizeStateTag');
         const running=['running','stopping'].includes(data.status);organizeStatusRunning=running;
         tag.textContent={idle:'空闲',running:'整理中',stopping:'停止中',completed:'已完成',partial:'部分完成',stopped:'已停止',failed:'失败'}[data.status]||data.status;
-        tag.className=`tag ${data.status==='failed'?'is-danger':['completed','partial'].includes(data.status)?'is-success':''}`;
+        const tagTone=running?'is-active':data.status==='failed'?'is-danger':['completed','partial'].includes(data.status)?'is-success':'';
+        tag.className=`organize-state-tag${tagTone?` ${tagTone}`:''}`;
 
         const iconDiv=document.getElementById('organizeStatusIcon');
         const iconName=data.status==='running'?'loader-2':['completed','partial'].includes(data.status)?'check-circle-2':data.status==='failed'?'alert-circle':'sparkles';
@@ -698,10 +734,16 @@
     document.getElementById('runOrganizeBtn').addEventListener('click',run);
     document.getElementById('stopOrganizeBtn').addEventListener('click',stop);
     document.getElementById('cleanEmptyBtn').addEventListener('click',cleanEmpty);
+    const cleanCheckbox=document.getElementById('r_clean');
+    if(cleanCheckbox)cleanCheckbox.addEventListener('change',()=>saveConfig());
     loadAppConfig().then(config=>{
         fillConfigFields(workspace,config);sources=parseSources(config.GY_ORGANIZE_SOURCE_DIRS);syncSources();renderSources();
-        renderTarget(config.GY_ORGANIZE_TARGET_DIR||'',config.GY_ORGANIZE_TARGET_DIR_NAME||'');finishConfigLoad(true);
+        renderTarget(config.GY_ORGANIZE_TARGET_DIR||'',config.GY_ORGANIZE_TARGET_DIR_NAME||'');
+        if(cleanCheckbox&&config.GY_ORGANIZE_CLEAN_EMPTY!==undefined&&config.GY_ORGANIZE_CLEAN_EMPTY!==''){
+            cleanCheckbox.checked=String(config.GY_ORGANIZE_CLEAN_EMPTY)==='true'||config.GY_ORGANIZE_CLEAN_EMPTY===true||config.GY_ORGANIZE_CLEAN_EMPTY==='1'||config.GY_ORGANIZE_CLEAN_EMPTY===1;
+        }
+        finishConfigLoad(true);
     }).catch(()=>{renderSources();renderTarget('','');finishConfigLoad(false);});
-    loadStatus().then(()=>{if(!['空闲','已完成','部分完成','已停止','失败'].includes(document.getElementById('organizeStateTag').textContent))startPolling();});
+    loadStatus().then(()=>{if(!['IDLE','空闲','已完成','DONE','部分完成','PARTIAL','已停止','STOPPED','失败','FAILED'].includes(document.getElementById('organizeStateTag')?.textContent?.trim()))startPolling();});
     }
 })();

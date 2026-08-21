@@ -30,6 +30,14 @@ class OrganizeScrollPerformanceContractTests(unittest.TestCase):
         render_status = template.split("function renderStatus(data){", 1)[1].split("async function loadStatus", 1)[0]
         self.assertNotIn("replaceChildren", render_status)
 
+    def test_execute_controls_remain_visible_and_status_keeps_component_classes(self):
+        template = (ROOT / "app/templates/organize.html").read_text(encoding="utf-8")
+        script = (ROOT / "app/static/js/organize.js").read_text(encoding="utf-8")
+        self.assertIn('class="organize-secondary-actions"', template)
+        self.assertNotRegex(template, r'id="(?:stopOrganizeBtn|cleanEmptyBtn)"[^>]*display:\s*none')
+        self.assertIn("tag.className=`organize-state-tag", script)
+        self.assertIn("running?'is-active'", script)
+
 
 if __name__ == "__main__":
     unittest.main()

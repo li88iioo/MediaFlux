@@ -11,8 +11,12 @@
         document.documentElement.dataset.strmInitialTab = initialTab;
     }
     try {
-        const rows = Math.min(12, Math.max(1, Number(sessionStorage.getItem('mediaflux:strm-source-rows')) || 1));
-        document.documentElement.style.setProperty('--strm-source-reserved-height', `${rows * 60 - 8}px`);
+        const storedHeight = Number(sessionStorage.getItem('mediaflux:strm-source-height'));
+        const legacyRows = Math.min(12, Math.max(1, Number(sessionStorage.getItem('mediaflux:strm-source-rows')) || 1));
+        const reservedHeight = Number.isFinite(storedHeight) && storedHeight >= 46
+            ? Math.min(720, storedHeight)
+            : legacyRows * 60 - 8;
+        document.documentElement.style.setProperty('--strm-source-reserved-height', `${reservedHeight}px`);
     } catch (_) {}
 })();
 </script>
@@ -33,75 +37,97 @@
         </button>
     </div>
 
-    <!-- Tab 1: Configuration (Spacious Vertical Stack Form Layout) -->
+    <!-- Tab 1: Configuration (INTJ UI/UX Refined Two-Card Layout) -->
     <div class="strm-tab-panel" id="strmTab_config" role="tabpanel" aria-labelledby="strmTabButton_config">
         <div class="strm-settings-grid">
             <!-- Left Card: Source Dirs, Server URL & Storage Paths -->
             <section class="card settings-section strm-settings-section strm-source-section">
                 <header class="strm-section-head">
+                    <div class="strm-card-icon-wrap">
+                        <i data-lucide="folder"></i>
+                    </div>
                     <div class="title-group">
-                        <h3><i data-lucide="folder-tree"></i>同步来源与存储路径</h3>
-                        <p class="desc">设置网盘扫描目录范围、播放服务地址与本地 STRM 生成路径。</p>
+                        <h3>同步来源与存储路径</h3>
+                        <p class="desc">设置网盘扫描范围、播放代理服务与本地生成目标</p>
                     </div>
                 </header>
 
                 <div class="strm-card-body">
+                    <!-- 1. 光鸭源目录 -->
                     <div class="strm-field-group">
                         <div class="strm-field-header">
-                            <label class="strm-field-label">光鸭源目录</label>
-                            <span class="strm-field-hint">可一次勾选多个目录，按目录名隔离本地路径</span>
+                            <label class="strm-field-label">光鸭源目录 <span class="strm-field-sublabel">(按目录隔离本地路径)</span></label>
+                            <button type="button" class="strm-action-link" id="addStrmSourceBtn">
+                                <i data-lucide="plus"></i>批量选择源目录
+                            </button>
                         </div>
                         <div class="strm-field-control">
                             <input type="hidden" data-key="GY_STRM_SOURCE_DIRS" id="strmSourceDirs">
-                            <div id="strmSourceList" class="strm-source-list" aria-live="polite" aria-busy="true"></div>
-                            <div class="strm-source-actions">
-                                <button type="button" class="jump-btn" id="addStrmSourceBtn">
-                                    <i data-lucide="folders"></i>批量选择源目录
-                                </button>
-                            </div>
+                            <div id="strmSourceList" class="strm-source-tag-box" aria-live="polite" aria-busy="true"></div>
                         </div>
                     </div>
 
+                    <!-- 2. 媒体反代播放服务地址 -->
                     <div class="strm-field-group">
                         <div class="strm-field-header">
-                            <label class="strm-field-label">播放服务地址</label>
-                            <span class="strm-field-hint">STRM 内写入、且媒体服务器可访问的本服务地址</span>
+                            <label class="strm-field-label">媒体反代播放服务地址</label>
+                            <span class="strm-field-hint">STRM 文件内写入的代理地址</span>
                         </div>
                         <div class="strm-field-control">
-                            <input type="text" class="form-input" id="strmBaseUrl" data-key="GY_STRM_BASE_URL" placeholder="http://192.168.88.195:1258">
-                            <div class="strm-base-url-tools">
-                                <button type="button" class="jump-btn" id="detectStrmBaseUrlBtn" aria-busy="false" disabled><i data-lucide="network" aria-hidden="true"></i><span>发现候选地址</span></button>
-                                <select class="form-input" id="strmBaseUrlCandidates" aria-label="播放服务地址候选" disabled><option value="">发现后选择地址</option></select>
+                            <div class="strm-composite-input-wrap">
+                                <i data-lucide="globe" class="strm-composite-icon"></i>
+                                <input type="text" class="form-input strm-composite-input" id="strmBaseUrl" data-key="GY_STRM_BASE_URL" placeholder="http://192.168.0.195:1258">
+                                <button type="button" class="strm-composite-btn" id="detectStrmBaseUrlBtn" aria-busy="false" disabled title="发现候选地址">
+                                    <i data-lucide="target"></i><span>自动探测</span>
+                                </button>
                             </div>
-                            <span class="strm-base-url-state" id="strmBaseUrlState" role="status" aria-live="polite">这里只发现本机地址，不验证 Jellyfin / Emby 是否能够访问。</span>
-                            <div class="strm-base-url-refresh" id="strmBaseUrlRefresh" data-state="idle">
+                            <select class="form-input strm-candidate-select" id="strmBaseUrlCandidates" aria-label="播放服务地址候选" disabled style="display: none;"><option value="">发现后选择地址</option></select>
+                            <span class="strm-base-url-state sr-only" id="strmBaseUrlState" role="status" aria-live="polite">这里只发现本机地址，不验证 Jellyfin / Emby 是否能够访问。</span>
+                            <div class="strm-callout-note">
+                                <i data-lucide="info"></i>
+                                <span>地址变更保存后，需执行完整校准才能批量更新已有 STRM 文件。</span>
+                            </div>
+                            <div class="strm-base-url-refresh" id="strmBaseUrlRefresh" data-state="idle" hidden>
                                 <span class="strm-base-url-refresh-icon" aria-hidden="true"><i data-lucide="route"></i></span>
                                 <span class="strm-base-url-refresh-copy">
                                     <strong id="strmBaseUrlRefreshTitle">现有 STRM 链接</strong>
-                                    <small id="strmBaseUrlRefreshText">播放地址变更并保存后，需要完整校准才能统一更新已有 STRM。</small>
+                                    <small id="strmBaseUrlRefreshText">地址变更保存后，需执行完整校准以更新 STRM。</small>
                                 </span>
                                 <button type="button" class="jump-btn" id="refreshStrmBaseUrlBtn" disabled aria-disabled="true"><i data-lucide="scan-search"></i>完整刷新</button>
                             </div>
                         </div>
                     </div>
 
+                    <!-- 3. STRM 本地根目录 -->
                     <div class="strm-field-group">
                         <div class="strm-field-header">
                             <label class="strm-field-label">STRM 本地根目录</label>
-                            <span class="strm-field-hint">Jellyfin/Emby 能扫描到的本机或共享目录</span>
+                            <span class="strm-field-hint">Jellyfin / Emby 媒体库挂载路径</span>
                         </div>
                         <div class="strm-field-control">
-                            <input type="text" class="form-input" data-key="STRM_ROOT" placeholder="/data/strm">
+                            <div class="strm-composite-input-wrap">
+                                <i data-lucide="server" class="strm-composite-icon"></i>
+                                <input type="text" class="form-input strm-composite-input" id="strmRootInput" data-key="STRM_ROOT" placeholder="/data/strm">
+                                <button type="button" class="strm-composite-btn" id="browseStrmRootBtn" title="浏览选择本地目录">
+                                    <i data-lucide="folder-open"></i><span>浏览</span>
+                                </button>
+                            </div>
                         </div>
                     </div>
 
+                    <!-- 4. 小文件过滤阈值 -->
                     <div class="strm-field-group">
                         <div class="strm-field-header">
-                            <label class="strm-field-label">小文件阈值 (MB)</label>
-                            <span class="strm-field-hint">小于该值不生成，0 表示不限文件大小</span>
+                            <label class="strm-field-label">小文件过滤阈值</label>
                         </div>
                         <div class="strm-field-control">
-                            <input type="number" min="0" class="form-input" data-key="STRM_SKIP_THRESHOLD_MB" value="0">
+                            <div class="strm-threshold-row">
+                                <div class="strm-size-unit-wrap">
+                                    <input type="number" min="0" class="form-input strm-size-input" data-key="STRM_SKIP_THRESHOLD_MB" value="0">
+                                    <span class="strm-size-unit">MB</span>
+                                </div>
+                                <span class="strm-threshold-hint">小于该体积的文件将跳过生成 (0 表示不限制)</span>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -110,58 +136,62 @@
             <!-- Right Card: File Extensions & Metadata Rules -->
             <section class="card settings-section strm-settings-section">
                 <header class="strm-section-head">
+                    <div class="strm-card-icon-wrap">
+                        <i data-lucide="save"></i>
+                    </div>
                     <div class="title-group">
-                        <h3><i data-lucide="file-video"></i>格式过滤与伴随元数据</h3>
-                        <p class="desc">设置 STRM 生成的扩展名过滤与伴随元数据下载规则。</p>
+                        <h3>格式过滤与伴随元数据</h3>
+                        <p class="desc">限制扫描格式，并在生成时同步字幕与海报</p>
                     </div>
                 </header>
 
                 <div class="strm-card-body">
+                    <!-- 1. 视频扩展名 -->
                     <div class="strm-field-group">
                         <div class="strm-field-header">
                             <label class="strm-field-label">视频扩展名</label>
-                            <span class="strm-field-hint">按回车添加 Tag 标签；留空使用默认格式</span>
+                            <div class="strm-preset-group">
+                                <span class="strm-preset-label">快捷填充:</span>
+                                <button type="button" class="strm-preset-chip" data-video-ext-preset="mkv,mp4,ts,m2ts">常用</button>
+                                <button type="button" class="strm-preset-chip" data-video-ext-preset="mkv,mp4,ts,m2ts,iso,mov,avi,flv">全量</button>
+                            </div>
                         </div>
                         <div class="strm-field-control">
                             <input type="hidden" data-key="STRM_VIDEO_EXTS" id="strmVideoExts">
                             <div class="strm-tag-input-box" id="strmVideoExtsTagBox">
                                 <div class="strm-tag-list"></div>
-                                <input type="text" class="strm-tag-field" placeholder="输入扩展名后按回车添加 (如 mkv)">
-                            </div>
-                            <div class="strm-preset-bar">
-                                <span class="preset-label">快捷预设：</span>
-                                <button type="button" data-video-ext-preset="mkv,mp4,ts,m2ts">常用格式 (mkv, mp4, ts, m2ts)</button>
-                                <button type="button" data-video-ext-preset="mkv,mp4,ts,m2ts,iso,mov,avi,flv">全量格式 (+ iso, mov, avi)</button>
+                                <input type="text" class="strm-tag-field" placeholder="输入后按 Enter 添加...">
                             </div>
                         </div>
                     </div>
 
-                    <div class="strm-toggle-card">
-                        <div class="strm-toggle-copy">
-                            <label for="strmMetadataEnabled">同步伴随元数据</label>
-                            <span>扫描结束后由后台队列同步 NFO、字幕和图片，不阻塞 STRM</span>
-                        </div>
-                        <label class="toggle">
-                            <input type="checkbox" data-key="STRM_METADATA_ENABLED" id="strmMetadataEnabled">
-                            <span class="toggle-slider"></span>
-                        </label>
-                    </div>
-
-                    <div class="strm-field-group" id="strmMetadataExtRow">
-                        <div class="strm-field-header">
-                            <label class="strm-field-label">元数据扩展名</label>
-                            <span class="strm-field-hint">按回车添加 Tag 标签</span>
-                        </div>
-                        <div class="strm-field-control">
-                            <input type="hidden" data-key="STRM_METADATA_EXTS" id="strmMetadataExts">
-                            <div class="strm-tag-input-box" id="strmMetadataExtsTagBox">
-                                <div class="strm-tag-list"></div>
-                                <input type="text" class="strm-tag-field" id="strmMetadataExtField" placeholder="输入扩展名后按回车添加 (如 nfo)">
+                    <!-- 2. 同步伴随元数据 Sub-card -->
+                    <div class="strm-metadata-panel">
+                        <div class="strm-metadata-panel-head">
+                            <div class="strm-toggle-subhead">
+                                <strong>同步伴随元数据</strong>
+                                <span>后台队列异步拉取 NFO、字幕与海报，不阻塞 STRM</span>
                             </div>
-                            <div class="strm-preset-bar">
-                                <span class="preset-label">快捷预设：</span>
-                                <button type="button" data-ext-preset="nfo,srt,ass,ssa,sub,idx">NFO + 字幕</button>
-                                <button type="button" data-ext-preset="nfo,srt,ass,ssa,sub,idx,jpg,jpeg,png,webp">全量元数据</button>
+                            <label class="toggle">
+                                <input type="checkbox" data-key="STRM_METADATA_ENABLED" id="strmMetadataEnabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+
+                        <div class="strm-field-group" id="strmMetadataExtRow">
+                            <div class="strm-field-header">
+                                <label class="strm-field-label">元数据扩展名</label>
+                                <div class="strm-preset-group">
+                                    <button type="button" class="strm-preset-chip" data-ext-preset="nfo,srt,ass,ssa,sub,idx">NFO+字幕</button>
+                                    <button type="button" class="strm-preset-chip" data-ext-preset="nfo,srt,ass,ssa,sub,idx,jpg,jpeg,png,webp">全量元数据</button>
+                                </div>
+                            </div>
+                            <div class="strm-field-control">
+                                <input type="hidden" data-key="STRM_METADATA_EXTS" id="strmMetadataExts">
+                                <div class="strm-tag-input-box" id="strmMetadataExtsTagBox">
+                                    <div class="strm-tag-list"></div>
+                                    <input type="text" class="strm-tag-field" id="strmMetadataExtField" placeholder="输入并回车...">
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -457,5 +487,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/guangya-strm.js') }}?v=20260821a"></script>
+<script src="{{ url_for('static', path='js/guangya-strm.js') }}?v=20260821b"></script>
 {% endblock %}

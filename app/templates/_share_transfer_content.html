@@ -1,45 +1,60 @@
 <div class="share-transfer-shell">
     <div class="share-transfer-grid">
         <!-- Left Main Transfer Card -->
-        <section class="card share-main-card">
-            <header class="share-card-head">
+        <section class="card settings-section strm-settings-section share-main-card">
+            <header class="strm-section-head">
+                <div class="strm-card-icon-wrap">
+                    <i data-lucide="link-2"></i>
+                </div>
                 <div class="title-group">
-                    <h3><i data-lucide="link-2"></i>光鸭分享链接解析</h3>
+                    <h3>光鸭分享链接解析</h3>
                     <p class="desc">粘贴光鸭云盘分享链接（包含密码或提取码），一键解析并选择文件进行云端转存</p>
                 </div>
                 <span class="share-status-badge" id="shareStateTag"><i data-lucide="clock"></i><span>等待解析</span></span>
             </header>
 
-            <div class="share-input-section">
-                <div class="share-input-box">
-                    <div class="share-input-wrapper">
-                        <i data-lucide="link" class="share-input-icon"></i>
-                        <input type="text" class="form-input share-url-input" id="shareUrl" placeholder="输入分享链接：https://www.guangyapan.com/s/...（支持带 code/pwd 提取码）" autocomplete="off">
+            <div class="strm-card-body share-card-body">
+                <!-- 1. 分享链接输入 -->
+                <div class="strm-field-group">
+                    <div class="strm-field-header">
+                        <label class="strm-field-label">光鸭云盘分享链接</label>
+                        <span class="strm-field-hint">支持包含密码、提取码或短链接</span>
                     </div>
-                    <button type="button" class="btn btn-primary share-inspect-btn" id="inspectShareBtn">
-                        <i data-lucide="scan-line"></i>解析分享
-                    </button>
-                </div>
-                <div id="shareMessage" class="share-message-notice"></div>
-            </div>
-
-            <div class="share-file-container">
-                <div class="share-file-toolbar" id="shareFileToolbar" hidden>
-                    <label class="share-check-all">
-                        <input type="checkbox" id="shareCheckAll" checked>
-                        <span>全选文件</span>
-                    </label>
-                    <span class="share-count-badge" id="shareSelectionCount">已选择 0 项</span>
+                    <div class="strm-field-control">
+                        <div class="strm-composite-input-wrap">
+                            <i data-lucide="link" class="strm-composite-icon"></i>
+                            <input type="text" class="form-input strm-composite-input" id="shareUrl" placeholder="输入分享链接：https://www.guangyapan.com/s/...（支持带 code/pwd 提取码）" autocomplete="off">
+                            <button type="button" class="btn btn-primary strm-composite-btn share-inspect-btn" id="inspectShareBtn">
+                                <i data-lucide="scan-line"></i><span>解析分享</span>
+                            </button>
+                        </div>
+                        <div id="shareMessage" class="share-message-notice"></div>
+                    </div>
                 </div>
 
-                <div id="shareFileList" class="share-file-list">
-                    <div class="share-empty-state">
-                        <div class="share-empty-icon"><i data-lucide="folder-search"></i></div>
-                        <strong>等待解析光鸭分享</strong>
-                        <p>请在上方输入框粘贴分享链接，点击“解析分享”后勾选需要转存的文件或目录。</p>
-                        <div class="share-link-tips">
-                            <span>支持格式示例：</span>
-                            <code>https://www.guangyapan.com/s/xxxx 密码: 1234</code>
+                <!-- 2. 文件选择与解析结果 -->
+                <div class="strm-field-group share-file-field-group">
+                    <div class="strm-field-header">
+                        <label class="strm-field-label">解析文件列表</label>
+                        <div class="share-file-toolbar" id="shareFileToolbar" hidden>
+                            <label class="share-check-all">
+                                <input type="checkbox" id="shareCheckAll" checked>
+                                <span>全选文件</span>
+                            </label>
+                            <span class="share-count-badge" id="shareSelectionCount">已选择 0 项</span>
+                        </div>
+                    </div>
+                    <div class="strm-field-control">
+                        <div id="shareFileList" class="share-file-list">
+                            <div class="share-empty-state">
+                                <div class="share-empty-icon"><i data-lucide="folder-search"></i></div>
+                                <strong>等待解析光鸭分享</strong>
+                                <p>请在上方输入框粘贴分享链接并点击“解析分享”，解析完成后可在此勾选拟转存的文件。</p>
+                                <div class="share-link-tips">
+                                    <span>支持格式示例：</span>
+                                    <code>https://www.guangyapan.com/s/xxxx 密码: 1234</code>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -47,10 +62,13 @@
         </section>
 
         <!-- Right Target Card -->
-        <aside class="card share-target-card">
-            <header class="share-card-head">
+        <aside class="card settings-section strm-settings-section share-target-card">
+            <header class="strm-section-head">
+                <div class="strm-card-icon-wrap">
+                    <i data-lucide="folder-output"></i>
+                </div>
                 <div class="title-group">
-                    <h3><i data-lucide="folder-output"></i>转存目标</h3>
+                    <h3>转存目标与概览</h3>
                     <p class="desc">设置目标盘符与保存目录</p>
                 </div>
             </header>
@@ -58,31 +76,50 @@
             <input type="hidden" id="shareTargetDir" value="0" data-key="GY_SHARE_TARGET_DIR">
             <input type="hidden" id="shareTargetDirName" value="根目录" data-key="GY_SHARE_TARGET_DIR_NAME">
 
-            <div class="share-target-body">
-                <div class="share-target-info" id="shareTargetValue">
-                    <div class="share-target-icon"><i data-lucide="folder-tree"></i></div>
-                    <div class="share-target-details">
-                        <strong>根目录</strong>
-                        <small>ID 0</small>
+            <div class="strm-card-body share-target-body">
+                <!-- 1. 目标目录 -->
+                <div class="strm-field-group">
+                    <div class="strm-field-header">
+                        <label class="strm-field-label">保存目标目录</label>
+                    </div>
+                    <div class="strm-field-control">
+                        <div class="share-target-card-box">
+                            <div class="share-target-info" id="shareTargetValue">
+                                <div class="share-target-icon"><i data-lucide="folder-tree"></i></div>
+                                <div class="share-target-details">
+                                    <strong>根目录</strong>
+                                    <small>目录 ID: 0</small>
+                                </div>
+                            </div>
+                            <div class="share-target-actions">
+                                <button type="button" class="jump-btn" id="pickShareTargetBtn"><i data-lucide="folder-open"></i>选择目录</button>
+                                <button type="button" class="jump-btn" id="saveShareTargetBtn" title="将当前选中的目录保存为默认转存位置"><i data-lucide="pin"></i>设为默认</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
-                <div class="share-target-actions">
-                    <button type="button" class="jump-btn" id="pickShareTargetBtn"><i data-lucide="folder-open"></i>选择目录</button>
-                    <button type="button" class="jump-btn" id="saveShareTargetBtn" title="将当前选中的目录保存为默认转存位置"><i data-lucide="pin"></i>设为默认</button>
+
+                <!-- 2. 转存概览 -->
+                <div class="strm-field-group">
+                    <div class="strm-field-header">
+                        <label class="strm-field-label">转存任务概览</label>
+                    </div>
+                    <div class="strm-field-control">
+                        <div class="share-summary-box">
+                            <div class="share-summary-text" id="shareTransferSummary">尚未解析分享链接</div>
+                        </div>
+                    </div>
                 </div>
 
-                <div class="share-summary-box">
-                    <div class="share-summary-head"><i data-lucide="info"></i>转存概览</div>
-                    <div class="share-summary-text" id="shareTransferSummary">尚未解析分享链接</div>
-                </div>
-
+                <!-- 3. 执行按钮 -->
                 <button type="button" class="btn btn-primary share-execute-btn" id="restoreShareBtn" disabled>
-                    <i data-lucide="cloud-download"></i>执行转存
+                    <i data-lucide="cloud-download"></i><span>立即执行云端转存</span>
                 </button>
 
-                <div class="share-safety-hint">
+                <!-- 4. 安全说明 -->
+                <div class="strm-callout-note share-safety-hint">
                     <i data-lucide="shield-check"></i>
-                    <span>云端直接离线写入转存，解析结果有效时间为 15 分钟</span>
+                    <span>云端直接离线写入，解析结果有效时间为 15 分钟</span>
                 </div>
             </div>
         </aside>

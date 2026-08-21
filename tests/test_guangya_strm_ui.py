@@ -36,13 +36,22 @@ class GuangyaStrmUiTests(unittest.TestCase):
         self.assertIn("grid-template-columns: max-content minmax(0, 1fr)", self.css)
         self.assertIn(".strm-base-url-refresh", self.css)
         self.assertIn("min-height: 58px", self.css)
+        self.assertIn("strmBaseUrlRefresh.hidden=state==='idle'", self.template)
+        self.assertNotIn('id="strmBaseUrlRefresh" data-state="idle" style="display: none;"', self.template)
+
+    def test_local_root_picker_uses_the_existing_directory_api_and_selected_id(self):
+        self.assertIn("/api/local-media/directories?", self.template)
+        self.assertNotIn("/api/local-media/browse?", self.template)
+        self.assertIn("data.directories || []", self.template)
+        self.assertIn("const selectedPath = String(item?.id || '').trim()", self.template)
 
     def test_source_list_reserves_previous_height_across_refresh(self):
         self.assertIn("mediaflux:strm-source-rows", self.template)
         self.assertIn("--strm-source-reserved-height", self.template)
-        self.assertIn("syncSourceReservation(sources.length)", self.template)
+        self.assertIn("syncSourceReservation(list)", self.template)
+        self.assertIn("mediaflux:strm-source-height", self.template)
         self.assertIn("aria-busy=\"true\"", self.template)
-        self.assertIn("min-height: var(--strm-source-reserved-height, 52px)", self.css)
+        self.assertIn("min-height: var(--strm-source-reserved-height, 46px)", self.css)
         self.assertIn("overflow-anchor: none", self.css)
 
     def test_frontend_exposes_only_full_sync_and_keeps_backend_fast_mode_hidden(self):

@@ -2,6 +2,18 @@
 
 所有关于 MediaFlux 的重大变更都将记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Changed
+- 重构光鸭整理、离线转存、STRM、媒体反代、分享转存与 GCID 工具的工作台布局、状态反馈和响应式样式。
+- 精简本地媒体人工处理页签的重复提示文案。
+- 涉及文件：`app/templates/` 下相关页面、`app/static/css/main.css`、`app/static/css/organize.css`、`app/static/js/guangya-strm.js` 与 `app/static/js/organize.js`。
+
+### Fixed
+- 修复整理执行页停止与清理操作不可见、状态标签样式被运行态覆盖的问题。
+- 修复 STRM 本地根目录浏览接口、播放地址完整刷新入口和来源列表稳定占位。
+- 恢复 GCID 导入预览区域的稳定高度，避免加载结果时页面跳动。
+
 ## [0.1.0] - 2026-08-18
 
 ### 🚀 初始版本发布 (Initial Release)

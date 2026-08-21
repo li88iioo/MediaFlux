@@ -1,86 +1,177 @@
-<section class="card card-pad tool-panel" id="gcid">
-    <div class="panel-head">
-        <div><div class="section-title" style="margin:0 0 4px;"><i data-lucide="file-json-2"></i>GCID 秒传清单</div><div class="panel-desc">递归导出光鸭目录文件元数据，或校验 MediaFlux 清单结构与完整性</div></div>
-        <span class="status-pill paused">只读工具</span>
-    </div>
-    <div class="gcid-grid">
-        <div class="gcid-pane">
-            <div class="scrape-label">导出清单</div>
-            <div id="gcidSourceValue" class="gcid-source-value"><strong>未选择目录</strong><span>只读扫描，不改动云盘</span></div>
-            <input type="hidden" id="gcidSourceId"><input type="hidden" id="gcidSourceName">
-            <div class="gcid-actions"><button type="button" class="jump-btn gcid-stable-button" id="gcidChooseDir">选择目录</button><button type="button" class="btn btn-primary gcid-stable-button" id="gcidExportBtn" disabled>下载 JSON</button></div>
-            <div id="gcidExportMessage" class="gcid-message"></div>
+<div class="gcid-workspace-shell">
+    <div class="gcid-workspace-grid">
+        <!-- Left Main Column: Import Workbench -->
+        <section class="card settings-section strm-settings-section gcid-main-section" aria-labelledby="gcidImportTitle">
+            <header class="strm-section-head">
+                <div class="strm-card-icon-wrap">
+                    <i data-lucide="cloud-upload"></i>
+                </div>
+                <div class="title-group">
+                    <h3 id="gcidImportTitle">GCID 安全导入工作台</h3>
+                    <p class="desc">规范化 v2 清单导入，需核对树形预览与安全确认后执行写入</p>
+                </div>
+                <span class="status-pill paused" id="gcidImportCapability">能力检查中</span>
+            </header>
+
+            <div class="strm-card-body">
+                <!-- 1. 四步流程指示器 -->
+                <div class="gcid-import-steps" aria-label="GCID 导入步骤">
+                    <span class="gcid-step-item"><b>01</b> 选择清单</span>
+                    <span class="gcid-step-item"><b>02</b> 绑定目标</span>
+                    <span class="gcid-step-item"><b>03</b> 核对预览</span>
+                    <span class="gcid-step-item"><b>04</b> 输入 GCID</span>
+                </div>
+
+                <!-- 2. 文件与目标配置 -->
+                <div class="gcid-import-controls">
+                    <div class="strm-field-group">
+                        <div class="strm-field-header">
+                            <label class="strm-field-label"><i data-lucide="file-json"></i> 导入文件</label>
+                            <span class="gcid-import-hint" id="gcidImportFileHint">本地初检 JSON 与 10,000 上限</span>
+                        </div>
+                        <div class="strm-field-control">
+                            <label class="gcid-file-input gcid-import-file-input" for="gcidImportFile">
+                                <i data-lucide="upload-cloud" class="gcid-file-icon"></i>
+                                <input type="file" id="gcidImportFile" accept="application/json,.json">
+                                <span id="gcidImportFileLabel">选择 v2 JSON 清单</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="strm-field-group">
+                        <div class="strm-field-header">
+                            <label class="strm-field-label"><i data-lucide="folder-git-2"></i> 目标目录</label>
+                            <span class="strm-field-hint">更换目标将使旧预览失效</span>
+                        </div>
+                        <div class="strm-field-control">
+                            <div class="gcid-target-row">
+                                <div class="gcid-target-value" id="gcidImportTargetValue">
+                                    <strong>未选择目录</strong>
+                                    <span>尚未绑定云盘目标</span>
+                                </div>
+                                <input type="hidden" id="gcidImportTarget">
+                                <button type="button" class="jump-btn gcid-stable-button" id="gcidImportChooseTarget"><i data-lucide="folder-open"></i>选择目标</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 3. 生成预览按钮与状态 -->
+                <div class="gcid-import-toolbar">
+                    <button type="button" class="btn btn-primary gcid-stable-button" id="gcidImportPreviewBtn" disabled><i data-lucide="scan-eye"></i>生成安全预览</button>
+                    <div class="gcid-import-status" id="gcidImportStatus" aria-live="polite">等待选择清单与目标目录</div>
+                </div>
+
+                <!-- 4. 预览树 -->
+                <div class="gcid-import-preview" id="gcidImportPreview">
+                    <div class="gcid-import-preview-head">
+                        <div><span class="server-kicker">BOUND PREVIEW</span><strong id="gcidImportPreviewTitle">尚未生成预览</strong></div>
+                        <div class="gcid-import-counts" id="gcidImportCounts"><span>文件 —</span><span>体积 —</span></div>
+                    </div>
+                    <div class="gcid-import-tree" id="gcidImportTree"><div class="gcid-empty-state">预览树将在此稳定展示，核对无误后解锁导入</div></div>
+                </div>
+
+                <!-- 5. 危险操作确认与执行 -->
+                <div class="gcid-import-confirm-row">
+                    <div class="gcid-confirm-label-group">
+                        <span class="scrape-label"><i data-lucide="shield-alert"></i> 危险操作确认</span>
+                        <span class="gcid-confirm-subtext">请输入大写 <code>GCID</code> 解锁导入操作</span>
+                    </div>
+                    <div class="gcid-confirm-composite">
+                        <input type="text" class="form-input gcid-confirm-input" id="gcidImportConfirm" autocomplete="off" spellcheck="false" placeholder="输入 GCID" disabled>
+                        <button type="button" class="btn btn-primary gcid-stable-button" id="gcidImportRunBtn" disabled><i data-lucide="rocket"></i>开始导入</button>
+                    </div>
+                </div>
+
+                <!-- 6. 执行进度状态 -->
+                <div class="gcid-import-progress" id="gcidImportProgress" aria-live="polite">
+                    <span class="gcid-progress-marker" aria-hidden="true"></span>
+                    <div><strong>未运行</strong><span>执行结果会明确区分成功、部分成功与失败</span></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Right Side Column: Toolbox & History -->
+        <div class="gcid-side-column">
+            <!-- Right Top: Toolbox -->
+            <section class="card settings-section strm-settings-section gcid-section" id="gcid">
+                <header class="strm-section-head">
+                    <div class="strm-card-icon-wrap">
+                        <i data-lucide="file-json-2"></i>
+                    </div>
+                    <div class="title-group">
+                        <h3>GCID 工具箱</h3>
+                        <p class="desc">目录元数据导出与结构完整性校验</p>
+                    </div>
+                    <span class="status-pill paused">只读</span>
+                </header>
+
+                <div class="strm-card-body">
+                    <!-- Export -->
+                    <div class="gcid-tool-block">
+                        <div class="gcid-pane-head">
+                            <div class="gcid-pane-icon"><i data-lucide="folder-output"></i></div>
+                            <div>
+                                <strong class="gcid-pane-title">导出清单</strong>
+                                <span class="gcid-pane-sub">扫描目录导出 v2 秒传清单</span>
+                            </div>
+                        </div>
+                        <div id="gcidSourceValue" class="gcid-source-value">
+                            <strong>未选择目录</strong>
+                            <span>只读扫描，不改动云盘</span>
+                        </div>
+                        <input type="hidden" id="gcidSourceId">
+                        <input type="hidden" id="gcidSourceName">
+                        <div class="gcid-actions">
+                            <button type="button" class="jump-btn gcid-stable-button" id="gcidChooseDir"><i data-lucide="folder-open"></i>选择目录</button>
+                            <button type="button" class="btn btn-primary gcid-stable-button" id="gcidExportBtn" disabled><i data-lucide="download"></i>下载 JSON</button>
+                        </div>
+                        <div id="gcidExportMessage" class="gcid-message"></div>
+                    </div>
+
+                    <!-- Validate -->
+                    <div class="gcid-tool-block">
+                        <div class="gcid-pane-head">
+                            <div class="gcid-pane-icon"><i data-lucide="shield-check"></i></div>
+                            <div>
+                                <strong class="gcid-pane-title">校验清单</strong>
+                                <span class="gcid-pane-sub">校验规范与 SHA-256 完整性</span>
+                            </div>
+                        </div>
+                        <label class="gcid-file-input" for="gcidFile">
+                            <i data-lucide="file-code" class="gcid-file-icon"></i>
+                            <input type="file" id="gcidFile" accept="application/json,.json">
+                            <span id="gcidFileLabel">选择 JSON 文件</span>
+                        </label>
+                        <div class="gcid-actions">
+                            <button type="button" class="jump-btn gcid-validate-btn gcid-stable-button" id="gcidValidateBtn" disabled><i data-lucide="scan-search"></i>检查结构与 SHA-256</button>
+                        </div>
+                        <div id="gcidValidateResult" class="gcid-message"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Bottom: History -->
+            <section class="card settings-section strm-settings-section gcid-section" aria-labelledby="gcidHistoryTitle">
+                <header class="strm-section-head">
+                    <div class="strm-card-icon-wrap">
+                        <i data-lucide="history"></i>
+                    </div>
+                    <div class="title-group">
+                        <h3 id="gcidHistoryTitle">导入任务历史</h3>
+                        <p class="desc">保留近期任务统计与失败样本</p>
+                    </div>
+                    <div class="gcid-history-actions">
+                        <span id="gcidHistoryRefreshState" aria-live="polite"></span>
+                        <button type="button" class="jump-btn gcid-stable-button" id="gcidImportRefresh"><i data-lucide="refresh-cw"></i>刷新</button>
+                    </div>
+                </header>
+                <div class="strm-card-body">
+                    <div class="gcid-import-history" id="gcidImportHistory">
+                        <div class="gcid-empty-state">正在读取任务历史…</div>
+                    </div>
+                </div>
+            </section>
         </div>
-        <div class="gcid-pane">
-            <div class="scrape-label">校验清单</div>
-            <label class="gcid-file-input"><input type="file" id="gcidFile" accept="application/json,.json"><span id="gcidFileLabel">选择 JSON 文件</span></label>
-            <button type="button" class="jump-btn gcid-validate-btn gcid-stable-button" id="gcidValidateBtn" disabled>检查结构与 SHA-256</button>
-            <div id="gcidValidateResult" class="gcid-message"></div>
-        </div>
     </div>
-</section>
-
-<section class="card card-pad tool-panel gcid-import-workspace" aria-labelledby="gcidImportTitle">
-    <div class="panel-head">
-        <div>
-            <div class="section-title" id="gcidImportTitle" style="margin:0 0 4px;"><i data-lucide="cloud-upload"></i>预览后导入</div>
-            <div class="panel-desc">仅接受 MediaFlux v2，清单与目标绑定后才可确认执行；生产 importer 未配置时严格拒绝写入</div>
-        </div>
-        <span class="status-pill paused" id="gcidImportCapability">能力检查中</span>
-    </div>
-
-    <div class="gcid-import-steps" aria-label="GCID 导入步骤">
-        <span><b>01</b> 选择清单</span><span><b>02</b> 绑定目标</span><span><b>03</b> 核对预览</span><span><b>04</b> 输入 GCID</span>
-    </div>
-
-    <div class="gcid-import-controls">
-        <div class="gcid-import-field">
-            <span class="scrape-label">导入文件</span>
-            <label class="gcid-file-input gcid-import-file-input">
-                <input type="file" id="gcidImportFile" accept="application/json,.json">
-                <span id="gcidImportFileLabel">选择 v2 JSON 清单</span>
-            </label>
-            <span class="gcid-import-hint" id="gcidImportFileHint">本地先检查 JSON、版本和 10,000 文件上限</span>
-        </div>
-        <div class="gcid-import-field">
-            <span class="scrape-label">目标目录</span>
-            <div class="gcid-target-value" id="gcidImportTargetValue"><strong>未选择目录</strong><span>更换目标会立即使旧预览失效</span></div>
-            <input type="hidden" id="gcidImportTarget">
-            <button type="button" class="jump-btn gcid-stable-button" id="gcidImportChooseTarget">选择目标目录</button>
-        </div>
-    </div>
-
-    <div class="gcid-import-toolbar">
-        <button type="button" class="btn btn-primary gcid-stable-button" id="gcidImportPreviewBtn" disabled>生成安全预览</button>
-        <div class="gcid-import-status" id="gcidImportStatus" aria-live="polite">等待选择清单与目标目录</div>
-    </div>
-
-    <div class="gcid-import-preview" id="gcidImportPreview">
-        <div class="gcid-import-preview-head">
-            <div><span class="server-kicker">BOUND PREVIEW</span><strong id="gcidImportPreviewTitle">尚未生成预览</strong></div>
-            <div class="gcid-import-counts" id="gcidImportCounts"><span>文件 —</span><span>体积 —</span></div>
-        </div>
-        <div class="gcid-import-tree" id="gcidImportTree"><div class="gcid-empty-state">预览树将在这里稳定显示，不会因历史刷新而重置</div></div>
-    </div>
-
-    <div class="gcid-import-confirm-row">
-        <label for="gcidImportConfirm"><span class="scrape-label">危险操作确认</span><span>输入大写 <code>GCID</code>；确认文本与预览、目标、摘要共同校验</span></label>
-        <input type="text" class="form-input" id="gcidImportConfirm" autocomplete="off" spellcheck="false" placeholder="GCID" disabled>
-        <button type="button" class="btn btn-primary gcid-stable-button" id="gcidImportRunBtn" disabled>开始导入</button>
-    </div>
-
-    <div class="gcid-import-progress" id="gcidImportProgress" aria-live="polite">
-        <span class="gcid-progress-marker" aria-hidden="true"></span>
-        <div><strong>未运行</strong><span>执行结果会明确区分成功、部分成功与失败</span></div>
-    </div>
-</section>
-
-<section class="card card-pad tool-panel" aria-labelledby="gcidHistoryTitle">
-    <div class="panel-head">
-        <div><div class="section-title" id="gcidHistoryTitle" style="margin:0 0 4px;"><i data-lucide="history"></i>导入任务历史</div><div class="panel-desc">后台刷新会保留当前列表；仅展示统计与少量通用失败样本</div></div>
-        <div class="gcid-history-actions"><span id="gcidHistoryRefreshState" aria-live="polite"></span><button type="button" class="jump-btn gcid-stable-button" id="gcidImportRefresh">刷新历史</button></div>
-    </div>
-    <div class="gcid-import-history" id="gcidImportHistory">
-        <div class="gcid-empty-state">正在读取任务历史…</div>
-    </div>
-</section>
+</div>

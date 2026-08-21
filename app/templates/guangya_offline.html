@@ -5,162 +5,202 @@
 {% block content %}
 <section class="standalone-settings offline-settings-shell" id="offlineForm">
     <div class="offline-settings-grid">
+        <!-- Left Column: Protocols & Directory Routing -->
         <div class="settings-section offline-settings-section">
-            <div class="offline-card-head">
-                <h3><i data-lucide="shield-check"></i>协议与过滤</h3>
-                <span class="offline-card-tag">AUTO FILTER</span>
-            </div>
-            <p class="desc">Telegram Bot 收到磁力、ED2K 或 BT 种子后，将按扩展名、体积和排除词自动筛选并提交到光鸭。</p>
-            <div class="offline-protocol-grid">
-                <div class="offline-protocol-card organize-toggle-tile">
-                    <div class="organize-toggle-top">
-                        <div class="organize-toggle-title offline-protocol-title">
-                            <div class="organize-toggle-icon"><i data-lucide="magnet"></i></div>
-                            <div class="offline-protocol-copy">
-                                <label for="offlineMagnetEnabled">允许磁力链接</label>
+            <header class="strm-section-head">
+                <div class="strm-card-icon-wrap">
+                    <i data-lucide="folders"></i>
+                </div>
+                <div class="title-group">
+                    <h3>协议与目录路由</h3>
+                    <p class="desc">Telegram Bot 收到磁力、ED2K 或 BT 种子后，将按默认目录与分流规则保存到光鸭。</p>
+                </div>
+                <span class="offline-card-tag">DIRECTORY ROUTING</span>
+            </header>
+
+            <div class="strm-card-body offline-card-body">
+                <!-- 1. 协议开关网格 -->
+                <div class="offline-protocol-grid">
+                    <div class="offline-protocol-card organize-toggle-tile">
+                        <div class="organize-toggle-top">
+                            <div class="organize-toggle-title offline-protocol-title">
+                                <div class="organize-toggle-icon"><i data-lucide="magnet"></i></div>
+                                <div class="offline-protocol-copy">
+                                    <label for="offlineMagnetEnabled">允许磁力链接</label>
+                                </div>
                             </div>
+                            <label class="toggle">
+                                <input id="offlineMagnetEnabled" type="checkbox" data-key="OFFLINE_MAGNET_ENABLED" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="offline-protocol-card organize-toggle-tile">
+                        <div class="organize-toggle-top">
+                            <div class="organize-toggle-title offline-protocol-title">
+                                <div class="organize-toggle-icon"><i data-lucide="link-2"></i></div>
+                                <div class="offline-protocol-copy">
+                                    <label for="offlineEd2kEnabled">允许 ED2K</label>
+                                </div>
+                            </div>
+                            <label class="toggle">
+                                <input id="offlineEd2kEnabled" type="checkbox" data-key="OFFLINE_ED2K_ENABLED" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="offline-protocol-card organize-toggle-tile">
+                        <div class="organize-toggle-top">
+                            <div class="organize-toggle-title offline-protocol-title">
+                                <div class="organize-toggle-icon"><i data-lucide="globe"></i></div>
+                                <div class="offline-protocol-copy">
+                                    <label for="offlineHttpEnabled">允许 HTTP(S)</label>
+                                </div>
+                            </div>
+                            <label class="toggle">
+                                <input id="offlineHttpEnabled" type="checkbox" data-key="OFFLINE_HTTP_ENABLED">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="offline-protocol-card offline-protocol-card--fallback organize-toggle-tile">
+                        <div class="offline-protocol-fallback-icon"><i data-lucide="shield-alert"></i></div>
+                        <div class="offline-protocol-copy offline-protocol-fallback-copy">
+                            <label for="offlineMagnetFallback">磁力解析失败自动隔离</label>
+                            <div class="offline-protocol-hint">无法取得文件树时，仅允许自动任务整单进入独立目录；默认开启，可手动关闭</div>
                         </div>
                         <label class="toggle">
-                            <input id="offlineMagnetEnabled" type="checkbox" data-key="OFFLINE_MAGNET_ENABLED" checked>
+                            <input id="offlineMagnetFallback" type="checkbox" data-key="OFFLINE_MAGNET_UNVERIFIED_FALLBACK" checked>
                             <span class="toggle-slider"></span>
                         </label>
                     </div>
                 </div>
 
-                <div class="offline-protocol-card organize-toggle-tile">
-                    <div class="organize-toggle-top">
-                        <div class="organize-toggle-title offline-protocol-title">
-                            <div class="organize-toggle-icon"><i data-lucide="link-2"></i></div>
-                            <div class="offline-protocol-copy">
-                                <label for="offlineEd2kEnabled">允许 ED2K</label>
-                            </div>
+                <!-- 2. 默认保存目录 -->
+                <div class="form-row">
+                    <div class="field-label">
+                        <div class="name">默认保存目录</div>
+                        <div class="hint">未命中二次分流时使用</div>
+                    </div>
+                    <div class="field-control offline-dir-control">
+                        <input type="hidden" data-key="OFFLINE_TARGET_DIR" id="offlineTargetDir">
+                        <input type="hidden" data-key="OFFLINE_TARGET_DIR_NAME" id="offlineTargetDirName">
+                        <div class="offline-dir-card-box">
+                            <div class="offline-dir-value" id="offlineTargetDirValue">未选择</div>
+                            <button type="button" class="jump-btn offline-dir-btn" data-offline-dir="primary"><i data-lucide="folder-search"></i>选择目录</button>
                         </div>
-                        <label class="toggle">
-                            <input id="offlineEd2kEnabled" type="checkbox" data-key="OFFLINE_ED2K_ENABLED" checked>
-                            <span class="toggle-slider"></span>
-                        </label>
                     </div>
                 </div>
 
-                <div class="offline-protocol-card organize-toggle-tile">
-                    <div class="organize-toggle-top">
-                        <div class="organize-toggle-title offline-protocol-title">
-                            <div class="organize-toggle-icon"><i data-lucide="globe"></i></div>
-                            <div class="offline-protocol-copy">
-                                <label for="offlineHttpEnabled">允许 HTTP(S)</label>
-                            </div>
-                        </div>
-                        <label class="toggle">
-                            <input id="offlineHttpEnabled" type="checkbox" data-key="OFFLINE_HTTP_ENABLED">
-                            <span class="toggle-slider"></span>
-                        </label>
+                <!-- 3. 启用二次分流开关 -->
+                <div class="form-row offline-switch-row">
+                    <div class="field-label">
+                        <div class="name">启用二次分流</div>
+                        <div class="hint">关键词命中时改存到另一个目录</div>
+                    </div>
+                    <div class="field-control">
+                        <label class="toggle"><input type="checkbox" data-key="OFFLINE_SECONDARY_ENABLED" id="offlineSecondaryEnabled"><span class="toggle-slider"></span></label>
                     </div>
                 </div>
 
-                <div class="offline-protocol-card offline-protocol-card--fallback organize-toggle-tile">
-                    <div class="offline-protocol-copy offline-protocol-fallback-copy">
-                        <label for="offlineMagnetFallback">磁力解析失败自动隔离</label>
-                        <div class="offline-protocol-hint">无法取得文件树时，仅允许自动任务整单进入独立目录；默认开启，可手动关闭</div>
+                <!-- 4. 二次分流嵌套设置区 -->
+                <div id="offlineSecondaryRows" class="offline-secondary-block">
+                    <div class="form-row">
+                        <div class="field-label">
+                            <div class="name">二次分流目录</div>
+                            <div class="hint">关键词命中时使用</div>
+                        </div>
+                        <div class="field-control offline-dir-control">
+                            <input type="hidden" data-key="OFFLINE_SECONDARY_DIR" id="offlineSecondaryDir">
+                            <input type="hidden" data-key="OFFLINE_SECONDARY_DIR_NAME" id="offlineSecondaryDirName">
+                            <div class="offline-dir-card-box">
+                                <div class="offline-dir-value" id="offlineSecondaryDirValue">未选择</div>
+                                <button type="button" class="jump-btn offline-dir-btn" data-offline-dir="secondary"><i data-lucide="folder-search"></i>选择目录</button>
+                            </div>
+                        </div>
                     </div>
-                    <label class="toggle">
-                        <input id="offlineMagnetFallback" type="checkbox" data-key="OFFLINE_MAGNET_UNVERIFIED_FALLBACK" checked>
-                        <span class="toggle-slider"></span>
-                    </label>
-                </div>
-            </div>
-            <div class="form-row offline-textarea-row">
-                <div class="field-label">
-                    <div class="name">排除词</div>
-                    <div class="hint">链接或文件名匹配时自动排除；按 Enter 或逗号生成标签</div>
-                </div>
-                <div class="field-control">
-                    <input type="hidden" data-key="OFFLINE_EXCLUDE_KEYWORDS" id="offlineExcludeKeywords">
-                    <div class="offline-tag-input-box" id="offlineExcludeTagBox">
-                        <div class="offline-tag-list"></div>
-                        <input type="text" class="offline-tag-field" id="offlineExcludeTagField" placeholder="输入排除词按 Enter 添加...">
-                    </div>
-                    <div class="offline-preset-chips" id="offlinePresetChips">
-                        <span class="chip-label">常用快捷填入:</span>
-                        <button type="button" class="tag-chip" data-chip="CAM">CAM</button>
-                        <button type="button" class="tag-chip" data-chip="TS抢先">TS抢先</button>
-                        <button type="button" class="tag-chip" data-chip="sample">sample</button>
-                        <button type="button" class="tag-chip" data-chip="预览版">预览版</button>
-                    </div>
-                </div>
-            </div>
-            <div class="form-row">
-                <div class="field-label">
-                    <div class="name">最小文件 (MB)</div>
-                    <div class="hint">小于此体积的文件自动排除</div>
-                </div>
-                <div class="field-control">
-                    <input type="number" min="0" class="form-input" data-key="OFFLINE_MIN_FILE_MB" id="offlineMinFileMb" value="0">
-                </div>
-            </div>
-            <div class="form-row offline-textarea-row">
-                <div class="field-label">
-                    <div class="name">允许扩展名</div>
-                    <div class="hint">当前生效的默认媒体类型已展开；按 Enter 或逗号添加，点击标签可删除</div>
-                </div>
-                <div class="field-control">
-                    <input type="hidden" data-key="OFFLINE_ALLOWED_EXTS" id="offlineAllowedExts">
-                    <div class="offline-tag-input-box" id="offlineAllowedExtsTagBox">
-                        <div class="offline-tag-list"></div>
-                        <input type="text" class="offline-tag-field" id="offlineAllowedExtsTagField" placeholder="输入扩展名 (如 mkv) 按 Enter 添加...">
+                    <div class="form-row offline-textarea-row">
+                        <div class="field-label">
+                            <div class="name">分流关键词</div>
+                            <div class="hint">按 Enter 或逗号生成标签</div>
+                        </div>
+                        <div class="field-control">
+                            <input type="hidden" data-key="OFFLINE_SECONDARY_KEYWORDS" id="offlineSecondaryKeywords">
+                            <div class="offline-tag-input-box" id="offlineSecondaryTagBox">
+                                <div class="offline-tag-list"></div>
+                                <input type="text" class="offline-tag-field" id="offlineSecondaryTagField" placeholder="输入分流词按 Enter 添加...">
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
+
+        <!-- Right Column: Media Filtering Rules -->
         <div class="settings-section offline-settings-section">
-            <div class="offline-card-head">
-                <h3><i data-lucide="folders"></i>保存目录与分流</h3>
-                <span class="offline-card-tag">DIRECTORY ROUTING</span>
-            </div>
-            <p class="desc">Telegram 自动下载会按照默认目录和关键词分流规则保存到光鸭。</p>
-            <div class="form-row">
-                <div class="field-label">
-                    <div class="name">默认保存目录</div>
-                    <div class="hint">未命中二次分流时使用</div>
+            <header class="strm-section-head">
+                <div class="strm-card-icon-wrap">
+                    <i data-lucide="filter"></i>
                 </div>
-                <div class="field-control offline-dir-control">
-                    <input type="hidden" data-key="OFFLINE_TARGET_DIR" id="offlineTargetDir">
-                    <input type="hidden" data-key="OFFLINE_TARGET_DIR_NAME" id="offlineTargetDirName">
-                    <div class="offline-dir-value" id="offlineTargetDirValue">未选择</div>
-                    <button type="button" class="jump-btn" data-offline-dir="primary"><i data-lucide="folder-search"></i>选择目录</button>
+                <div class="title-group">
+                    <h3>过滤与排除规则</h3>
+                    <p class="desc">按扩展名、体积和排除词自动筛选有效媒体，屏蔽非必要文件</p>
                 </div>
-            </div>
-            <div class="form-row">
-                <div class="field-label">
-                    <div class="name">启用二次分流</div>
-                    <div class="hint">关键词命中时改存到另一个目录</div>
-                </div>
-                <div class="field-control">
-                    <label class="toggle"><input type="checkbox" data-key="OFFLINE_SECONDARY_ENABLED" id="offlineSecondaryEnabled"><span class="toggle-slider"></span></label>
-                </div>
-            </div>
-            <div id="offlineSecondaryRows" class="offline-secondary-block">
+                <span class="offline-card-tag">AUTO FILTER</span>
+            </header>
+
+            <div class="strm-card-body offline-card-body">
+                <!-- 1. 最小文件体积 -->
                 <div class="form-row">
                     <div class="field-label">
-                        <div class="name">二次分流目录</div>
-                        <div class="hint">关键词命中时使用</div>
-                    </div>
-                    <div class="field-control offline-dir-control">
-                        <input type="hidden" data-key="OFFLINE_SECONDARY_DIR" id="offlineSecondaryDir">
-                        <input type="hidden" data-key="OFFLINE_SECONDARY_DIR_NAME" id="offlineSecondaryDirName">
-                        <div class="offline-dir-value" id="offlineSecondaryDirValue">未选择</div>
-                        <button type="button" class="jump-btn" data-offline-dir="secondary"><i data-lucide="folder-search"></i>选择目录</button>
-                    </div>
-                </div>
-                <div class="form-row offline-textarea-row">
-                    <div class="field-label">
-                        <div class="name">分流关键词</div>
-                        <div class="hint">按 Enter 或逗号生成标签</div>
+                        <div class="name">最小文件体积</div>
+                        <div class="hint">小于此体积的文件自动排除</div>
                     </div>
                     <div class="field-control">
-                        <input type="hidden" data-key="OFFLINE_SECONDARY_KEYWORDS" id="offlineSecondaryKeywords">
-                        <div class="offline-tag-input-box" id="offlineSecondaryTagBox">
+                        <div class="strm-composite-input-wrap offline-size-wrap">
+                            <i data-lucide="hard-drive" class="strm-composite-icon"></i>
+                            <input type="number" min="0" class="form-input strm-composite-input" data-key="OFFLINE_MIN_FILE_MB" id="offlineMinFileMb" value="0">
+                            <span class="offline-unit-suffix">MB</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. 排除词 -->
+                <div class="form-row offline-textarea-row">
+                    <div class="field-label">
+                        <div class="name">排除词</div>
+                        <div class="hint">链接或文件名匹配时自动排除；按 Enter 或逗号生成标签</div>
+                    </div>
+                    <div class="field-control">
+                        <input type="hidden" data-key="OFFLINE_EXCLUDE_KEYWORDS" id="offlineExcludeKeywords">
+                        <div class="offline-tag-input-box" id="offlineExcludeTagBox">
                             <div class="offline-tag-list"></div>
-                            <input type="text" class="offline-tag-field" id="offlineSecondaryTagField" placeholder="输入分流词按 Enter 添加...">
+                            <input type="text" class="offline-tag-field" id="offlineExcludeTagField" placeholder="输入排除词按 Enter 添加...">
+                        </div>
+                        <div class="offline-preset-chips" id="offlinePresetChips">
+                            <span class="chip-label">快捷添加:</span>
+                            <button type="button" class="tag-chip" data-chip="CAM">+ CAM</button>
+                            <button type="button" class="tag-chip" data-chip="TS抢先">+ TS抢先</button>
+                            <button type="button" class="tag-chip" data-chip="sample">+ sample</button>
+                            <button type="button" class="tag-chip" data-chip="预告版">+ 预告版</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 3. 允许扩展名 -->
+                <div class="form-row offline-textarea-row">
+                    <div class="field-label">
+                        <div class="name">允许扩展名</div>
+                        <div class="hint">当前生效的默认媒体类型已展开；按 Enter 或逗号添加，点击标签可删除</div>
+                    </div>
+                    <div class="field-control">
+                        <input type="hidden" data-key="OFFLINE_ALLOWED_EXTS" id="offlineAllowedExts">
+                        <div class="offline-tag-input-box" id="offlineAllowedExtsTagBox">
+                            <div class="offline-tag-list"></div>
+                            <input type="text" class="offline-tag-field" id="offlineAllowedExtsTagField" placeholder="输入扩展名 (如 mkv) 按 Enter 添加...">
                         </div>
                     </div>
                 </div>

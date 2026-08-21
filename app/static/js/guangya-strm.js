@@ -178,8 +178,45 @@
     const videoTagInput = initTagInput(videoExtsBox, videoExtsInput);
     const metadataTagInput = initTagInput(metadataExtsBox, metadataExtsInput);
 
-    function syncSourceReservation(count){const rows=Math.min(12,Math.max(1,Number(count)||1));document.documentElement?.style?.setProperty('--strm-source-reserved-height',`${rows*60-8}px`);try{sessionStorage.setItem('mediaflux:strm-source-rows',String(rows));}catch(_) {}}
-    function renderSources(){input.value=JSON.stringify(sources);const list=document.getElementById('strmSourceList');syncSourceReservation(sources.length);list.setAttribute('aria-busy','false');if(!sources.length){list.innerHTML='<div class="strm-source-empty"><i data-lucide="folder-plus" style="width:16px;height:16px;vertical-align:-3px;margin-right:6px;color:var(--text-muted);"></i>暂未设置网盘扫描目录</div>';window.renderLucideIcons?.(list);return;}list.innerHTML=sources.map((source,index)=>`<div class="strm-source-item"><div class="strm-source-info"><i data-lucide="folder-check" class="strm-source-icon"></i><div><strong>${esc(source.name)}</strong><span>ID ${esc(source.id)}</span></div></div><button type="button" data-remove-source="${index}" title="移除目录"><i data-lucide="x"></i></button></div>`).join('');window.renderLucideIcons?.(list);list.querySelectorAll('[data-remove-source]').forEach(btn=>btn.addEventListener('click',()=>{sources.splice(Number(btn.dataset.removeSource),1);renderSources();}));}
+    function syncSourceReservation(list){
+        requestAnimationFrame(()=>{
+            if(!list)return;
+            const listRect=list.getBoundingClientRect();
+            const styles=getComputedStyle(list);
+            const paddingBottom=Number.parseFloat(styles.paddingBottom)||0;
+            const contentBottom=[...list.children].reduce((max,child)=>Math.max(max,child.getBoundingClientRect().bottom-listRect.top),0);
+            const height=Math.min(720,Math.max(46,Math.ceil(contentBottom+paddingBottom)));
+            document.documentElement?.style?.setProperty('--strm-source-reserved-height',`${height}px`);
+            try{
+                sessionStorage.setItem('mediaflux:strm-source-height',String(height));
+                sessionStorage.setItem('mediaflux:strm-source-rows',String(Math.min(12,Math.max(1,sources.length))));
+            }catch(_) {}
+        });
+    }
+    function renderSources(){
+        input.value=JSON.stringify(sources);
+        const list=document.getElementById('strmSourceList');
+        list.setAttribute('aria-busy','false');
+        if(!sources.length){
+            list.innerHTML='<div class="strm-source-empty"><i data-lucide="folder-plus"></i><span>暂未设置网盘扫描目录，请点击右上角选择</span></div>';
+            window.renderLucideIcons?.(list);
+            syncSourceReservation(list);
+            return;
+        }
+        list.innerHTML=sources.map((source,index)=>`
+            <div class="strm-source-chip">
+                <i data-lucide="folder" class="strm-source-chip-icon"></i>
+                <span class="strm-source-chip-text">${source.name ? `${esc(source.name)} (ID: ${esc(source.id)})` : `ID: ${esc(source.id)}`}</span>
+                <button type="button" class="strm-source-chip-remove" data-remove-source="${index}" title="移除目录" aria-label="移除目录">&times;</button>
+            </div>
+        `).join('');
+        window.renderLucideIcons?.(list);
+        syncSourceReservation(list);
+        list.querySelectorAll('[data-remove-source]').forEach(btn=>btn.addEventListener('click',()=>{
+            sources.splice(Number(btn.dataset.removeSource),1);
+            renderSources();
+        }));
+    }
 
     const normalizeBaseUrl=value=>String(value??'').trim().replace(/\/+$/,'');
     const isBaseUrlManaged=()=>strmBaseUrlInput.dataset.managedByEnvironment==='true';
@@ -192,6 +229,7 @@
             error:['完整刷新未完成','上次完整校准未完全成功，请查看运行记录后重试。'],
         }[state]||['现有 STRM 链接','播放地址变更并保存后，需要完整校准才能统一更新已有 STRM。'];
         strmBaseUrlRefresh.dataset.state=state;
+        strmBaseUrlRefresh.hidden=state==='idle';
         strmBaseUrlRefreshTitle.textContent=copy[0];
         strmBaseUrlRefreshText.textContent=message||copy[1];
         const actionable=(state==='pending'||state==='error')&&strmConfigReady&&!strmSyncRunning&&!isBaseUrlManaged();
@@ -250,7 +288,7 @@
         if(!['http:','https:'].includes(window.location.protocol))return null;
         return {url:window.location.origin,source:'browser_origin',label:'当前访问地址'};
     }
-    function renderStrmBaseUrlCandidates(payload){
+    function renderStrmBaseUrlCandidates(payload, interactive=false){
         const rows=[];
         const configured=String(payload.configured||'').replace(/\/$/,'');
         if(configured)rows.push({url:configured,source:'configured',label:'已保存地址'});
@@ -271,22 +309,48 @@
         if(browser&&['localhost','127.0.0.1','0.0.0.0'].includes(window.location.hostname)){warnings.unshift('当前浏览器地址仅适合本机访问，其他设备请不要选择 localhost。');}
         strmBaseUrlState.dataset.tone=warnings.length?'warning':'success';
         strmBaseUrlState.textContent=warnings[0]||(unique.length?`已发现 ${unique.length} 个候选地址；请选择媒体服务器实际可达的一项。`:'未发现候选地址，请手动填写媒体服务器可访问的地址。');
+
+        if(interactive){
+            if(unique.length){
+                const best=unique.find(item=>!item.url.includes('127.0.0.1')&&!item.url.includes('localhost')&&!item.url.includes('0.0.0.0'))||unique[0];
+                if(best){
+                    strmBaseUrlInput.value=best.url;
+                    strmBaseUrlInput.dispatchEvent(new Event('input',{bubbles:true}));
+                    if(unique.length>1){
+                        strmBaseUrlCandidates.value=best.url;
+                        strmBaseUrlCandidates.style.display='block';
+                    }else{
+                        strmBaseUrlCandidates.style.display='none';
+                    }
+                    if(window.showToast)window.showToast(`已自动探测到局域网地址: ${best.url}`,'success');
+                }
+            }else{
+                if(window.showToast)window.showToast('未探测到可用局域网地址，请手动输入','warning');
+            }
+        }
     }
-    async function loadStrmBaseUrlCandidates(){
+    async function loadStrmBaseUrlCandidates(interactive=false){
         if(strmBaseUrlDetectBtn.disabled||!strmConfigReady||isBaseUrlManaged())return;
         strmBaseUrlDetectBtn.disabled=true;strmBaseUrlDetectBtn.classList.add('is-loading');strmBaseUrlDetectBtn.setAttribute('aria-busy','true');
         strmBaseUrlState.dataset.tone='testing';strmBaseUrlState.textContent='正在发现监听配置与局域网候选地址…';
-        try{const response=await fetch('/api/strm/base-url-candidates');const data=await response.json();if(!response.ok)throw new Error(data.error||'候选地址读取失败');renderStrmBaseUrlCandidates(data);}
-        catch(error){strmBaseUrlState.dataset.tone='error';strmBaseUrlState.textContent=error.message||'候选地址读取失败，请手动填写。';}
+        try{const response=await fetch('/api/strm/base-url-candidates');const data=await response.json();if(!response.ok)throw new Error(data.error||'候选地址读取失败');renderStrmBaseUrlCandidates(data, interactive);}
+        catch(error){
+            strmBaseUrlState.dataset.tone='error';strmBaseUrlState.textContent=error.message||'候选地址读取失败，请手动填写。';
+            if(interactive&&window.showToast)window.showToast(error.message||'候选地址探测失败','error');
+        }
         finally{strmBaseUrlDetectBtn.classList.remove('is-loading');strmBaseUrlDetectBtn.setAttribute('aria-busy','false');syncBaseUrlControlAvailability();}
     }
 
     function syncMetadata(){
         const enabled = metadata.checked;
         const metadataRow = document.getElementById('strmMetadataExtRow');
-        metadataRow.classList.toggle('is-disabled', !enabled);
+        if (metadataRow) {
+            metadataRow.classList.toggle('is-disabled', !enabled);
+            metadataRow.style.display = enabled ? '' : 'none';
+        }
         metadataExtsBox.classList.toggle('is-disabled', !enabled);
-        document.getElementById('strmMetadataExtField').disabled = !enabled;
+        const extField = document.getElementById('strmMetadataExtField');
+        if (extField) extField.disabled = !enabled;
     }
 
     function setTag(text,color){const tag=document.getElementById('strmStateTag');tag.innerHTML=`<i data-lucide="activity"></i><span>${esc(text)}</span>`;tag.className='share-status-badge';if(color==='var(--success)')tag.classList.add('is-success');else if(color==='var(--warning)'||color==='var(--danger)')tag.classList.add('is-danger');window.renderLucideIcons?.(tag);}
@@ -677,7 +741,7 @@
         state.textContent=error.message||'配置读取失败，请刷新页面后重试';
     });
 
-    strmBaseUrlDetectBtn.addEventListener('click',loadStrmBaseUrlCandidates);
+    strmBaseUrlDetectBtn.addEventListener('click',()=>loadStrmBaseUrlCandidates(true));
     strmBaseUrlCandidates.addEventListener('change',()=>{
         if(!strmConfigReady||isBaseUrlManaged()||!strmBaseUrlCandidates.value)return;
         strmBaseUrlInput.value=strmBaseUrlCandidates.value;
@@ -692,6 +756,44 @@
     });
 
     document.getElementById('addStrmSourceBtn').addEventListener('click',()=>openGuangYaDirectoryPicker({modalId:'strmStandaloneDirModal',title:'批量选择 STRM 源目录',multiple:true,selected:sources,allowRoot:false,onSelect:dirs=>{sources=dirs.map(item=>({id:item.id,name:item.name}));renderSources();}}));
+    const browseStrmRootBtn = document.getElementById('browseStrmRootBtn');
+    if (browseStrmRootBtn) {
+        browseStrmRootBtn.addEventListener('click', () => {
+            const rootInput = form.querySelector('[data-key="STRM_ROOT"]');
+            if (!rootInput) return;
+            if (window.openGuangYaDirectoryPicker) {
+                window.openGuangYaDirectoryPicker({
+                    modalId: 'localMediaDirModal',
+                    title: '选择 STRM 本地根目录',
+                    rootId: '__roots__',
+                    rootName: '本机目录',
+                    allowRoot: true,
+                    fetchDirectory: async (path) => {
+                        const query = new URLSearchParams({path: !path || path === '__roots__' ? '__roots__' : path});
+                        const res = await fetch(`/api/local-media/directories?${query.toString()}`);
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok) throw new Error(data.error || '读取本地目录失败');
+                        return (data.directories || []).map((item) => {
+                            const itemId = String(item.id ?? item.path ?? '');
+                            return {
+                                id: itemId,
+                                file_id: itemId,
+                                name: item.name || itemId,
+                                is_dir: true,
+                            };
+                        });
+                    },
+                    onSelect: (item) => {
+                        const selectedPath = String(item?.id || '').trim();
+                        if (selectedPath && selectedPath !== '__roots__') {
+                            rootInput.value = selectedPath;
+                            rootInput.dispatchEvent(new Event('input', {bubbles: true}));
+                        }
+                    }
+                });
+            }
+        });
+    }
     metadata.addEventListener('change',syncMetadata);
 
     // Preset Chip Click Events

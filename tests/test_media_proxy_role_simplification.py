@@ -552,7 +552,7 @@ class MediaProxyTemplateTests(unittest.TestCase):
         template = Path("app/templates/media_proxy.html").read_text(encoding="utf-8")
         self.assertIn("已配置媒体服务器", template)
         self.assertIn("高级光鸭播放映射", template)
-        self.assertIn("本地媒体由媒体服务器负责", template)
+        self.assertIn("本地视频继续由上游负责", template)
         self.assertIn("/api/media-proxy/profiles", template)
         self.assertNotIn("本地媒体根目录", template)
         self.assertNotIn("本地相对路径", template)
