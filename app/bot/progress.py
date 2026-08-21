@@ -82,12 +82,37 @@ def _update_pending(operation_id: str, **fields: Any) -> bool:
         return False
 
 
+def _rich_html(rendered: str) -> str:
+    """把普通 Telegram HTML 的换行转换成 Rich Message 块结构。
+
+    ``send_message(parse_mode="HTML")`` 会保留裸换行，但 ``InputRichMessage``
+    按 HTML 文档规则折叠空白。这里用段落保留分组、用 ``<br>`` 保留组内
+    换行，避免终态汇总在 Rich Message 通道中挤成一整段。
+    """
+    if not rendered:
+        return ""
+
+    paragraphs: list[str] = []
+    lines: list[str] = []
+    normalized = str(rendered).replace("\r\n", "\n").replace("\r", "\n")
+    for line in normalized.split("\n"):
+        if line.strip():
+            lines.append(line)
+            continue
+        if lines:
+            paragraphs.append(f"<p>{'<br>'.join(lines)}</p>")
+            lines = []
+    if lines:
+        paragraphs.append(f"<p>{'<br>'.join(lines)}</p>")
+    return "".join(paragraphs)
+
+
 def _rich_message(telebot: Any, rendered: str) -> Any | None:
     cls = getattr(getattr(telebot, "types", None), "InputRichMessage", None)
     if not callable(cls):
         return None
     try:
-        return cls(html=rendered)
+        return cls(html=_rich_html(rendered))
     except Exception:
         return None
 

@@ -124,11 +124,21 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
     def test_prefers_rich_draft_and_persists_rich_final_message(self):
         bot = _RichBot()
         progress = TelegramProgress(bot, _TELEBOT, "100", "资源搜索", timeout_seconds=60)
-        progress.begin("<b>正在搜索</b>")
+        progress.begin("<b>正在搜索</b>\n阶段：准备中")
         self.assertEqual(progress.mode, "rich_draft")
+        self.assertEqual(
+            bot.rich_drafts[-1][2],
+            "<p><b>正在搜索</b><br>阶段：准备中</p>",
+        )
         self.assertTrue(progress.update("<b>仍在搜索</b>"))
-        self.assertTrue(progress.finish("<b>搜索完成</b>"))
-        self.assertEqual(bot.rich_messages[-1][1], "<b>搜索完成</b>")
+        self.assertTrue(progress.finish(
+            "<b>搜索完成</b>\n\n<b>状态</b>  已完成\n<b>概览</b>  2 个来源"
+        ))
+        self.assertEqual(
+            bot.rich_messages[-1][1],
+            "<p><b>搜索完成</b></p>"
+            "<p><b>状态</b>  已完成<br><b>概览</b>  2 个来源</p>",
+        )
         self.assertEqual(bot.rich_drafts[-1][2], "")
         self.assertEqual(bot.text_drafts, [])
         self.assertFalse(progress.update("不应覆盖终态"))
