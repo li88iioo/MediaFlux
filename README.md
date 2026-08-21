@@ -89,7 +89,7 @@ MediaFlux 提供开箱即用的 Docker 容器化部署与 Python 源码运行方
 
 ### 方式一：Docker Compose 部署（推荐）
 
-MediaFlux 专注于轻量、高性能的容器化架构，使用 FastAPI + uvloop 高性能异步网络栈。媒体规格探测会按 `MEDIAFLUX_FFPROBE` 和系统 `PATH` 查找 ffprobe；官方镜像默认不捆绑 ffprobe，缺失时降级为文件名规格，不会阻断整理。
+MediaFlux 专注于轻量、高性能的容器化架构，使用 FastAPI + uvloop 高性能异步网络栈。官方 Docker 镜像已内置 ffprobe，并通过 `MEDIAFLUX_FFPROBE=/usr/bin/ffprobe` 用于本地与云端媒体规格探测；若自定义镜像移除该工具，程序仍会降级为文件名规格，不会阻断整理。
 
 1. **获取 Compose 配置**：
    ```bash

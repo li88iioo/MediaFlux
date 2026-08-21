@@ -25,9 +25,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MEDIAFLUX_CONFIG_DIR=/app/db \
     MEDIAFLUX_CACHE_DIR=/app/db/cache \
     MEDIAFLUX_LOG_DIR=/app/db/logs \
-    MEDIAFLUX_STRM_DIR=/data/strm
+    MEDIAFLUX_STRM_DIR=/data/strm \
+    MEDIAFLUX_FFPROBE=/usr/bin/ffprobe
 
 WORKDIR /app
+
+# 本地与云端媒体规格探测依赖 ffprobe；Debian 的 ffmpeg 包同时提供该命令。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && /usr/bin/ffprobe -version >/dev/null 2>&1 \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 mediaflux \
     && useradd --system --uid 10001 --gid mediaflux --home-dir /app mediaflux

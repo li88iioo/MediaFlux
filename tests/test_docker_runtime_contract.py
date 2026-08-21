@@ -157,6 +157,16 @@ class DockerRuntimeContractTests(unittest.TestCase):
             "${SESSION_COOKIE_SECURE:-0}",
         )
 
+    def test_image_bundles_ffprobe_before_switching_to_non_root_user(self) -> None:
+        self.assertIn("apt-get install -y --no-install-recommends ffmpeg", self.dockerfile)
+        self.assertIn("MEDIAFLUX_FFPROBE=/usr/bin/ffprobe", self.dockerfile)
+        self.assertIn("/usr/bin/ffprobe -version >/dev/null 2>&1", self.dockerfile)
+        self.assertLess(
+            self.dockerfile.index("apt-get install -y --no-install-recommends ffmpeg"),
+            self.dockerfile.index("USER mediaflux"),
+        )
+        self.assertIn("rm -rf /var/lib/apt/lists/*", self.dockerfile)
+
     def test_compose_keeps_non_root_security_contract(self) -> None:
         service = self.compose["services"]["mediaflux"]
         self.assertIn("USER mediaflux", self.dockerfile)
