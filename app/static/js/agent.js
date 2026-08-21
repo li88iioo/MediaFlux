@@ -1582,6 +1582,66 @@
         return renderTextBlocks(narrative, 'agent-narrative agent-rich-text', {promoteFirst: true});
     }
 
+    function responseInspectionTrace(payload) {
+        const rawItems = Array.isArray(payload?.agent_trace) ? payload.agent_trace : [];
+        const partial = payload?.agent_partial?.complete === false;
+        const items = rawItems.flatMap((item) => {
+            if (!item || typeof item !== 'object') return [];
+            const label = String(item.label || '').trim().slice(0, 80);
+            if (!label) return [];
+            return [{
+                label,
+                ok: item.ok === true,
+                summary: String(item.summary || '').trim().slice(0, 240),
+            }];
+        }).slice(0, 6);
+        if (!items.length || (items.length === 1 && !partial)) return null;
+        return {items, partial, total: rawItems.length};
+    }
+
+    function renderInspectionTrace(payload) {
+        const trace = responseInspectionTrace(payload);
+        if (!trace) return null;
+        const section = node('section', 'agent-inspection-trace');
+        section.setAttribute('aria-label', '本次核对范围');
+        const head = node('div', 'agent-inspection-trace-head');
+        const heading = node('div');
+        heading.append(
+            node('span', 'agent-inspection-kicker', trace.partial ? 'PARTIAL CHECK' : 'VERIFIED SOURCES'),
+            node('h4', '', `本次核对 · ${trace.total} 项`),
+        );
+        head.append(
+            heading,
+            node(
+                'span',
+                `agent-inspection-state ${trace.partial ? 'is-warning' : 'is-good'}`,
+                trace.partial ? '部分完成' : '核对完成',
+            ),
+        );
+        const list = node('div', 'agent-inspection-list');
+        list.setAttribute('role', 'list');
+        trace.items.forEach((item) => {
+            const row = node('div', `agent-inspection-item ${item.ok ? 'is-good' : 'is-warning'}`);
+            row.setAttribute('role', 'listitem');
+            const mark = node('span', 'agent-inspection-mark');
+            mark.append(icon(item.ok ? 'check' : 'triangle-alert'));
+            const copy = node('div', 'agent-inspection-copy');
+            copy.append(node('strong', '', item.label));
+            if (item.summary) copy.append(node('p', '', item.summary));
+            row.append(
+                mark,
+                copy,
+                node('span', 'agent-inspection-result', item.ok ? '完成' : '需关注'),
+            );
+            list.append(row);
+        });
+        section.append(head, list);
+        if (trace.total > trace.items.length) {
+            section.append(node('p', 'agent-inspection-more', `另有 ${trace.total - trace.items.length} 项已核对`));
+        }
+        return section;
+    }
+
     function renderGuidance(payload) {
         const items = responseGuidance(payload);
         if (!items.length) return null;
@@ -1657,6 +1717,8 @@
                 {promoteFirst: true},
             );
             if (copy) card.append(copy);
+            const trace = renderInspectionTrace(payload);
+            if (trace) card.append(trace);
             const state = renderNarrativeState(display, result);
             if (state) card.append(state);
             const guidance = renderGuidance(payload);
@@ -1686,6 +1748,8 @@
                 if (errorCopy) card.append(errorCopy);
             }
         }
+        const trace = renderInspectionTrace(payload);
+        if (trace) card.append(trace);
         const specializedData = renderSpecializedData(payload?.tool_call?.name, result.data, result);
         const genericData = specializedData ? null : renderData(display.details);
         if (specializedData) card.append(specializedData);

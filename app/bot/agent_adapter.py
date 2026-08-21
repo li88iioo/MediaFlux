@@ -84,7 +84,9 @@ _READ_PLAN_LABELS = {
     "agent.action_history": "操作历史",
 }
 _MAX_SUMMARY_LENGTH = 900
+_MAX_NARRATIVE_LENGTH = 1000
 _MAX_SUGGESTION_LENGTH = 280
+_MAX_TRACE_ITEMS = 5
 _TELEGRAM_QUERY_LIMIT_PER_MINUTE = 12
 _TELEGRAM_CALLBACK_LIMIT_PER_MINUTE = 12
 _RESOURCE_RESULT_LIMIT = 3
@@ -1285,6 +1287,43 @@ def _telegram_library_audit_details(response: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _telegram_agent_trace_details(response: dict[str, Any]) -> str:
+    """展示模型实际核对过的公开数据源，不暴露工具名、参数或内部标识。"""
+    raw_trace = response.get("agent_trace")
+    if not isinstance(raw_trace, list):
+        return ""
+    partial_payload = response.get("agent_partial")
+    partial = (
+        isinstance(partial_payload, dict)
+        and partial_payload.get("complete") is False
+    )
+    projected: list[tuple[str, bool, str]] = []
+    for item in raw_trace[:_MAX_TRACE_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        label = _public_text(item.get("label"), limit=70)
+        if not label:
+            continue
+        projected.append((
+            label,
+            item.get("ok") is True,
+            _public_text(item.get("summary"), limit=150),
+        ))
+    if not projected or (len(projected) == 1 and not partial):
+        return ""
+
+    title = "已完成部分核对" if partial else "本次核对"
+    lines = [f"<b>{title}</b>"]
+    for label, ok, summary in projected:
+        lines.append(f"• <b>{label}</b> · {'完成' if ok else '需关注'}")
+        if summary:
+            lines.append(f"  {summary}")
+    remaining = max(0, len(raw_trace) - len(projected))
+    if remaining:
+        lines.append(f"另有 {remaining} 项已核对。")
+    return "\n".join(lines)
+
+
 def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
     """将 Agent 回复排成自然短段落，避免重复栏目和内部诊断细节。"""
     payload = response if isinstance(response, dict) else {}
@@ -1305,12 +1344,17 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
     narrative = ""
     if isinstance(presentation, dict) and presentation.get("source") == "llm":
         narrative = _public_multiline_html(
-            presentation.get("narrative"), limit=1400, promote_first=True
+            presentation.get("narrative"),
+            limit=_MAX_NARRATIVE_LENGTH,
+            promote_first=True,
         )
 
-    structured_details = "" if narrative else _telegram_library_audit_details(payload)
-    body_parts = [item for item in (summary, structured_details) if item]
-    body = narrative or "\n\n".join(body_parts) or "当前没有可安全展示的结果摘要。"
+    structured_details = _telegram_library_audit_details(payload)
+    trace_details = _telegram_agent_trace_details(payload)
+    body_parts = [
+        item for item in (narrative or summary, structured_details, trace_details) if item
+    ]
+    body = "\n\n".join(body_parts) or "当前没有可安全展示的结果摘要。"
     error = _public_multiline_html(
         display.get("error") or result.get("error"), limit=500
     )

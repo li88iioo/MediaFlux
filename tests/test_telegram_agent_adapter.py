@@ -692,7 +692,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("0/0", text)
         self.assertNotIn("暂未发现", text)
 
-    def test_library_audit_llm_narrative_has_priority_over_structured_projection(self):
+    def test_library_audit_llm_narrative_keeps_structured_facts_visible(self):
         text = render_agent_response({
             "tool_call": {"name": "library.audit_library_episodes"},
             "result": {
@@ -714,8 +714,42 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         })
 
         self.assertIn("确认有两部剧需要补集", text)
-        self.assertNotIn("<b>核对范围</b>", text)
+        self.assertIn("<b>核对范围</b>", text)
+        self.assertIn("已实际核对 8 部", text)
         self.assertNotIn("确定性摘要", text)
+
+    def test_multi_tool_narrative_lists_verified_sources_without_internal_names(self):
+        text = render_agent_response({
+            "mode": "conversation",
+            "result": {
+                "ok": True,
+                "status": "answered",
+                "summary": "确定性摘要",
+                "suggestions": [],
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "下载队列正常，但 RSS 最近没有新活动。",
+            },
+            "agent_trace": [
+                {"label": "下载队列", "ok": True, "summary": "当前没有异常任务。"},
+                {
+                    "label": "RSS 订阅",
+                    "ok": False,
+                    "summary": "检查 /volume/private/rss.db 和 https://secret.invalid 失败。",
+                },
+            ],
+        })
+
+        self.assertIn("下载队列正常", text)
+        self.assertIn("<b>本次核对</b>", text)
+        self.assertIn("<b>下载队列</b> · 完成", text)
+        self.assertIn("<b>RSS 订阅</b> · 需关注", text)
+        self.assertIn("[路径已隐藏]", text)
+        self.assertIn("[链接已隐藏]", text)
+        self.assertNotIn("/volume/private", text)
+        self.assertNotIn("secret.invalid", text)
 
     def test_stream_preview_uses_same_paragraph_and_list_projection(self):
         text = _stream_preview_html(

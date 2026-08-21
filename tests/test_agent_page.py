@@ -95,8 +95,8 @@ class AgentPageTests(InitializedWebTestCase):
         )
         self.assertEqual(response.text.count("/static/css/agent.css"), 1)
         self.assertEqual(response.text.count("/static/js/agent.js"), 1)
-        self.assertIn("/static/css/agent.css?v=20260818c", response.text)
-        self.assertIn("/static/js/agent.js?v=20260811c", response.text)
+        self.assertIn("/static/css/agent.css?v=20260821a", response.text)
+        self.assertIn("/static/js/agent.js?v=20260821a", response.text)
         self.assertIn('id="agentResumeLatestSession"', response.text)
         self.assertIn("继续上次", response.text)
         self.assertNotRegex(response.text, re.compile(r"(?:API_KEY|PASSWORD|TOKEN)=", re.I))
@@ -136,6 +136,19 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("action_key: actionKey", source)
         self.assertNotIn("target_tool: action", source)
         self.assertIn("renderSpecializedData", source)
+        self.assertIn("responseInspectionTrace", source)
+        self.assertIn("renderInspectionTrace", source)
+        self.assertIn("payload?.agent_trace", source)
+        self.assertIn("本次核对", source)
+        self.assertIn(".agent-inspection-trace", styles)
+        self.assertIn(".agent-inspection-item", styles)
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"@media \(max-width:\s*680px\)[\s\S]*"
+                r"\.agent-guidance-action, \.agent-result-disclosure > summary \{ min-height: 44px; \}"
+            ),
+        )
         self.assertIn("WORKFLOW_ACTIONS", source)
         self.assertIn("[data-agent-prompt], [data-agent-draft]", source)
         self.assertIn("promptInput.setSelectionRange", source)
