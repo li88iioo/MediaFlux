@@ -15,13 +15,17 @@ from app.modules.local_media_service import LocalMediaService
 from app.modules.local_media_candidates import discover_local_media_candidates
 from app.modules.local_media_notifications import notify_local_media_task
 from app.modules.local_path_mapping import PathMapping, PathMappingError, assert_within
-from app.modules.local_storage import LocalFilesystemAdapter, snapshot_digest
+from app.modules.local_storage import LocalFilesystemAdapter, LocalStorageError, snapshot_digest
 
 logger = get_logger(__name__)
 
 
 MANUAL_SCAN_TOKEN_PREFIX = "manual-scan:"
 SILENT_MANUAL_SCAN_TOKEN_PREFIX = "silent-manual-scan:"
+
+
+class LocalMediaProbeRetryable(RuntimeError):
+    """qB 完成内容暂时无法可靠判断，调用方应保留任务并稍后重试。"""
 
 
 class LocalMediaScheduler:
@@ -103,10 +107,11 @@ class LocalMediaScheduler:
             mapping.local_root,
         )
         try:
-            if not LocalFilesystemAdapter(mapping.local_root).contains_video(local_path):
-                return None
-        except Exception as exc:
-            logger.warning("qB 完成内容媒体检查失败 %s: %s", local_path.name, exc)
+            contains_video = LocalFilesystemAdapter(mapping.local_root).contains_video(local_path)
+        except (LocalStorageError, OSError) as exc:
+            logger.warning("qB 完成内容媒体检查暂时失败 %s: %s", local_path.name, exc)
+            raise LocalMediaProbeRetryable(str(exc)) from exc
+        if not contains_video:
             return None
         task_id = db.create_local_media_task(
             source.id, task.hash, str(local_path), owner=self.owner, trigger="qb_completed",

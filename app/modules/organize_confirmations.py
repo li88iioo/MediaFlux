@@ -97,6 +97,39 @@ def _fingerprint(payload: dict) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _confirmation_kind(payload: dict) -> str:
+    """旧记录没有 kind；缺省值必须永久保持为光鸭整理。"""
+    kind = str(payload.get("kind") or "guangya").strip().lower()
+    if kind not in {"guangya", "local_media"}:
+        raise ValueError("确认任务类型无效，请重新执行整理")
+    return kind
+
+
+def _persist_confirmation_actions(
+    payload: dict, *, chat_id: str = ""
+) -> tuple[NotificationAction, ...]:
+    candidates = [dict(item) for item in (payload.get("candidates") or [])]
+    if not candidates or not list(payload.get("files") or []):
+        return ()
+    resolved_chat = str(chat_id or get("TG_CHAT_ID", "") or "").strip()
+    token = secrets.token_urlsafe(12)
+    db.create_organize_confirmation(
+        token=token,
+        fingerprint=_fingerprint(payload),
+        chat_id=resolved_chat,
+        source_name=str(payload.get("source_name") or ""),
+        directory_path=str(payload.get("directory") or "/"),
+        payload=payload,
+        expires_at=_timestamp(datetime.now() + timedelta(hours=_CONFIRMATION_TTL_HOURS)),
+    )
+    actions = [
+        NotificationAction(_safe_label(candidate, index), f"orgc:{token}:{index}")
+        for index, candidate in enumerate(candidates)
+    ]
+    actions.append(NotificationAction("暂不处理", f"orgc:{token}:cancel"))
+    return tuple(actions)
+
+
 def create_confirmation_actions(
     group: dict,
     rules: OrganizeRules,
@@ -113,7 +146,6 @@ def create_confirmation_actions(
     files = [dict(item) for item in (group.get("files") or [])]
     if not candidates or not files:
         return ()
-    resolved_chat = str(chat_id or get("TG_CHAT_ID", "") or "").strip()
     payload = {
         "version": 1,
         "source_dir_id": str(group.get("source_dir_id") or ""),
@@ -127,22 +159,115 @@ def create_confirmation_actions(
         "candidates": candidates,
         "rules": asdict(rules),
     }
-    token = secrets.token_urlsafe(12)
-    db.create_organize_confirmation(
-        token=token,
-        fingerprint=_fingerprint(payload),
-        chat_id=resolved_chat,
-        source_name=payload["source_name"],
-        directory_path=payload["directory"],
-        payload=payload,
-        expires_at=_timestamp(datetime.now() + timedelta(hours=_CONFIRMATION_TTL_HOURS)),
-    )
-    actions = [
-        NotificationAction(_safe_label(candidate, index), f"orgc:{token}:{index}")
-        for index, candidate in enumerate(candidates)
-    ]
-    actions.append(NotificationAction("暂不处理", f"orgc:{token}:cancel"))
-    return tuple(actions)
+    return _persist_confirmation_actions(payload, chat_id=chat_id)
+
+
+def create_local_media_confirmation_actions(
+    task,
+    source,
+    preview: dict,
+    *,
+    owner: str = "admin",
+    chat_id: str = "",
+) -> tuple[NotificationAction, ...]:
+    """为本地待确认任务生成与光鸭相同协议的 TG 候选按钮。"""
+    if task is None or source is None or str(getattr(task, "status", "")) != "requires_manual":
+        return ()
+    reason = str(preview.get("reason") or getattr(task, "error", "") or "").strip()
+    raw_candidates = list(preview.get("candidates") or [])
+    if not raw_candidates and isinstance(preview.get("candidate"), dict):
+        raw_candidates = [preview["candidate"]]
+    candidates: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_candidates:
+        if not isinstance(item, dict):
+            continue
+        candidate = dict(item)
+        tmdb_id = str(candidate.get("tmdb_id") or "").strip()
+        media_type = str(candidate.get("media_type") or "").strip().lower()
+        provider = str(candidate.get("provider") or "tmdb").strip().lower()
+        key = (tmdb_id, media_type)
+        if (
+            not tmdb_id
+            or media_type not in {"movie", "tv"}
+            or provider != "tmdb"
+            or key in seen
+        ):
+            continue
+        seen.add(key)
+        candidate["tmdb_id"] = tmdb_id
+        candidate["media_type"] = media_type
+        try:
+            candidate["score"] = float(
+                candidate.get("score", candidate.get("confidence", 0.0)) or 0.0
+            )
+        except (TypeError, ValueError):
+            candidate["score"] = 0.0
+        candidates.append(candidate)
+        if len(candidates) >= _MAX_CANDIDATES:
+            break
+    if not candidates:
+        return ()
+    if (
+        candidates[0].get("media_type") == "tv"
+        and "缺少集数" in reason
+        and getattr(task, "episode_override", None) is None
+    ):
+        return ()
+
+    def safe_name(value: object) -> str:
+        text = str(value or "").strip().replace("\\", "/")
+        return text.rsplit("/", 1)[-1] if text else ""
+
+    files = []
+    for item in list(preview.get("files") or []):
+        if not isinstance(item, dict):
+            continue
+        name = safe_name(item.get("name"))
+        if name:
+            file_item = {"name": name}
+            if getattr(task, "season_override", None) is not None:
+                file_item["season"] = task.season_override
+            if getattr(task, "episode_override", None) is not None:
+                file_item["episode"] = task.episode_override
+            files.append(file_item)
+    if not files:
+        name = safe_name(getattr(task, "content_path", ""))
+        if name:
+            file_item = {"name": name}
+            if getattr(task, "season_override", None) is not None:
+                file_item["season"] = task.season_override
+            if getattr(task, "episode_override", None) is not None:
+                file_item["episode"] = task.episode_override
+            files.append(file_item)
+    if not files:
+        return ()
+    expected_digest = str(
+        preview.get("snapshot_digest") or getattr(task, "snapshot_digest", "") or ""
+    ).strip()
+    rules_snapshot = str(
+        preview.get("rules_snapshot") or getattr(task, "rules_snapshot", "") or ""
+    ).strip()
+    if not expected_digest or not rules_snapshot:
+        return ()
+    payload = {
+        "version": 1,
+        "kind": "local_media",
+        "owner": str(owner or "admin"),
+        "local_task_id": int(task.id),
+        "local_task_version": int(task.version),
+        "local_source_id": int(task.source_id),
+        "source_name": str(getattr(source, "name", "") or "本地媒体"),
+        "directory": safe_name(getattr(task, "content_path", "")) or "本地媒体",
+        "reason": reason,
+        "files": files,
+        "candidates": candidates,
+        "rules_snapshot": rules_snapshot,
+        "snapshot_digest": expected_digest,
+        "season_override": getattr(task, "season_override", None),
+        "episode_override": getattr(task, "episode_override", None),
+    }
+    return _persist_confirmation_actions(payload, chat_id=chat_id)
 
 
 def _decode_row(row) -> dict:
@@ -683,7 +808,175 @@ def _deliver_persisted_confirmation_terminal(token: str) -> bool:
         return False
 
 
+def _local_confirmation_result_event(
+    payload: dict, candidate: dict, result: dict
+) -> NotificationEvent:
+    moved = len(list(result.get("moved") or []))
+    deleted = len(list(result.get("deleted_junk") or []))
+    warnings = len(list(result.get("warnings") or []))
+    return NotificationEvent(
+        "✅ 本地媒体确认整理完成",
+        fields=(
+            ("媒体", candidate.get("title") or candidate.get("tmdb_id") or "待确认媒体"),
+            ("来源", payload.get("source_name") or "本地媒体"),
+            ("结果", f"已移动 {moved} · 清理 {deleted} · 警告 {warnings}"),
+        ),
+        layout="relaxed",
+    )
+
+
+def _execute_local_media_confirmation(
+    token: str, payload: dict, candidate: dict, *, selected_index: int, chat_id: str
+) -> dict:
+    claimed_task = False
+    task_id = safe_int(payload.get("local_task_id"), 0, minimum=0)
+    try:
+        if task_id <= 0:
+            raise ValueError("本地媒体确认任务无效，请前往 Web 重新处理")
+        owner = str(payload.get("owner") or "admin").strip() or "admin"
+        expected_version = safe_int(payload.get("local_task_version"), 0, minimum=0)
+        expected_source_id = safe_int(payload.get("local_source_id"), 0, minimum=0)
+        expected_digest = str(payload.get("snapshot_digest") or "").strip()
+        rules_snapshot = str(payload.get("rules_snapshot") or "").strip()
+        tmdb_id = str(candidate.get("tmdb_id") or "").strip()
+        media_type = str(candidate.get("media_type") or "").strip().lower()
+        if not tmdb_id or media_type not in {"movie", "tv"}:
+            raise ValueError("候选媒体参数无效")
+        if expected_version <= 0 or expected_source_id <= 0 or not expected_digest or not rules_snapshot:
+            raise ValueError("本地媒体确认快照无效，请前往 Web 重新处理")
+
+        task = db.get_local_media_task(task_id, owner=owner)
+        if task is None or task.status != "requires_manual":
+            raise ValueError("本地媒体任务已变化，请前往 Web 查看最新状态")
+        if task.version != expected_version or task.source_id != expected_source_id:
+            raise ValueError("本地媒体任务已更新，请前往 Web 重新确认")
+        source = db.get_local_media_source(task.source_id, owner=owner)
+        if source is None:
+            raise ValueError("本地媒体来源已删除，请前往 Web 重新配置")
+
+        from app.modules.local_media_scheduler import get_local_media_scheduler
+
+        scheduler = get_local_media_scheduler()
+        inspection = scheduler.service.inspect_source(owner, task.source_id, task.content_path)
+        if str(inspection.get("digest") or "") != expected_digest:
+            raise ValueError("源文件在通知后发生变化，请前往 Web 重新检查")
+        if not db.claim_local_media_confirmation_task(
+            task_id,
+            owner=owner,
+            expected_version=expected_version,
+            expected_snapshot_digest=str(task.snapshot_digest or ""),
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            rules_snapshot=rules_snapshot,
+            season_override=payload.get("season_override"),
+            episode_override=payload.get("episode_override"),
+            title=str(candidate.get("title") or ""),
+            year=str(candidate.get("year") or ""),
+        ):
+            raise ValueError("本地媒体任务已被其他操作认领，请前往 Web 查看最新状态")
+        claimed_task = True
+        current = db.get_local_media_task(task_id, owner=owner)
+        if current is None:
+            raise ValueError("本地媒体任务不存在")
+        qb_client = scheduler.qb_factory() if current.qb_hash else None
+        result = scheduler.service.execute_task(owner, task_id, qb_client=qb_client)
+        if str(result.get("status") or "") != "completed":
+            reason = str(
+                (result.get("preview") or {}).get("reason")
+                or "本地媒体仍需补充季集等信息"
+            )
+            raise ValueError(f"{reason}；请前往 Web 继续处理")
+        try:
+            db.update_download_request_for_local_media_task(task_id, "completed")
+        except Exception as exc:
+            logger.warning(
+                "本地媒体确认完成状态回写失败 task=%s type=%s",
+                task_id,
+                type(exc).__name__,
+            )
+        terminal_event = _local_confirmation_result_event(payload, candidate, result)
+        db.complete_organize_confirmation_with_delivery(
+            token,
+            result_json=json.dumps(result, ensure_ascii=False, default=str),
+            event_json=_serialize_notification_event(terminal_event),
+            chat_id=chat_id,
+            message_id=_confirmation_message_id(payload),
+        )
+        if not _deliver_persisted_confirmation_terminal(token):
+            logger.warning(
+                "本地媒体确认整理完成回执暂未送达，已进入重试队列 token=%s",
+                token[:6],
+            )
+        return {"candidate": candidate, "stats": result, "local_task_id": task_id}
+    except Exception as exc:
+        message = str(exc or "本地媒体确认整理失败").strip() or "本地媒体确认整理失败"
+        if claimed_task and task_id > 0:
+            try:
+                current = db.get_local_media_task(
+                    task_id, owner=str(payload.get("owner") or "admin")
+                )
+                if current is not None and current.status == "recognizing":
+                    db.update_local_media_task(
+                        task_id,
+                        owner=current.owner,
+                        status="failed",
+                        error=message,
+                    )
+            except Exception:
+                logger.warning(
+                    "本地媒体确认失败状态保存异常 task=%s", task_id, exc_info=True
+                )
+        logger.warning(
+            "本地媒体确认整理失败 token=%s type=%s",
+            token[:6],
+            type(exc).__name__,
+        )
+        failure_event = NotificationEvent(
+            "❌ 本地媒体确认整理失败",
+            fields=(
+                ("文件", payload.get("directory") or "本地媒体"),
+                ("候选", candidate.get("title") or candidate.get("tmdb_id") or ""),
+            ),
+            footer=f"{message}\n\n请前往 Web 的本地媒体待确认页继续处理。",
+            layout="relaxed",
+        )
+        db.fail_organize_confirmation_with_delivery(
+            token,
+            error=message,
+            event_json=_serialize_notification_event(failure_event),
+            chat_id=chat_id,
+            message_id=_confirmation_message_id(payload),
+            retryable=False,
+        )
+        if not _deliver_persisted_confirmation_terminal(token):
+            logger.warning(
+                "本地媒体确认整理失败回执暂未送达，已进入重试队列 token=%s",
+                token[:6],
+            )
+        raise
+
+
 def _execute_confirmation(
+    token: str, payload: dict, candidate: dict, *, selected_index: int, chat_id: str
+) -> dict:
+    if _confirmation_kind(payload) == "local_media":
+        return _execute_local_media_confirmation(
+            token,
+            payload,
+            candidate,
+            selected_index=selected_index,
+            chat_id=chat_id,
+        )
+    return _execute_guangya_confirmation(
+        token,
+        payload,
+        candidate,
+        selected_index=selected_index,
+        chat_id=chat_id,
+    )
+
+
+def _execute_guangya_confirmation(
     token: str, payload: dict, candidate: dict, *, selected_index: int, chat_id: str
 ) -> dict:
     # running 状态由 claim_queued_organize_confirmation 原子授予；worker 不得

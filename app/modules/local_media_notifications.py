@@ -6,8 +6,10 @@ from typing import Any, Mapping
 
 from app import config
 from app import database as db
+from app.logger import get_logger
 from app.notifier import NotificationEvent, send_event
 
+logger = get_logger(__name__)
 send = send_event
 
 _TRIGGER_LABELS = {
@@ -93,7 +95,36 @@ def build_local_media_event(task, source, result: Mapping[str, Any] | None = Non
                 fields.append(("置信度", f"{float(confidence) * 100:.0f}%"))
             except (TypeError, ValueError):
                 pass
-        return NotificationEvent("⚠️ 本地媒体待确认", fields=tuple(fields))
+        from app.modules.organize_confirmations import (
+            create_local_media_confirmation_actions,
+        )
+
+        try:
+            actions = create_local_media_confirmation_actions(
+                task,
+                source,
+                dict(preview) if isinstance(preview, Mapping) else {},
+                owner=str(getattr(task, "owner", "admin") or "admin"),
+            )
+        except Exception as exc:
+            actions = ()
+            logger.warning(
+                "本地媒体 TG 确认按钮生成失败 task=%s type=%s",
+                getattr(task, "id", ""),
+                type(exc).__name__,
+            )
+        footer = (
+            "请选择下方候选继续整理。"
+            if actions
+            else "当前信息不足以安全直接确认，请前往 Web 的本地媒体待确认页处理。"
+        )
+        return NotificationEvent(
+            "⚠️ 本地媒体待确认",
+            fields=tuple(fields),
+            footer=footer,
+            actions=actions,
+            layout="relaxed",
+        )
 
     if status == "planned":
         return NotificationEvent("ℹ️ 本地媒体预览完成", fields=tuple(fields))

@@ -70,19 +70,77 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
         self.assertNotIn("完成（有警告）", rendered)
 
     def test_requires_manual_event_contains_reason_and_candidate(self):
+        db.update_local_media_task(
+            self.task_id, owner="admin", status="requires_manual", error="剧集文件缺少集数"
+        )
         task = db.get_local_media_task(self.task_id, owner="admin")
         source = db.get_local_media_source(self.source_id, owner="admin")
         event = build_local_media_event(task, source, {
             "status": "requires_manual",
             "preview": {
                 "reason": "剧集文件缺少集数",
-                "candidate": {"title": "攻壳机动队", "year": "2026", "tmdb_id": "255358", "confidence": 0.82},
+                "snapshot_digest": "digest-1",
+                "rules_snapshot": "{}",
+                "files": [{"name": "file.mkv"}],
+                "candidate": {
+                    "title": "攻壳机动队", "year": "2026", "tmdb_id": "255358",
+                    "media_type": "tv", "confidence": 0.82, "provider": "tmdb",
+                },
             },
         })
         rendered = render_event(event)
         self.assertIn("本地媒体待确认", rendered)
         self.assertIn("剧集文件缺少集数", rendered)
         self.assertIn("82%", rendered)
+        self.assertEqual(event.actions, ())
+        self.assertIn("Web", str(event.footer))
+
+    def test_actionable_manual_event_reuses_telegram_candidate_buttons(self):
+        db.update_local_media_task(
+            self.task_id, owner="admin", status="requires_manual", error="匹配置信度不足"
+        )
+        task = db.get_local_media_task(self.task_id, owner="admin")
+        source = db.get_local_media_source(self.source_id, owner="admin")
+        event = build_local_media_event(task, source, {
+            "status": "requires_manual",
+            "preview": {
+                "reason": "匹配置信度不足",
+                "snapshot_digest": "digest-1",
+                "rules_snapshot": "{}",
+                "files": [{"name": "file.mkv"}],
+                "candidate": {
+                    "title": "封神第二部", "year": "2025", "tmdb_id": "1155281",
+                    "media_type": "movie", "confidence": 0.82, "provider": "tmdb",
+                },
+            },
+        })
+
+        self.assertEqual(len(event.actions), 2)
+        self.assertRegex(event.actions[0].callback_data, r"^orgc:[A-Za-z0-9_-]+:0$")
+        self.assertEqual(str(event.actions[-1].label), "暂不处理")
+        self.assertIn("请选择下方候选", str(event.footer))
+
+    def test_confirmation_button_failure_falls_back_to_web_without_changing_task(self):
+        db.update_local_media_task(
+            self.task_id, owner="admin", status="requires_manual", error="匹配置信度不足"
+        )
+        task = db.get_local_media_task(self.task_id, owner="admin")
+        source = db.get_local_media_source(self.source_id, owner="admin")
+        with patch(
+            "app.modules.organize_confirmations.create_local_media_confirmation_actions",
+            side_effect=RuntimeError("database busy"),
+        ):
+            event = build_local_media_event(task, source, {
+                "status": "requires_manual",
+                "preview": {"reason": "匹配置信度不足"},
+            })
+
+        self.assertEqual(event.actions, ())
+        self.assertIn("Web", str(event.footer))
+        self.assertEqual(
+            db.get_local_media_task(self.task_id, owner="admin").status,
+            "requires_manual",
+        )
 
     def test_notify_uses_structured_sender_without_real_transport(self):
         result = {"status": "completed", "moved": [], "deleted_junk": [], "warnings": []}

@@ -5014,6 +5014,62 @@ def claim_local_media_task(
         return cur.rowcount == 1
 
 
+def claim_local_media_confirmation_task(
+    task_id: int,
+    *,
+    owner: str = "admin",
+    expected_version: int,
+    expected_snapshot_digest: str = "",
+    tmdb_id: str,
+    media_type: str,
+    rules_snapshot: str,
+    season_override: int | None = None,
+    episode_override: int | None = None,
+    title: str = "",
+    year: str = "",
+) -> bool:
+    """把仍然有效的本地待确认任务原子转换为执行态。"""
+    normalized_type = str(media_type or "").strip().lower()
+    normalized_tmdb_id = str(tmdb_id or "").strip()
+    if not normalized_tmdb_id or normalized_type not in {"movie", "tv"}:
+        raise ValueError("候选媒体参数无效")
+    if isinstance(expected_version, bool) or int(expected_version) <= 0:
+        raise ValueError("本地媒体任务版本无效")
+    for value, minimum, maximum, label in (
+        (season_override, 0, 99, "季数"),
+        (episode_override, 1, 999, "集数"),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{label}必须是整数")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{label}超出允许范围")
+    if normalized_type == "movie":
+        season_override = None
+        episode_override = None
+
+    where = "id=? AND owner=? AND status='requires_manual' AND version=?"
+    params: list[object] = [
+        str(rules_snapshot or ""), normalized_tmdb_id, normalized_type,
+        season_override, episode_override, str(title or ""), str(year or ""),
+        now(), int(task_id), _local_media_owner(owner), int(expected_version),
+    ]
+    expected_digest = str(expected_snapshot_digest or "").strip()
+    if expected_digest:
+        where += " AND snapshot_digest=?"
+        params.append(expected_digest)
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE local_media_tasks SET status='recognizing',attempts=attempts+1,"
+            "rules_snapshot=?,tmdb_id=?,media_type=?,season_override=?,episode_override=?,"
+            "title=?,year=?,error='',warning='',completed_at=NULL,version=version+1,updated_at=? "
+            f"WHERE {where}",
+            params,
+        )
+        return cur.rowcount == 1
+
+
 def update_local_media_task(task_id: int, *, owner: str = "admin", **fields) -> bool:
     from app.modules.local_media_models import LOCAL_TASK_STATUSES
 

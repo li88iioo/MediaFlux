@@ -18,6 +18,7 @@ from app.modules.organize_confirmations import (
     cancel_confirmation,
     confirmation_event,
     create_confirmation_actions,
+    create_local_media_confirmation_actions,
     semantic_candidate_category,
     start_confirmation,
     stop_confirmation_dispatcher,
@@ -897,6 +898,213 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(event.actions), 2)
         token = event.actions[0].callback_data.split(":")[1]
         self.assertEqual(db.get_organize_confirmation(token)["status"], "pending")
+
+
+class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
+    def setUp(self):
+        stop_confirmation_dispatcher()
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM organize_confirmations")
+            conn.execute("DELETE FROM local_media_tasks")
+            conn.execute("DELETE FROM local_media_sources")
+        self.source_id = db.create_local_media_source(
+            name="本地下载",
+            qb_profile="",
+            qb_path_prefix="",
+            local_root="/downloads",
+            owner="admin",
+        )
+        self.task_id = db.create_local_media_task(
+            self.source_id,
+            "",
+            "/downloads/Movie.2026.mkv",
+            owner="admin",
+            trigger="scan",
+        )
+        db.update_local_media_task(
+            self.task_id,
+            owner="admin",
+            status="requires_manual",
+            snapshot_digest="digest-1",
+            error="匹配置信度不足",
+        )
+
+    def tearDown(self):
+        stop_confirmation_dispatcher()
+
+    def _context(self):
+        task = db.get_local_media_task(self.task_id, owner="admin")
+        source = db.get_local_media_source(self.source_id, owner="admin")
+        preview = {
+            "reason": "匹配置信度不足",
+            "snapshot_digest": "digest-1",
+            "rules_snapshot": "{}",
+            "files": [{"name": "Movie.2026.mkv"}],
+            "candidate": {
+                "tmdb_id": "101",
+                "media_type": "movie",
+                "title": "电影甲",
+                "year": "2026",
+                "confidence": 0.82,
+                "provider": "tmdb",
+            },
+            "candidates": [
+                {
+                    "tmdb_id": "101",
+                    "media_type": "movie",
+                    "title": "电影甲",
+                    "year": "2026",
+                    "score": 0.82,
+                    "provider": "tmdb",
+                },
+                {
+                    "tmdb_id": "202",
+                    "media_type": "movie",
+                    "title": "电影乙",
+                    "year": "2025",
+                    "score": 0.76,
+                    "provider": "tmdb",
+                },
+            ],
+        }
+        return task, source, preview
+
+    def _actions(self, *, chat_id="100"):
+        task, source, preview = self._context()
+        return create_local_media_confirmation_actions(
+            task, source, preview, owner="admin", chat_id=chat_id
+        )
+
+    def test_local_actions_reuse_orgc_protocol_and_persist_kind(self):
+        actions = self._actions()
+
+        self.assertEqual(len(actions), 3)
+        self.assertRegex(actions[0].callback_data, r"^orgc:[A-Za-z0-9_-]+:0$")
+        token = actions[0].callback_data.split(":")[1]
+        payload = json.loads(db.get_organize_confirmation(token)["payload_json"])
+        self.assertEqual(payload["kind"], "local_media")
+        self.assertEqual(payload["local_task_id"], self.task_id)
+        self.assertEqual(payload["snapshot_digest"], "digest-1")
+        self.assertNotIn("/downloads/", json.dumps(payload, ensure_ascii=False))
+
+    def test_payload_without_kind_still_dispatches_to_guangya_executor(self):
+        candidate = {"tmdb_id": "1", "media_type": "movie"}
+        with patch.object(
+            confirmation_module,
+            "_execute_guangya_confirmation",
+            return_value={"path": "guangya"},
+        ) as guangya, patch.object(
+            confirmation_module,
+            "_execute_local_media_confirmation",
+        ) as local:
+            result = confirmation_module._execute_confirmation(
+                "token", {"version": 1}, candidate, selected_index=0, chat_id="100"
+            )
+
+        self.assertEqual(result, {"path": "guangya"})
+        guangya.assert_called_once()
+        local.assert_not_called()
+
+    def test_local_candidate_executes_through_shared_queue(self):
+        actions = self._actions()
+        token = actions[0].callback_data.split(":")[1]
+        callbacks = []
+        manager = SimpleNamespace(
+            start_operation=lambda _name, _reference, callback: (
+                callbacks.append(callback) or {"ok": True, "task_id": "worker-1"}
+            )
+        )
+
+        def execute(owner, task_id, qb_client=None):
+            self.assertEqual(owner, "admin")
+            self.assertEqual(task_id, self.task_id)
+            self.assertIsNone(qb_client)
+            db.update_local_media_task(
+                task_id, owner=owner, status="completed", completed_at=db.now()
+            )
+            return {
+                "status": "completed",
+                "task_id": task_id,
+                "moved": ["/library/Movie.2026.mkv"],
+                "deleted_junk": [],
+                "warnings": [],
+            }
+
+        service = SimpleNamespace(
+            inspect_source=lambda *_args: {"digest": "digest-1"},
+            execute_task=execute,
+        )
+        scheduler = SimpleNamespace(
+            service=service,
+            qb_factory=lambda: self.fail("无 qB 任务时不应创建客户端"),
+        )
+        with patch(
+            "app.modules.organize_tasks.get_organize_manager", return_value=manager
+        ), patch(
+            "app.modules.local_media_scheduler.get_local_media_scheduler",
+            return_value=scheduler,
+        ), patch(
+            "app.modules.organize_confirmations.send_event", return_value=True
+        ):
+            queued = start_confirmation(token, 0, chat_id="100")
+            worker_result = callbacks[0]()
+
+        self.assertEqual(queued["status"], "running")
+        self.assertEqual(worker_result["local_task_id"], self.task_id)
+        self.assertEqual(db.get_local_media_task(self.task_id, owner="admin").status, "completed")
+        self.assertEqual(db.get_organize_confirmation(token)["status"], "completed")
+        delivery = db.get_organize_confirmation_delivery(token)
+        self.assertEqual(delivery["status"], "sent")
+        self.assertIn("本地媒体确认整理完成", str(delivery["event_json"]))
+
+    def test_changed_local_snapshot_fails_without_claiming_task(self):
+        actions = self._actions()
+        token = actions[0].callback_data.split(":")[1]
+        callbacks = []
+        manager = SimpleNamespace(
+            start_operation=lambda _name, _reference, callback: (
+                callbacks.append(callback) or {"ok": True, "task_id": "worker-1"}
+            )
+        )
+        scheduler = SimpleNamespace(
+            service=SimpleNamespace(
+                inspect_source=lambda *_args: {"digest": "changed"},
+                execute_task=lambda *_args, **_kwargs: self.fail("快照变化后不得执行"),
+            ),
+            qb_factory=lambda: self.fail("不得创建 qB 客户端"),
+        )
+        with patch(
+            "app.modules.organize_tasks.get_organize_manager", return_value=manager
+        ), patch(
+            "app.modules.local_media_scheduler.get_local_media_scheduler",
+            return_value=scheduler,
+        ), patch(
+            "app.modules.organize_confirmations.send_event", return_value=True
+        ):
+            start_confirmation(token, 0, chat_id="100")
+            with self.assertRaisesRegex(ValueError, "源文件在通知后发生变化"):
+                callbacks[0]()
+
+        self.assertEqual(
+            db.get_local_media_task(self.task_id, owner="admin").status,
+            "requires_manual",
+        )
+        self.assertEqual(db.get_organize_confirmation(token)["status"], "failed")
+
+    def test_cancel_local_confirmation_leaves_task_for_web_review(self):
+        actions = self._actions()
+        token = actions[0].callback_data.split(":")[1]
+
+        with patch(
+            "app.modules.organize_confirmations.send_event", return_value=True
+        ):
+            cancel_confirmation(token, chat_id="100")
+
+        self.assertEqual(db.get_organize_confirmation(token)["status"], "cancelled")
+        self.assertEqual(
+            db.get_local_media_task(self.task_id, owner="admin").status,
+            "requires_manual",
+        )
 
 
 class NotificationActionTests(unittest.TestCase):

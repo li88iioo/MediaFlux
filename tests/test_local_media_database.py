@@ -170,6 +170,45 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(retried.media_type, "tv")
         self.assertEqual((retried.season_override, retried.episode_override), (2, 7))
 
+    def test_local_confirmation_claim_is_versioned_and_atomic(self):
+        source_id = db.create_local_media_source(
+            name="telegram-confirm", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/telegram-confirm", media_type="movie", owner="admin",
+        )
+        task_id = db.create_local_media_task(
+            source_id, "", "/tmp/telegram-confirm/Movie.mkv",
+            owner="admin", trigger="scan",
+        )
+        db.update_local_media_task(
+            task_id, owner="admin", status="requires_manual", snapshot_digest="digest-1"
+        )
+        task = db.get_local_media_task(task_id, owner="admin")
+
+        self.assertFalse(db.claim_local_media_confirmation_task(
+            task_id,
+            owner="admin",
+            expected_version=task.version + 1,
+            expected_snapshot_digest="digest-1",
+            tmdb_id="101",
+            media_type="movie",
+            rules_snapshot="{}",
+        ))
+        self.assertTrue(db.claim_local_media_confirmation_task(
+            task_id,
+            owner="admin",
+            expected_version=task.version,
+            expected_snapshot_digest="digest-1",
+            tmdb_id="101",
+            media_type="movie",
+            rules_snapshot="{}",
+            title="电影甲",
+            year="2026",
+        ))
+        claimed = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(claimed.status, "recognizing")
+        self.assertEqual((claimed.tmdb_id, claimed.media_type), ("101", "movie"))
+        self.assertEqual((claimed.title, claimed.year), ("电影甲", "2026"))
+
     def test_manual_task_prepare_never_resets_an_active_task(self):
         source_id = db.create_local_media_source(
             name="manual-race", qb_profile="", qb_path_prefix="", local_root="/tmp/manual", owner="admin"

@@ -516,6 +516,9 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             inspection = service.inspect_source("admin", source_id, source_root)
             preview = service.preview("admin", inspection["inspection_id"])
             self.assertEqual(preview["status"], "requires_manual")
+            self.assertEqual(preview["candidates"][0]["tmdb_id"], "1")
+            self.assertEqual(preview["files"], [{"name": "Show.mkv"}])
+            self.assertTrue(preview["snapshot_digest"])
             self.assertEqual(list(target_root.rglob("*")), [])
 
 

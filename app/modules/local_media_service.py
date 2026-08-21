@@ -209,6 +209,55 @@ class LocalMediaService:
             season_override = 1
         return season_override, episode_override
 
+    @staticmethod
+    def _confirmation_candidates(match: MatchResult) -> list[dict[str, Any]]:
+        """把识别结果压缩成可持久化的安全候选，供 Web/TG 共用。"""
+        raw_candidates = list(match.candidates or [])
+        candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def append_candidate(item, *, primary: bool = False) -> None:
+            tmdb_id = str(getattr(item, "tmdb_id", "") or "").strip()
+            media_type = str(
+                getattr(item, "media_type", "") or match.media_type or ""
+            ).strip().lower()
+            provider = str(
+                getattr(item, "provider", "") or match.provider or "tmdb"
+            ).strip().lower()
+            if not tmdb_id or media_type not in {"movie", "tv"} or provider != "tmdb":
+                return
+            key = (tmdb_id, media_type)
+            if key in seen:
+                return
+            seen.add(key)
+            metadata = getattr(item, "metadata", None)
+            metadata = metadata if isinstance(metadata, dict) else {}
+            raw_genres = metadata.get("genre_ids") or []
+            candidates.append({
+                "tmdb_id": tmdb_id,
+                "title": str(getattr(item, "title", "") or match.title or "").strip(),
+                "year": str(getattr(item, "year", "") or match.year or "").strip(),
+                "media_type": media_type,
+                "score": float(
+                    match.confidence if primary else (getattr(item, "score", 0.0) or 0.0)
+                ),
+                "confidence": float(
+                    match.confidence if primary else (getattr(item, "score", 0.0) or 0.0)
+                ),
+                "provider": provider,
+                "external_id": str(
+                    getattr(item, "external_id", "") or tmdb_id
+                ).strip(),
+                "genre_ids": [
+                    int(value) for value in raw_genres if str(value).isdigit()
+                ],
+            })
+
+        append_candidate(match, primary=True)
+        for candidate in raw_candidates:
+            append_candidate(candidate)
+        return candidates[:3]
+
     def _match_video(
         self,
         video: LocalFileSnapshot,
@@ -366,6 +415,7 @@ class LocalMediaService:
                 ))
                 or automatic_requires_confirmation
             ):
+                candidates = self._confirmation_candidates(match)
                 return {
                     "inspection_id": inspection_id,
                     "status": "requires_manual",
@@ -374,12 +424,15 @@ class LocalMediaService:
                         if automatic_requires_confirmation
                         else (match.error or "媒体识别结果需要人工确认")
                     ),
-                    "candidate": {
+                    "candidate": candidates[0] if candidates else {
                         "tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
                         "media_type": match.media_type, "confidence": match.confidence,
                         "provider": self.organizer._match_provider(match),
                         "external_id": match_identity,
                     },
+                    "candidates": candidates,
+                    "files": [{"name": item.path.name} for item in videos],
+                    "snapshot_digest": inspection.digest,
                     "plans": [], "cloud_write": False,
                     "rules_snapshot": effective_rules_snapshot,
                 }
@@ -413,13 +466,19 @@ class LocalMediaService:
             if match.media_type == "tv" and parsed.get("episode") is not None and parsed.get("season") is None:
                 parsed["season"] = 1
             if match.media_type == "tv" and parsed.get("episode") is None:
+                candidates = self._confirmation_candidates(match)
                 return {
                     "inspection_id": inspection_id, "status": "requires_manual",
                     "reason": f"剧集文件缺少集数，不能自动归档: {video.path.name}",
-                    "candidate": {"tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
-                                  "media_type": match.media_type, "confidence": match.confidence,
-                                  "provider": self.organizer._match_provider(match),
-                                  "external_id": match_identity},
+                    "candidate": candidates[0] if candidates else {
+                        "tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
+                        "media_type": match.media_type, "confidence": match.confidence,
+                        "provider": self.organizer._match_provider(match),
+                        "external_id": match_identity,
+                    },
+                    "candidates": candidates,
+                    "files": [{"name": item.path.name} for item in videos],
+                    "snapshot_digest": inspection.digest,
                     "plans": [], "cloud_write": False,
                     "rules_snapshot": effective_rules_snapshot,
                 }

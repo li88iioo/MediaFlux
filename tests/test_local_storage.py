@@ -5,11 +5,13 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.modules.local_storage import (
     LocalContentChanged,
     LocalFilesystemAdapter,
     LocalScanLimitExceeded,
+    LocalStorageError,
     snapshot_digest,
 )
 
@@ -72,6 +74,25 @@ class LocalStorageTests(unittest.TestCase):
             self.assertTrue(adapter.contains_video(nested_media.parent))
             self.assertFalse(adapter.contains_video(non_media / "readme.txt"))
             self.assertTrue(adapter.contains_video(nested_media / "Show.S01E01.mkv"))
+
+    def test_contains_video_distinguishes_missing_and_unreadable_paths(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            blocked = root / "blocked"
+            blocked.mkdir()
+            adapter = LocalFilesystemAdapter(root)
+
+            with self.assertRaisesRegex(LocalContentChanged, "扫描路径不存在"):
+                adapter.contains_video(root / "Movie.mkv")
+
+            def failed_walk(_path, *, followlinks, onerror):
+                self.assertFalse(followlinks)
+                onerror(PermissionError("denied"))
+                return []
+
+            with patch("app.modules.local_storage.os.walk", side_effect=failed_walk):
+                with self.assertRaisesRegex(LocalStorageError, "目录暂时不可完整读取"):
+                    adapter.contains_video(blocked)
 
     def test_scan_prunes_system_and_temporary_directories_by_exact_name(self):
         with tempfile.TemporaryDirectory() as root_raw:

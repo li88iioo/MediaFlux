@@ -40,6 +40,7 @@ from app.modules.download_dispatcher import (
     torrent_download_input,
 )
 from app.modules.download_tracker import DownloadTracker
+from app.modules.local_media_scheduler import LocalMediaProbeRetryable
 from app.modules.media_proxy import (
     _parse_range,
     _websocket_upstream_url,
@@ -503,6 +504,64 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     request_id, 77, "/downloads/Movie.mkv"
                 ))
                 self.assertEqual(db.get_download_request(request_id)["local_import_status"], "completed")
+                self.assertEqual(db.list_active_download_requests(include_local_import=True), [])
+
+    def test_retryable_local_media_probe_recovers_without_becoming_skipped(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                request_id, _ = db.create_download_request("retryable-key", "magnet")
+                db.update_download_request(request_id, qb_status="completed", status="completed")
+                tracker = DownloadTracker()
+                scheduler = Mock()
+                scheduler.enqueue_completed_torrent.side_effect = [
+                    LocalMediaProbeRetryable("扫描路径不存在: Movie.mkv"),
+                    77,
+                ]
+                task = self._task("/downloads/Movie.mkv", "/downloads")
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    tracker._start_local_import(db.get_download_request(request_id), task)
+                    waiting = db.get_download_request(request_id)
+                    self.assertEqual(waiting["local_import_status"], "pending")
+                    self.assertEqual(waiting["local_import_attempts"], 1)
+                    self.assertIn("扫描路径不存在", waiting["local_import_error"])
+                    self.assertTrue(db.list_active_download_requests(include_local_import=True))
+
+                    tracker._start_local_import(waiting, task)
+
+                recovered = db.get_download_request(request_id)
+                self.assertEqual(recovered["local_import_status"], "pending")
+                self.assertEqual(recovered["local_import_target"], "local-media-task:77")
+                self.assertEqual(recovered["local_import_error"], "")
+
+    def test_retryable_local_media_probe_becomes_visible_failure_after_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                request_id, _ = db.create_download_request("retry-limit-key", "magnet")
+                db.update_download_request(request_id, qb_status="completed", status="completed")
+                tracker = DownloadTracker()
+                scheduler = Mock()
+                scheduler.enqueue_completed_torrent.side_effect = LocalMediaProbeRetryable(
+                    "目录暂时不可完整读取: Movie.2026"
+                )
+                task = self._task("/downloads/Movie.2026", "/downloads")
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    for _ in range(8):
+                        tracker._start_local_import(db.get_download_request(request_id), task)
+
+                failed = db.get_download_request(request_id)
+                self.assertEqual(failed["local_import_status"], "failed")
+                self.assertEqual(failed["local_import_attempts"], 8)
+                self.assertIn("暂时不可完整读取", failed["local_import_error"])
                 self.assertEqual(db.list_active_download_requests(include_local_import=True), [])
 
     def test_unmatched_completed_request_is_marked_skipped(self):
