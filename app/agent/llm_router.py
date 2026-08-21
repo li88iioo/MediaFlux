@@ -23,7 +23,7 @@ from app.agent.conversation_summary import (
 )
 from app.agent.prompts import DEFAULT_AGENT_SYSTEM_PROMPT
 from app.agent.rate_limit import agent_rate_limiter
-from app.agent.models import ToolResult
+from app.agent.models import LLMToolDisposition, ToolResult
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.result_projection import (
     is_public_text_safe,
@@ -274,6 +274,7 @@ class _NativeLoopState:
     seen_calls: set[str] = field(default_factory=set)
     public_trace: list[dict[str, Any]] = field(default_factory=list)
     tool_executions: list[dict[str, Any]] = field(default_factory=list)
+    confirmation_prepared: bool = False
 
     def reserve_provider_request(
         self, fallback_budget: Callable[[], bool] | None
@@ -1522,11 +1523,15 @@ def _native_read_capabilities(
     registry: ToolRegistry,
     message: str = "",
     conversation_context: list[dict[str, Any]] | None = None,
+    *,
+    include_confirmations: bool = False,
 ) -> list[dict[str, Any]]:
-    """基于工具自身语义召回有界只读候选，不再按名称前缀硬门控。"""
+    """基于工具语义召回有界候选；写能力只在显式授权时进入候选集。"""
     context_text = _native_context_text(message, conversation_context)
     selected = _rank_read_capabilities(
-        read_tool_capabilities(registry),
+        orchestration_tool_capabilities(
+            registry, include_confirmations=include_confirmations
+        ),
         context_text,
         max_candidates=_NATIVE_MAX_CAPABILITIES,
     )
@@ -1545,11 +1550,10 @@ def _native_read_capabilities(
     return capabilities
 
 
-def _native_read_system_prompt() -> str:
-    return (
+def _native_read_system_prompt(*, include_confirmations: bool = False) -> str:
+    prompt = (
         DEFAULT_AGENT_SYSTEM_PROMPT
-        + "\n你现在是 MediaFlux 的只读排障助手。只可使用本次请求中提供的只读工具；"
-        "不得请求、推测或执行任何写入、删除、下载、整理、配置变更或确认操作。"
+        + "\n你现在是 MediaFlux 的受控工具编排助手。只可使用本次请求明确提供的工具；"
         "需要事实时先调用合适工具，工具结果是唯一可信数据源。"
         "当前问题是本轮唯一目标；最近会话只用于解析‘这个、这部剧、刷新一下、重试、"
         "继续、列出列表’等指代，不得把旧问题当成新的任务。"
@@ -1562,6 +1566,21 @@ def _native_read_system_prompt() -> str:
         "不要复述用户问题，不要主动汇报无关模块，不要要求用户记忆内部能力名称。"
         "不得展示工具名、函数名、字段名、参数、内部 ID、凭据、链接或绝对路径，"
         "也不要说‘可调用某工具’。若数据来自快照或检查范围有限，要明确边界。"
+    )
+    if include_confirmations:
+        return (
+            prompt
+            + "本轮可能同时提供只读工具和需要用户确认的动作工具。只读工具可直接检查；"
+            "动作工具绝不会直接执行，只会生成一张预检后的待确认票据。只有当用户当前消息"
+            "明确要求改变状态、对象唯一且参数可以从当前消息或安全会话上下文确定时，才可"
+            "调用一个动作工具；一轮最多生成一张确认票据。必要时可先读取事实再准备确认，"
+            "但不得准备多个备选动作。生成票据后必须明确说明‘尚未执行’，请用户检查影响"
+            "并确认；不得声称配置已修改、任务已运行或内容已删除。"
+        )
+    return (
+        prompt
+        + "本轮只提供只读工具；不得请求、推测或执行任何写入、删除、下载、整理、"
+        "配置变更或确认操作。"
     )
 
 
@@ -1702,8 +1721,10 @@ async def _execute_native_tool_turn(
     registry: ToolRegistry,
     execute_tool: Callable[[str, dict[str, Any]], dict[str, Any]],
     state: _NativeLoopState,
+    allowed_aliases: frozenset[str],
+    allow_confirmations: bool,
 ) -> list[tuple[Any, str]]:
-    """校验并串行执行一个 Provider turn；可恢复错误回喂模型自行修正。"""
+    """校验并串行执行一个 Provider turn；写能力最多只准备一张确认票据。"""
     outputs: list[tuple[Any, str]] = []
     round_ids: set[str] = set()
     for call in turn.tool_calls:
@@ -1714,13 +1735,14 @@ async def _execute_native_tool_turn(
             not call_id
             or len(call_id) > 200
             or call_id in round_ids
+            or alias not in allowed_aliases
             or tool_name is None
         ):
             raise ValueError("AI 工具调用标识无效")
         round_ids.add(call_id)
 
         try:
-            normalized_arguments = registry.validate_read_call(
+            disposition, normalized_arguments = registry.validate_llm_orchestration_call(
                 tool_name, call.arguments
             )
         except AgentToolError as exc:
@@ -1735,6 +1757,28 @@ async def _execute_native_tool_turn(
             outputs.append(_native_tool_output(call, response_payload))
             state.total_tool_calls += 1
             continue
+
+        if disposition is LLMToolDisposition.PREPARE_CONFIRMATION:
+            if not allow_confirmations:
+                raise AgentToolError(
+                    "该工具未开放给本轮 Agent 编排", code="tool_not_exposed"
+                )
+            if state.confirmation_prepared:
+                response_payload = {
+                    "request_id": secrets.token_urlsafe(12),
+                    "mode": "conversation",
+                    "tool_call": {"name": tool_name, "arguments": {}},
+                    "result": ToolResult(
+                        False,
+                        "attention",
+                        "本轮已生成一项待确认操作，不再创建其他确认票据。",
+                        suggestions=["先检查并处理当前待确认操作。"],
+                    ).to_dict(),
+                }
+                outputs.append(_native_tool_output(call, response_payload))
+                state.total_tool_calls += 1
+                continue
+            state.confirmation_prepared = True
 
         state.register_call(tool_name, normalized_arguments)
         try:
@@ -1765,13 +1809,17 @@ async def _request_native_read_agent(
     execute_tool: Callable[[str, dict[str, Any]], dict[str, Any]],
     *,
     conversation_context: list[dict[str, Any]] | None = None,
+    include_confirmations: bool = False,
     client_factory: Callable[..., FixedHostHttpClient] = FixedHostHttpClient,
     fallback_budget: Callable[[], bool] | None = None,
 ) -> LLMConversationReply | None:
     provider = _provider()
     model = str(get("AGENT_LLM_MODEL", "") or "").strip()
     native_capabilities = _native_read_capabilities(
-        registry, message, conversation_context
+        registry,
+        message,
+        conversation_context,
+        include_confirmations=include_confirmations,
     )
     if (
         provider is None
@@ -1794,7 +1842,14 @@ async def _request_native_read_agent(
         user_agent="MediaFlux-Agent-Native-Tools/1.0",
         pin_resolved_address=True,
     )
-    system_prompt = _native_read_system_prompt()
+    system_prompt = _native_read_system_prompt(
+        include_confirmations=include_confirmations
+    )
+    allowed_aliases = frozenset(
+        str(item.get("name") or "").strip()
+        for item in native_capabilities
+        if str(item.get("name") or "").strip()
+    )
     user_content = _conversation_user_content(message, conversation_context)
     overall_started = monotonic()
     state = _NativeLoopState()
@@ -1904,6 +1959,8 @@ async def _request_native_read_agent(
                     registry=registry,
                     execute_tool=execute_tool,
                     state=state,
+                    allowed_aliases=allowed_aliases,
+                    allow_confirmations=include_confirmations,
                 )
                 protocol_state.history = append_native_tool_results(
                     protocol, protocol_state.history, turn, outputs
@@ -2159,8 +2216,9 @@ def run_native_read_agent(
     *,
     owner: str = "",
     conversation_context: list[dict[str, Any]] | None = None,
+    include_confirmations: bool = False,
 ) -> LLMConversationReply | None:
-    """让 Provider 原生工具循环只执行受控只读能力；失败时安全回退旧路由。"""
+    """运行受控原生工具循环；写能力只可准备确认，绝不直接执行。"""
     if not _enabled():
         return None
     normalized = unicodedata.normalize("NFKC", str(message or "")).strip()
@@ -2179,6 +2237,7 @@ def run_native_read_agent(
                 registry,
                 execute_tool,
                 conversation_context=conversation_context,
+                include_confirmations=include_confirmations,
                 fallback_budget=lambda: _reserve_llm_provider_request(owner),
             )
         )

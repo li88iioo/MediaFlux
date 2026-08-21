@@ -388,7 +388,31 @@ class AgentLLMSelectionTests(unittest.TestCase):
             for name in hidden_tools
             if all_tools[name]["risk"] != RiskLevel.LOW_WRITE.value
         ))
-        self.assertEqual(len(registry.native_aliases()), len(read_tools))
+        self.assertEqual(
+            len(registry.native_aliases()),
+            len(read_tools | confirmation_tools),
+        )
+
+    def test_native_capabilities_only_expose_confirmation_tools_when_authorized(self):
+        registry = _confirmation_registry()
+
+        read_only = _native_read_capabilities(
+            registry, "请开启网页搜索"
+        )
+        controlled = _native_read_capabilities(
+            registry,
+            "请开启网页搜索",
+            include_confirmations=True,
+        )
+
+        self.assertEqual(
+            {registry.native_tool_name(item["name"]) for item in read_only},
+            {"workspace.health"},
+        )
+        self.assertIn(
+            "config.set_feature_state",
+            {registry.native_tool_name(item["name"]) for item in controlled},
+        )
 
     def test_confirmation_selector_only_plans_explicit_safe_action(self):
         registry = _confirmation_registry()
@@ -970,6 +994,110 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertEqual(
             captured["bodies"][1]["messages"][-1]["role"], "tool"
         )
+
+    def test_native_agent_prepares_at_most_one_confirmation_without_execution(self):
+        captured = {"bodies": [], "closed": False}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                captured["bodies"].append(json)
+                if len(captured["bodies"]) == 1:
+                    body = json_module.dumps({
+                        "choices": [{"message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_enable",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mf_config_set_feature_state",
+                                        "arguments": json_module.dumps({
+                                            "feature": "web_search",
+                                            "enabled": True,
+                                        }),
+                                    },
+                                },
+                                {
+                                    "id": "call_disable",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mf_config_set_feature_state",
+                                        "arguments": json_module.dumps({
+                                            "feature": "web_search",
+                                            "enabled": False,
+                                        }),
+                                    },
+                                },
+                            ],
+                        }}],
+                    }).encode()
+                else:
+                    body = _chat_text_turn(
+                        "已生成一项待确认操作，尚未执行；请检查影响后再确认。"
+                    )
+                return IndexerHttpResponse(
+                    url=url,
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    body=body,
+                )
+
+            async def aclose(self):
+                captured["closed"] = True
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+        }
+        handler_calls = []
+        registry = _confirmation_registry(calls=handler_calls)
+        orchestrator = AgentOrchestrator(registry)
+        prepared = []
+
+        def prepare_tool(name, arguments):
+            prepared.append((name, dict(arguments)))
+            return orchestrator.prepare(name, arguments, owner="web-session")
+
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            reply = asyncio.run(_request_native_read_agent(
+                "请开启网页搜索",
+                registry,
+                prepare_tool,
+                include_confirmations=True,
+                client_factory=FakeClient,
+                fallback_budget=lambda: True,
+            ))
+
+        self.assertIsNotNone(reply)
+        self.assertTrue(reply.completed)
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(prepared[0][0], "config.set_feature_state")
+        self.assertEqual(handler_calls, [])
+        self.assertEqual(len(reply.tool_executions), 1)
+        prepared_response = reply.tool_executions[0]["response"]
+        self.assertEqual(prepared_response["mode"], "confirmation_required")
+        self.assertEqual(
+            prepared_response["confirmation"]["tool"],
+            "config.set_feature_state",
+        )
+        self.assertTrue(captured["closed"])
+        tool_names = {
+            item["function"]["name"] for item in captured["bodies"][0]["tools"]
+        }
+        self.assertIn("mf_config_set_feature_state", tool_names)
+        tool_messages = [
+            item for item in captured["bodies"][1]["messages"]
+            if item.get("role") == "tool"
+        ]
+        self.assertEqual(len(tool_messages), 2)
 
     def test_native_read_agent_rejects_duplicate_tool_loop(self):
         captured = {"count": 0}
@@ -2006,6 +2134,80 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(response["confirmation"]["risk"], "low_write")
         self.assertEqual(calls, [])
+
+    def test_native_action_planning_preserves_confirmation_and_narrative(self):
+        calls = []
+        registry = _confirmation_registry(calls=calls)
+
+        def native(message, selected_registry, execute_tool, **kwargs):
+            self.assertIs(selected_registry, registry)
+            self.assertTrue(kwargs["include_confirmations"])
+            prepared = execute_tool(
+                "config.set_feature_state",
+                {"feature": "web_search", "enabled": True},
+            )
+            return LLMConversationReply(
+                "网页搜索开启操作已经完成预检，但尚未执行；请检查影响后确认。",
+                ("确认后再执行",),
+                tool_trace=({
+                    "label": "功能开关调整",
+                    "ok": True,
+                    "summary": "等待确认",
+                },),
+                tool_executions=({
+                    "tool_name": "config.set_feature_state",
+                    "arguments": {"feature": "web_search", "enabled": True},
+                    "response": prepared,
+                },),
+            )
+
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent",
+            side_effect=native,
+        ) as native_agent, patch(
+            "app.agent.orchestrator.select_orchestration_tool"
+        ) as fallback_selector:
+            response = AgentOrchestrator(registry).query(
+                "请调整这个安全功能", owner="web-session"
+            )
+
+        self.assertEqual(response["mode"], "confirmation_required")
+        self.assertEqual(
+            response["confirmation"]["tool"], "config.set_feature_state"
+        )
+        self.assertIn("尚未执行", response["presentation"]["narrative"])
+        self.assertEqual(calls, [])
+        native_agent.assert_called_once()
+        fallback_selector.assert_not_called()
+
+    def test_native_confirmation_replaces_premature_execution_claim(self):
+        registry = _confirmation_registry()
+
+        def native(_message, _registry, execute_tool, **_kwargs):
+            prepared = execute_tool(
+                "config.set_feature_state",
+                {"feature": "web_search", "enabled": True},
+            )
+            return LLMConversationReply(
+                "网页搜索已开启。",
+                tool_executions=({
+                    "tool_name": "config.set_feature_state",
+                    "arguments": {"feature": "web_search", "enabled": True},
+                    "response": prepared,
+                },),
+            )
+
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent",
+            side_effect=native,
+        ):
+            response = AgentOrchestrator(registry).query(
+                "请调整这个安全功能", owner="web-session"
+            )
+
+        narrative = response["presentation"]["narrative"]
+        self.assertIn("尚未执行", narrative)
+        self.assertNotIn("已开启", narrative)
 
     def test_llm_first_read_selection_executes_only_validated_read_handler(self):
         calls = []

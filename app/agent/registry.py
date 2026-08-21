@@ -75,14 +75,17 @@ class ToolRegistry:
             raise ValueError(
                 f"LLM confirmation tool must be a confirmation-gated non-READ tool: {name}"
             )
-        alias = self._native_alias_for_spec(spec) if spec.llm_read else ""
-        if spec.native_alias and not spec.llm_read:
-            raise ValueError(f"native alias requires LLM read exposure: {name}")
+        native_exposed = spec.llm_read or spec.llm_confirmation
+        alias = self._native_alias_for_spec(spec) if native_exposed else ""
+        if spec.native_alias and not native_exposed:
+            raise ValueError(
+                f"native alias requires LLM orchestration exposure: {name}"
+            )
         if alias and not _NATIVE_ALIAS_RE.fullmatch(alias):
             raise ValueError(f"invalid native tool alias: {alias}")
         if alias and any(
             self._native_alias_for_spec(item) == alias for item in self._tools.values()
-            if item.llm_read
+            if item.llm_read or item.llm_confirmation
         ):
             raise ValueError(f"duplicate native tool alias: {alias}")
         if (
@@ -160,19 +163,26 @@ class ToolRegistry:
 
     def native_alias_for(self, name: str) -> str:
         spec = self._get_spec(name)
-        return self._native_alias_for_spec(spec) if spec.llm_read else ""
+        return (
+            self._native_alias_for_spec(spec)
+            if spec.llm_read or spec.llm_confirmation
+            else ""
+        )
 
     def native_aliases(self) -> frozenset[str]:
         return frozenset(
             self._native_alias_for_spec(spec)
             for spec in self._tools.values()
-            if spec.llm_read
+            if spec.llm_read or spec.llm_confirmation
         )
 
     def native_tool_name(self, alias: str) -> str | None:
         target = str(alias or "").strip()
         for name, spec in self._tools.items():
-            if spec.llm_read and self._native_alias_for_spec(spec) == target:
+            if (
+                (spec.llm_read or spec.llm_confirmation)
+                and self._native_alias_for_spec(spec) == target
+            ):
                 return name
         return None
 

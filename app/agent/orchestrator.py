@@ -77,6 +77,12 @@ _LLM_FIRST_CONTEXT_MARKERS = (
     "这部", "这集", "这个", "它", "刚才", "上一个", "继续", "重试",
     "再来", "刷新一下", "打开它", "关闭它", "有多少", "缺不缺",
 )
+_CONFIRMATION_NARRATIVE_PENDING_MARKERS = (
+    "尚未执行", "还未执行", "未执行", "待确认", "等待确认", "确认后",
+)
+_CONFIRMATION_NARRATIVE_EXECUTED_RE = re.compile(
+    r"(?:已经|已)(?:执行|修改|删除|开启|关闭|启用|停用|暂停|恢复|刷新|同步|发送)"
+)
 
 
 def _prefer_deterministic_context_route(
@@ -87,6 +93,18 @@ def _prefer_deterministic_context_route(
         return False
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
     return any(marker in normalized for marker in _LLM_FIRST_CONTEXT_MARKERS)
+
+
+def _safe_confirmation_narrative(value: str) -> str:
+    """确认响应必须明确尚未执行，并拒绝模型提前宣称状态已改变。"""
+    narrative = result_projection.sanitize_public_multiline_text(value, limit=1800)
+    if (
+        narrative
+        and any(marker in narrative for marker in _CONFIRMATION_NARRATIVE_PENDING_MARKERS)
+        and not _CONFIRMATION_NARRATIVE_EXECUTED_RE.search(narrative)
+    ):
+        return narrative
+    return "操作预检已经完成，但尚未执行。请先检查影响范围，确认后系统才会执行。"
 
 
 class AgentInputError(ValueError):
@@ -5705,22 +5723,42 @@ class AgentOrchestrator:
     ) -> dict[str, Any] | None:
         """让模型在注册表边界内理解请求，失败时返回 ``None`` 继续确定性回退。
 
-        普通查询优先进入原生多工具只读循环，使模型可以围绕同一目标连续读取多个
-        数据源并自行归纳。``read_only`` 模式不会向模型暴露确认型工具；明确动作
-        仍只能通过既有统一选择器创建确认票据。非法名称、越权风险或参数错误均
-        按失败关闭处理。
+        普通查询优先进入原生多工具循环，使模型可以围绕同一目标连续读取多个
+        数据源并自行归纳。``read_only`` 模式不会向模型暴露确认型工具；已登录
+        动作请求可以由模型准备一张确认票据，但永远不能直接执行写操作。非法名称、
+        越权风险、重复确认或参数错误均按失败关闭处理。
         """
         rate_identity = llm_tool_rate_identity or llm_rate_owner or owner
         action_request = is_agent_action_request(message)
 
-        def _execute_native_read(
+        def _execute_native_tool(
             tool_name: str, arguments: dict[str, Any]
         ) -> dict[str, Any]:
+            disposition, normalized_arguments = (
+                self.registry.validate_llm_orchestration_call(
+                    tool_name, arguments
+                )
+            )
             if rate_identity and not allow_agent_tool(rate_identity, tool_name):
                 raise AgentToolError(
                     "Agent 请求过于频繁，请稍后重试", code="rate_limited"
                 )
-            return self.invoke(tool_name, arguments, owner=owner)
+            if disposition is LLMToolDisposition.PREPARE_CONFIRMATION:
+                if read_only or not owner:
+                    raise AgentToolError(
+                        "该工具未开放给本轮 Agent 编排",
+                        code="tool_not_exposed",
+                    )
+                return self.prepare(
+                    tool_name, normalized_arguments, owner=owner
+                )
+            if disposition is LLMToolDisposition.EXECUTE_READ:
+                return self.invoke(
+                    tool_name, normalized_arguments, owner=owner
+                )
+            raise AgentToolError(
+                "该工具未开放给 Agent 编排", code="tool_not_exposed"
+            )
 
         def _execute_selection(selection: Any) -> dict[str, Any] | None:
             if selection is None:
@@ -5754,18 +5792,17 @@ class AgentOrchestrator:
                 )
             return None
 
-        native_reply = None
-        if not action_request:
-            native_reply = run_native_read_agent(
-                message,
-                self.registry,
-                _execute_native_read,
-                owner=llm_rate_owner or owner,
-                **(
-                    {"conversation_context": conversation_context}
-                    if conversation_context else {}
-                ),
-            )
+        native_reply = run_native_read_agent(
+            message,
+            self.registry,
+            _execute_native_tool,
+            owner=llm_rate_owner or owner,
+            include_confirmations=bool(owner and not read_only),
+            **(
+                {"conversation_context": conversation_context}
+                if conversation_context else {}
+            ),
+        )
 
         if native_reply is None:
             # 复合只读请求交给后面的 JSON 计划回退，避免在原生循环失败后退化成
@@ -5833,7 +5870,21 @@ class AgentOrchestrator:
         # 不能把它降级成 tool_call=None 的普通对话，否则候选资源、媒体身份、
         # RSS 订阅对象和后续确认入口都会在这一层丢失。
         response: dict[str, Any] | None = None
-        if len(executions) > 1:
+        confirmation_execution = next(
+            (
+                execution
+                for execution in executions
+                if isinstance(execution.get("response"), dict)
+                and (
+                    execution["response"].get("mode") == "confirmation_required"
+                    or isinstance(execution["response"].get("confirmation"), dict)
+                )
+            ),
+            None,
+        )
+        if confirmation_execution is not None:
+            response = deepcopy(confirmation_execution["response"])
+        elif len(executions) > 1:
             response = self._aggregate_native_read_executions(
                 executions,
                 owner=owner,
@@ -5866,8 +5917,13 @@ class AgentOrchestrator:
                 ).to_dict(),
             }
 
+        narrative_answer = (
+            _safe_confirmation_narrative(native_reply.answer)
+            if confirmation_execution is not None
+            else native_reply.answer
+        )
         presentation = result_projection.build_public_narrative_presentation(
-            native_reply.answer,
+            narrative_answer,
             native_reply.suggestions,
         )
         if presentation:
@@ -6551,7 +6607,6 @@ class AgentOrchestrator:
         model_routing_attempted = False
         if (
             allow_model_routing
-            and not action_request
             and not has_resource_continuation
             and not _prefer_deterministic_context_route(
                 message, conversation_context
@@ -6564,7 +6619,7 @@ class AgentOrchestrator:
                 llm_rate_owner=llm_rate_owner,
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
-                read_only=True,
+                read_only=not action_request,
             )
             if model_read is not None:
                 return model_read
