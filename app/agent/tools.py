@@ -924,7 +924,9 @@ def search_library(arguments: dict[str, Any]) -> ToolResult:
             if unavailable else "媒体库中没有找到匹配内容"
         )
         suggestions = (["请检查不可用的媒体服务器后重试。"] if unavailable else []) + [
-            "可尝试中文名、原名或去掉季集编号后重新搜索。"
+            "可尝试中文名、原名或去掉季集编号后重新搜索。",
+            f"搜索《{query}》的资源。",
+            f"在网上找《{query}》。",
         ]
     return ToolResult(
         ok=available > 0,
@@ -2074,6 +2076,11 @@ def build_tool_registry() -> ToolRegistry:
         validator=indexer_readiness_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "为什么没搜到资源",
+            "资源站连不上怎么办",
+            "检查多站资源搜索状态",
+        ),
     ))
     registry.register(ToolSpec(
         name="indexer.search_resources",
@@ -2110,6 +2117,8 @@ def build_tool_registry() -> ToolRegistry:
             "搜索《某片》的下载资源",
             "找种子或磁力资源",
             "在资源站搜索资源",
+            "帮我下载《某片》",
+            "下载某部电视剧",
         ),
     ))
     registry.register(ToolSpec(

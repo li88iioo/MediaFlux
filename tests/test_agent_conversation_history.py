@@ -123,6 +123,55 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         ):
             self.assertNotIn(forbidden, raw)
 
+    def test_empty_media_result_keeps_tentative_context_and_pending_selection(self):
+        empty_response = {
+            "mode": "tool_result",
+            "tool_call": {
+                "name": "library.search",
+                "arguments": {"query": "沙丘2", "limit": 8},
+            },
+            "result": {
+                "ok": True,
+                "status": "empty",
+                "summary": "媒体库中没有找到匹配内容",
+                "data": {"query": "沙丘2", "total": 0},
+                "suggestions": [],
+            },
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="媒体库里有《沙丘2》吗",
+            response=empty_response,
+        )
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(context[-1]["tentative_media_context"], {"title": "沙丘2"})
+        self.assertNotIn("media_context", context[-1])
+
+        selection_response = {
+            "mode": "tool_result",
+            "tool_call": {"name": "indexer.submit_resource", "arguments": {}},
+            "result": {
+                "ok": False,
+                "status": "selection_required",
+                "summary": "请选择下载目标",
+                "data": {"pending_selection": {"position": 2}},
+                "suggestions": [],
+            },
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="下载第二个",
+            response=selection_response,
+        )
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(context[-1]["pending_selection"], {"position": 2})
+
     def test_tampered_payload_fails_closed_and_delete_is_owner_scoped(self):
         self.repository.append_query_turn(
             principal="browser-principal-a",

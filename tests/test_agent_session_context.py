@@ -413,6 +413,34 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
             repository=self.repository, wall_clock=lambda: self.wall[0]
         ).get(owner="session-b"))
 
+    def test_patrol_and_download_clear_owner_remove_persisted_rows(self):
+        patrol = RecentPatrolStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        )
+        downloads = RecentDownloadSubmissionStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        )
+        patrol.capture(owner="session-a", result=_patrol_result())
+        downloads.capture(owner="session-a", result=_download_result(91))
+
+        self.assertTrue(patrol.clear_owner(owner="session-a"))
+        self.assertTrue(downloads.clear_owner(owner="session-a"))
+        self.assertIsNone(RecentPatrolStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        ).get(owner="session-a"))
+        self.assertEqual(RecentDownloadSubmissionStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        ).get(owner="session-a"), ())
+
+        digest = self.repository.owner_digest_for_tests("session-a")
+        with db.get_conn() as conn:
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS total FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type IN ('patrol','download_submission')",
+                (digest,),
+            ).fetchone()["total"]
+        self.assertEqual(remaining, 0)
+
     def test_candidate_restore_rejects_tampered_payload_and_clear_is_type_scoped(self):
         resource = RecentResourceCandidateStore(
             repository=self.repository, wall_clock=lambda: self.wall[0]

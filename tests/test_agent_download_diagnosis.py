@@ -257,8 +257,11 @@ class DownloadDiagnosisUnitTests(unittest.TestCase):
         self.assertTrue(is_download_queue_diagnosis_message("哪些下载任务卡住了"))
         self.assertTrue(is_download_queue_diagnosis_message("检查qB下载状态"))
         self.assertTrue(is_download_queue_diagnosis_message("查看下载队列"))
+        self.assertTrue(is_download_queue_diagnosis_message("下载完成了吗"))
+        self.assertTrue(is_download_queue_diagnosis_message("下载进度怎么样"))
         self.assertFalse(is_download_queue_diagnosis_message("检查下载器配置"))
         self.assertFalse(is_download_queue_diagnosis_message("搜索《沙丘2》的下载源"))
+        self.assertFalse(is_download_queue_diagnosis_message("刚才下载为什么失败，帮我重试"))
 
         registry = Mock()
         registry.execute.return_value = (

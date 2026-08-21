@@ -208,6 +208,10 @@ class IndexerReadinessUnitTests(IsolatedDatabaseTestCase):
             "查看索引站状态",
             "索引器有异常吗",
             "检查索引站状态",
+            "为什么没搜到资源",
+            "为什么搜不到资源",
+            "资源站连不上怎么办",
+            "站点连接失败了",
         ):
             self.assertTrue(is_indexer_readiness_diagnosis_message(message), message)
         for message in (

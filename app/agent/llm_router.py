@@ -1272,6 +1272,7 @@ _NATIVE_DEFAULT_READ_TOOLS = (
     "rss.subscription_summaries",
     "rss.recent_activity",
     "downloads.diagnose_queue",
+    "indexer.diagnose_readiness",
     "library.search",
     "library.count_series_episodes",
     "discovery.search",

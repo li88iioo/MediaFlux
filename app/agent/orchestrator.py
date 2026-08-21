@@ -246,6 +246,8 @@ _MEDIA_CONTEXT_TOOL_NAMES = frozenset({
 
 def _latest_media_context(
     conversation_context: list[dict[str, Any]] | None,
+    *,
+    allow_tentative: bool = False,
 ) -> dict[str, str]:
     """继承当前媒体主题，允许普通寒暄穿插但阻止跨领域串线。
 
@@ -264,6 +266,12 @@ def _latest_media_context(
         media_context = _safe_media_context(item.get("media_context"))
         if media_context:
             return media_context
+        if allow_tentative:
+            tentative_media_context = _safe_media_context(
+                item.get("tentative_media_context")
+            )
+            if tentative_media_context:
+                return tentative_media_context
         tool_name = str(item.get("tool_name") or "").strip()
         if tool_name and tool_name not in _MEDIA_CONTEXT_TOOL_NAMES:
             return {}
@@ -325,15 +333,18 @@ def _inherit_verified_media_query(
     conversation_context: list[dict[str, Any]] | None,
     *,
     tv_only: bool = False,
+    allow_tentative: bool = False,
 ) -> dict[str, Any]:
-    """为明确的媒体追问继承最近一次已核验标题，不覆盖本轮显式输入。"""
+    """为明确媒体追问继承安全标题，不覆盖本轮显式输入。"""
     inherited = dict(arguments)
     query = str(inherited.get("query") or "").strip()
     if not _is_contextual_media_query(query):
         return inherited
     requested_type = _contextual_media_reference_type(query)
     inherited.pop("query", None)
-    media_context = _latest_media_context(conversation_context)
+    media_context = _latest_media_context(
+        conversation_context, allow_tentative=allow_tentative
+    )
     title = str(media_context.get("title") or "").strip()
     media_type = str(media_context.get("media_type") or "").strip().casefold()
     if (
@@ -450,7 +461,7 @@ def contextual_media_rating_request(
         _pending_rating_media_context(conversation_context)
         if previous_rating
         else {}
-    ) or _latest_media_context(conversation_context)
+    ) or _latest_media_context(conversation_context, allow_tentative=True)
 
     explicit_rating = "豆瓣" in compact and any(
         token in compact for token in ("评分", "打分", "多少分", "几分")
@@ -598,7 +609,8 @@ _RECENT_DOWNLOAD_EXPLANATION_MARKERS = (
 )
 _RECENT_DOWNLOAD_STATUS_MARKERS = (
     "状态", "进度", "到哪", "到哪了", "到哪一步", "成功了吗", "完成了吗",
-    "有没有成功", "是否成功", "怎么样", "怎样了", "结束了吗",
+    "有没有成功", "是否成功", "怎么样", "怎样了", "结束了吗", "完了吗",
+    "好了吗", "好了没", "完成没有", "下载完没", "下载好了没", "下完了吗",
 )
 _RECENT_DOWNLOAD_LIBRARY_MARKERS = ("入库", "补齐", "补上", "缺集")
 _RECENT_DOWNLOAD_LIBRARY_INTENTS = ("核验", "检查", "确认", "是否", "了吗", "有没有", "有无")
@@ -787,9 +799,12 @@ _MEDIA_SERVER_DIAGNOSIS_REJECT_TOKENS = (
     "strm", "缺集", "更新", "资源", "种子", "磁力", "播放", "打开", "搜索", "查找", "启用", "关闭", "删除",
     "媒体库", "电影", "剧集",
 )
-_DOWNLOAD_DIAGNOSIS_SCOPES = ("下载队列", "下载任务", "下载自动化", "qbittorrent", "qb 下载", "qb下载", "下载器")
-_DOWNLOAD_DIAGNOSIS_INTENTS = ("诊断", "检查", "查看", "哪些", "状态", "卡住", "停滞", "异常", "失败", "排队")
-_DOWNLOAD_DIAGNOSIS_REJECT_TOKENS = ("配置", "设置")
+_DOWNLOAD_DIAGNOSIS_SCOPES = ("下载队列", "下载任务", "下载自动化", "qbittorrent", "qb 下载", "qb下载", "下载器", "下载")
+_DOWNLOAD_DIAGNOSIS_INTENTS = ("诊断", "检查", "查看", "哪些", "状态", "卡住", "停滞", "异常", "失败", "排队", "完成了吗", "完了吗", "好了吗", "好了没", "完成没有", "到哪了", "进度")
+_DOWNLOAD_DIAGNOSIS_REJECT_TOKENS = (
+    "配置", "设置", "重试", "再试", "重新提交", "再次提交", "修复", "删除", "移除",
+    "暂停", "停止", "恢复", "继续",
+)
 _CONFIG_DIAGNOSIS_EXACT_PHRASES = frozenset({
     "项目诊断", "环境诊断", "系统诊断", "配置诊断", "诊断项目", "诊断配置",
     "诊断系统", "请诊断", "进行诊断", "检查配置", "检查项目配置", "项目配置检查",
@@ -909,11 +924,13 @@ _RSS_DIAGNOSIS_INTENTS = ("诊断", "检查", "查看", "状态", "健康", "异
 _RSS_DIAGNOSIS_REJECT_TOKENS = ("配置", "设置")
 
 _INDEXER_READINESS_SCOPES = (
-    "资源站", "资源站搜索", "资源检索", "资源搜索", "多站资源搜索", "索引站", "索引器",
+    "资源站", "资源站搜索", "资源检索", "资源搜索", "多站资源搜索", "索引站",
+    "索引器", "站点", "资源",
 )
 _INDEXER_READINESS_INTENTS = (
     "诊断", "检查", "查看", "状态", "健康", "就绪", "可用", "能用", "正常",
-    "异常", "失败", "不可用", "连通",
+    "异常", "失败", "不可用", "连通", "连不上", "连不通", "打不开", "超时",
+    "没搜到", "搜不到", "搜不出来", "没结果", "没有结果", "连接失败",
 )
 _INDEXER_READINESS_REJECT_TOKENS = (
     "配置", "设置", "开启", "关闭", "启用", "停用", "禁用", "新增", "删除",
@@ -2850,7 +2867,14 @@ def _recent_resource_target_followup_request(
     target, has_target = _recent_resource_target(normalized)
     if not has_target:
         return None
-    position = _recent_resource_selection(previous.get("text"))
+    pending_selection = previous.get("pending_selection")
+    position = (
+        pending_selection.get("position")
+        if isinstance(pending_selection, dict)
+        else None
+    )
+    if not isinstance(position, int) or isinstance(position, bool):
+        position = _recent_resource_selection(previous.get("text"))
     if position is None:
         return None
     return {"position": position, "target": target}
@@ -2941,6 +2965,15 @@ def recent_download_status_request(message: str) -> dict[str, int | None] | None
 
 def is_recent_download_status_message(message: str) -> bool:
     return recent_download_status_request(message) is not None
+
+
+def _is_generic_download_status_message(message: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not normalized or any(token in normalized for token in _RECENT_DOWNLOAD_REJECT_TOKENS):
+        return False
+    return "下载" in normalized and any(
+        token in normalized for token in _RECENT_DOWNLOAD_STATUS_MARKERS
+    )
 
 
 def recent_download_library_verification_request(message: str) -> dict[str, int | None] | None:
@@ -3170,16 +3203,51 @@ def _extract_workspace_search_query(message: str) -> str:
     return query.strip(" ，。！？?、:：")[:120]
 
 
+_RESOURCE_SEARCH_DIAGNOSIS_MARKERS = (
+    "为什么", "怎么", "没搜到", "搜不到", "找不到", "没有结果", "没结果",
+    "连不上", "连不通", "打不开", "超时", "报错",
+)
+_DOWNLOAD_TITLE_REJECT_MARKERS = (
+    "完成了吗", "完了吗", "好了吗", "好了没", "进度", "状态", "到哪",
+    "为什么", "怎么", "如何", "配置", "设置", "失败",
+)
+
+
+def _extract_download_title_query(message: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).strip()
+    lowered = normalized.casefold()
+    if not normalized or any(token in lowered for token in _DOWNLOAD_TITLE_REJECT_MARKERS):
+        return ""
+    matched = re.fullmatch(
+        r"(?:请(?:帮我)?|帮我)?\s*(?:下载|下)(?:一下)?\s*"
+        r"(?:电影|电视剧|剧集|动画|动漫|影片|片子)?\s*"
+        r"(?:[《「『\"']([^》」』\"']{1,120})[》」』\"']|(.{1,120}))",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if matched is None:
+        return ""
+    query = (matched.group(1) or matched.group(2) or "").strip(" ，。！？?、:：")
+    if not query or any(token in query.casefold() for token in _RESOURCE_SEARCH_DIAGNOSIS_MARKERS):
+        return ""
+    return query[:120]
+
+
 def is_indexer_resource_search_message(message: str) -> bool:
-    normalized = str(message or "").casefold()
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    if any(token in normalized for token in _RESOURCE_SEARCH_DIAGNOSIS_MARKERS):
+        return False
     return (
         any(token in normalized for token in _RESOURCE_SEARCH_TOKENS)
         and any(token in normalized for token in _RESOURCE_SEARCH_VERBS)
-    )
+    ) or bool(_extract_download_title_query(message))
 
 
 def _extract_resource_search_query(message: str) -> str:
-    query = _extract_search_query(message)
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    if any(token in normalized for token in _RESOURCE_SEARCH_DIAGNOSIS_MARKERS):
+        return ""
+    query = _extract_search_query(message) or _extract_download_title_query(message)
     if not query:
         return ""
     query = re.sub(
@@ -3233,7 +3301,9 @@ def indexer_site_change_followup_request(
                 if title:
                     break
     if not title:
-        media_context = _latest_media_context(conversation_context)
+        media_context = _latest_media_context(
+            conversation_context, allow_tentative=True
+        )
         title = str(media_context.get("title") or "").strip()
     if not title:
         return None
@@ -5061,7 +5131,14 @@ class AgentOrchestrator:
                 False,
                 "selection_required",
                 summary,
-                data={"candidates": candidates},
+                data={
+                    "candidates": candidates,
+                    "pending_selection": (
+                        {"position": position, **({"target": target} if target else {})}
+                        if isinstance(position, int)
+                        else None
+                    ),
+                },
                 suggestions=suggestions,
                 error="需要明确选择候选序号和提交目标后才能创建确认请求。",
             ),
@@ -5929,6 +6006,12 @@ class AgentOrchestrator:
 
         recent_status_request = recent_download_status_request(message)
         if recent_status_request is not None:
+            return self._continue_recent_download_status(message, owner=owner)
+        if (
+            owner
+            and _is_generic_download_status_message(message)
+            and self.recent_download_store.get(owner=owner)
+        ):
             return self._continue_recent_download_status(message, owner=owner)
         return None
 
@@ -6902,6 +6985,7 @@ class AgentOrchestrator:
             inherited = _inherit_verified_media_query(
                 {"query": _extract_resource_search_query(message)},
                 conversation_context,
+                allow_tentative=True,
             )
             query = str(inherited.get("query") or "").strip()
             if not query:

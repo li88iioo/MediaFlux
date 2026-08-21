@@ -145,9 +145,21 @@ class RecentDownloadSubmissionStore:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return False
+        removed = False
         with self._owner_lock(owner_key):
             with self._lock:
-                return self._entries.pop(owner_key, None) is not None
+                removed = self._entries.pop(owner_key, None) is not None
+            if self._repository is not None:
+                try:
+                    removed = bool(self._repository.delete_downloads(
+                        owner=owner_key
+                    )) or removed
+                except Exception as exc:
+                    logger.warning(
+                        "Agent 下载上下文清理失败 type=%s",
+                        type(exc).__name__,
+                    )
+        return removed
 
     def _owner_lock(self, owner_key: str) -> threading.RLock:
         return self._owner_locks[hash(owner_key) % len(self._owner_locks)]

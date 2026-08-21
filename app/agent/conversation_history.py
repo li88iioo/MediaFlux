@@ -660,6 +660,40 @@ class SQLiteAgentConversationHistoryRepository:
             result["media_type"] = media_type
         return result
 
+    def _tentative_media_context_projection(
+        self,
+        *,
+        tool_name: str,
+        data: Any,
+        arguments: Any = None,
+        status: str = "",
+    ) -> dict[str, str]:
+        """保留用户明确输入但尚未由当前数据源命中的安全媒体标题。"""
+        if str(status or "").strip().lower() not in {"empty", "not_found"}:
+            return {}
+        return self._media_context_projection(
+            tool_name=tool_name,
+            data=data,
+            arguments=arguments,
+            ok=True,
+            status="success",
+        )
+
+    @staticmethod
+    def _validated_pending_selection(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict) or not set(value).issubset({"position", "target"}):
+            return None
+        position = value.get("position")
+        if not isinstance(position, int) or isinstance(position, bool) or not 1 <= position <= 20:
+            return None
+        result: dict[str, Any] = {"position": position}
+        target = str(value.get("target") or "").strip().lower()
+        if target:
+            if target not in {"qb", "guangya", "both"}:
+                return None
+            result["target"] = target
+        return result
+
     def _context_entry_from_row(
         self,
         row: Any,
@@ -691,10 +725,22 @@ class SQLiteAgentConversationHistoryRepository:
                 tool_name=tool_name,
                 data=data.get("media_context"),
             )
+            tentative_media_context = self._tentative_media_context_projection(
+                tool_name=tool_name,
+                data=data.get("tentative_media_context"),
+                status="empty",
+            )
+            pending_selection = self._validated_pending_selection(
+                data.get("pending_selection")
+            )
             if tool_name:
                 entry["tool_name"] = tool_name
             if media_context:
                 entry["media_context"] = media_context
+            if tentative_media_context:
+                entry["tentative_media_context"] = tentative_media_context
+            if pending_selection is not None:
+                entry["pending_selection"] = pending_selection
             if status:
                 entry["status"] = status
             if isinstance(suggestions, list):
@@ -861,6 +907,25 @@ class SQLiteAgentConversationHistoryRepository:
         )
         if media_context:
             projection["media_context"] = media_context
+        else:
+            tentative_media_context = self._tentative_media_context_projection(
+                tool_name=tool_name,
+                data=result.get("data"),
+                arguments=tool_call.get("arguments"),
+                status=str(result.get("status") or ""),
+            )
+            if tentative_media_context:
+                projection["tentative_media_context"] = tentative_media_context
+        result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        if (
+            tool_name == "indexer.submit_resource"
+            and str(result.get("status") or "").strip().lower() == "selection_required"
+        ):
+            pending_selection = self._validated_pending_selection(
+                result_data.get("pending_selection")
+            )
+            if pending_selection is not None:
+                projection["pending_selection"] = pending_selection
         return projection
 
     @staticmethod

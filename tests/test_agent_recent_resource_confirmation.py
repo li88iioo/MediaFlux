@@ -376,6 +376,34 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         )
         return service, preview_calls, execute_calls, search_results
 
+    def test_download_by_title_searches_candidates_before_any_write(self):
+        for message in ("帮我下载光明之外", "帮我下载《光明之外》"):
+            with self.subTest(message=message):
+                service, preview_calls, execute_calls, _ = self._agent()
+                searched = service.query(message, owner="session-a")
+                self.assertEqual(searched["tool_call"]["name"], "indexer.search_resources")
+                self.assertEqual(searched["tool_call"]["arguments"]["title"], "光明之外")
+                self.assertEqual(preview_calls, [])
+                self.assertEqual(execute_calls, [])
+
+    def test_resource_search_inherits_tentative_media_context(self):
+        service, preview_calls, execute_calls, _ = self._agent()
+        response = service.query(
+            "搜一下它的资源",
+            owner="session-a",
+            conversation_context=[{
+                "role": "assistant",
+                "tool_name": "library.search",
+                "status": "empty",
+                "text": "媒体库中没有找到匹配内容",
+                "tentative_media_context": {"title": "光明之外", "media_type": "tv"},
+            }],
+        )
+        self.assertEqual(response["tool_call"]["name"], "indexer.search_resources")
+        self.assertEqual(response["tool_call"]["arguments"]["title"], "光明之外")
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
     def test_generic_search_supports_natural_number_followup_and_keeps_confirmation(self):
         service, preview_calls, execute_calls, _ = self._agent()
         searched = service.query("搜索光明之外资源", owner="session-a")
@@ -443,6 +471,32 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         )
         self.assertEqual(ambiguous["result"]["status"], "selection_required")
         self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
+    def test_target_only_followup_uses_structured_pending_selection(self):
+        service, preview_calls, execute_calls, _ = self._agent()
+        service.query("搜索光明之外资源", owner="session-a")
+        needs_target = service.query("下载第2个", owner="session-a")
+        pending = needs_target["result"]["data"]["pending_selection"]
+        self.assertEqual(pending, {"position": 2})
+
+        response = service.query(
+            "推到qB",
+            owner="session-a",
+            conversation_context=[{
+                "role": "assistant",
+                "tool_name": "indexer.submit_resource",
+                "status": "selection_required",
+                "text": "请选择一个下载目标。",
+                "pending_selection": pending,
+            }],
+        )
+
+        self.assertEqual(response["mode"], "confirmation_required")
+        self.assertEqual(preview_calls[-1], {
+            "result_id": "generic-resource-0002",
+            "target": "qb",
+        })
         self.assertEqual(execute_calls, [])
 
     def test_target_only_followup_without_pending_selection_does_not_guess(self):

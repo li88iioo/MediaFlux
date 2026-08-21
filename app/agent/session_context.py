@@ -73,6 +73,8 @@ class AgentSessionContextRepository(Protocol):
 
     def delete_latest(self, *, owner: str, context_type: str) -> int: ...
 
+    def delete_downloads(self, *, owner: str) -> int: ...
+
     def delete_owner(self, *, owner: str) -> int: ...
 
 
@@ -225,6 +227,17 @@ class SQLiteAgentSessionContextRepository:
                 "DELETE FROM agent_session_context "
                 "WHERE owner_digest=? AND context_type=?",
                 (owner_digest, normalized_type),
+            )
+        return max(0, int(cursor.rowcount or 0))
+
+    def delete_downloads(self, *, owner: str) -> int:
+        """删除指定会话的全部最近下载提交上下文。"""
+        owner_digest = self._owner_digest(owner)
+        with db.get_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type='download_submission'",
+                (owner_digest,),
             )
         return max(0, int(cursor.rowcount or 0))
 

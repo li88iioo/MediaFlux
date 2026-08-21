@@ -507,6 +507,17 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
         self.assertEqual(stale_calls, [])
         self.assertEqual(stale_service.recent_download_store.get(owner="session-a"), ())
 
+    def test_generic_download_status_prefers_recent_session_record(self):
+        store = RecentDownloadSubmissionStore()
+        request_id = self._create_request("generic", "downloading")
+        store.capture(owner="session-a", result=_submission_result(request_id=request_id))
+        service, _ = _submission_agent(_submission_result(request_id=request_id), store=store)
+
+        response = service.query("下载完成了吗", owner="session-a")
+
+        self.assertEqual(response["tool_call"]["name"], "downloads.recent_submission_status")
+        self.assertEqual(response["result"]["data"]["phase"], "downloading")
+
     def test_default_is_latest_and_out_of_range_fails_closed(self):
         store = RecentDownloadSubmissionStore()
         first = self._create_request("one", "submitted")
