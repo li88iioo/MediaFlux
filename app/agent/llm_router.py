@@ -62,10 +62,51 @@ _ACTION_STATUS_QUERY_PATTERNS = (
     re.compile(r"(?:当前|现在).{0,12}(?:状态|情况|是否|有没有|有无)"),
 )
 
+_ACTION_EXPLANATION_QUERY_PATTERNS = (
+    re.compile(r"(?:怎么|怎样|如何|为何|为什么)"),
+    re.compile(
+        r"(?:下载|推送|提交|设置|配置|开启|启用|关闭|修改|调整|使用|操作).{0,12}"
+        r"(?:方法|步骤|教程|指南|说明|文档|方式|怎么弄|怎么操作|怎么配置)"
+    ),
+    re.compile(
+        r"(?:下载|推送|提交|设置|配置|开启|启用|关闭|修改|调整|使用|操作).{0,12}"
+        r"(?:有哪些|哪些|什么|哪种|哪类)"
+    ),
+)
+_ACTION_CAPABILITY_QUERY_PATTERNS = (
+    re.compile(r"^(?:能否|能不能|可否|可不可以|是否支持|支不支持)"),
+    re.compile(
+        r"(?:是否|能否|能不能|可否|可不可以).{0,20}"
+        r"(?:支持|设置|配置|开启|启用|关闭|修改|调整|使用)"
+    ),
+    re.compile(
+        r"(?:支持|可以|能够).{0,16}(?:设置|配置|开启|启用|关闭|修改|调整|使用)"
+        r"(?:(?:哪些|什么|哪种|哪类).{0,16}|.{0,24}(?:吗|么|呢|[?？]))"
+    ),
+)
+_EXPLICIT_POLITE_ACTION_RE = re.compile(
+    r"(?:请|麻烦|劳驾).{0,6}帮我.{0,12}"
+    r"(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复|调整|修改|设置|改成|保存|取消|"
+    r"删除|移除|清理|刷新|同步|重试|推送|提交|立即执行|开始执行|运行一次|发送测试)"
+    r"|(?:能否|能不能|可以|可否).{0,4}帮我.{0,12}"
+    r"(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复|调整|修改|设置|改成|保存|取消|"
+    r"删除|移除|清理|刷新|同步|重试|推送|提交|立即执行|开始执行|运行一次|发送测试)"
+)
+
 
 def _looks_like_action_status_query(value: str) -> bool:
     """避免把“网页搜索是否开启”一类状态查询误当成修改动作。"""
     return any(pattern.search(value) for pattern in _ACTION_STATUS_QUERY_PATTERNS)
+
+
+def _looks_like_action_explanation_query(value: str) -> bool:
+    """识别操作说明与故障解释；这类问题应先进入只读工具链。"""
+    return any(pattern.search(value) for pattern in _ACTION_EXPLANATION_QUERY_PATTERNS)
+
+
+def _looks_like_action_capability_query(value: str) -> bool:
+    """识别“能否/是否支持”类能力咨询，避免把询问当作执行。"""
+    return any(pattern.search(value) for pattern in _ACTION_CAPABILITY_QUERY_PATTERNS)
 
 
 _ACTION_INTENT_RE = re.compile(
@@ -93,6 +134,12 @@ def is_agent_action_request(message: str) -> bool:
     """
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
     if not normalized or _looks_like_action_status_query(normalized):
+        return False
+    if _looks_like_action_explanation_query(normalized):
+        return False
+    if _EXPLICIT_POLITE_ACTION_RE.search(normalized):
+        return True
+    if _looks_like_action_capability_query(normalized):
         return False
     return bool(_ACTION_INTENT_RE.search(normalized) or _DOWNLOAD_ACTION_RE.search(normalized))
 
@@ -1189,6 +1236,10 @@ _NATIVE_DEFAULT_READ_TOOLS = (
 _NATIVE_FULL_LIBRARY_MARKERS = (
     "全库", "全部剧集", "所有剧集", "整个媒体库", "全媒体库", "缺集巡检",
 )
+_NATIVE_INTENT_CLAUSE_SPLIT_RE = re.compile(
+    r"[，,；;。！？!?]+|\s+(?:and|then|plus)\s+|"
+    r"(?:并在需要时|并根据需要|并且|以及|同时|顺便|另外|还有|然后|再看看|再查查|和)"
+)
 
 
 def _native_context_text(
@@ -1286,6 +1337,50 @@ def _semantic_capability_weights(capability: Mapping[str, Any]) -> dict[str, flo
     return weights
 
 
+def _intent_clauses(context_text: str) -> tuple[str, ...]:
+    """把明确的复合请求拆成独立子目标，短标题或普通短语保持整句召回。"""
+    clauses = tuple(
+        part.strip()
+        for part in _NATIVE_INTENT_CLAUSE_SPLIT_RE.split(context_text)
+        if len(re.sub(r"\s+", "", part)) >= 4
+    )
+    return clauses if len(clauses) >= 2 else (context_text,)
+
+
+def _score_read_capabilities(
+    eligible: list[dict[str, Any]],
+    documents: list[dict[str, float]],
+    document_frequency: Mapping[str, int],
+    context_text: str,
+) -> list[tuple[float, str, dict[str, Any]]]:
+    query_tokens = _semantic_tokens(context_text)
+    normalized_context = unicodedata.normalize("NFKC", context_text).casefold()
+    total_documents = len(documents)
+    ranked: list[tuple[float, str, dict[str, Any]]] = []
+    for item, document in zip(eligible, documents):
+        score = 0.0
+        for token in query_tokens:
+            weight = document.get(token)
+            if weight is None:
+                continue
+            inverse_frequency = math.log(
+                (total_documents + 1) / (document_frequency.get(token, 0) + 1)
+            ) + 1.0
+            score += weight * inverse_frequency
+        for example in _capability_examples(item):
+            normalized_example = unicodedata.normalize("NFKC", example).casefold()
+            if normalized_example and (
+                normalized_example in normalized_context
+                or normalized_context in normalized_example
+            ):
+                score += 12.0
+        name = str(item.get("name") or "").strip()
+        if score > 0 and name:
+            ranked.append((score, name, item))
+    ranked.sort(key=lambda entry: (-entry[0], entry[1]))
+    return ranked
+
+
 def _rank_read_capabilities(
     capabilities: list[dict[str, Any]],
     context_text: str,
@@ -1307,39 +1402,44 @@ def _rank_read_capabilities(
     if len(eligible) <= 4:
         return eligible[:max_candidates]
 
-    query_tokens = _semantic_tokens(context_text)
     documents = [_semantic_capability_weights(item) for item in eligible]
     document_frequency: dict[str, int] = {}
     for document in documents:
         for token in document:
             document_frequency[token] = document_frequency.get(token, 0) + 1
 
-    normalized_context = unicodedata.normalize("NFKC", context_text).casefold()
-    ranked: list[tuple[float, str, dict[str, Any]]] = []
-    total_documents = len(documents)
-    for item, document in zip(eligible, documents):
-        score = 0.0
-        for token in query_tokens:
-            weight = document.get(token)
-            if weight is None:
-                continue
-            inverse_frequency = math.log(
-                (total_documents + 1) / (document_frequency.get(token, 0) + 1)
-            ) + 1.0
-            score += weight * inverse_frequency
-        for example in _capability_examples(item):
-            normalized_example = unicodedata.normalize("NFKC", example).casefold()
-            if normalized_example and (
-                normalized_example in normalized_context
-                or normalized_context in normalized_example
-            ):
-                score += 12.0
-        name = str(item.get("name") or "").strip()
-        if score > 0 and name:
-            ranked.append((score, name, item))
+    ranked = _score_read_capabilities(
+        eligible, documents, document_frequency, context_text
+    )
 
     if ranked:
-        ranked.sort(key=lambda entry: (-entry[0], entry[1]))
+        clauses = _intent_clauses(context_text)
+        if len(clauses) >= 2:
+            selected: list[dict[str, Any]] = []
+            selected_names: set[str] = set()
+            for clause in clauses:
+                clause_ranked = _score_read_capabilities(
+                    eligible, documents, document_frequency, clause
+                )
+                if not clause_ranked:
+                    continue
+                clause_minimum = max(1.0, clause_ranked[0][0] * 0.30)
+                clause_added = 0
+                for score, name, item in clause_ranked:
+                    if score < clause_minimum:
+                        break
+                    if name in selected_names:
+                        continue
+                    selected.append(item)
+                    selected_names.add(name)
+                    clause_added += 1
+                    if len(selected) >= max_candidates:
+                        return selected
+                    if clause_added >= 3:
+                        break
+            if selected:
+                return selected
+
         best_score = ranked[0][0]
         minimum_score = max(1.0, best_score * 0.30)
         return [
@@ -1407,6 +1507,8 @@ def _native_read_system_prompt() -> str:
         "当前问题是本轮唯一目标；最近会话只用于解析‘这个、这部剧、刷新一下、重试、"
         "继续、列出列表’等指代，不得把旧问题当成新的任务。"
         "若一个目标需要多个只读事实，应连续调用必要工具后再统一回答，不要只执行第一步。"
+        "用户泛称‘订阅、追番、追更’且没有明确限定 RSS 或媒体追更时，应同时核对可用的"
+        "媒体追更与 RSS 事实，再统一回答；不得把其中一类为空说成用户没有任何订阅。"
         "必须区分‘确实没有结果’、‘数据源不可用’和‘检查范围不完整’，不得把失败说成不存在。"
         "最终必须用普通用户能理解的中文直接回答：第一句给结论，随后只保留与当前问题相关的"
         "数量、影响和可执行下一步。回答使用 2 到 5 个短段或项目符号，不要堆成一整段。"

@@ -1005,6 +1005,10 @@ def build_tool_registry() -> ToolRegistry:
         validator=local_media_diagnosis_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "本地媒体来源和整理调度正常吗",
+            "检查本地媒体自动化状态",
+        ),
     ))
     registry.register(ToolSpec(
         name="local_media.source_summaries",
@@ -1160,6 +1164,10 @@ def build_tool_registry() -> ToolRegistry:
         validator=rss_diagnosis_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "RSS 订阅为什么没有更新",
+            "检查 RSS 待处理和失败项目",
+        ),
     ))
     registry.register(ToolSpec(
         name="rss.subscription_summaries",
@@ -1170,6 +1178,11 @@ def build_tool_registry() -> ToolRegistry:
         validator=rss_subscription_summaries_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "我有哪些 RSS 订阅",
+            "列出 RSS 订阅和启用状态",
+            "查看我的订阅",
+        ),
     ))
     registry.register(ToolSpec(
         name="rss.get_subscription_summary",
@@ -1255,6 +1268,7 @@ def build_tool_registry() -> ToolRegistry:
         llm_examples=(
             "我订阅了哪些媒体",
             "列出当前的追更订阅",
+            "查看我的订阅",
         ),
     ))
     registry.register(ToolSpec(
@@ -1272,6 +1286,8 @@ def build_tool_registry() -> ToolRegistry:
             "我订阅的媒体又更新吗",
             "检查追更订阅有没有新集",
             "看看订阅缺哪些集并搜索资源",
+            "查看我的追更和 RSS 更新情况",
+            "检查订阅更新",
         ),
     ))
     registry.register(ToolSpec(
@@ -1317,6 +1333,12 @@ def build_tool_registry() -> ToolRegistry:
         validator=rss_subscription_summaries_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "RSS 最近有下载新内容吗",
+            "查看最近 24 小时 RSS 更新",
+            "查看我的追更和 RSS 更新情况",
+            "检查订阅更新",
+        ),
     ))
     registry.register(ToolSpec(
         name="rss.refresh_subscription",
@@ -1643,6 +1665,10 @@ def build_tool_registry() -> ToolRegistry:
         validator=_no_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "STRM 最近同步正常吗",
+            "检查 STRM 缺失和失败",
+        ),
     ))
     registry.register(ToolSpec(
         name="strm.triage_failures",
@@ -1695,6 +1721,10 @@ def build_tool_registry() -> ToolRegistry:
         validator=_no_arguments,
         llm_read=True,
         llm_read_plan=True,
+        llm_examples=(
+            "光鸭整理任务现在正常吗",
+            "查看光鸭整理和调度状态",
+        ),
     ))
     registry.register(ToolSpec(
         name="strm.schedule_policy",
@@ -2030,6 +2060,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=bangumi_calendar,
         validator=bangumi_calendar_arguments,
         llm_read=True,
+        llm_examples=(
+            "看看本周追番日历",
+            "今天有哪些动画更新",
+        ),
     ))
     registry.register(ToolSpec(
         name="indexer.diagnose_readiness",
@@ -2075,6 +2109,7 @@ def build_tool_registry() -> ToolRegistry:
         llm_examples=(
             "搜索《某片》的下载资源",
             "找种子或磁力资源",
+            "在资源站搜索资源",
         ),
     ))
     registry.register(ToolSpec(
@@ -2218,6 +2253,10 @@ def build_tool_registry() -> ToolRegistry:
         handler=search_missing_episode_resources,
         validator=missing_episode_resource_arguments,
         llm_read=True,
+        llm_examples=(
+            "搜索某剧第 2 季第 3 集的缺集资源",
+            "确认 S02E03 缺失后找资源",
+        ),
     ))
 
     registry.register(ToolSpec(

@@ -25,6 +25,8 @@ from app.agent.llm_router import (
     answer_conversation,
     compose_tool_answer,
     confirmation_tool_capabilities,
+    is_agent_action_request,
+    is_confirmation_planning_request,
     normalize_streamed_answer,
     orchestration_tool_capabilities,
     read_tool_capabilities,
@@ -524,6 +526,80 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertIn("library.search", default_names)
         self.assertNotIn("library.audit_library_episodes", default_names)
         self.assertLessEqual(len(default_caps), 14)
+
+    def test_action_detection_distinguishes_commands_from_information_queries(self):
+        for message in (
+            "开启网页搜索",
+            "把 TMDB 匹配模式改成严格",
+            "刷新 RSS 订阅",
+            "开始下载第 2 个到 qB",
+            "请帮我开启网页搜索",
+            "能否帮我开启自动追更",
+            "能否帮我刷新 RSS 订阅",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(is_agent_action_request(message))
+
+        for message in (
+            "怎么设置网页搜索",
+            "如何配置资源站点",
+            "能否开启自动追更",
+            "支持开启 Sukebei 吗",
+            "可以设置哪些下载器",
+            "为什么不能开启自动整理",
+            "网页搜索是否开启",
+            "请帮我看看怎么开启网页搜索",
+            "能否帮我查一下怎么设置下载器",
+            "麻烦帮我确认下怎么修改 TMDB 模式",
+            "怎么下载到 qB",
+            "为什么下载到 qB 失败了",
+            "如何下载第 2 个到 qB",
+            "下载到 qB 有什么步骤",
+            "能否下载第 2 个到 qB",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(is_agent_action_request(message))
+                self.assertFalse(is_confirmation_planning_request(message))
+
+    def test_native_capabilities_cover_each_clause_of_compound_read_requests(self):
+        registry = build_tool_registry()
+
+        subscription_names = {
+            registry.native_tool_name(item["name"])
+            for item in _native_read_capabilities(
+                registry, "查看我的追更和 RSS 更新情况"
+            )
+        }
+        self.assertIn("media.subscription_updates", subscription_names)
+        self.assertIn("rss.recent_activity", subscription_names)
+
+        resource_names = {
+            registry.native_tool_name(item["name"])
+            for item in _native_read_capabilities(
+                registry, "检查订阅更新并在需要时搜索资源"
+            )
+        }
+        self.assertIn("media.subscription_updates", resource_names)
+        self.assertIn("indexer.search_resources", resource_names)
+
+        calendar_names = {
+            registry.native_tool_name(item["name"])
+            for item in _native_read_capabilities(
+                registry, "看看追番日历和我的媒体订阅"
+            )
+        }
+        self.assertIn("bangumi.calendar", calendar_names)
+        self.assertIn("media.subscription_summaries", calendar_names)
+        self.assertNotIn("library.audit_library_episodes", calendar_names)
+
+        download_names = {
+            registry.native_tool_name(item["name"])
+            for item in _native_read_capabilities(
+                registry, "检查下载队列有没有异常"
+            )
+        }
+        self.assertTrue(download_names)
+        self.assertTrue(all(name.startswith("downloads.") for name in download_names))
 
     def test_native_semantic_recall_is_independent_of_tool_prefix(self):
         registry = ToolRegistry()
@@ -2056,6 +2132,27 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
 
         self.assertIs(response, model_response)
         self.assertEqual(deterministic_calls, [])
+        self.assertTrue(model_router.call_args.kwargs["read_only"])
+
+    def test_action_how_to_question_reaches_llm_read_tools(self):
+        model_response = {
+            "request_id": "model-how-to",
+            "mode": "conversation",
+            "tool_call": None,
+            "result": ToolResult(
+                True, "answered", "可以先查看功能状态，再按界面提示配置。"
+            ).to_dict(),
+        }
+        agent = AgentOrchestrator(ToolRegistry())
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=model_response
+        ) as model_router:
+            response = agent.query(
+                "怎么设置网页搜索", owner="web-session", present=False
+            )
+
+        self.assertIs(response, model_response)
+        model_router.assert_called_once()
         self.assertTrue(model_router.call_args.kwargs["read_only"])
 
     def test_fallback_executes_only_valid_read_selection(self):
