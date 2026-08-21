@@ -18,6 +18,7 @@ from app.agent.owner_routes import web_agent_owner
 from app.agent.recent_discovery_candidates import RecentDiscoveryCandidateStore
 from app.agent.recent_download_submissions import RecentDownloadSubmissionStore
 from app.agent.recent_patrol import RecentPatrolStore
+from app.agent.recent_read_operations import READ_PLAN_OPERATION, RecentReadOperationStore
 from app.agent.recent_resource_candidates import RecentResourceCandidateStore
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
@@ -563,6 +564,64 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
                 (digest,),
             ).fetchone()["total"]
         self.assertEqual(remaining, 0)
+
+    def test_recent_read_operations_restore_across_instances_and_clear(self):
+        monotonic = [20.0]
+        first = RecentReadOperationStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        self.assertTrue(first.capture(
+            owner="read-single",
+            tool_name="downloads.diagnose_queue",
+            arguments={"status": "active"},
+        ))
+        self.assertTrue(first.capture_plan(
+            owner="read-plan",
+            steps=[
+                ("workspace.health", {}),
+                ("downloads.diagnose_queue", {"status": "active"}),
+            ],
+        ))
+
+        recreated = RecentReadOperationStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        self.assertEqual(
+            recreated.get(owner="read-single"),
+            ("downloads.diagnose_queue", {"status": "active"}),
+        )
+        self.assertEqual(
+            recreated.get(owner="read-plan"),
+            (
+                READ_PLAN_OPERATION,
+                {"steps": [
+                    {"tool_name": "workspace.health", "arguments": {}},
+                    {
+                        "tool_name": "downloads.diagnose_queue",
+                        "arguments": {"status": "active"},
+                    },
+                ]},
+            ),
+        )
+
+        digest = self.repository.owner_digest_for_tests("read-single")
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT payload FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type='read_operation'",
+                (digest,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertNotIn("read-single", str(row["payload"]))
+        self.assertTrue(recreated.clear_owner(owner="read-single"))
+        self.assertIsNone(RecentReadOperationStore(
+            repository=self.repository,
+            wall_clock=lambda: self.wall[0],
+        ).get(owner="read-single"))
 
     def test_patrol_and_download_clear_owner_remove_persisted_rows(self):
         patrol = RecentPatrolStore(

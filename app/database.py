@@ -1257,6 +1257,44 @@ CREATE INDEX IF NOT EXISTS idx_agent_confirmations_owner_expiry
 CREATE INDEX IF NOT EXISTS idx_agent_confirmations_expiry
     ON agent_confirmations(expires_at);
 
+CREATE TABLE IF NOT EXISTS telegram_agent_actions (
+    action_id TEXT PRIMARY KEY,
+    owner_digest TEXT NOT NULL,
+    action_kind TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    confirmation_id TEXT NOT NULL DEFAULT '',
+    result_id TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    tool_name TEXT NOT NULL DEFAULT '',
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    action_key TEXT NOT NULL DEFAULT '',
+    expires_at REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_agent_actions_owner_group
+    ON telegram_agent_actions(owner_digest, group_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_agent_actions_owner_expiry
+    ON telegram_agent_actions(owner_digest, expires_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_agent_actions_expiry
+    ON telegram_agent_actions(expires_at);
+
+CREATE TABLE IF NOT EXISTS telegram_write_confirmations (
+    action_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    owner_digest TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    value_json TEXT NOT NULL DEFAULT '{}',
+    expires_at REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_write_confirmations_group
+    ON telegram_write_confirmations(group_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_write_confirmations_owner_expiry
+    ON telegram_write_confirmations(owner_digest, expires_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_write_confirmations_expiry
+    ON telegram_write_confirmations(expires_at);
+
 CREATE TABLE IF NOT EXISTS agent_missing_media_workflows (
     workflow_id TEXT PRIMARY KEY,
     owner_digest TEXT NOT NULL,
@@ -1692,6 +1730,14 @@ def init_db() -> None:
             )
             conn.execute(
                 "DELETE FROM agent_confirmations WHERE expires_at<=?",
+                (time.time(),),
+            )
+            conn.execute(
+                "DELETE FROM telegram_agent_actions WHERE expires_at<=?",
+                (time.time(),),
+            )
+            conn.execute(
+                "DELETE FROM telegram_write_confirmations WHERE expires_at<=?",
                 (time.time(),),
             )
             timestamp = now()

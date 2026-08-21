@@ -14,6 +14,7 @@ from app.agent.orchestrator import AgentOrchestrator
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.bot.agent_adapter import (
+    SQLiteTelegramAgentActionStore,
     TelegramAgentActionStore,
     _render_resource_candidates,
     _safe_callback_history_response,
@@ -473,6 +474,65 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 tool_name="indexer.search_resources",
                 arguments={"query": "The Show"},
             )
+
+    def test_sqlite_action_store_persists_owner_hashed_group_across_instances(self):
+        tokens = iter(["persist-confirm", "persist-cancel"])
+        first = SQLiteTelegramAgentActionStore(
+            token_factory=lambda: next(tokens)
+        )
+        confirm = first.create(
+            owner="owner-persist", confirmation_id="ticket-persist", action="confirm"
+        )
+        cancel = first.create(
+            owner="owner-persist", confirmation_id="ticket-persist", action="cancel"
+        )
+        with db.get_conn() as conn:
+            owner_digest = conn.execute(
+                "SELECT owner_digest FROM telegram_agent_actions WHERE action_id=?",
+                (confirm,),
+            ).fetchone()["owner_digest"]
+        self.assertNotEqual(owner_digest, "owner-persist")
+        self.assertRegex(str(owner_digest), r"^[0-9a-f]{64}$")
+
+        second = SQLiteTelegramAgentActionStore()
+        with self.assertRaises(ValueError):
+            second.resolve(confirm, owner="other-owner")
+        self.assertEqual(
+            second.resolve(confirm, owner="owner-persist"),
+            {"confirmation_id": "ticket-persist", "action": "confirm"},
+        )
+        with self.assertRaises(ValueError):
+            first.resolve(cancel, owner="owner-persist")
+
+    def test_sqlite_action_store_group_consumption_is_atomic_across_instances(self):
+        tokens = iter(["resource-action-qb", "resource-action-gy"])
+        issuer = SQLiteTelegramAgentActionStore(
+            token_factory=lambda: next(tokens)
+        )
+        action_ids = [
+            issuer.create_resource_prepare(
+                owner="owner-race",
+                result_id="resource_result_123456",
+                target=target,
+                group_id="resource-group-race",
+            )
+            for target in ("qb", "guangya")
+        ]
+        barrier = threading.Barrier(2)
+
+        def resolve_once(action_id: str) -> str:
+            barrier.wait(timeout=3)
+            try:
+                SQLiteTelegramAgentActionStore().resolve(
+                    action_id, owner="owner-race"
+                )
+            except ValueError:
+                return "invalid"
+            return "resolved"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = sorted(pool.map(resolve_once, action_ids))
+        self.assertEqual(outcomes, ["invalid", "resolved"])
 
     def test_render_projects_only_safe_summary_and_guidance_without_internal_evidence(self):
         response = {

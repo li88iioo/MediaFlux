@@ -3,12 +3,16 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from copy import deepcopy
+import logging
 import re
 import threading
 import time
 from typing import Any, Callable
 
+from app.agent.session_context import AgentSessionContextRepository
 from app.sensitive_data import contains_sensitive_credential
+
+logger = logging.getLogger(__name__)
 
 # 仅记录参数不含凭据、路径、分享口令或内部句柄的幂等只读工具。
 # 新工具必须经过显式审查后才能加入，避免把“重试”扩展成任意调用重放。
@@ -61,6 +65,7 @@ _SENSITIVE_KEY_PARTS = frozenset({
 _PATH_OR_URL_RE = re.compile(
     r"(?i)(?:^[a-z][a-z0-9+.-]{1,20}://|^[a-z]:[\\/]|^/(?:[^/\s]+/)+)"
 )
+_CONTEXT_TYPE = "read_operation"
 
 
 class RecentReadOperationStore:
@@ -72,11 +77,16 @@ class RecentReadOperationStore:
         ttl_seconds: int = 900,
         max_entries: int = 256,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        repository: AgentSessionContextRepository | None = None,
     ) -> None:
         self.ttl_seconds = max(1, int(ttl_seconds))
         self.max_entries = max(1, int(max_entries))
         self._clock = clock
+        self._wall_clock = wall_clock
+        self._repository = repository
         self._lock = threading.RLock()
+        self._owner_locks = tuple(threading.RLock() for _ in range(64))
         self._entries: OrderedDict[str, tuple[float, str, dict[str, Any]]] = OrderedDict()
 
     def capture(self, *, owner: str, tool_name: str, arguments: dict[str, Any]) -> bool:
@@ -114,38 +124,72 @@ class RecentReadOperationStore:
         )
 
     def _store(self, *, owner_key: str, name: str, payload: dict[str, Any]) -> bool:
-        now = self._clock()
-        with self._lock:
-            self._prune_locked(now)
-            self._entries.pop(owner_key, None)
-            self._entries[owner_key] = (
-                now + self.ttl_seconds,
-                name,
-                deepcopy(payload),
-            )
-            while len(self._entries) > self.max_entries:
-                self._entries.popitem(last=False)
+        with self._owner_lock(owner_key):
+            now = self._clock()
+            safe_payload = deepcopy(payload)
+            with self._lock:
+                self._prune_locked(now)
+                self._entries.pop(owner_key, None)
+                self._entries[owner_key] = (
+                    now + self.ttl_seconds,
+                    name,
+                    safe_payload,
+                )
+                while len(self._entries) > self.max_entries:
+                    self._entries.popitem(last=False)
+            if self._repository is not None:
+                snapshot = (
+                    {"tool_name": name, "steps": deepcopy(safe_payload["steps"])}
+                    if name == READ_PLAN_OPERATION
+                    else {"tool_name": name, "arguments": deepcopy(safe_payload)}
+                )
+                try:
+                    self._repository.replace_latest(
+                        owner=owner_key,
+                        context_type=_CONTEXT_TYPE,
+                        payload=snapshot,
+                        expires_at=self._wall_clock() + self.ttl_seconds,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Agent 最近只读操作持久化失败 type=%s",
+                        type(exc).__name__,
+                    )
         return True
 
     def get(self, *, owner: str) -> tuple[str, dict[str, Any]] | None:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return None
-        now = self._clock()
-        with self._lock:
-            self._prune_locked(now)
-            entry = self._entries.get(owner_key)
-            if entry is None:
-                return None
-            self._entries.move_to_end(owner_key)
-            return entry[1], deepcopy(entry[2])
+        with self._owner_lock(owner_key):
+            now = self._clock()
+            with self._lock:
+                self._prune_locked(now)
+                entry = self._entries.get(owner_key)
+                if entry is not None:
+                    self._entries.move_to_end(owner_key)
+                    return entry[1], deepcopy(entry[2])
+            return self._restore(owner_key=owner_key, now=now)
 
     def clear_owner(self, *, owner: str) -> bool:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return False
-        with self._lock:
-            return self._entries.pop(owner_key, None) is not None
+        removed = False
+        with self._owner_lock(owner_key):
+            with self._lock:
+                removed = self._entries.pop(owner_key, None) is not None
+            if self._repository is not None:
+                try:
+                    removed = bool(self._repository.delete_latest(
+                        owner=owner_key, context_type=_CONTEXT_TYPE
+                    )) or removed
+                except Exception as exc:
+                    logger.warning(
+                        "Agent 最近只读操作清理失败 type=%s",
+                        type(exc).__name__,
+                    )
+        return removed
 
     def reset(self) -> None:
         with self._lock:
@@ -155,6 +199,82 @@ class RecentReadOperationStore:
         for owner, (expires_at, _name, _arguments) in tuple(self._entries.items()):
             if expires_at <= now:
                 self._entries.pop(owner, None)
+
+    def _owner_lock(self, owner_key: str) -> threading.RLock:
+        return self._owner_locks[hash(owner_key) % len(self._owner_locks)]
+
+    def _restore(
+        self, *, owner_key: str, now: float
+    ) -> tuple[str, dict[str, Any]] | None:
+        if self._repository is None:
+            return None
+        wall_now = self._wall_clock()
+        try:
+            persisted = self._repository.get_latest(
+                owner=owner_key,
+                context_type=_CONTEXT_TYPE,
+                now=wall_now,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Agent 最近只读操作恢复失败 type=%s", type(exc).__name__
+            )
+            return None
+        if persisted is None:
+            return None
+        restored = validate_safe_read_operation_snapshot(persisted.payload)
+        remaining = persisted.expires_at - wall_now
+        if restored is None or remaining <= 0:
+            return None
+        name, payload = restored
+        with self._lock:
+            self._prune_locked(now)
+            self._entries.pop(owner_key, None)
+            self._entries[owner_key] = (
+                now + min(float(self.ttl_seconds), remaining),
+                name,
+                deepcopy(payload),
+            )
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+        return name, deepcopy(payload)
+
+
+def validate_safe_read_operation_snapshot(
+    value: Any,
+) -> tuple[str, dict[str, Any]] | None:
+    """验证持久化的只读重放快照，任何额外字段均 fail-closed。"""
+    if not isinstance(value, dict):
+        return None
+    name = str(value.get("tool_name") or "").strip()
+    if name == READ_PLAN_OPERATION:
+        if set(value) != {"tool_name", "steps"}:
+            return None
+        raw_steps = value.get("steps")
+        if not isinstance(raw_steps, list) or not _MIN_PLAN_STEPS <= len(raw_steps) <= _MAX_PLAN_STEPS:
+            return None
+        safe_steps: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        for raw_step in raw_steps:
+            if not isinstance(raw_step, dict) or set(raw_step) != {"tool_name", "arguments"}:
+                return None
+            step_name = str(raw_step.get("tool_name") or "").strip()
+            safe_arguments = _safe_json_object(raw_step.get("arguments"))
+            if (
+                step_name not in _REPLAYABLE_READ_TOOLS
+                or step_name in seen_names
+                or safe_arguments is None
+            ):
+                return None
+            seen_names.add(step_name)
+            safe_steps.append({"tool_name": step_name, "arguments": safe_arguments})
+        return READ_PLAN_OPERATION, {"steps": safe_steps}
+    if set(value) != {"tool_name", "arguments"} or name not in _REPLAYABLE_READ_TOOLS:
+        return None
+    safe_arguments = _safe_json_object(value.get("arguments"))
+    if safe_arguments is None:
+        return None
+    return name, safe_arguments
 
 
 def _safe_json_object(value: Any) -> dict[str, Any] | None:

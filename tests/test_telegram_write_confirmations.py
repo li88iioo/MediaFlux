@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import unittest
 
+from app import database as db
 from app.modules.telegram_write_confirmations import (
+    SQLiteTelegramWriteConfirmationStore,
     TelegramWriteConfirmationError,
     TelegramWriteConfirmationStore,
 )
+from tests.support import IsolatedDatabaseTestCase
 
 
 class TelegramWriteConfirmationStoreTests(unittest.TestCase):
@@ -100,6 +105,75 @@ class TelegramWriteConfirmationStoreTests(unittest.TestCase):
             store.claim(new_ids[0], chat_id="100", user_id="9")["operation"],
             "new",
         )
+
+
+class SQLiteTelegramWriteConfirmationStoreTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM telegram_write_confirmations")
+
+    def test_pair_persists_owner_hashed_and_consumes_across_instances(self):
+        tokens = iter(["group-token", "confirm-token", "cancel-token"])
+        first = SQLiteTelegramWriteConfirmationStore(
+            token_factory=lambda: next(tokens)
+        )
+        confirm, cancel = first.create_pair(
+            chat_id="100",
+            user_id="9",
+            operation="rss_refresh",
+            value={"subscription_id": 7},
+        )
+        with db.get_conn() as conn:
+            owner_digest = conn.execute(
+                "SELECT owner_digest FROM telegram_write_confirmations "
+                "WHERE action_id=?",
+                (confirm,),
+            ).fetchone()["owner_digest"]
+        self.assertNotIn("100", str(owner_digest))
+        self.assertRegex(str(owner_digest), r"^[0-9a-f]{64}$")
+
+        second = SQLiteTelegramWriteConfirmationStore()
+        with self.assertRaisesRegex(TelegramWriteConfirmationError, "不属于"):
+            second.claim(confirm, chat_id="100", user_id="10")
+        self.assertEqual(
+            second.claim(confirm, chat_id="100", user_id="9"),
+            {
+                "decision": "confirm",
+                "operation": "rss_refresh",
+                "value": {"subscription_id": 7},
+            },
+        )
+        with self.assertRaisesRegex(TelegramWriteConfirmationError, "已处理"):
+            first.claim(cancel, chat_id="100", user_id="9")
+
+    def test_group_claim_is_atomic_across_store_instances(self):
+        tokens = iter(["group-race", "choice-a", "choice-b"])
+        action_ids = SQLiteTelegramWriteConfirmationStore(
+            token_factory=lambda: next(tokens)
+        ).create_group(
+            chat_id="-100",
+            user_id="9",
+            operation="download_request",
+            actions=[
+                ("confirm", {"target": "qb"}),
+                ("confirm", {"target": "guangya"}),
+            ],
+        )
+        barrier = threading.Barrier(2)
+
+        def claim_once(action_id: str) -> str:
+            barrier.wait(timeout=3)
+            try:
+                SQLiteTelegramWriteConfirmationStore().claim(
+                    action_id, chat_id="-100", user_id="9"
+                )
+            except TelegramWriteConfirmationError:
+                return "invalid"
+            return "claimed"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = sorted(pool.map(claim_once, action_ids))
+        self.assertEqual(outcomes, ["claimed", "invalid"])
 
 
 if __name__ == "__main__":

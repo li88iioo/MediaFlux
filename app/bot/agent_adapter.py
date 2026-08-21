@@ -7,16 +7,19 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import html
 import json
 import re
 import secrets
+import sqlite3
 import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from app import database as db
 from app.agent.async_bridge import run_awaitable_sync
 from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.conversation_history import get_agent_conversation_history_repository
@@ -56,6 +59,7 @@ from app.agent.workspace_next_actions import (
 from app.bot.progress import deliver_terminal_to_existing_message
 from app.config import get
 from app.logger import get_logger
+from app.modules.web_secret import get_web_secret
 
 logger = get_logger(__name__)
 
@@ -433,7 +437,318 @@ class TelegramAgentActionStore:
             return len(revoked)
 
 
-_action_store = TelegramAgentActionStore()
+class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
+    """跨 worker 共享的 Telegram Agent opaque callback 仓库。"""
+
+    _ACTIONS = frozenset({
+        "confirm",
+        "cancel",
+        "prepare_resource",
+        "invoke_read_tool",
+        "invoke_workspace_action",
+    })
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = _ACTION_TTL_SECONDS,
+        max_entries: int = _ACTION_MAX_ENTRIES,
+        clock: Callable[[], float] = time.time,
+        token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(18),
+    ) -> None:
+        super().__init__(
+            ttl_seconds=ttl_seconds,
+            max_entries=max_entries,
+            clock=clock,
+            token_factory=token_factory,
+        )
+
+    @staticmethod
+    def _ensure_schema(conn: Any) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS telegram_agent_actions("
+            "action_id TEXT PRIMARY KEY,owner_digest TEXT NOT NULL,"
+            "action_kind TEXT NOT NULL,group_id TEXT NOT NULL,"
+            "confirmation_id TEXT NOT NULL DEFAULT '',"
+            "result_id TEXT NOT NULL DEFAULT '',target TEXT NOT NULL DEFAULT '',"
+            "tool_name TEXT NOT NULL DEFAULT '',"
+            "arguments_json TEXT NOT NULL DEFAULT '{}',"
+            "action_key TEXT NOT NULL DEFAULT '',expires_at REAL NOT NULL,"
+            "created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telegram_agent_actions_owner_group "
+            "ON telegram_agent_actions(owner_digest,group_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telegram_agent_actions_owner_expiry "
+            "ON telegram_agent_actions(owner_digest,expires_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telegram_agent_actions_expiry "
+            "ON telegram_agent_actions(expires_at)"
+        )
+
+    @staticmethod
+    def _owner_digest(owner: str) -> str:
+        return hmac.new(
+            get_web_secret().encode("utf-8"),
+            b"mediaflux-telegram-agent-action:v1\0" + owner.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
+    def _prune(conn: Any, now: float) -> int:
+        cursor = conn.execute(
+            "DELETE FROM telegram_agent_actions WHERE expires_at<=?", (now,)
+        )
+        return max(0, int(cursor.rowcount or 0))
+
+    def _prune_locked(self, now: float) -> None:
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+
+    def _new_action_id_locked(self) -> str:
+        with db.get_conn() as conn:
+            self._ensure_schema(conn)
+            for _ in range(8):
+                action_id = str(self._token_factory() or "").strip()
+                if (
+                    action_id
+                    and ":" not in action_id
+                    and conn.execute(
+                        "SELECT 1 FROM telegram_agent_actions WHERE action_id=?",
+                        (action_id,),
+                    ).fetchone() is None
+                ):
+                    return action_id
+        raise RuntimeError("无法生成 Telegram Agent 操作标识")
+
+    def _store_locked(self, item: _AgentAction) -> str:
+        if not item.action_id or ":" in item.action_id or item.action not in self._ACTIONS:
+            raise RuntimeError("无法生成 Telegram Agent 操作标识")
+        owner_digest = self._owner_digest(item.owner)
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, self._clock())
+            try:
+                conn.execute(
+                    "INSERT INTO telegram_agent_actions("
+                    "action_id,owner_digest,action_kind,group_id,confirmation_id,"
+                    "result_id,target,tool_name,arguments_json,action_key,expires_at,created_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        item.action_id,
+                        owner_digest,
+                        item.action,
+                        item.group_id,
+                        item.confirmation_id,
+                        item.result_id,
+                        item.target,
+                        item.tool_name,
+                        item.arguments_json,
+                        item.action_key,
+                        item.expires_at,
+                        db.now(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeError("无法生成 Telegram Agent 操作标识") from exc
+            while int(conn.execute(
+                "SELECT COUNT(*) FROM telegram_agent_actions"
+            ).fetchone()[0] or 0) > self._max_entries:
+                oldest = conn.execute(
+                    "SELECT owner_digest,group_id FROM telegram_agent_actions "
+                    "ORDER BY expires_at ASC,rowid ASC LIMIT 1"
+                ).fetchone()
+                if oldest is None:
+                    break
+                conn.execute(
+                    "DELETE FROM telegram_agent_actions "
+                    "WHERE owner_digest=? AND group_id=?",
+                    (oldest["owner_digest"], oldest["group_id"]),
+                )
+        return item.action_id
+
+    def _row_for_owner(
+        self, conn: Any, *, action_id: str, owner: str
+    ) -> Any | None:
+        return conn.execute(
+            "SELECT action_id,action_kind,group_id,confirmation_id,result_id,target,"
+            "tool_name,arguments_json,action_key,expires_at FROM telegram_agent_actions "
+            "WHERE action_id=? AND owner_digest=?",
+            (action_id, self._owner_digest(owner)),
+        ).fetchone()
+
+    @classmethod
+    def _inspect_row(cls, row: Any) -> dict[str, str]:
+        action = str(row["action_kind"] or "")
+        if action not in cls._ACTIONS:
+            raise ValueError("操作已过期或无效")
+        tool_name = str(row["tool_name"] or "")
+        action_key = str(row["action_key"] or "")
+        if action == "invoke_read_tool" and tool_name != "library.search_missing_episode_resources":
+            raise ValueError("操作已过期或无效")
+        if action == "invoke_workspace_action":
+            try:
+                action_key = workspace_action_handoff_arguments(
+                    {"action_key": action_key}
+                )["action_key"]
+            except AgentToolError as exc:
+                raise ValueError("操作已过期或无效") from exc
+        return {"action": action, "tool_name": tool_name, "action_key": action_key}
+
+    def inspect(self, action_id: str, *, owner: str) -> dict[str, str]:
+        key = str(action_id or "").strip()
+        owner_key = str(owner or "").strip()
+        if not key or not owner_key:
+            raise ValueError("操作已过期或无效")
+        with self._lock, db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            now = self._clock()
+            self._prune(conn, now)
+            row = self._row_for_owner(conn, action_id=key, owner=owner_key)
+            if row is None or float(row["expires_at"]) <= now:
+                raise ValueError("操作已过期或无效")
+            return self._inspect_row(row)
+
+    def claim_workspace_action(
+        self, action_id: str, *, owner: str
+    ) -> dict[str, Any]:
+        key = str(action_id or "").strip()
+        owner_key = str(owner or "").strip()
+        if not key or not owner_key:
+            raise ValueError("操作已过期或无效")
+        with self._lock, db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            now = self._clock()
+            self._prune(conn, now)
+            row = self._row_for_owner(conn, action_id=key, owner=owner_key)
+            metadata = self._inspect_row(row) if row is not None else None
+            if metadata is None or metadata["action"] != "invoke_workspace_action":
+                raise ValueError("操作已过期或无效")
+            deleted = conn.execute(
+                "DELETE FROM telegram_agent_actions WHERE action_id=? AND owner_digest=?",
+                (key, self._owner_digest(owner_key)),
+            )
+            if deleted.rowcount != 1:
+                raise ValueError("操作已过期或无效")
+            return {
+                "action": metadata["action"],
+                "action_key": metadata["action_key"],
+                "expires_at": float(row["expires_at"]),
+            }
+
+    def restore_workspace_action(
+        self,
+        action_id: str,
+        *,
+        owner: str,
+        action_key: str,
+        expires_at: float,
+    ) -> bool:
+        key = str(action_id or "").strip()
+        owner_key = str(owner or "").strip()
+        if not key or ":" in key or not owner_key:
+            return False
+        try:
+            normalized = workspace_action_handoff_arguments({"action_key": action_key})
+            expiry = float(expires_at)
+        except (AgentToolError, TypeError, ValueError, OverflowError):
+            return False
+        with self._lock, db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            now = self._clock()
+            self._prune(conn, now)
+            if expiry <= now or conn.execute(
+                "SELECT 1 FROM telegram_agent_actions WHERE action_id=?", (key,)
+            ).fetchone() is not None:
+                return False
+            conn.execute(
+                "INSERT INTO telegram_agent_actions("
+                "action_id,owner_digest,action_kind,group_id,action_key,expires_at,created_at"
+                ") VALUES(?,?, 'invoke_workspace_action',?,?,?,?)",
+                (
+                    key,
+                    self._owner_digest(owner_key),
+                    f"workspace:{key}",
+                    normalized["action_key"],
+                    expiry,
+                    db.now(),
+                ),
+            )
+            return True
+
+    def resolve(self, action_id: str, *, owner: str) -> dict[str, Any]:
+        key = str(action_id or "").strip()
+        owner_key = str(owner or "").strip()
+        if not key or not owner_key:
+            raise ValueError("操作已过期或无效")
+        owner_digest = self._owner_digest(owner_key)
+        with self._lock, db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            now = self._clock()
+            self._prune(conn, now)
+            row = self._row_for_owner(conn, action_id=key, owner=owner_key)
+            metadata = self._inspect_row(row) if row is not None else None
+            if metadata is None or float(row["expires_at"]) <= now:
+                raise ValueError("操作已过期或无效")
+            deleted = conn.execute(
+                "DELETE FROM telegram_agent_actions WHERE owner_digest=? AND group_id=?",
+                (owner_digest, str(row["group_id"] or "")),
+            )
+            if deleted.rowcount < 1:
+                raise ValueError("操作已过期或无效")
+
+            action = metadata["action"]
+            if action == "prepare_resource":
+                result_id = str(row["result_id"] or "")
+                target = str(row["target"] or "")
+                if not _RESULT_ID_RE.fullmatch(result_id) or target not in {"qb", "guangya"}:
+                    raise ValueError("操作已过期或无效")
+                return {"action": action, "result_id": result_id, "target": target}
+            if action == "invoke_read_tool":
+                try:
+                    arguments = json.loads(str(row["arguments_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("操作已过期或无效") from exc
+                if not isinstance(arguments, dict):
+                    raise ValueError("操作已过期或无效")
+                return {
+                    "action": action,
+                    "tool_name": metadata["tool_name"],
+                    "arguments": arguments,
+                }
+            if action == "invoke_workspace_action":
+                return {"action": action, "action_key": metadata["action_key"]}
+            confirmation_id = str(row["confirmation_id"] or "")
+            if not confirmation_id or action not in {"confirm", "cancel"}:
+                raise ValueError("操作已过期或无效")
+            return {"confirmation_id": confirmation_id, "action": action}
+
+    def revoke_owner(self, *, owner: str) -> int:
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return 0
+        with self._lock, db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, self._clock())
+            cursor = conn.execute(
+                "DELETE FROM telegram_agent_actions WHERE owner_digest=?",
+                (self._owner_digest(owner_key),),
+            )
+            return max(0, int(cursor.rowcount or 0))
+
+
+_action_store: TelegramAgentActionStore = SQLiteTelegramAgentActionStore()
 
 
 def get_telegram_agent_action_store() -> TelegramAgentActionStore:

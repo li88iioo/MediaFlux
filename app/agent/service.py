@@ -43,7 +43,9 @@ def get_agent_service() -> AgentOrchestrator:
                     recent_download_store=RecentDownloadSubmissionStore(
                         repository=context_repository
                     ),
-                    recent_read_store=RecentReadOperationStore(),
+                    recent_read_store=RecentReadOperationStore(
+                        repository=context_repository
+                    ),
                     missing_workflow_repository=missing_workflow_repository,
                     session_context_repository=context_repository,
                     automatic_verification_enqueuer=(

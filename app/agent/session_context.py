@@ -20,6 +20,7 @@ _CONTEXT_TYPES = frozenset({
     "download_submission",
     "resource_candidates",
     "discovery_candidates",
+    "read_operation",
 })
 _SCHEMA_VERSION = 1
 _DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024

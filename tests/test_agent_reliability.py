@@ -85,6 +85,38 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
         with self.assertRaises(AgentToolError):
             first.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
 
+    def test_orchestrator_prepare_and_confirm_across_default_store_instances(self) -> None:
+        calls: list[dict[str, str]] = []
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="write.test",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={"type": "object"},
+            validator=lambda arguments: {"value": str(arguments.get("value") or "")},
+            preview_handler=lambda arguments: ToolResult(
+                True, "confirmation_required", "preview", data=arguments
+            ),
+            handler=lambda arguments: (
+                calls.append(dict(arguments))
+                or ToolResult(True, "completed", "done")
+            ),
+            requires_confirmation=True,
+        ))
+        issuer = AgentOrchestrator(registry)
+        confirmer = AgentOrchestrator(registry)
+
+        prepared = issuer.prepare(
+            "write.test", {"value": "cross-worker"}, owner="owner-cross"
+        )
+        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        confirmed = confirmer.confirm(confirmation_id, owner="owner-cross")
+
+        self.assertEqual(confirmed["result"]["status"], "completed")
+        self.assertEqual(calls, [{"value": "cross-worker"}])
+        with self.assertRaises(AgentToolError):
+            issuer.confirm(confirmation_id, owner="owner-cross")
+
 
 class AgentTraceAndMetricsTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:

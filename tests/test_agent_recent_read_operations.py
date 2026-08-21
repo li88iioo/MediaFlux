@@ -6,7 +6,11 @@ from unittest.mock import patch
 
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import AgentOrchestrator
-from app.agent.recent_read_operations import READ_PLAN_OPERATION, RecentReadOperationStore
+from app.agent.recent_read_operations import (
+    READ_PLAN_OPERATION,
+    RecentReadOperationStore,
+    validate_safe_read_operation_snapshot,
+)
 from app.agent.registry import ToolRegistry
 
 
@@ -96,6 +100,49 @@ class RecentReadOperationStoreTests(unittest.TestCase):
             ("workspace.health", {}),
             ("downloads.diagnose_queue", {"url": "https://private.invalid"}),
         ]))
+
+    def test_persisted_snapshot_validator_accepts_only_safe_read_shapes(self):
+        self.assertEqual(
+            validate_safe_read_operation_snapshot({
+                "tool_name": "downloads.diagnose_queue",
+                "arguments": {"status": "active"},
+            }),
+            ("downloads.diagnose_queue", {"status": "active"}),
+        )
+        self.assertEqual(
+            validate_safe_read_operation_snapshot({
+                "tool_name": READ_PLAN_OPERATION,
+                "steps": [
+                    {"tool_name": "workspace.health", "arguments": {}},
+                    {
+                        "tool_name": "downloads.diagnose_queue",
+                        "arguments": {"status": "active"},
+                    },
+                ],
+            })[0],
+            READ_PLAN_OPERATION,
+        )
+        for malformed in (
+            {
+                "tool_name": "downloads.diagnose_queue",
+                "arguments": {"token": "secret"},
+            },
+            {"tool_name": "write.test", "arguments": {}},
+            {
+                "tool_name": READ_PLAN_OPERATION,
+                "steps": [
+                    {"tool_name": "workspace.health", "arguments": {}},
+                    {"tool_name": "workspace.health", "arguments": {}},
+                ],
+            },
+            {
+                "tool_name": "workspace.health",
+                "arguments": {},
+                "unexpected": True,
+            },
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(validate_safe_read_operation_snapshot(malformed))
 
 
 class RecentReadOperationRetryTests(unittest.TestCase):

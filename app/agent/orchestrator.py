@@ -14,7 +14,11 @@ from typing import Any, Callable
 
 from app import database as db
 from app.agent.action_history import record_confirmation_error, record_confirmed_result
-from app.agent.confirmation import ConfirmationStore, confirmation_reply_intent
+from app.agent.confirmation import (
+    ConfirmationStore,
+    SQLiteConfirmationStore,
+    confirmation_reply_intent,
+)
 from app.agent.confirmation_contract import (
     build_confirmation_contract,
     sanitize_confirmation_contract,
@@ -4643,7 +4647,7 @@ class AgentOrchestrator:
                  ) = None,
                  record_actions: bool = False):
         self.registry = registry
-        self.confirmation_store = confirmation_store or ConfirmationStore()
+        self.confirmation_store = confirmation_store or SQLiteConfirmationStore()
         self.recent_patrol_store = recent_patrol_store or RecentPatrolStore()
         self.recent_resource_store = recent_resource_store or RecentResourceCandidateStore()
         self.recent_discovery_store = recent_discovery_store or RecentDiscoveryCandidateStore()
