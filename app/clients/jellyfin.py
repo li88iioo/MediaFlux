@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import logging
 from datetime import datetime
 from urllib.parse import quote
 
@@ -17,7 +18,7 @@ from app.clients.base import (
     normalize_playback_progress,
     runtime_ticks_to_minutes,
 )
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 
 logger = get_logger(__name__)
 
@@ -75,13 +76,22 @@ class JellyfinClient(MediaServerClient):
                 name: pool.submit(self._isolated_part, method_name, user_id)
                 for name, (method_name, _default) in parts.items()
             }
+            failure_types: list[str] = []
             for name, (method_name, default) in parts.items():
                 try:
                     setattr(data, name, futures[name].result())
                 except Exception as exc:
-                    logger.warning(f"[Jellyfin] {method_name} 失败: {exc}")
                     setattr(data, name, default)
                     data.partial_errors.append(name)
+                    failure_types.append(f"{name}:{type(exc).__name__}")
+        if failure_types:
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"dashboard:jellyfin:{','.join(failure_types)}",
+                "Jellyfin 看板部分读取失败 parts=%s",
+                ",".join(failure_types),
+            )
         return data
 
     def _headers(self) -> dict[str, str]:
@@ -458,7 +468,7 @@ class JellyfinClient(MediaServerClient):
             resp.raise_for_status()
             return True
         except Exception as exc:
-            logger.error(f"[Jellyfin] 刷新媒体库 {library_id} 失败: {exc}")
+            logger.error("Jellyfin 刷新媒体库失败 library=%s type=%s", library_id, type(exc).__name__)
             return False
 
     @staticmethod
@@ -485,7 +495,7 @@ class JellyfinClient(MediaServerClient):
                 return bool(results) and all(results)
             logger.info(f"[Jellyfin] 未找到与媒体路径匹配的媒体库，回退全局刷新: {media_path}")
         except Exception as exc:
-            logger.warning(f"[Jellyfin] 定位媒体库失败，回退全局刷新: {exc}")
+            logger.warning("Jellyfin 定位媒体库失败，回退全局刷新 type=%s", type(exc).__name__)
         return self.refresh_all()
 
     def refresh_all(self) -> bool:
@@ -499,5 +509,5 @@ class JellyfinClient(MediaServerClient):
             resp.raise_for_status()
             return True
         except Exception as exc:
-            logger.error(f"[Jellyfin] 全局刷新失败: {exc}")
+            logger.error("Jellyfin 全局刷新失败 type=%s", type(exc).__name__)
             return False

@@ -7,6 +7,7 @@ Token 或会话 ID 时静默降级为日志；配置热更新由 ``app.bot.resta
 from __future__ import annotations
 
 import html
+import logging
 import os
 import re
 import threading
@@ -14,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
 from app.config import get
-from app.logger import configure_telebot_logging, get_logger
+from app.logger import configure_telebot_logging, get_logger, log_throttled
 
 logger = get_logger(__name__)
 
@@ -28,6 +29,24 @@ _CAPTION_LIMIT = 1000
 _HTML_TOKEN_RE = re.compile(r"<[^>]+>|&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);")
 _TAG_RE = re.compile(r"<\s*(/?)\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>")
 _LEADING_EMOJI_RE = re.compile(r"^[\U0001F000-\U0001FAFF\u2600-\u27BF]")
+
+
+def _notification_log_title(text: object) -> str:
+    """提取适合落盘的短标题，避免降级通知把整段正文写入运行日志。"""
+    plain = html.unescape(re.sub(r"<[^>]+>", "", str(text or "")))
+    first_line = next((line.strip() for line in plain.splitlines() if line.strip()), "通知")
+    return first_line[:120]
+
+
+def _log_notification_fallback(text: object) -> None:
+    title = _notification_log_title(text)
+    log_throttled(
+        logger,
+        logging.INFO,
+        f"telegram-notification-fallback:{title}",
+        "Telegram 未配置，通知已降级为本地记录 title=%s",
+        title,
+    )
 
 _FIELD_EMOJI = {
     "任务": "🆔",
@@ -432,7 +451,7 @@ def _init() -> None:
                 _bot = telebot.TeleBot(token, parse_mode="HTML")
                 logger.info("Telegram Bot 客户端已初始化")
             except Exception as exc:
-                logger.error(f"Telegram Bot 初始化失败: {exc}")
+                logger.error("Telegram Bot 初始化失败 type=%s", type(exc).__name__)
                 _bot = None
         else:
             logger.warning("未配置 TG_BOT_TOKEN，Telegram 功能降级为日志")
@@ -663,7 +682,7 @@ def send_result(
     bot = get_bot()
     target = str(chat_id or _chat_id or "").strip()
     if not bot or not target:
-        logger.info(f"[通知降级] {text}")
+        _log_notification_fallback(text)
         return TelegramSendResult(ok=False, error="Telegram Bot 或 Chat ID 未配置")
     try:
         image = str(image_url or "").strip()
@@ -731,7 +750,7 @@ def edit_event(
         return True
     except Exception as exc:
         if _telegram_message_is_unchanged(exc):
-            logger.info("Telegram 原位消息已是目标内容，按幂等成功处理")
+            logger.debug("Telegram 原位消息已是目标内容，按幂等成功处理")
             return True
         logger.warning("Telegram 原位更新失败 type=%s", type(exc).__name__)
         return False
@@ -743,7 +762,7 @@ def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
     target = str(chat_id or _chat_id or "").strip()
     text = render_event(event)
     if not bot or not target:
-        logger.info(f"[通知降级] {text}")
+        _log_notification_fallback(text)
         return False
     image_url = str(event.image_url or "").strip()
     reply_markup = _event_markup(event)
@@ -751,7 +770,7 @@ def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
         try:
             return _send_text(bot, target, text, reply_markup=reply_markup)
         except Exception as exc:
-            logger.error(f"Telegram 发送失败: {exc}")
+            logger.error("Telegram 发送失败 type=%s", type(exc).__name__)
             return False
 
     caption_chunks = split_message(text, _CAPTION_LIMIT)
@@ -759,11 +778,11 @@ def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
         photo_kwargs = {"reply_markup": reply_markup} if reply_markup is not None and len(caption_chunks) == 1 else {}
         bot.send_photo(target, image_url, caption=caption_chunks[0], **photo_kwargs)
     except Exception as exc:
-        logger.warning(f"Telegram 图片发送失败，回退文本: {exc}")
+        logger.warning("Telegram 图片发送失败，回退文本 type=%s", type(exc).__name__)
         try:
             return _send_text(bot, target, text, reply_markup=reply_markup)
         except Exception as fallback_exc:
-            logger.error(f"Telegram 文本回退失败: {fallback_exc}")
+            logger.error("Telegram 文本回退失败 type=%s", type(fallback_exc).__name__)
             return False
     try:
         for index, chunk in enumerate(caption_chunks[1:]):
@@ -771,7 +790,7 @@ def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
             bot.send_message(target, chunk, **kwargs)
         return True
     except Exception as exc:
-        logger.error(f"Telegram 图片通知续发失败: {exc}")
+        logger.error("Telegram 图片通知续发失败 type=%s", type(exc).__name__)
         return False
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 from decimal import Decimal
 import json
+import logging
 import re
 import threading
 import time
@@ -26,7 +27,7 @@ from app import database as db
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.config import get, get_bool, get_int
 from app.database import add_organize_log, add_organize_log_items, get_media_probe_cache
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.media_variant import MediaVariant, classify_variant, variants_can_coexist
 from app.modules.recognition_policy import (
     automatic_match_confirmation_message,
@@ -834,7 +835,10 @@ class Organizer:
                     key[0], key[1], strip_domains=key[2], timeout=key[3]
                 )
             except ValueError as exc:
-                logger.warning("MetaTube 配置无效，已跳过成人内容识别: %s", exc)
+                log_throttled(
+                    logger, logging.WARNING, f"metatube-config:{exc}",
+                    "MetaTube 配置无效，已跳过成人内容识别: %s", exc,
+                )
                 self._nsfw_recognizers[key] = None
         return self._nsfw_recognizers[key]
 
@@ -945,7 +949,10 @@ class Organizer:
         try:
             return with_variant_tags(render_template(template, context))
         except ValueError as exc:
-            logger.warning(f"命名模板无效，回退旧规则: {exc}")
+            log_throttled(
+                logger, logging.WARNING, f"file-template:{exc}",
+                "命名模板无效，回退旧规则: %s", exc,
+            )
             if is_tv:
                 season = f"S{int(parsed['season']):02d}"
                 ep = f"E{int(parsed['episode']):02d}" if parsed.get("episode") else ""
@@ -975,7 +982,10 @@ class Organizer:
         try:
             return render_template(rules.show_dir_template, context)
         except ValueError as exc:
-            logger.warning(f"剧集目录模板无效，回退旧规则: {exc}")
+            log_throttled(
+                logger, logging.WARNING, f"show-template:{exc}",
+                "剧集目录模板无效，回退旧规则: %s", exc,
+            )
             return fallback.strip()
 
     def build_media_dir(self, match: MatchResult, rules: OrganizeRules | None = None) -> str:
@@ -999,7 +1009,10 @@ class Organizer:
         try:
             return render_template(rules.movie_dir_template, context)
         except ValueError as exc:
-            logger.warning(f"电影目录模板无效，回退默认规则: {exc}")
+            log_throttled(
+                logger, logging.WARNING, f"movie-template:{exc}",
+                "电影目录模板无效，回退默认规则: %s", exc,
+            )
             return fallback.strip()
 
     @staticmethod
@@ -2225,7 +2238,7 @@ class Organizer:
                 logger.info(f"整理联动 STRM: {result}")
                 stats["strm"] = result
             except Exception as e:
-                logger.error(f"联动 STRM 失败: {e}")
+                logger.error("联动 STRM 失败 type=%s", type(e).__name__)
                 stats["strm"] = {
                     "ok": False, "error_code": "strm_trigger_failed",
                     "error": f"STRM 联动启动失败: {str(e)[:300]}",
@@ -2606,7 +2619,7 @@ class Organizer:
                 layout="relaxed",
             ), chat_id=chat_id or None)
         except Exception as exc:
-            logger.warning(f"整理通知失败: {exc}")
+            logger.warning("整理通知失败 type=%s", type(exc).__name__)
 
     @staticmethod
     def _notification_count_summary(counts: dict, *, compact: bool = False) -> str:
@@ -5247,7 +5260,10 @@ class Organizer:
         if not callable(file_info):
             # 兼容只实现最小移动接口的自定义适配器；官方光鸭客户端始终
             # 提供 file_info，因此生产链路仍执行严格复核。
-            logger.warning("远端客户端不支持 file_info，无法执行写前快照复核")
+            log_throttled(
+                logger, logging.WARNING, "organize-client-file-info-missing",
+                "远端客户端不支持 file_info，无法执行写前快照复核",
+            )
             return expected
         try:
             current = file_info(expected.file_id)
@@ -5256,7 +5272,10 @@ class Organizer:
                 f"{role}状态复核失败，请刷新目录后重试"
             ) from exc
         if current is not None and not isinstance(current, GuangYaFile):
-            logger.warning("远端客户端 file_info 返回未知类型，无法执行写前快照复核")
+            log_throttled(
+                logger, logging.WARNING, "organize-client-file-info-invalid",
+                "远端客户端 file_info 返回未知类型，无法执行写前快照复核",
+            )
             return expected
         if current is None or current.is_dir:
             raise DirectoryScrapeConflictError(
@@ -5525,7 +5544,7 @@ class Organizer:
                     ),
                 )
                 cleaned += 1
-                logger.info("清理空目录: %s", dir_id)
+                logger.debug("清理空目录: %s", dir_id)
             except Exception as exc:
                 delete_failures += 1
                 reason = " ".join(str(exc or type(exc).__name__).split())[:160]

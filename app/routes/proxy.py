@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.clients.guangya import GuangYaClient
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.media_proxy import (
     PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
     SignedUrlCache,
@@ -77,7 +78,7 @@ def play_gy(
             ua_bound=ua_bound,
         )
         if result.url:
-            logger.info("[302] 光鸭 file_id=%s cache_hit=%s", file_id, result.cache_hit)
+            logger.debug("[302] 光鸭 file_id=%s cache_hit=%s", file_id, result.cache_hit)
             return RedirectResponse(
                 result.url,
                 status_code=302,
@@ -87,11 +88,20 @@ def play_gy(
                     "Referrer-Policy": "no-referrer",
                 },
             )
-        logger.warning(f"光鸭直链获取失败 file_id={file_id}")
+        log_throttled(
+            logger, logging.WARNING, "playgy-url-missing",
+            "光鸭直链获取失败",
+        )
         return JSONResponse({"error": "无法获取直链"}, status_code=404)
     except TimeoutError:
-        logger.warning("playgy 获取直链超时 file_id=%s", file_id)
+        log_throttled(
+            logger, logging.WARNING, "playgy-timeout",
+            "playgy 获取直链超时",
+        )
         return JSONResponse({"error": "光鸭播放地址获取超时"}, status_code=504)
     except Exception as exc:
-        logger.error("playgy 异常 type=%s", type(exc).__name__)
+        log_throttled(
+            logger, logging.ERROR, f"playgy-error:{type(exc).__name__}",
+            "playgy 异常 type=%s", type(exc).__name__,
+        )
         return JSONResponse({"error": "光鸭播放地址获取失败"}, status_code=500)

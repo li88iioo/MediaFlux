@@ -143,7 +143,7 @@ def send_sms(request: Request, data: dict | None = Body(default=None)):
             "expires_in": send.get("expires_in", 300) if isinstance(send, dict) else 300,
         }
     except Exception as e:
-        logger.error(f"发送验证码失败: {e}")
+        logger.error("发送验证码失败 type=%s", type(e).__name__)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -169,7 +169,7 @@ def login(request: Request, data: dict | None = Body(default=None)):
             request.session.pop(key, None)
         return {"success": ok, "logged_in": ok}
     except Exception as e:
-        logger.error(f"光鸭登录失败: {e}")
+        logger.error("光鸭登录失败 type=%s", type(e).__name__)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import logging
 import re
 import threading
 import time
@@ -10,7 +11,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from app import config
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -98,7 +99,14 @@ def media_image(request: Request, server: str, item_id: str):
             return _missing_image_response()
         upstream.raise_for_status()
     except requests.RequestException as exc:
-        logger.warning(f"[{server}] 海报代理失败 item_id={item_id}: {exc}")
+        log_throttled(
+            logger,
+            logging.WARNING,
+            f"media-image:{server}:{type(exc).__name__}",
+            "媒体海报代理失败 server=%s type=%s",
+            server,
+            type(exc).__name__,
+        )
         raise HTTPException(status_code=502, detail="upstream image failed") from exc
     content_type = upstream.headers.get("Content-Type", "")
     if not content_type.startswith("image/"):

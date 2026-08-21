@@ -301,7 +301,7 @@ class EmbyClient(MediaServerClient):
             resp.raise_for_status()
             return True
         except Exception as e:
-            logger.error(f"[Emby] 刷新媒体库 {library_id} 失败: {e}")
+            logger.error("Emby 刷新媒体库失败 library=%s type=%s", library_id, type(e).__name__)
             return False
 
     @staticmethod
@@ -330,7 +330,7 @@ class EmbyClient(MediaServerClient):
                 return bool(results) and all(results)
             logger.info(f"[Emby] 未找到与 STRM 路径匹配的媒体库，回退全局刷新: {media_path}")
         except Exception as e:
-            logger.warning(f"[Emby] 定位 STRM 媒体库失败，回退全局刷新: {e}")
+            logger.warning("Emby 定位 STRM 媒体库失败，回退全局刷新 type=%s", type(e).__name__)
         return self.refresh_all()
 
     def refresh_all(self) -> bool:
@@ -344,5 +344,5 @@ class EmbyClient(MediaServerClient):
             resp.raise_for_status()
             return True
         except Exception as e:
-            logger.error(f"[Emby] 全局刷新失败: {e}")
+            logger.error("Emby 全局刷新失败 type=%s", type(e).__name__)
             return False

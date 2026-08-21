@@ -640,6 +640,7 @@ def _audit_library_episodes(
     ][: arguments["max_series"]]
     if resumable and earliest_source_boundary is not None:
         data["stalled_tmdb_id"] = str(earliest_source_boundary)
+    audit_failure_types: dict[str, int] = {}
     for tmdb_id in selected_tmdb_ids:
         if time.monotonic() >= deadline_at:
             deadline_exhausted = True
@@ -673,7 +674,8 @@ def _audit_library_episodes(
                 data["stalled_tmdb_id"] = tmdb_id
             break
         except (ProviderError, ValueError) as exc:
-            logger.warning("TMDB 全库剧集巡检失败 type=%s", type(exc).__name__)
+            error_type = type(exc).__name__
+            audit_failure_types[error_type] = audit_failure_types.get(error_type, 0) + 1
             incomplete = True
             if time.monotonic() >= deadline_at:
                 deadline_exhausted = True
@@ -728,6 +730,14 @@ def _audit_library_episodes(
         if deadline_exhausted:
             break
 
+    if audit_failure_types:
+        logger.warning(
+            "TMDB 全库剧集巡检存在失败 total=%s types=%s",
+            sum(audit_failure_types.values()),
+            ",".join(
+                f"{name}:{count}" for name, count in sorted(audit_failure_types.items())
+            ),
+        )
     data["deadline_exhausted"] = deadline_exhausted
     data["tmdb_requests_used"] = _MAX_TMDB_REQUESTS - request_budget["remaining"]
     data["findings"] = findings[:_MAX_FINDINGS]

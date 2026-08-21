@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import threading
 from datetime import datetime, timedelta
@@ -10,7 +11,7 @@ from app import database as db
 from app.clients.guangya import GuangYaClient
 from app.clients.qbittorrent import QBittorrentClient, is_qb_torrent_complete
 from app.config import get
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.organize import OrganizeRules
 from app.modules.organize_tasks import get_organize_manager
 from app.notifier import NotificationEvent, send_event
@@ -612,7 +613,10 @@ class DownloadTracker:
                 password=get("QB_PASSWORD"), api_key=get("QB_API_KEY"),
             ).list_torrents()
         except Exception as exc:
-            logger.warning("下载跟踪读取 qB 失败 type=%s", type(exc).__name__)
+            log_throttled(
+                logger, logging.WARNING, f"download-tracker-qb:{type(exc).__name__}",
+                "下载跟踪读取 qB 失败 type=%s", type(exc).__name__,
+            )
             return False, []
 
     @staticmethod
@@ -623,7 +627,10 @@ class DownloadTracker:
                 return False, []
             return True, client.list_offline_tasks()
         except Exception as exc:
-            logger.warning("下载跟踪读取光鸭失败 type=%s", type(exc).__name__)
+            log_throttled(
+                logger, logging.WARNING, f"download-tracker-guangya:{type(exc).__name__}",
+                "下载跟踪读取光鸭失败 type=%s", type(exc).__name__,
+            )
             return False, []
 
     @staticmethod
@@ -723,7 +730,10 @@ class DownloadTracker:
             try:
                 self.run_once()
             except Exception as exc:
-                logger.exception(f"下载跟踪检查失败: {exc}")
+                log_throttled(
+                    logger, logging.ERROR, f"download-tracker-loop:{type(exc).__name__}",
+                    "下载跟踪检查失败 type=%s", type(exc).__name__,
+                )
             self._wake_event.wait(timeout=30)
             self._wake_event.clear()
 

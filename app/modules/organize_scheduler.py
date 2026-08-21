@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import datetime
 from typing import Callable
@@ -12,7 +13,7 @@ from typing import Callable
 from croniter import croniter
 
 from app.config import get, get_bool
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.organize import OrganizeRules
 from app.modules.organize_sources import normalize_organize_sources
 
@@ -120,7 +121,10 @@ class OrganizeScheduler:
             try:
                 self._tick()
             except Exception as exc:
-                logger.error(f"网盘整理调度检查失败: {exc}")
+                log_throttled(
+                    logger, logging.ERROR, f"organize-scheduler:{type(exc).__name__}",
+                    "网盘整理调度检查失败 type=%s", type(exc).__name__,
+                )
             self._wake_event.wait(timeout=self._check_interval)
             self._wake_event.clear()
 
@@ -223,7 +227,10 @@ class OrganizeScheduler:
             self._get_value("GY_ORGANIZE_SOURCE_DIRS", ""),
         )
         if error:
-            logger.warning("读取定时整理来源失败: %s", error)
+            log_throttled(
+                logger, logging.WARNING, f"organize-sources:{error}",
+                "读取定时整理来源失败: %s", error,
+            )
         return sources
 
     @classmethod

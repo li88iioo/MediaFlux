@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from dataclasses import fields
@@ -343,7 +344,7 @@ class OrganizeProbeWorker:
                 rules,
                 force_incremental=True,
             )
-        logger.info(
+        logger.debug(
             "媒体规格后台补全完成 log=%s file=%s renamed=%s",
             log.get("id"), video.get("file_id"), desired_name,
         )
@@ -363,7 +364,7 @@ class OrganizeProbeWorker:
             db.complete_organize_probe_job(job_id, owner=self._owner)
         except _ProbeCompletionCancelled as exc:
             db.cancel_organize_probe_job(job_id, owner=self._owner, reason=exc)
-            logger.info("媒体规格补全任务已取消 job=%s reason=%s", job_id, exc)
+            logger.debug("媒体规格补全任务已取消 job=%s reason=%s", job_id, exc)
         except InterruptedError as exc:
             db.release_organize_probe_job(
                 job_id, owner=self._owner, delay_seconds=30, reason=exc,
@@ -373,7 +374,12 @@ class OrganizeProbeWorker:
                 job_id, owner=self._owner, error_type="ProbeUnavailable", error=exc,
                 base_backoff_seconds=600,
             )
-            logger.info("媒体规格补全等待重试 job=%s status=%s", job_id, status)
+            logger.log(
+                logging.WARNING if status == "failed" else logging.DEBUG,
+                "媒体规格补全处理结果 job=%s status=%s",
+                job_id,
+                status,
+            )
         except Exception as exc:
             status = db.fail_or_retry_organize_probe_job(
                 job_id, owner=self._owner, error_type=type(exc).__name__, error=exc,

@@ -1,6 +1,7 @@
 """qB 完成、定时扫描与稳定等待驱动的本地媒体调度器。"""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
@@ -10,7 +11,7 @@ from pathlib import Path
 from app import database as db
 from app.clients.qbittorrent import QBittorrentClient, TorrentTask
 from app.config import get
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.local_media_service import LocalMediaService
 from app.modules.local_media_candidates import discover_local_media_candidates
 from app.modules.local_media_notifications import notify_local_media_task
@@ -299,7 +300,7 @@ class LocalMediaScheduler:
             current = db.get_local_media_task(task.id, owner=self.owner)
             if current and current.status != "failed":
                 db.update_local_media_task(task.id, owner=self.owner, status="failed", error=str(exc))
-            logger.error(f"本地媒体任务执行失败 task={task.id}: {exc}")
+            logger.error("本地媒体任务执行失败 task=%s type=%s", task.id, type(exc).__name__)
             if not self._is_silent_task(task):
                 notify_local_media_task(task.id, owner=self.owner, error=str(exc))
             db.update_download_request_for_local_media_task(task.id, "failed", error=str(exc))
@@ -320,7 +321,10 @@ class LocalMediaScheduler:
             try:
                 self.run_once()
             except Exception as exc:
-                logger.error(f"本地媒体调度周期失败: {exc}")
+                log_throttled(
+                    logger, logging.ERROR, f"local-media-scheduler:{type(exc).__name__}",
+                    "本地媒体调度周期失败 type=%s", type(exc).__name__,
+                )
             self._wake_event.wait(self.interval)
             self._wake_event.clear()
 

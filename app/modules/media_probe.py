@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app import database as db
-from app.logger import get_logger, redact_sensitive_text
+from app.logger import get_logger, log_throttled, redact_sensitive_text
 
 logger = get_logger(__name__)
 
@@ -531,9 +532,9 @@ def _read_probe_cache(
             allow_fingerprint_fallback=allow_fingerprint_fallback,
         )
     except Exception as exc:
-        logger.warning(
-            "读取媒体探测缓存失败 file=%s type=%s",
-            str(file_id or "")[:96], type(exc).__name__,
+        log_throttled(
+            logger, logging.WARNING, f"media-probe-cache-read:{type(exc).__name__}",
+            "读取媒体探测缓存失败 type=%s", type(exc).__name__,
         )
         return ""
 
@@ -546,9 +547,9 @@ def _write_success_cache(file_id: str, etag: str, size: int, profile: MediaProfi
             json.dumps(asdict(profile), ensure_ascii=False),
         )
     except Exception as exc:
-        logger.warning(
-            "写入媒体探测成功缓存失败 file=%s type=%s",
-            str(file_id or "")[:96], type(exc).__name__,
+        log_throttled(
+            logger, logging.WARNING, f"media-probe-cache-write:{type(exc).__name__}",
+            "写入媒体探测成功缓存失败 type=%s", type(exc).__name__,
         )
 
 
@@ -563,9 +564,9 @@ def _write_failure_cache(file, reason: str, ttl_seconds: int = 600) -> None:
             str(file.file_id), str(file.etag or ""), int(file.size or 0), payload,
         )
     except Exception as exc:
-        logger.warning(
-            "写入媒体探测失败缓存失败 file=%s type=%s",
-            str(getattr(file, "file_id", "") or ""), type(exc).__name__,
+        log_throttled(
+            logger, logging.WARNING, f"media-probe-failure-cache:{type(exc).__name__}",
+            "写入媒体探测失败缓存失败 type=%s", type(exc).__name__,
         )
 
 
@@ -811,16 +812,21 @@ def probe_media_profile(
 
     ttl_seconds = 600 if last_reason == "timeout" else 60 if last_reason == "download_url_unavailable" else 120
     _write_failure_cache(file, last_reason, ttl_seconds=ttl_seconds)
-    logger.warning(
-        "媒体探测失败 file=%s name=%s reason=%s returncode=%s attempts=%s elapsed=%.2fs detail=%s",
-        str(getattr(file, "file_id", "") or ""),
-        redact_sensitive_text(str(getattr(file, "name", "") or ""))[:160],
-        last_reason,
-        last_returncode if last_returncode is not None else "-",
-        attempts,
-        time.monotonic() - started,
-        last_detail or "-",
-    )
+    if last_reason == "ffprobe_missing":
+        log_throttled(
+            logger, logging.WARNING, "media-probe-ffprobe-missing",
+            "媒体探测不可用：未找到 ffprobe 可执行文件",
+        )
+    else:
+        logger.debug(
+            "媒体探测失败 file=%s reason=%s returncode=%s attempts=%s elapsed=%.2fs detail=%s",
+            str(getattr(file, "file_id", "") or ""),
+            last_reason,
+            last_returncode if last_returncode is not None else "-",
+            attempts,
+            time.monotonic() - started,
+            last_detail or "-",
+        )
     return None
 
 
@@ -1016,10 +1022,16 @@ def probe_local_media_profile(
         reason = type(exc).__name__
 
     _write_failure_cache(cache_file, reason, ttl_seconds=300)
-    logger.warning(
-        "本地媒体探测失败 file=%s reason=%s elapsed=%.2fs",
-        redact_sensitive_text(media_path.name)[:160],
-        reason,
-        time.monotonic() - started,
-    )
+    if reason == "ffprobe_missing":
+        log_throttled(
+            logger, logging.WARNING, "local-media-probe-ffprobe-missing",
+            "本地媒体探测不可用：未找到 ffprobe 可执行文件",
+        )
+    else:
+        logger.debug(
+            "本地媒体探测失败 file=%s reason=%s elapsed=%.2fs",
+            redact_sensitive_text(media_path.name)[:160],
+            reason,
+            time.monotonic() - started,
+        )
     return None

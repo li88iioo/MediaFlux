@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import math
 import time
 from typing import Any, Optional
 
 import requests
 
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 
 logger = get_logger(__name__)
 
@@ -160,7 +161,7 @@ class MediaServerClient:
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as e:
-            logger.error(f"[{self.display_name}] 请求失败 {path}: {e}")
+            logger.error("媒体服务器请求失败 server=%s path=%s type=%s", self.display_name, path, type(e).__name__)
             raise
 
     def list_virtual_folders(self) -> list[dict[str, Any]]:
@@ -214,20 +215,38 @@ class MediaServerClient:
             ("total_items", self._total_items, 0),
             ("total_plays", self._total_plays, 0),
         )
+        failure_types: list[str] = []
         for name, func, default in parts:
             try:
                 setattr(data, name, func())
             except Exception as exc:
-                logger.warning(f"[{self.display_name}] {func.__name__} 失败: {exc}")
                 setattr(data, name, default)
                 data.partial_errors.append(name)
+                failure_types.append(f"{name}:{type(exc).__name__}")
+        if failure_types:
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"dashboard:{self.display_name}:{','.join(failure_types)}",
+                "媒体服务器看板部分读取失败 server=%s parts=%s",
+                self.display_name,
+                ",".join(failure_types),
+            )
         return data
 
     def _safe(self, func, default):
         try:
             return func()
-        except Exception as e:
-            logger.warning(f"[{self.display_name}] {func.__name__} 失败: {e}")
+        except Exception as exc:
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"media-server-safe:{self.display_name}:{func.__name__}:{type(exc).__name__}",
+                "媒体服务器数据读取失败 server=%s operation=%s type=%s",
+                self.display_name,
+                func.__name__,
+                type(exc).__name__,
+            )
             return default
 
     # ---- 子类实现的数据方法 ----

@@ -626,11 +626,8 @@ class HybridMediaProxyTests(unittest.TestCase):
             (),
             None,
         )
-        self.assertTrue(log_filter.filter(disconnected))
-        self.assertEqual(
-            disconnected.getMessage(),
-            "Telegram Bot 网络连接异常（ConnectionError），将在后台自动重试",
-        )
+        self.assertFalse(log_filter.filter(disconnected))
+        self.assertIn("RemoteDisconnected", disconnected.getMessage())
 
     def test_configure_telebot_logging_removes_vendor_handler(self):
         from app import logger as app_logger

@@ -1,11 +1,12 @@
 """RSS 订阅周期调度器。"""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
 from app import database as db
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.rss import RSSEngine, rss_subscription_refresh_revision
 
 logger = get_logger(__name__)
@@ -95,11 +96,11 @@ class RSSScheduler:
                 else engine.refresh(sub_id, expected_revision=expected_revision)
             )
             if result.get("busy"):
-                logger.info(f"RSS 周期刷新跳过 sub#{sub_id}: {result['error']}")
+                logger.debug("RSS 周期刷新跳过 sub#%s", sub_id)
             elif result.get("conflict"):
-                logger.info(f"RSS 周期刷新取消 sub#{sub_id}: {result['error']}")
+                logger.debug("RSS 周期刷新取消 sub#%s", sub_id)
             elif result.get("error"):
-                logger.warning(f"RSS 周期任务失败 sub#{sub_id}: {result['error']}")
+                logger.warning("RSS 周期任务失败 sub#%s", sub_id)
             elif int(result.get("outcome_unknown_count") or 0) > 0:
                 logger.warning(
                     "RSS 周期下载结果待核对 sub#%s outcome_unknown=%s failed=%s",
@@ -118,7 +119,7 @@ class RSSScheduler:
             ):
                 logger.warning("RSS 周期刷新部分完成 sub#%s", sub_id)
         except Exception as exc:
-            logger.exception(f"RSS 周期任务异常 sub#{sub_id}: {exc}")
+            logger.warning("RSS 周期任务异常 sub#%s type=%s", sub_id, type(exc).__name__)
         finally:
             with self._lock:
                 self._running_ids.discard(sub_id)
@@ -128,7 +129,10 @@ class RSSScheduler:
             try:
                 self.run_due()
             except Exception as exc:
-                logger.warning(f"RSS 调度检查失败: {exc}")
+                log_throttled(
+                    logger, logging.WARNING, f"rss-scheduler:{type(exc).__name__}",
+                    "RSS 调度检查失败 type=%s", type(exc).__name__,
+                )
             self._wake_event.wait(timeout=30)
             self._wake_event.clear()
 

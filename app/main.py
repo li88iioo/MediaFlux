@@ -320,7 +320,7 @@ def stop_background_services() -> bool:
 
         stop_bot()
     except Exception as exc:
-        logger.warning(f"停止 TG Bot 失败: {exc}")
+        logger.warning("停止 TG Bot 失败 type=%s", type(exc).__name__)
     try:
         from app.modules.agent_jobs_scheduler import get_agent_jobs_scheduler
 
@@ -348,13 +348,13 @@ def stop_background_services() -> bool:
 
         get_download_tracker().stop()
     except Exception as exc:
-        logger.warning(f"停止下载跟踪器失败: {exc}")
+        logger.warning("停止下载跟踪器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.rss_scheduler import get_rss_scheduler
 
         get_rss_scheduler().stop()
     except Exception as exc:
-        logger.warning(f"停止 RSS 调度器失败: {exc}")
+        logger.warning("停止 RSS 调度器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.media_subscription_scheduler import get_media_subscription_scheduler
 
@@ -367,13 +367,13 @@ def stop_background_services() -> bool:
 
         get_organize_scheduler().stop()
     except Exception as exc:
-        logger.warning(f"停止网盘整理调度器失败: {exc}")
+        logger.warning("停止网盘整理调度器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.local_media_scheduler import get_local_media_scheduler
 
         get_local_media_scheduler().stop()
     except Exception as exc:
-        logger.warning(f"停止本地媒体调度器失败: {exc}")
+        logger.warning("停止本地媒体调度器失败 type=%s", type(exc).__name__)
 
     # 停止 Telegram 候选队列消费者，保留 queued 项供下次启动恢复。
     try:
@@ -381,7 +381,7 @@ def stop_background_services() -> bool:
 
         stop_confirmation_dispatcher()
     except Exception as exc:
-        logger.warning(f"停止 Telegram 整理确认队列失败: {exc}")
+        logger.warning("停止 Telegram 整理确认队列失败 type=%s", type(exc).__name__)
 
     # 整理完成时可能排队触发 STRM，因此先收敛整理，再停止 STRM。
     try:
@@ -390,13 +390,13 @@ def stop_background_services() -> bool:
             logger.warning("停止网盘整理任务超时，保留依赖运行时直到进程退出")
     except Exception as exc:
         organize_drained = False
-        logger.warning(f"停止网盘整理任务失败: {exc}")
+        logger.warning("停止网盘整理任务失败 type=%s", type(exc).__name__)
     try:
         from app.modules.scheduler import get_scheduler
 
         get_scheduler().stop()
     except Exception as exc:
-        logger.warning(f"停止 STRM 调度器失败: {exc}")
+        logger.warning("停止 STRM 调度器失败 type=%s", type(exc).__name__)
     return subscription_workers_stopped and organize_drained
 
 

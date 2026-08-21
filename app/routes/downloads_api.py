@@ -1,6 +1,7 @@
 """下载管理 API：qBittorrent 实时状态与统一下载日志。"""
 from __future__ import annotations
 
+import logging
 import re
 import time
 from fastapi import APIRouter, Body, Query, Request
@@ -8,7 +9,7 @@ from fastapi import APIRouter, Body, Query, Request
 from app import config
 from app import database as db
 from app.clients.qbittorrent import QBConnectionTestError, QBittorrentClient
-from app.logger import get_logger, redact_sensitive_text
+from app.logger import get_logger, log_throttled, redact_sensitive_text
 from app.modules.download_dispatcher import (
     SUPPORTED_TARGETS,
     download_resubmit_capabilities,
@@ -300,7 +301,10 @@ def overview(request: Request):
                 "error": "",
             }
     except Exception as exc:
-        logger.warning(f"下载页 qB 数据读取失败: {exc}")
+        log_throttled(
+            logger, logging.WARNING, f"downloads-page-qb:{type(exc).__name__}",
+            "下载页 qB 数据读取失败 type=%s", type(exc).__name__,
+        )
         result["qb"].update({
             "configured": True,
             "error_code": "connection_failed",
@@ -419,9 +423,11 @@ def resubmit_issues_batch(request: Request, data: dict | None = Body(default=Non
         try:
             result = resubmit_download_request(request_id, target)
         except Exception as exc:
-            logger.exception(
-                "批量重新提交下载请求失败 request=%s target=%s type=%s",
-                request_id,
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"download-batch-resubmit:{target}:{type(exc).__name__}",
+                "批量重新提交下载请求存在失败 target=%s type=%s",
                 target,
                 type(exc).__name__,
             )
@@ -606,5 +612,5 @@ def qb_action(action: str, request: Request, data: dict | None = Body(default=No
             "accepted": len(hashes),
         })
     except Exception as exc:
-        logger.error(f"qB 任务操作失败 {action}: {exc}")
+        logger.error("qB 任务操作失败 action=%s type=%s", action, type(exc).__name__)
         return api_error("连接失败，请检查地址、认证信息和网络", 502)

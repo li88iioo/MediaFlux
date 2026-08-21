@@ -1,6 +1,7 @@
 """探索海报同源代理；使用签名 opaque token 和固定 Provider 域名。"""
 from __future__ import annotations
 
+import logging
 import random
 import re
 import threading
@@ -13,7 +14,7 @@ from requests.adapters import HTTPAdapter
 
 from app import config
 from app.modules.web_secret import WebSecretUnavailable, get_web_secret
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 
 logger = get_logger(__name__)
 
@@ -254,7 +255,14 @@ def poster(request: Request, provider: str, token: str):
 
         if upstream is None or upstream.status_code != 200:
             status_code = upstream.status_code if upstream else (last_status or "none")
-            logger.warning(f"探索海报代理上游返回非 200 provider={provider} status={status_code} url={url}")
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"discovery-image-status:{provider}:{status_code}",
+                "探索海报代理上游异常 provider=%s status=%s",
+                provider,
+                status_code,
+            )
             raise HTTPException(status_code=502, detail="upstream image failed")
         content_type = str(upstream.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         if content_type not in _SAFE_IMAGE_MIME_TYPES:
@@ -284,7 +292,14 @@ def poster(request: Request, provider: str, token: str):
     except HTTPException:
         raise
     except requests.RequestException as exc:
-        logger.warning(f"探索海报代理失败 provider={provider}: {type(exc).__name__}")
+        log_throttled(
+            logger,
+            logging.WARNING,
+            f"discovery-image-error:{provider}:{type(exc).__name__}",
+            "探索海报代理失败 provider=%s type=%s",
+            provider,
+            type(exc).__name__,
+        )
         raise HTTPException(status_code=502, detail="upstream image failed") from exc
     finally:
         if upstream is not None:

@@ -3324,7 +3324,7 @@ class TMDBScraper:
                     self._detail_failure_cache, key, redact_sensitive_text(e)[:500]
                 )
                 self._record_tmdb_failure(e)
-            logger.error(f"TMDB 详情失败 [{tmdb_id}] [{normalized}]: {e}")
+            logger.error("TMDB 详情失败 tmdb=%s type=%s error=%s", tmdb_id, normalized, type(e).__name__)
             return {}
 
     def _season_episodes(self, tmdb_id: str, season_number: int | None) -> list | None:
@@ -3420,7 +3420,7 @@ class TMDBScraper:
                     self._detail_failure_cache, key, redact_sensitive_text(e)[:500]
                 )
                 self._record_tmdb_failure(e)
-            logger.error(f"TMDB 演职员详情失败 [{tmdb_id}] [{normalized}]: {e}")
+            logger.error("TMDB 演职员详情失败 tmdb=%s type=%s error=%s", tmdb_id, normalized, type(e).__name__)
             return {}
 
     def search_candidates(self, query: str, year: str = "",
@@ -3711,7 +3711,7 @@ class TMDBScraper:
                 "episode": episode,
             }
         except Exception as e:
-            logger.warning(f"guessit 解析失败 [{filename}]: {e}")
+            logger.warning("guessit 解析失败 type=%s", type(e).__name__)
             return {"title": name, "year": "", "type": "movie",
                     "season": None, "episode": None}
 

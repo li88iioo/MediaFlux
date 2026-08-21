@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from fastapi import APIRouter, Body, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app import database as db
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.organize_tasks import get_organize_manager
 from app.modules.runtime_log import clear_logs, log_snapshot, read_stream_chunk
@@ -53,7 +54,7 @@ def clear_runtime_logs(request: Request):
             "generation": generation,
         }
     except Exception as exc:
-        logger.error(f"清空实时日志失败: {exc}")
+        logger.error("清空实时日志失败 type=%s", type(exc).__name__)
         return api_error("清空实时日志失败", 500)
 
 
@@ -141,15 +142,25 @@ async def runtime_log_stream(
                 current_stream_id = chunk.stream_id
                 current_checkpoint = chunk.checkpoint
                 current_generation = chunk.generation
+                consecutive_errors = 0
                 now = time.monotonic()
                 if now - last_heartbeat >= 15:
                     yield ": heartbeat\n\n"
                     last_heartbeat = now
             except Exception as exc:
-                logger.error(f"实时日志流读取失败: {exc}")
+                consecutive_errors += 1
+                log_throttled(
+                    logger,
+                    logging.ERROR,
+                    f"runtime-log-stream:{type(exc).__name__}",
+                    "实时日志流读取失败 type=%s",
+                    type(exc).__name__,
+                )
                 payload = json.dumps({"message": "实时日志读取暂时失败"}, ensure_ascii=False)
                 yield f"event: error\ndata: {payload}\n\n"
-            await asyncio.sleep(0.75)
+                if consecutive_errors >= 3:
+                    return
+            await asyncio.sleep(min(5.0, 0.75 * max(1, consecutive_errors)))
 
     return StreamingResponse(
         events(),
@@ -171,7 +182,7 @@ def overview(request: Request):
             "timeline": db.count_organize_timeline_by_status(owner="admin"),
         }
     except Exception as exc:
-        logger.error(f"日志概览失败: {exc}")
+        logger.error("日志概览失败 type=%s", type(exc).__name__)
         return api_error(str(exc), 500)
 
 
@@ -304,7 +315,7 @@ def clear_organize_log_records(request: Request, data: dict | None = Body(defaul
             "message": "光鸭与本地整理记录已清理；未删除任何云端或本地媒体文件",
         }
     except Exception as exc:
-        logger.error(f"清理整理日志失败: {exc}")
+        logger.error("清理整理日志失败 type=%s", type(exc).__name__)
         return api_error("清理整理日志失败", 500)
 
 
@@ -316,7 +327,7 @@ def organize_log_detail(log_id: int, request: Request):
     except LookupError as exc:
         return api_error(str(exc), 404)
     except Exception as exc:
-        logger.error(f"整理日志详情失败 log={log_id}: {exc}")
+        logger.error("整理日志详情失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error("整理日志详情读取失败", 500)
 
 
@@ -340,7 +351,7 @@ def organize_tmdb_search(log_id: int, request: Request,
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error(f"整理日志 TMDB 搜索失败 log={log_id}: {exc}")
+        logger.error("整理日志 TMDB 搜索失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 502)
 
 
@@ -381,7 +392,7 @@ def preview_reorganize(log_id: int, request: Request,
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error(f"整理纠偏预览失败 log={log_id}: {exc}")
+        logger.error("整理纠偏预览失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 502)
 
 
@@ -451,7 +462,7 @@ def run_organize_batch(request: Request, data: dict | None = Body(default=None))
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error(f"剧集批量操作提交失败: {exc}")
+        logger.error("剧集批量操作提交失败 type=%s", type(exc).__name__)
         return api_error(str(exc), 409)
 
 
@@ -492,7 +503,7 @@ def run_reorganize(log_id: int, request: Request,
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error(f"重新整理提交失败 log={log_id}: {exc}")
+        logger.error("重新整理提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)
 
 
@@ -521,7 +532,7 @@ def return_to_source(log_id: int, request: Request,
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error(f"送回源目录提交失败 log={log_id}: {exc}")
+        logger.error("送回源目录提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)
 
 
@@ -551,7 +562,7 @@ def revert_organize(log_id: int, request: Request,
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error(f"回退整理提交失败 log={log_id}: {exc}")
+        logger.error("回退整理提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)
 
 
@@ -584,5 +595,5 @@ def delete_organize_group(log_id: int, request: Request,
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error(f"删除媒体组提交失败 log={log_id}: {exc}")
+        logger.error("删除媒体组提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)

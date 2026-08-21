@@ -4,9 +4,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import unittest
+from unittest.mock import patch
 from io import StringIO
 
-from app.logger import _RedactFilter, _RedactingFormatter, get_logger
+from app.logger import (
+    _RedactFilter,
+    _RedactingFormatter,
+    get_logger,
+    log_throttled,
+    reset_log_limiter,
+)
 
 
 class ThirdPartyLoggingTests(unittest.TestCase):
@@ -116,6 +123,63 @@ class ThirdPartyLoggingTests(unittest.TestCase):
             None,
         )
         self.assertTrue(redact_filter.filter(normal_asyncio_record))
+
+    def test_throttled_log_emits_first_and_summarizes_suppressed_records(self):
+        reset_log_limiter()
+        records: list[logging.LogRecord] = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        logger = logging.getLogger("throttled-log-test")
+        logger.handlers = [CaptureHandler()]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+        try:
+            with patch("app.logger.time.monotonic", side_effect=[100.0, 101.0, 401.0]):
+                self.assertTrue(log_throttled(logger, logging.WARNING, "offline", "上游离线"))
+                self.assertFalse(log_throttled(logger, logging.WARNING, "offline", "上游离线"))
+                self.assertTrue(log_throttled(logger, logging.WARNING, "offline", "上游离线"))
+        finally:
+            logger.handlers = []
+            reset_log_limiter()
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0].getMessage(), "上游离线")
+        self.assertEqual(records[1].getMessage(), "上游离线（期间已抑制 1 条重复日志）")
+
+    def test_telebot_network_retries_and_startup_lines_are_rate_limited(self):
+        redact_filter = _RedactFilter()
+        raw_error = (
+            "Infinity polling exception: HTTPSConnectionPool(host='api.telegram.org'): "
+            "Max retries exceeded with url: /bot123:secret/getUpdates "
+            "(Caused by ConnectionError('network down'))"
+        )
+        first_error = logging.LogRecord(
+            "TeleBot", logging.ERROR, __file__, 1, raw_error, (), None,
+        )
+        repeated_error = logging.LogRecord(
+            "TeleBot", logging.ERROR, __file__, 1, raw_error, (), None,
+        )
+        first_start = logging.LogRecord(
+            "TeleBot", logging.INFO, __file__, 1,
+            "Starting your bot with username: [@private_bot]", (), None,
+        )
+        repeated_start = logging.LogRecord(
+            "TeleBot", logging.INFO, __file__, 1,
+            "Starting your bot with username: [@private_bot]", (), None,
+        )
+
+        self.assertTrue(redact_filter.filter(first_error))
+        self.assertEqual(
+            first_error.getMessage(),
+            "Telegram Bot 网络连接异常（ConnectionError），将在后台自动重试",
+        )
+        self.assertFalse(redact_filter.filter(repeated_error))
+        self.assertTrue(redact_filter.filter(first_start))
+        self.assertEqual(first_start.getMessage(), "Telegram Bot 正在建立轮询连接")
+        self.assertFalse(redact_filter.filter(repeated_start))
 
     def test_telebot_getupdates_conflict_is_normalized_and_rate_limited(self):
         redact_filter = _RedactFilter()

@@ -414,7 +414,7 @@ def _safe_indexed_path(path_text: object, strm_root: str) -> Path | None:
             path = Path(strm_root) / path
         return _require_target_within_root(path, strm_root)
     except (ValueError, RuntimeError, OSError):
-        logger.warning("忽略超出当前 STRM 根目录的历史索引路径")
+        logger.debug("忽略超出当前 STRM 根目录的历史索引路径")
         return None
 
 
@@ -515,7 +515,7 @@ def _discard_backup(backup: Optional[Path]) -> None:
     try:
         backup.unlink(missing_ok=True)
     except OSError as exc:
-        logger.warning(f"清理 STRM 事务备份失败 {backup}: {exc}")
+        logger.warning("清理 STRM 事务备份失败 type=%s", type(exc).__name__)
 
 
 def _restore_installed_file(
@@ -655,7 +655,7 @@ def _rollback_index(
         for row in conflicting_rows:
             _restore_index_row(source_key, row)
     except Exception as exc:
-        logger.error(f"回滚 STRM 索引失败 file={new_file_id}: {exc}")
+        logger.error("回滚 STRM 索引失败 file=%s type=%s", new_file_id, type(exc).__name__)
 
 
 def build_play_url(base_url: str, file_id: str, etag: str,
@@ -1341,7 +1341,7 @@ class _BoundedProgress:
         try:
             self.callback(stage, bounded_completed, bounded_total, detail)
         except Exception as exc:
-            logger.warning(f"STRM 进度回调失败 stage={stage}: {exc}")
+            logger.warning("STRM 进度回调失败 stage=%s type=%s", stage, type(exc).__name__)
 
 
 def _failure_target_rel_path(target: Path, strm_root: str) -> str:
@@ -2135,7 +2135,7 @@ def _sync_strm_impl(
                         installed_fingerprint,
                     )
                 except Exception as exc:
-                    logger.warning(f"生成 STRM 失败 {file.name}: {exc}")
+                    logger.debug("生成 STRM 失败 file=%s type=%s", redact_sensitive_text(file.name)[:160], type(exc).__name__)
                     stats["failed"] += 1
                     consistency_errors += 1
                     _append_error_sample(stats, "生成 STRM", file.name, exc)
@@ -2314,7 +2314,7 @@ def _sync_strm_impl(
                     "previous_deleted": False,
                 })
             except Exception as exc:
-                logger.warning(f"准备元数据下载失败 {file.name}: {exc}")
+                logger.debug("准备元数据下载失败 file=%s type=%s", redact_sensitive_text(file.name)[:160], type(exc).__name__)
                 stats["metadata_failed"] += 1
                 consistency_errors += 1
                 _append_error_sample(stats, "准备元数据", file.name, exc)
@@ -2384,7 +2384,7 @@ def _sync_strm_impl(
                         job["url"] = url
                         runnable_jobs.append(job)
                     except Exception as exc:
-                        logger.warning(f"获取元数据下载直链失败 {job['file'].name}: {exc}")
+                        logger.debug("获取元数据下载直链失败 file=%s type=%s", redact_sensitive_text(job["file"].name)[:160], type(exc).__name__)
                         _discard_backup(job["backup"])
                         _discard_backup(job["previous_backup"])
                         stats["metadata_failed"] += 1
@@ -2493,7 +2493,7 @@ def _sync_strm_impl(
                             else:
                                 _discard_backup(job["previous_backup"])
                         except Exception as restore_exc:
-                            logger.error(f"恢复已取消元数据文件失败 {target}: {restore_exc}")
+                            logger.error("恢复已取消元数据文件失败 type=%s", type(restore_exc).__name__)
                         stats["stopped"] = True
                         stats["stop_stage"] = "metadata"
                         stats["clean_skipped"] = True
@@ -2513,8 +2513,8 @@ def _sync_strm_impl(
                             else:
                                 _discard_backup(job["previous_backup"])
                         except Exception as restore_exc:
-                            logger.error(f"恢复元数据旧文件失败 {target}: {restore_exc}")
-                        logger.warning(f"下载元数据失败 {file.name}: {exc}")
+                            logger.error("恢复元数据旧文件失败 type=%s", type(restore_exc).__name__)
+                        logger.debug("下载元数据失败 file=%s type=%s", redact_sensitive_text(file.name)[:160], type(exc).__name__)
                         stats["metadata_failed"] += 1
                         consistency_errors += 1
                         _append_error_sample(stats, "下载元数据", file.name, exc)
@@ -3472,7 +3472,7 @@ def clean_invalid_strm(
                     _require_owned_file(path, [row], "清理失效 STRM")
                 except _STRMOwnershipError as exc:
                     blocked_paths.append(path_text)
-                    logger.warning(str(exc))
+                    logger.debug("STRM 所有权校验阻止清理 type=%s", type(exc).__name__)
                     continue
                 _delete_owned_file(path, [row], "清理失效 STRM")
                 cleaned += 1
@@ -3480,9 +3480,9 @@ def clean_invalid_strm(
             removed_ids.append(row["file_id"])
         except _STRMOwnershipError as exc:
             blocked_paths.append(path_text)
-            logger.warning(str(exc))
+            logger.debug("STRM 所有权校验阻止清理 type=%s", type(exc).__name__)
         except OSError as exc:
-            logger.warning(f"清理无效 STRM 失败 {path_text}: {exc}")
+            logger.debug("清理无效 STRM 失败 type=%s", type(exc).__name__)
     db.delete_strm_index_ids(source_key, removed_ids)
 
     empty_dirs = 0

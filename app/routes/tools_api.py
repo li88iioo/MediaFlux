@@ -296,7 +296,7 @@ def scrape_preview(request: Request, data: dict | None = Body(default=None)):
             ),
         })
     except Exception as exc:
-        logger.error(f"刮削预览失败 [{filename}]: {exc}")
+        logger.error("刮削预览失败 type=%s", type(exc).__name__)
         return api_error(str(exc), 500)
 
 
@@ -361,7 +361,7 @@ def scrape_confirm(request: Request, data: dict | None = Body(default=None)):
         )
         return api_response({"success": True})
     except Exception as exc:
-        logger.error(f"映射锁定失败: {exc}")
+        logger.error("映射锁定失败 type=%s", type(exc).__name__)
         return api_error(str(exc), 500)
 
 
@@ -621,7 +621,7 @@ def export_gcid_manifest(request: Request, data: dict | None = Body(default=None
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error(f"GCID 清单导出失败: {exc}")
+        logger.error("GCID 清单导出失败 type=%s", type(exc).__name__)
         return api_error("GCID 清单导出失败", 502)
 
 
