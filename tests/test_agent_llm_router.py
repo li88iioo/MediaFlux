@@ -16,6 +16,7 @@ from app.agent.llm_router import (
     LLMResultNarrative,
     LLMToolSelection,
     _conversation_user_content,
+    _native_context_text,
     _native_read_capabilities,
     _parse_selection,
     _request_native_read_agent,
@@ -627,6 +628,41 @@ class AgentLLMSelectionTests(unittest.TestCase):
         }
         self.assertTrue(download_names)
         self.assertTrue(all(name.startswith("downloads.") for name in download_names))
+
+    def test_native_context_inherits_long_explicit_reference_without_polluting_new_topic(self):
+        context = [{
+            "role": "assistant",
+            "text": "刚才检查了《九门》的全部剧集",
+            "tool_name": "library.audit_library_episodes",
+            "media_context": {
+                "title": "九门",
+                "media_type": "tv",
+                "year": "2026",
+                "tmdb_id": "123456",
+                "season": 2,
+            },
+        }]
+        referential = (
+            "请继续仔细检查刚才这部剧在媒体库中的全部季度和剧集状态，"
+            "并把这一季目前缺少、尚未入库或者文件异常的集数分别列出来，"
+            "还要说明哪些结果来自本地媒体库，避免重新猜测成另一部同名作品。"
+        )
+        unrelated = (
+            "请分析家庭网络中通过 WireGuard 访问远程 NAS 时的传输性能，"
+            "分别讨论 MTU、MSS Clamping、拥塞控制、DNS 和路由配置，"
+            "最后给出一套不依赖任何影视媒体信息的排查步骤与验证方法。"
+        )
+
+        self.assertGreater(len(referential), 80)
+        self.assertGreater(len(unrelated), 80)
+        inherited = _native_context_text(referential, context)
+        isolated = _native_context_text(unrelated, context)
+
+        self.assertIn("九门", inherited)
+        self.assertIn("library.audit_library_episodes", inherited)
+        self.assertIn("123456", inherited)
+        self.assertNotIn("九门", isolated)
+        self.assertNotIn("library.audit_library_episodes", isolated)
 
     def test_native_semantic_recall_is_independent_of_tool_prefix(self):
         registry = ToolRegistry()
@@ -2507,6 +2543,27 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertIn("当前媒体：电视剧《九门》（2026）", content)
         self.assertNotIn("raw tool payload", content)
         self.assertTrue(content.endswith("当前问题：继续说明"))
+
+    def test_conversation_context_preserves_safe_media_ids_and_coordinates(self):
+        content = _conversation_user_content(
+            "这一集讲了什么？",
+            [{
+                "role": "assistant",
+                "text": "找到剧集信息",
+                "media_context": {
+                    "title": "九门",
+                    "media_type": "tv",
+                    "year": "2026",
+                    "tmdb_id": "123456",
+                    "bangumi_id": "7890",
+                    "douban_id": "334455",
+                    "season": 2,
+                    "episode": 3,
+                },
+            }],
+        )
+
+        self.assertIn("当前媒体：电视剧《九门》（2026）第 2 季第 3 集", content)
 
     def test_conversation_context_exposes_only_safe_previous_action_metadata(self):
         content = _conversation_user_content(

@@ -182,12 +182,22 @@ class AgentConversationCompactionRepositoryTests(
         self.assertEqual(len(next_snapshot.messages), 8)
 
     def test_compaction_preserves_latest_verified_media_context(self):
+        media_context = {
+            "title": "光阴之外",
+            "year": "2026",
+            "media_type": "tv",
+            "tmdb_id": "887766",
+            "bangumi_id": "5544",
+            "douban_id": "998877",
+            "season": 1,
+            "episode": 12,
+        }
         self.assertTrue(
             self.repository.append_query_turn(
                 principal="browser-a",
                 session_id=SESSION_A,
                 message="搜索《光阴之外》的缺集资源",
-                response=_media_response("光阴之外"),
+                response=_media_response("光阴之外", data=media_context),
             )
         )
         self._append_turns(5, start=1)
@@ -196,6 +206,7 @@ class AgentConversationCompactionRepositoryTests(
         )
         self.assertIsNotNone(snapshot)
         assert snapshot is not None
+        self.assertEqual(snapshot.latest_media_context, media_context)
         self.assertTrue(
             self.repository.store_compaction_summary(
                 principal="browser-a",
@@ -211,7 +222,7 @@ class AgentConversationCompactionRepositoryTests(
 
         self.assertEqual(
             context[0].get("media_context"),
-            {"title": "光阴之外", "media_type": "tv"},
+            media_context,
         )
         self.assertNotIn("已找到资源", context[0]["text"])
 

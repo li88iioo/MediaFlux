@@ -730,11 +730,11 @@ async def _request_read_plan(
     return _parse_read_plan(payload, set(names))
 
 
-def _safe_media_context_for_llm(value: Any) -> dict[str, str]:
+def _safe_media_context_for_llm(value: Any) -> dict[str, Any]:
     """只允许把不可执行的媒体身份投影发送给模型。"""
     if not isinstance(value, dict):
         return {}
-    result: dict[str, str] = {}
+    result: dict[str, Any] = {}
     for key in ("title", "original_title"):
         text = " ".join(str(value.get(key) or "").split()).strip()
         if (
@@ -750,6 +750,14 @@ def _safe_media_context_for_llm(value: Any) -> dict[str, str]:
     media_type = str(value.get("media_type") or "").strip().lower()
     if media_type in {"movie", "tv"}:
         result["media_type"] = media_type
+    for field, maximum_digits in (("tmdb_id", 10), ("bangumi_id", 10), ("douban_id", 20)):
+        identifier = str(value.get(field) or "").strip()
+        if identifier.isascii() and identifier.isdigit() and 1 <= len(identifier) <= maximum_digits:
+            result[field] = identifier
+    for field, maximum in (("season", 100), ("episode", 1000)):
+        coordinate = value.get(field)
+        if isinstance(coordinate, int) and not isinstance(coordinate, bool) and 1 <= coordinate <= maximum:
+            result[field] = coordinate
     if not result.get("title"):
         return {}
     return result
@@ -841,6 +849,10 @@ def _conversation_user_content(
             identity = f"{media_label}《{media_context['title']}》"
             if media_context.get("year"):
                 identity += f"（{media_context['year']}）"
+            if media_context.get("season"):
+                identity += f"第 {media_context['season']} 季"
+            if media_context.get("episode"):
+                identity += f"第 {media_context['episode']} 集"
             line += f"；当前媒体：{identity}"
         suggestions = item.get("suggestions") or []
         if suggestions:
@@ -1296,12 +1308,14 @@ def _native_context_text(
     current = " ".join(str(message or "").split()).strip()
     parts = [current]
     normalized_current = unicodedata.normalize("NFKC", current).casefold()
-    # 长而明确的新指令不应被旧话题污染；只有短续句、指代或重试语句才继承上下文。
-    inherit_context = len(current) <= 24 or any(
+    # 自然追问经常超过 24 个字符；有限长度内继承最近安全上下文，长篇新任务
+    # 仍需命中明确指代词才继承，避免旧话题污染能力召回。
+    inherit_context = len(current) <= 80 or any(
         marker in normalized_current
         for marker in (
             "这部", "这集", "这个", "它", "刚才", "上一个", "继续", "重试",
             "再来", "刷新一下", "打开它", "关闭它", "评分", "有多少", "缺不缺",
+            "那个", "上一部", "前一个", "接着", "这一季", "这一集", "该片", "该剧",
         )
     )
     if inherit_context:

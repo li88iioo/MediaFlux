@@ -67,7 +67,7 @@ class ConversationCompactionSnapshot:
     expected_revision: int
     through_message_id: int
     previous_summary: dict[str, Any] | None
-    latest_media_context: dict[str, str] | None
+    latest_media_context: dict[str, Any] | None
     messages: tuple[dict[str, Any], ...]
 
 
@@ -576,17 +576,20 @@ class SQLiteAgentConversationHistoryRepository:
 
     def _validated_media_context(
         self, value: Any
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         if value in (None, {}):
             return {}
         if not isinstance(value, dict) or not set(value).issubset(
-            {"title", "original_title", "year", "media_type"}
+            {
+                "title", "original_title", "year", "media_type",
+                "tmdb_id", "bangumi_id", "douban_id", "season", "episode",
+            }
         ):
             return None
         title = self._safe_optional_output_text(value.get("title"), limit=160)
         if not title or title == _UNSAFE_HISTORY_DETAIL:
             return None
-        result: dict[str, str] = {"title": title}
+        result: dict[str, Any] = {"title": title}
         original_title = self._safe_optional_output_text(
             value.get("original_title"), limit=160
         )
@@ -602,6 +605,18 @@ class SQLiteAgentConversationHistoryRepository:
             if media_type not in {"movie", "tv"}:
                 return None
             result["media_type"] = media_type
+        for field, maximum_digits in (("tmdb_id", 10), ("bangumi_id", 10), ("douban_id", 20)):
+            identifier = str(value.get(field) or "").strip()
+            if identifier:
+                if not identifier.isascii() or not identifier.isdigit() or len(identifier) > maximum_digits:
+                    return None
+                result[field] = identifier
+        for field, maximum in (("season", 100), ("episode", 1000)):
+            coordinate = value.get(field)
+            if coordinate is not None:
+                if isinstance(coordinate, bool) or not isinstance(coordinate, int) or not 1 <= coordinate <= maximum:
+                    return None
+                result[field] = coordinate
         return result
 
     def _media_context_projection(
@@ -612,7 +627,7 @@ class SQLiteAgentConversationHistoryRepository:
         arguments: Any = None,
         ok: bool = True,
         status: str = "",
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """仅保留不可执行、可验签的媒体身份，供自然续问使用。"""
         normalized_tool = str(tool_name or "").strip()
         if normalized_tool not in _MEDIA_CONTEXT_TOOL_TYPES:
@@ -633,8 +648,18 @@ class SQLiteAgentConversationHistoryRepository:
         }:
             return {}
         safe_arguments = arguments if isinstance(arguments, dict) else {}
+        verification = safe_data.get("verification")
+        safe_verification = verification if isinstance(verification, dict) else {}
+        raw_items = safe_data.get("items")
+        safe_item = (
+            raw_items[0]
+            if isinstance(raw_items, list) and len(raw_items) == 1 and isinstance(raw_items[0], dict)
+            else {}
+        )
         title = self._safe_optional_output_text(
             safe_data.get("title")
+            or safe_verification.get("title")
+            or safe_item.get("title")
             or safe_data.get("query")
             or safe_arguments.get("title")
             or safe_arguments.get("query"),
@@ -642,14 +667,20 @@ class SQLiteAgentConversationHistoryRepository:
         )
         if not title or title == _UNSAFE_HISTORY_DETAIL:
             return {}
-        result: dict[str, str] = {"title": title}
+        result: dict[str, Any] = {"title": title}
         original_title = self._safe_optional_output_text(
-            safe_data.get("original_title") or safe_arguments.get("original_title"),
+            safe_data.get("original_title")
+            or safe_verification.get("original_title")
+            or safe_item.get("original_title")
+            or safe_arguments.get("original_title"),
             limit=160,
         )
         if original_title and original_title != _UNSAFE_HISTORY_DETAIL:
             result["original_title"] = original_title
-        year = str(safe_data.get("year") or safe_arguments.get("year") or "").strip()
+        year = str(
+            safe_data.get("year") or safe_verification.get("year")
+            or safe_item.get("year") or safe_arguments.get("year") or ""
+        ).strip()
         if _MEDIA_CONTEXT_YEAR_RE.fullmatch(year):
             result["year"] = year
         forced_type = _MEDIA_CONTEXT_TOOL_TYPES[normalized_tool]
@@ -658,6 +689,45 @@ class SQLiteAgentConversationHistoryRepository:
         ).strip().lower()
         if media_type in {"movie", "tv"}:
             result["media_type"] = media_type
+        sources = (safe_data, safe_verification, safe_item, safe_arguments)
+        for field, maximum_digits in (
+            ("tmdb_id", 10),
+            ("bangumi_id", 10),
+            ("douban_id", 20),
+        ):
+            identifier = next(
+                (
+                    candidate
+                    for source in sources
+                    if (
+                        candidate := str(source.get(field) or "").strip()
+                    ).isascii()
+                    and candidate.isdigit()
+                    and 1 <= len(candidate) <= maximum_digits
+                ),
+                "",
+            )
+            if identifier:
+                result[field] = identifier
+        coordinate_aliases = {
+            "season": ("season",),
+            "episode": ("episode", "target_episode"),
+        }
+        for field, aliases in coordinate_aliases.items():
+            maximum = 100 if field == "season" else 1000
+            coordinate = next(
+                (
+                    candidate
+                    for source in sources
+                    for alias in aliases
+                    if isinstance((candidate := source.get(alias)), int)
+                    and not isinstance(candidate, bool)
+                    and 1 <= candidate <= maximum
+                ),
+                None,
+            )
+            if coordinate is not None:
+                result[field] = coordinate
         return result
 
     def _tentative_media_context_projection(
@@ -667,7 +737,7 @@ class SQLiteAgentConversationHistoryRepository:
         data: Any,
         arguments: Any = None,
         status: str = "",
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """保留用户明确输入但尚未由当前数据源命中的安全媒体标题。"""
         if str(status or "").strip().lower() not in {"empty", "not_found"}:
             return {}

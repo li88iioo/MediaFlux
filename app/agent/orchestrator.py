@@ -235,7 +235,7 @@ _MEDIA_RATING_YEAR_SEARCH_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 _MEDIA_RATING_QUOTED_TITLE_RE = re.compile(r"[《「『\"']([^》」』\"']{1,120})[》」』\"']")
 
 
-def _safe_media_context(value: Any) -> dict[str, str]:
+def _safe_media_context(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     title = " ".join(str(value.get("title") or "").split()).strip()
@@ -251,6 +251,14 @@ def _safe_media_context(value: Any) -> dict[str, str]:
     media_type = str(value.get("media_type") or "").strip().lower()
     if media_type in {"movie", "tv"}:
         result["media_type"] = media_type
+    for field, maximum_digits in (("tmdb_id", 10), ("bangumi_id", 10), ("douban_id", 20)):
+        identifier = str(value.get(field) or "").strip()
+        if identifier.isascii() and identifier.isdigit() and 1 <= len(identifier) <= maximum_digits:
+            result[field] = identifier
+    for field, maximum in (("season", 100), ("episode", 1000)):
+        coordinate = value.get(field)
+        if isinstance(coordinate, int) and not isinstance(coordinate, bool) and 1 <= coordinate <= maximum:
+            result[field] = coordinate
     return result
 
 
@@ -275,7 +283,7 @@ def _latest_media_context(
     conversation_context: list[dict[str, Any]] | None,
     *,
     allow_tentative: bool = False,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """继承当前媒体主题，允许普通寒暄穿插但阻止跨领域串线。
 
     纯对话回复不会天然代表切换主题；只有明确执行了非媒体工具，才停止向前

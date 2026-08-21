@@ -413,6 +413,157 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
             repository=self.repository, wall_clock=lambda: self.wall[0]
         ).get(owner="session-b"))
 
+    def test_candidate_snapshots_support_search_id_reselection_after_restart(self):
+        monotonic = [20.0]
+        resource_store = RecentResourceCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        first_resource = _resource_result()
+        first_selected = first_resource.data["search"]["recommendation"]["selected"]
+        first_selected["result_id"] = "resource-result-a"
+        first_selected["title"] = "Dune.Part.Two.2024"
+        second_resource = _resource_result()
+        second_selected = second_resource.data["search"]["recommendation"]["selected"]
+        second_selected["result_id"] = "resource-result-b"
+        second_selected["title"] = "Joy.of.Life.S02E01"
+
+        resource_search_a = resource_store.capture(
+            owner="session-a", result=first_resource
+        )
+        resource_search_b = resource_store.capture(
+            owner="session-a", result=second_resource
+        )
+
+        self.assertRegex(resource_search_a, r"^rs_[A-Za-z0-9_-]{16,40}$")
+        self.assertNotEqual(resource_search_a, resource_search_b)
+        self.assertEqual(
+            resource_store.get(owner="session-a")["candidates"][0]["result_id"],
+            "resource-result-b",
+        )
+        self.assertEqual(
+            resource_store.get(
+                owner="session-a", search_id=resource_search_a
+            )["candidates"][0]["result_id"],
+            "resource-result-a",
+        )
+
+        restored_resource = RecentResourceCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        self.assertEqual(
+            restored_resource.get(
+                owner="session-a", search_id=resource_search_a
+            )["candidates"][0]["result_id"],
+            "resource-result-a",
+        )
+        self.assertEqual(
+            restored_resource.get(
+                owner="session-a", search_id=resource_search_b
+            )["candidates"][0]["result_id"],
+            "resource-result-b",
+        )
+
+        discovery_store = RecentDiscoveryCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        first_discovery = _discovery_result()
+        first_discovery.data["items"][0]["external_id"] = "8801"
+        first_discovery.data["items"][0]["title"] = "候选影片 A"
+        second_discovery = _discovery_result()
+        second_discovery.data["items"][0]["external_id"] = "8802"
+        second_discovery.data["items"][0]["title"] = "候选影片 B"
+        discovery_search_a = discovery_store.capture(
+            owner="session-a", result=first_discovery
+        )
+        discovery_search_b = discovery_store.capture(
+            owner="session-a", result=second_discovery
+        )
+
+        restored_discovery = RecentDiscoveryCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        self.assertEqual(
+            restored_discovery.get(
+                owner="session-a", search_id=discovery_search_a
+            )["candidates"][0]["title"],
+            "候选影片 A",
+        )
+        self.assertEqual(
+            restored_discovery.get(
+                owner="session-a", search_id=discovery_search_b
+            )["candidates"][0]["title"],
+            "候选影片 B",
+        )
+
+    def test_candidate_snapshots_enforce_bounded_eviction_and_clear_all_rows(self):
+        monotonic = [20.0]
+        store = RecentResourceCandidateStore(
+            repository=self.repository,
+            max_snapshots_per_owner=3,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        search_ids = []
+        for index in range(5):
+            result = _resource_result()
+            selected = result.data["search"]["recommendation"]["selected"]
+            selected["result_id"] = f"resource-result-{index}"
+            selected["title"] = f"Example.S02E{index + 1:02d}.1080p"
+            search_ids.append(store.capture(owner="session-bounded", result=result))
+
+        self.assertIsNone(
+            store.get(owner="session-bounded", search_id=search_ids[0])
+        )
+        self.assertIsNone(
+            store.get(owner="session-bounded", search_id=search_ids[1])
+        )
+        self.assertEqual(
+            store.get(
+                owner="session-bounded", search_id=search_ids[-1]
+            )["candidates"][0]["result_id"],
+            "resource-result-4",
+        )
+
+        digest = self.repository.owner_digest_for_tests("session-bounded")
+        with db.get_conn() as conn:
+            persisted = conn.execute(
+                "SELECT COUNT(*) AS total FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type='resource_candidates'",
+                (digest,),
+            ).fetchone()["total"]
+        self.assertEqual(persisted, 3)
+
+        restored = RecentResourceCandidateStore(
+            repository=self.repository,
+            max_snapshots_per_owner=3,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        self.assertIsNone(
+            restored.get(owner="session-bounded", search_id=search_ids[0])
+        )
+        self.assertTrue(store.clear_owner(owner="session-bounded"))
+        self.assertIsNone(RecentResourceCandidateStore(
+            repository=self.repository,
+            max_snapshots_per_owner=3,
+            wall_clock=lambda: self.wall[0],
+        ).get(owner="session-bounded"))
+        with db.get_conn() as conn:
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS total FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type='resource_candidates'",
+                (digest,),
+            ).fetchone()["total"]
+        self.assertEqual(remaining, 0)
+
     def test_patrol_and_download_clear_owner_remove_persisted_rows(self):
         patrol = RecentPatrolStore(
             repository=self.repository, wall_clock=lambda: self.wall[0]

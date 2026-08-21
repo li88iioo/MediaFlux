@@ -201,6 +201,67 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(context[-1]["pending_subscription"], {"season": 2})
 
+    def test_media_context_preserves_stable_ids_and_uses_later_valid_coordinates(self):
+        response = {
+            "mode": "tool_result",
+            "tool_call": {
+                "name": "library.search_missing_episode_resources",
+                "arguments": {
+                    "title": "九门",
+                    "season": 2,
+                    "target_episode": 3,
+                },
+            },
+            "result": {
+                "ok": True,
+                "status": "success",
+                "summary": "找到缺集资源",
+                "data": {
+                    "title": "九门",
+                    "original_title": "Jiu Men",
+                    "year": "2026",
+                    "media_type": "tv",
+                    "tmdb_id": "invalid",
+                    "episode": "invalid",
+                    "verification": {
+                        "tmdb_id": "987654",
+                        "bangumi_id": "3210",
+                        "douban_id": "654321",
+                        "season": 2,
+                        "episode": 3,
+                    },
+                },
+                "suggestions": ["下载第 1 个"],
+            },
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="搜索《九门》第 2 季第 3 集",
+            response=response,
+        )
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        expected = {
+            "title": "九门",
+            "original_title": "Jiu Men",
+            "year": "2026",
+            "media_type": "tv",
+            "tmdb_id": "987654",
+            "bangumi_id": "3210",
+            "douban_id": "654321",
+            "season": 2,
+            "episode": 3,
+        }
+        self.assertEqual(history["messages"][1]["data"]["media_context"], expected)
+
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(context[-1]["media_context"], expected)
+
     def test_tampered_payload_fails_closed_and_delete_is_owner_scoped(self):
         self.repository.append_query_turn(
             principal="browser-principal-a",

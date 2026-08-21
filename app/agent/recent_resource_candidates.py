@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import date
 import logging
 import re
+import secrets
 import threading
 import time
 import unicodedata
@@ -16,6 +17,7 @@ from app.agent.session_context import AgentSessionContextRepository
 
 
 _RESULT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_SEARCH_ID_PATTERN = re.compile(r"^rs_[A-Za-z0-9_-]{16,64}$")
 _ALLOWED_CONFIDENCE = {"high", "medium", "low"}
 _ALLOWED_MATCH = {"exact_episode", "episode_pack", "season_pack", "unknown"}
 _ALLOWED_DOWNLOAD_STATE = {"ready", "resolvable"}
@@ -33,47 +35,63 @@ class RecentResourceCandidateStore:
         *,
         ttl_seconds: int = 600,
         max_entries: int = 256,
+        max_snapshots_per_owner: int = 5,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         repository: AgentSessionContextRepository | None = None,
     ) -> None:
         self.ttl_seconds = max(1, int(ttl_seconds))
         self.max_entries = max(1, int(max_entries))
+        self.max_snapshots_per_owner = max(1, min(int(max_snapshots_per_owner), 16))
         self._clock = clock
         self._wall_clock = wall_clock
         self._repository = repository
         self._lock = threading.RLock()
         self._owner_locks = tuple(threading.RLock() for _ in range(64))
-        self._entries: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._entries: OrderedDict[str, list[tuple[float, dict[str, Any]]]] = OrderedDict()
 
-    def capture(self, *, owner: str, result: ToolResult) -> None:
+    def capture(self, *, owner: str, result: ToolResult) -> str:
         owner_key = str(owner or "").strip()
         if not owner_key:
-            return
+            return ""
         snapshot = _safe_snapshot(result)
+        search_id = f"rs_{secrets.token_urlsafe(16)}"
+        snapshot["search_id"] = search_id
         with self._owner_lock(owner_key):
             now = self._clock()
             with self._lock:
                 self._prune_locked(now)
-                self._entries.pop(owner_key, None)
-                self._entries[owner_key] = (now + self.ttl_seconds, snapshot)
+                items = self._entries.pop(owner_key, [])
+                items.insert(0, (now + self.ttl_seconds, snapshot))
+                self._entries[owner_key] = items[: self.max_snapshots_per_owner]
                 while len(self._entries) > self.max_entries:
                     self._entries.popitem(last=False)
             if self._repository is not None:
                 try:
-                    self._repository.replace_latest(
-                        owner=owner_key,
-                        context_type=_CONTEXT_TYPE,
-                        payload=snapshot,
-                        expires_at=self._wall_clock() + self.ttl_seconds,
-                    )
+                    append_snapshot = getattr(self._repository, "append_snapshot", None)
+                    if callable(append_snapshot):
+                        append_snapshot(
+                            owner=owner_key,
+                            context_type=_CONTEXT_TYPE,
+                            payload=snapshot,
+                            expires_at=self._wall_clock() + self.ttl_seconds,
+                            max_items=self.max_snapshots_per_owner,
+                        )
+                    else:
+                        self._repository.replace_latest(
+                            owner=owner_key,
+                            context_type=_CONTEXT_TYPE,
+                            payload=snapshot,
+                            expires_at=self._wall_clock() + self.ttl_seconds,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Agent 资源候选上下文持久化失败 type=%s",
                         type(exc).__name__,
                     )
+        return search_id
 
-    def get(self, *, owner: str) -> dict[str, Any] | None:
+    def get(self, *, owner: str, search_id: str = "") -> dict[str, Any] | None:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return None
@@ -81,11 +99,15 @@ class RecentResourceCandidateStore:
             now = self._clock()
             with self._lock:
                 self._prune_locked(now)
-                entry = self._entries.get(owner_key)
-                if entry is not None:
+                entries = self._entries.get(owner_key)
+                if entries:
                     self._entries.move_to_end(owner_key)
-                    return deepcopy(entry[1])
-            return self._restore(owner_key=owner_key, now=now)
+                    selected = next(
+                        (snapshot for _expires, snapshot in entries if snapshot.get("search_id") == search_id),
+                        entries[0][1] if not search_id else None,
+                    )
+                    return deepcopy(selected) if selected is not None else None
+            return self._restore(owner_key=owner_key, now=now, search_id=search_id)
 
     def reset(self) -> None:
         with self._lock:
@@ -115,41 +137,59 @@ class RecentResourceCandidateStore:
         return self._owner_locks[hash(owner_key) % len(self._owner_locks)]
 
     def _prune_locked(self, now: float) -> None:
-        expired = [owner for owner, (expires_at, _) in self._entries.items() if expires_at <= now]
-        for owner in expired:
-            self._entries.pop(owner, None)
+        for owner, entries in list(self._entries.items()):
+            active = [entry for entry in entries if entry[0] > now]
+            if active:
+                self._entries[owner] = active
+            else:
+                self._entries.pop(owner, None)
 
-    def _restore(self, *, owner_key: str, now: float) -> dict[str, Any] | None:
+    def _restore(self, *, owner_key: str, now: float, search_id: str = "") -> dict[str, Any] | None:
         if self._repository is None:
             return None
         wall_now = self._wall_clock()
         try:
-            persisted = self._repository.get_latest(
-                owner=owner_key,
-                context_type=_CONTEXT_TYPE,
-                now=wall_now,
-            )
+            list_snapshots = getattr(self._repository, "list_snapshots", None)
+            if callable(list_snapshots):
+                persisted_items = list_snapshots(
+                    owner=owner_key,
+                    context_type=_CONTEXT_TYPE,
+                    now=wall_now,
+                    limit=self.max_snapshots_per_owner,
+                )
+            else:
+                latest = self._repository.get_latest(
+                    owner=owner_key,
+                    context_type=_CONTEXT_TYPE,
+                    now=wall_now,
+                )
+                persisted_items = (latest,) if latest is not None else ()
         except Exception as exc:
             logger.warning(
                 "Agent 资源候选上下文恢复失败 type=%s", type(exc).__name__
             )
             return None
-        if persisted is None:
+        if not persisted_items:
             return None
-        snapshot = validate_safe_resource_snapshot(persisted.payload)
-        remaining = persisted.expires_at - wall_now
-        if snapshot is None or remaining <= 0:
+        restored: list[tuple[float, dict[str, Any]]] = []
+        for persisted in persisted_items:
+            snapshot = validate_safe_resource_snapshot(persisted.payload)
+            remaining = persisted.expires_at - wall_now
+            if snapshot is not None and remaining > 0:
+                restored.append((now + min(float(self.ttl_seconds), remaining), snapshot))
+        if not restored:
             return None
         with self._lock:
             self._prune_locked(now)
-            self._entries[owner_key] = (
-                now + min(float(self.ttl_seconds), remaining),
-                snapshot,
-            )
+            self._entries[owner_key] = restored
             self._entries.move_to_end(owner_key)
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)
-        return deepcopy(snapshot)
+        selected = next(
+            (snapshot for _expires, snapshot in restored if snapshot.get("search_id") == search_id),
+            restored[0][1] if not search_id else None,
+        )
+        return deepcopy(selected) if selected is not None else None
 
 
 def _safe_snapshot(result: ToolResult) -> dict[str, Any]:
@@ -322,7 +362,13 @@ _EPISODIC_PERSISTED_KEYS = frozenset({
 
 def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
     """严格验证持久化资源候选投影，拒绝额外字段或被篡改的句柄。"""
-    if not isinstance(value, dict) or set(value) != {"search_status", "candidates"}:
+    if not isinstance(value, dict) or set(value) not in (
+        {"search_status", "candidates"},
+        {"search_id", "search_status", "candidates"},
+    ):
+        return None
+    search_id = str(value.get("search_id") or "").strip()
+    if search_id and not _SEARCH_ID_PATTERN.fullmatch(search_id):
         return None
     search_status = _safe_text(value.get("search_status"), 40)
     raw_candidates = value.get("candidates")
@@ -396,7 +442,10 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
             return None
         seen_result_ids.add(result_id)
         candidates.append(projected)
-    return {"search_status": search_status, "candidates": candidates}
+    result = {"search_status": search_status, "candidates": candidates}
+    if search_id:
+        result["search_id"] = search_id
+    return result
 
 
 def public_candidate_projection(value: Any) -> dict[str, Any]:

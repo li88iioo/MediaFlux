@@ -55,6 +55,16 @@ class AgentSessionContextRepository(Protocol):
         max_items: int,
     ) -> None: ...
 
+    def append_snapshot(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        payload: dict[str, Any],
+        expires_at: float,
+        max_items: int,
+    ) -> None: ...
+
     def get_latest(
         self,
         *,
@@ -67,6 +77,15 @@ class AgentSessionContextRepository(Protocol):
         self,
         *,
         owner: str,
+        now: float,
+        limit: int,
+    ) -> tuple[PersistedAgentContext, ...]: ...
+
+    def list_snapshots(
+        self,
+        *,
+        owner: str,
+        context_type: str,
         now: float,
         limit: int,
     ) -> tuple[PersistedAgentContext, ...]: ...
@@ -164,6 +183,42 @@ class SQLiteAgentSessionContextRepository:
             )
             self._bound_rows(conn)
 
+    def append_snapshot(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        payload: dict[str, Any],
+        expires_at: float,
+        max_items: int,
+    ) -> None:
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        expiry = self._expiry(expires_at)
+        encoded = self._encode(
+            owner_digest=owner_digest,
+            context_type=normalized_type,
+            payload=payload,
+            expires_at=expiry,
+        )
+        bounded_items = max(1, min(int(max_items), 16))
+        now = float(self._clock())
+        with db.get_conn() as conn:
+            self._prune(conn, now=now)
+            conn.execute(
+                "INSERT INTO agent_session_context("
+                "owner_digest,context_type,payload,expires_at,created_at"
+                ") VALUES(?,?,?,?,?)",
+                (owner_digest, normalized_type, encoded, expiry, db.now()),
+            )
+            conn.execute(
+                "DELETE FROM agent_session_context WHERE owner_digest=? AND context_type=? "
+                "AND id NOT IN (SELECT id FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=? ORDER BY id DESC LIMIT ?)",
+                (owner_digest, normalized_type, owner_digest, normalized_type, bounded_items),
+            )
+            self._bound_rows(conn)
+
     def get_latest(
         self,
         *,
@@ -214,6 +269,38 @@ class SQLiteAgentSessionContextRepository:
                     row,
                     owner_digest=owner_digest,
                     context_type="download_submission",
+                )
+            ) is not None
+        )
+
+    def list_snapshots(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        now: float,
+        limit: int,
+    ) -> tuple[PersistedAgentContext, ...]:
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        current = self._finite_number(now, "now")
+        bounded_limit = max(1, min(int(limit), 16))
+        with db.get_conn() as conn:
+            self._prune(conn, now=current)
+            rows = conn.execute(
+                "SELECT payload,expires_at FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=? AND expires_at>? "
+                "ORDER BY id DESC LIMIT ?",
+                (owner_digest, normalized_type, current, bounded_limit),
+            ).fetchall()
+        return tuple(
+            decoded
+            for row in rows
+            if (
+                decoded := self._decode_row(
+                    row,
+                    owner_digest=owner_digest,
+                    context_type=normalized_type,
                 )
             ) is not None
         )
