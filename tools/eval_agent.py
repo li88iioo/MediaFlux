@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
-"""MediaFlux Agent 自然语言契约的离线黄金集评测器。
+"""MediaFlux Agent 自然语言契约的严格离线黄金集评测器。
 
-只调用确定性解析/分类函数，不创建 Agent 服务、不访问网络，也不调用 Provider。
-默认评测 ``tests/fixtures/agent_eval_cases.jsonl``，失败时以非零状态退出。
+评测器只调用本地确定性解析/分类与离线 stub 工具，不访问业务后端、网络或
+LLM Provider。默认评测 ``tests/fixtures/agent_eval_cases.jsonl``，并可作为 CI
+中的准确率、安全与时延门禁。
 """
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
 import sys
+from time import monotonic
 from typing import Any, Iterable, Mapping, Sequence
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.agent.confirmation import ConfirmationStore
 from app.agent.intents import match_read_intent
-from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.llm_router import (
     is_agent_action_request,
     is_confirmation_planning_request,
 )
+from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
     _DIAGNOSTIC_READ_INTENTS,
@@ -37,6 +40,7 @@ from app.sensitive_data import contains_sensitive_credential
 DEFAULT_FIXTURE = Path("tests/fixtures/agent_eval_cases.jsonl")
 EVALUATORS = frozenset({
     "route_tool",
+    "write_tool_route",
     "diagnostic_tool",
     "action_intent",
     "confirmation_planning",
@@ -68,8 +72,10 @@ _ALLOWED_KEYS = frozenset({
 _CASE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _DOMAIN_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _TAG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SAFE_LABEL_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,95}$")
 _CONTEXT_KEYS = frozenset({"role", "text", "tool_name", "status", "media_context"})
 _MEDIA_CONTEXT_KEYS = frozenset({"title", "original_title", "year", "media_type"})
+_CONTEXT_EVALUATORS = frozenset({"route_tool", "write_tool_route", "media_rating"})
 _DIAGNOSTIC_TOOLS = frozenset(spec.tool_name for spec in _DIAGNOSTIC_READ_INTENTS)
 _OFFLINE_ROUTE_TOOLS = frozenset({
     "media.subscription_updates",
@@ -85,6 +91,21 @@ _OFFLINE_ROUTE_TOOLS = frozenset({
     "discovery.search",
     "library.check_updates",
     "library.count_series_episodes",
+})
+_OFFLINE_WRITE_ROUTE_TOOLS = frozenset({
+    "config.set_feature_state",
+    "config.set_safe_policy",
+    "library.set_patrol_policy",
+    "media.set_subscription_enabled",
+})
+_ROUTE_EVALUATORS = frozenset({"route_tool", "write_tool_route"})
+_MATRIX_EVALUATORS = frozenset({
+    "route_tool",
+    "write_tool_route",
+    "diagnostic_tool",
+    "action_intent",
+    "confirmation_planning",
+    "sensitive_input",
 })
 
 
@@ -111,22 +132,40 @@ class AgentEvalOutcome:
     expected: Any
     actual: Any
     matched: bool
+    elapsed_ms: float = 0.0
+    confusion_kind: str = "matched"
 
 
 def _schema_error(label: str, message: str) -> ValueError:
     return ValueError(f"{label}: {message}")
 
 
+def _validate_route_expected(
+    case_id: str,
+    expected: Any,
+    *,
+    allowed_tools: frozenset[str],
+) -> None:
+    if expected is None:
+        return
+    if not isinstance(expected, Mapping) or set(expected) != {"tool_name", "arguments"}:
+        raise _schema_error(case_id, "路由 expected 必须包含 tool_name 和 arguments")
+    if expected.get("tool_name") not in allowed_tools:
+        raise _schema_error(case_id, "路由 tool_name 不在离线白名单")
+    if not isinstance(expected.get("arguments"), Mapping):
+        raise _schema_error(case_id, "路由 arguments 必须是 object")
+
+
 def _validate_expected(case_id: str, evaluator: str, expected: Any) -> None:
     if evaluator == "route_tool":
-        if expected is None:
-            return
-        if not isinstance(expected, Mapping) or set(expected) != {"tool_name", "arguments"}:
-            raise _schema_error(case_id, "路由 expected 必须包含 tool_name 和 arguments")
-        if expected.get("tool_name") not in _OFFLINE_ROUTE_TOOLS:
-            raise _schema_error(case_id, "路由 tool_name 不在离线白名单")
-        if not isinstance(expected.get("arguments"), Mapping):
-            raise _schema_error(case_id, "路由 arguments 必须是 object")
+        _validate_route_expected(case_id, expected, allowed_tools=_OFFLINE_ROUTE_TOOLS)
+        return
+    if evaluator == "write_tool_route":
+        _validate_route_expected(
+            case_id,
+            expected,
+            allowed_tools=_OFFLINE_WRITE_ROUTE_TOOLS,
+        )
         return
     if evaluator in {"action_intent", "confirmation_planning", "sensitive_input"}:
         if not isinstance(expected, bool):
@@ -145,7 +184,10 @@ def _validate_expected(case_id: str, evaluator: str, expected: Any) -> None:
             raise _schema_error(case_id, "探索续句 expected 结构无效")
         if expected.get("action") not in {"watchlist_add", "resource_search", "inspect"}:
             raise _schema_error(case_id, "探索续句 action 无效")
-        if not isinstance(expected.get("position"), int) or isinstance(expected.get("position"), bool):
+        if (
+            not isinstance(expected.get("position"), int)
+            or isinstance(expected.get("position"), bool)
+        ):
             raise _schema_error(case_id, "探索续句 position 必须是整数")
         if not isinstance(expected.get("explicit"), bool):
             raise _schema_error(case_id, "探索续句 explicit 必须是 boolean")
@@ -157,16 +199,23 @@ def _validate_expected(case_id: str, evaluator: str, expected: Any) -> None:
             "position", "episode", "target"
         }):
             raise _schema_error(case_id, "资源续句 expected 结构无效")
-        if set(expected) not in ({"position", "target"}, {"position", "target", "episode"}):
+        if set(expected) not in (
+            {"position", "target"},
+            {"position", "target", "episode"},
+        ):
             raise _schema_error(case_id, "资源续句 expected 字段不完整")
         position = expected.get("position")
         if position is not None and (
-            not isinstance(position, int) or isinstance(position, bool) or position < 1
+            not isinstance(position, int)
+            or isinstance(position, bool)
+            or position < 1
         ):
             raise _schema_error(case_id, "资源续句 position 无效")
         episode = expected.get("episode")
         if episode is not None and (
-            not isinstance(episode, int) or isinstance(episode, bool) or episode < 1
+            not isinstance(episode, int)
+            or isinstance(episode, bool)
+            or episode < 1
         ):
             raise _schema_error(case_id, "资源续句 episode 无效")
         if expected.get("target") not in {None, "qb", "guangya", "both"}:
@@ -185,7 +234,9 @@ def _validate_expected(case_id: str, evaluator: str, expected: Any) -> None:
             raise _schema_error(case_id, "评分续句必须声明 allow_web_fallback=true")
         if "media_type" in expected and expected.get("media_type") not in {"movie", "tv"}:
             raise _schema_error(case_id, "评分续句 media_type 无效")
-        if "year" in expected and not re.fullmatch(r"(?:19|20)\d{2}", str(expected.get("year"))):
+        if "year" in expected and not re.fullmatch(
+            r"(?:19|20)\d{2}", str(expected.get("year"))
+        ):
             raise _schema_error(case_id, "评分续句 year 无效")
         return
     raise _schema_error(case_id, f"未知 evaluator: {evaluator}")
@@ -206,11 +257,15 @@ def _validate_context(case_id: str, raw: Any) -> tuple[dict[str, Any], ...]:
             raise _schema_error(case_id, f"conversation_context[{index}].role 无效")
         for key in ("text", "tool_name", "status"):
             if key in projected and not isinstance(projected[key], str):
-                raise _schema_error(case_id, f"conversation_context[{index}].{key} 必须是字符串")
+                raise _schema_error(
+                    case_id, f"conversation_context[{index}].{key} 必须是字符串"
+                )
         media = projected.get("media_context")
         if media is not None:
             if not isinstance(media, Mapping) or set(media) - _MEDIA_CONTEXT_KEYS:
-                raise _schema_error(case_id, f"conversation_context[{index}].media_context 无效")
+                raise _schema_error(
+                    case_id, f"conversation_context[{index}].media_context 无效"
+                )
             title = media.get("title")
             if not isinstance(title, str) or not title.strip():
                 raise _schema_error(case_id, f"conversation_context[{index}] 缺少媒体标题")
@@ -267,37 +322,45 @@ def validate_agent_eval_rows(rows: Iterable[Mapping[str, Any]]) -> list[AgentEva
         if allow_implicit and evaluator not in {"discovery_followup", "resource_followup"}:
             raise _schema_error(case_id, "只有候选续句可启用 allow_implicit")
         context = _validate_context(case_id, row.get("conversation_context"))
-        if context and evaluator != "media_rating":
-            raise _schema_error(case_id, "conversation_context 仅供 media_rating 使用")
+        if context and evaluator not in _CONTEXT_EVALUATORS:
+            raise _schema_error(
+                case_id,
+                "conversation_context 仅供工具路由或 media_rating 使用",
+            )
         expected = row["expected"]
         _validate_expected(case_id, evaluator, expected)
 
         tags_raw = row.get("tags", [])
         if not isinstance(tags_raw, list) or any(
-            not isinstance(tag, str) or not _TAG_RE.fullmatch(tag) for tag in tags_raw
+            not isinstance(tag, str) or not _TAG_RE.fullmatch(tag)
+            for tag in tags_raw
         ):
-            raise _schema_error(case_id, "tags 必须是 slug 字符串数组")
-        tags = tuple(tags_raw)
-        if len(set(tags)) != len(tags):
-            raise _schema_error(case_id, "tags 不得重复")
+            raise _schema_error(case_id, "tags 必须是小写 slug 数组")
+        if len(tags_raw) != len(set(tags_raw)):
+            raise _schema_error(case_id, "tags 不能重复")
         notes = row.get("notes", "")
         if not isinstance(notes, str) or len(notes) > 300:
-            raise _schema_error(case_id, "notes 必须是不超过 300 字的字符串")
+            raise _schema_error(case_id, "notes 必须是至多 300 字符的字符串")
 
-        input_key = (evaluator, message, allow_implicit, json.dumps(context, ensure_ascii=False, sort_keys=True))
+        input_key = (
+            evaluator,
+            message,
+            allow_implicit,
+            json.dumps(context, ensure_ascii=False, sort_keys=True),
+        )
         if input_key in seen_inputs:
-            raise _schema_error(case_id, "evaluator/message/context 组合重复")
+            raise _schema_error(case_id, "同一评估器输入重复")
         seen_inputs.add(input_key)
         cases.append(AgentEvalCase(
             case_id=case_id,
-            category=category,
+            category=str(category),
             domain=domain,
-            evaluator=evaluator,
+            evaluator=str(evaluator),
             message=message,
             expected=expected,
             allow_implicit=allow_implicit,
             conversation_context=context,
-            tags=tags,
+            tags=tuple(tags_raw),
             notes=notes,
         ))
     return cases
@@ -305,7 +368,7 @@ def validate_agent_eval_rows(rows: Iterable[Mapping[str, Any]]) -> list[AgentEva
 
 def load_agent_eval_cases(path: Path | str = DEFAULT_FIXTURE) -> list[AgentEvalCase]:
     fixture = Path(path)
-    rows: list[Mapping[str, Any]] = []
+    rows: list[Any] = []
     with fixture.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             stripped = line.strip()
@@ -321,7 +384,8 @@ def load_agent_eval_cases(path: Path | str = DEFAULT_FIXTURE) -> list[AgentEvalC
     return validate_agent_eval_rows(rows)
 
 
-def _offline_route_projection(message: str) -> dict[str, Any] | None:
+def build_offline_agent_eval_registry() -> ToolRegistry:
+    """构建无业务 I/O 的工具注册表，用于冻结编排器的确定性路由契约。"""
     registry = ToolRegistry()
 
     def _identity(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -330,30 +394,100 @@ def _offline_route_projection(message: str) -> dict[str, Any] | None:
     for tool_name in sorted(_OFFLINE_ROUTE_TOOLS):
         registry.register(ToolSpec(
             name=tool_name,
-            description="offline agent route evaluator",
+            description="offline agent read route evaluator",
             risk=RiskLevel.READ,
-            parameters={},
+            parameters={"type": "object"},
             validator=_identity,
             handler=lambda _arguments, name=tool_name: ToolResult(
-                True, "success", name, data={}
+                True,
+                "success",
+                name,
+                data={},
             ),
         ))
-    response = AgentOrchestrator(registry)._query_raw(
-        message, owner="offline-agent-eval", allow_model_routing=False
+    for tool_name in sorted(_OFFLINE_WRITE_ROUTE_TOOLS):
+        registry.register(ToolSpec(
+            name=tool_name,
+            description="offline agent write route evaluator",
+            risk=RiskLevel.LOW_WRITE,
+            parameters={"type": "object"},
+            validator=_identity,
+            handler=lambda _arguments, name=tool_name: ToolResult(
+                True,
+                "changed",
+                name,
+            ),
+            requires_confirmation=True,
+            preview_handler=lambda arguments, name=tool_name: ToolResult(
+                True,
+                "confirmation_required",
+                name,
+                data=dict(arguments),
+            ),
+        ))
+    return registry
+
+
+def _offline_route_projection(
+    message: str,
+    conversation_context: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any] | None:
+    owner = "offline-agent-eval"
+    confirmation_store = ConfirmationStore()
+    orchestrator = AgentOrchestrator(
+        build_offline_agent_eval_registry(),
+        confirmation_store=confirmation_store,
+    )
+    response = orchestrator._query_raw(
+        message,
+        owner=owner,
+        conversation_context=[dict(item) for item in conversation_context],
+        allow_model_routing=False,
     )
     tool_call = response.get("tool_call") if isinstance(response, dict) else None
     if not isinstance(tool_call, dict) or not str(tool_call.get("name") or "").strip():
         return None
     arguments = tool_call.get("arguments")
+    if response.get("mode") == "confirmation_required":
+        confirmation = response.get("confirmation")
+        confirmation_id = (
+            str(confirmation.get("confirmation_id") or "").strip()
+            if isinstance(confirmation, Mapping)
+            else ""
+        )
+        if confirmation_id:
+            ticket = confirmation_store.claim(
+                owner=owner,
+                confirmation_id=confirmation_id,
+            )
+            arguments = ticket.arguments
     return {
         "tool_name": str(tool_call["name"]),
-        "arguments": dict(arguments) if isinstance(arguments, dict) else {},
+        "arguments": dict(arguments) if isinstance(arguments, Mapping) else {},
     }
 
 
+def _confusion_kind(expected: Any, actual: Any, *, matched: bool) -> str:
+    if matched:
+        return "matched"
+    if expected is None and actual is not None:
+        return "false_positive"
+    if expected is not None and actual is None:
+        return "unresolved"
+    if isinstance(expected, Mapping) and isinstance(actual, Mapping):
+        expected_tool = expected.get("tool_name")
+        actual_tool = actual.get("tool_name")
+        if expected_tool is not None or actual_tool is not None:
+            if expected_tool != actual_tool:
+                return "tool_mismatch"
+            return "argument_mismatch"
+    return "value_mismatch"
+
+
 def evaluate_agent_case(case: AgentEvalCase) -> AgentEvalOutcome:
-    if case.evaluator == "route_tool":
-        actual = _offline_route_projection(case.message)
+    started = monotonic()
+    if case.evaluator in _ROUTE_EVALUATORS:
+        actual = _offline_route_projection(case.message, case.conversation_context)
     elif case.evaluator == "diagnostic_tool":
         actual = match_read_intent(case.message.casefold(), _DIAGNOSTIC_READ_INTENTS)
     elif case.evaluator == "action_intent":
@@ -362,20 +496,25 @@ def evaluate_agent_case(case: AgentEvalCase) -> AgentEvalOutcome:
         actual = is_confirmation_planning_request(case.message)
     elif case.evaluator == "discovery_followup":
         actual = recent_discovery_candidate_request(
-            case.message, allow_implicit=case.allow_implicit
+            case.message,
+            allow_implicit=case.allow_implicit,
         )
     elif case.evaluator == "resource_followup":
         actual = recent_resource_submit_request(
-            case.message, allow_implicit=case.allow_implicit
+            case.message,
+            allow_implicit=case.allow_implicit,
         )
     elif case.evaluator == "media_rating":
         actual = contextual_media_rating_request(
-            case.message, [dict(item) for item in case.conversation_context]
+            case.message,
+            [dict(item) for item in case.conversation_context],
         )
     elif case.evaluator == "sensitive_input":
         actual = contains_sensitive_credential(case.message)
     else:  # pragma: no cover - schema validation owns this branch
         raise ValueError(f"unsupported evaluator: {case.evaluator}")
+    matched = actual == case.expected
+    elapsed_ms = max(0.0, (monotonic() - started) * 1000.0)
     return AgentEvalOutcome(
         case_id=case.case_id,
         category=case.category,
@@ -383,7 +522,9 @@ def evaluate_agent_case(case: AgentEvalCase) -> AgentEvalOutcome:
         evaluator=case.evaluator,
         expected=case.expected,
         actual=actual,
-        matched=actual == case.expected,
+        matched=matched,
+        elapsed_ms=round(elapsed_ms, 4),
+        confusion_kind=_confusion_kind(case.expected, actual, matched=matched),
     )
 
 
@@ -391,7 +532,33 @@ def evaluate_agent_cases(cases: Iterable[AgentEvalCase]) -> list[AgentEvalOutcom
     return [evaluate_agent_case(case) for case in cases]
 
 
-def _bucket_metrics(outcomes: Iterable[AgentEvalOutcome], key: str) -> dict[str, dict[str, Any]]:
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(max(0.0, float(value)) for value in values)
+    if len(ordered) == 1:
+        return round(ordered[0], 4)
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction, 4)
+
+
+def _latency_metrics(outcomes: Sequence[AgentEvalOutcome]) -> dict[str, float]:
+    values = [outcome.elapsed_ms for outcome in outcomes]
+    return {
+        "avg": round(sum(values) / len(values), 4) if values else 0.0,
+        "p50": _percentile(values, 0.50),
+        "p95": _percentile(values, 0.95),
+        "max": round(max(values), 4) if values else 0.0,
+    }
+
+
+def _bucket_metrics(
+    outcomes: Iterable[AgentEvalOutcome],
+    key: str,
+) -> dict[str, dict[str, Any]]:
     groups: dict[str, list[AgentEvalOutcome]] = defaultdict(list)
     for outcome in outcomes:
         groups[str(getattr(outcome, key))].append(outcome)
@@ -401,14 +568,54 @@ def _bucket_metrics(outcomes: Iterable[AgentEvalOutcome], key: str) -> dict[str,
             "passed": sum(row.matched for row in rows),
             "failed": sum(not row.matched for row in rows),
             "pass_rate": round(sum(row.matched for row in rows) / len(rows), 4),
+            "latency_ms": _latency_metrics(rows),
         }
         for name, rows in sorted(groups.items())
+    }
+
+
+def _safe_matrix_label(value: Any) -> str:
+    if value is None:
+        return "<none>"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, Mapping):
+        value = value.get("tool_name")
+    label = str(value or "").strip().casefold()
+    return label if _SAFE_LABEL_RE.fullmatch(label) else "<value>"
+
+
+def _confusion_matrix(outcomes: Sequence[AgentEvalOutcome]) -> dict[str, Any]:
+    by_evaluator: dict[str, dict[str, dict[str, int]]] = {}
+    for evaluator in sorted(_MATRIX_EVALUATORS):
+        rows = [outcome for outcome in outcomes if outcome.evaluator == evaluator]
+        if not rows:
+            continue
+        matrix: dict[str, Counter[str]] = defaultdict(Counter)
+        for outcome in rows:
+            matrix[_safe_matrix_label(outcome.expected)][
+                _safe_matrix_label(outcome.actual)
+            ] += 1
+        by_evaluator[evaluator] = {
+            expected: dict(sorted(actuals.items()))
+            for expected, actuals in sorted(matrix.items())
+        }
+    return {
+        "by_kind": dict(sorted(Counter(
+            outcome.confusion_kind for outcome in outcomes
+        ).items())),
+        "by_evaluator": by_evaluator,
     }
 
 
 def agent_eval_metrics(outcomes: Sequence[AgentEvalOutcome]) -> dict[str, Any]:
     total = len(outcomes)
     passed = sum(outcome.matched for outcome in outcomes)
+    safety_rows = [
+        outcome for outcome in outcomes if outcome.category == "safety_adversarial"
+    ]
+    safety_passed = sum(outcome.matched for outcome in safety_rows)
+    safety_gate_passed = bool(safety_rows) and safety_passed == len(safety_rows)
     return {
         "overall": {
             "total": total,
@@ -416,37 +623,71 @@ def agent_eval_metrics(outcomes: Sequence[AgentEvalOutcome]) -> dict[str, Any]:
             "failed": total - passed,
             "pass_rate": round(passed / total, 4) if total else 0.0,
         },
+        "latency_ms": _latency_metrics(outcomes),
         "by_category": _bucket_metrics(outcomes, "category"),
         "by_domain": _bucket_metrics(outcomes, "domain"),
         "by_evaluator": _bucket_metrics(outcomes, "evaluator"),
-        "failed_case_ids": [outcome.case_id for outcome in outcomes if not outcome.matched],
+        "confusion_matrix": _confusion_matrix(outcomes),
+        "safety": {
+            "total": len(safety_rows),
+            "passed": safety_passed,
+            "failed": len(safety_rows) - safety_passed,
+            "pass_rate": (
+                round(safety_passed / len(safety_rows), 4) if safety_rows else 0.0
+            ),
+            "gate_passed": safety_gate_passed,
+        },
+        "safety_gate_passed": safety_gate_passed,
+        "failed_case_ids": [
+            outcome.case_id for outcome in outcomes if not outcome.matched
+        ],
     }
 
 
 def format_agent_eval_report(outcomes: Sequence[AgentEvalOutcome]) -> str:
     metrics = agent_eval_metrics(outcomes)
     overall = metrics["overall"]
+    latency = metrics["latency_ms"]
     lines = [
         "MediaFlux Agent 离线评测",
         f"总体: {overall['passed']}/{overall['total']} "
         f"({overall['pass_rate'] * 100:.1f}%)，失败 {overall['failed']}",
+        "时延: "
+        f"avg={latency['avg']:.3f}ms p50={latency['p50']:.3f}ms "
+        f"p95={latency['p95']:.3f}ms max={latency['max']:.3f}ms",
+        "安全门禁: " + ("通过" if metrics["safety_gate_passed"] else "失败或未覆盖"),
     ]
-    for label, key in (("分类", "by_category"), ("领域", "by_domain"), ("评估器", "by_evaluator")):
+    for label, key in (
+        ("分类", "by_category"),
+        ("领域", "by_domain"),
+        ("评估器", "by_evaluator"),
+    ):
         lines.append(f"{label}:")
         for name, row in metrics[key].items():
             lines.append(
                 f"  - {name}: {row['passed']}/{row['total']} "
-                f"({row['pass_rate'] * 100:.1f}%)"
+                f"({row['pass_rate'] * 100:.1f}%)，p95={row['latency_ms']['p95']:.3f}ms"
             )
     failures = [outcome for outcome in outcomes if not outcome.matched]
     if failures:
         lines.append("失败样本:")
         for outcome in failures:
+            # 不输出 message、expected 或 actual，避免自定义安全语料进入日志/CI。
             lines.append(
                 f"  - {outcome.case_id} [{outcome.evaluator}] "
-                f"expected={outcome.expected!r} actual={outcome.actual!r}"
+                f"kind={outcome.confusion_kind}"
             )
     return "\n".join(lines)
+
+
+def _positive_latency(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是数字") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须大于 0")
+    return parsed
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -456,6 +697,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--domain")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--strict-safety",
+        action="store_true",
+        help="要求安全对抗分组存在且 100%% 通过；失败返回状态码 3",
+    )
+    parser.add_argument(
+        "--max-p95-latency-ms",
+        type=_positive_latency,
+        help="限制总体单样本 P95 时延；超限返回状态码 4",
+    )
     return parser
 
 
@@ -470,8 +721,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("筛选后没有 Agent 评测样本", file=sys.stderr)
         return 2
     outcomes = evaluate_agent_cases(cases)
+    metrics = agent_eval_metrics(outcomes)
     if args.format == "json":
-        rendered = json.dumps(agent_eval_metrics(outcomes), ensure_ascii=False, indent=2)
+        rendered = json.dumps(metrics, ensure_ascii=False, indent=2)
     else:
         rendered = format_agent_eval_report(outcomes)
     if args.output:
@@ -479,7 +731,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.output.write_text(f"{rendered}\n", encoding="utf-8")
     else:
         print(rendered)
-    return 0 if all(outcome.matched for outcome in outcomes) else 1
+
+    if args.strict_safety and not metrics["safety_gate_passed"]:
+        return 3
+    if (
+        args.max_p95_latency_ms is not None
+        and metrics["latency_ms"]["p95"] > args.max_p95_latency_ms
+    ):
+        return 4
+    return 0 if metrics["overall"]["failed"] == 0 else 1
 
 
 if __name__ == "__main__":

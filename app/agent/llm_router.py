@@ -2238,6 +2238,7 @@ def run_native_read_agent(
                 execute_tool,
                 conversation_context=conversation_context,
                 include_confirmations=include_confirmations,
+                client_factory=FixedHostHttpClient,
                 fallback_budget=lambda: _reserve_llm_provider_request(owner),
             )
         )

@@ -53,7 +53,8 @@ python -m unittest tests.test_anime_recognition_adapter
 # Agent 自然语言离线评测集
 
 `agent_eval_cases.jsonl` 用于冻结 Agent 的确定性自然语言契约。它只评估本地分类器、
-参数抽取器与安全检测，不启动 Agent 服务、不连接网络，也不调用 LLM Provider。
+参数抽取器、只读/写入确认路由与安全检测；评测器使用离线 stub 注册表，不连接业务后端、
+网络或 LLM Provider。
 
 每条样本必须包含：
 
@@ -61,11 +62,12 @@ python -m unittest tests.test_anime_recognition_adapter
 - `category`：`read`、`write`、`clarification`、`multi_turn`、
   `argument_validation` 或 `safety_adversarial`；
 - `domain`：小写 snake_case 领域名；
-- `evaluator`：受支持的确定性评估器；
+- `evaluator`：受支持的确定性评估器，包括 `route_tool` 与
+  `write_tool_route`；
 - `message`：用户自然语言输入；
 - `expected`：该评估器的精确期望结果。
 
-候选续句可通过 `allow_implicit` 模拟当前会话已有候选快照；评分续句可通过
+候选续句可通过 `allow_implicit` 模拟当前会话已有候选快照；评分和工具路由续句可通过
 `conversation_context` 提供经过裁剪的安全历史。加载器会拒绝未知字段、重复样本、
 非法上下文和与评估器不匹配的 expected 结构。
 
@@ -76,10 +78,17 @@ python -m tools.eval_agent
 python -m unittest tests.test_agent_eval
 ```
 
-生成机器可读报告：
+执行发布门禁并生成机器可读报告：
 
 ```bash
-python -m tools.eval_agent --format json --output .superpowers/agent-eval.json
+python -m tools.eval_agent \
+  --format json \
+  --output .superpowers/agent-eval.json \
+  --strict-safety \
+  --max-p95-latency-ms 25
 ```
 
-报告只列出指标与失败 `case_id`，不会回显安全对抗样本中的输入文本。
+退出码约定：`0` 全部通过、`1` 存在普通契约失败、`2` 筛选后无样本、`3` 严格安全
+门禁失败、`4` P95 时延超限。JSON 报告包含总体/分组准确率、混淆矩阵和
+avg/P50/P95/max 时延；文本与 JSON 报告只列失败 `case_id`，不会回显安全对抗输入、
+expected 或 actual。
