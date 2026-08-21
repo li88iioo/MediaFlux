@@ -1,0 +1,137 @@
+{# 光鸭与本地媒体共用的刮削弹窗骨架；调用方通过 media_scrape 配置保留各自既有 ID/API。 #}
+<div class="app-modal {{ media_scrape.css }}-modal"
+     id="{{ media_scrape.modal_id }}" data-media-scrape-source="{{ media_scrape.source }}" hidden>
+    <section class="{% if media_scrape.card %}card {% endif %}{{ media_scrape.css }}-dialog"
+             role="dialog" aria-modal="true"{% if media_scrape.title_id %} aria-labelledby="{{ media_scrape.title_id }}"{% else %} aria-label="搜索并刮削所选媒体"{% endif %}>
+        <header class="{{ media_scrape.css }}-head">
+            <div class="{{ media_scrape.css }}-head-context">
+                <i data-lucide="folder-search"></i>
+                <div>
+                    <span{% if media_scrape.title_id %} id="{{ media_scrape.title_id }}"{% endif %}>{{ media_scrape.title }}</span>
+                    <p id="{{ media_scrape.path_id }}">{{ media_scrape.path_placeholder }}</p>
+                </div>
+            </div>
+            <button type="button" class="icon-btn" id="{{ media_scrape.close_id }}"
+                    aria-label="关闭刮削窗口" title="关闭"><i data-lucide="x"></i></button>
+        </header>
+
+        <div class="{{ media_scrape.css }}-searchbar">
+            <label{% if media_scrape.query_label_class %} class="{{ media_scrape.query_label_class }}"{% endif %}>
+                <span>搜索名称</span>
+                {% if media_scrape.clean_id %}<div class="{{ media_scrape.css }}-query-input-wrap">{% endif %}
+                <input type="search" class="form-input" id="{{ media_scrape.query_id }}"
+                       autocomplete="off" placeholder="输入电影或剧集名称">
+                {% if media_scrape.clean_id %}
+                    <button type="button" class="{{ media_scrape.css }}-clean-btn" id="{{ media_scrape.clean_id }}"
+                            title="智能精简搜索词（保留正式副标题，仅移除发布噪声）" aria-label="一键精简搜索名称">
+                        <i data-lucide="sparkles"></i><span>一键精简</span>
+                    </button>
+                </div>
+                {% endif %}
+            </label>
+            <label>
+                <span>媒体类型</span>
+                <select class="form-select" id="{{ media_scrape.type_id }}" data-media-scrape-role="media-type">
+                    {% if media_scrape.allow_auto_type %}<option value="auto">自动</option>{% endif %}
+                    <option value="movie">电影</option>
+                    <option value="tv">剧集</option>
+                </select>
+            </label>
+            <div class="{{ media_scrape.css }}-episode-fields"
+                 id="{{ media_scrape.position_id }}" data-media-scrape-role="position-fields" hidden>
+                {% if media_scrape.numbering_id %}
+                <label id="{{ media_scrape.numbering_field_id }}" title="自动判断发布组编号是否需要按 TMDB 季集重新映射">
+                    <span>编号方式</span>
+                    <select class="form-select" id="{{ media_scrape.numbering_id }}" data-media-scrape-role="numbering">
+                        <option value="auto">自动判断</option>
+                        <option value="standard">保持原编号</option>
+                        <option value="absolute">绝对集数</option>
+                        <option value="season_continuous">跨季连续</option>
+                    </select>
+                </label>
+                {% endif %}
+                <label id="{{ media_scrape.season_field_id }}" data-media-scrape-role="season-field"
+                       title="目录模式下会将季号应用到其中全部剧集文件">
+                    <span>归档季</span>
+                    <input type="number" class="form-input" id="{{ media_scrape.season_id }}"
+                           min="0" max="99" inputmode="numeric" aria-label="归档季号"
+                           data-media-scrape-role="season">
+                </label>
+                <label id="{{ media_scrape.episode_field_id }}" data-media-scrape-role="episode-field">
+                    <span>集</span>
+                    <input type="number" class="form-input" id="{{ media_scrape.episode_id }}"
+                           min="1" max="999" inputmode="numeric" aria-label="归档集号"
+                           data-media-scrape-role="episode">
+                </label>
+            </div>
+            {% if media_scrape.auto_id %}
+            <button class="jump-btn" type="button" id="{{ media_scrape.auto_id }}">
+                <i data-lucide="wand-sparkles"></i><span data-button-label>自动匹配</span>
+            </button>
+            {% endif %}
+            <button class="btn btn-primary" type="button" id="{{ media_scrape.search_id }}">
+                <i data-lucide="search"></i><span data-button-label>搜索</span>
+            </button>
+        </div>
+
+        <div class="{{ media_scrape.css }}-workspace">
+            <section class="{{ media_scrape.css }}-candidate-region"
+                     aria-labelledby="{{ media_scrape.candidate_title_id }}">
+                <div class="{{ media_scrape.css }}-region-head">
+                    <div><strong id="{{ media_scrape.candidate_title_id }}">媒体候选</strong><small id="{{ media_scrape.candidate_count_id }}">0 项</small></div>
+                    {% if media_scrape.external_id %}
+                    <button type="button" class="jump-btn {{ media_scrape.css }}-external-btn" id="{{ media_scrape.external_id }}">
+                        <i data-lucide="book-open-check"></i><span>豆瓣 / BGM 线索</span>
+                    </button>
+                    {% endif %}
+                </div>
+                <div class="{{ media_scrape.candidate_list_class }}" id="{{ media_scrape.candidates_id }}" aria-live="polite">
+                    <div class="{{ media_scrape.css }}-placeholder">
+                        <i data-lucide="scan-search"></i><strong>等待搜索</strong>
+                        <span>候选结果会保留在这里，切换候选不会引起布局跳动。</span>
+                    </div>
+                </div>
+                {% if media_scrape.external_hints_id %}
+                <div class="{{ media_scrape.css }}-external-hints" id="{{ media_scrape.external_hints_id }}" hidden aria-live="polite"></div>
+                {% endif %}
+            </section>
+
+            <section class="{{ media_scrape.css }}-detail-region"
+                     aria-labelledby="{{ media_scrape.detail_title_id }}">
+                <div class="{{ media_scrape.css }}-region-head">
+                    <strong id="{{ media_scrape.detail_title_id }}">媒体与归档预览</strong>
+                    <small id="{{ media_scrape.status_id }}" aria-live="polite">尚未选择</small>
+                </div>
+                <div class="{{ media_scrape.css }}-detail" id="{{ media_scrape.detail_id }}">
+                    <div class="{{ media_scrape.css }}-placeholder">
+                        <i data-lucide="clapperboard"></i><strong>{{ media_scrape.detail_placeholder_title }}</strong>
+                        <span>{{ media_scrape.detail_placeholder_copy }}</span>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <footer class="{{ media_scrape.css }}-footer">
+            <div class="{{ media_scrape.css }}-footer-context">
+                <div class="{{ media_scrape.css }}-inspection"{% if media_scrape.inspection_id %} id="{{ media_scrape.inspection_id }}"{% endif %}
+                     data-state="ready" aria-live="polite">
+                    <i data-lucide="shield-check"></i>
+                    <div>
+                        <strong id="{{ media_scrape.inspection_summary_id }}">等待检查</strong>
+                        <span{% if media_scrape.inspection_hint_id %} class="sr-only" id="{{ media_scrape.inspection_hint_id }}"{% endif %}>{{ media_scrape.inspection_hint }}</span>
+                    </div>
+                </div>
+                <div class="{{ media_scrape.css }}-target">
+                    <strong id="{{ media_scrape.plan_summary_id }}">确认前不会写入{{ media_scrape.target_noun }}</strong>
+                    <small id="{{ media_scrape.archive_target_id }}">{{ media_scrape.archive_placeholder }}</small>
+                </div>
+            </div>
+            <div class="{{ media_scrape.css }}-footer-actions">
+                <button type="button" class="jump-btn" id="{{ media_scrape.cancel_id }}">取消</button>
+                <button type="button" class="btn btn-primary" id="{{ media_scrape.run_id }}" disabled>
+                    <i data-lucide="folder-check"></i><span data-button-label>{{ media_scrape.run_label }}</span>
+                </button>
+            </div>
+        </footer>
+    </section>
+</div>

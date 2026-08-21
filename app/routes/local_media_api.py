@@ -66,6 +66,27 @@ def _boolean(payload: dict, key: str, default: bool) -> bool:
     return value
 
 
+def _optional_integer(
+    payload: dict, key: str, *, minimum: int, maximum: int, label: str,
+) -> int | None:
+    if key not in payload or payload.get(key) in (None, ""):
+        return None
+    value = payload.get(key)
+    if isinstance(value, bool):
+        raise ValueError(f"{label}必须是整数")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}必须是整数") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError(f"{label}必须是整数")
+    if isinstance(value, str) and str(number) != value.strip():
+        raise ValueError(f"{label}必须是整数")
+    if not minimum <= number <= maximum:
+        raise ValueError(f"{label}必须是 {minimum}-{maximum} 的整数")
+    return number
+
+
 def _source_payload(source) -> dict:
     targets = db.list_local_library_targets(source.id, owner=_OWNER)
     return {
@@ -94,6 +115,8 @@ def _task_payload(task) -> dict:
         "content_name": Path(task.content_path).name,
         "trigger": task.trigger, "status": task.status, "attempts": task.attempts,
         "tmdb_id": getattr(task, "tmdb_id", ""), "media_type": getattr(task, "media_type", ""),
+        "season": getattr(task, "season_override", None),
+        "episode": getattr(task, "episode_override", None),
         "error": task.error, "warning": task.warning,
         "created_at": task.created_at, "updated_at": task.updated_at,
         "completed_at": task.completed_at,
@@ -501,6 +524,12 @@ def preview_media(request: Request, data: dict | None = Body(default=None)):
             _OWNER, _text(payload, "inspection_id", required=True, max_length=64),
             _text(payload, "tmdb_id", max_length=32), _text(payload, "media_type", max_length=16),
             payload.get("overrides") if isinstance(payload.get("overrides"), dict) else None,
+            season_override=_optional_integer(
+                payload, "season", minimum=0, maximum=99, label="季数",
+            ),
+            episode_override=_optional_integer(
+                payload, "episode", minimum=1, maximum=999, label="集数",
+            ),
         )
         return {key: value for key, value in result.items() if not key.startswith("_")}
     except Exception as exc:
@@ -518,6 +547,12 @@ def execute_media(request: Request, data: dict | None = Body(default=None)):
             tmdb_id=_text(payload, "tmdb_id", max_length=32),
             media_type=_text(payload, "media_type", max_length=16),
             rules_snapshot=_text(payload, "rules_snapshot", max_length=20000),
+            season_override=_optional_integer(
+                payload, "season", minimum=0, maximum=99, label="季数",
+            ),
+            episode_override=_optional_integer(
+                payload, "episode", minimum=1, maximum=999, label="集数",
+            ),
         )
         if not db.claim_local_media_task(task_id, expected="waiting_stable", owner=_OWNER):
             raise LocalMediaServiceError("任务已被其他操作认领")
@@ -544,10 +579,20 @@ def retry_task(task_id: int, request: Request, data: dict | None = Body(default=
     require_api_login(request)
     payload = data or {}
     try:
-        if not db.reset_local_media_task(
-            task_id, owner=_OWNER, tmdb_id=_text(payload, "tmdb_id", max_length=32),
-            media_type=_text(payload, "media_type", max_length=16),
-        ):
+        retry_fields: dict[str, object] = {}
+        if "tmdb_id" in payload:
+            retry_fields["tmdb_id"] = _text(payload, "tmdb_id", max_length=32)
+        if "media_type" in payload:
+            retry_fields["media_type"] = _text(payload, "media_type", max_length=16)
+        if "season" in payload:
+            retry_fields["season_override"] = _optional_integer(
+                payload, "season", minimum=0, maximum=99, label="季数",
+            )
+        if "episode" in payload:
+            retry_fields["episode_override"] = _optional_integer(
+                payload, "episode", minimum=1, maximum=999, label="集数",
+            )
+        if not db.reset_local_media_task(task_id, owner=_OWNER, **retry_fields):
             return api_error("任务不存在或当前状态不可重试", 409)
         get_local_media_scheduler().reload()
         return {"queued": True, "task_id": task_id}

@@ -21,6 +21,7 @@ class StaticAssetBuildTests(unittest.TestCase):
             "window.fetch",
         ),
         "js/motion.js": ("MFAnim",),
+        "js/media-scrape-position.js": ("MediaScrapePosition",),
         "js/guangya-directory-scrape.js": ("GuangYaDirectoryScrapeUI",),
         "js/subscriptions.js": ("openSubscriptionModal", "closeSubscriptionModal"),
         "js/downloads.js": (

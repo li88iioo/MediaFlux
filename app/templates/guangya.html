@@ -126,128 +126,36 @@
     </button>
 </div>
 
-<div class="app-modal gy-scrape-modal" id="gyScrapeModal" hidden>
-    <section class="card gy-scrape-dialog" role="dialog" aria-modal="true" aria-label="搜索并刮削所选媒体">
-        <header class="gy-scrape-head">
-            <div class="gy-scrape-head-context">
-                <i data-lucide="folder-search"></i>
-                <div>
-                    <span>手动刮削</span>
-                    <p id="gyScrapeDirectory">等待目录检查</p>
-                </div>
-            </div>
-            <button type="button" class="icon-btn" id="gyScrapeCloseBtn" aria-label="关闭刮削窗口" title="关闭">
-                <i data-lucide="x"></i>
-            </button>
-        </header>
-
-        <div class="gy-scrape-searchbar">
-            <label class="gy-scrape-query-label">
-                <span>搜索名称</span>
-                <div class="gy-scrape-query-input-wrap">
-                    <input type="search" class="form-input" id="gyScrapeQuery" autocomplete="off" placeholder="输入电影或剧集名称">
-                    <button type="button" class="gy-scrape-clean-btn" id="gyScrapeCleanBtn" title="智能精简搜索词（保留正式副标题，仅移除发布噪声）" aria-label="一键精简搜索名称">
-                        <i data-lucide="sparkles"></i>
-                        <span>一键精简</span>
-                    </button>
-                </div>
-            </label>
-            <label>
-                <span>媒体类型</span>
-                <select class="form-select" id="gyScrapeType">
-                    <option value="auto">自动</option>
-                    <option value="movie">电影</option>
-                    <option value="tv">剧集</option>
-                </select>
-            </label>
-            <div class="gy-scrape-episode-fields" id="gyScrapeEpisodeFields" hidden>
-                <label id="gyScrapeNumberingField" title="自动判断发布组编号是否需要按 TMDB 季集重新映射">
-                    <span>编号方式</span>
-                    <select class="form-select" id="gyScrapeNumbering" aria-label="剧集编号映射方式">
-                        <option value="auto">自动判断</option>
-                        <option value="standard">保持原编号</option>
-                        <option value="absolute">绝对集数</option>
-                        <option value="season_continuous">跨季连续</option>
-                    </select>
-                </label>
-                <label id="gyScrapeSeasonField" title="目录模式下会将季号应用到其中全部剧集文件">
-                    <span>归档季</span>
-                    <input type="number" class="form-input" id="gyScrapeSeason" min="0" max="99" inputmode="numeric" aria-label="归档季号">
-                </label>
-                <label id="gyScrapeEpisodeField">
-                    <span>集</span>
-                    <input type="number" class="form-input" id="gyScrapeEpisode" min="1" max="999" inputmode="numeric" aria-label="归档集号">
-                </label>
-            </div>
-            <button type="button" class="btn btn-primary" id="gyScrapeSearchBtn">
-                <i data-lucide="search"></i><span>搜索</span>
-            </button>
-        </div>
-
-        <div class="gy-scrape-workspace">
-            <section class="gy-scrape-candidate-region" aria-labelledby="gyScrapeCandidateTitle">
-                <div class="gy-scrape-region-head">
-                    <div>
-                        <strong id="gyScrapeCandidateTitle">媒体候选</strong>
-                        <small id="gyScrapeCandidateCount">0 项</small>
-                    </div>
-                    <button type="button" class="jump-btn gy-scrape-external-btn" id="gyScrapeExternalBtn">
-                        <i data-lucide="book-open-check"></i><span>豆瓣 / BGM 线索</span>
-                    </button>
-                </div>
-                <div class="gy-scrape-candidates" id="gyScrapeCandidates" aria-live="polite">
-                    <div class="gy-scrape-placeholder">
-                        <i data-lucide="scan-search"></i>
-                        <strong>等待搜索</strong>
-                        <span>候选结果会保留在这里，切换候选不会引起布局跳动。</span>
-                    </div>
-                </div>
-                <div class="gy-scrape-external-hints" id="gyScrapeExternalHints" hidden aria-live="polite"></div>
-            </section>
-
-            <section class="gy-scrape-detail-region" aria-labelledby="gyScrapeDetailTitle">
-                <div class="gy-scrape-region-head">
-                    <strong id="gyScrapeDetailTitle">媒体与归档预览</strong>
-                    <small id="gyScrapeStatus" aria-live="polite">尚未选择</small>
-                </div>
-                <div class="gy-scrape-detail" id="gyScrapeDetail">
-                    <div class="gy-scrape-placeholder">
-                        <i data-lucide="clapperboard"></i>
-                        <strong>选择一个媒体候选</strong>
-                        <span>选择候选后，将逐项核对源文件、季集映射和最终归档名称。</span>
-                    </div>
-                </div>
-            </section>
-        </div>
-
-        <footer class="gy-scrape-footer">
-            <div class="gy-scrape-footer-context">
-                <div class="gy-scrape-inspection" id="gyScrapeInspection" data-state="ready" aria-live="polite">
-                    <i data-lucide="shield-check"></i>
-                    <div>
-                        <strong id="gyScrapeInspectionSummary">等待检查</strong>
-                        <span class="sr-only" id="gyScrapeInspectionHint">仅归档已确认文件</span>
-                    </div>
-                </div>
-                <div class="gy-scrape-target">
-                    <strong id="gyScrapePlanSummary">确认前不会写入云盘</strong>
-                    <small id="gyScrapeArchiveTarget">将整理至：等待目录检查</small>
-                </div>
-            </div>
-            <div class="gy-scrape-footer-actions">
-                <button type="button" class="jump-btn" id="gyScrapeCancelBtn">取消</button>
-                <button type="button" class="btn btn-primary" id="gyScrapeRunBtn" disabled>
-                    <i data-lucide="folder-check"></i><span>确认并开始刮削</span>
-                </button>
-            </div>
-        </footer>
-    </section>
-</div>
+{% set media_scrape = {
+    "source": "guangya", "css": "gy-scrape", "card": true,
+    "modal_id": "gyScrapeModal", "title_id": "", "title": "手动刮削",
+    "path_id": "gyScrapeDirectory", "path_placeholder": "等待目录检查",
+    "close_id": "gyScrapeCloseBtn", "query_id": "gyScrapeQuery",
+    "query_label_class": "gy-scrape-query-label", "clean_id": "gyScrapeCleanBtn",
+    "type_id": "gyScrapeType", "allow_auto_type": true,
+    "position_id": "gyScrapeEpisodeFields", "numbering_field_id": "gyScrapeNumberingField",
+    "numbering_id": "gyScrapeNumbering", "season_field_id": "gyScrapeSeasonField",
+    "season_id": "gyScrapeSeason", "episode_field_id": "gyScrapeEpisodeField",
+    "episode_id": "gyScrapeEpisode", "auto_id": "", "search_id": "gyScrapeSearchBtn",
+    "candidate_title_id": "gyScrapeCandidateTitle", "candidate_count_id": "gyScrapeCandidateCount",
+    "candidate_list_class": "gy-scrape-candidates", "candidates_id": "gyScrapeCandidates",
+    "external_id": "gyScrapeExternalBtn", "external_hints_id": "gyScrapeExternalHints",
+    "detail_title_id": "gyScrapeDetailTitle", "status_id": "gyScrapeStatus",
+    "detail_id": "gyScrapeDetail", "detail_placeholder_title": "选择一个媒体候选",
+    "detail_placeholder_copy": "选择候选后，将逐项核对源文件、季集映射和最终归档名称。",
+    "inspection_id": "gyScrapeInspection", "inspection_summary_id": "gyScrapeInspectionSummary",
+    "inspection_hint_id": "gyScrapeInspectionHint", "inspection_hint": "仅归档已确认文件",
+    "plan_summary_id": "gyScrapePlanSummary", "archive_target_id": "gyScrapeArchiveTarget",
+    "target_noun": "云盘", "archive_placeholder": "将整理至：等待目录检查",
+    "cancel_id": "gyScrapeCancelBtn", "run_id": "gyScrapeRunBtn", "run_label": "确认并开始刮削"
+} %}
+{% include "_media_scrape_modal.html" %}
 
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/guangya-directory-scrape.js') }}?v=20260810a"></script>
+<script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260821a"></script>
+<script src="{{ url_for('static', path='js/guangya-directory-scrape.js') }}?v=20260821a"></script>
 <script>
 function gyApi(path, opts){
     return fetch('/api/guangya'+path, opts).then(async response=>{

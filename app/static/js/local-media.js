@@ -624,6 +624,16 @@
         },
     };
 
+    const positionControls = window.MediaScrapePosition.create({
+        root: $('lmScrapeModal'),
+        isSingleFile: () => inspection?.selected_kind === 'file',
+        elements: {
+            fields: $('lmScrapeEpisodeFields'), seasonField: $('lmScrapeSeasonField'),
+            episodeField: $('lmScrapeEpisodeField'), season: $('lmScrapeSeason'),
+            episode: $('lmScrapeEpisode'),
+        },
+    });
+
     function openSource(source = null, trigger = null) {
         $('lmSourceDialogTitle').textContent = source ? '编辑媒体来源' : '新增媒体来源';
         $('lmSourceId').value = source?.id || '';
@@ -706,6 +716,8 @@
         searchRequestSerial += 1;
         invalidatePreview();
         inspection = null;
+        positionControls.reset();
+        positionControls.sync($('lmMediaType').value);
         $('lmCandidateCount').textContent = '0 项';
         $('lmCandidates').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>等待搜索</strong><span>检查完成后会在这里展示 TMDB 候选。</span></div>';
         $('lmScrapeDetail').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="clapperboard"></i><strong>等待媒体识别</strong><span>选择候选或使用自动匹配后，将显示完整归档方案。</span></div>';
@@ -722,6 +734,7 @@
         lastPreview = null;
         appliedPreviewContext = null;
         $('lmSearchQuery').value = inspection.selected_name || activeMediaItem?.name || '';
+        positionControls.sync($('lmMediaType').value);
         $('lmScrapeInspectionSummary').textContent = `${inspection.video_count} 个视频 · ${inspection.file_count} 个扫描文件`;
         $('lmScrapeStatus').textContent = '等待匹配';
         $('lmCandidates').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>检查完成</strong><span>可以搜索 TMDB 候选，或直接使用自动匹配。</span></div>';
@@ -737,6 +750,7 @@
         resetScrapeWorkspace();
         const source = sources.find((entry) => Number(entry.id) === Number(item.source_id));
         $('lmMediaType').value = source?.media_type === 'tv' ? 'tv' : 'movie';
+        positionControls.sync($('lmMediaType').value);
         $('lmScrapeTitle').textContent = automatic ? `自动匹配 · ${item.name}` : `搜索刮削 · ${item.name}`;
         $('lmScrapeItemPath').textContent = `${item.source_name} / ${item.path}`;
         if (scrapeModal) scrapeModal.open(trigger);
@@ -805,6 +819,8 @@
             if (scrapeModal) scrapeModal.open(button);
             else $('lmScrapeModal').hidden = false;
             applyInspection(result);
+            positionControls.reset({season: task?.season, episode: task?.episode});
+            positionControls.sync($('lmMediaType').value);
             await search();
         } catch (error) {
             if (requestSerial === inspectionRequestSerial) appAlert({type: 'error', title: '无法进入人工确认', message: error.message});
@@ -859,11 +875,23 @@
 
     async function preview(candidate = null) {
         if (!inspection) return false;
+        const mediaType = candidate?.media_type || $('lmMediaType').value;
+        positionControls.sync(mediaType);
+        let positionPayload;
+        try {
+            positionPayload = positionControls.payload(mediaType, {singleFileRequiresDirty: false});
+        } catch (error) {
+            $('lmScrapeStatus').textContent = '预览参数无效';
+            appAlert({type: 'warning', title: '季集参数无效', message: error.message});
+            return false;
+        }
         const requestSerial = ++previewRequestSerial;
         const context = Object.freeze({
             inspectionId: inspection.inspection_id,
             tmdbId: candidate?.tmdb_id || '',
-            mediaType: candidate?.media_type || $('lmMediaType').value,
+            mediaType,
+            season: positionPayload.season ?? null,
+            episode: positionPayload.episode ?? null,
         });
         selectedCandidate = null;
         lastPreview = null;
@@ -878,6 +906,8 @@
                     inspection_id: context.inspectionId,
                     tmdb_id: context.tmdbId,
                     media_type: context.mediaType,
+                    season: context.season,
+                    episode: context.episode,
                 }),
             });
             if (requestSerial !== previewRequestSerial || inspection?.inspection_id !== context.inspectionId) return false;
@@ -889,18 +919,26 @@
             }
             selectedCandidate = candidate;
             lastPreview = previewResult;
-            appliedPreviewContext = context;
+            const effectivePosition = previewResult.position_overrides || {};
+            appliedPreviewContext = Object.freeze({
+                ...context,
+                season: effectivePosition.season ?? context.season,
+                episode: effectivePosition.episode ?? context.episode,
+            });
             const plans = previewResult.plans || [];
             const cleanup = previewResult.cleanup || [];
             const replacements = plans.filter((item) => item.action === 'replace').length;
             const skipped = plans.filter((item) => item.action === 'skip').length;
             const matched = previewResult.matches?.[0];
+            const positionLabel = Number.isInteger(matched?.episode)
+                ? ` · S${String(matched.season ?? 1).padStart(2, '0')}E${String(matched.episode).padStart(2, '0')}`
+                : (Number.isInteger(appliedPreviewContext.season) ? ` · 第 ${appliedPreviewContext.season} 季` : '');
             $('lmPlanSummary').textContent = `${plans.length} 项整理 · ${replacements} 项安全覆盖 · ${cleanup.length} 项清理`;
             $('lmScrapeTarget').textContent = plans[0]?.target_path ? `将整理至：${plans[0].target_path}` : '目标路径已校验';
             $('lmScrapeStatus').textContent = '计划已就绪';
             $('lmScrapeDetail').innerHTML = `
                 <div class="lm-scrape-summary">
-                    <div><strong>${esc(matched?.title || activeMediaItem?.name || '已识别')}</strong><span>${esc(matched?.media_type || context.mediaType)} · TMDB ${esc(matched?.tmdb_id || context.tmdbId || '自动')}</span></div>
+                    <div><strong>${esc(matched?.title || activeMediaItem?.name || '已识别')}</strong><span>${esc(matched?.media_type || context.mediaType)} · TMDB ${esc(matched?.tmdb_id || context.tmdbId || '自动')}${positionLabel}</span></div>
                     <div><strong>${plans.length}</strong><span>媒体与伴随文件</span></div>
                     <div><strong>${replacements}</strong><span>同名目标安全覆盖${skipped ? ` · ${skipped} 项保留` : ''}</span></div>
                 </div>
@@ -955,6 +993,8 @@
                     inspection_id: confirmedContext.inspectionId,
                     tmdb_id: confirmedContext.tmdbId,
                     media_type: confirmedContext.mediaType,
+                    season: confirmedContext.season,
+                    episode: confirmedContext.episode,
                     rules_snapshot: confirmedPreview.rules_snapshot || '',
                 }),
             });
@@ -1079,6 +1119,12 @@
     $('lmSearchQuery').addEventListener('keydown', (event) => {
         if (event.key === 'Enter') { event.preventDefault(); search(); }
     });
+    $('lmMediaType').addEventListener('change', () => {
+        positionControls.sync($('lmMediaType').value);
+        invalidatePreview();
+    });
+    $('lmScrapeSeason').addEventListener('input', invalidatePreview);
+    $('lmScrapeEpisode').addEventListener('input', invalidatePreview);
     $('lmScrapeCloseBtn').addEventListener('click', closeScrape);
     $('lmScrapeCancelBtn').addEventListener('click', closeScrape);
     $('lmExecuteBtn').addEventListener('click', execute);

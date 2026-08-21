@@ -594,7 +594,7 @@ body.lm-scrape-open { overflow: hidden; }
 }
 .lm-scrape-searchbar {
     min-height: 60px; padding: 8px 16px 9px;
-    display: grid; grid-template-columns: minmax(280px, 1fr) 128px 118px 102px; align-items: end; gap: 8px;
+    display: grid; grid-template-columns: minmax(280px, 1fr) 116px minmax(188px, 220px) 118px 102px; align-items: end; gap: 8px;
     background: var(--bg-input); border-bottom: 1px solid var(--border-soft);
 }
 .lm-scrape-searchbar label > span {
@@ -605,6 +605,15 @@ body.lm-scrape-open { overflow: hidden; }
 .lm-scrape-searchbar .form-select,
 .lm-scrape-searchbar .btn,
 .lm-scrape-searchbar .jump-btn { width: 100%; height: var(--lm-scrape-control-height); min-height: var(--lm-scrape-control-height); }
+.lm-scrape-episode-fields {
+    min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(82px, 1fr)); align-items: end; gap: 8px;
+}
+.lm-scrape-episode-fields[hidden] { display: none; }
+.lm-scrape-episode-fields.is-season-only { grid-template-columns: minmax(96px, 1fr); }
+.lm-scrape-episode-fields label > span {
+    display: block; margin-bottom: 4px; color: var(--text-muted);
+    font: 700 8.5px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: .5px;
+}
 .lm-scrape-workspace { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(340px, 35%) minmax(0, 1fr); overflow: hidden; }
 .lm-scrape-candidate-region,
 .lm-scrape-detail-region { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
@@ -1075,6 +1084,7 @@ body.local-media-page .settings-dir-modal { z-index: 321; }
     .lm-scrape-modal { padding: 10px; }
     .lm-scrape-dialog { width: calc(100vw - 20px); height: calc(100dvh - 20px); max-height: calc(100dvh - 20px); }
     .lm-scrape-searchbar { grid-template-columns: minmax(0, 1fr) 112px; }
+    .lm-scrape-episode-fields { grid-column: 1 / -1; }
     .lm-scrape-searchbar > button { width: 100%; }
     .lm-scrape-workspace { grid-template-columns: 1fr; overflow: auto; }
     .lm-scrape-candidate-region { min-height: 300px; border-right: 0; border-bottom: 1px solid var(--border-soft); }
@@ -1099,6 +1109,8 @@ body.local-media-page .settings-dir-modal { z-index: 321; }
     .lm-media-icon { width: 30px; height: 30px; }
     .lm-scrape-searchbar { grid-template-columns: 1fr 1fr; }
     .lm-scrape-searchbar > label:first-child { grid-column: 1 / -1; }
+    .lm-scrape-episode-fields { grid-template-columns: 1fr 1fr; }
+    .lm-scrape-episode-fields.is-season-only { grid-template-columns: 1fr; }
     .lm-scrape-summary { grid-template-columns: 1fr; }
     .lm-plan-row { grid-template-columns: 54px minmax(0, 1fr); }
     .lm-scrape-head-context p { max-width: calc(100vw - 110px); }

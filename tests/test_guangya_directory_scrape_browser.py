@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - 由显式 system python3 门禁执行
 
 
 ROOT = Path(__file__).resolve().parents[1]
+POSITION_SCRIPT = (ROOT / "app/static/js/media-scrape-position.js").read_text("utf-8")
 SCRIPT = (ROOT / "app/static/js/guangya-directory-scrape.js").read_text("utf-8")
 STYLES = (ROOT / "app/static/css/guangya-directory-scrape.css").read_text("utf-8")
 HARNESS = textwrap.dedent(
@@ -232,6 +233,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
             }
             """
         )
+        self.page.add_script_tag(content=POSITION_SCRIPT)
         self.page.add_script_tag(content=SCRIPT)
         self.assertEqual(self.page_errors, [])
 

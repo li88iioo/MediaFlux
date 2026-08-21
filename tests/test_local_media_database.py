@@ -123,6 +123,24 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual({item.id for item in sources}, before_ids)
         self.assertNotIn("atomic", {item.name for item in sources})
 
+    def test_manual_task_persists_position_overrides_and_retry_keeps_selection(self):
+        source_id = db.create_local_media_source(
+            name="manual-position", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/manual-position", media_type="tv", owner="admin",
+        )
+        task_id = db.prepare_manual_local_media_task(
+            source_id, "/tmp/manual-position/Show.S01E07.mkv", owner="admin",
+            tmdb_id="42", media_type="tv", season_override=2, episode_override=7,
+        )
+        task = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual((task.season_override, task.episode_override), (2, 7))
+        db.update_local_media_task(task_id, owner="admin", status="requires_manual")
+        self.assertTrue(db.reset_local_media_task(task_id, owner="admin"))
+        retried = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(retried.tmdb_id, "42")
+        self.assertEqual(retried.media_type, "tv")
+        self.assertEqual((retried.season_override, retried.episode_override), (2, 7))
+
     def test_manual_task_prepare_never_resets_an_active_task(self):
         source_id = db.create_local_media_source(
             name="manual-race", qb_profile="", qb_path_prefix="", local_root="/tmp/manual", owner="admin"

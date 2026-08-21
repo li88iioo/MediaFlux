@@ -24,11 +24,12 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertRegex(css, r"\.lm-review-list\s*\{[^}]*min-height:\s*220px")
         self.assertIn(".lm-source-card,", css)
         self.assertIn(".lm-review-item,", css)
-        self.assertIn("?v=20260820c", template)
+        self.assertIn("?v=20260821a", template)
 
 
     def test_manual_workspace_uses_configured_item_list_context_menu_and_scrape_modal(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
+        shared_modal = Path("app/templates/_media_scrape_modal.html").read_text(encoding="utf-8")
         css = Path("app/static/css/local-media.css").read_text(encoding="utf-8")
         js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
 
@@ -36,12 +37,16 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
             "LOCAL MEDIA INBOX",
             'id="lmMediaItems"',
             'id="lmItemContextMenu"',
-            'class="app-modal lm-scrape-modal"',
+            '{% include "_media_scrape_modal.html" %}',
+            '"source": "local"',
             'data-item-action="search"',
             'data-item-action="auto"',
             'data-item-action="delete"',
         ):
             self.assertIn(contract, template)
+        self.assertIn('class="app-modal {{ media_scrape.css }}-modal"', shared_modal)
+        self.assertIn('data-media-scrape-role="season"', shared_modal)
+        self.assertIn('data-media-scrape-role="episode"', shared_modal)
         for removed in ('id="lmManualSource"', 'id="lmManualPath"', 'id="lmPickManualPathBtn"'):
             self.assertNotIn(removed, template)
         self.assertIn("grid-template-columns: minmax(340px, 35%) minmax(0, 1fr);", css)

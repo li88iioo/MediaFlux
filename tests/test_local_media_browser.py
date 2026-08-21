@@ -25,6 +25,7 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
             'id="lmSourcesSection"', 'id="lmMediaItems"', 'id="lmReviewList"',
             'id="lmTaskList"', 'id="lmSourceModal"', 'id="lmItemContextMenu"',
             'id="lmScrapeModal"', 'id="lmSearchQuery"', 'id="lmExecuteBtn"',
+            'id="lmScrapeEpisodeFields"', 'id="lmScrapeSeason"', 'id="lmScrapeEpisode"',
             'id="lmPickLocalRootBtn"', 'id="lmSourceMediaType"', 'id="lmStableSeconds"',
             'id="lmScanMinutes"', 'class="lm-form-grid-3 lm-wide"',
             'js/local-media.js', 'css/local-media.css',
@@ -63,8 +64,11 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
             "function invalidatePreview()",
             "requestSerial !== previewRequestSerial",
             "inspection?.inspection_id !== context.inspectionId",
-            "appliedPreviewContext = context",
+            "positionControls.payload(mediaType",
+            "appliedPreviewContext = Object.freeze",
             "tmdb_id: confirmedContext.tmdbId",
+            "season: confirmedContext.season",
+            "episode: confirmedContext.episode",
             "rules_snapshot: confirmedPreview.rules_snapshot",
             "if (!hasLoadedLocalMedia) renderInitialLoadFailure",
             "if (currentManual && window.appAlert)",
@@ -79,6 +83,7 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn(".lm-media-list", css)
         self.assertIn(".lm-item-context-menu", css)
         self.assertIn(".lm-scrape-workspace", css)
+        self.assertIn(".lm-scrape-episode-fields", css)
         self.assertIn(".lm-form-grid-3", css)
         self.assertIn("grid-template-columns: minmax(340px, 35%) minmax(0, 1fr)", css)
         self.assertNotRegex(css, r"\.lm-media-row:hover\s*\{[^}]*transform")

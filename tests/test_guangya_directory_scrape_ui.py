@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - 由显式 system python3 门禁执行
 
 ROOT = Path(__file__).resolve().parents[1]
 DIRECTORY_SCRIPT = ROOT / "app/static/js/guangya-directory-scrape.js"
+POSITION_SCRIPT = ROOT / "app/static/js/media-scrape-position.js"
 DIRECTORY_CSS = ROOT / "app/static/css/guangya-directory-scrape.css"
 DIRECT_DELETE_HARNESS = textwrap.dedent(
     """
@@ -132,7 +133,8 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
         ):
             self.assertIn(f'value="{value}"', response.text)
         self.assertIn("guangya-directory-scrape.css?v=20260821a", response.text)
-        self.assertIn("guangya-directory-scrape.js?v=20260810a", response.text)
+        self.assertIn("media-scrape-position.js?v=20260821a", response.text)
+        self.assertIn("guangya-directory-scrape.js?v=20260821a", response.text)
         self.assertIn('aria-label="列表视图" aria-pressed="true"', response.text)
         self.assertIn('aria-label="网格视图" aria-pressed="false"', response.text)
         self.assertNotIn('title="列表视图"', response.text)
@@ -521,6 +523,7 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
             }
             """
         )
+        self.page.add_script_tag(content=POSITION_SCRIPT.read_text("utf-8"))
         self.page.add_script_tag(content=DIRECTORY_SCRIPT.read_text("utf-8"))
 
     def tearDown(self):

@@ -43,7 +43,6 @@
         preview: null,
         menuReturnFocus: null,
         requestVersion: 0,
-        episodeOverridesDirty: false,
         searchController: null,
         previewController: null,
         externalController: null,
@@ -51,6 +50,15 @@
         pendingPreviewKey: '',
         pendingExternalKey: '',
     };
+    const positionControls = window.MediaScrapePosition.create({
+        root: modal,
+        isSingleFile: () => isSingleFileScope(),
+        elements: {
+            fields: elements.episodeFields, seasonField: elements.seasonField,
+            episodeField: elements.episodeField, season: elements.season,
+            episode: elements.episode, numbering: elements.numbering,
+        },
+    });
 
     function node(tag, className = '', text = '') {
         const element = document.createElement(tag);
@@ -243,34 +251,11 @@
     }
 
     function syncEpisodeFields(mediaType = elements.type.value) {
-        const isTv = mediaType === 'tv';
-        const singleFile = isSingleFileScope();
-        elements.episodeFields.hidden = !isTv;
-        elements.seasonField.hidden = !isTv;
-        elements.episodeField.hidden = !isTv || !singleFile;
-        elements.episodeFields.classList.toggle('is-season-only', isTv && !singleFile);
+        positionControls.sync(mediaType);
     }
 
     function episodePreviewPayload(mediaType) {
-        if (mediaType !== 'tv') return {};
-        const singleFile = isSingleFileScope();
-        const payload = {numbering_mode: elements.numbering?.value || 'auto'};
-        if (singleFile && !state.episodeOverridesDirty) return payload;
-        const values = singleFile ? [
-            ['season', elements.season.value.trim(), 0, 99, '季数'],
-            ['episode', elements.episode.value.trim(), 1, 999, '集数'],
-        ] : [
-            ['season', elements.season.value.trim(), 0, 99, '季数'],
-        ];
-        values.forEach(([key, raw, minimum, maximum, label]) => {
-            if (raw === '') return;
-            const value = Number(raw);
-            if (!Number.isInteger(value) || value < minimum || value > maximum) {
-                throw new Error(`${label}必须是 ${minimum}-${maximum} 的整数`);
-            }
-            payload[key] = value;
-        });
-        return payload;
+        return positionControls.payload(mediaType);
     }
 
     function invalidatePreview() {
@@ -330,7 +315,7 @@
             && inspectionEpisode >= 1 && inspectionEpisode <= 999
             ? String(inspectionEpisode)
             : '';
-        state.episodeOverridesDirty = false;
+        positionControls.markClean();
         syncEpisodeFields();
         elements.archiveTarget.textContent = archiveTargetLabel(
             inspection.archive_target.name || inspection.archive_target.id,
@@ -1250,14 +1235,8 @@
         invalidatePreview();
     });
     elements.numbering?.addEventListener('change', invalidatePreview);
-    elements.season.addEventListener('input', () => {
-        state.episodeOverridesDirty = true;
-        invalidatePreview();
-    });
-    elements.episode.addEventListener('input', () => {
-        state.episodeOverridesDirty = true;
-        invalidatePreview();
-    });
+    elements.season.addEventListener('input', invalidatePreview);
+    elements.episode.addEventListener('input', invalidatePreview);
     elements.run.addEventListener('click', runManual);
 
     window.GuangYaDirectoryScrapeUI = {

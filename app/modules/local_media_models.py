@@ -120,6 +120,8 @@ class LocalMediaTask:
     rules_snapshot: str
     tmdb_id: str
     media_type: str
+    season_override: int | None
+    episode_override: int | None
     title: str
     year: str
     attempts: int
@@ -140,6 +142,14 @@ class LocalMediaTask:
             operation_token=str(row["operation_token"]), snapshot_digest=str(_value(row, "snapshot_digest")),
             rules_snapshot=str(_value(row, "rules_snapshot")),
             tmdb_id=str(_value(row, "tmdb_id")), media_type=str(_value(row, "media_type")),
+            season_override=(
+                None if _value(row, "season_override", None) is None
+                else int(_value(row, "season_override"))
+            ),
+            episode_override=(
+                None if _value(row, "episode_override", None) is None
+                else int(_value(row, "episode_override"))
+            ),
             title=str(_value(row, "title")), year=str(_value(row, "year")),
             attempts=int(_value(row, "attempts", 0)),
             version=int(_value(row, "version", 1)), error=str(_value(row, "error")),

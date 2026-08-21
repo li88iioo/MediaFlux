@@ -408,16 +408,39 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
                 "/api/local-media/inspect", json={"source_id": source_id}, headers=headers
             )
             previewed = self.client.post(
-                "/api/local-media/preview", json={"inspection_id": "inspect-1"}, headers=headers
+                "/api/local-media/preview",
+                json={"inspection_id": "inspect-1", "tmdb_id": "1", "media_type": "tv",
+                      "season": 2, "episode": 7},
+                headers=headers,
             )
             executed = self.client.post(
                 "/api/local-media/execute",
-                json={"inspection_id": "inspect-1", "tmdb_id": "1", "media_type": "movie"},
+                json={"inspection_id": "inspect-1", "tmdb_id": "1", "media_type": "tv",
+                      "season": 2, "episode": 7},
                 headers=headers,
             )
         self.assertEqual(inspected.status_code, 200)
         self.assertNotIn("_move_plans", previewed.json())
+        preview_call = service.preview.call_args
+        self.assertEqual(preview_call.kwargs["season_override"], 2)
+        self.assertEqual(preview_call.kwargs["episode_override"], 7)
+        create_call = service.create_manual_task.call_args
+        self.assertEqual(create_call.kwargs["season_override"], 2)
+        self.assertEqual(create_call.kwargs["episode_override"], 7)
         self.assertEqual(executed.json()["status"], "completed")
+
+    def test_preview_rejects_invalid_position_override_before_service_call(self):
+        csrf = self.login(); headers = {"X-CSRF-Token": csrf}
+        service = Mock()
+        with patch("app.routes.local_media_api.get_local_media_service", return_value=service):
+            response = self.client.post(
+                "/api/local-media/preview",
+                json={"inspection_id": "inspect-1", "media_type": "tv", "season": True},
+                headers=headers,
+            )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("季数必须是整数", response.json()["error"])
+        service.preview.assert_not_called()
 
 
 if __name__ == "__main__":

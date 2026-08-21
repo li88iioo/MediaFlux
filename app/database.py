@@ -1086,6 +1086,8 @@ CREATE TABLE IF NOT EXISTS local_media_tasks (
     rules_snapshot TEXT NOT NULL DEFAULT '',
     tmdb_id TEXT DEFAULT '',
     media_type TEXT DEFAULT '',
+    season_override INTEGER,
+    episode_override INTEGER,
     title TEXT DEFAULT '',
     year TEXT DEFAULT '',
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -4892,6 +4894,7 @@ def get_local_media_history_summary(*, owner: str = "admin") -> dict[str, object
 def prepare_manual_local_media_task(
     source_id: int, content_path: str, *, owner: str = "admin",
     tmdb_id: str = "", media_type: str = "", rules_snapshot: str = "",
+    season_override: int | None = None, episode_override: int | None = None,
 ) -> int:
     """原子创建或重置可重试的手动任务；活动任务绝不被改回等待态。"""
     import uuid
@@ -4903,6 +4906,18 @@ def prepare_manual_local_media_task(
         raise ValueError("本地媒体任务路径不能为空")
     if normalized_type and normalized_type not in {"movie", "tv"}:
         raise ValueError("媒体类型必须是 movie 或 tv")
+    if season_override is not None:
+        if isinstance(season_override, bool) or not isinstance(season_override, int):
+            raise ValueError("季数必须是整数")
+        if not 0 <= season_override <= 99:
+            raise ValueError("季数超出允许范围")
+    if episode_override is not None:
+        if isinstance(episode_override, bool) or not isinstance(episode_override, int):
+            raise ValueError("集数必须是整数")
+        if not 1 <= episode_override <= 999:
+            raise ValueError("集数超出允许范围")
+    if normalized_type == "movie" and (season_override is not None or episode_override is not None):
+        raise ValueError("电影任务不能指定季数或集数")
     timestamp = now()
     token = uuid.uuid4().hex
     with get_conn() as conn:
@@ -4920,10 +4935,11 @@ def prepare_manual_local_media_task(
             task_id = int(existing["id"])
             cur = conn.execute(
                 "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',snapshot_digest='',"
-                "rules_snapshot=?,tmdb_id=?,media_type=?,operation_token=?,error='',warning='',completed_at=NULL,"
+                "rules_snapshot=?,tmdb_id=?,media_type=?,season_override=?,episode_override=?,"
+                "operation_token=?,error='',warning='',completed_at=NULL,"
                 "version=version+1,updated_at=? WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
                 (str(rules_snapshot or ""), str(tmdb_id or "").strip(), normalized_type,
-                 token, timestamp, task_id, safe_owner),
+                 season_override, episode_override, token, timestamp, task_id, safe_owner),
             )
             if cur.rowcount != 1:
                 raise ValueError("任务状态已变化，请刷新后重试")
@@ -4932,10 +4948,11 @@ def prepare_manual_local_media_task(
             raise ValueError("该目录已有任务正在处理中")
         cur = conn.execute(
             "INSERT INTO local_media_tasks(owner,source_id,qb_hash,content_path,trigger,status,"
-            "operation_token,rules_snapshot,tmdb_id,media_type,created_at,updated_at) "
-            "VALUES(?,?,NULL,?,'manual','waiting_stable',?,?,?,?,?,?)",
+            "operation_token,rules_snapshot,tmdb_id,media_type,season_override,episode_override,"
+            "created_at,updated_at) VALUES(?,?,NULL,?,'manual','waiting_stable',?,?,?,?,?,?,?,?)",
             (safe_owner, int(source_id), safe_path, token, str(rules_snapshot or ""),
-             str(tmdb_id or "").strip(), normalized_type, timestamp, timestamp),
+             str(tmdb_id or "").strip(), normalized_type, season_override, episode_override,
+             timestamp, timestamp),
         )
         return int(cur.lastrowid)
 
@@ -4965,7 +4982,8 @@ def update_local_media_task(task_id: int, *, owner: str = "admin", **fields) -> 
     from app.modules.local_media_models import LOCAL_TASK_STATUSES
 
     allowed = {
-        "status", "stable_since", "snapshot_digest", "rules_snapshot", "tmdb_id", "media_type", "title", "year",
+        "status", "stable_since", "snapshot_digest", "rules_snapshot", "tmdb_id", "media_type",
+        "season_override", "episode_override", "title", "year",
         "error", "warning", "completed_at", "content_path",
     }
     sets: list[str] = []
@@ -5166,18 +5184,51 @@ def reset_local_media_task(
     task_id: int,
     *,
     owner: str = "admin",
-    tmdb_id: str = "",
-    media_type: str = "",
+    tmdb_id: str | None = None,
+    media_type: str | None = None,
+    season_override: int | None = None,
+    episode_override: int | None = None,
 ) -> bool:
-    normalized_type = str(media_type or "").strip().lower()
+    normalized_type = None if media_type is None else str(media_type or "").strip().lower()
     if normalized_type and normalized_type not in {"movie", "tv"}:
         raise ValueError("媒体类型必须是 movie 或 tv")
+    for value, minimum, maximum, label in (
+        (season_override, 0, 99, "季数"),
+        (episode_override, 1, 999, "集数"),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{label}必须是整数")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{label}超出允许范围")
+    if normalized_type == "movie" and (season_override is not None or episode_override is not None):
+        raise ValueError("电影任务不能指定季数或集数")
+    assignments = [
+        "status='waiting_stable'", "stable_since=''", "snapshot_digest=''",
+        "error=''", "warning=''", "completed_at=NULL", "version=version+1", "updated_at=?",
+    ]
+    params: list[object] = [now()]
+    if tmdb_id is not None:
+        assignments.append("tmdb_id=?")
+        params.append(str(tmdb_id or "").strip())
+    if normalized_type is not None:
+        assignments.append("media_type=?")
+        params.append(normalized_type)
+        if normalized_type == "movie":
+            assignments.extend(["season_override=NULL", "episode_override=NULL"])
+    if season_override is not None:
+        assignments.append("season_override=?")
+        params.append(season_override)
+    if episode_override is not None:
+        assignments.append("episode_override=?")
+        params.append(episode_override)
+    params.extend([int(task_id), _local_media_owner(owner)])
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',snapshot_digest='',"
-            "tmdb_id=?,media_type=?,error='',warning='',completed_at=NULL,version=version+1,updated_at=? "
+            f"UPDATE local_media_tasks SET {', '.join(assignments)} "
             "WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
-            (str(tmdb_id or "").strip(), normalized_type, now(), int(task_id), _local_media_owner(owner)),
+            params,
         )
         return cur.rowcount == 1
 

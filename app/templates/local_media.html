@@ -2,7 +2,7 @@
 {% block title %}本地媒体 - MediaFlux{% endblock %}
 {% block page_title %}本地媒体{% endblock %}
 {% block body_class %}local-media-page{% endblock %}
-{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260820c">{% endblock %}
+{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260821a">{% endblock %}
 
 {% block content %}
 <div class="lm-page" data-windows-package="{{ '1' if package_type == 'windows' else '0' }}">
@@ -125,47 +125,29 @@
     <button type="button" role="menuitem" class="is-danger" data-item-action="delete"><i data-lucide="trash-2"></i><span><strong>删除</strong><small>移入来源内的 MediaFlux 回收区</small></span></button>
 </div>
 
-<div class="app-modal lm-scrape-modal" id="lmScrapeModal" hidden>
-    <section class="lm-scrape-dialog" role="dialog" aria-modal="true" aria-labelledby="lmScrapeTitle">
-        <header class="lm-scrape-head">
-            <div class="lm-scrape-head-context">
-                <i data-lucide="folder-search"></i>
-                <div><span id="lmScrapeTitle">本地手动刮削</span><p id="lmScrapeItemPath">等待选择条目</p></div>
-            </div>
-            <button type="button" class="icon-btn" id="lmScrapeCloseBtn" aria-label="关闭刮削窗口" title="关闭"><i data-lucide="x"></i></button>
-        </header>
-        <div class="lm-scrape-searchbar">
-            <label><span>搜索名称</span><input type="search" class="form-input" id="lmSearchQuery" autocomplete="off" placeholder="输入电影或剧集名称"></label>
-            <label><span>媒体类型</span><select class="form-select" id="lmMediaType"><option value="movie">电影</option><option value="tv">剧集</option></select></label>
-            <button class="jump-btn" type="button" id="lmAutoPreviewBtn"><i data-lucide="wand-sparkles"></i><span data-button-label>自动匹配</span></button>
-            <button class="btn btn-primary" type="button" id="lmSearchBtn"><i data-lucide="search"></i><span data-button-label>搜索</span></button>
-        </div>
-        <div class="lm-scrape-workspace">
-            <section class="lm-scrape-candidate-region" aria-labelledby="lmCandidateTitle">
-                <div class="lm-scrape-region-head"><div><strong id="lmCandidateTitle">媒体候选</strong><small id="lmCandidateCount">0 项</small></div></div>
-                <div class="lm-candidate-list" id="lmCandidates" aria-live="polite">
-                    <div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>等待搜索</strong><span>候选结果会保留在这里，切换候选不会引起布局跳动。</span></div>
-                </div>
-            </section>
-            <section class="lm-scrape-detail-region" aria-labelledby="lmScrapeDetailTitle">
-                <div class="lm-scrape-region-head"><strong id="lmScrapeDetailTitle">媒体与归档预览</strong><small id="lmScrapeStatus">尚未选择</small></div>
-                <div class="lm-scrape-detail" id="lmScrapeDetail">
-                    <div class="lm-scrape-placeholder"><i data-lucide="clapperboard"></i><strong>选择媒体候选或自动匹配</strong><span>这里会逐项展示移动、覆盖和清理动作；不会生成编号副本。</span></div>
-                </div>
-            </section>
-        </div>
-        <footer class="lm-scrape-footer">
-            <div class="lm-scrape-footer-context">
-                <div class="lm-scrape-inspection"><i data-lucide="shield-check"></i><div><strong id="lmScrapeInspectionSummary">等待检查</strong><span>手动整理遇到同名目标时安全覆盖</span></div></div>
-                <div class="lm-scrape-target"><strong id="lmPlanSummary">确认前不会写入媒体库</strong><small id="lmScrapeTarget">目标路径将在识别后显示</small></div>
-            </div>
-            <div class="lm-scrape-footer-actions">
-                <button type="button" class="jump-btn" id="lmScrapeCancelBtn">取消</button>
-                <button type="button" class="btn btn-primary" id="lmExecuteBtn" disabled><i data-lucide="folder-check"></i><span data-button-label>确认并开始整理</span></button>
-            </div>
-        </footer>
-    </section>
-</div>
+{% set media_scrape = {
+    "source": "local", "css": "lm-scrape", "card": false,
+    "modal_id": "lmScrapeModal", "title_id": "lmScrapeTitle", "title": "本地手动刮削",
+    "path_id": "lmScrapeItemPath", "path_placeholder": "等待选择条目",
+    "close_id": "lmScrapeCloseBtn", "query_id": "lmSearchQuery",
+    "query_label_class": "", "clean_id": "", "type_id": "lmMediaType",
+    "allow_auto_type": false, "position_id": "lmScrapeEpisodeFields",
+    "numbering_field_id": "", "numbering_id": "", "season_field_id": "lmScrapeSeasonField",
+    "season_id": "lmScrapeSeason", "episode_field_id": "lmScrapeEpisodeField",
+    "episode_id": "lmScrapeEpisode", "auto_id": "lmAutoPreviewBtn", "search_id": "lmSearchBtn",
+    "candidate_title_id": "lmCandidateTitle", "candidate_count_id": "lmCandidateCount",
+    "candidate_list_class": "lm-candidate-list", "candidates_id": "lmCandidates",
+    "external_id": "", "external_hints_id": "", "detail_title_id": "lmScrapeDetailTitle",
+    "status_id": "lmScrapeStatus", "detail_id": "lmScrapeDetail",
+    "detail_placeholder_title": "选择媒体候选或自动匹配",
+    "detail_placeholder_copy": "这里会逐项展示移动、覆盖和清理动作；不会生成编号副本。",
+    "inspection_id": "", "inspection_summary_id": "lmScrapeInspectionSummary",
+    "inspection_hint_id": "", "inspection_hint": "手动整理遇到同名目标时安全覆盖",
+    "plan_summary_id": "lmPlanSummary", "archive_target_id": "lmScrapeTarget",
+    "target_noun": "媒体库", "archive_placeholder": "目标路径将在识别后显示",
+    "cancel_id": "lmScrapeCancelBtn", "run_id": "lmExecuteBtn", "run_label": "确认并开始整理"
+} %}
+{% include "_media_scrape_modal.html" %}
 
 <div class="app-modal lm-modal" id="lmSourceModal" hidden>
     <div class="card lm-source-dialog" role="dialog" aria-modal="true" aria-labelledby="lmSourceDialogTitle">
@@ -215,4 +197,7 @@
 </div>
 {% endblock %}
 
-{% block scripts %}<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260820c"></script>{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260821a"></script>
+<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260821a"></script>
+{% endblock %}

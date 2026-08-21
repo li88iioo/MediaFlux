@@ -317,6 +317,96 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertEqual(scraper.parents, ["The Ghost in the Shell"])
 
 
+    def test_single_tv_file_can_override_season_and_keep_parsed_episode(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); source_root = root / "downloads-season-override"; target_root = root / "tv"
+            source_root.mkdir(); target_root.mkdir()
+            episode = source_root / "Show.S01E07.mkv"
+            episode.write_bytes(b"video")
+            source_id = self._source(source_root, target_root, "tv")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="42", title="Show", year="2026", media_type="tv", confidence=1.0
+            )))
+            inspection = service.inspect_source("admin", source_id, episode)
+            self.assertEqual(inspection["selected_kind"], "file")
+            preview = service.preview(
+                "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                season_override=2,
+            )
+            self.assertEqual(preview["status"], "planned")
+            self.assertEqual(preview["position_overrides"], {"season": 2, "episode": None})
+            self.assertEqual(preview["matches"][0]["season"], 2)
+            self.assertEqual(preview["matches"][0]["episode"], 7)
+            self.assertIn("S02E07", preview["plans"][0]["target_name"])
+            self.assertEqual(Path(preview["plans"][0]["target_path"]).parent.name, "Season 2")
+
+    def test_single_tv_file_episode_override_defaults_to_season_one(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); source_root = root / "downloads-episode-override"; target_root = root / "tv"
+            source_root.mkdir(); target_root.mkdir()
+            episode = source_root / "Show.mkv"
+            episode.write_bytes(b"video")
+            source_id = self._source(source_root, target_root, "tv")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="42", title="Show", year="2026", media_type="tv", confidence=1.0
+            )))
+            inspection = service.inspect_source("admin", source_id, episode)
+            preview = service.preview(
+                "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                episode_override=9,
+            )
+            self.assertEqual(preview["status"], "planned")
+            self.assertEqual(preview["position_overrides"], {"season": 1, "episode": 9})
+            self.assertIn("S01E09", preview["plans"][0]["target_name"])
+
+    def test_manual_task_execution_reuses_persisted_position_override(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); source_root = root / "downloads-persisted-position"; target_root = root / "tv"
+            source_root.mkdir(); target_root.mkdir()
+            episode = source_root / "Show.S01E07.mkv"
+            episode.write_bytes(b"video")
+            source_id = db.create_local_media_source(
+                name="persisted-position-source", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), media_type="tv", mode="preview_only",
+                stable_seconds=0, owner="admin",
+            )
+            db.upsert_local_library_target(source_id, "tv", str(target_root), owner="admin")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="42", title="Show", year="2026", media_type="tv", confidence=1.0
+            )))
+            inspection = service.inspect_source("admin", source_id, episode)
+            preview = service.preview(
+                "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                season_override=2,
+            )
+            task_id = service.create_manual_task(
+                "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                rules_snapshot=preview["rules_snapshot"], season_override=2,
+            )
+            self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+            result = service.execute_task("admin", task_id)
+            self.assertEqual(result["status"], "completed")
+            self.assertIn("S02E07", result["preview"]["plans"][0]["target_name"])
+            self.assertTrue(episode.exists())
+
+    def test_directory_scope_rejects_one_episode_override(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); source_root = root / "downloads-directory-override"; target_root = root / "tv"
+            show = source_root / "Show"
+            show.mkdir(parents=True); target_root.mkdir()
+            (show / "Show.S01E01.mkv").write_bytes(b"video")
+            source_id = self._source(source_root, target_root, "tv")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="42", title="Show", year="2026", media_type="tv", confidence=1.0
+            )))
+            inspection = service.inspect_source("admin", source_id, show)
+            self.assertEqual(inspection["selected_kind"], "directory")
+            with self.assertRaisesRegex(Exception, "目录整理只能指定归档季"):
+                service.preview(
+                    "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                    episode_override=2,
+                )
+
     def test_manual_tmdb_selection_does_not_apply_preprocess_position_offsets(self):
         class PositionAwareScraper(FakeScraper):
             def parse_media(self, filename, parent_path="", match=None):

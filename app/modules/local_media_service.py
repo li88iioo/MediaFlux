@@ -148,6 +148,7 @@ class LocalMediaService:
             "inspection_id": inspection_id,
             "source_id": int(source_id),
             "selected_name": selected.name,
+            "selected_kind": "file" if selected.is_file() else "directory",
             "file_count": len(snapshots),
             "video_count": len(videos),
             "digest": digest,
@@ -185,6 +186,28 @@ class LocalMediaService:
     def _relative_parent(snapshot: LocalFileSnapshot) -> str:
         parent = Path(snapshot.relative_path).parent.as_posix()
         return "" if parent == "." else parent
+
+    @staticmethod
+    def _normalize_position_overrides(
+        inspection: _Inspection,
+        season_override: int | None,
+        episode_override: int | None,
+    ) -> tuple[int | None, int | None]:
+        for value, minimum, maximum, label in (
+            (season_override, 0, 99, "季数"),
+            (episode_override, 1, 999, "集数"),
+        ):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise LocalMediaServiceError(f"{label}必须是整数")
+            if not minimum <= value <= maximum:
+                raise LocalMediaServiceError(f"{label}必须是 {minimum}-{maximum} 的整数")
+        if episode_override is not None and not inspection.selected_path.is_file():
+            raise LocalMediaServiceError("目录整理只能指定归档季，不能统一指定集数")
+        if episode_override is not None and season_override is None:
+            season_override = 1
+        return season_override, episode_override
 
     def _match_video(
         self,
@@ -265,8 +288,13 @@ class LocalMediaService:
         overrides: dict | None = None,
         rules_snapshot: str = "",
         automatic: bool = False,
+        season_override: int | None = None,
+        episode_override: int | None = None,
     ) -> dict[str, Any]:
         inspection = self.inspections.get(owner, inspection_id)
+        season_override, episode_override = self._normalize_position_overrides(
+            inspection, season_override, episode_override,
+        )
         source = db.get_local_media_source(inspection.source_id, owner=owner)
         if source is None:
             raise LocalMediaServiceError("本地媒体来源已被删除")
@@ -309,6 +337,8 @@ class LocalMediaService:
         effective_media_type = str(media_type or "").strip().lower()
         if effective_media_type not in {"movie", "tv"}:
             effective_media_type = source.media_type if source.media_type in {"movie", "tv"} else ""
+        if (season_override is not None or episode_override is not None) and effective_media_type == "movie":
+            raise LocalMediaServiceError("电影整理不能指定季数或集数")
 
         plans: list[LocalMovePlan] = []
         matches: list[dict[str, Any]] = []
@@ -318,6 +348,8 @@ class LocalMediaService:
                 video, tmdb_id=tmdb_id, media_type=effective_media_type, rules=rules,
             )
             match_identity = self.organizer._match_external_id(match)
+            if (season_override is not None or episode_override is not None) and match.media_type != "tv":
+                raise LocalMediaServiceError("只有剧集整理可以指定季数或集数")
             automatic_policy = automatic_match_policy(rules.automatic_match_preset)
             automatic_requires_confirmation = bool(
                 not tmdb_id
@@ -373,6 +405,11 @@ class LocalMediaService:
             }
             if tmdb_id and match.season_override is not None:
                 parsed["season"] = match.season_override
+            if match.media_type == "tv":
+                if season_override is not None:
+                    parsed["season"] = season_override
+                if episode_override is not None:
+                    parsed["episode"] = episode_override
             if match.media_type == "tv" and parsed.get("episode") is not None and parsed.get("season") is None:
                 parsed["season"] = 1
             if match.media_type == "tv" and parsed.get("episode") is None:
@@ -486,6 +523,7 @@ class LocalMediaService:
                 "provider": self.organizer._match_provider(match),
                 "external_id": match_identity,
                 "source_name": video.path.name, "target_name": target_name,
+                "season": parsed.get("season"), "episode": parsed.get("episode"),
                 "category": main, "target_root": target_config.path,
             })
         return {
@@ -494,6 +532,9 @@ class LocalMediaService:
             "digest": inspection.digest,
             "cloud_write": False,
             "rules_snapshot": effective_rules_snapshot,
+            "position_overrides": {
+                "season": season_override, "episode": episode_override,
+            },
             "matches": matches,
             "plans": [
                 {
@@ -643,6 +684,7 @@ class LocalMediaService:
                 owner, inspection["inspection_id"], task.tmdb_id, task.media_type,
                 rules_snapshot=task.rules_snapshot,
                 automatic=task.trigger in {"scan", "qb_completed"},
+                season_override=task.season_override, episode_override=task.episode_override,
             )
             if preview.get("status") != "planned":
                 db.update_local_media_task(
@@ -752,12 +794,20 @@ class LocalMediaService:
 
     def create_manual_task(
         self, owner: str, inspection_id: str, *, tmdb_id: str = "", media_type: str = "",
-        rules_snapshot: str = "",
+        rules_snapshot: str = "", season_override: int | None = None,
+        episode_override: int | None = None,
     ) -> int:
         inspection = self.inspections.get(owner, inspection_id)
+        season_override, episode_override = self._normalize_position_overrides(
+            inspection, season_override, episode_override,
+        )
         normalized_type = str(media_type or "").strip().lower()
         if normalized_type and normalized_type not in {"movie", "tv"}:
             raise LocalMediaServiceError("媒体类型必须是 movie 或 tv")
+        source = db.get_local_media_source(inspection.source_id, owner=owner)
+        effective_type = normalized_type or (source.media_type if source else "")
+        if (season_override is not None or episode_override is not None) and effective_type != "tv":
+            raise LocalMediaServiceError("只有剧集整理可以指定季数或集数")
         normalized_snapshot = ""
         if rules_snapshot:
             normalized_snapshot = self._serialize_rules_snapshot(
@@ -766,7 +816,8 @@ class LocalMediaService:
         return db.prepare_manual_local_media_task(
             inspection.source_id, str(inspection.selected_path), owner=owner,
             tmdb_id=str(tmdb_id or "").strip(), media_type=normalized_type,
-            rules_snapshot=normalized_snapshot,
+            rules_snapshot=normalized_snapshot, season_override=season_override,
+            episode_override=episode_override,
         )
 
     def execute_preview(self, owner: str, inspection_id: str, preview: dict[str, Any]) -> MoveTransactionResult:

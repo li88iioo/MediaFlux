@@ -40,6 +40,8 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertEqual(version, db.SCHEMA_VERSION)
         self.assertEqual(version, 1)
         self.assertIn("rules_snapshot", task_columns)
+        self.assertIn("season_override", task_columns)
+        self.assertIn("episode_override", task_columns)
         self.assertIn("session_id", playback_columns)
         self.assertIn("idx_agent_action_history_owner_id", action_indexes)
         self.assertEqual(rss_indexes.get("idx_rss_entries_item_guid"), 1)
