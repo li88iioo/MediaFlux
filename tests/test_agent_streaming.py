@@ -278,7 +278,7 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertNotIn("private.invalid", response.text)
         history.assert_not_called()
 
-    def test_windows_path_stream_token_is_never_publicly_emitted(self):
+    def test_windows_path_stream_token_is_smoothly_redacted(self):
         csrf = self._login()
         service = _FakeService(_tool_response())
         history = Mock()
@@ -306,13 +306,68 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         events = self._events(response)
         self.assertEqual(
             [item["type"] for item in events],
-            ["status", "status", "status", "delta", "error"],
+            ["status", "status", "status", "delta", "final"],
         )
-        self.assertEqual(events[-1]["code"], "stream_invalid")
         self.assertEqual(events[3]["delta"], "已完成基础检查。")
+        self.assertIn("[路径已隐藏]", events[-1]["payload"]["presentation"]["narrative"])
         self.assertNotIn("Windows", response.text)
         self.assertNotIn("System32", response.text)
-        history.assert_not_called()
+        history.assert_called_once()
+        saved = history.call_args.kwargs["response"]
+        self.assertIn("[路径已隐藏]", saved["presentation"]["narrative"])
+
+    def test_native_trace_streams_steps_and_reuses_final_card_payload(self):
+        csrf = self._login()
+        payload = {
+            "request_id": "native-stream-request",
+            "mode": "conversation",
+            "agent_trace": [
+                {"label": "核对订阅", "ok": True, "summary": "已完成"},
+                {"label": "查询资源站", "ok": False, "summary": "部分超时"},
+            ],
+            "result": {
+                "ok": True,
+                "status": "answered",
+                "summary": "订阅检查完成",
+                "error": "",
+                "suggestions": [],
+                "data": {},
+                "evidence": [],
+            },
+            "presentation": {
+                "version": 1,
+                "source": "native",
+                "kind": "narrative",
+                "narrative": "订阅、媒体库和资源站已核对完成。",
+            },
+        }
+        service = _FakeService(payload)
+        history = Mock()
+
+        with (
+            patch("app.routes.agent_api.get_agent_service", return_value=service),
+            patch("app.routes.agent_api._record_query_history", history),
+        ):
+            response = self.client.post(
+                "/api/agent/query",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "message": "检查我的媒体订阅更新",
+                    "session_id": SESSION_ID,
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        events = self._events(response)
+        self.assertEqual(
+            [item["type"] for item in events],
+            ["status", "status", "step", "step", "step", "status", "delta", "final"],
+        )
+        self.assertEqual([item["step"] for item in events[2:5]], ["tool_finish", "tool_finish", "summary"])
+        self.assertFalse(events[3]["ok"])
+        self.assertEqual(events[-1]["payload"]["presentation"]["narrative"], "订阅、媒体库和资源站已核对完成。")
+        history.assert_called_once()
 
     def test_confirmation_response_never_enters_provider_stream(self):
         csrf = self._login()

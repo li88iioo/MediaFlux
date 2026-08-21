@@ -583,6 +583,31 @@ async def _stream_query_events(
             return
         yield event
 
+        trace = response.get("agent_trace")
+        if isinstance(trace, list):
+            for index, item in enumerate(trace[:8], start=1):
+                if not isinstance(item, dict):
+                    continue
+                event = current_event(
+                    "step",
+                    step="tool_finish",
+                    phase="running",
+                    index=index,
+                    label=str(item.get("label") or "检查")[:80],
+                    ok=item.get("ok") is not False,
+                    summary=str(item.get("summary") or "")[:240],
+                )
+                if event is not None:
+                    yield event
+            event = current_event(
+                "step",
+                step="summary",
+                phase="answering",
+                label="正在组织答复…",
+            )
+            if event is not None:
+                yield event
+
         stream = select_agent_answer_stream(
             message,
             response,
@@ -593,6 +618,19 @@ async def _stream_query_events(
 
         projector = PublicNarrativeProjector()
         emitted = False
+
+        if stream is None and isinstance(trace, list):
+            presentation = response.get("presentation")
+            narrative = (
+                str(presentation.get("narrative") or "")
+                if isinstance(presentation, dict) else ""
+            )
+            if narrative:
+                async def _native_narrative_stream() -> AsyncIterator[str]:
+                    for offset in range(0, len(narrative), 96):
+                        yield narrative[offset:offset + 96]
+                        await asyncio.sleep(0)
+                stream = _native_narrative_stream()
 
         def interrupted_event() -> bytes | None:
             """在线性化窗口内保存已公开安全前缀，再发布中断事件。"""

@@ -341,7 +341,14 @@ class AgentPageTests(InitializedWebTestCase):
                 re.S,
             ),
         )
-        self.assertIn(".agent-cancelled { min-height: 74px; }", source)
+        self.assertRegex(
+            source,
+            re.compile(
+                r"\.agent-streaming,\s*\n\.agent-cancelled\s*\{[^}]*"
+                r"min-height:\s*116px",
+                re.S,
+            ),
+        )
         self.assertIn(".agent-confirmation-executing", source)
         self.assertIn(".agent-confirmation-executing-mark svg { animation: none !important; }", source)
         self.assertIn("@media (max-width: 980px)", source)

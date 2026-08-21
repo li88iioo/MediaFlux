@@ -1095,7 +1095,7 @@ body.agent-page-body::after { display: none; }
 }
 
 .agent-streaming,
-.agent-cancelled { min-height: 74px; }
+.agent-cancelled { min-height: 116px; box-sizing: border-box; padding: 20px 22px; }
 .agent-cancelled { color: var(--text-secondary); background: color-mix(in srgb, var(--bg-input) 72%, var(--bg-card)); border-color: var(--agent-line); }
 .agent-cancelled .agent-stream-head { color: var(--text-secondary); }
 .agent-cancelled .agent-stream-head svg { color: var(--text-muted); }
@@ -1120,6 +1120,10 @@ body.agent-page-body::after { display: none; }
     font-size: 14px;
     line-height: 1.75;
 }
+.agent-stream-steps { min-height: 24px; margin-top: 8px; display: grid; gap: 4px; }
+.agent-stream-step { display: flex; align-items: center; gap: 7px; min-height: 20px; color: var(--text-muted); font-size: 11px; line-height: 1.35; }
+.agent-stream-step svg { width: 13px; height: 13px; flex: 0 0 auto; color: var(--success); }
+.agent-stream-step.is-warning svg { color: var(--warning); }
 .agent-streaming .agent-stream-text:empty::after {
     content: "";
     display: inline-block;
@@ -1538,6 +1542,7 @@ body.agent-page-body::after { display: none; }
     .agent-pending-line::after,
     .agent-send.is-busy svg,
     .agent-stream-head .lucide-loader-circle { animation: none !important; }
+    .agent-streaming .agent-stream-text:empty::after { animation: none !important; }
     .agent-confirmation-executing-mark svg { animation: none !important; }
     .agent-starter-grid button, .agent-overview-action, .agent-next-action-button, .agent-search-item, .agent-web-result, .agent-resource-action, .agent-config-action, .agent-episode-chip, .agent-new-session, .agent-icon-action, .agent-send, .agent-stop { transition: none !important; }
     .agent-send:hover,

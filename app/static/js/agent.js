@@ -1778,17 +1778,29 @@
     }
 
     function appendAssistantResponse(payload, pendingNode) {
-        const view = reuseAssistantMessage(pendingNode, 'MEDIAFLUX AGENT', 'bot');
-        const resultCard = renderResultCard(payload);
-        view.body.append(resultCard);
+        const keepPinned = transcriptIsNearBottom();
+        const streamingCard = pendingNode?.querySelector?.('.agent-result-card.agent-streaming');
+        const view = streamingCard
+            ? {article: pendingNode, body: pendingNode.querySelector('.agent-message-body')}
+            : reuseAssistantMessage(pendingNode, 'MEDIAFLUX AGENT', 'bot');
+        const renderedCard = renderResultCard(payload);
+        let resultCard = renderedCard;
+        if (streamingCard) {
+            streamingCard.className = renderedCard.className;
+            streamingCard.removeAttribute('aria-busy');
+            streamingCard.replaceChildren(...renderedCard.childNodes);
+            resultCard = streamingCard;
+        } else {
+            view.body.append(resultCard);
+        }
         if (payload?.mode === 'confirmation_required' && payload.confirmation?.confirmation_id) {
             view.body.append(renderConfirmation(payload.confirmation, payload.tool_call));
         }
         refreshIcons(view.article);
-        if (window.MFAnim && typeof window.MFAnim.popIn === 'function' && !restoringHistory) {
+        if (!streamingCard && window.MFAnim && typeof window.MFAnim.popIn === 'function' && !restoringHistory) {
             window.MFAnim.popIn(resultCard, { duration: 0.22, y: 6 });
         }
-        scrollToLatest();
+        if (keepPinned) scrollToLatest({force: true});
         return view.article;
     }
 
@@ -1851,10 +1863,21 @@
         content.setAttribute('aria-live', 'off');
         const textNode = document.createTextNode('');
         content.append(textNode);
-        card.append(head, content);
+        const steps = node('div', 'agent-stream-steps');
+        steps.setAttribute('aria-hidden', 'true');
+        card.append(head, steps, content);
         view.body.append(card);
         refreshIcons(view.article);
-        return {article: view.article, card, content, head, textNode};
+        return {article: view.article, card, content, head, steps, textNode};
+    }
+
+    function appendStreamingStep(streamView, event) {
+        if (!streamView?.steps) return;
+        const row = node('div', `agent-stream-step ${event.ok === false ? 'is-warning' : ''}`);
+        row.append(icon(event.ok === false ? 'triangle-alert' : 'check'), node('span', '', String(event.label || '检查完成')));
+        streamView.steps.append(row);
+        while (streamView.steps.children.length > 4) streamView.steps.firstElementChild?.remove();
+        refreshIcons(streamView.article);
     }
 
     function updateStreamingPhase(streamView, phase) {
@@ -1964,6 +1987,13 @@
                 streamView ||= beginStreamingMessage(pendingNode, event.phase);
                 operation.streamView = streamView;
                 updateStreamingPhase(streamView, event.phase);
+                return;
+            }
+            if (event.type === 'step') {
+                streamView ||= beginStreamingMessage(pendingNode, event.phase || 'running');
+                operation.streamView = streamView;
+                updateStreamingPhase(streamView, event.phase || 'running');
+                if (event.step === 'tool_finish') appendStreamingStep(streamView, event);
                 return;
             }
             if (event.type === 'delta') {

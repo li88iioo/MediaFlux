@@ -12,8 +12,8 @@ from typing import Any
 
 from app.agent.llm_router import normalize_streamed_answer
 from app.agent.result_projection import (
-    is_public_text_safe,
     public_stream_readable_prefix_length,
+    smooth_sanitize_public_stream_text,
 )
 from app.clients.openai_compatible import ProviderStreamError
 
@@ -37,6 +37,7 @@ class PublicNarrativeProjector:
     """把 Provider token 流收敛为可安全公开的完整文本片段。"""
 
     def __init__(self) -> None:
+        self._raw_accumulated = ""
         self._accumulated = ""
         self._published_length = 0
         self._pending_error: PublicNarrativeValidationError | None = None
@@ -53,22 +54,34 @@ class PublicNarrativeProjector:
         delta = str(value or "")
         if not delta:
             return None
-        candidate = self._accumulated + delta
-        stable_length = public_stream_readable_prefix_length(candidate)
-        stable_candidate = candidate[:stable_length]
-        if stable_candidate.strip() and not is_public_text_safe(stable_candidate):
+        raw_candidate = self._raw_accumulated + delta
+        if len(raw_candidate) > 1800:
             raise PublicNarrativeValidationError(
-                "Agent 流式回答未通过公开文本校验"
+                "Agent 流式回答超过公开长度限制"
             )
 
-        self._accumulated = candidate
-        if candidate.strip() and not is_public_text_safe(candidate):
-            # 先允许调用方发布已经越过完整句边界的安全前缀，再由
-            # raise_pending_error() 终止本次流。这样 Web/TG 都不会丢失
-            # 已经公开的安全内容，也不会泄漏 URL、路径等非公开尾部。
+        candidate = smooth_sanitize_public_stream_text(raw_candidate)
+        if candidate is None:
+            # 凭据、控制符或链接可能附着在已经完成的安全句子后。先只投影
+            # 原始流中跨过句界的前缀，让调用方发布，再延迟终止；危险尾部
+            # 从不进入 accumulated，因此也不会被历史或中断收口公开。
+            raw_stable_length = public_stream_readable_prefix_length(raw_candidate)
+            raw_stable = raw_candidate[:raw_stable_length]
+            candidate = smooth_sanitize_public_stream_text(raw_stable)
+            if candidate is None or not candidate.strip():
+                raise PublicNarrativeValidationError(
+                    "Agent 流式回答未通过公开文本校验"
+                )
             self._pending_error = PublicNarrativeValidationError(
                 "Agent 流式回答未通过公开文本校验"
             )
+            stable_length = len(candidate)
+        else:
+            stable_length = public_stream_readable_prefix_length(candidate)
+
+        stable_candidate = candidate[:stable_length]
+        self._raw_accumulated = raw_candidate
+        self._accumulated = candidate
         if stable_length <= self._published_length:
             return None
 

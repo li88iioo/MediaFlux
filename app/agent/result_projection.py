@@ -672,6 +672,28 @@ def is_public_text_safe(value: object) -> bool:
     return replace_internal_identifiers(text) == text
 
 
+def smooth_sanitize_public_stream_text(value: object) -> str | None:
+    """流式公开文本：凭据/控制符致命，路径与链接平滑替换。"""
+    text = str(value or "")
+    if not text:
+        return ""
+    if (
+        _CONTROL_RE.search(text)
+        or contains_sensitive_credential(text)
+        or _URI_RE.search(text)
+        or re.search(r"(?i)\b(?:https?|ftp|file)\s*://", text)
+        or _P2P_RE.search(text)
+    ):
+        return None
+    text = _replace_internal_identifiers_in_text(text)
+    text = _WINDOWS_PATH_RE.sub("[路径已隐藏]", text)
+    text = _UNIX_PATH_RE.sub("[路径已隐藏]", text)
+    text = _RELATIVE_PATH_RE.sub("[路径已隐藏]", text)
+    text = _CONTEXTUAL_PATH_RE.sub("[路径已隐藏]", text)
+    text = _UNICODE_FILE_PATH_RE.sub("[路径已隐藏]", text)
+    return text
+
+
 def public_stream_stable_prefix_length(value: object) -> int:
     """返回可立即公开的稳定前缀长度，暂存可能继续扩展的 ASCII token。"""
     text = str(value or "")
