@@ -52,6 +52,38 @@ class AgentPresentationStreamTests(unittest.TestCase):
             self.assertIsNone(stream)
 
 
+    def test_existing_presentation_skips_second_provider_stream(self):
+        calls = []
+
+        def tool_factory(*_args, **_kwargs):
+            calls.append("tool")
+            return object()
+
+        def conversation_factory(*_args, **_kwargs):
+            calls.append("conversation")
+            return object()
+
+        stream = select_agent_answer_stream(
+            "检查订阅更新",
+            {
+                "mode": "read_plan",
+                "tool_call": {"name": "agent.read_plan"},
+                "result": {"ok": True, "status": "completed"},
+                "presentation": {
+                    "version": 1,
+                    "source": "llm",
+                    "kind": "narrative",
+                    "narrative": "订阅和媒体库已经核对完成。",
+                },
+            },
+            owner="owner",
+            tool_stream_factory=tool_factory,
+            conversation_stream_factory=conversation_factory,
+        )
+
+        self.assertIsNone(stream)
+        self.assertEqual(calls, [])
+
     def test_conversation_stream_uses_conversation_factory_and_skips_partial(self):
         calls = []
 

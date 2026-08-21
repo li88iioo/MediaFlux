@@ -119,6 +119,10 @@ def select_agent_answer_stream(
     mode = str(response.get("mode") or "")
     if mode in {"confirmation_required", "confirmed_action"}:
         return None
+    # Native Agent 或同步 presenter 已经生成过安全 narrative 时，直接复用；
+    # 流式适配器不应为同一用户请求再次调用 Provider。
+    if isinstance(response.get("presentation"), dict):
+        return None
     if isinstance(response.get("tool_call"), dict) and isinstance(
         response.get("result"), dict
     ):

@@ -1799,6 +1799,24 @@ def _resource_item_groups(response: Any) -> list[tuple[str, list[Any]]]:
     if not isinstance(data, dict):
         return []
 
+    if tool_name == "agent.read_plan":
+        groups: list[tuple[str, list[Any]]] = []
+        steps = data.get("steps")
+        if not isinstance(steps, list):
+            return []
+        for step in steps[:8]:
+            if not isinstance(step, dict):
+                continue
+            step_tool = str(step.get("tool_name") or "").strip()
+            step_result = step.get("result")
+            if not step_tool or not isinstance(step_result, dict):
+                continue
+            groups.extend(_resource_item_groups({
+                "tool_call": {"name": step_tool},
+                "result": step_result,
+            }))
+        return groups
+
     if tool_name == "indexer.search_resources":
         items = data.get("items")
         return [("", items)] if isinstance(items, list) else []

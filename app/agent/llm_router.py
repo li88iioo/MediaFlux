@@ -5,8 +5,10 @@ import asyncio
 import json
 import math
 import re
+import secrets
 import unicodedata
 from collections.abc import Mapping
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, AsyncIterator, Callable
@@ -21,6 +23,7 @@ from app.agent.conversation_summary import (
 )
 from app.agent.prompts import DEFAULT_AGENT_SYSTEM_PROMPT
 from app.agent.rate_limit import agent_rate_limiter
+from app.agent.models import ToolResult
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.result_projection import (
     is_public_text_safe,
@@ -162,6 +165,7 @@ _NATIVE_MAX_PROVIDER_CALLS = 6
 _NATIVE_MAX_TOOL_ROUNDS = 5
 _NATIVE_MAX_TOOL_CALLS = 8
 _NATIVE_MAX_CAPABILITIES = 14
+_LLM_MAX_PROVIDER_CALLS_PER_QUERY = 8
 _STREAM_MAX_ANSWER_CHARS = 1800
 _STREAM_FORBIDDEN_MARKERS = (
     "可调用",
@@ -199,6 +203,48 @@ class LLMToolSelection:
 @dataclass(frozen=True, slots=True)
 class LLMReadPlan:
     steps: tuple[LLMToolSelection, ...]
+
+
+@dataclass(slots=True)
+class _LLMRequestBudget:
+    """一次用户查询内共享 Provider 轮次，只占用一个分钟级请求名额。"""
+
+    owner: str
+    provider_requests: int = 0
+    admitted: bool = False
+
+    def reserve_provider_request(self) -> bool:
+        if self.provider_requests >= _LLM_MAX_PROVIDER_CALLS_PER_QUERY:
+            return False
+        if not self.admitted:
+            if not _allow_llm_request(self.owner):
+                return False
+            self.admitted = True
+        self.provider_requests += 1
+        return True
+
+
+_LLM_REQUEST_BUDGET: ContextVar[_LLMRequestBudget | None] = ContextVar(
+    "agent_llm_request_budget", default=None
+)
+
+
+def begin_llm_request_budget(owner: str) -> Token[_LLMRequestBudget | None]:
+    """为一次外部查询建立懒加载预算；没有 Provider 调用时不会消耗配额。"""
+    rate_owner = str(owner or "anonymous").strip() or "anonymous"
+    return _LLM_REQUEST_BUDGET.set(_LLMRequestBudget(owner=rate_owner))
+
+
+def reset_llm_request_budget(token: Token[_LLMRequestBudget | None]) -> None:
+    _LLM_REQUEST_BUDGET.reset(token)
+
+
+def _reserve_llm_provider_request(owner: str) -> bool:
+    rate_owner = str(owner or "anonymous").strip() or "anonymous"
+    budget = _LLM_REQUEST_BUDGET.get()
+    if budget is None or budget.owner != rate_owner:
+        return _allow_llm_request(rate_owner)
+    return budget.reserve_provider_request()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1137,7 +1183,7 @@ async def stream_conversation_answer(
     ):
         return
     prompts = _conversation_stream_prompts(normalized, conversation_context)
-    if prompts is None or not _allow_llm_request(owner):
+    if prompts is None or not _reserve_llm_provider_request(owner):
         return
     system_prompt, user_content = prompts
     async for delta in _request_text_stream(
@@ -1145,7 +1191,7 @@ async def stream_conversation_answer(
         user_content=user_content,
         max_tokens=700,
         max_content_length=1600,
-        fallback_budget=lambda: _allow_llm_request(owner),
+        fallback_budget=lambda: _reserve_llm_provider_request(owner),
     ):
         yield delta
 
@@ -1171,7 +1217,7 @@ async def stream_tool_answer(
     if projection is None:
         return
     prompts = _result_stream_prompts(normalized, projection)
-    if prompts is None or not _allow_llm_request(owner):
+    if prompts is None or not _reserve_llm_provider_request(owner):
         return
     system_prompt, user_content = prompts
     async for delta in _request_text_stream(
@@ -1179,7 +1225,7 @@ async def stream_tool_answer(
         user_content=user_content,
         max_tokens=900,
         max_content_length=_STREAM_MAX_ANSWER_CHARS,
-        fallback_budget=lambda: _allow_llm_request(owner),
+        fallback_budget=lambda: _reserve_llm_provider_request(owner),
     ):
         yield delta
 
@@ -1202,7 +1248,7 @@ async def stream_existing_answer(
     ):
         return
     prompts = _existing_answer_stream_prompts(normalized, response)
-    if prompts is None or not _allow_llm_request(owner):
+    if prompts is None or not _reserve_llm_provider_request(owner):
         return
     system_prompt, user_content = prompts
     async for delta in _request_text_stream(
@@ -1210,7 +1256,7 @@ async def stream_existing_answer(
         user_content=user_content,
         max_tokens=700,
         max_content_length=1600,
-        fallback_budget=lambda: _allow_llm_request(owner),
+        fallback_budget=lambda: _reserve_llm_provider_request(owner),
     ):
         yield delta
 
@@ -1596,6 +1642,59 @@ def _native_partial_reply(
     )
 
 
+_NATIVE_FATAL_TOOL_ERROR_CODES = frozenset({
+    "identity_required",
+    "rate_limited",
+    "sensitive_external_input",
+    "tool_not_exposed",
+    "tool_not_found",
+})
+
+
+def _native_tool_error_is_fatal(exc: AgentToolError) -> bool:
+    code = str(exc.code or "").strip()
+    return code in _NATIVE_FATAL_TOOL_ERROR_CODES or code.startswith("confirmation_")
+
+
+def _native_tool_error_response(
+    tool_name: str,
+    exc: AgentToolError,
+    *,
+    status: str,
+    summary: str,
+) -> dict[str, Any]:
+    """构造可安全回喂 Provider 的失败结果，不包含模型原始参数。"""
+    error = sanitize_public_text(exc.safe_message, limit=240)
+    return {
+        "request_id": secrets.token_urlsafe(12),
+        "mode": "read_only",
+        "tool_call": {"name": tool_name, "arguments": {}},
+        "result": ToolResult(
+            ok=False,
+            status=status,
+            summary=summary,
+            error=error or "本次调用暂时无法完成。",
+        ).to_dict(),
+    }
+
+
+def _native_tool_output(
+    call: Any, response_payload: dict[str, Any]
+) -> tuple[Any, str]:
+    projection = project_agent_response_for_llm(response_payload)
+    if projection is None:
+        raise ValueError("工具结果无法安全投影")
+    return (
+        call,
+        json.dumps(
+            projection,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
+    )
+
+
 async def _execute_native_tool_turn(
     turn: Any,
     *,
@@ -1603,7 +1702,7 @@ async def _execute_native_tool_turn(
     execute_tool: Callable[[str, dict[str, Any]], dict[str, Any]],
     state: _NativeLoopState,
 ) -> list[tuple[Any, str]]:
-    """校验并串行执行一个 Provider turn 中的只读工具调用。"""
+    """校验并串行执行一个 Provider turn；可恢复错误回喂模型自行修正。"""
     outputs: list[tuple[Any, str]] = []
     round_ids: set[str] = set()
     for call in turn.tool_calls:
@@ -1618,26 +1717,43 @@ async def _execute_native_tool_turn(
         ):
             raise ValueError("AI 工具调用标识无效")
         round_ids.add(call_id)
-        normalized_arguments = registry.validate_read_call(
-            tool_name, call.arguments
-        )
+
+        try:
+            normalized_arguments = registry.validate_read_call(
+                tool_name, call.arguments
+            )
+        except AgentToolError as exc:
+            if _native_tool_error_is_fatal(exc):
+                raise
+            response_payload = _native_tool_error_response(
+                tool_name,
+                exc,
+                status="attention",
+                summary="调用参数无效，正在重新规划。",
+            )
+            outputs.append(_native_tool_output(call, response_payload))
+            state.total_tool_calls += 1
+            continue
+
         state.register_call(tool_name, normalized_arguments)
-        response_payload = await asyncio.to_thread(
-            execute_tool, tool_name, normalized_arguments
-        )
+        try:
+            response_payload = await asyncio.to_thread(
+                execute_tool, tool_name, normalized_arguments
+            )
+        except AgentToolError as exc:
+            if _native_tool_error_is_fatal(exc):
+                raise
+            response_payload = _native_tool_error_response(
+                tool_name,
+                exc,
+                status="unavailable",
+                summary="本次检查暂时无法完成。",
+            )
+
         state.record_execution(
             tool_name, normalized_arguments, response_payload
         )
-        projection = project_agent_response_for_llm(response_payload)
-        if projection is None:
-            raise ValueError("工具结果无法安全投影")
-        output = json.dumps(
-            projection,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        outputs.append((call, output))
+        outputs.append(_native_tool_output(call, response_payload))
         state.total_tool_calls += 1
     return outputs
 
@@ -2052,7 +2168,7 @@ def run_native_read_agent(
         or len(normalized) > 1000
         or _CONTROL_RE.search(normalized)
         or contains_sensitive_credential(normalized)
-        or not _allow_llm_request(owner)
+        or not _reserve_llm_provider_request(owner)
     ):
         return None
     try:
@@ -2062,7 +2178,7 @@ def run_native_read_agent(
                 registry,
                 execute_tool,
                 conversation_context=conversation_context,
-                fallback_budget=lambda: _allow_llm_request(owner),
+                fallback_budget=lambda: _reserve_llm_provider_request(owner),
             )
         )
     except AgentToolError as exc:
@@ -2097,13 +2213,13 @@ def compose_tool_answer(
     projection = project_agent_response_for_llm(response)
     if projection is None:
         return None
-    if not _allow_llm_request(owner):
+    if not _reserve_llm_provider_request(owner):
         return None
     try:
         return run_awaitable_sync(
             _request_result_narrative(
                 normalized, projection,
-                fallback_budget=lambda: _allow_llm_request(owner),
+                fallback_budget=lambda: _reserve_llm_provider_request(owner),
             )
         )
     except Exception as exc:
@@ -2128,13 +2244,13 @@ def answer_conversation(
         or contains_sensitive_credential(normalized)
     ):
         return None
-    if not _allow_llm_request(owner):
+    if not _reserve_llm_provider_request(owner):
         return None
     try:
         return run_awaitable_sync(
             _request_conversation_reply(
                 normalized, conversation_context,
-                fallback_budget=lambda: _allow_llm_request(owner),
+                fallback_budget=lambda: _reserve_llm_provider_request(owner),
             )
         )
     except Exception as exc:
@@ -2219,7 +2335,7 @@ def select_orchestration_tool(
     capabilities = orchestration_tool_capabilities(
         registry, include_confirmations=bool(route_owner)
     )
-    if not capabilities or not _allow_llm_request(request_owner):
+    if not capabilities or not _reserve_llm_provider_request(request_owner):
         return None
     prompt = (
         "当前任务是 MediaFlux 业务工具路由。理解用户自然语言，只选择一个最能直接完成当前目标的候选工具，"
@@ -2237,7 +2353,7 @@ def select_orchestration_tool(
             _request_selection(
                 _conversation_user_content(normalized, conversation_context),
                 capabilities,
-                fallback_budget=lambda: _allow_llm_request(request_owner),
+                fallback_budget=lambda: _reserve_llm_provider_request(request_owner),
                 routing_prompt=prompt,
                 schema_name="mediaflux_agent_orchestration_route",
             )
@@ -2269,7 +2385,7 @@ def select_confirmation_tool(
     ):
         return None
     capabilities = confirmation_tool_capabilities(registry)
-    if not capabilities or not _allow_llm_request(owner):
+    if not capabilities or not _reserve_llm_provider_request(owner):
         return None
     prompt = (
         "当前任务是低风险受控设置规划。只选择一个候选工具并填写精确参数，不直接回答问题，"
@@ -2287,7 +2403,7 @@ def select_confirmation_tool(
             _request_selection(
                 _conversation_user_content(normalized, conversation_context),
                 capabilities,
-                fallback_budget=lambda: _allow_llm_request(owner),
+                fallback_budget=lambda: _reserve_llm_provider_request(owner),
                 routing_prompt=prompt,
                 schema_name="mediaflux_agent_confirmation_route",
             )
@@ -2321,13 +2437,13 @@ def select_read_tool(
     )
     if not capabilities:
         return None
-    if not _allow_llm_request(owner):
+    if not _reserve_llm_provider_request(owner):
         return None
     try:
         return run_awaitable_sync(
             _request_selection(
                 _conversation_user_content(normalized, conversation_context), capabilities,
-                fallback_budget=lambda: _allow_llm_request(owner),
+                fallback_budget=lambda: _reserve_llm_provider_request(owner),
             )
         )
     except Exception as exc:
@@ -2359,13 +2475,13 @@ def select_read_plan(
     )
     if len(capabilities) < 2:
         return None
-    if not _allow_llm_request(owner):
+    if not _reserve_llm_provider_request(owner):
         return None
     try:
         return run_awaitable_sync(
             _request_read_plan(
                 _conversation_user_content(normalized, conversation_context), capabilities,
-                fallback_budget=lambda: _allow_llm_request(owner),
+                fallback_budget=lambda: _reserve_llm_provider_request(owner),
             )
         )
     except Exception as exc:

@@ -26,10 +26,12 @@ from app.agent.llm_router import (
     LLMReadPlan,
     LLMToolSelection,
     answer_conversation,
+    begin_llm_request_budget,
     compose_tool_answer,
     is_agent_action_request,
     is_compound_read_request,
     is_confirmation_planning_request,
+    reset_llm_request_budget,
     run_native_read_agent,
     select_confirmation_tool,
     select_orchestration_tool,
@@ -5283,6 +5285,7 @@ class AgentOrchestrator:
         message = normalize_agent_message(value)
         confirmation_token = None
         rate_identity_token = None
+        llm_budget_token = begin_llm_request_budget(llm_rate_owner or owner)
         owner_key = str(owner or "").strip()
         if confirmation_owner_generation is not None and owner_key:
             confirmation_token = _QUERY_CONFIRMATION_EPOCH.set(
@@ -5416,10 +5419,119 @@ class AgentOrchestrator:
                 message, response, owner=llm_rate_owner or owner
             )
         finally:
+            reset_llm_request_budget(llm_budget_token)
             if rate_identity_token is not None:
                 _QUERY_TOOL_RATE_IDENTITY.reset(rate_identity_token)
             if confirmation_token is not None:
                 _QUERY_CONFIRMATION_EPOCH.reset(confirmation_token)
+
+    def _aggregate_native_read_executions(
+        self,
+        executions: list[dict[str, Any]],
+        *,
+        owner: str,
+        completed: bool,
+        narrative_suggestions: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        """把 Native 多工具执行投影为既有 read_plan 契约。"""
+        if len(executions) < 2:
+            return None
+
+        public_steps: list[dict[str, Any]] = []
+        replay_steps: list[tuple[str, dict[str, Any]]] = []
+        suggestions: list[str] = []
+        total_elapsed_ms = 0
+        succeeded = 0
+        for position, execution in enumerate(executions, start=1):
+            tool_name = str(execution.get("tool_name") or "").strip()
+            arguments = execution.get("arguments")
+            raw_response = execution.get("response")
+            if not tool_name or not isinstance(arguments, dict):
+                return None
+            replay_steps.append((tool_name, dict(arguments)))
+
+            tool_call = (
+                raw_response.get("tool_call")
+                if isinstance(raw_response, dict) else None
+            )
+            try:
+                elapsed_ms = (
+                    int(tool_call.get("elapsed_ms") or 0)
+                    if isinstance(tool_call, dict) else 0
+                )
+            except (TypeError, ValueError):
+                elapsed_ms = 0
+            elapsed_ms = max(0, elapsed_ms)
+            total_elapsed_ms += elapsed_ms
+
+            result = (
+                raw_response.get("result")
+                if isinstance(raw_response, dict) else None
+            )
+            if not isinstance(result, dict):
+                result = ToolResult(
+                    False,
+                    "unavailable",
+                    "工具返回了无效结果",
+                    error="该步骤暂时无法读取。",
+                ).to_dict()
+            else:
+                result = deepcopy(result)
+            if result.get("ok") is True:
+                succeeded += 1
+            for item in result.get("suggestions", []):
+                text = result_projection.sanitize_public_text(item, limit=240)
+                if text and text not in suggestions:
+                    suggestions.append(text)
+            public_steps.append({
+                "position": position,
+                "tool_name": tool_name,
+                "elapsed_ms": elapsed_ms,
+                "result": result,
+            })
+
+        for item in narrative_suggestions:
+            text = result_projection.sanitize_public_text(item, limit=240)
+            if text and text not in suggestions:
+                suggestions.append(text)
+
+        failed = len(public_steps) - succeeded
+        fully_completed = completed and failed == 0
+        if fully_completed:
+            summary = f"综合检查完成：{succeeded} 项正常"
+            error = ""
+        elif failed:
+            summary = f"综合检查完成：{succeeded} 项正常，{failed} 项需要关注"
+            error = "部分检查未能正常完成。"
+        else:
+            summary = f"已保留 {succeeded} 项检查结果，但后续归纳未完整结束"
+            error = "检查结果已保留，但后续分析暂时中断。"
+
+        aggregate = ToolResult(
+            ok=fully_completed,
+            status="completed" if fully_completed else "partial",
+            summary=summary,
+            data={
+                "step_count": len(public_steps),
+                "completed": succeeded,
+                "failed": failed,
+                "steps": public_steps,
+            },
+            suggestions=suggestions[:8],
+            error=error,
+        )
+        response = self._response(
+            "agent.read_plan",
+            {"step_count": len(public_steps)},
+            aggregate,
+            total_elapsed_ms,
+            mode="read_plan",
+        )
+        if owner and not self.recent_read_store.capture_plan(
+            owner=owner, steps=replay_steps
+        ):
+            self.recent_read_store.clear_owner(owner=owner)
+        return response
 
     def _query_with_model_tools(
         self,
@@ -5561,9 +5673,15 @@ class AgentOrchestrator:
         # 不能把它降级成 tool_call=None 的普通对话，否则候选资源、媒体身份、
         # RSS 订阅对象和后续确认入口都会在这一层丢失。
         response: dict[str, Any] | None = None
-        if executions:
-            last_execution = executions[-1]
-            raw_response = last_execution.get("response")
+        if len(executions) > 1:
+            response = self._aggregate_native_read_executions(
+                executions,
+                owner=owner,
+                completed=native_reply.completed,
+                narrative_suggestions=native_reply.suggestions,
+            )
+        elif executions:
+            raw_response = executions[0].get("response")
             if isinstance(raw_response, dict):
                 response = deepcopy(raw_response)
 

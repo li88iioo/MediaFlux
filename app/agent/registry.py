@@ -330,6 +330,10 @@ class ToolRegistry:
             return spec.validator(dict(arguments))
         except AgentToolError:
             raise
+        except KeyError as exc:
+            key = str(exc.args[0] if exc.args else "").strip()
+            message = f"缺少必需参数：{key}" if key else "缺少必需参数"
+            raise AgentToolError(message) from exc
         except (TypeError, ValueError) as exc:
             raise AgentToolError(str(exc) or "工具参数无效") from exc
 

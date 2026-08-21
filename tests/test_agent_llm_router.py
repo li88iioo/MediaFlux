@@ -23,11 +23,14 @@ from app.agent.llm_router import (
     _request_selection,
     _request_text_stream,
     answer_conversation,
+    begin_llm_request_budget,
     compose_tool_answer,
     confirmation_tool_capabilities,
     is_agent_action_request,
     is_confirmation_planning_request,
     normalize_streamed_answer,
+    reset_llm_request_budget,
+    run_native_read_agent,
     orchestration_tool_capabilities,
     read_tool_capabilities,
     select_confirmation_tool,
@@ -1151,6 +1154,121 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertIn("系统健康检查：系统运行正常", reply.answer)
         self.assertNotIn("workspace.health", json_module.dumps(reply.tool_trace))
 
+    def test_native_read_agent_returns_invalid_arguments_to_model_for_retry(self):
+        captured = {"requests": 0, "bodies": []}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                captured["bodies"].append(json)
+                captured["requests"] += 1
+                if captured["requests"] == 1:
+                    return IndexerHttpResponse(
+                        url=url,
+                        status_code=200,
+                        headers={},
+                        body=json_module.dumps({
+                            "choices": [{"message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [{
+                                    "id": "call_invalid",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mf_demo_counter",
+                                        "arguments": "{}",
+                                    },
+                                }],
+                            }}],
+                        }).encode(),
+                    )
+                if captured["requests"] == 2:
+                    return IndexerHttpResponse(
+                        url=url, status_code=200, headers={},
+                        body=_chat_tool_turn(("call_valid", 2)),
+                    )
+                return IndexerHttpResponse(
+                    url=url, status_code=200, headers={},
+                    body=_chat_text_turn("已经读取计数 2。"),
+                )
+
+            async def aclose(self):
+                pass
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+        }
+        executed = []
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            reply = asyncio.run(_request_native_read_agent(
+                "读取计数",
+                _counter_read_registry(),
+                lambda name, arguments: executed.append(dict(arguments)) or {
+                    "tool_call": {"name": name, "arguments": arguments},
+                    "result": ToolResult(
+                        True, "ok", f"计数 {arguments['n']}"
+                    ).to_dict(),
+                },
+                client_factory=FakeClient,
+                fallback_budget=lambda: True,
+            ))
+
+        self.assertIsNotNone(reply)
+        self.assertTrue(reply.completed)
+        self.assertEqual(reply.answer, "已经读取计数 2。")
+        self.assertEqual(executed, [{"n": 2}])
+        self.assertEqual(len(reply.tool_executions), 1)
+        self.assertEqual(captured["requests"], 3)
+        retry_body = json_module.dumps(captured["bodies"][1], ensure_ascii=False)
+        self.assertIn("参数无效", retry_body)
+        self.assertIn("缺少必需参数", retry_body)
+
+    def test_native_read_agent_rate_limit_error_aborts_without_retry(self):
+        captured = {"requests": 0}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                captured["requests"] += 1
+                return IndexerHttpResponse(
+                    url=url, status_code=200, headers={},
+                    body=_chat_tool_turn(("call_1", 1)),
+                )
+
+            async def aclose(self):
+                pass
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+        }
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), self.assertRaises(AgentToolError) as raised:
+            asyncio.run(_request_native_read_agent(
+                "读取计数",
+                _counter_read_registry(),
+                lambda *_args: (_ for _ in ()).throw(AgentToolError(
+                    "请求过于频繁", code="rate_limited"
+                )),
+                client_factory=FakeClient,
+                fallback_budget=lambda: True,
+            ))
+
+        self.assertEqual(raised.exception.code, "rate_limited")
+        self.assertEqual(captured["requests"], 1)
+
     def test_native_read_agent_checks_shared_budget_only_after_first_request(self):
         captured = {"requests": 0, "budget_checks": 0}
 
@@ -1777,6 +1895,49 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertEqual(answer_request.call_count, 1)
         self.assertEqual(presenter_request.call_count, 1)
 
+    def test_request_scope_charges_one_minute_slot_for_internal_provider_rounds(self):
+        registry = _read_registry()
+        values = {"AGENT_LLM_ENABLED": "1"}
+
+        async def native(*args, **kwargs):
+            self.assertTrue(kwargs["fallback_budget"]())
+            self.assertTrue(kwargs["fallback_budget"]())
+            return None
+
+        async def selection(*args, **kwargs):
+            self.assertTrue(kwargs["fallback_budget"]())
+            return LLMToolSelection("workspace.health", {})
+
+        admitted = []
+        token = begin_llm_request_budget("owner-a")
+        try:
+            with patch(
+                "app.agent.llm_router.get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ), patch(
+                "app.agent.llm_router._allow_llm_request",
+                side_effect=lambda owner: admitted.append(owner) or True,
+            ), patch(
+                "app.agent.llm_router._request_native_read_agent",
+                side_effect=native,
+            ), patch(
+                "app.agent.llm_router._request_selection",
+                side_effect=selection,
+            ):
+                self.assertIsNone(
+                    run_native_read_agent(
+                        "检查整体健康", registry, lambda *_args: {}, owner="owner-a"
+                    )
+                )
+                self.assertEqual(
+                    select_read_tool("检查整体健康", registry, owner="owner-a"),
+                    LLMToolSelection("workspace.health", {}),
+                )
+        finally:
+            reset_llm_request_budget(token)
+
+        self.assertEqual(admitted, ["owner-a"])
+
     def test_selector_exception_fails_closed(self):
         registry = _read_registry()
         values = {"AGENT_LLM_ENABLED": "1"}
@@ -1905,6 +2066,144 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         orchestration_selector.assert_not_called()
         read_selector.assert_not_called()
         presenter.assert_not_called()
+
+    def test_native_multi_tool_executions_use_read_plan_contract(self):
+        registry = ToolRegistry()
+        for name, summary in (
+            ("workspace.health", "系统正常"),
+            ("downloads.diagnose_queue", "有 1 项需要关注"),
+        ):
+            registry.register(ToolSpec(
+                name=name,
+                description=summary,
+                risk=RiskLevel.READ,
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                validator=lambda arguments: {},
+                handler=lambda arguments, text=summary: ToolResult(
+                    True, "ok", text
+                ),
+                llm_read=True,
+            ))
+
+        reply = LLMConversationReply(
+            "系统正常，但下载队列有 1 项需要关注。",
+            ("检查下载队列里的异常",),
+            tool_trace=(
+                {"label": "系统健康检查", "ok": True, "summary": "系统正常"},
+                {"label": "下载队列", "ok": False, "summary": "1 项需关注"},
+            ),
+            tool_executions=(
+                {
+                    "tool_name": "workspace.health",
+                    "arguments": {},
+                    "response": {
+                        "request_id": "step-one",
+                        "mode": "read_only",
+                        "tool_call": {
+                            "name": "workspace.health",
+                            "arguments": {},
+                            "elapsed_ms": 4,
+                        },
+                        "result": ToolResult(
+                            True, "healthy", "系统正常"
+                        ).to_dict(),
+                    },
+                },
+                {
+                    "tool_name": "downloads.diagnose_queue",
+                    "arguments": {},
+                    "response": {
+                        "request_id": "step-two",
+                        "mode": "read_only",
+                        "tool_call": {
+                            "name": "downloads.diagnose_queue",
+                            "arguments": {},
+                            "elapsed_ms": 6,
+                        },
+                        "result": ToolResult(
+                            False,
+                            "attention",
+                            "有 1 项需要关注",
+                            suggestions=["检查下载队列里的异常"],
+                            error="存在失败任务。",
+                        ).to_dict(),
+                    },
+                },
+            ),
+        )
+        orchestrator = AgentOrchestrator(registry)
+
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent", return_value=reply
+        ), patch(
+            "app.agent.orchestrator.compose_tool_answer"
+        ) as presenter:
+            response = orchestrator.query(
+                "同时检查下载队列和项目配置",
+                owner="web-session",
+                llm_rate_owner="stable-login",
+            )
+
+        self.assertEqual(response["mode"], "read_plan")
+        self.assertEqual(response["tool_call"]["name"], "agent.read_plan")
+        self.assertEqual(response["tool_call"]["elapsed_ms"], 10)
+        self.assertFalse(response["result"]["ok"])
+        self.assertEqual(response["result"]["status"], "partial")
+        self.assertEqual(response["result"]["data"]["step_count"], 2)
+        self.assertEqual(
+            [step["tool_name"] for step in response["result"]["data"]["steps"]],
+            ["workspace.health", "downloads.diagnose_queue"],
+        )
+        self.assertEqual(
+            response["presentation"]["narrative"],
+            "系统正常,但下载队列有 1 项需要关注。",
+        )
+        recent = orchestrator.recent_read_store.get(owner="web-session")
+        self.assertIsNotNone(recent)
+        self.assertEqual(recent[0], "agent.read_plan")
+        self.assertEqual(len(recent[1]["steps"]), 2)
+        presenter.assert_not_called()
+
+    def test_native_single_tool_execution_preserves_original_contract(self):
+        registry = _read_registry()
+        original = {
+            "request_id": "single-step",
+            "mode": "read_only",
+            "tool_call": {
+                "name": "workspace.health",
+                "arguments": {},
+                "elapsed_ms": 3,
+            },
+            "result": ToolResult(True, "healthy", "系统正常").to_dict(),
+        }
+        reply = LLMConversationReply(
+            "系统正常。",
+            (),
+            tool_trace=(
+                {"label": "系统健康检查", "ok": True, "summary": "系统正常"},
+            ),
+            tool_executions=({
+                "tool_name": "workspace.health",
+                "arguments": {},
+                "response": original,
+            },),
+        )
+
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent", return_value=reply
+        ):
+            response = AgentOrchestrator(registry).query(
+                "自然语言检查一下系统", owner="web-session"
+            )
+
+        self.assertEqual(response["request_id"], "single-step")
+        self.assertEqual(response["mode"], "read_only")
+        self.assertEqual(response["tool_call"]["name"], "workspace.health")
+        self.assertEqual(response["result"]["status"], "healthy")
 
     def test_unified_hidden_tool_selection_fails_closed_without_execution(self):
         calls = []

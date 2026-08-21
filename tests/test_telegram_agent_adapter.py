@@ -16,6 +16,7 @@ from app.agent.registry import AgentToolError, ToolRegistry
 from app.bot.agent_adapter import (
     TelegramAgentActionStore,
     _render_resource_candidates,
+    _resource_candidates,
     _stream_preview_html,
     _truncate_telegram_html,
     handle_agent_callback,
@@ -761,6 +762,49 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertIn("\n\n暂未找到结果。", text)
         self.assertIn("• 检查片名", text)
         self.assertIn("<code>▍</code>", text)
+
+    def test_resource_candidates_include_non_final_native_read_plan_step(self):
+        response = {
+            "mode": "read_plan",
+            "tool_call": {"name": "agent.read_plan", "arguments": {"step_count": 2}},
+            "result": {
+                "ok": True,
+                "status": "completed",
+                "summary": "综合检查完成",
+                "data": {
+                    "steps": [
+                        {
+                            "position": 1,
+                            "tool_name": "indexer.search_resources",
+                            "result": {
+                                "ok": True,
+                                "data": {
+                                    "items": [{
+                                        "result_id": "result_123456789",
+                                        "title": "庆余年 S02E01 2160p",
+                                        "site_name": "Demo",
+                                        "size_text": "2.1 GB",
+                                        "download_state": "ready",
+                                        "download_kinds": ["magnet"],
+                                    }],
+                                },
+                            },
+                        },
+                        {
+                            "position": 2,
+                            "tool_name": "downloads.diagnose_queue",
+                            "result": {"ok": True, "data": {}},
+                        },
+                    ],
+                },
+            },
+        }
+
+        candidates = _resource_candidates(response)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["result_id"], "result_123456789")
+        self.assertEqual(candidates[0]["title"], "庆余年 S02E01 2160p")
 
     def test_resource_candidate_message_keeps_candidates_outside_llm_narrative(self):
         response = {
