@@ -324,6 +324,37 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
         self.assertEqual(resource["tool_call"]["name"], "indexer.search_resources")
         self.assertEqual(calls[-1][1], {"title": "候选影片 2", "limit": 20})
 
+    def test_recent_search_accepts_implicit_ordinal_followups(self) -> None:
+        calls: list[tuple[str, dict]] = []
+        agent = self._orchestrator(calls)
+        agent.query("在网上找《候选影片》电影", owner="owner", present=False)
+
+        provider = Mock()
+        provider.get_detail.return_value = _card(2)
+        with patch("app.agent.discovery_watchlist_actions.config.get_bool", return_value=True), patch(
+            "app.agent.discovery_watchlist_actions.get_discovery_service",
+            return_value=provider,
+        ):
+            prepared = agent.query("收藏第二个", owner="owner", present=False)
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(prepared["tool_call"]["name"], "discovery.add_watchlist")
+
+        resource = agent.query("搜第1部资源", owner="owner", present=False)
+        self.assertEqual(resource["tool_call"]["name"], "indexer.search_resources")
+        self.assertEqual(calls[-1][1], {"title": "候选影片 1", "limit": 20})
+
+        inspected = agent.query("看看第二个", owner="owner", present=False)
+        self.assertEqual(inspected["mode"], "conversation")
+        self.assertIn("候选影片 2", inspected["result"]["summary"])
+
+    def test_implicit_ordinal_does_not_steal_quoted_title_or_out_of_range_query(self) -> None:
+        agent = self._orchestrator([])
+        agent.query("在网上找《候选影片》电影", owner="owner", present=False)
+
+        quoted = agent.query("在网上搜《第二十条》电影", owner="owner", present=False)
+        self.assertEqual(quoted["tool_call"]["name"], "discovery.search")
+        self.assertEqual(quoted["tool_call"]["arguments"]["query"], "第二十条")
+
     def test_watchlist_natural_language_routes_preserve_read_and_write_boundaries(self) -> None:
         calls: list[tuple[str, dict]] = []
         agent = self._orchestrator(calls)

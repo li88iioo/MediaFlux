@@ -227,23 +227,45 @@ def _safe_media_context(value: Any) -> dict[str, str]:
     return result
 
 
+_MEDIA_CONTEXT_TOOL_NAMES = frozenset({
+    "library.search",
+    "library.count_series_episodes",
+    "library.audit_episodes",
+    "library.audit_library_episodes",
+    "library.check_updates",
+    "library.search_missing_episode_resources",
+    "library.search_missing_season_resources",
+    "media.subscription_updates",
+    "discovery.search",
+    "discovery.recommend",
+    "discovery.lookup_rating",
+    "discovery.add_watchlist",
+    "indexer.search_resources",
+})
+
+
 def _latest_media_context(
     conversation_context: list[dict[str, Any]] | None,
 ) -> dict[str, str]:
-    """只继承当前主题最近一次助手回复中的媒体上下文。
+    """继承当前媒体主题，允许普通寒暄穿插但阻止跨领域串线。
 
-    一旦最近的助手回复已经切换到下载、RSS、配置等其他领域，就不能继续
-    向前翻找旧片名，否则“搜索这部电影资源”会错误复用几轮之前的作品。
+    纯对话回复不会天然代表切换主题；只有明确执行了非媒体工具，才停止向前
+    查找已验证的媒体身份。最多查看 12 条助手/摘要记录，避免旧上下文无限续接。
     """
+    inspected = 0
     for item in reversed(conversation_context or []):
         if not isinstance(item, dict):
             continue
         if str(item.get("role") or "").casefold() not in {"assistant", "summary"}:
             continue
+        inspected += 1
+        if inspected > 12:
+            break
         media_context = _safe_media_context(item.get("media_context"))
         if media_context:
             return media_context
-        if str(item.get("tool_name") or "").strip() or str(item.get("text") or "").strip():
+        tool_name = str(item.get("tool_name") or "").strip()
+        if tool_name and tool_name not in _MEDIA_CONTEXT_TOOL_NAMES:
             return {}
     return {}
 
@@ -348,7 +370,7 @@ def _extract_media_rating_title(message: str) -> str:
     )
     text = re.sub(r"(?:豆瓣|电视剧|电视连续剧|连续剧|剧集|电影|影片|这部剧|该剧|这部电影)", " ", text)
     text = re.sub(r"(?:是多少|多少分|是几分|几分|怎么样|如何|重试|再试一次|重新查询|重新查|继续查)", " ", text)
-    text = re.sub(r"[\s，。！？!?、；;：:~～·•\-_/]+", " ", text).strip(" 的")
+    text = re.sub(r"[\s，。！？!?、；;：:~～·•\-_/]+", " ", text).strip(" 的呢吗")
     title = " ".join(text.split()).strip()[:120]
     return "" if _is_generic_media_collection_term(title) else title
 
@@ -411,6 +433,18 @@ def contextual_media_rating_request(
     text = unicodedata.normalize("NFKC", str(message or "")).strip()
     compact = re.sub(r"[\s，。！？!?、；;：:~～]+", "", text.casefold())
     last_assistant = _latest_assistant_tool_context(conversation_context)
+    if not last_assistant:
+        for item in reversed(conversation_context or []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("role") or "").casefold() not in {"assistant", "summary"}:
+                continue
+            tool_name = str(item.get("tool_name") or "").strip()
+            if not tool_name:
+                continue
+            if tool_name in _MEDIA_CONTEXT_TOOL_NAMES:
+                last_assistant = item
+            break
     previous_rating = str(last_assistant.get("tool_name") or "") == "discovery.lookup_rating"
     media_context = (
         _pending_rating_media_context(conversation_context)
@@ -572,7 +606,7 @@ _RECENT_DOWNLOAD_LIBRARY_REJECT_TOKENS = (
     *_RECENT_DOWNLOAD_REJECT_TOKENS,
     "暂停", "恢复", "开始下载", "执行入库", "帮我入库", "帮我补齐",
 )
-_DISCOVERY_TV_TOKENS = ("电视剧", "剧集", "连续剧", "电视节目", "剧荒")
+_DISCOVERY_TV_TOKENS = ("电视剧", "剧集", "连续剧", "电视节目", "剧荒", "追剧", "追番")
 _DISCOVERY_MOVIE_TOKENS = ("电影", "影片", "片荒")
 _DISCOVERY_CONTEXTUAL_RECOMMEND_TOKENS = ("类似", "相似", "同类", "根据", "按照", "基于", "我喜欢", "适合我")
 _BANGUMI_CALENDAR_CONTENT_TOKENS = ("番剧", "新番", "动画", "bangumi", "bgm")
@@ -1335,7 +1369,12 @@ def is_media_subscription_summaries_message(message: str) -> bool:
         return False
     if any(token in normalized for token in _MEDIA_SUBSCRIPTION_WRITE_TOKENS):
         return False
-    if re.search(r"(?:id|编号)?\s*[#:]?\s*\d{1,9}", normalized):
+    if re.search(
+        r"(?:id|编号)\s*[#:]?\s*\d{1,9}"
+        r"|订阅\s*[#:]?\s*\d{1,9}\s*"
+        r"(?:状态|详情|摘要|情况|健康|概览|是否启用|缺集情况)?[.!。！？]?$",
+        normalized,
+    ):
         return False
     bare_query = normalized.strip(" ，。！？!?、；;：:~～")
     if bare_query in _MEDIA_SUBSCRIPTION_BARE_SUMMARY_QUERIES:
@@ -1344,9 +1383,24 @@ def is_media_subscription_summaries_message(message: str) -> bool:
     has_collection_scope = any(
         token in normalized for token in _MEDIA_SUBSCRIPTION_COLLECTION_SCOPES
     )
-    return has_read_intent and (
-        any(token in normalized for token in _MEDIA_SUBSCRIPTION_LIST_TOKENS)
-        or has_collection_scope
+    count_scope = any(token in normalized for token in (
+        "媒体订阅", "影视订阅", "媒体追更订阅", "影视追更订阅", "追更订阅",
+        "我的订阅", "订阅列表", "我追的剧", "我的追剧", "在追的剧",
+        "我追的番", "我的追番", "在追的番", "我的追更",
+    ))
+    count_question = count_scope and (
+        any(token in normalized for token in ("多少", "几个", "几部", "数量"))
+        or (
+            "订阅了" in normalized
+            and any(token in normalized for token in ("吗", "么", "呢", "是不是", "当前"))
+        )
+    )
+    return count_question or (
+        has_read_intent
+        and (
+            any(token in normalized for token in _MEDIA_SUBSCRIPTION_LIST_TOKENS)
+            or has_collection_scope
+        )
     )
 
 
@@ -2599,22 +2653,35 @@ _RECENT_DISCOVERY_REFERENCES = (
 _DISCOVERY_WATCHLIST_SCOPES = ("探索收藏", "影视收藏", "发现收藏")
 
 
-def recent_discovery_candidate_request(message: str) -> dict[str, Any] | None:
-    """解析最近探索候选的收藏或资源搜索续句。"""
+def recent_discovery_candidate_request(
+    message: str, *, allow_implicit: bool = False
+) -> dict[str, Any] | None:
+    """解析最近探索候选的收藏、资源搜索或查看续句。"""
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
-    if not normalized or not any(token in normalized for token in _RECENT_DISCOVERY_REFERENCES):
+    if not normalized or _MEDIA_RATING_QUOTED_TITLE_RE.search(normalized):
+        return None
+    explicit_reference = any(token in normalized for token in _RECENT_DISCOVERY_REFERENCES)
+    if not explicit_reference and not allow_implicit:
         return None
     position = _recent_resource_selection(normalized)
     if position is None:
         return None
+    base = {"position": position, "explicit": explicit_reference}
     if "收藏" in normalized and any(token in normalized for token in (
         "加入", "添加", "收藏", "存下", "保存",
     )) and not any(token in normalized for token in ("移除", "删除", "取消收藏")):
-        return {"action": "watchlist_add", "position": position}
+        return {**base, "action": "watchlist_add"}
     if any(token in normalized for token in (
         "找资源", "搜索资源", "搜资源", "找种子", "搜种子", "资源搜索",
+    )) or (
+        any(token in normalized for token in ("搜", "找", "搜索", "查找"))
+        and any(token in normalized for token in ("资源", "种子", "磁力"))
+    ):
+        return {**base, "action": "resource_search"}
+    if any(token in normalized for token in (
+        "看看", "查看", "详情", "介绍", "是什么", "是哪部", "哪一个",
     )):
-        return {"action": "resource_search", "position": position}
+        return {**base, "action": "inspect"}
     return None
 
 
@@ -4765,15 +4832,31 @@ class AgentOrchestrator:
                     "Agent 补库工作流选择候选失败 type=%s",
                     type(exc).__name__,
                 )
-        return self.prepare(
-            "indexer.submit_resource",
-            {"result_id": selected["result_id"], "target": target},
-            owner=owner,
-            followup_context=workflow_followup_context(
-                verification_context,
-                workflow_ref,
-            ),
-        )
+        try:
+            return self.prepare(
+                "indexer.submit_resource",
+                {"result_id": selected["result_id"], "target": target},
+                owner=owner,
+                followup_context=workflow_followup_context(
+                    verification_context,
+                    workflow_ref,
+                ),
+            )
+        except AgentToolError as exc:
+            if exc.code != "confirmation_unavailable":
+                raise
+            return self._response(
+                "indexer.submit_resource",
+                {},
+                ToolResult(
+                    False,
+                    "precondition_failed",
+                    "最近资源列表已恢复，但下载句柄已经过期",
+                    suggestions=["请重新搜索资源后，再选择序号推送到 qB 或光鸭。"],
+                    error="资源候选对应的短期下载句柄不可恢复。",
+                ),
+                0,
+            )
 
     def _continue_recent_download_status(self, message: str, *, owner: str) -> dict[str, Any]:
         request = recent_download_status_request(message) or {}
@@ -5736,14 +5819,16 @@ class AgentOrchestrator:
         query_tool_rate_identity: str,
     ) -> dict[str, Any] | None:
         """处理最近探索结果与探索收藏的确定性续句。"""
-        recent_discovery_request = recent_discovery_candidate_request(message)
+        snapshot = self.recent_discovery_store.get(owner=owner) if owner else None
+        recent_discovery_request = recent_discovery_candidate_request(
+            message, allow_implicit=snapshot is not None
+        )
         if recent_discovery_request is not None:
             if not owner:
                 return self._unsupported(
                     "最近探索结果只在当前已登录会话中可用",
                     ["请在 Agent 页面重新搜索影片后继续操作。"],
                 )
-            snapshot = self.recent_discovery_store.get(owner=owner)
             candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
             position = int(recent_discovery_request["position"])
             candidate = next((
@@ -5751,6 +5836,8 @@ class AgentOrchestrator:
                 if isinstance(item, dict) and int(item.get("position") or 0) == position
             ), None)
             if candidate is None:
+                if not bool(recent_discovery_request.get("explicit")):
+                    return None
                 return self._clarification_response(
                     "没有找到对应的最近探索结果，结果可能已经过期或序号超出范围。",
                     ["重新搜索片名", "列出探索收藏"],
@@ -5764,6 +5851,17 @@ class AgentOrchestrator:
                         "media_type": candidate["media_type"],
                     },
                     owner=owner,
+                )
+            if recent_discovery_request["action"] == "inspect":
+                label = "电视剧" if candidate.get("media_type") == "tv" else "电影"
+                year = str(candidate.get("year") or "").strip()
+                year_text = f"（{year}）" if year else ""
+                return self._conversation_response(
+                    f"第 {position} 个是{label}《{candidate['title']}》{year_text}。",
+                    [
+                        f"收藏第 {position} 个",
+                        f"搜第 {position} 部资源",
+                    ],
                 )
             if query_tool_rate_identity and not allow_agent_tool(
                 query_tool_rate_identity, "indexer.search_resources"

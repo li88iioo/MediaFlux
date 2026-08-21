@@ -15,7 +15,12 @@ from app.modules.web_secret import get_web_secret
 
 logger = logging.getLogger(__name__)
 
-_CONTEXT_TYPES = frozenset({"patrol", "download_submission"})
+_CONTEXT_TYPES = frozenset({
+    "patrol",
+    "download_submission",
+    "resource_candidates",
+    "discovery_candidates",
+})
 _SCHEMA_VERSION = 1
 _DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024
 _DEFAULT_MAX_ROWS = 4096
@@ -65,6 +70,8 @@ class AgentSessionContextRepository(Protocol):
         now: float,
         limit: int,
     ) -> tuple[PersistedAgentContext, ...]: ...
+
+    def delete_latest(self, *, owner: str, context_type: str) -> int: ...
 
     def delete_owner(self, *, owner: str) -> int: ...
 
@@ -208,6 +215,18 @@ class SQLiteAgentSessionContextRepository:
                 )
             ) is not None
         )
+
+    def delete_latest(self, *, owner: str, context_type: str) -> int:
+        """仅删除指定会话的一类 latest 上下文。"""
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        with db.get_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=?",
+                (owner_digest, normalized_type),
+            )
+        return max(0, int(cursor.rowcount or 0))
 
     def delete_owner(self, *, owner: str) -> int:
         """删除指定会话的全部持久化上下文。"""

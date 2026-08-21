@@ -49,3 +49,37 @@ python -m unittest tests.test_anime_recognition_adapter
 当前锁定的 `anitomy-ng` 版本未通过零回退/零新增假阳性的晋级门，因此不得加入
 `requirements.txt` 或生产 resolver；后续升级依赖或调整
 投影规则时，必须重新运行 `anime` 与 `anime-negative` 两个 golden corpus slice。
+
+# Agent 自然语言离线评测集
+
+`agent_eval_cases.jsonl` 用于冻结 Agent 的确定性自然语言契约。它只评估本地分类器、
+参数抽取器与安全检测，不启动 Agent 服务、不连接网络，也不调用 LLM Provider。
+
+每条样本必须包含：
+
+- `case_id`：唯一小写 slug；
+- `category`：`read`、`write`、`clarification`、`multi_turn`、
+  `argument_validation` 或 `safety_adversarial`；
+- `domain`：小写 snake_case 领域名；
+- `evaluator`：受支持的确定性评估器；
+- `message`：用户自然语言输入；
+- `expected`：该评估器的精确期望结果。
+
+候选续句可通过 `allow_implicit` 模拟当前会话已有候选快照；评分续句可通过
+`conversation_context` 提供经过裁剪的安全历史。加载器会拒绝未知字段、重复样本、
+非法上下文和与评估器不匹配的 expected 结构。
+
+运行全部样本：
+
+```bash
+python -m tools.eval_agent
+python -m unittest tests.test_agent_eval
+```
+
+生成机器可读报告：
+
+```bash
+python -m tools.eval_agent --format json --output .superpowers/agent-eval.json
+```
+
+报告只列出指标与失败 `case_id`，不会回显安全对抗样本中的输入文本。

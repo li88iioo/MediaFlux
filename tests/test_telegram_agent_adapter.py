@@ -16,6 +16,7 @@ from app.agent.registry import AgentToolError, ToolRegistry
 from app.bot.agent_adapter import (
     TelegramAgentActionStore,
     _render_resource_candidates,
+    _safe_callback_history_response,
     _resource_candidates,
     _stream_preview_html,
     _truncate_telegram_html,
@@ -1564,6 +1565,46 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(
             history.append_query_turn.call_args.kwargs["message"], "继续看一下"
         )
+
+    def test_media_callback_history_keeps_only_safe_media_identity(self):
+        projected = _safe_callback_history_response(
+            {
+                "mode": "read_only",
+                "tool_call": {
+                    "name": "library.search_missing_episode_resources",
+                    "arguments": {
+                        "query": "九门",
+                        "media_type": "tv",
+                        "tmdb_id": "private-id",
+                        "path": "/private/path",
+                    },
+                },
+                "result": {
+                    "ok": True,
+                    "status": "success",
+                    "summary": "已找到资源",
+                    "data": {
+                        "title": "九门",
+                        "year": "2026",
+                        "media_type": "tv",
+                        "result_id": "private-result-id",
+                        "magnet": "magnet:?xt=urn:btih:secret",
+                    },
+                },
+            },
+            fallback_summary="已完成",
+        )
+
+        self.assertEqual(projected["tool_call"], {
+            "name": "library.search_missing_episode_resources",
+            "arguments": {},
+        })
+        self.assertEqual(projected["result"]["data"], {
+            "title": "九门", "year": "2026", "media_type": "tv",
+        })
+        serialized = repr(projected)
+        for forbidden in ("private-id", "/private/path", "private-result-id", "magnet:"):
+            self.assertNotIn(forbidden, serialized)
 
     def test_confirmation_callback_history_omits_internal_identifiers(self):
         bot = _Bot()

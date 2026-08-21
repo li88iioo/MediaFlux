@@ -1479,6 +1479,63 @@ def _telegram_history_generation(owner: str) -> int | None:
         return None
 
 
+_CALLBACK_MEDIA_CONTEXT_TOOLS = frozenset({
+    "library.search",
+    "library.count_series_episodes",
+    "library.audit_episodes",
+    "library.audit_library_episodes",
+    "library.check_updates",
+    "library.search_missing_episode_resources",
+    "library.search_missing_season_resources",
+    "media.subscription_updates",
+    "discovery.search",
+    "discovery.recommend",
+    "discovery.lookup_rating",
+    "discovery.add_watchlist",
+    "indexer.search_resources",
+})
+
+
+def _safe_callback_media_history(
+    payload: dict[str, Any], result: dict[str, Any]
+) -> tuple[str, dict[str, str]]:
+    """只保留 callback 续问所需的媒体身份，不保留票据、内部 ID 或路径。"""
+    tool_call = payload.get("tool_call") if isinstance(payload.get("tool_call"), dict) else {}
+    tool_name = str(tool_call.get("name") or "").strip()[:120]
+    if tool_name not in _CALLBACK_MEDIA_CONTEXT_TOOLS:
+        return "", {}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    arguments = (
+        tool_call.get("arguments")
+        if isinstance(tool_call.get("arguments"), dict)
+        else {}
+    )
+    title = sanitize_public_text(
+        data.get("title")
+        or data.get("query")
+        or arguments.get("title")
+        or arguments.get("query"),
+        limit=160,
+    )
+    if not title:
+        return tool_name, {}
+    media: dict[str, str] = {"title": title}
+    original_title = sanitize_public_text(
+        data.get("original_title") or arguments.get("original_title"), limit=160
+    )
+    if original_title:
+        media["original_title"] = original_title
+    year = str(data.get("year") or arguments.get("year") or "").strip()
+    if re.fullmatch(r"(?:19|20)\d{2}", year):
+        media["year"] = year
+    media_type = str(
+        data.get("media_type") or arguments.get("media_type") or ""
+    ).strip().lower()
+    if media_type in {"movie", "tv"}:
+        media["media_type"] = media_type
+    return tool_name, media
+
+
 def _safe_callback_history_response(
     response: Any, *, fallback_summary: str
 ) -> dict[str, Any]:
@@ -1496,7 +1553,8 @@ def _safe_callback_history_response(
             safe = sanitize_public_text(value, limit=180)
             if safe and safe not in suggestions:
                 suggestions.append(safe)
-    return {
+    tool_name, media_context = _safe_callback_media_history(payload, result)
+    safe_response: dict[str, Any] = {
         "mode": "conversation",
         "result": {
             "ok": ok,
@@ -1507,6 +1565,11 @@ def _safe_callback_history_response(
             "evidence": [],
         },
     }
+    if tool_name:
+        safe_response["tool_call"] = {"name": tool_name, "arguments": {}}
+        if media_context:
+            safe_response["result"]["data"] = media_context
+    return safe_response
 
 
 def _record_telegram_callback_conversation(

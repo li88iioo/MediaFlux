@@ -339,12 +339,45 @@ class MediaRatingContextTests(unittest.TestCase):
             },
         )
 
-        stale_topic = failed_context + [
+        conversational_gap = failed_context + [
+            {"role": "user", "text": "谢谢"},
+            {"role": "assistant", "text": "不客气，还想了解什么？"},
+        ]
+        self.assertEqual(
+            contextual_media_rating_request("重试", conversational_gap),
+            {
+                "query": "九门", "media_type": "tv", "year": "2026",
+                "allow_web_fallback": True,
+            },
+        )
+
+        stale_topic = conversational_gap + [
             {"role": "user", "text": "下载队列怎么样"},
-            {"role": "assistant", "text": "下载队列正常。"},
+            {
+                "role": "assistant",
+                "text": "下载队列正常。",
+                "tool_name": "downloads.status",
+            },
         ]
         self.assertIsNone(contextual_media_rating_request("重试", stale_topic))
         self.assertIsNone(contextual_media_rating_request("电视剧", stale_topic))
+
+    def test_summary_media_context_survives_plain_conversation(self):
+        context = [{
+            "role": "summary",
+            "text": "之前在看《九门》。",
+            "media_context": {"title": "九门", "year": "2026", "media_type": "tv"},
+        }, {
+            "role": "assistant",
+            "text": "可以，继续说。",
+        }]
+        self.assertEqual(
+            contextual_media_rating_request("这部剧评分呢", context),
+            {
+                "query": "九门", "media_type": "tv", "year": "2026",
+                "allow_web_fallback": True,
+            },
+        )
 
     def test_new_title_does_not_inherit_stale_year_or_type(self):
         request = contextual_media_rating_request("老九门的豆瓣评分", self.series_context)

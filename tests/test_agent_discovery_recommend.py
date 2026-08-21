@@ -179,6 +179,8 @@ class AgentDiscoveryRecommendTests(unittest.TestCase):
             "豆瓣推荐电视剧": {"provider": "douban", "media_type": "tv", "page": 1, "limit": 10},
             "最近有什么好看的电影": {"provider": "tmdb", "media_type": "movie", "page": 1, "limit": 10},
             "剧荒了，推荐几部电视剧": {"provider": "tmdb", "media_type": "tv", "page": 1, "limit": 10},
+            "推荐几部追剧": {"provider": "tmdb", "media_type": "tv", "page": 1, "limit": 10},
+            "推荐几个追番": {"provider": "tmdb", "media_type": "tv", "page": 1, "limit": 10},
         }
         for message, arguments in expected.items():
             with self.subTest(message=message):

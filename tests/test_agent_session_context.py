@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from app import database as db
 from app.agent.models import ToolResult
 from app.agent.owner_routes import web_agent_owner
+from app.agent.recent_discovery_candidates import RecentDiscoveryCandidateStore
 from app.agent.recent_download_submissions import RecentDownloadSubmissionStore
 from app.agent.recent_patrol import RecentPatrolStore
 from app.agent.recent_resource_candidates import RecentResourceCandidateStore
@@ -73,6 +74,26 @@ def _resource_result() -> ToolResult:
                     "alternatives": [],
                 }
             },
+        },
+    )
+
+
+def _discovery_result() -> ToolResult:
+    return ToolResult(
+        True,
+        "success",
+        "探索完成",
+        data={
+            "query": "候选影片",
+            "items": [{
+                "provider": "tmdb",
+                "external_id": "8801",
+                "media_type": "movie",
+                "title": "候选影片 1",
+                "year": "2026",
+                "overview": "private overview",
+                "poster_key": "https://private.example/poster",
+            }],
         },
     )
 
@@ -348,17 +369,79 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
             wall_clock=lambda: self.wall[0],
         ).get(owner="session-b"))
 
-    def test_resource_candidates_remain_process_local(self):
-        first = RecentResourceCandidateStore()
-        first.capture(owner="session-a", result=_resource_result())
-        self.assertEqual(first.get(owner="session-a")["candidates"][0]["position"], 1)
-        self.assertIsNone(RecentResourceCandidateStore().get(owner="session-a"))
+    def test_resource_and_discovery_candidates_restore_safe_snapshots(self):
+        monotonic = [20.0]
+        resource = RecentResourceCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        discovery = RecentDiscoveryCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        resource.capture(owner="session-a", result=_resource_result())
+        discovery.capture(owner="session-a", result=_discovery_result())
+
+        restored_resource = RecentResourceCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        ).get(owner="session-a")
+        restored_discovery = RecentDiscoveryCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        ).get(owner="session-a")
+
+        self.assertEqual(restored_resource["candidates"][0]["result_id"], "resource-result-0001")
+        self.assertEqual(restored_discovery["candidates"][0]["title"], "候选影片 1")
         with db.get_conn() as conn:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM agent_session_context "
-                "WHERE context_type='resource_candidate'"
-            ).fetchone()[0]
-        self.assertEqual(count, 0)
+            payloads = " ".join(
+                row["payload"] for row in conn.execute(
+                    "SELECT payload FROM agent_session_context "
+                    "WHERE context_type IN ('resource_candidates','discovery_candidates')"
+                ).fetchall()
+            )
+        for forbidden in ("magnet:", "/secret", "private.example", "overview"):
+            self.assertNotIn(forbidden, payloads)
+        self.assertIsNone(RecentResourceCandidateStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        ).get(owner="session-b"))
+        self.assertIsNone(RecentDiscoveryCandidateStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        ).get(owner="session-b"))
+
+    def test_candidate_restore_rejects_tampered_payload_and_clear_is_type_scoped(self):
+        resource = RecentResourceCandidateStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        )
+        discovery = RecentDiscoveryCandidateStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        )
+        resource.capture(owner="session-a", result=_resource_result())
+        discovery.capture(owner="session-a", result=_discovery_result())
+        digest = self.repository.owner_digest_for_tests("session-a")
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT id,payload FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type='resource_candidates'",
+                (digest,),
+            ).fetchone()
+            envelope = json.loads(row["payload"])
+            envelope["data"]["candidates"][0]["title"] = "被篡改"
+            conn.execute(
+                "UPDATE agent_session_context SET payload=? WHERE id=?",
+                (json.dumps(envelope, ensure_ascii=False), row["id"]),
+            )
+        self.assertIsNone(RecentResourceCandidateStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        ).get(owner="session-a"))
+        self.assertTrue(discovery.clear_owner(owner="session-a"))
+        self.assertIsNone(RecentDiscoveryCandidateStore(
+            repository=self.repository, wall_clock=lambda: self.wall[0]
+        ).get(owner="session-a"))
 
     def test_legacy_and_malformed_download_payloads_are_rejected(self):
         legacy = {
@@ -493,17 +576,24 @@ class AgentServiceSessionContextTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("DELETE FROM agent_session_context")
 
-    def test_service_singleton_recreation_restores_only_restart_safe_context(self):
+    def test_service_singleton_recreation_restores_restart_safe_context(self):
         owner = "stable-session-owner"
         first = get_agent_service()
         first.recent_patrol_store.capture(owner=owner, result=_patrol_result())
         first.recent_resource_store.capture(owner=owner, result=_resource_result())
+        first.recent_discovery_store.capture(owner=owner, result=_discovery_result())
         first.recent_download_store.capture(owner=owner, result=_download_result(101))
 
         reset_agent_service_for_tests()
         second = get_agent_service()
         self.assertEqual(second.recent_patrol_store.get(owner=owner)["options"][0]["season"], 2)
-        self.assertIsNone(second.recent_resource_store.get(owner=owner))
+        self.assertEqual(
+            second.recent_resource_store.get(owner=owner)["candidates"][0]["position"], 1
+        )
+        self.assertEqual(
+            second.recent_discovery_store.get(owner=owner)["candidates"][0]["title"],
+            "候选影片 1",
+        )
         self.assertEqual(second.recent_download_store.get(owner=owner)[0].request_id, 101)
 
 
@@ -588,7 +678,7 @@ class AgentSessionContextAPITests(IsolatedDatabaseTestCase):
             "library.search_missing_season_resources",
         )
 
-    def test_http_query_does_not_restore_process_local_resource_handle(self):
+    def test_http_query_restores_resource_choice_but_reports_expired_handle(self):
         csrf = self._login()
         get_agent_service().recent_resource_store.capture(
             owner=web_agent_owner(csrf, session_id="session_context_http_0001"), result=_resource_result()
@@ -602,7 +692,7 @@ class AgentSessionContextAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         result = response.json()["result"]
         self.assertEqual(result["status"], "precondition_failed")
-        self.assertIn("请先搜索", " ".join(result.get("suggestions") or []))
+        self.assertIn("重新搜索", " ".join(result.get("suggestions") or []))
 
     def test_http_query_restores_download_context_after_service_reset(self):
         csrf = self._login()

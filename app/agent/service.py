@@ -30,10 +30,14 @@ def get_agent_service() -> AgentOrchestrator:
                 _service = AgentOrchestrator(
                     build_tool_registry(),
                     recent_patrol_store=RecentPatrolStore(repository=context_repository),
-                    # 资源 result_id 只在进程内 IndexerResultStore 中有效；
-                    # 不把不可恢复的句柄伪装成跨重启可提交上下文。
-                    recent_resource_store=RecentResourceCandidateStore(),
-                    recent_discovery_store=RecentDiscoveryCandidateStore(),
+                    # 候选安全投影可跨进程续接；若底层 result_id 已失效，
+                    # 确认执行阶段仍会由资源存储返回明确的过期提示。
+                    recent_resource_store=RecentResourceCandidateStore(
+                        repository=context_repository
+                    ),
+                    recent_discovery_store=RecentDiscoveryCandidateStore(
+                        repository=context_repository
+                    ),
                     recent_download_store=RecentDownloadSubmissionStore(
                         repository=context_repository
                     ),

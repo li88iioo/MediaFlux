@@ -34,7 +34,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -1221,8 +1221,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_action_history_ok_id
 CREATE TABLE IF NOT EXISTS agent_session_context (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_digest TEXT NOT NULL,
-    context_type TEXT NOT NULL
-        CHECK(context_type IN ('patrol','download_submission')),
+    context_type TEXT NOT NULL,
     payload TEXT NOT NULL,
     expires_at REAL NOT NULL,
     created_at TEXT NOT NULL
@@ -1483,8 +1482,49 @@ def _test_mode_enabled() -> bool:
     return _configured_test_mode or os.getenv("MEDIAFLUX_TEST_MODE", "").strip() == "1"
 
 
-# 以后正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
-_SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
+def _migrate_agent_session_context_v2(conn: sqlite3.Connection) -> None:
+    """移除固定 context_type CHECK，允许仓储白名单安全扩展上下文类型。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='agent_session_context'"
+    ).fetchone()
+    if row is None:
+        return
+    table_sql = str(row[0] or "").casefold()
+    if "check" not in table_sql or "context_type" not in table_sql:
+        return
+    conn.execute("ALTER TABLE agent_session_context RENAME TO agent_session_context_v1")
+    conn.execute(
+        "CREATE TABLE agent_session_context ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "owner_digest TEXT NOT NULL,"
+        "context_type TEXT NOT NULL,"
+        "payload TEXT NOT NULL,"
+        "expires_at REAL NOT NULL,"
+        "created_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "INSERT INTO agent_session_context("
+        "id,owner_digest,context_type,payload,expires_at,created_at"
+        ") SELECT id,owner_digest,context_type,payload,expires_at,created_at "
+        "FROM agent_session_context_v1"
+    )
+    conn.execute("DROP TABLE agent_session_context_v1")
+    conn.execute(
+        "CREATE INDEX idx_agent_session_context_lookup "
+        "ON agent_session_context(owner_digest, context_type, expires_at, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_agent_session_context_expiry "
+        "ON agent_session_context(expires_at)"
+    )
+
+
+# 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
+_SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    1: _migrate_agent_session_context_v2,
+}
 
 
 def _prepare_schema_migration(
@@ -1497,8 +1537,8 @@ def _prepare_schema_migration(
     if not database_existed:
         return current_version
     if current_version == 0:
-        # 对于初始发布版本（SCHEMA_VERSION = 1），若已存在未打版本的早期数据库，
-        # 允许平滑进入并通过 _SCHEMA 幂等补齐表结构，基线化为正式版版本 1。
+        # 已存在但尚未打版本的早期数据库允许平滑进入，由 _SCHEMA
+        # 幂等补齐表结构，再基线化为当前正式版本。
         return current_version
     if current_version > SCHEMA_VERSION:
         raise RuntimeError(
@@ -1600,6 +1640,8 @@ def init_db() -> None:
         try:
             _prepare_schema_migration(conn, database_existed=database_existed)
             _sync_missing_schema_columns(conn)
+            # 未打版本的早期数据库也可能已有 v1 约束表；幂等检查后补齐。
+            _migrate_agent_session_context_v2(conn)
             conn.executescript(_SCHEMA)
             # 播放诊断保留期在启动时也执行，避免长期无新播放时旧媒体标识滞留。
             conn.execute(

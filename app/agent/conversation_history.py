@@ -36,6 +36,7 @@ _MEDIA_CONTEXT_TOOL_TYPES: dict[str, str] = {
     "discovery.search": "",
     "discovery.recommend": "",
     "discovery.lookup_rating": "",
+    "discovery.add_watchlist": "",
     "indexer.search_resources": "",
 }
 _MEDIA_CONTEXT_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")

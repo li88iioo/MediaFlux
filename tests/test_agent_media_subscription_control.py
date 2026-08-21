@@ -171,9 +171,18 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         ):
             with self.subTest(message=message):
                 self.assertTrue(is_media_subscription_updates_message(message))
+        for recommendation in (
+            "推荐几部追剧", "推荐几个追番", "最近有什么好看的追剧推荐几部",
+        ):
+            with self.subTest(recommendation=recommendation):
+                self.assertFalse(is_media_subscription_summaries_message(recommendation))
         self.assertFalse(is_media_subscription_updates_message("RSS 订阅有更新吗"))
         self.assertFalse(is_media_subscription_updates_message("修改媒体订阅更新间隔"))
-        for message in ("我的订阅", "我的追番", "追更列表", "列出我追的剧", "查看我的追番"):
+        for message in (
+            "我的订阅", "我的追番", "追更列表", "列出我追的剧", "查看我的追番",
+            "我的媒体订阅当前不是订阅了三个媒体吗",
+            "我的媒体订阅当前不是订阅了3个媒体吗", "我的媒体订阅有多少个",
+        ):
             with self.subTest(summary_message=message):
                 self.assertTrue(is_media_subscription_summaries_message(message))
         for message in ("我追的剧有没有更新", "我的追番有没有更新", "追番有新一集吗"):

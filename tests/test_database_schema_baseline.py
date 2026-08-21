@@ -11,7 +11,7 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
-    def test_fresh_database_contains_complete_v1_schema(self) -> None:
+    def test_fresh_database_contains_complete_v2_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             task_columns = {
@@ -38,7 +38,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             }
 
         self.assertEqual(version, db.SCHEMA_VERSION)
-        self.assertEqual(version, 1)
+        self.assertEqual(version, 2)
         self.assertIn("rules_snapshot", task_columns)
         self.assertIn("season_override", task_columns)
         self.assertIn("episode_override", task_columns)
@@ -56,6 +56,56 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             "media_proxy_playback_sessions",
             "idx_media_proxy_records_session_id",
         }.issubset(schema_objects))
+
+    def test_v1_agent_session_context_migrates_without_losing_rows(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-agent-v2-") as root:
+            path = Path(root) / "v1.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL "
+                    "CHECK(context_type IN ('patrol','download_submission')),"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "created_at TEXT NOT NULL"
+                    ");"
+                    "CREATE INDEX idx_agent_session_context_lookup "
+                    "ON agent_session_context(owner_digest,context_type,expires_at,id DESC);"
+                    "CREATE INDEX idx_agent_session_context_expiry "
+                    "ON agent_session_context(expires_at);"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES('digest','patrol','{}',9999999999,'2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    preserved = migrated.execute(
+                        "SELECT context_type FROM agent_session_context "
+                        "WHERE owner_digest='digest'"
+                    ).fetchone()
+                    migrated.execute(
+                        "INSERT INTO agent_session_context("
+                        "owner_digest,context_type,payload,expires_at,created_at"
+                        ") VALUES('digest','resource_candidates','{}',9999999999,'2026-08-01')"
+                    )
+                self.assertEqual(version, 2)
+                self.assertEqual(preserved["context_type"], "patrol")
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
 
     def test_schema_initialization_is_idempotent(self) -> None:
         db.init_db()

@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from copy import deepcopy
 from datetime import date
+import logging
 import re
 import threading
 import time
@@ -11,6 +12,7 @@ import unicodedata
 from typing import Any, Callable
 
 from app.agent.models import ToolResult
+from app.agent.session_context import AgentSessionContextRepository
 
 
 _RESULT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
@@ -19,6 +21,8 @@ _ALLOWED_MATCH = {"exact_episode", "episode_pack", "season_pack", "unknown"}
 _ALLOWED_DOWNLOAD_STATE = {"ready", "resolvable"}
 _ALLOWED_DOWNLOAD_KINDS = {"magnet", "torrent"}
 _MAX_CANDIDATES = 12
+_CONTEXT_TYPE = "resource_candidates"
+logger = logging.getLogger(__name__)
 
 
 class RecentResourceCandidateStore:
@@ -30,11 +34,16 @@ class RecentResourceCandidateStore:
         ttl_seconds: int = 600,
         max_entries: int = 256,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        repository: AgentSessionContextRepository | None = None,
     ) -> None:
         self.ttl_seconds = max(1, int(ttl_seconds))
         self.max_entries = max(1, int(max_entries))
         self._clock = clock
+        self._wall_clock = wall_clock
+        self._repository = repository
         self._lock = threading.RLock()
+        self._owner_locks = tuple(threading.RLock() for _ in range(64))
         self._entries: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
 
     def capture(self, *, owner: str, result: ToolResult) -> None:
@@ -42,26 +51,41 @@ class RecentResourceCandidateStore:
         if not owner_key:
             return
         snapshot = _safe_snapshot(result)
-        now = self._clock()
-        with self._lock:
-            self._prune_locked(now)
-            self._entries.pop(owner_key, None)
-            self._entries[owner_key] = (now + self.ttl_seconds, snapshot)
-            while len(self._entries) > self.max_entries:
-                self._entries.popitem(last=False)
+        with self._owner_lock(owner_key):
+            now = self._clock()
+            with self._lock:
+                self._prune_locked(now)
+                self._entries.pop(owner_key, None)
+                self._entries[owner_key] = (now + self.ttl_seconds, snapshot)
+                while len(self._entries) > self.max_entries:
+                    self._entries.popitem(last=False)
+            if self._repository is not None:
+                try:
+                    self._repository.replace_latest(
+                        owner=owner_key,
+                        context_type=_CONTEXT_TYPE,
+                        payload=snapshot,
+                        expires_at=self._wall_clock() + self.ttl_seconds,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Agent 资源候选上下文持久化失败 type=%s",
+                        type(exc).__name__,
+                    )
 
     def get(self, *, owner: str) -> dict[str, Any] | None:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return None
-        now = self._clock()
-        with self._lock:
-            self._prune_locked(now)
-            entry = self._entries.get(owner_key)
-            if entry is None:
-                return None
-            self._entries.move_to_end(owner_key)
-            return deepcopy(entry[1])
+        with self._owner_lock(owner_key):
+            now = self._clock()
+            with self._lock:
+                self._prune_locked(now)
+                entry = self._entries.get(owner_key)
+                if entry is not None:
+                    self._entries.move_to_end(owner_key)
+                    return deepcopy(entry[1])
+            return self._restore(owner_key=owner_key, now=now)
 
     def reset(self) -> None:
         with self._lock:
@@ -71,13 +95,61 @@ class RecentResourceCandidateStore:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return False
-        with self._lock:
-            return self._entries.pop(owner_key, None) is not None
+        removed = False
+        with self._owner_lock(owner_key):
+            with self._lock:
+                removed = self._entries.pop(owner_key, None) is not None
+            if self._repository is not None:
+                try:
+                    removed = bool(self._repository.delete_latest(
+                        owner=owner_key, context_type=_CONTEXT_TYPE
+                    )) or removed
+                except Exception as exc:
+                    logger.warning(
+                        "Agent 资源候选上下文清理失败 type=%s",
+                        type(exc).__name__,
+                    )
+        return removed
+
+    def _owner_lock(self, owner_key: str) -> threading.RLock:
+        return self._owner_locks[hash(owner_key) % len(self._owner_locks)]
 
     def _prune_locked(self, now: float) -> None:
         expired = [owner for owner, (expires_at, _) in self._entries.items() if expires_at <= now]
         for owner in expired:
             self._entries.pop(owner, None)
+
+    def _restore(self, *, owner_key: str, now: float) -> dict[str, Any] | None:
+        if self._repository is None:
+            return None
+        wall_now = self._wall_clock()
+        try:
+            persisted = self._repository.get_latest(
+                owner=owner_key,
+                context_type=_CONTEXT_TYPE,
+                now=wall_now,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Agent 资源候选上下文恢复失败 type=%s", type(exc).__name__
+            )
+            return None
+        if persisted is None:
+            return None
+        snapshot = validate_safe_resource_snapshot(persisted.payload)
+        remaining = persisted.expires_at - wall_now
+        if snapshot is None or remaining <= 0:
+            return None
+        with self._lock:
+            self._prune_locked(now)
+            self._entries[owner_key] = (
+                now + min(float(self.ttl_seconds), remaining),
+                snapshot,
+            )
+            self._entries.move_to_end(owner_key)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+        return deepcopy(snapshot)
 
 
 def _safe_snapshot(result: ToolResult) -> dict[str, Any]:
@@ -94,7 +166,7 @@ def _safe_snapshot(result: ToolResult) -> dict[str, Any]:
             projected["position"] = len(candidates) + 1
             candidates.append(projected)
         return {
-            "search_status": str(result.status or "")[:40],
+            "search_status": _safe_text(str(result.status or ""), 40),
             "candidates": candidates,
         }
 
@@ -158,7 +230,7 @@ def _safe_snapshot(result: ToolResult) -> dict[str, Any]:
             candidates.append(projected)
 
     return {
-        "search_status": str(result.status or "")[:40],
+        "search_status": _safe_text(str(result.status or ""), 40),
         "candidates": candidates,
     }
 
@@ -235,6 +307,96 @@ def _safe_candidate(
         "download_state": download_state,
         "_verification_context": verification_context,
     }
+
+
+_GENERIC_PERSISTED_KEYS = frozenset({
+    "position", "result_id", "title", "site_id", "site_name", "size_text",
+    "download_state", "_verification_context",
+})
+_EPISODIC_PERSISTED_KEYS = frozenset({
+    "position", "season", "episode", "episode_label", "result_id", "title",
+    "site_id", "site_name", "rank", "score", "confidence", "match",
+    "download_state", "_verification_context",
+})
+
+
+def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
+    """严格验证持久化资源候选投影，拒绝额外字段或被篡改的句柄。"""
+    if not isinstance(value, dict) or set(value) != {"search_status", "candidates"}:
+        return None
+    search_status = _safe_text(value.get("search_status"), 40)
+    raw_candidates = value.get("candidates")
+    if (
+        search_status != value.get("search_status")
+        or not isinstance(raw_candidates, list)
+        or len(raw_candidates) > _MAX_CANDIDATES
+    ):
+        return None
+    candidates: list[dict[str, Any]] = []
+    seen_result_ids: set[str] = set()
+    for expected_position, raw in enumerate(raw_candidates, start=1):
+        if not isinstance(raw, dict):
+            return None
+        keys = frozenset(raw)
+        if keys == _GENERIC_PERSISTED_KEYS:
+            result_id = str(raw.get("result_id") or "").strip()
+            projected = {
+                "position": expected_position,
+                "result_id": result_id,
+                "title": _safe_text(raw.get("title"), 300),
+                "site_id": _safe_text(raw.get("site_id"), 32),
+                "site_name": _safe_text(raw.get("site_name"), 80),
+                "size_text": _safe_text(raw.get("size_text"), 32),
+                "download_state": str(raw.get("download_state") or "").strip().lower(),
+                "_verification_context": None,
+            }
+            if (
+                raw != projected
+                or not _RESULT_ID_PATTERN.fullmatch(result_id)
+                or not projected["title"]
+                or projected["download_state"] not in _ALLOWED_DOWNLOAD_STATE
+            ):
+                return None
+        elif keys == _EPISODIC_PERSISTED_KEYS:
+            season = _safe_positive_int(raw.get("season"), maximum=100)
+            episode = _safe_positive_int(raw.get("episode"), maximum=1000)
+            if season is None or episode is None:
+                return None
+            verification = raw.get("_verification_context")
+            if verification is not None:
+                if not isinstance(verification, dict) or set(verification) not in ({
+                    "title", "tmdb_id", "season", "episode", "as_of"
+                }, {
+                    "title", "tmdb_id", "season", "episode", "as_of", "library_name"
+                }):
+                    return None
+                safe_verification = _safe_verification_context(
+                    verification, season=season, episode=episode
+                )
+                if safe_verification != verification:
+                    return None
+            else:
+                safe_verification = None
+            projected = _safe_candidate(
+                raw,
+                season=season,
+                episode=episode,
+                episode_label=_safe_text(raw.get("episode_label"), 24),
+                verification_context=safe_verification,
+            )
+            if projected is None:
+                return None
+            projected["position"] = expected_position
+            if raw != projected:
+                return None
+            result_id = projected["result_id"]
+        else:
+            return None
+        if result_id in seen_result_ids:
+            return None
+        seen_result_ids.add(result_id)
+        candidates.append(projected)
+    return {"search_status": search_status, "candidates": candidates}
 
 
 def public_candidate_projection(value: Any) -> dict[str, Any]:
