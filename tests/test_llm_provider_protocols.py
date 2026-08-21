@@ -5,8 +5,10 @@ import unittest
 
 from app.clients.openai_compatible import (
     ANTHROPIC_VERSION,
+    ProviderUsage,
     ProviderStreamError,
     extract_output_text,
+    extract_provider_usage,
     infer_protocol_from_url,
     append_native_tool_results,
     iter_provider_text_deltas,
@@ -24,6 +26,74 @@ from app.clients.openai_compatible import (
 
 
 class LLMProviderProtocolTests(unittest.TestCase):
+    def test_provider_usage_is_normalized_for_all_protocols(self):
+        cases = (
+            (
+                "responses",
+                {
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 3,
+                        "total_tokens": 15,
+                        "input_token_details": {"cached_tokens": 2},
+                        "output_token_details": {"reasoning_tokens": 1},
+                    }
+                },
+            ),
+            (
+                "chat_completions",
+                {
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 3,
+                        "total_tokens": 15,
+                        "prompt_tokens_details": {"cached_tokens": 2},
+                        "completion_tokens_details": {"reasoning_tokens": 1},
+                    }
+                },
+            ),
+            (
+                "anthropic_messages",
+                {
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 2,
+                    }
+                },
+            ),
+        )
+        for protocol, envelope in cases:
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    extract_provider_usage(envelope, protocol),
+                    ProviderUsage(12, 3, 15, 2, 1 if protocol != "anthropic_messages" else 0),
+                )
+
+        self.assertIsNone(extract_provider_usage({}, "responses"))
+        self.assertIsNone(extract_provider_usage(
+            {"usage": {"prompt_tokens": True, "completion_tokens": 2}},
+            "chat_completions",
+        ))
+        self.assertEqual(
+            ProviderUsage(10, 2, 12, 1, 0) + ProviderUsage(20, 5, 25, 2, 3),
+            ProviderUsage(30, 7, 37, 3, 3),
+        )
+
+    def test_native_turn_carries_provider_usage(self):
+        turn = parse_native_tool_turn(
+            {
+                "choices": [{"message": {"role": "assistant", "content": "完成"}}],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 2,
+                    "total_tokens": 10,
+                },
+            },
+            "chat_completions",
+        )
+        self.assertEqual(turn.usage, ProviderUsage(8, 2, 10))
+
     def test_explicit_endpoint_inference_and_location_normalization(self):
         cases = {
             "https://api.example.com/v1/responses": "responses",

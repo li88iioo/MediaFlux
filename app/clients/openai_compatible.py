@@ -31,10 +31,42 @@ class NativeToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderUsage:
+    """Provider 明确返回的 token 用量；缺失时保持 ``None``。"""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
+
+    def __add__(self, other: object) -> ProviderUsage:
+        if not isinstance(other, ProviderUsage):
+            return self
+        return ProviderUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "cached_tokens": self.cached_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class NativeToolTurn:
     text: str
     tool_calls: tuple[NativeToolCall, ...]
     assistant_entry: object | None = None
+    usage: ProviderUsage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +295,65 @@ def extract_output_text(envelope: object, protocol: str) -> str:
     if parts:
         return "".join(parts)
     raise ValueError("AI 响应格式无效")
+
+
+def _usage_int(value: Any, *, maximum: int = 4_000_000) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+        return None
+    return value
+
+
+def extract_provider_usage(
+    envelope: object, protocol: str
+) -> ProviderUsage | None:
+    """解析三类非流式协议的 usage；缺失或畸形时不伪造零值。"""
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("usage"), dict):
+        return None
+    raw = envelope["usage"]
+    normalized = normalize_protocol(protocol)
+    if normalized == "anthropic_messages":
+        prompt = _usage_int(raw.get("input_tokens"), maximum=2_000_000)
+        completion = _usage_int(raw.get("output_tokens"), maximum=2_000_000)
+        cached = _usage_int(raw.get("cache_read_input_tokens", 0), maximum=2_000_000)
+        reasoning = 0
+        total = _usage_int(raw.get("total_tokens"))
+    elif normalized == "responses":
+        prompt = _usage_int(raw.get("input_tokens"), maximum=2_000_000)
+        completion = _usage_int(raw.get("output_tokens"), maximum=2_000_000)
+        input_details = raw.get("input_token_details")
+        output_details = raw.get("output_token_details")
+        cached = _usage_int(
+            input_details.get("cached_tokens", 0) if isinstance(input_details, dict) else 0,
+            maximum=2_000_000,
+        )
+        reasoning = _usage_int(
+            output_details.get("reasoning_tokens", 0) if isinstance(output_details, dict) else 0,
+            maximum=2_000_000,
+        )
+        total = _usage_int(raw.get("total_tokens"))
+    else:
+        prompt = _usage_int(raw.get("prompt_tokens"), maximum=2_000_000)
+        completion = _usage_int(raw.get("completion_tokens"), maximum=2_000_000)
+        prompt_details = raw.get("prompt_tokens_details")
+        completion_details = raw.get("completion_tokens_details")
+        cached = _usage_int(
+            prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0,
+            maximum=2_000_000,
+        )
+        reasoning = _usage_int(
+            completion_details.get("reasoning_tokens", 0)
+            if isinstance(completion_details, dict) else 0,
+            maximum=2_000_000,
+        )
+        total = _usage_int(raw.get("total_tokens"))
+    if prompt is None or completion is None or cached is None or reasoning is None:
+        return None
+    expected_total = prompt + completion
+    if total is None:
+        total = expected_total
+    if total < expected_total:
+        return None
+    return ProviderUsage(prompt, completion, total, cached, reasoning)
 
 
 def _supports_strict_function_schema(schema: object) -> bool:
@@ -600,6 +691,7 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
         raise ValueError("AI 响应格式无效")
     calls: list[NativeToolCall] = []
     text_parts: list[str] = []
+    usage = extract_provider_usage(envelope, protocol)
 
     if protocol == "responses":
         output = envelope.get("output")
@@ -641,6 +733,7 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
             text="".join(text_parts),
             tool_calls=tuple(calls),
             assistant_entry=assistant_items,
+            usage=usage,
         )
 
     if protocol == "chat_completions":
@@ -690,6 +783,7 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
             text="".join(text_parts),
             tool_calls=tuple(calls),
             assistant_entry=assistant_entry,
+            usage=usage,
         )
 
     if envelope.get("stop_reason") in {"max_tokens", "refusal"}:
@@ -723,6 +817,7 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
         text="".join(text_parts),
         tool_calls=tuple(calls),
         assistant_entry={"role": "assistant", "content": assistant_blocks},
+        usage=usage,
     )
 
 

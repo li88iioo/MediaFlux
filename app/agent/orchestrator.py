@@ -6245,6 +6245,8 @@ class AgentOrchestrator:
         )
         if guidance:
             response["guidance"] = guidance
+        if native_reply.usage is not None:
+            response["llm_usage"] = native_reply.usage.to_dict()
         return result_projection.attach_public_display(response)
 
     def _handle_discovery_followup(
@@ -7576,6 +7578,8 @@ class AgentOrchestrator:
             )
             if guidance:
                 response["guidance"] = guidance
+            if conversation.usage is not None:
+                response["llm_usage"] = conversation.usage.to_dict()
             return result_projection.attach_public_display(response)
 
         return self._clarification_response(
@@ -7608,7 +7612,10 @@ class AgentOrchestrator:
 
     @staticmethod
     def _conversation_response(
-        summary: str, suggestions: list[str] | tuple[str, ...] = ()
+        summary: str,
+        suggestions: list[str] | tuple[str, ...] = (),
+        *,
+        llm_usage: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         safe_summary = result_projection.sanitize_public_multiline_text(summary, limit=1800)
         safe_suggestions = [
@@ -7630,6 +7637,8 @@ class AgentOrchestrator:
         guidance = result_projection.project_public_guidance(safe_suggestions, force_kind="draft")
         if guidance:
             response["guidance"] = guidance
+        if llm_usage is not None:
+            response["llm_usage"] = dict(llm_usage)
         return result_projection.attach_public_display(response)
 
     def _continue_narrow_followup(
@@ -7666,7 +7675,12 @@ class AgentOrchestrator:
         )
         if conversation is not None:
             return self._conversation_response(
-                conversation.answer, conversation.suggestions
+                conversation.answer,
+                conversation.suggestions,
+                llm_usage=(
+                    conversation.usage.to_dict()
+                    if conversation.usage is not None else None
+                ),
             )
 
         label = result_projection.public_tool_label(previous_tool)

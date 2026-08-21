@@ -55,7 +55,7 @@ from app.agent.result_projection import (
     sanitize_public_multiline_text,
 )
 from app.indexers.http import IndexerHttpResponse
-from app.clients.openai_compatible import ProviderStreamError
+from app.clients.openai_compatible import ProviderStreamError, ProviderUsage
 from app.routes.agent_api import _agent_llm_rate_owner, _agent_owner
 
 
@@ -138,8 +138,10 @@ def _counter_read_registry() -> ToolRegistry:
     return registry
 
 
-def _chat_tool_turn(*calls: tuple[str, int]) -> bytes:
-    return json_module.dumps({
+def _chat_tool_turn(
+    *calls: tuple[str, int], usage: dict[str, int] | None = None
+) -> bytes:
+    payload = {
         "choices": [{"message": {
             "role": "assistant",
             "content": None,
@@ -155,16 +157,22 @@ def _chat_tool_turn(*calls: tuple[str, int]) -> bytes:
                 for call_id, n in calls
             ],
         }}],
-    }).encode()
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return json_module.dumps(payload).encode()
 
 
-def _chat_text_turn(text: str) -> bytes:
-    return json_module.dumps({
+def _chat_text_turn(text: str, *, usage: dict[str, int] | None = None) -> bytes:
+    payload = {
         "choices": [{"message": {
             "role": "assistant",
             "content": text,
         }}],
-    }).encode()
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return json_module.dumps(payload).encode()
 
 
 def _read_registry(*, calls=None) -> ToolRegistry:
@@ -2110,6 +2118,52 @@ class AgentLLMSelectionTests(unittest.TestCase):
         with patch("app.agent.llm_router.get", side_effect=lambda key, default="": values.get(key, default)), patch("app.agent.llm_router._request_selection", side_effect=broken):
             self.assertIsNone(select_read_tool("未知请求", registry, owner="session-a"))
 
+    def test_native_agent_accumulates_usage_across_tool_rounds(self):
+        responses = [
+            _chat_tool_turn(
+                ("call_1", 1),
+                usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            ),
+            _chat_text_turn(
+                "计数 1 已读取，结果完整。",
+                usage={"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+            ),
+        ]
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def post_json(self, url, **_kwargs):
+                return IndexerHttpResponse(
+                    url=url, status_code=200, headers={}, body=responses.pop(0)
+                )
+
+            async def aclose(self):
+                pass
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+        }
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            reply = asyncio.run(_request_native_read_agent(
+                "读取计数 1",
+                _counter_read_registry(),
+                lambda name, arguments: {
+                    "tool_call": {"name": name, "arguments": arguments},
+                    "result": ToolResult(True, "ok", "计数 1").to_dict(),
+                },
+                client_factory=FakeClient,
+            ))
+
+        self.assertIsNotNone(reply)
+        self.assertEqual(reply.usage, ProviderUsage(30, 7, 37))
+
 
     def test_sensitive_message_never_leaves_process(self):
         registry = _read_registry()
@@ -2276,6 +2330,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
                 {"label": "下载队列", "ok": True, "summary": "正常"},
                 {"label": "项目配置", "ok": True, "summary": "1 项待补充"},
             ),
+            usage=ProviderUsage(120, 30, 150, 10, 4),
         )
 
         with patch(
@@ -2300,6 +2355,13 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             "下载队列正常。\n\n项目配置中有 1 项需要补充。",
         )
         self.assertEqual(len(response["agent_trace"]), 2)
+        self.assertEqual(response["llm_usage"], {
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 150,
+            "cached_tokens": 10,
+            "reasoning_tokens": 4,
+        })
         native_agent.assert_called_once()
         orchestration_selector.assert_not_called()
         read_selector.assert_not_called()

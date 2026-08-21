@@ -23,6 +23,12 @@ from app.agent.conversation_summary import (
 )
 from app.agent.prompts import DEFAULT_AGENT_SYSTEM_PROMPT
 from app.agent.rate_limit import agent_rate_limiter
+from app.agent.token_budget import (
+    estimate_tokens,
+    fit_structured_user_content,
+    request_fits_token_budget,
+    resolve_context_window,
+)
 from app.agent.models import LLMToolDisposition, ToolResult
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.result_projection import (
@@ -34,9 +40,11 @@ from app.agent.result_projection import (
     sanitize_public_text,
 )
 from app.clients.openai_compatible import (
+    ProviderUsage,
     ProviderStreamError,
     append_native_tool_results,
     extract_output_text,
+    extract_provider_usage,
     iter_provider_text_deltas,
     native_tool_definitions,
     native_tool_initial_history,
@@ -257,6 +265,7 @@ class LLMConversationReply:
     # 仅在服务端内部传递；不会进入 Provider prompt 或公开展示。
     # 保留真实工具响应，供候选资源、专用卡片和后续指代继续使用。
     tool_executions: tuple[dict[str, Any], ...] = ()
+    usage: ProviderUsage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +283,7 @@ class _NativeLoopState:
     seen_calls: set[str] = field(default_factory=set)
     public_trace: list[dict[str, Any]] = field(default_factory=list)
     tool_executions: list[dict[str, Any]] = field(default_factory=list)
+    usage: ProviderUsage | None = None
     confirmation_prepared: bool = False
 
     def reserve_provider_request(
@@ -328,7 +338,12 @@ class _NativeLoopState:
             self.public_trace,
             executions=self.tool_executions,
             reason=reason,
+            usage=self.usage,
         )
+
+    def record_usage(self, usage: ProviderUsage | None) -> None:
+        if usage is not None:
+            self.usage = usage if self.usage is None else self.usage + usage
 
 
 @dataclass(slots=True)
@@ -366,6 +381,12 @@ def _timeout() -> int:
     return max(2, min(value, 30))
 
 
+def _context_window(model: str) -> int:
+    return resolve_context_window(
+        get("AGENT_LLM_CONTEXT_WINDOW", ""), model=model
+    )
+
+
 def _provider() -> tuple[object, str] | None:
     raw = str(get("AGENT_LLM_API_URL", "") or "").strip()
     try:
@@ -396,6 +417,7 @@ async def _request_structured_json(
     client_factory: Callable[..., FixedHostHttpClient],
     max_content_length: int,
     fallback_budget: Callable[[], bool] | None = None,
+    usage_out: list[ProviderUsage] | None = None,
 ) -> object | None:
     provider = _provider()
     model = str(get("AGENT_LLM_MODEL", "") or "").strip()
@@ -415,11 +437,35 @@ async def _request_structured_json(
     async def _request_protocols() -> object | None:
         for index, protocol in enumerate(protocols):
             attempt_started = monotonic()
-            body = structured_request_body(
+            empty_body = structured_request_body(
                 protocol=protocol, model=model, system_prompt=system_prompt,
-                user_content=user_content, schema_name=schema_name, schema=schema,
+                user_content="", schema_name=schema_name, schema=schema,
                 max_tokens=max_tokens,
             )
+            fitted_user_content = fit_structured_user_content(
+                body_without_user=empty_body,
+                user_content=user_content,
+                context_window=_context_window(model),
+                output_reserve=max_tokens,
+            )
+            if fitted_user_content is None:
+                logger.warning(
+                    "Agent LLM provider event outcome=context_budget_exhausted "
+                    "protocol=%s",
+                    protocol,
+                )
+                return None
+            body = structured_request_body(
+                protocol=protocol, model=model, system_prompt=system_prompt,
+                user_content=fitted_user_content, schema_name=schema_name, schema=schema,
+                max_tokens=max_tokens,
+            )
+            if not request_fits_token_budget(
+                body,
+                context_window=_context_window(model),
+                output_reserve=max_tokens,
+            ):
+                return None
             response = await client.post_json(
                 location.endpoint(protocol),
                 json=body,
@@ -462,6 +508,9 @@ async def _request_structured_json(
                 )
                 return None
             parsed = json.loads(content)
+            usage = extract_provider_usage(envelope, protocol)
+            if usage is not None and usage_out is not None:
+                usage_out.append(usage)
             logger.info(
                 "Agent LLM provider event outcome=success "
                 "protocol=%s status_code=200 elapsed_ms=%s",
@@ -857,10 +906,11 @@ def _conversation_user_content(
         suggestions = item.get("suggestions") or []
         if suggestions:
             line += "；可继续选择：" + " / ".join(suggestions)
-        if total + len(line) > 4_000:
+        line_tokens = estimate_tokens(line)
+        if total + line_tokens > 2_200:
             continue
         selected.append(line)
-        total += len(line)
+        total += line_tokens
     lines.extend(reversed(selected))
     if not summary_text and not lines:
         return message
@@ -993,6 +1043,7 @@ async def _request_conversation_reply(
         "answer 使用两到四个短段落，必要时使用以短横线开头的简短列表；"
         "不要输出 Markdown 粗体、标题符号、代码块，也不要添加‘结论’‘Agent 解读’‘依据’等固定栏目。"
     )
+    usage: list[ProviderUsage] = []
     payload = await _request_structured_json(
         system_prompt=system,
         user_content=_conversation_user_content(message, conversation_context),
@@ -1002,6 +1053,7 @@ async def _request_conversation_reply(
         client_factory=client_factory,
         max_content_length=8_192,
         fallback_budget=fallback_budget,
+        usage_out=usage,
     )
     if not isinstance(payload, dict):
         return None
@@ -1025,7 +1077,11 @@ async def _request_conversation_reply(
             and not contains_sensitive_credential(text)
         ):
             suggestions.append(text)
-    return LLMConversationReply(answer=answer, suggestions=tuple(suggestions))
+    return LLMConversationReply(
+        answer=answer,
+        suggestions=tuple(suggestions),
+        usage=usage[0] if usage else None,
+    )
 
 
 async def _request_result_narrative(
@@ -1638,6 +1694,7 @@ def _native_partial_reply(
     *,
     reason: str,
     executions: list[dict[str, Any]] | None = None,
+    usage: ProviderUsage | None = None,
 ) -> LLMConversationReply | None:
     """原生循环已经执行过只读检查时，保留结果并禁止旧路由重复执行。"""
     if not trace:
@@ -1673,6 +1730,7 @@ def _native_partial_reply(
         stop_reason=reason,
         tool_trace=tuple(dict(item) for item in trace),
         tool_executions=tuple(dict(item) for item in (executions or [])),
+        usage=usage,
     )
 
 
@@ -1870,17 +1928,44 @@ async def _request_native_read_agent(
 
     async def _run() -> LLMConversationReply | None:
         for protocol_index, protocol in enumerate(protocols):
+            tools = native_tool_definitions(protocol, native_capabilities)
+            if not tools:
+                return None
+            empty_history = native_tool_initial_history(
+                protocol,
+                system_prompt=system_prompt,
+                user_content="",
+            )
+            empty_body = native_tool_request_body(
+                protocol=protocol,
+                model=model,
+                system_prompt=system_prompt,
+                history=empty_history,
+                tools=tools,
+                max_tokens=1000,
+            )
+            fitted_user_content = fit_structured_user_content(
+                body_without_user=empty_body,
+                user_content=user_content,
+                context_window=_context_window(model),
+                output_reserve=1000,
+            )
+            if fitted_user_content is None:
+                logger.warning(
+                    "Agent LLM native event outcome=context_budget_exhausted "
+                    "protocol=%s",
+                    protocol,
+                )
+                return state.partial("context_budget_exhausted")
             protocol_state = _NativeProtocolState(
                 protocol=protocol,
                 history=native_tool_initial_history(
                     protocol,
                     system_prompt=system_prompt,
-                    user_content=user_content,
+                    user_content=fitted_user_content,
                 ),
-                tools=native_tool_definitions(protocol, native_capabilities),
+                tools=tools,
             )
-            if not protocol_state.tools:
-                return None
             fallback_to_next = False
             for request_index in range(_NATIVE_MAX_PROVIDER_CALLS):
                 if not state.reserve_provider_request(fallback_budget):
@@ -1890,16 +1975,23 @@ async def _request_native_read_agent(
                     )
                     return state.partial("request_budget_exhausted")
                 attempt_started = monotonic()
+                request_body = native_tool_request_body(
+                    protocol=protocol,
+                    model=model,
+                    system_prompt=system_prompt,
+                    history=protocol_state.history,
+                    tools=protocol_state.tools,
+                    max_tokens=1000,
+                )
+                if not request_fits_token_budget(
+                    request_body,
+                    context_window=_context_window(model),
+                    output_reserve=1000,
+                ):
+                    return state.partial("context_budget_exhausted")
                 response = await client.post_json(
                     location.endpoint(protocol),
-                    json=native_tool_request_body(
-                        protocol=protocol,
-                        model=model,
-                        system_prompt=system_prompt,
-                        history=protocol_state.history,
-                        tools=protocol_state.tools,
-                        max_tokens=1000,
-                    ),
+                    json=request_body,
                     headers=provider_headers(protocol, api_key),
                     max_redirects=0,
                 )
@@ -1927,6 +2019,7 @@ async def _request_native_read_agent(
 
                 envelope = json.loads(response.text)
                 turn = parse_native_tool_turn(envelope, protocol)
+                state.record_usage(turn.usage)
                 logger.info(
                     "Agent LLM native event outcome=turn_success protocol=%s "
                     "tool_calls=%s elapsed_ms=%s",
@@ -1947,6 +2040,7 @@ async def _request_native_read_agent(
                             tool_executions=tuple(
                                 dict(item) for item in state.tool_executions
                             ),
+                            usage=state.usage,
                         )
                     return state.partial("invalid_final_answer")
 
@@ -2081,15 +2175,37 @@ async def _request_text_stream(
                 attempt_started = monotonic()
                 retry_next = False
                 try:
+                    empty_body = text_stream_request_body(
+                        protocol=protocol,
+                        model=model,
+                        system_prompt=system_prompt,
+                        user_content="",
+                        max_tokens=max_tokens,
+                    )
+                    fitted_user_content = fit_structured_user_content(
+                        body_without_user=empty_body,
+                        user_content=user_content,
+                        context_window=_context_window(model),
+                        output_reserve=max_tokens,
+                    )
+                    if fitted_user_content is None:
+                        return
+                    request_body = text_stream_request_body(
+                        protocol=protocol,
+                        model=model,
+                        system_prompt=system_prompt,
+                        user_content=fitted_user_content,
+                        max_tokens=max_tokens,
+                    )
+                    if not request_fits_token_budget(
+                        request_body,
+                        context_window=_context_window(model),
+                        output_reserve=max_tokens,
+                    ):
+                        return
                     async with client.stream_post_json(
                         location.endpoint(protocol),
-                        json=text_stream_request_body(
-                            protocol=protocol,
-                            model=model,
-                            system_prompt=system_prompt,
-                            user_content=user_content,
-                            max_tokens=max_tokens,
-                        ),
+                        json=request_body,
                         headers=provider_headers(protocol, api_key, stream=True),
                         max_redirects=0,
                     ) as response:

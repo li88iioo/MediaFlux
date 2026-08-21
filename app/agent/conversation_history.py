@@ -959,6 +959,34 @@ class SQLiteAgentConversationHistoryRepository:
     def _title(message: str) -> str:
         return message if len(message) <= 48 else f"{message[:47].rstrip()}…"
 
+    @staticmethod
+    def _validated_usage(value: Any) -> dict[str, int] | None:
+        """只保存 Provider 明确返回且内部一致的有界 usage。"""
+        if not isinstance(value, dict):
+            return None
+        allowed = {
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cached_tokens",
+            "reasoning_tokens",
+        }
+        required = {"prompt_tokens", "completion_tokens", "total_tokens"}
+        if not required.issubset(value) or not set(value).issubset(allowed):
+            return None
+        normalized: dict[str, int] = {}
+        for key in allowed:
+            raw = value.get(key, 0)
+            maximum = 4_000_000 if key == "total_tokens" else 2_000_000
+            if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw <= maximum:
+                return None
+            normalized[key] = raw
+        if normalized["total_tokens"] < (
+            normalized["prompt_tokens"] + normalized["completion_tokens"]
+        ):
+            return None
+        return normalized
+
     def _assistant_projection(self, response: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(response, dict):
             raise ValueError("Agent 历史响应无效")
@@ -982,6 +1010,9 @@ class SQLiteAgentConversationHistoryRepository:
             "error": self._safe_optional_output_text(result.get("error"), limit=300),
             "suggestions": safe_suggestions,
         }
+        usage = self._validated_usage(response.get("llm_usage"))
+        if usage is not None:
+            projection["usage"] = usage
         media_context = self._media_context_projection(
             tool_name=tool_name,
             data=result.get("data"),

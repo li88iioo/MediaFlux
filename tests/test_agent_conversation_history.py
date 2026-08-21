@@ -123,6 +123,44 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         ):
             self.assertNotIn(forbidden, raw)
 
+    def test_usage_is_signed_and_stored_but_not_sent_back_to_llm(self):
+        response = _response()
+        response["llm_usage"] = {
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 150,
+            "cached_tokens": 8,
+            "reasoning_tokens": 4,
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="检查媒体库",
+            response=response,
+        )
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(history["messages"][-1]["data"]["usage"], response["llm_usage"])
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertNotIn("usage", context[-1])
+
+    def test_invalid_or_missing_usage_is_omitted(self):
+        for usage in (
+            None,
+            {"prompt_tokens": True, "completion_tokens": 1, "total_tokens": 2},
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 4},
+            {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "secret": 9},
+        ):
+            with self.subTest(usage=usage):
+                response = _response()
+                if usage is not None:
+                    response["llm_usage"] = usage
+                projection = self.repository._assistant_projection(response)
+                self.assertNotIn("usage", projection)
+
     def test_empty_media_result_keeps_tentative_context_and_pending_selection(self):
         empty_response = {
             "mode": "tool_result",
