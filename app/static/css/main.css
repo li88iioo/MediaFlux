@@ -263,6 +263,8 @@ svg { display: block; flex: 0 0 auto; }
     white-space: nowrap;
     text-overflow: ellipsis;
 }
+/* Reserve icon geometry before Lucide replaces placeholders, preventing labels from shifting on page navigation. */
+.nav-item > i[data-lucide]:not(.nav-cluster-chevron) { width: 18px; height: 18px; display: block; flex: 0 0 18px; }
 .nav-item svg { width: 18px; height: 18px; }
 .nav-item:hover { color: var(--text-primary); background: var(--bg-card); border-color: var(--border-soft); }
 .nav-item.active { color: var(--on-accent); background: var(--accent); border-color: var(--accent); font-weight: 700; }
@@ -277,6 +279,7 @@ svg { display: block; flex: 0 0 auto; }
 :root[data-nav-guangya="closed"] .nav-cluster[data-nav-cluster="guangya"] .nav-cluster-chevron { transform: none; }
 :root[data-nav-guangya="closed"] .nav-cluster[data-nav-cluster="guangya"] .nav-submenu { max-height: 0; opacity: 0; }
 .nav-subitem { min-height: 34px; display: flex; align-items: center; gap: 8px; margin-left: 10px; padding: 0 8px; color: var(--text-muted); border-left: 1px solid var(--border); font-size: 11.5px; transition: color .15s ease, border-color .15s ease, background .15s ease; }
+.nav-subitem > i[data-lucide] { width: 14px; height: 14px; display: block; flex: 0 0 14px; }
 .nav-subitem svg { width: 14px; height: 14px; }
 .nav-subitem:hover { color: var(--text-primary); border-left-color: var(--accent); background: var(--bg-card); }
 .nav-subitem.active { color: var(--accent); border-left-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
@@ -284,6 +287,7 @@ svg { display: block; flex: 0 0 auto; }
 .nav-cluster-flyout[hidden] { display: none; }
 .nav-flyout-label { display: block; padding: 3px 9px 9px; color: var(--text-muted); font: 9px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: 1.4px; }
 .nav-flyout-item { min-height: 36px; display: flex; align-items: center; gap: 10px; padding: 0 9px; color: var(--text-secondary); border: 1px solid transparent; border-radius: var(--radius-sm); font-size: 12px; }
+.nav-flyout-item > i[data-lucide] { width: 15px; height: 15px; display: block; flex: 0 0 15px; }
 .nav-flyout-item svg { width: 15px; height: 15px; }
 .nav-flyout-item:hover { color: var(--text-primary); background: var(--bg-card); border-color: var(--border-soft); }
 .nav-flyout-item.active { color: var(--on-accent); background: var(--accent); border-color: var(--accent); font-weight: 700; }
