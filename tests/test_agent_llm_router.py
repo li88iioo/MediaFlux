@@ -580,6 +580,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
             "请帮我开启网页搜索",
             "能否帮我开启自动追更",
             "能否帮我刷新 RSS 订阅",
+            "整理一下光鸭云盘",
         ):
             with self.subTest(message=message):
                 self.assertTrue(is_agent_action_request(message))
@@ -600,6 +601,18 @@ class AgentLLMSelectionTests(unittest.TestCase):
             "如何下载第 2 个到 qB",
             "下载到 qB 有什么步骤",
             "能否下载第 2 个到 qB",
+            "查看整理日志",
+            "查看光鸭整理状态",
+            "预览光鸭云盘整理结果",
+            "查看 STRM 同步状态",
+            "光鸭整理失败原因",
+            "STRM 同步失败原因",
+            "不要停止光鸭整理",
+            "不要下载第 2 个到 qB",
+            "不许把刚才第 2 个下到 qB",
+            "不准下载第 2 个到 qB",
+            "删除下载任务 Foo 了吗",
+            "立即运行 STRM 同步了吗",
         ):
             with self.subTest(message=message):
                 self.assertFalse(is_agent_action_request(message))
@@ -2579,6 +2592,39 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertEqual(planner.call_args.kwargs["conversation_context"], context)
         self.assertTrue(planner.call_args.kwargs["read_only"])
 
+    def test_contextual_search_followup_tries_planner_before_clarification(self):
+        agent = AgentOrchestrator(_read_registry())
+        planned = {
+            "mode": "read_only",
+            "tool_call": {
+                "name": "library.search_missing_episode_resources",
+                "arguments": {"query": "沧元图", "season": 1, "episode": 91},
+            },
+            "result": ToolResult(True, "success", "已找到可用资源").to_dict(),
+        }
+        context = [{
+            "role": "assistant",
+            "text": "《沧元图》缺少第 91 集。",
+            "tool_name": "library.check_updates",
+            "status": "attention",
+            "media_context": {"title": "沧元图", "media_type": "tv"},
+        }]
+
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=planned
+        ) as planner:
+            response = agent.query(
+                "搜索一下呢",
+                owner="web-session",
+                conversation_context=context,
+                present=False,
+            )
+
+        self.assertIs(response, planned)
+        planner.assert_called_once()
+        self.assertEqual(planner.call_args.kwargs["conversation_context"], context)
+        self.assertTrue(planner.call_args.kwargs["read_only"])
+
     def test_reply_anchor_is_forwarded_to_contextual_planner(self):
         registry = _read_registry()
         agent = AgentOrchestrator(registry)
@@ -2602,6 +2648,463 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertEqual(response, planned)
         planner.assert_called_once()
         self.assertEqual(planner.call_args.kwargs["reply_context"], reply_context)
+
+    def test_casual_greeting_prefers_natural_conversation_without_tools(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        with patch(
+            "app.agent.orchestrator.answer_conversation",
+            return_value=LLMConversationReply("我在呢。想先看看哪部剧？"),
+        ) as conversation, patch.object(
+            agent, "_query_with_model_tools"
+        ) as planner:
+            response = agent.query("在干吗呢", present=False)
+
+        self.assertEqual(response["mode"], "conversation")
+        self.assertIn("我在呢", response["result"]["summary"])
+        self.assertIn("哪部剧", response["result"]["summary"])
+        conversation.assert_called_once()
+        planner.assert_not_called()
+
+    def test_safe_media_control_gets_planner_before_deterministic_fallback(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        planned = {
+            "mode": "confirmation_required",
+            "tool_call": {
+                "name": "media.set_subscription_enabled",
+                "arguments": {"subscription_id": 12, "enabled": False},
+            },
+            "result": ToolResult(True, "confirmation_required", "等待确认").to_dict(),
+            "confirmation": {"confirmation_id": "opaque"},
+        }
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=planned
+        ) as planner, patch.object(agent, "prepare") as deterministic_prepare:
+            response = agent.query(
+                "暂停媒体订阅 12", owner="web-session", present=False
+            )
+
+        self.assertIs(response, planned)
+        self.assertFalse(planner.call_args.kwargs["read_only"])
+        deterministic_prepare.assert_not_called()
+
+    def test_danger_media_delete_keeps_deterministic_object_binding(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        fallback = {
+            "mode": "confirmation_required",
+            "result": ToolResult(True, "confirmation_required", "等待删除确认").to_dict(),
+        }
+        with patch.object(
+            agent, "_query_with_model_tools"
+        ) as planner, patch.object(
+            agent, "_handle_download_and_media_subscription_requests",
+            return_value=fallback,
+        ) as deterministic:
+            response = agent._query_raw(
+                "删除媒体订阅 12", owner="web-session"
+            )
+
+        self.assertIs(response, fallback)
+        planner.assert_not_called()
+        deterministic.assert_called_once()
+
+    def test_danger_organize_action_bypasses_planner_and_keeps_run_once_binding(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        fallback = {
+            "mode": "confirmation_required",
+            "tool_call": {"name": "guangya.organize.run_once", "arguments": {}},
+            "result": ToolResult(True, "confirmation_required", "等待整理确认").to_dict(),
+        }
+        with patch.object(
+            agent, "_query_with_model_tools"
+        ) as planner, patch.object(
+            agent, "_handle_automation_and_missing_resource_requests",
+            return_value=fallback,
+        ) as deterministic:
+            response = agent._query_raw(
+                "整理一下光鸭云盘", owner="web-session"
+            )
+
+        self.assertIs(response, fallback)
+        planner.assert_not_called()
+        deterministic.assert_called_once()
+
+    def test_danger_domain_intents_never_enter_planner_even_when_incomplete(self):
+        cases = (
+            ("停止光鸭整理", "_handle_automation_and_missing_resource_requests"),
+            ("中止云盘整理", "_handle_automation_and_missing_resource_requests"),
+            ("终止光鸭整理", "_handle_automation_and_missing_resource_requests"),
+            ("光鸭整理", "_handle_automation_and_missing_resource_requests"),
+            ("删除下载任务", "_handle_download_and_media_subscription_requests"),
+            ("重新提交下载请求", "_handle_download_and_media_subscription_requests"),
+            ("删除 RSS 订阅", "_handle_rss_requests"),
+            ("向 qB 提交所有待处理 RSS 条目", "_handle_rss_requests"),
+            ("重试所有 RSS 失败条目", "_handle_rss_requests"),
+            ("重试 STRM 失败", "_handle_automation_and_missing_resource_requests"),
+            ("立即运行 STRM 同步", "_handle_automation_and_missing_resource_requests"),
+            ("STRM 同步", "_handle_automation_and_missing_resource_requests"),
+            ("停止光鸭整理？", "_handle_automation_and_missing_resource_requests"),
+            ("停止光鸭整理，当前状态不用看", "_handle_automation_and_missing_resource_requests"),
+            ("删除下载任务？", "_handle_download_and_media_subscription_requests"),
+            ("删除 RSS 订阅 12？", "_handle_rss_requests"),
+            ("重试所有 RSS 失败条目？", "_handle_rss_requests"),
+            ("立即运行 STRM 同步？", "_handle_automation_and_missing_resource_requests"),
+            ("整理一下光鸭云盘？", "_handle_automation_and_missing_resource_requests"),
+            ("清理光鸭整理空目录？", "_handle_automation_and_missing_resource_requests"),
+        )
+        for message, handler_name in cases:
+            with self.subTest(message=message):
+                agent = AgentOrchestrator(ToolRegistry())
+                fallback = {
+                    "mode": "clarification",
+                    "result": ToolResult(
+                        True, "clarification_required", "确定性领域处理"
+                    ).to_dict(),
+                }
+                with patch.object(
+                    agent, "_query_with_model_tools"
+                ) as planner, patch.object(
+                    agent, handler_name, return_value=fallback
+                ) as deterministic:
+                    response = agent._query_raw(message, owner="web-session")
+
+                self.assertIs(response, fallback)
+                planner.assert_not_called()
+                deterministic.assert_called_once()
+
+    def test_context_and_reply_routes_cannot_bypass_danger_planner_gate(self):
+        cases = (
+            (
+                "停止光鸭整理",
+                None,
+                {"text": "上一条是整理状态说明", "message_id": 1},
+                "_handle_automation_and_missing_resource_requests",
+            ),
+            (
+                "继续停止光鸭整理",
+                [{"role": "assistant", "text": "整理任务仍在运行"}],
+                None,
+                "_handle_automation_and_missing_resource_requests",
+            ),
+            (
+                "删除下载任务",
+                None,
+                {"text": "上一条列出了下载任务", "message_id": 2},
+                "_handle_download_and_media_subscription_requests",
+            ),
+            (
+                "停止光鸭整理？",
+                [{"role": "assistant", "text": "光鸭整理仍在运行"}],
+                None,
+                "_handle_automation_and_missing_resource_requests",
+            ),
+            (
+                "立即运行 STRM 同步？",
+                None,
+                {"text": "上一条是 STRM 状态", "message_id": 3},
+                "_handle_automation_and_missing_resource_requests",
+            ),
+        )
+        for message, context, reply_context, handler_name in cases:
+            with self.subTest(message=message):
+                agent = AgentOrchestrator(ToolRegistry())
+                fallback = {
+                    "mode": "clarification",
+                    "result": ToolResult(
+                        True, "clarification_required", "确定性领域处理"
+                    ).to_dict(),
+                }
+                with patch.object(
+                    agent, "_query_with_model_tools"
+                ) as planner, patch.object(
+                    agent, handler_name, return_value=fallback
+                ) as deterministic:
+                    response = agent.query(
+                        message,
+                        owner="web-session",
+                        conversation_context=context,
+                        reply_context=reply_context,
+                        present=False,
+                    )
+
+                self.assertIs(response, fallback)
+                planner.assert_not_called()
+                deterministic.assert_called_once()
+
+    def test_negated_danger_actions_are_deterministic_noops(self):
+        contexts = (
+            ({},),
+            ({"conversation_context": [{"role": "assistant", "text": "任务仍在运行"}]},),
+            ({"reply_context": {"text": "上一条是任务状态", "message_id": 4}},),
+        )
+        for message in (
+            "不要停止光鸭整理",
+            "不要下载第 2 个到 qB",
+            "不许把刚才第 2 个下到 qB",
+            "不准下载第 2 个到 qB",
+            "不要推送第 2 个到 qB",
+            "不用提交刚才第 2 个到光鸭",
+            "别发送第 2 个到 qB",
+        ):
+            for (context_kwargs,) in contexts:
+                with self.subTest(message=message, context_kwargs=context_kwargs):
+                    agent = AgentOrchestrator(ToolRegistry())
+                    with patch.object(
+                        agent, "_query_with_model_tools"
+                    ) as planner, patch.object(
+                        agent, "_continue_recent_resource_submit"
+                    ) as submit:
+                        response = agent.query(
+                            message,
+                            owner="web-session",
+                            present=False,
+                            **context_kwargs,
+                        )
+
+                    self.assertEqual(response["mode"], "conversation")
+                    self.assertIn("不会执行", response["result"]["summary"])
+                    self.assertNotIn("confirmation", response)
+                    planner.assert_not_called()
+                    submit.assert_not_called()
+
+    def test_danger_status_questions_are_read_only_and_reject_confirmations(self):
+        planned_confirmation = {
+            "mode": "confirmation_required",
+            "tool_call": {
+                "name": "config.set_feature_state",
+                "arguments": {"feature": "web_search", "enabled": True},
+            },
+            "result": ToolResult(
+                True, "confirmation_required", "不相关的确认"
+            ).to_dict(),
+            "confirmation": {"confirmation_id": "opaque"},
+        }
+        cases = (
+            ("删除下载任务 Foo 了吗", "_handle_download_and_media_subscription_requests"),
+            ("立即运行 STRM 同步了吗", "_handle_automation_and_missing_resource_requests"),
+            ("重新提交下载请求状态", "_handle_download_and_media_subscription_requests"),
+        )
+        for message, handler_name in cases:
+            with self.subTest(message=message):
+                agent = AgentOrchestrator(ToolRegistry())
+                fallback = {
+                    "mode": "read_only",
+                    "result": ToolResult(True, "success", "只读状态").to_dict(),
+                }
+                with patch.object(
+                    agent,
+                    "_query_with_model_tools",
+                    return_value=planned_confirmation,
+                ) as planner, patch.object(
+                    agent, handler_name, return_value=fallback
+                ):
+                    response = agent.query(
+                        message,
+                        owner="web-session",
+                        reply_context={"text": "上一条列出了相关任务", "message_id": 5},
+                        present=False,
+                    )
+
+                self.assertIs(response, fallback)
+                planner.assert_called_once()
+                self.assertTrue(planner.call_args.kwargs["read_only"])
+                self.assertNotEqual(response["mode"], "confirmation_required")
+
+    def test_recent_resource_submit_with_question_mark_keeps_snapshot_binding(self):
+        store = RecentResourceCandidateStore()
+        store.capture(
+            owner="web-session",
+            result=ToolResult(
+                True,
+                "success",
+                "找到 2 项资源",
+                data={
+                    "query": "沧元图",
+                    "items": [
+                        {
+                            "result_id": "resource-result-0001",
+                            "title": "The.Show.S03E20",
+                            "site_id": "nyaa",
+                            "site_name": "Nyaa",
+                            "rank": 1,
+                            "score": 300,
+                            "confidence": "high",
+                            "match": "exact_episode",
+                            "download_state": "ready",
+                            "download_kinds": ["magnet"],
+                        },
+                        {
+                            "result_id": "resource-result-0002",
+                            "title": "The.Show.S03E21",
+                            "site_id": "nyaa",
+                            "site_name": "Nyaa",
+                            "rank": 2,
+                            "score": 290,
+                            "confidence": "high",
+                            "match": "exact_episode",
+                            "download_state": "ready",
+                            "download_kinds": ["magnet"],
+                        },
+                    ],
+                },
+            ),
+        )
+        fallback = {
+            "mode": "confirmation_required",
+            "result": ToolResult(
+                True, "confirmation_required", "等待资源提交确认"
+            ).to_dict(),
+        }
+        for message in ("刚才第 2 个到 qB？", "下载第 2 个到 qB？"):
+            with self.subTest(message=message):
+                agent = AgentOrchestrator(
+                    ToolRegistry(), recent_resource_store=store
+                )
+                with patch.object(
+                    agent, "_query_with_model_tools"
+                ) as planner, patch.object(
+                    agent, "_continue_recent_resource_submit", return_value=fallback
+                ) as submit:
+                    response = agent.query(
+                        message,
+                        owner="web-session",
+                        conversation_context=[{
+                            "role": "assistant",
+                            "text": "刚才找到了两个候选资源",
+                        }],
+                        present=False,
+                    )
+
+                self.assertIs(response, fallback)
+                planner.assert_not_called()
+                submit.assert_called_once_with(
+                    {"position": 2, "target": "qb"}, owner="web-session"
+                )
+
+    def test_read_only_danger_domain_questions_can_still_use_planner(self):
+        messages = (
+            "查看光鸭整理状态",
+            "预览光鸭云盘整理结果",
+            "为什么要停止光鸭整理？",
+            "查看 STRM 同步状态",
+            "检查 RSS 失败条目",
+            "光鸭整理失败原因",
+            "检查光鸭整理异常详情",
+            "STRM 同步失败原因",
+            "查看 STRM 同步错误详情",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                agent = AgentOrchestrator(ToolRegistry())
+                planned = {
+                    "mode": "read_only",
+                    "result": ToolResult(True, "success", "只读结果").to_dict(),
+                }
+                with patch.object(
+                    agent, "_query_with_model_tools", return_value=planned
+                ) as planner:
+                    response = agent._query_raw(message, owner="web-session")
+
+                self.assertIs(response, planned)
+                planner.assert_called_once()
+                self.assertTrue(planner.call_args.kwargs["read_only"])
+
+    def test_strm_failure_reason_falls_back_to_read_only_triage(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        triage = {
+            "mode": "read_only",
+            "tool_call": {"name": "strm.triage_failures", "arguments": {}},
+            "result": ToolResult(True, "success", "失败原因已分诊").to_dict(),
+        }
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as planner, patch.object(
+            agent, "_invoke_query_read", return_value=triage
+        ) as invoke:
+            response = agent._query_raw(
+                "STRM 同步失败原因", owner="web-session"
+            )
+
+        self.assertIs(response, triage)
+        planner.assert_called_once()
+        self.assertTrue(planner.call_args.kwargs["read_only"])
+        invoke.assert_called_once_with("strm.triage_failures", {})
+
+    def test_title_subscription_keeps_deterministic_candidate_provenance(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        fallback = {
+            "mode": "read_only",
+            "tool_call": {
+                "name": "discovery.search",
+                "arguments": {"query": "庆余年", "limit": 20},
+            },
+            "result": ToolResult(True, "success", "请选择准确条目").to_dict(),
+        }
+        with patch.object(
+            agent, "_query_with_model_tools"
+        ) as planner, patch.object(
+            agent, "_handle_download_and_media_subscription_requests",
+            return_value=fallback,
+        ) as deterministic:
+            response = agent._query_raw(
+                "订阅《庆余年》", owner="web-session"
+            )
+
+        self.assertIs(response, fallback)
+        planner.assert_not_called()
+        deterministic.assert_called_once()
+
+    def test_action_without_confirmation_falls_back_instead_of_claiming_success(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent",
+            return_value=LLMConversationReply("已经开始整理，请稍候。"),
+        ), patch(
+            "app.agent.orchestrator.select_orchestration_tool", return_value=None
+        ):
+            response = agent._query_with_model_tools(
+                "整理一下光鸭云盘",
+                owner="web-session",
+                llm_rate_owner="",
+                llm_tool_rate_identity="",
+                conversation_context=None,
+                read_only=False,
+            )
+
+        self.assertIsNone(response)
+
+    def test_partial_action_read_is_preserved_without_claiming_execution_or_fallback(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        read_response = {
+            "mode": "read_only",
+            "tool_call": {"name": "guangya.organize.preview", "arguments": {}},
+            "result": ToolResult(True, "success", "发现 1 项待整理来源").to_dict(),
+        }
+        native_reply = LLMConversationReply(
+            "已经开始整理。",
+            completed=False,
+            stop_reason="provider_unavailable",
+            tool_executions=({
+                "tool_name": "guangya.organize.preview",
+                "arguments": {},
+                "response": read_response,
+            },),
+        )
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent", return_value=native_reply
+        ):
+            response = agent._query_with_model_tools(
+                "整理一下光鸭云盘",
+                owner="web-session",
+                llm_rate_owner="",
+                llm_tool_rate_identity="",
+                conversation_context=None,
+                read_only=False,
+            )
+
+        self.assertEqual(response["tool_call"]["name"], "guangya.organize.preview")
+        self.assertIn("操作尚未执行", response["presentation"]["narrative"])
+        self.assertNotIn("已经开始整理", response["presentation"]["narrative"])
+        self.assertFalse(response["agent_partial"]["complete"])
 
     def test_low_write_model_selection_creates_confirmation_without_execution(self):
         calls = []
@@ -2629,6 +3132,35 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(response["confirmation"]["risk"], "low_write")
         self.assertEqual(calls, [])
+
+    def test_confirmation_selector_fallback_uses_shared_tool_rate_limit(self):
+        registry = _confirmation_registry()
+        agent = AgentOrchestrator(registry)
+        selection = LLMToolSelection(
+            "config.set_feature_state",
+            {"feature": "web_search", "enabled": True},
+        )
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent", return_value=None
+        ), patch(
+            "app.agent.orchestrator.select_orchestration_tool",
+            return_value=selection,
+        ), patch(
+            "app.agent.orchestrator.allow_agent_tool", return_value=False
+        ), patch.object(agent, "prepare") as prepare, self.assertRaises(
+            AgentToolError
+        ) as raised:
+            agent._query_with_model_tools(
+                "开启网页搜索",
+                owner="web-session",
+                llm_rate_owner="",
+                llm_tool_rate_identity="web-session",
+                conversation_context=None,
+                read_only=False,
+            )
+
+        self.assertEqual(raised.exception.code, "rate_limited")
+        prepare.assert_not_called()
 
     def test_native_action_planning_preserves_confirmation_and_narrative(self):
         calls = []

@@ -89,10 +89,16 @@ _ACTION_STATUS_QUERY_PATTERNS = (
     re.compile(r"(?:是否|是不是|有无|有没有).{0,16}(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复)"),
     re.compile(r"(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复).{0,4}(?:了吗|没有|没|状态|情况)"),
     re.compile(r"(?:当前|现在).{0,12}(?:状态|情况|是否|有没有|有无)"),
+    re.compile(r"(?:查看|检查|查询).{0,24}(?:状态|进度|日志|记录|历史|结果)"),
+    re.compile(
+        r"(?:删除|移除|清理|刷新|同步|重试|提交|执行|整理).{0,24}"
+        r"(?:了吗|了没|没有|状态|情况|进度)$"
+    ),
 )
 
 _ACTION_EXPLANATION_QUERY_PATTERNS = (
     re.compile(r"(?:怎么|怎样|如何|为何|为什么)"),
+    re.compile(r"(?:失败|异常|故障|错误).{0,8}(?:原因|详情|情况|怎么了)"),
     re.compile(
         r"(?:下载|推送|提交|设置|配置|开启|启用|关闭|修改|调整|使用|操作).{0,12}"
         r"(?:方法|步骤|教程|指南|说明|文档|方式|怎么弄|怎么操作|怎么配置)"
@@ -142,8 +148,29 @@ _ACTION_INTENT_RE = re.compile(
     r"(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复|调整|修改|设置|改成|保存|取消|"
     r"删除|移除|清理|刷新|同步|重试|推送|提交|立即执行|开始执行|运行一次|发送测试|测试通知)"
 )
+_NEGATED_ACTION_RE = re.compile(
+    r"(?:不要|别|不许|不准|无需|不用)[^，,。；;！？!?]{0,24}"
+    r"(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复|停止|取消|中止|终止|"
+    r"调整|修改|设置|改成|保存|删除|移除|清理|整理|刷新|同步|重试|"
+    r"下载|推送|提交|发送|下到|下去|就要|执行)"
+)
 _DOWNLOAD_ACTION_RE = re.compile(
     r"(?:开始下载|下载第?\s*\d+|下载.{0,30}(?:到|至|进)\s*(?:qb|qbit|qbittorrent|光鸭))",
+    re.IGNORECASE,
+)
+_GUANGYA_ORGANIZE_ACTION_RE = re.compile(
+    r"(?:^(?:请(?:帮我)?\s*)?(?:开始|立即|马上|执行|进行)?\s*整理(?:一下|一次)?"
+    r".{0,12}(?:光鸭|云盘)|(?:光鸭|云盘).{0,12}(?:开始|立即|马上|执行|进行)?"
+    r"\s*整理(?:一下|一次)?$)",
+    re.IGNORECASE,
+)
+_ORGANIZE_READ_MARKERS = (
+    "查看", "检查", "状态", "日志", "记录", "历史", "进度", "预览",
+    "怎么", "如何", "为什么", "是否", "能否",
+)
+_MEDIA_SUBSCRIPTION_CREATE_ACTION_RE = re.compile(
+    r"(?:订阅|追更|加入追更|添加追更|创建订阅)\s*"
+    r"(?:第\s*\d{1,3}\s*(?:个|项|部|季)|这部|这个|它|[《「『\"'])",
     re.IGNORECASE,
 )
 _GENERIC_CONFIRMATION_EXCLUDED_RE = re.compile(
@@ -162,7 +189,11 @@ def is_agent_action_request(message: str) -> bool:
     才会进入写操作路径。所有写操作仍由服务端确认门控制。
     """
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
-    if not normalized or _looks_like_action_status_query(normalized):
+    if (
+        not normalized
+        or _NEGATED_ACTION_RE.search(normalized)
+        or _looks_like_action_status_query(normalized)
+    ):
         return False
     if _looks_like_action_explanation_query(normalized):
         return False
@@ -170,7 +201,16 @@ def is_agent_action_request(message: str) -> bool:
         return True
     if _looks_like_action_capability_query(normalized):
         return False
-    return bool(_ACTION_INTENT_RE.search(normalized) or _DOWNLOAD_ACTION_RE.search(normalized))
+    organize_action = bool(
+        not any(marker in normalized for marker in _ORGANIZE_READ_MARKERS)
+        and _GUANGYA_ORGANIZE_ACTION_RE.search(normalized)
+    )
+    return bool(
+        _ACTION_INTENT_RE.search(normalized)
+        or _DOWNLOAD_ACTION_RE.search(normalized)
+        or _MEDIA_SUBSCRIPTION_CREATE_ACTION_RE.search(normalized)
+        or organize_action
+    )
 
 
 def is_confirmation_planning_request(message: str) -> bool:

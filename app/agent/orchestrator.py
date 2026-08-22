@@ -89,7 +89,8 @@ _QUERY_TOOL_RATE_IDENTITY: ContextVar[str] = ContextVar(
 )
 _LLM_FIRST_CONTEXT_MARKERS = (
     "这部", "这集", "这个", "它", "刚才", "上一个", "继续", "重试",
-    "再来", "刷新一下", "打开它", "关闭它", "有多少", "缺不缺",
+    "再来", "刷新一下", "搜索一下", "搜一下", "找一下", "查一下",
+    "打开它", "关闭它", "有多少", "缺不缺",
 )
 def _should_try_contextual_model_first(
     message: str, conversation_context: list[dict[str, Any]] | None
@@ -640,7 +641,7 @@ _RECENT_RESOURCE_REFERENCES = (
 )
 _RECENT_RESOURCE_ACTIONS = ("下载", "推送", "提交", "发送")
 _RECENT_RESOURCE_REJECT_TOKENS = (
-    "不要", "别", "取消", "停止", "不准", "无需", "不用",
+    "不要", "别", "不许", "取消", "停止", "不准", "无需", "不用",
     "了吗", "是否", "状态", "进度", "什么意思", "怎么", "如何", "为什么",
     "能否", "可以吗", "会不会",
 )
@@ -3062,8 +3063,9 @@ def _is_recent_resource_question(message: str) -> bool:
     compact = re.sub(r"\s+", "", normalized)
     if not compact:
         return False
+    semantic_tail = compact.rstrip("?？!！。")
     question_like = (
-        compact.endswith(("?", "？", "吗", "么", "呢"))
+        semantic_tail.endswith(("吗", "么", "呢"))
         or any(token in compact for token in _RECENT_RESOURCE_QUESTION_TOKENS)
     )
     return question_like and (
@@ -4846,6 +4848,137 @@ def is_guangya_organize_run_message(message: str) -> bool:
     )
 
 
+_DANGER_READ_MARKERS = (
+    "原因", "详情", "怎么了", "怎么", "怎样", "如何", "为什么", "是否", "能否",
+    "可以吗", "会不会", "影响", "后果", "风险", "说明", "帮助",
+)
+
+
+def _is_danger_read_question(message: str) -> bool:
+    """识别提及危险动作、但实际只是在问状态、原因或影响的句子。"""
+    normalized = _normalize_intent_message(message)
+    if not normalized:
+        return False
+    if re.search(
+        r"(?:不要|别|不许|无需|不用).{0,8}"
+        r"(?:停止|取消|中止|终止|删除|移除|清理|整理|同步|重试|提交)",
+        normalized,
+    ):
+        return True
+    if normalized.startswith(("查看", "检查", "查询", "看看", "查一下")):
+        return True
+    if re.search(
+        r"(?:停止|取消|中止|终止|删除|移除|清理|整理|同步|重试|提交)"
+        r".{0,10}(?:了吗|了没|没有|是否完成|是否成功)$",
+        normalized.rstrip(" ，。！？!?、；;：:"),
+    ):
+        return True
+    if normalized.rstrip(" ，。！？!?、；;：:").endswith(
+        ("状态", "进度", "情况", "结果", "日志", "记录", "历史")
+    ):
+        return True
+    return bool(
+        any(marker in normalized for marker in _DANGER_READ_MARKERS)
+        or is_strm_failure_triage_message(normalized)
+    )
+
+
+def _has_deterministic_media_subscription_binding(message: str) -> bool:
+    """媒体候选/标题与删除必须由服务端绑定真实对象，不能让模型猜 ID。"""
+    return bool(
+        media_subscription_candidate_request(message) is not None
+        or media_subscription_title_request(message) is not None
+        or media_subscription_delete_request(message) is not None
+        or is_media_subscription_delete_write_message(message)
+    )
+
+
+def _is_negated_danger_action_message(message: str) -> bool:
+    """识别明确撤回/拒绝危险动作的句子；这类请求应确定性 no-op。"""
+    normalized = _normalize_intent_message(message)
+    if not normalized:
+        return False
+    negated_action = bool(re.search(
+        r"(?:不要|别|不许|不准|无需|不用)[^，,。；;！？!?]{0,24}"
+        r"(?:停止|取消|中止|终止|删除|移除|清理|整理|同步|重试|"
+        r"下载|推送|提交|发送|下到|下去|就要)",
+        normalized,
+    ))
+    recent_resource_scope = bool(
+        (
+            _recent_resource_selection(normalized) is not None
+            or _recent_resource_episode(normalized) is not None
+            or any(reference in normalized for reference in _RECENT_RESOURCE_REFERENCES)
+        )
+        and any(
+            action in normalized
+            for action in (*_RECENT_RESOURCE_ACTIONS, "下到", "下去", "就要")
+        )
+    )
+    if not negated_action:
+        return False
+    return bool(
+        _has_organize_scope(normalized)
+        or "strm" in normalized
+        or is_download_task_control_message(normalized)
+        or any(scope in normalized for scope in _DOWNLOAD_RETRY_SCOPES)
+        or "rss" in normalized
+        or "订阅源" in normalized
+        or recent_resource_scope
+    )
+
+
+def _is_confirmation_response(response: Any) -> bool:
+    """响应侧防线：只读/否定请求不得接受任何确认票据。"""
+    return bool(
+        isinstance(response, dict)
+        and (
+            str(response.get("mode") or "").strip() == "confirmation_required"
+            or isinstance(response.get("confirmation"), dict)
+        )
+    )
+
+
+def _has_deterministic_danger_intent(message: str) -> bool:
+    """按领域意图阻断 DANGER 请求进入 Planner，包括参数不完整的命令。"""
+    normalized = _normalize_intent_message(message)
+    if not normalized or _is_danger_read_question(normalized):
+        return False
+
+    download_delete_intent = bool(
+        is_download_task_control_message(normalized)
+        and any(token in normalized for token in ("删除", "移除"))
+    )
+    rss_delete_intent = bool(
+        is_rss_subscription_control_write_message(normalized)
+        and any(token in normalized for token in ("删除", "移除"))
+    )
+    strm_run_intent = bool(
+        "strm" in normalized
+        and "同步" in normalized
+        and "元数据" not in normalized
+        and not any(
+            token in normalized
+            for token in ("状态", "进度", "怎么样", "完成了吗", "到哪", "定时", "计划")
+        )
+    )
+    organize_danger_intent = bool(
+        _has_organize_scope(normalized)
+        and not is_guangya_organize_preview_message(normalized)
+        and not is_guangya_organize_schedule_policy_summary_message(normalized)
+    )
+    return bool(
+        is_download_retry_submission_message(normalized)
+        or download_delete_intent
+        or rss_delete_intent
+        or is_rss_pending_download_write_message(normalized)
+        or is_rss_failure_retry_write_message(normalized)
+        or is_strm_failure_write_message(normalized)
+        or strm_run_intent
+        or organize_danger_intent
+    )
+
+
 class AgentOrchestrator:
     def __init__(self, registry: ToolRegistry, confirmation_store: ConfirmationStore | None = None,
                  *, recent_patrol_store: RecentPatrolStore | None = None,
@@ -6164,6 +6297,24 @@ class AgentOrchestrator:
                 )
             local_conversation = self._local_conversation(message)
             if local_conversation is not None:
+                # 纯闲聊不暴露任何工具，但优先让对话模型自然回应；Provider
+                # 不可用时再使用稳定的本地短句，避免伪造系统状态。
+                conversation = answer_conversation(
+                    message,
+                    owner=llm_rate_owner or owner,
+                    conversation_context=conversation_context,
+                    **({"reply_context": reply_context} if reply_context else {}),
+                )
+                if conversation is not None:
+                    return self._conversation_response(
+                        conversation.answer,
+                        conversation.suggestions,
+                        llm_usage=(
+                            conversation.usage.to_dict()
+                            if conversation.usage is not None
+                            else None
+                        ),
+                    )
                 return local_conversation
             recent_resource_question = self._answer_recent_resource_question(
                 message,
@@ -6173,11 +6324,25 @@ class AgentOrchestrator:
             )
             if recent_resource_question is not None:
                 return recent_resource_question
+            if _is_negated_danger_action_message(message):
+                return self._conversation_response("好，不会执行这项操作。")
             # 指代型续句与显式引用消息优先交给统一 Planner。模型不可用、
             # 无法可靠规划或安全门禁拒绝时，再回退到既有窄续句解析器。
             contextual_model_attempted = False
+            danger_read_question = _is_danger_read_question(message)
+            recent_resource_request = None
+            if owner and self.recent_resource_store.get(owner=owner) is not None:
+                recent_resource_request = _recent_resource_pre_model_submit_request(
+                    message, conversation_context
+                )
+            requires_deterministic_context_routing = bool(
+                _has_deterministic_media_subscription_binding(message)
+                or _has_deterministic_danger_intent(message)
+                or recent_resource_request is not None
+            )
             if (
-                (conversation_context or reply_context)
+                not requires_deterministic_context_routing
+                and (conversation_context or reply_context)
                 and (
                     reply_context
                     or _should_try_contextual_model_first(
@@ -6194,6 +6359,7 @@ class AgentOrchestrator:
                     conversation_context=conversation_context,
                     read_only=(
                         not is_agent_action_request(message)
+                        or danger_read_question
                         or _is_cross_domain_rss_refresh_correction(
                             message, conversation_context
                         )
@@ -6203,7 +6369,10 @@ class AgentOrchestrator:
                         if reply_context else {}
                     ),
                 )
-                if contextual_model is not None:
+                if contextual_model is not None and not (
+                    danger_read_question
+                    and _is_confirmation_response(contextual_model)
+                ):
                     if not present:
                         return contextual_model
                     return self._present_tool_response(
@@ -6211,36 +6380,33 @@ class AgentOrchestrator:
                         contextual_model,
                         owner=llm_rate_owner or owner,
                     )
-            continued = self._continue_narrow_followup(
-                message,
-                owner=llm_rate_owner or owner,
-                conversation_context=conversation_context,
-                reply_context=reply_context,
-            )
-            if continued is not None:
-                return continued
-            clarification = self._clarify_ambiguous_followup(
-                message,
-                conversation_context=conversation_context,
-                reply_context=reply_context,
-            )
-            if clarification is not None:
-                return clarification
+            if not requires_deterministic_context_routing:
+                continued = self._continue_narrow_followup(
+                    message,
+                    owner=llm_rate_owner or owner,
+                    conversation_context=conversation_context,
+                    reply_context=reply_context,
+                )
+                if continued is not None:
+                    return continued
+                clarification = self._clarify_ambiguous_followup(
+                    message,
+                    conversation_context=conversation_context,
+                    reply_context=reply_context,
+                )
+                if clarification is not None:
+                    return clarification
             # 最近资源候选属于已经建立的强上下文。像“第 2 个到光鸭”或
             # “下载 34 集到 qB”必须先进入确认流程，不能再次交给模型猜测。
-            if owner and self.recent_resource_store.get(owner=owner) is not None:
-                recent_resource_request = _recent_resource_pre_model_submit_request(
-                    message, conversation_context
+            if recent_resource_request is not None:
+                response = self._continue_recent_resource_submit(
+                    recent_resource_request, owner=owner
                 )
-                if recent_resource_request is not None:
-                    response = self._continue_recent_resource_submit(
-                        recent_resource_request, owner=owner
-                    )
-                    if not present:
-                        return response
-                    return self._present_tool_response(
-                        message, response, owner=llm_rate_owner or owner
-                    )
+                if not present:
+                    return response
+                return self._present_tool_response(
+                    message, response, owner=llm_rate_owner or owner
+                )
             # 强上下文与确认接力已由服务端绑定；其余请求进入统一编排层：
             # _query_raw 先尝试受注册表约束的模型规划，再回退到兼容性业务路由。
             response = self._query_raw(
@@ -6444,6 +6610,12 @@ class AgentOrchestrator:
             if disposition is LLMToolDisposition.PREPARE_CONFIRMATION:
                 if not owner:
                     return None
+                if rate_identity and not allow_agent_tool(
+                    rate_identity, selection.tool_name
+                ):
+                    raise AgentToolError(
+                        "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                    )
                 return self.prepare(
                     selection.tool_name,
                     normalized_arguments,
@@ -6560,6 +6732,17 @@ class AgentOrchestrator:
             ),
             None,
         )
+        action_partial_without_confirmation = bool(
+            action_request
+            and confirmation_execution is None
+            and executions
+            and not native_reply.completed
+        )
+        if action_request and confirmation_execution is None and not action_partial_without_confirmation:
+            # 动作请求必须以服务端确认票据闭环。模型若只给出自由文本或只读了
+            # 状态（典型是未暴露的 DANGER 工具），交回确定性业务路由；绝不能
+            # 让“正在/已经处理”的自然语言冒充受控动作结果。
+            return None
         if confirmation_execution is not None:
             response = deepcopy(confirmation_execution["response"])
         elif len(executions) > 1:
@@ -6596,9 +6779,13 @@ class AgentOrchestrator:
             }
 
         narrative_answer = (
-            _safe_confirmation_narrative(native_reply.answer)
-            if confirmation_execution is not None
-            else native_reply.answer
+            "只完成了部分只读检查，操作尚未执行。请稍后重试。"
+            if action_partial_without_confirmation
+            else (
+                _safe_confirmation_narrative(native_reply.answer)
+                if confirmation_execution is not None
+                else native_reply.answer
+            )
         )
         presentation = result_projection.build_public_narrative_presentation(
             narrative_answer,
@@ -7246,6 +7433,8 @@ class AgentOrchestrator:
                 "Agent 不会自动修复、清理或删除 STRM 失败记录。",
                 ["可先查看 STRM 失败状态，或明确请求重试生成失败/元数据失败。"],
             )
+        if is_strm_failure_triage_message(lower):
+            return self._invoke_query_read("strm.triage_failures", {})
         if _is_strm_run_action(lower):
             if not owner:
                 return self._unsupported(
@@ -7253,8 +7442,20 @@ class AgentOrchestrator:
                     ["请通过 Agent 页面重新提交，并在预检后确认执行。"],
                 )
             return self.prepare("strm.run_once", {}, owner=owner)
-        if is_strm_failure_triage_message(lower):
-            return self._invoke_query_read("strm.triage_failures", {})
+        if (
+            "strm" in lower
+            and "同步" in lower
+            and "元数据" not in lower
+            and not _is_dangerous_action_discussion(lower)
+            and not any(
+                token in lower
+                for token in ("状态", "进度", "怎么样", "完成了吗", "到哪", "定时", "计划")
+            )
+        ):
+            return self._clarification_response(
+                "你是要立即运行一次 STRM 同步，还是只查看当前状态？",
+                ["立即运行一次 STRM 同步", "查看 STRM 状态"],
+            )
         if is_guangya_organize_stop_message(lower):
             if not owner:
                 return self._unsupported(
@@ -7278,6 +7479,21 @@ class AgentOrchestrator:
                     ["请通过 Agent 页面重新提交，并在只读预览后确认执行。"],
                 )
             return self.prepare("guangya.organize.run_once", {}, owner=owner)
+        if (
+            _has_organize_scope(lower)
+            and not _is_danger_read_question(lower)
+            and not any(
+                token in lower
+                for token in (
+                    "查看", "检查", "查询", "状态", "进度", "日志", "记录", "历史",
+                    "结果", "完成了吗", "到哪", "怎么样", "定时", "计划", "预览", "试运行",
+                )
+            )
+        ):
+            return self._clarification_response(
+                "你是要先预览整理范围，还是立即整理一次光鸭云盘？",
+                ["预览光鸭云盘整理", "立即整理一次光鸭云盘"],
+            )
         if is_missing_season_resource_search_message(lower):
             arguments = _inherit_verified_media_query(
                 _extract_missing_season_resource_args(message),
@@ -7359,6 +7575,9 @@ class AgentOrchestrator:
         message = normalize_agent_message(value)
         lower = message.casefold()
 
+        if _is_negated_danger_action_message(message):
+            return self._conversation_response("好，不会执行这项操作。")
+
         discovery_followup = self._handle_discovery_followup(
             message,
             owner=owner,
@@ -7386,27 +7605,23 @@ class AgentOrchestrator:
                 return patrol_followup
 
         action_request = is_agent_action_request(message)
+        danger_read_question = _is_danger_read_question(message)
         has_resource_continuation = bool(
             owner
             and self.recent_resource_store.get(owner=owner) is not None
             and recent_resource_submit_request(message, allow_implicit=True) is not None
         )
-        has_deterministic_media_subscription_action = bool(
-            action_request
-            and (
-                media_subscription_candidate_request(message) is not None
-                or media_subscription_title_request(message) is not None
-                or media_subscription_delete_request(message) is not None
-                or is_media_subscription_delete_write_message(message)
-                or media_subscription_control_request(message) is not None
-                or is_media_subscription_control_write_message(message)
-            )
+        has_deterministic_media_subscription_binding = (
+            _has_deterministic_media_subscription_binding(message)
         )
-        model_routing_attempted = False
+        has_deterministic_danger_action = _has_deterministic_danger_intent(message)
+        # 被确定性 DANGER 领域接管的请求，后置兼容选择器也不得再次交给模型。
+        model_routing_attempted = has_deterministic_danger_action
         if (
             allow_model_routing
             and not has_resource_continuation
-            and not has_deterministic_media_subscription_action
+            and not has_deterministic_media_subscription_binding
+            and not has_deterministic_danger_action
         ):
             model_routing_attempted = True
             model_read = self._query_with_model_tools(
@@ -7417,6 +7632,7 @@ class AgentOrchestrator:
                 conversation_context=conversation_context,
                 read_only=(
                     not action_request
+                    or danger_read_question
                     or _is_cross_domain_rss_refresh_correction(
                         message, conversation_context
                     )
@@ -7426,7 +7642,9 @@ class AgentOrchestrator:
                     if reply_context else {}
                 ),
             )
-            if model_read is not None:
+            if model_read is not None and not (
+                danger_read_question and _is_confirmation_response(model_read)
+            ):
                 return model_read
 
         history_request = agent_action_history_request(message)
@@ -7482,6 +7700,7 @@ class AgentOrchestrator:
                 llm_rate_owner=llm_rate_owner,
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
+                read_only=True,
                 **(
                     {"reply_context": reply_context}
                     if reply_context else {}
@@ -7921,8 +8140,8 @@ class AgentOrchestrator:
                 owner=owner,
             )
 
-        # 动作请求或强上下文请求不会进入前置 read-only 模型层；仅在确定性
-        # 业务路由也未命中时使用兼容选择器。READ 可执行，写工具只生成确认票据。
+        # 前置 Planner 未执行或未可靠闭环时，再使用兼容选择器。READ 可执行，
+        # 安全写工具只生成确认票据，DANGER 工具继续由确定性路由绑定对象。
         model_routed = None
         if allow_model_routing and not model_routing_attempted:
             model_routed = self._query_with_model_tools(
@@ -7931,13 +8150,15 @@ class AgentOrchestrator:
                 llm_rate_owner=llm_rate_owner,
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
-                read_only=not action_request,
+                read_only=(not action_request or danger_read_question),
                 **(
                     {"reply_context": reply_context}
                     if reply_context else {}
                 ),
             )
-        if model_routed is not None:
+        if model_routed is not None and not (
+            danger_read_question and _is_confirmation_response(model_routed)
+        ):
             return model_routed
 
         # Provider 不可用时仍保留本地媒体库标题搜索作为最后的零模型兜底。
