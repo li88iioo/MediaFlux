@@ -90,11 +90,72 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         self.assertEqual(rss_subscription_refresh_name("刷新 RSS Mikan"), "Mikan")
         self.assertEqual(rss_subscription_refresh_name("刷新一下《Mikan》RSS"), "Mikan")
         self.assertIsNone(rss_subscription_refresh_name("刷新全部 RSS 订阅"))
+        self.assertIsNone(rss_subscription_refresh_name("刷新一个rss订阅"))
         diagnosis = "查看 RSS 刷新失败状态"
         self.assertTrue(is_rss_diagnosis_message(diagnosis))
         self.assertFalse(is_rss_subscription_refresh_write_message(diagnosis))
         routed = get_agent_service().query(diagnosis, owner="owner")
         self.assertEqual(routed["tool_call"]["name"], "rss.diagnose")
+
+    def test_unique_disabled_subscription_can_still_be_manually_refreshed(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+
+        prepared = get_agent_service().query(
+            "刷新一个rss订阅", owner="owner", present=False
+        )
+
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
+        self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
+
+    def test_disabled_state_correction_continues_recent_rss_refresh_intent(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+
+        prepared = get_agent_service().query(
+            "没启动不影响刷新啊",
+            owner="owner",
+            conversation_context=[{
+                "role": "assistant",
+                "text": "这个 RSS 订阅目前停用，因此刚才没有继续刷新。",
+                "tool_name": "rss.subscription_summaries",
+                "status": "completed",
+            }],
+            present=False,
+        )
+
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
+        self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
+
+    def test_rss_context_does_not_hijack_other_domain_refresh_correction(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+        service = get_agent_service()
+        for message in (
+            "下载任务没启动不影响刷新啊",
+            "qB 没启动不影响刷新啊",
+            "qBittorrent 没启动不影响刷新啊",
+            "下载器没启动不影响刷新啊",
+        ):
+            with self.subTest(message=message), patch.object(
+                service, "_query_with_model_tools", return_value=None
+            ) as model_route:
+                response = service.query(
+                    message,
+                    owner="owner",
+                    conversation_context=[{
+                        "role": "assistant",
+                        "text": "已列出全部 RSS 订阅。",
+                        "tool_name": "rss.subscription_summaries",
+                        "status": "completed",
+                    }],
+                    present=False,
+                )
+
+            self.assertNotIn(
+                (response.get("tool_call") or {}).get("name"),
+                {"rss.refresh_subscription", "rss.refresh_subscriptions"},
+            )
+            self.assertTrue(model_route.call_args.kwargs["read_only"])
 
     def test_refresh_by_unique_subscription_name_resolves_before_confirmation(self):
         mikan_id = db.add_rss_subscription("Ｍｉｋａｎ", "https://mikan.invalid/rss")

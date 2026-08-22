@@ -56,7 +56,7 @@ from app.agent.workspace_next_actions import (
     resolve_workspace_action_handoff,
     workspace_action_handoff_arguments,
 )
-from app.bot.progress import deliver_terminal_to_existing_message
+from app.bot.progress import deliver_terminal_to_existing_message, send_typing
 from app.config import get
 from app.logger import get_logger
 from app.modules.web_secret import get_web_secret
@@ -99,6 +99,10 @@ _RESOURCE_PAGE_PAYLOAD_LIMIT = 32768
 _EPISODE_FOLLOWUP_LIMIT = 3
 _WORKSPACE_ACTION_LIMIT = 5
 _TELEGRAM_STREAM_UPDATE_INTERVAL_SECONDS = 0.35
+_TELEGRAM_TYPING_INTERVAL_SECONDS = 4.0
+_TELEGRAM_TYPING_TIMEOUT_SECONDS = 120.0
+_TELEGRAM_TYPING_REGISTRY_LOCK = threading.RLock()
+_TELEGRAM_TYPING_REGISTRY: dict[str, Any] = {}
 
 _URL_RE = re.compile(r"(?i)\b(?:https?://|magnet:\?|ed2k://)\S+")
 _UNIX_PATH_RE = re.compile(r"(?<![\w.])/(?:[^\s/]+/)+[^\s]*")
@@ -142,6 +146,89 @@ class _AgentAction:
     tool_name: str = ""
     arguments_json: str = ""
     action_key: str = ""
+
+
+class _TelegramTypingHeartbeat:
+    """在同步 Agent 查询期间续期 Telegram typing，不依赖流式草稿开关。"""
+
+    def __init__(
+        self,
+        bot: Any,
+        chat_id: object,
+        *,
+        is_current: Callable[[], bool],
+        interval_seconds: float = _TELEGRAM_TYPING_INTERVAL_SECONDS,
+        timeout_seconds: float = _TELEGRAM_TYPING_TIMEOUT_SECONDS,
+    ) -> None:
+        self.bot = bot
+        self.chat_id = chat_id
+        self.is_current = is_current
+        self.interval_seconds = max(0.01, float(interval_seconds))
+        self.timeout_seconds = max(self.interval_seconds, float(timeout_seconds))
+        self._stop = threading.Event()
+        self._started = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._registry_key = str(chat_id)
+
+    def start(self) -> "_TelegramTypingHeartbeat":
+        if self.chat_id is None or not callable(getattr(self.bot, "send_chat_action", None)):
+            return self
+        if not self._still_current():
+            return self
+        thread = threading.Thread(
+            target=self._run,
+            name="mediaflux-agent-telegram-typing",
+            daemon=True,
+        )
+        with _TELEGRAM_TYPING_REGISTRY_LOCK:
+            existing = _TELEGRAM_TYPING_REGISTRY.get(self._registry_key)
+            if isinstance(existing, _TelegramTypingHeartbeat):
+                existing._stop.set()
+                existing_thread = existing._thread
+                if existing_thread is not None and existing_thread.is_alive():
+                    return self
+            self._thread = thread
+            _TELEGRAM_TYPING_REGISTRY[self._registry_key] = self
+        try:
+            thread.start()
+        except RuntimeError:
+            self._unregister()
+            self._thread = None
+            return self
+        # 只等待后台 worker 获得调度，不等待 Telegram 外部 I/O 返回。
+        self._started.wait(timeout=0.05)
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=0.1)
+
+    def _still_current(self) -> bool:
+        try:
+            return bool(self.is_current())
+        except Exception:
+            return False
+
+    def _run(self) -> None:
+        try:
+            self._started.set()
+            if self._stop.is_set() or not self._still_current():
+                return
+            send_typing(self.bot, self.chat_id)
+            deadline = time.monotonic() + self.timeout_seconds
+            while not self._stop.wait(self.interval_seconds):
+                if time.monotonic() >= deadline or not self._still_current():
+                    return
+                send_typing(self.bot, self.chat_id)
+        finally:
+            self._unregister()
+
+    def _unregister(self) -> None:
+        with _TELEGRAM_TYPING_REGISTRY_LOCK:
+            if _TELEGRAM_TYPING_REGISTRY.get(self._registry_key) is self:
+                _TELEGRAM_TYPING_REGISTRY.pop(self._registry_key, None)
 
 
 def _normalize_resource_page_payload(
@@ -1099,13 +1186,6 @@ def _begin_agent_stream(
     if chat_id is None:
         return None
 
-    send_action = getattr(bot, "send_chat_action", None)
-    if callable(send_action):
-        try:
-            send_action(chat_id, "typing")
-        except Exception:
-            pass
-
     draft_id = secrets.randbelow(2_147_483_647) + 1
     send_rich_draft = getattr(bot, "send_rich_message_draft", None)
     send_rich = getattr(bot, "send_rich_message", None)
@@ -1739,8 +1819,10 @@ def _telegram_library_audit_details(response: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _telegram_agent_trace_details(response: dict[str, Any]) -> str:
-    """展示模型实际核对过的公开数据源，不暴露工具名、参数或内部标识。"""
+def _telegram_agent_trace_details(
+    response: dict[str, Any], *, attention_only: bool = False
+) -> str:
+    """展示必要的公开核对范围；自然叙述后只补失败或未完成项。"""
     raw_trace = response.get("agent_trace")
     if not isinstance(raw_trace, list):
         return ""
@@ -1756,22 +1838,25 @@ def _telegram_agent_trace_details(response: dict[str, Any]) -> str:
         label = _public_text(item.get("label"), limit=70)
         if not label:
             continue
+        item_ok = item.get("ok") is True
+        if attention_only and item_ok and not partial:
+            continue
         projected.append((
             label,
-            item.get("ok") is True,
+            item_ok,
             _public_text(item.get("summary"), limit=150),
         ))
-    if not projected or (len(projected) == 1 and not partial):
+    if not projected or (len(projected) == 1 and not partial and not attention_only):
         return ""
 
-    title = "已完成部分核对" if partial else "本次核对"
+    title = "已完成部分核对" if partial else ("需要留意" if attention_only else "本次核对")
     lines = [f"<b>{title}</b>"]
     for label, ok, summary in projected:
         lines.append(f"• <b>{label}</b> · {'完成' if ok else '需关注'}")
         if summary:
             lines.append(f"  {summary}")
     remaining = max(0, len(raw_trace) - len(projected))
-    if remaining:
+    if remaining and not attention_only:
         lines.append(f"另有 {remaining} 项已核对。")
     return "\n".join(lines)
 
@@ -1789,7 +1874,7 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
     summary = _public_multiline_html(
         display.get("summary") or result.get("summary"),
         limit=_MAX_SUMMARY_LENGTH,
-        promote_first=True,
+        promote_first=False,
     )
 
     presentation = payload.get("presentation")
@@ -1798,11 +1883,13 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
         narrative = _public_multiline_html(
             presentation.get("narrative"),
             limit=_MAX_NARRATIVE_LENGTH,
-            promote_first=True,
+            promote_first=False,
         )
 
     structured_details = _telegram_library_audit_details(payload)
-    trace_details = _telegram_agent_trace_details(payload)
+    trace_details = _telegram_agent_trace_details(
+        payload, attention_only=bool(narrative)
+    )
     body_parts = [
         item for item in (narrative or summary, structured_details, trace_details) if item
     ]
@@ -1844,6 +1931,8 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
             if not isinstance(step, dict):
                 continue
             step_result = step.get("result") if isinstance(step.get("result"), dict) else {}
+            if narrative and step_result.get("ok") is True:
+                continue
             label = _READ_PLAN_LABELS.get(str(step.get("tool_name") or ""), "诊断步骤")
             step_summary = _public_text(step_result.get("summary"), limit=180)
             step_status = "完成" if step_result.get("ok") is True else "需关注"
@@ -1852,10 +1941,22 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
                 + (f"\n   {step_summary}" if step_summary else "")
             )
         if safe_steps:
-            lines.extend(["", "<b>检查步骤</b>", *safe_steps])
+            lines.extend([
+                "",
+                "<b>需要留意</b>" if narrative else "<b>检查步骤</b>",
+                *safe_steps,
+            ])
 
     guidance = _telegram_guidance(payload)
-    if guidance:
+    show_guidance = (
+        status in {
+            "clarification_required", "selection_required", "partial", "incomplete", "degraded",
+        }
+        or public_key == "attention"
+        or public_tone == "warning"
+        or not ok
+    )
+    if guidance and show_guidance:
         lines.extend(["", "<b>接下来可以</b>"])
         for item in guidance:
             lines.append(f"• {item['label']}")
@@ -2592,7 +2693,16 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         initialize=initialize_query,
     )
     stream_target = None
+    message_chat_id, _source_message_id, _message_thread_id = _message_context(message)
+    typing_heartbeat = _TelegramTypingHeartbeat(
+        bot,
+        message_chat_id,
+        is_current=lambda: coordinator.is_current(operation),
+        interval_seconds=_TELEGRAM_TYPING_INTERVAL_SECONDS,
+        timeout_seconds=_TELEGRAM_TYPING_TIMEOUT_SECONDS,
+    )
     try:
+        typing_heartbeat.start()
         # Telegram 调用属于不可控外部 I/O，不能占用 owner 生命周期锁；否则
         # 草稿接口卡顿会同时卡住新消息抢占与 /agent_reset。
         allowed, stream_target = _publish_telegram_io_if_current(
@@ -2833,6 +2943,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             ):
                 _delete_stale_telegram_delivery(bot, publish_result.delivery)
     finally:
+        typing_heartbeat.stop()
         coordinator.finish(operation)
     return True
 

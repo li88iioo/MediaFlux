@@ -48,7 +48,7 @@ from app.agent.models import (
     ToolResult,
     ToolSpec,
 )
-from app.agent.orchestrator import AgentOrchestrator
+from app.agent.orchestrator import AgentOrchestrator, _safe_confirmation_narrative
 from app.agent.rate_limit import agent_rate_limiter, allow_agent_tool
 from app.agent.recent_resource_candidates import RecentResourceCandidateStore
 from app.agent.registry import AgentToolError, ToolRegistry
@@ -2443,6 +2443,18 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         narrative = response["presentation"]["narrative"]
         self.assertIn("尚未执行", narrative)
         self.assertNotIn("已开启", narrative)
+
+    def test_confirmation_narrative_never_trusts_model_execution_wording(self):
+        expected = "操作尚未执行。预检已完成，请核对下面的影响范围；只有确认后系统才会执行。"
+        for claim in (
+            "尚未执行，但刷新完成。",
+            "预检完成，刷新已成功。",
+            "尚未执行，操作完成。",
+            "待确认，但已经成功执行。",
+            "未执行但已刷新。",
+        ):
+            with self.subTest(claim=claim):
+                self.assertEqual(_safe_confirmation_narrative(claim), expected)
 
     def test_llm_first_read_selection_executes_only_validated_read_handler(self):
         calls = []

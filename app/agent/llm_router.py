@@ -1253,15 +1253,31 @@ async def _request_result_narrative(
         },
         "additionalProperties": False,
     }
+    mode = str(projection.get("mode") or "read_only").strip().lower()
+    if mode == "confirmation_required":
+        task_instruction = (
+            "当前任务是解释一次已经完成的写操作预检。操作尚未执行，必须明确写出‘尚未执行’；"
+            "只说明预检确认的对象、实际影响和用户下一步如何确认，绝不能声称已经刷新、整理、移动、"
+            "删除、下载或修改了任何内容。"
+        )
+    elif mode == "confirmed_action":
+        task_instruction = (
+            "当前任务是解释一次已经由 MediaFlux 服务端确认执行的操作结果。"
+            "只按安全投影说明真实完成、部分完成或失败的内容，不得扩大执行范围。"
+        )
+    else:
+        task_instruction = "当前任务是解释一个已经由 MediaFlux 服务端执行完成的只读检查结果。"
     system = (
         DEFAULT_AGENT_SYSTEM_PROMPT
-        + "\n当前任务是解释一个已经由 MediaFlux 服务端执行完成的只读检查结果。"
-        "只能使用提供的安全投影，不得补充未出现的事实、凭据、路径、链接、ID 或工具参数。"
+        + "\n"
+        + task_instruction
+        + "只能使用提供的安全投影，不得补充未出现的事实、凭据、路径、链接、ID 或工具参数。"
         "不要展示内部工具名、模块名、字段名或建议用户调用 API；要把技术状态翻译成普通用户能理解的中文。"
-        "开头直接回答用户最关心的结论，再说明数量、影响范围与优先级。"
+        "开头直接回答用户最关心的结论，再说明必要的数量、影响范围与优先级。"
         "若结果来自本地快照或未联网检查，要明确说明数据边界；失败时说明已知原因和可执行的下一步。"
-        "answer 使用两到四个短段落，必要时使用以短横线开头的简短列表；"
+        "answer 使用自然短段落，保留合理换行；只有确有必要时才使用短列表。"
         "不要输出 Markdown 粗体、标题符号、代码块，也不要添加‘结论’‘Agent 解读’‘依据’等固定栏目。"
+        "不要复述完整检查步骤，不要生成运行报告式栏目。"
         "suggestions 必须是用户可直接发送的自然语言指令，最多三条；不需要时返回空数组。"
     )
     projection_json = json.dumps(

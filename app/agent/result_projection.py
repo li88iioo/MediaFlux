@@ -751,10 +751,15 @@ def sanitize_public_multiline_text(value: object, *, limit: int = 1200) -> str:
     decoded = _INLINE_MARKDOWN_BULLET_RE.sub("\n- ", decoded)
     decoded = _INLINE_NUMBERED_ITEM_RE.sub("\n- ", decoded)
 
-    blocks: list[tuple[str, str]] = []
+    normalized_lines: list[str] = []
+    previous_blank = False
     for raw_line in decoded.split("\n"):
         if not raw_line.strip():
+            if normalized_lines and not previous_blank:
+                normalized_lines.append("")
+            previous_blank = True
             continue
+        previous_blank = False
         line = re.sub(r"^#{1,6}\s+", "", raw_line)
         line = re.sub(r"^[*+]\s+", "- ", line)
         line = line.replace("**", "").replace("__", "").replace("~~", "").replace("`", "")
@@ -766,39 +771,16 @@ def sanitize_public_multiline_text(value: object, *, limit: int = 1200) -> str:
             continue
         bullet = re.match(r"^[-•]\s+(.+)$", line)
         if bullet:
-            blocks.append(("bullet", f"- {bullet.group(1).strip()}"))
+            normalized_lines.append(f"- {bullet.group(1).strip()}")
             continue
 
-        sentences = [match.group(0).strip() for match in _DISPLAY_SENTENCE_RE.finditer(line)]
-        if not sentences:
-            sentences = [line]
-        paragraph: list[str] = []
-        paragraph_length = 0
-        for sentence in sentences:
-            for piece in _display_chunks(sentence, max_length=150):
-                projected_length = paragraph_length + len(piece)
-                if paragraph and (len(paragraph) >= 2 or projected_length > 150):
-                    blocks.append(("paragraph", "".join(paragraph)))
-                    paragraph = []
-                    paragraph_length = 0
-                paragraph.append(piece)
-                paragraph_length += len(piece)
-                if len(piece) >= 150:
-                    blocks.append(("paragraph", "".join(paragraph)))
-                    paragraph = []
-                    paragraph_length = 0
-        if paragraph:
-            blocks.append(("paragraph", "".join(paragraph)))
-
-    normalized_lines: list[str] = []
-    previous_kind = ""
-    for kind, content in blocks:
-        if normalized_lines and kind != "bullet" and normalized_lines[-1] != "":
-            normalized_lines.append("")
-        elif normalized_lines and kind == "bullet" and previous_kind != "bullet" and normalized_lines[-1] != "":
-            normalized_lines.append("")
-        normalized_lines.append(content)
-        previous_kind = kind
+        # 尊重 LLM 原始段落边界。只对异常超长的单行做硬切分，避免把正常
+        # 两三句话重新拼成报告式分块，或把模型有意留下的空行压掉。
+        pieces = _display_chunks(line, max_length=150)
+        for index, piece in enumerate(pieces):
+            if index and normalized_lines and normalized_lines[-1] != "":
+                normalized_lines.append("")
+            normalized_lines.append(piece)
 
     text = "\n".join(normalized_lines).strip()
     if not text:
@@ -1110,7 +1092,13 @@ def project_agent_response_for_llm(response: Mapping[str, Any]) -> dict[str, Any
                 entry["collected_at"] = collected_at
             evidence.append(entry)
 
+    raw_mode = str(response.get("mode") or "read_only").strip().lower()
+    mode = raw_mode if raw_mode in {
+        "read_only", "read_plan", "conversation", "clarification",
+        "confirmation_required", "confirmed_action",
+    } else "read_only"
     projection = {
+        "mode": mode,
         "tool": public_tool_label(tool_name),
         "untrusted_content": True,
         "ok": bool(result.get("ok")),

@@ -91,14 +91,6 @@ _LLM_FIRST_CONTEXT_MARKERS = (
     "这部", "这集", "这个", "它", "刚才", "上一个", "继续", "重试",
     "再来", "刷新一下", "打开它", "关闭它", "有多少", "缺不缺",
 )
-_CONFIRMATION_NARRATIVE_PENDING_MARKERS = (
-    "尚未执行", "还未执行", "未执行", "待确认", "等待确认", "确认后",
-)
-_CONFIRMATION_NARRATIVE_EXECUTED_RE = re.compile(
-    r"(?:已经|已)(?:执行|修改|删除|开启|关闭|启用|停用|暂停|恢复|刷新|同步|发送)"
-)
-
-
 def _prefer_deterministic_context_route(
     message: str, conversation_context: list[dict[str, Any]] | None
 ) -> bool:
@@ -110,15 +102,9 @@ def _prefer_deterministic_context_route(
 
 
 def _safe_confirmation_narrative(value: str) -> str:
-    """确认响应必须明确尚未执行，并拒绝模型提前宣称状态已改变。"""
-    narrative = result_projection.sanitize_public_multiline_text(value, limit=1800)
-    if (
-        narrative
-        and any(marker in narrative for marker in _CONFIRMATION_NARRATIVE_PENDING_MARKERS)
-        and not _CONFIRMATION_NARRATIVE_EXECUTED_RE.search(narrative)
-    ):
-        return narrative
-    return "操作预检已经完成，但尚未执行。请先检查影响范围，确认后系统才会执行。"
+    """确认态的执行状态只能由服务端陈述，不能接受模型自由改写。"""
+    del value
+    return "操作尚未执行。预检已完成，请核对下面的影响范围；只有确认后系统才会执行。"
 
 
 class AgentInputError(ValueError):
@@ -148,7 +134,9 @@ _AMBIGUOUS_FOLLOWUP_PHRASES = frozenset({
 })
 _CASUAL_GREETING_PHRASES = frozenset({
     "你好", "您好", "嗨", "哈喽", "hello", "hi", "hey",
-    "在吗", "在不在", "在干嘛", "在干什么", "在干嘛呢", "在干什么呢",
+    "在吗", "在不在", "在干吗", "在干吗呢", "在干嘛", "在干什么",
+    "在干嘛呢", "在干什么呢", "在干啥", "在干啥呢",
+    "干吗", "干嘛", "干什么", "干啥",
 })
 _AMBIGUOUS_FOLLOWUP_MARKERS = (
     "啥情况", "什么情况", "怎么回事", "咋回事", "继续看看", "看看这个",
@@ -226,6 +214,30 @@ def _latest_assistant_tool_context(
         if role == "user":
             break
     return {}
+
+
+def _is_cross_domain_rss_refresh_correction(
+    message: str, conversation_context: list[dict[str, Any]] | None
+) -> bool:
+    """识别正在纠正 qB/下载器状态的句子，禁止借旧 RSS 上下文规划写操作。"""
+    previous = _latest_assistant_tool_context(conversation_context)
+    if not str(previous.get("tool_name") or "").strip().startswith("rss."):
+        return False
+    normalized = re.sub(
+        r"[\s，。！？!?、；;：:~～]+",
+        "",
+        unicodedata.normalize("NFKC", str(message or "")).casefold(),
+    )
+    return (
+        "不影响刷新" in normalized
+        and any(token in normalized for token in (
+            "没启动", "未启动", "没启用", "未启用", "没开启", "未开启", "停用", "关闭",
+        ))
+        and any(token in normalized for token in (
+            "qb", "qbittorrent", "下载器", "下载任务", "下载队列", "下载速度",
+            "媒体库", "缺集", "strm", "光鸭", "云盘", "整理",
+        ))
+    )
 
 
 _MEDIA_RATING_RETRY_PHRASES = frozenset({
@@ -626,6 +638,9 @@ _RECENT_RESOURCE_REJECT_TOKENS = (
     "不要", "别", "取消", "停止", "不准", "无需", "不用",
     "了吗", "是否", "状态", "进度", "什么意思", "怎么", "如何", "为什么",
     "能否", "可以吗", "会不会",
+)
+_RECENT_RESOURCE_QUESTION_TOKENS = (
+    "是不是", "是否", "对应", "相当于", "等于", "算不算", "对不对", "对得上",
 )
 _RECENT_DOWNLOAD_REFERENCES = ("刚才", "刚刚", "上次", "最近")
 _RECENT_DOWNLOAD_SCOPES = ("下载", "推送", "提交", "资源", "任务")
@@ -1175,6 +1190,7 @@ _RSS_REFRESH_NAMED_PATTERNS = (
 )
 _RSS_NAMED_TARGET_REJECTS = frozenset({
     "全部", "所有", "全部订阅", "所有订阅", "all", "everything",
+    "一个", "一条", "单条", "某个", "任意一个", "随便一个",
     "一下", "一次", "一下rss", "rss", "订阅", "rss订阅",
 })
 
@@ -2983,6 +2999,23 @@ def _recent_resource_episode(message: str) -> int | None:
     return episode if episode is not None and 1 <= episode <= 1000 else None
 
 
+def _is_recent_resource_question(message: str) -> bool:
+    """解释性追问不能被最近候选解析器当成下载准备请求。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    compact = re.sub(r"\s+", "", normalized)
+    if not compact:
+        return False
+    question_like = (
+        compact.endswith(("?", "？", "吗", "么", "呢"))
+        or any(token in compact for token in _RECENT_RESOURCE_QUESTION_TOKENS)
+    )
+    return question_like and (
+        _recent_resource_selection(compact) is not None
+        or _recent_resource_episode(compact) is not None
+        or "季" in compact
+    )
+
+
 def _candidate_episode(candidate: Any) -> int | None:
     if not isinstance(candidate, dict):
         return None
@@ -3010,6 +3043,118 @@ def _candidate_episode(candidate: Any) -> int | None:
         if episode is not None and 1 <= episode <= 1000:
             return episode
     return None
+
+
+def _resource_title_coordinates(title: object) -> tuple[int, int] | None:
+    """从资源标题读取发布组使用的季度集数，不借用搜索目标集数。"""
+    normalized = unicodedata.normalize("NFKC", str(title or ""))
+    season_match = re.search(
+        rf"第\s*({_HUMAN_NUMBER_TOKEN_RE})\s*季",
+        normalized,
+        re.IGNORECASE,
+    ) or re.search(r"(?<![A-Za-z0-9])S([0-9]{1,3})(?![A-Za-z0-9])", normalized, re.IGNORECASE)
+    if not season_match:
+        return None
+    season = _parse_human_number(season_match.group(1))
+    if season is None or not 1 <= season <= 100:
+        return None
+
+    tail = normalized[season_match.end():]
+    episode_match = (
+        re.search(r"(?i)E(?:P)?\s*0*([0-9]{1,3})(?!\d)", tail)
+        or re.search(r"(?:第\s*)?0*([0-9]{1,3})\s*(?:集|话)(?![数目])", tail)
+    )
+    if episode_match:
+        episode = int(episode_match.group(1))
+    else:
+        bracketed = [
+            int(value)
+            for value in re.findall(
+                r"[\[【(（]\s*0*([0-9]{1,4})\s*[\]】)）]", tail
+            )
+            if 1 <= int(value) <= 1000
+        ]
+        if not bracketed:
+            return None
+        episode = bracketed[-1]
+    return (season, episode) if 1 <= episode <= 1000 else None
+
+
+def _recent_resource_question_context(snapshot: dict[str, Any]) -> str:
+    """构造只供 LLM 解释的数字关系；不传递外部资源站原始标题。"""
+    candidates = snapshot.get("candidates") if isinstance(snapshot, dict) else None
+    if not isinstance(candidates, list):
+        return ""
+    lines = ["最近一次资源搜索的候选背景（仅用于解释，不代表执行下载）："]
+    for candidate in candidates[:5]:
+        if not isinstance(candidate, dict):
+            continue
+        position = candidate.get("position")
+        if not isinstance(position, int):
+            continue
+        details = [f"候选 {position}"]
+        coordinates = _resource_title_coordinates(candidate.get("title"))
+        if coordinates is not None:
+            details.append(
+                f"发布标题解析为第 {coordinates[0]} 季第 {coordinates[1]} 集"
+            )
+        verification = candidate.get("_verification_context")
+        if isinstance(verification, dict):
+            season = verification.get("season")
+            episode = verification.get("episode")
+            if isinstance(season, int) and isinstance(episode, int):
+                details.append(f"本次搜索目标为 S{season:02d}E{episode:02d}")
+        if len(details) > 1:
+            lines.append("；".join(details))
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _recent_resource_relation_fallback(
+    message: str, snapshot: dict[str, Any]
+) -> str:
+    """仅在候选标题与搜索目标都明确时确定性回答编号关系。"""
+    normalized = unicodedata.normalize("NFKC", str(message or ""))
+    matched = re.search(
+        rf"第?\s*({_HUMAN_NUMBER_TOKEN_RE})\s*季\s*(?:第\s*)?"
+        rf"({_HUMAN_NUMBER_TOKEN_RE})\s*集\s*(?:是|就是|对应|等于|相当于)\s*"
+        rf"(?:第\s*)?({_HUMAN_NUMBER_TOKEN_RE})\s*集",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not matched:
+        return ""
+    season = _parse_human_number(matched.group(1))
+    season_episode = _parse_human_number(matched.group(2))
+    absolute_episode = _parse_human_number(matched.group(3))
+    if None in {season, season_episode, absolute_episode}:
+        return ""
+    candidates = snapshot.get("candidates") if isinstance(snapshot, dict) else None
+    if not isinstance(candidates, list):
+        return ""
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if _resource_title_coordinates(candidate.get("title")) != (season, season_episode):
+            continue
+        verification = candidate.get("_verification_context")
+        target_episode = (
+            verification.get("episode")
+            if isinstance(verification, dict)
+            else candidate.get("episode")
+        )
+        if not isinstance(target_episode, int):
+            return ""
+        if target_episode == absolute_episode:
+            return (
+                f"对。按刚才这次资源搜索的上下文，标题里的第 {season} 季第 "
+                f"{season_episode} 集就是本次要补的第 {absolute_episode} 集；"
+                "资源标题采用季度编号，媒体库缺集结果采用连续总集数编号。"
+            )
+        return (
+            f"不是。这个候选标题是第 {season} 季第 {season_episode} 集，"
+            f"但刚才搜索绑定的缺集目标是第 {target_episode} 集，不是第 {absolute_episode} 集。"
+        )
+    return ""
 
 
 def _recent_resource_target(message: str) -> tuple[str | None, bool]:
@@ -3076,7 +3221,11 @@ def recent_resource_submit_request(
 ) -> dict[str, Any] | None:
     """解析最近资源候选的确认准备请求；始终只进入预检，不直接下载。"""
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
-    if not normalized or any(token in normalized for token in _RECENT_RESOURCE_REJECT_TOKENS):
+    if (
+        not normalized
+        or _is_recent_resource_question(normalized)
+        or any(token in normalized for token in _RECENT_RESOURCE_REJECT_TOKENS)
+    ):
         return None
 
     selection = _recent_resource_selection(normalized)
@@ -5560,6 +5709,18 @@ class AgentOrchestrator:
             if int(item.get("subscription_number") or 0) > 0
         ]
 
+    @staticmethod
+    def _rss_subscriptions() -> list[dict[str, Any]]:
+        """返回全部 RSS 的安全目标；停用只影响调度，不影响手动刷新。"""
+        aggregate = db.list_rss_subscription_safe_summaries(db.now(), limit=100)
+        items = aggregate.get("items") if isinstance(aggregate, dict) else []
+        return [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and int(item.get("subscription_number") or 0) > 0
+        ]
+
     def _prepare_enabled_rss_refresh(self, *, owner: str) -> dict[str, Any]:
         """为当前全部已启用订阅创建一次批量刷新确认。"""
         if not owner:
@@ -5579,15 +5740,18 @@ class AgentOrchestrator:
         )
 
     def _prepare_contextual_rss_refresh(self, *, owner: str) -> dict[str, Any]:
-        """刷新意图没有名称时，只有唯一启用订阅才自动补全。"""
-        enabled = self._enabled_rss_subscriptions()
-        if not enabled:
+        """刷新意图没有名称时，只有唯一订阅才自动补全。
+
+        ``enabled`` 仅控制定时调度；手动刷新任意已配置订阅都有效。
+        """
+        subscriptions = self._rss_subscriptions()
+        if not subscriptions:
             return self._unsupported(
-                "当前没有已启用的 RSS 订阅",
-                ["可先列出全部 RSS 订阅，确认名称和启用状态。"],
+                "当前还没有可刷新的 RSS 订阅",
+                ["可先在 RSS 页面创建订阅。"],
             )
-        if len(enabled) == 1:
-            subscription_id = int(enabled[0].get("subscription_number") or 0)
+        if len(subscriptions) == 1:
+            subscription_id = int(subscriptions[0].get("subscription_number") or 0)
             if not owner:
                 return self._unsupported(
                     "刷新 RSS 订阅需要在已登录会话中确认",
@@ -5600,10 +5764,10 @@ class AgentOrchestrator:
             )
         names = [
             str(item.get("name") or f"#{item.get('subscription_number')}").strip()
-            for item in enabled[:5]
+            for item in subscriptions[:5]
         ]
         return self._clarification_response(
-            "有多个已启用的 RSS 订阅，请告诉我要刷新哪一个，或明确说“刷新全部 RSS 订阅”。",
+            "有多个 RSS 订阅，请告诉我要手动刷新哪一个；停用状态不影响单次手动刷新。",
             [f"刷新 {name} RSS 订阅。" for name in names],
         )
 
@@ -5633,6 +5797,26 @@ class AgentOrchestrator:
         if normalized in {"全部刷新", "刷新全部", "刷新全部rss订阅", "全部rss订阅刷新"}:
             return self._prepare_enabled_rss_refresh(owner=owner)
         if normalized in {"刷新", "刷新一下", "再刷新", "再刷新一下", "继续刷新"}:
+            return self._prepare_contextual_rss_refresh(owner=owner)
+        previous_text = unicodedata.normalize(
+            "NFKC", str(previous.get("text") or "")
+        ).casefold()
+        current_mentions_rss = "rss" in normalized or "订阅" in normalized
+        previous_was_refresh_topic = (
+            "刷新" in previous_text
+            and ("rss" in previous_text or "订阅" in previous_text)
+        )
+        other_domain = _is_cross_domain_rss_refresh_correction(
+            message, conversation_context
+        )
+        if (
+            "不影响刷新" in normalized
+            and not other_domain
+            and (current_mentions_rss or previous_was_refresh_topic)
+            and any(token in normalized for token in (
+                "没启动", "未启动", "没启用", "未启用", "没开启", "未开启", "停用", "关闭",
+            ))
+        ):
             return self._prepare_contextual_rss_refresh(owner=owner)
         named = re.fullmatch(r"刷新(?:一下)?(.+?)(?:rss)?(?:订阅)?", normalized)
         if named:
@@ -5900,6 +6084,14 @@ class AgentOrchestrator:
             local_conversation = self._local_conversation(message)
             if local_conversation is not None:
                 return local_conversation
+            recent_resource_question = self._answer_recent_resource_question(
+                message,
+                owner=owner,
+                llm_owner=llm_rate_owner or owner,
+                conversation_context=conversation_context,
+            )
+            if recent_resource_question is not None:
+                return recent_resource_question
             continued = self._continue_narrow_followup(
                 message,
                 owner=llm_rate_owner or owner,
@@ -7096,7 +7288,12 @@ class AgentOrchestrator:
                 llm_rate_owner=llm_rate_owner,
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
-                read_only=not action_request,
+                read_only=(
+                    not action_request
+                    or _is_cross_domain_rss_refresh_correction(
+                        message, conversation_context
+                    )
+                ),
             )
             if model_read is not None:
                 return model_read
@@ -7645,6 +7842,44 @@ class AgentOrchestrator:
             ],
         )
 
+    def _answer_recent_resource_question(
+        self,
+        message: str,
+        *,
+        owner: str,
+        llm_owner: str,
+        conversation_context: list[dict[str, Any]] | None,
+    ) -> dict[str, Any] | None:
+        """把最近候选的解释性追问交给 LLM，而不是误入下载状态机。"""
+        if not owner or not _is_recent_resource_question(message):
+            return None
+        snapshot = self.recent_resource_store.get(owner=owner)
+        if not isinstance(snapshot, dict):
+            return None
+        fallback = _recent_resource_relation_fallback(message, snapshot)
+        if fallback:
+            return self._conversation_response(fallback)
+        safe_context = _recent_resource_question_context(snapshot)
+        if safe_context:
+            augmented_context = list(conversation_context or [])
+            augmented_context.append({"role": "assistant", "text": safe_context})
+            conversation = answer_conversation(
+                message,
+                owner=llm_owner,
+                conversation_context=augmented_context,
+            )
+            if conversation is not None:
+                return self._conversation_response(
+                    conversation.answer,
+                    conversation.suggestions,
+                    llm_usage=(
+                        conversation.usage.to_dict()
+                        if conversation.usage is not None
+                        else None
+                    ),
+                )
+        return None
+
     @staticmethod
     def _local_conversation(message: str) -> dict[str, Any] | None:
         if not _is_casual_greeting(message):
@@ -7656,10 +7891,7 @@ class AgentOrchestrator:
             "result": ToolResult(
                 ok=True,
                 status="answered",
-                summary=(
-                    "我在。直接告诉我想检查什么就行，例如下载队列、媒体库缺集、"
-                    "项目配置或某部影片的资源。"
-                ),
+                summary="我在，正等你安排。想找资源、看追更，还是处理下载和媒体库？",
             ).to_dict(),
         }
         return result_projection.attach_public_display(response)
@@ -7839,12 +8071,11 @@ class AgentOrchestrator:
         result = response.get("result")
         tool_call = response.get("tool_call")
         if (
-            mode in {"conversation", "clarification", "confirmation_required", "confirmed_action"}
+            mode in {"conversation", "clarification", "confirmation_required"}
             or not isinstance(result, dict)
             or not isinstance(tool_call, dict)
             or str(result.get("status") or "") in {
                 "clarification_required", "selection_required", "unsupported",
-                "confirmation_required",
             }
         ):
             return response
@@ -7852,8 +8083,13 @@ class AgentOrchestrator:
         if narrative is None:
             return response
         presented = dict(response)
+        answer = (
+            _safe_confirmation_narrative(narrative.answer)
+            if mode == "confirmation_required"
+            else narrative.answer
+        )
         presentation = result_projection.build_public_narrative_presentation(
-            narrative.answer,
+            answer,
             narrative.suggestions,
         )
         if not presentation:

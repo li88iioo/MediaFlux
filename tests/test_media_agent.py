@@ -173,12 +173,19 @@ class AgentCoreTests(unittest.TestCase):
 
 
     def test_greeting_uses_local_conversation_without_exposing_tools(self):
-        response = AgentOrchestrator(ToolRegistry()).query("你好")
-
-        self.assertEqual(response["mode"], "conversation")
-        self.assertIsNone(response["tool_call"])
-        self.assertIn("我在", response["result"]["summary"])
-        self.assertNotIn(".", response["result"]["summary"])
+        service = AgentOrchestrator(ToolRegistry())
+        for message in (
+            "你好", "在干吗呢", "在干嘛呢", "在干啥呢", "干吗", "干嘛", "干什么", "干啥",
+        ):
+            with self.subTest(message=message):
+                response = service.query(message)
+                self.assertEqual(response["mode"], "conversation")
+                self.assertIsNone(response["tool_call"])
+                self.assertIn("我在", response["result"]["summary"])
+                self.assertNotIn(".", response["result"]["summary"])
+        for message in ("干嘛检查下载队列", "干什么刷新 RSS 订阅", "干啥找《沙丘2》的资源"):
+            with self.subTest(message=message):
+                self.assertIsNone(service._local_conversation(message))
 
     def test_bare_ambiguous_followup_asks_for_plain_language_scope(self):
         response = AgentOrchestrator(ToolRegistry()).query("啥？")

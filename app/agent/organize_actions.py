@@ -281,12 +281,12 @@ def _organize_preview_snapshot(
     summary = (
         "确认后将按当前配置整理全部光鸭来源"
         if for_confirmation
-        else "光鸭整理只读预览已完成"
+        else "已生成光鸭整理预览；尚未移动、改名或删除任何云盘内容"
     )
     suggestions = (
         ["确认前请核对移动、改名、清理空目录和 STRM 联动影响。"]
         if for_confirmation
-        else ["如需执行，可请求：立即整理光鸭云盘。"]
+        else ["如果预览范围正确，可以继续发起实际整理并确认。"]
     )
     return ToolResult(
         ok=True,

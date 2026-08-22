@@ -375,8 +375,10 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
         self.assertEqual(listed["tool_call"]["name"], "rss.subscription_summaries")
 
         with patch(
-            "app.agent.orchestrator.db.list_enabled_rss_subscription_safe_targets",
-            return_value=[{"subscription_number": 11, "enabled": True}],
+            "app.agent.orchestrator.db.list_rss_subscription_safe_summaries",
+            return_value={
+                "items": [{"subscription_number": 11, "name": "Mikan", "enabled": True}],
+            },
         ), patch.object(agent, "prepare", return_value={"mode": "confirmation_required"}) as prepare:
             refreshed = agent.query(
                 "刷新一下", owner="owner", conversation_context=context

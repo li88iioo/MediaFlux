@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -71,6 +72,15 @@ class _Bot:
 
     def edit_message_reply_markup(self, chat_id, message_id, **kwargs):
         self.keyboard_edits.append((chat_id, message_id, kwargs))
+
+
+class _TypingBot(_Bot):
+    def __init__(self):
+        super().__init__()
+        self.typing_actions = []
+
+    def send_chat_action(self, chat_id, action):
+        self.typing_actions.append((chat_id, action))
 
 
 class _InputRichMessage:
@@ -624,8 +634,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("must-not-leak", text)
         self.assertNotIn("raw-error", text)
         self.assertNotIn("secret-value", text)
-        self.assertIn("<b>接下来可以</b>", text)
-        self.assertIn("继续核验", text)
+        self.assertNotIn("<b>接下来可以</b>", text)
+        self.assertNotIn("继续核验", text)
         self.assertNotIn("可修改后发送", text)
         self.assertNotIn("<b>依据</b>", text)
         self.assertNotIn("（library）", text)
@@ -872,13 +882,57 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         })
 
         self.assertIn("下载队列正常", text)
-        self.assertIn("<b>本次核对</b>", text)
-        self.assertIn("<b>下载队列</b> · 完成", text)
+        self.assertNotIn("<b>本次核对</b>", text)
+        self.assertNotIn("<b>下载队列</b> · 完成", text)
+        self.assertIn("<b>需要留意</b>", text)
         self.assertIn("<b>RSS 订阅</b> · 需关注", text)
         self.assertIn("[路径已隐藏]", text)
         self.assertIn("[链接已隐藏]", text)
         self.assertNotIn("/volume/private", text)
         self.assertNotIn("secret.invalid", text)
+
+    def test_failed_narrative_keeps_actionable_guidance(self):
+        text = render_agent_response({
+            "mode": "read_plan",
+            "result": {
+                "ok": False,
+                "status": "partial",
+                "summary": "部分检查失败",
+                "suggestions": ["重新检查 RSS 订阅"],
+                "data": {"steps": []},
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "下载队列已确认正常，但 RSS 暂时无法完成检查。",
+            },
+        })
+
+        self.assertIn("RSS 暂时无法完成检查", text)
+        self.assertIn("<b>接下来可以</b>", text)
+        self.assertIn("重新检查 RSS 订阅", text)
+
+    def test_attention_narrative_keeps_actionable_guidance(self):
+        for status in ("partial", "incomplete", "degraded"):
+            with self.subTest(status=status):
+                text = render_agent_response({
+                    "mode": "read_only",
+                    "result": {
+                        "ok": True,
+                        "status": status,
+                        "summary": "RSS 订阅刷新部分完成",
+                        "suggestions": ["请稍后核对暂不可用的订阅源。"],
+                    },
+                    "presentation": {
+                        "source": "llm",
+                        "kind": "narrative",
+                        "narrative": "大部分订阅源已刷新，但仍有部分来源暂不可用。",
+                    },
+                })
+
+                self.assertIn("仍有部分来源暂不可用", text)
+                self.assertIn("<b>接下来可以</b>", text)
+                self.assertIn("请稍后核对暂不可用的订阅源", text)
 
     def test_stream_preview_uses_same_paragraph_and_list_projection(self):
         text = _stream_preview_html(
@@ -1311,6 +1365,147 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         history.assert_called_once()
         self.assertEqual(len(bot.replies), 1)
         self.assertIn("下载队列正常", bot.replies[0][1])
+
+    def test_message_sends_typing_when_streaming_is_disabled(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        bot = _TypingBot()
+        service = Mock()
+        service.query.return_value = _answer_response("下载队列正常")
+
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter._telegram_conversation_context",
+            return_value=([], 1),
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_conversation"
+        ):
+            self.assertTrue(handle_agent_message(bot, _Telebot, _message()))
+
+        self.assertGreaterEqual(len(bot.typing_actions), 1)
+        self.assertEqual(bot.typing_actions[0], (100, "typing"))
+
+    def test_slow_message_renews_and_stops_typing_heartbeat(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+
+        class SlowService:
+            @staticmethod
+            def query(_message, **_kwargs):
+                time.sleep(0.06)
+                return _answer_response("检查完成")
+
+        bot = _TypingBot()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=SlowService()
+        ), patch(
+            "app.bot.agent_adapter._telegram_conversation_context",
+            return_value=([], 1),
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_conversation"
+        ), patch(
+            "app.bot.agent_adapter._TELEGRAM_TYPING_INTERVAL_SECONDS", 0.01
+        ), patch(
+            "app.bot.agent_adapter._TELEGRAM_TYPING_TIMEOUT_SECONDS", 1.0
+        ):
+            self.assertTrue(handle_agent_message(bot, _Telebot, _message()))
+
+        self.assertGreaterEqual(len(bot.typing_actions), 2)
+        count_after_return = len(bot.typing_actions)
+        time.sleep(0.03)
+        self.assertEqual(len(bot.typing_actions), count_after_return)
+
+    def test_typing_thread_start_failure_does_not_leak_operation(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        bot = _TypingBot()
+        service = Mock()
+        service.query.return_value = _answer_response("仍然完成查询")
+
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter._telegram_conversation_context",
+            return_value=([], 1),
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_conversation"
+        ), patch(
+            "app.bot.agent_adapter.threading.Thread.start",
+            side_effect=RuntimeError("thread unavailable"),
+        ):
+            self.assertTrue(
+                handle_agent_message(bot, _Telebot, _message(message_id=611))
+            )
+
+        service.query.assert_called_once()
+        self.assertIn("仍然完成查询", bot.replies[0][1])
+
+    def test_blocked_typing_io_does_not_block_agent_query(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+
+        class BlockingTypingBot(_Bot):
+            def __init__(self):
+                super().__init__()
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def send_chat_action(self, _chat_id, _action):
+                self.started.set()
+                self.release.wait(timeout=3)
+
+        bot = BlockingTypingBot()
+        service = Mock()
+        service.query.return_value = _answer_response("查询没有被 typing 阻塞")
+        started_at = time.monotonic()
+        try:
+            with patch(
+                "app.bot.agent_adapter.get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ), patch(
+                "app.bot.agent_adapter.get_agent_service", return_value=service
+            ), patch(
+                "app.bot.agent_adapter._telegram_conversation_context",
+                return_value=([], 1),
+            ), patch(
+                "app.bot.agent_adapter._record_telegram_conversation"
+            ):
+                self.assertTrue(
+                    handle_agent_message(bot, _Telebot, _message(message_id=612))
+                )
+        finally:
+            bot.release.set()
+
+        self.assertTrue(bot.started.is_set())
+        self.assertLess(time.monotonic() - started_at, 0.8)
+        service.query.assert_called_once()
+        self.assertIn("查询没有被 typing 阻塞", bot.replies[0][1])
 
     def test_latest_message_revokes_stale_publication_and_history(self):
         values = {
