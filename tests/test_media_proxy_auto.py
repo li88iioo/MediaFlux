@@ -1174,11 +1174,16 @@ class HybridMediaProxyTests(unittest.TestCase):
                     "SupportsDirectPlay": False,
                     "SupportsTranscoding": True,
                     "TranscodingUrl": "/Videos/item/master.m3u8",
+                    "TranscodingContainer": "ts",
+                    "TranscodingSubProtocol": "hls",
+                    "TranscodingInfo": {"Protocol": "hls"},
                 },
                 {
                     "Id": "cloud-relative",
                     "Path": "/playgy/file-b/etag/200/Episode.mkv",
                     "SupportsDirectStream": False,
+                    "SupportsTranscoding": True,
+                    "TranscodingSubProtocol": "hls",
                 },
                 local_source,
                 unknown_source,
@@ -1200,11 +1205,19 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertTrue(absolute["SupportsDirectPlay"])
         self.assertTrue(absolute["SupportsDirectStream"])
         self.assertFalse(absolute["SupportsTranscoding"])
-        self.assertNotIn("TranscodingUrl", absolute)
+        for stale_field in (
+            "TranscodingUrl",
+            "TranscodingContainer",
+            "TranscodingSubProtocol",
+            "TranscodingInfo",
+        ):
+            self.assertNotIn(stale_field, absolute)
         self.assertEqual(
             relative["DirectStreamUrl"],
             "/Videos/item-1/stream?MediaSourceId=cloud-relative",
         )
+        self.assertFalse(relative["SupportsTranscoding"])
+        self.assertNotIn("TranscodingSubProtocol", relative)
         self.assertEqual(local_after, local_before)
         self.assertEqual(unknown_after, unknown_before)
         self.assertEqual(
@@ -1250,6 +1263,73 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(len(direct_query["_mfss"][0]), 48)
         self.assertEqual(sources[1], payload["MediaSources"][1])
         self.assertEqual(_FakeAsyncClient.requests[0].url.path, "/emby/Items/item-emby/PlaybackInfo")
+
+    def test_jellyfin_web_direct_stream_clears_stale_hls_metadata(self):
+        payload = {
+            "MediaSources": [
+                {
+                    "Id": "cloud",
+                    "Path": "/playgy/browser-file/e/1/Movie.mkv",
+                    "SupportsDirectPlay": False,
+                    "SupportsDirectStream": False,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": "/Videos/browser-item/main.m3u8?api_key=client-token",
+                    "TranscodingContainer": "ts",
+                    "TranscodingSubProtocol": "hls",
+                    "TranscodingInfo": {"Protocol": "hls"},
+                }
+            ]
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        app = media_proxy.create_proxy_app(7)
+        authorization = (
+            'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
+            'Token="client-token"'
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.get(
+                "/Items/browser-item/PlaybackInfo",
+                headers={"X-Emby-Authorization": authorization},
+            )
+            source = playback.json()["MediaSources"][0]
+            stream = client.get(
+                source["DirectStreamUrl"],
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertTrue(source["SupportsDirectPlay"])
+        self.assertTrue(source["SupportsDirectStream"])
+        self.assertFalse(source["SupportsTranscoding"])
+        for stale_field in (
+            "TranscodingUrl",
+            "TranscodingContainer",
+            "TranscodingSubProtocol",
+            "TranscodingInfo",
+        ):
+            self.assertNotIn(stale_field, source)
+        self.assertEqual(stream.status_code, 302)
+        self.assertEqual(
+            stream.headers["location"],
+            "https://signed.invalid/browser-file",
+        )
 
     def test_post_playback_info_body_is_forwarded_and_response_is_rewritten(self):
         payload = {

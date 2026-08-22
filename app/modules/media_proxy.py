@@ -1453,7 +1453,6 @@ def _mark_direct_source(
 ) -> None:
     source["SupportsDirectPlay"] = True
     source["SupportsDirectStream"] = True
-    source["SupportsTranscoding"] = False
     source["IsRemote"] = False
     source["Protocol"] = "Http"
     source["RequiresOpening"] = False
@@ -1462,7 +1461,16 @@ def _mark_direct_source(
     source["ReadAtNativeFramerate"] = False
     source["Path"] = stream_path
     source["DirectStreamUrl"] = direct_stream_url or stream_path
-    source.pop("TranscodingUrl", None)
+    source["SupportsTranscoding"] = False
+    # Jellyfin Web 会依据这些残留字段选择 HLS.js；若只删除 URL，浏览器会把
+    # 普通视频 302 地址当作 m3u8 通过 XHR 加载，随后被无 CORS 头的 CDN 拦截。
+    for key in (
+        "TranscodingUrl",
+        "TranscodingContainer",
+        "TranscodingSubProtocol",
+        "TranscodingInfo",
+    ):
+        source.pop(key, None)
 
 
 def validate_listen_host(value: str) -> str:

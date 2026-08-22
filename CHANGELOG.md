@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-22
+
+### Fixed
+- 修复 Jellyfin Web 经光鸭 302 直链播放时，因 PlaybackInfo 残留 HLS/转码字段而错误使用 HLS.js 跨域请求 CDN，最终被浏览器 CORS 策略拦截的问题；光鸭媒体源现在会完整清理转码元数据并继续通过带短时能力凭据的 DirectStream URL 安全跳转至 CDN（[`f89a41c`](https://github.com/li88iioo/MediaFlux/commit/f89a41c)）。
+
 ## [0.1.2] - 2026-08-22
 
 ### Added
@@ -80,7 +85,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/li88iioo/MediaFlux/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/li88iioo/MediaFlux/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/li88iioo/MediaFlux/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/li88iioo/MediaFlux/releases/tag/v0.1.0
