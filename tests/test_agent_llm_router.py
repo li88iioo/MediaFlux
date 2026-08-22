@@ -1251,6 +1251,212 @@ class AgentLLMSelectionTests(unittest.TestCase):
         ]
         self.assertEqual(len(tool_messages), 2)
 
+    def test_native_agent_can_read_then_prepare_one_confirmation(self):
+        captured = {"bodies": [], "closed": False}
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                del headers, max_redirects
+                captured["bodies"].append(json)
+                index = len(captured["bodies"])
+                if index == 1:
+                    body = json_module.dumps({
+                        "choices": [{"message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "call_health",
+                                "type": "function",
+                                "function": {
+                                    "name": "mf_workspace_health",
+                                    "arguments": "{}",
+                                },
+                            }],
+                        }}],
+                    }).encode()
+                elif index == 2:
+                    body = json_module.dumps({
+                        "choices": [{"message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "call_enable",
+                                "type": "function",
+                                "function": {
+                                    "name": "mf_config_set_feature_state",
+                                    "arguments": json_module.dumps({
+                                        "feature": "web_search",
+                                        "enabled": True,
+                                    }),
+                                },
+                            }],
+                        }}],
+                    }).encode()
+                else:
+                    body = _chat_text_turn(
+                        "状态已经核对，并生成了一项待确认修改；操作尚未执行。"
+                    )
+                return IndexerHttpResponse(
+                    url=url,
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    body=body,
+                )
+
+            async def aclose(self):
+                captured["closed"] = True
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+        }
+        writes = []
+        registry = _confirmation_registry(calls=writes)
+        orchestrator = AgentOrchestrator(registry)
+
+        def execute_tool(name, arguments):
+            if name == "workspace.health":
+                return orchestrator.invoke(name, arguments, owner="web-session")
+            return orchestrator.prepare(name, arguments, owner="web-session")
+
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            reply = asyncio.run(_request_native_read_agent(
+                "先检查系统状态，再帮我开启网页搜索",
+                registry,
+                execute_tool,
+                include_confirmations=True,
+                client_factory=FakeClient,
+                fallback_budget=lambda: True,
+            ))
+
+        self.assertIsNotNone(reply)
+        self.assertTrue(reply.completed)
+        self.assertEqual(writes, [])
+        self.assertEqual(
+            [item["tool_name"] for item in reply.tool_executions],
+            ["workspace.health", "config.set_feature_state"],
+        )
+        second_round_tools = {
+            item["function"]["name"] for item in captured["bodies"][1]["tools"]
+        }
+        final_round_tools = {
+            item["function"]["name"] for item in captured["bodies"][2]["tools"]
+        }
+        self.assertIn("mf_config_set_feature_state", second_round_tools)
+        self.assertNotIn("mf_config_set_feature_state", final_round_tools)
+        self.assertTrue(captured["closed"])
+
+    def test_failed_confirmation_prepare_keeps_confirmation_tool_for_retry(self):
+        captured = {"bodies": [], "closed": False}
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                del headers, max_redirects
+                captured["bodies"].append(json)
+                index = len(captured["bodies"])
+                if index <= 2:
+                    body = json_module.dumps({
+                        "choices": [{"message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": f"call_prepare_{index}",
+                                "type": "function",
+                                "function": {
+                                    "name": "mf_config_set_feature_state",
+                                    "arguments": json_module.dumps({
+                                        "feature": "web_search",
+                                        "enabled": index == 1,
+                                    }),
+                                },
+                            }],
+                        }}],
+                    }).encode()
+                else:
+                    body = _chat_text_turn(
+                        "第一次预检未通过，已改正参数并生成待确认操作；尚未执行。"
+                    )
+                return IndexerHttpResponse(
+                    url=url,
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    body=body,
+                )
+
+            async def aclose(self):
+                captured["closed"] = True
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+        }
+        writes = []
+        attempts = []
+        registry = _confirmation_registry(calls=writes)
+        orchestrator = AgentOrchestrator(registry)
+
+        def execute_tool(name, arguments):
+            attempts.append(dict(arguments))
+            if arguments["enabled"] is True:
+                raise AgentToolError(
+                    "该状态暂时不能开启", code="precondition_failed"
+                )
+            return orchestrator.prepare(name, arguments, owner="web-session")
+
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            reply = asyncio.run(_request_native_read_agent(
+                "调整网页搜索状态",
+                registry,
+                execute_tool,
+                include_confirmations=True,
+                client_factory=FakeClient,
+                fallback_budget=lambda: True,
+            ))
+
+        self.assertIsNotNone(reply)
+        assert reply is not None
+        self.assertTrue(reply.completed)
+        self.assertEqual(
+            attempts,
+            [
+                {"feature": "web_search", "enabled": True},
+                {"feature": "web_search", "enabled": False},
+            ],
+        )
+        self.assertEqual(writes, [])
+        self.assertEqual(len(reply.tool_executions), 2)
+        self.assertEqual(
+            reply.tool_executions[0]["response"]["result"]["status"],
+            "unavailable",
+        )
+        self.assertEqual(
+            reply.tool_executions[1]["response"]["mode"],
+            "confirmation_required",
+        )
+        second_round_tools = {
+            item["function"]["name"] for item in captured["bodies"][1]["tools"]
+        }
+        final_round_tools = {
+            item["function"]["name"] for item in captured["bodies"][2]["tools"]
+        }
+        self.assertIn("mf_config_set_feature_state", second_round_tools)
+        self.assertNotIn("mf_config_set_feature_state", final_round_tools)
+        self.assertTrue(captured["closed"])
+
     def test_native_read_agent_rejects_duplicate_tool_loop(self):
         captured = {"count": 0}
 
@@ -2343,6 +2549,60 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
         agent_rate_limiter.reset()
 
+    def test_contextual_followup_tries_planner_before_legacy_clarification(self):
+        registry = _read_registry()
+        agent = AgentOrchestrator(registry)
+        planned = {
+            "mode": "read_only",
+            "tool_call": {"name": "workspace.health", "arguments": {}},
+            "result": ToolResult(True, "healthy", "系统状态已核对").to_dict(),
+        }
+        context = [{
+            "role": "assistant",
+            "text": "刚才检查了系统状态。",
+            "tool_name": "workspace.health",
+            "status": "healthy",
+        }]
+
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=planned
+        ) as planner:
+            response = agent.query(
+                "这个现在什么情况",
+                owner="web-session",
+                conversation_context=context,
+                present=False,
+            )
+
+        self.assertEqual(response, planned)
+        planner.assert_called_once()
+        self.assertEqual(planner.call_args.kwargs["conversation_context"], context)
+        self.assertTrue(planner.call_args.kwargs["read_only"])
+
+    def test_reply_anchor_is_forwarded_to_contextual_planner(self):
+        registry = _read_registry()
+        agent = AgentOrchestrator(registry)
+        planned = {
+            "mode": "read_only",
+            "tool_call": {"name": "workspace.health", "arguments": {}},
+            "result": ToolResult(True, "healthy", "引用内容已核对").to_dict(),
+        }
+        reply_context = {"text": "上一条消息在检查下载队列。", "message_id": 9}
+
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=planned
+        ) as planner:
+            response = agent.query(
+                "继续看看",
+                owner="web-session",
+                reply_context=reply_context,
+                present=False,
+            )
+
+        self.assertEqual(response, planned)
+        planner.assert_called_once()
+        self.assertEqual(planner.call_args.kwargs["reply_context"], reply_context)
+
     def test_low_write_model_selection_creates_confirmation_without_execution(self):
         calls = []
         registry = _confirmation_registry(calls=calls)
@@ -2803,10 +3063,75 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             ],
         )
 
-        self.assertIn("上一已执行能力：rss.subscription_summaries", content)
+        self.assertIn("上一核对范围：RSS 订阅列表", content)
+        self.assertNotIn("rss.subscription_summaries", content)
         self.assertIn("上一结果状态：healthy", content)
         self.assertNotIn("DROP TABLE", content)
         self.assertNotIn("ignore previous instructions", content)
+
+    def test_conversation_context_preserves_summary_media_and_reply_anchor(self):
+        content = _conversation_user_content(
+            "这个有多少集",
+            [{
+                "role": "summary",
+                "text": "此前一直在核对一部电视剧。",
+                "media_context": {
+                    "title": "九门",
+                    "year": "2026",
+                    "media_type": "tv",
+                    "season": 1,
+                },
+            }],
+            {
+                "text": "《九门》第 1 季的本地库存已经核对完成。",
+                "media_context": {
+                    "title": "九门",
+                    "year": "2026",
+                    "media_type": "tv",
+                    "season": 1,
+                },
+            },
+        )
+
+        self.assertIn("摘要中的当前媒体身份", content)
+        self.assertIn("用户明确引用的消息", content)
+        self.assertIn("《九门》第 1 季", content)
+        self.assertIn('"title":"九门"', content)
+
+    def test_summary_media_identity_is_not_borrowed_from_another_summary(self):
+        content = _conversation_user_content(
+            "继续检查",
+            [
+                {"role": "summary", "text": "此前在检查媒体 A。"},
+                {
+                    "role": "summary",
+                    "text": "此前在检查媒体 B。",
+                    "media_context": {
+                        "title": "媒体B",
+                        "year": "2025",
+                        "media_type": "tv",
+                    },
+                },
+            ],
+        )
+
+        self.assertIn("此前在检查媒体 A", content)
+        self.assertNotIn("媒体B", content)
+        self.assertNotIn("摘要中的当前媒体身份", content)
+
+    def test_reply_anchor_is_preserved_without_conversation_history(self):
+        content = _conversation_user_content(
+            "继续看看",
+            reply_context={
+                "text": "上一条消息在检查下载队列。",
+                "media_context": {"title": "沧元图", "media_type": "tv"},
+            },
+        )
+
+        self.assertIn("用户明确引用的消息", content)
+        self.assertIn("上一条消息在检查下载队列", content)
+        self.assertIn('"title":"沧元图"', content)
+        self.assertIn("当前问题：继续看看", content)
 
     def test_conversation_context_keeps_newest_safe_messages_within_budget(self):
         context = [
@@ -3093,7 +3418,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             conversation_context=context,
         )
 
-    def test_vague_followup_variants_fail_closed_before_llm_routing(self):
+    def test_vague_followup_variants_fail_closed_after_planner_fallback(self):
         variants = (
             "这是什么情况？",
             "帮我看看这个",
@@ -3104,7 +3429,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         )
         for message in variants:
             with self.subTest(message=message), patch(
-                "app.agent.orchestrator.select_read_tool"
+                "app.agent.orchestrator.select_read_tool", return_value=None
             ) as selector, patch(
                 "app.agent.orchestrator.compose_tool_answer"
             ) as presenter:
@@ -3119,7 +3444,8 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
                     }],
                 )
             self.assertEqual(response["mode"], "clarification")
-            selector.assert_not_called()
+            if "这个" in message:
+                selector.assert_called_once()
             presenter.assert_not_called()
 
     def test_llm_fallback_uses_actual_tool_budget_shared_with_direct_calls(self):

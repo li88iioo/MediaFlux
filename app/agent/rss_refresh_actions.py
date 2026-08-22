@@ -23,6 +23,7 @@ def clear_confirmation_state() -> None:
     _CONFIRMATION_STATE.preview = None
     _CONFIRMATION_STATE.pending = None
 _BULK_EXPLICIT_LIMIT = 32
+_BULK_SCOPE_LIMIT = 32
 _BULK_DISPLAY_LIMIT = 100
 _BULK_MAX_WORKERS = 4
 _MAX_SAFE_ID = 2_147_483_647
@@ -213,12 +214,13 @@ def rss_refresh_subscriptions_arguments(arguments: dict[str, Any]) -> dict[str, 
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) == {"scope"}:
-        if arguments.get("scope") != "all_enabled":
-            raise AgentToolError("scope 只支持 all_enabled")
-        return {"scope": "all_enabled"}
+        scope = arguments.get("scope")
+        if scope not in {"all_configured", "all_enabled"}:
+            raise AgentToolError("scope 只支持 all_configured 或 all_enabled")
+        return {"scope": str(scope)}
     if set(arguments) != {"subscription_ids"}:
         raise AgentToolError(
-            "rss.refresh_subscriptions 只接受 subscription_ids 或 all_enabled scope"
+            "rss.refresh_subscriptions 只接受 subscription_ids、all_configured 或 all_enabled scope"
         )
     raw_ids = arguments.get("subscription_ids")
     if not isinstance(raw_ids, list) or not raw_ids:
@@ -241,12 +243,15 @@ def rss_refresh_subscriptions_arguments(arguments: dict[str, Any]) -> dict[str, 
 
 
 def _capture_many(arguments: dict[str, Any]) -> dict[str, Any]:
-    if arguments.get("scope") == "all_enabled":
-        states = [
-            _capture_row(int(row["id"]), row)
-            for row in db.list_enabled_rss_subscriptions()
-        ]
-        scope = "all_enabled"
+    requested_scope = arguments.get("scope")
+    if requested_scope in {"all_configured", "all_enabled"}:
+        rows = (
+            db.list_rss_subscriptions()
+            if requested_scope == "all_configured"
+            else db.list_enabled_rss_subscriptions()
+        )
+        states = [_capture_row(int(row["id"]), row) for row in rows]
+        scope = str(requested_scope)
     else:
         states = [_capture({"subscription_id": item}) for item in arguments["subscription_ids"]]
         scope = "selected"
@@ -267,14 +272,41 @@ def _capture_many(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"scope": scope, "states": states, "fingerprint": fingerprint}
 
 
-def _preview_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
-    """只读预检一组订阅；确认后才会依次访问订阅源。"""
-    if not state["states"]:
+def _bulk_scope_limit_failure(state: dict[str, Any]) -> ToolResult | None:
+    if (
+        state.get("scope") in {"all_configured", "all_enabled"}
+        and len(state.get("states") or []) > _BULK_SCOPE_LIMIT
+    ):
         return ToolResult(
             ok=False,
             status="precondition_failed",
-            summary="当前没有已启用的 RSS 订阅",
-            error="请先启用至少一个 RSS 订阅。",
+            summary=f"一次最多手动刷新 {_BULK_SCOPE_LIMIT} 个 RSS 订阅",
+            error=(
+                f"当前范围包含 {len(state['states'])} 个订阅，请按订阅编号分批刷新。"
+            ),
+            suggestions=[f"每次请选择不超过 {_BULK_SCOPE_LIMIT} 个 RSS 订阅。"],
+        )
+    return None
+
+
+def _preview_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
+    """只读预检一组订阅；确认后才会依次访问订阅源。"""
+    limit_failure = _bulk_scope_limit_failure(state)
+    if limit_failure is not None:
+        return limit_failure
+    if not state["states"]:
+        all_configured = state.get("scope") == "all_configured"
+        return ToolResult(
+            ok=False,
+            status="precondition_failed",
+            summary=(
+                "当前没有已配置的 RSS 订阅"
+                if all_configured else "当前没有已启用的 RSS 订阅"
+            ),
+            error=(
+                "请先创建并配置至少一个 RSS 订阅。"
+                if all_configured else "请先启用至少一个 RSS 订阅。"
+            ),
         )
     missing = [item["subscription_id"] for item in state["states"] if not item["exists"]]
     unconfigured = [
@@ -335,7 +367,7 @@ def preview_rss_subscriptions_refresh(arguments: dict[str, Any]) -> ToolResult:
 def prepare_rss_subscriptions_refresh(
     arguments: dict[str, Any],
 ) -> tuple[ToolResult, str]:
-    """生成完整快照；all_enabled 不把全部内部 ID 写入确认参数。"""
+    """生成完整快照；批量 scope 不把全部内部 ID 写入确认参数。"""
     state = _capture_many(arguments)
     return _preview_rss_subscriptions_state(state), str(state["fingerprint"])
 
@@ -348,6 +380,9 @@ def rss_refresh_subscriptions_confirmation_context(arguments: dict[str, Any]) ->
 def _refresh_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
     from app.modules.rss import RSSEngine
 
+    limit_failure = _bulk_scope_limit_failure(state)
+    if limit_failure is not None:
+        return limit_failure
     states = list(state["states"])
     results: list[dict[str, Any]] = []
     totals = {"total": 0, "new": 0, "skipped": 0}

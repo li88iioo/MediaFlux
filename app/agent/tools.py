@@ -1422,7 +1422,10 @@ def build_tool_registry() -> ToolRegistry:
     ))
     registry.register(ToolSpec(
         name="rss.refresh_subscriptions",
-        description="预检并在用户确认后依次刷新一组 RSS 订阅；不自动下载且不返回 URL、过滤词、条目正文或凭据。",
+        description=(
+            "预检并在用户确认后依次刷新一组 RSS 订阅，单次最多 32 个；"
+            "不自动下载且不返回 URL、过滤词、条目正文或凭据。"
+        ),
         risk=RiskLevel.WRITE,
         parameters={
             "type": "object",
@@ -1434,7 +1437,14 @@ def build_tool_registry() -> ToolRegistry:
                     "uniqueItems": True,
                     "items": {"type": "integer", "minimum": 1},
                 },
-                "scope": {"type": "string", "enum": ["all_enabled"]},
+                "scope": {
+                    "type": "string",
+                    "enum": ["all_configured", "all_enabled"],
+                    "description": (
+                        "all_configured 手动刷新全部已配置订阅（含停用项）；"
+                        "all_enabled 仅刷新启用项，保留用于兼容旧调用。"
+                    ),
+                },
             },
             "oneOf": [
                 {"required": ["subscription_ids"]},

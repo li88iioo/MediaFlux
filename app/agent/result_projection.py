@@ -245,7 +245,9 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "available": "可用",
     "blocked": "受阻数量",
     "cached": "使用缓存",
+    "candidate_summaries": "候选资源摘要",
     "completed": "已完成",
+    "codec": "编码",
     "cancelled_admissions": "已取消的待提交任务",
     "cancelled_runs": "已取消的检查任务",
     "configured": "已配置",
@@ -342,6 +344,8 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "source_method": "查询方式",
     "web_fallback_used": "已使用网页补查",
     "returned": "返回数量",
+    "release_source": "发布来源",
+    "resolution": "分辨率",
     "runtime_refreshed": "运行时已刷新",
     "runtime_scope": "生效范围",
     "running": "运行中",
@@ -350,6 +354,10 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "seasons": "季度分布",
     "severity": "严重程度",
     "source": "来源区域",
+    "site_name": "资源站",
+    "size_text": "体积",
+    "seeders": "做种数",
+    "position": "候选序号",
     "source_count": "来源数量",
     "source_number": "来源编号",
     "sources": "来源明细",
@@ -440,6 +448,7 @@ _PUBLIC_TEXT_VALUE_KEYS = frozenset({
     "schedule_state", "source", "state", "status", "operation", "status_filter", "summary", "patrol_status", "task_status", "task_status_label",
     "title", "year", "origin", "scope", "updated_at", "server_type", "runtime_status", "connection_status", "rule_type",
     "target_categories", "trigger", "subscription_name", "query", "original_title", "rating_source", "source_method",
+    "codec", "release_source", "resolution", "site_name", "size_text",
 })
 _MAX_DEPTH = 4
 _MAX_MAPPING_ITEMS = 24
@@ -956,6 +965,82 @@ def _without_resource_candidate_details(value: Any) -> Any:
     return value
 
 
+def _resource_candidate_summaries(value: Any, *, limit: int = 3) -> list[dict[str, Any]]:
+    """提取不可执行的候选元数据，不发送原始标题、链接、hash 或结果标识。"""
+    summaries: list[dict[str, Any]] = []
+
+    def visit(node: Any) -> None:
+        if len(summaries) >= limit:
+            return
+        if isinstance(node, Mapping):
+            title = unicodedata.normalize("NFKC", str(node.get("title") or ""))
+            looks_like_candidate = bool(
+                title
+                and any(
+                    key in node
+                    for key in (
+                        "result_id", "site_name", "site", "size_text", "seeders",
+                    )
+                )
+            )
+            if looks_like_candidate:
+                summary: dict[str, Any] = {"position": len(summaries) + 1}
+                site_name = sanitize_public_text(
+                    node.get("site_name") or node.get("site"), limit=60
+                )
+                size_text = sanitize_public_text(
+                    node.get("size_text") or node.get("size"), limit=40
+                )
+                if site_name:
+                    summary["site_name"] = site_name
+                if size_text:
+                    summary["size_text"] = size_text
+                seeders = node.get("seeders")
+                if isinstance(seeders, int) and not isinstance(seeders, bool) and seeders >= 0:
+                    summary["seeders"] = min(seeders, 10**9)
+                resolution = re.search(
+                    r"(?i)(?<![A-Za-z0-9])(?:2160p|1080p|720p|4k|8k)(?![A-Za-z0-9])",
+                    title,
+                )
+                codec = re.search(
+                    r"(?i)(?<![A-Za-z0-9])(?:av1|hevc|h\.?265|x265|h\.?264|x264)(?![A-Za-z0-9])",
+                    title,
+                )
+                release_source = re.search(
+                    r"(?i)(?<![A-Za-z0-9])(?:web[- .]?dl|webrip|blu[- .]?ray|bdrip)(?![A-Za-z0-9])",
+                    title,
+                )
+                coordinates = re.search(
+                    r"(?i)(?<![A-Za-z0-9])S0*([0-9]{1,3})\s*E(?:P)?0*([0-9]{1,3})(?![A-Za-z0-9])",
+                    title,
+                )
+                if resolution:
+                    summary["resolution"] = resolution.group(0).upper()
+                if codec:
+                    summary["codec"] = codec.group(0).upper().replace(".", "")
+                if release_source:
+                    summary["release_source"] = release_source.group(0).upper()
+                if coordinates:
+                    summary["season"] = int(coordinates.group(1))
+                    summary["episode"] = int(coordinates.group(2))
+                summaries.append(summary)
+                return
+            for child in node.values():
+                visit(child)
+                if len(summaries) >= limit:
+                    return
+        elif isinstance(node, Sequence) and not isinstance(
+            node, (str, bytes, bytearray, memoryview)
+        ):
+            for child in node:
+                visit(child)
+                if len(summaries) >= limit:
+                    return
+
+    visit(value)
+    return summaries
+
+
 def _public_status_projection(status: object, *, ok: bool) -> dict[str, str]:
     normalized = str(status or "unknown").strip().casefold() or "unknown"
     if not ok and normalized in _PUBLIC_STATUS_ATTENTION | {"no_changes"}:
@@ -1078,7 +1163,11 @@ def project_agent_response_for_llm(response: Mapping[str, Any]) -> dict[str, Any
 
     data_source = result.get("data")
     if tool_name in _RESOURCE_CANDIDATE_TOOL_NAMES:
+        candidate_summaries = _resource_candidate_summaries(data_source)
         data_source = _without_resource_candidate_details(data_source)
+        if candidate_summaries and isinstance(data_source, Mapping):
+            data_source = dict(data_source)
+            data_source["candidate_summaries"] = candidate_summaries
     data = _safe_value(data_source, depth=0, budget=[_MAX_PROJECTED_NODES])
     evidence: list[dict[str, str]] = []
     for item in (result.get("evidence") or [])[:4]:

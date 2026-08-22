@@ -91,10 +91,10 @@ _LLM_FIRST_CONTEXT_MARKERS = (
     "这部", "这集", "这个", "它", "刚才", "上一个", "继续", "重试",
     "再来", "刷新一下", "打开它", "关闭它", "有多少", "缺不缺",
 )
-def _prefer_deterministic_context_route(
+def _should_try_contextual_model_first(
     message: str, conversation_context: list[dict[str, Any]] | None
 ) -> bool:
-    """强指代继续由服务端绑定已验证上下文，模型不负责猜测对象。"""
+    """识别应优先交给 Planner 理解的上下文型自然续句。"""
     if not conversation_context:
         return False
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
@@ -5702,42 +5702,43 @@ class AgentOrchestrator:
         return result_projection.attach_public_display(response)
 
     @staticmethod
-    def _enabled_rss_subscriptions() -> list[dict[str, Any]]:
-        return [
-            item
-            for item in db.list_enabled_rss_subscription_safe_targets()
-            if int(item.get("subscription_number") or 0) > 0
-        ]
-
-    @staticmethod
     def _rss_subscriptions() -> list[dict[str, Any]]:
         """返回全部 RSS 的安全目标；停用只影响调度，不影响手动刷新。"""
-        aggregate = db.list_rss_subscription_safe_summaries(db.now(), limit=100)
-        items = aggregate.get("items") if isinstance(aggregate, dict) else []
         return [
-            item
-            for item in items
-            if isinstance(item, dict)
-            and int(item.get("subscription_number") or 0) > 0
+            {
+                "subscription_number": int(row["id"]),
+                "name": str(row["name"] or "").strip()[:120],
+                "enabled": bool(row["enabled"]),
+            }
+            for row in db.list_rss_subscriptions()
+            if int(row["id"] or 0) > 0
         ]
 
-    def _prepare_enabled_rss_refresh(self, *, owner: str) -> dict[str, Any]:
-        """为当前全部已启用订阅创建一次批量刷新确认。"""
+    def _prepare_all_rss_refresh(self, *, owner: str) -> dict[str, Any]:
+        """为全部已配置订阅创建批量刷新确认；停用不限制手动刷新。"""
         if not owner:
             return self._unsupported(
                 "刷新 RSS 订阅需要在已登录会话中确认",
                 ["请登录后重试。"],
             )
-        if not self._enabled_rss_subscriptions():
+        if not self._rss_subscriptions():
             return self._unsupported(
-                "当前没有已启用的 RSS 订阅",
-                ["可先列出全部 RSS 订阅，确认名称和启用状态。"],
+                "当前还没有可刷新的 RSS 订阅",
+                ["可先在 RSS 页面创建并配置订阅。"],
             )
-        return self.prepare(
-            "rss.refresh_subscriptions",
-            {"scope": "all_enabled"},
-            owner=owner,
-        )
+        try:
+            return self.prepare(
+                "rss.refresh_subscriptions",
+                {"scope": "all_configured"},
+                owner=owner,
+            )
+        except AgentToolError as exc:
+            if exc.code != "precondition_failed":
+                raise
+            return self._unsupported(
+                str(exc),
+                ["请按订阅编号分批刷新，每次最多选择 32 个。"],
+            )
 
     def _prepare_contextual_rss_refresh(self, *, owner: str) -> dict[str, Any]:
         """刷新意图没有名称时，只有唯一订阅才自动补全。
@@ -5795,7 +5796,7 @@ class AgentOrchestrator:
         if normalized in {"近24小时下载几次", "近24小时下载了几次", "24小时下载几次"}:
             return self._invoke_query_read("rss.recent_activity", {}, owner=owner)
         if normalized in {"全部刷新", "刷新全部", "刷新全部rss订阅", "全部rss订阅刷新"}:
-            return self._prepare_enabled_rss_refresh(owner=owner)
+            return self._prepare_all_rss_refresh(owner=owner)
         if normalized in {"刷新", "刷新一下", "再刷新", "再刷新一下", "继续刷新"}:
             return self._prepare_contextual_rss_refresh(owner=owner)
         previous_text = unicodedata.normalize(
@@ -6092,6 +6093,44 @@ class AgentOrchestrator:
             )
             if recent_resource_question is not None:
                 return recent_resource_question
+            # 指代型续句与显式引用消息优先交给统一 Planner。模型不可用、
+            # 无法可靠规划或安全门禁拒绝时，再回退到既有窄续句解析器。
+            contextual_model_attempted = False
+            if (
+                (conversation_context or reply_context)
+                and (
+                    reply_context
+                    or _should_try_contextual_model_first(
+                        message, conversation_context
+                    )
+                )
+            ):
+                contextual_model_attempted = True
+                contextual_model = self._query_with_model_tools(
+                    message,
+                    owner=owner,
+                    llm_rate_owner=llm_rate_owner,
+                    llm_tool_rate_identity=llm_tool_rate_identity,
+                    conversation_context=conversation_context,
+                    read_only=(
+                        not is_agent_action_request(message)
+                        or _is_cross_domain_rss_refresh_correction(
+                            message, conversation_context
+                        )
+                    ),
+                    **(
+                        {"reply_context": reply_context}
+                        if reply_context else {}
+                    ),
+                )
+                if contextual_model is not None:
+                    if not present:
+                        return contextual_model
+                    return self._present_tool_response(
+                        message,
+                        contextual_model,
+                        owner=llm_rate_owner or owner,
+                    )
             continued = self._continue_narrow_followup(
                 message,
                 owner=llm_rate_owner or owner,
@@ -6122,9 +6161,8 @@ class AgentOrchestrator:
                     return self._present_tool_response(
                         message, response, owner=llm_rate_owner or owner
                     )
-            # 专用业务路由必须先于模型工具选择。这样下载诊断、RSS 控制、
-            # 缺集审计等确定性请求不会被模型误选成其他工具；只有全部专用路由
-            # 都未命中时，_query_raw 才会在末尾调用受注册表约束的模型工具层。
+            # 强上下文与确认接力已由服务端绑定；其余请求进入统一编排层：
+            # _query_raw 先尝试受注册表约束的模型规划，再回退到兼容性业务路由。
             response = self._query_raw(
                 message,
                 owner=owner,
@@ -6132,7 +6170,8 @@ class AgentOrchestrator:
                 query_tool_rate_identity=query_tool_rate_identity,
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
-                allow_model_routing=True,
+                reply_context=reply_context,
+                allow_model_routing=not contextual_model_attempted,
             )
             if not present:
                 return response
@@ -6268,6 +6307,7 @@ class AgentOrchestrator:
         llm_rate_owner: str,
         llm_tool_rate_identity: str,
         conversation_context: list[dict[str, Any]] | None,
+        reply_context: dict[str, Any] | None = None,
         read_only: bool = False,
     ) -> dict[str, Any] | None:
         """让模型在注册表边界内理解请求，失败时返回 ``None`` 继续确定性回退。
@@ -6346,6 +6386,7 @@ class AgentOrchestrator:
             self.registry,
             _execute_native_tool,
             owner=llm_rate_owner or owner,
+            reply_context=reply_context,
             include_confirmations=bool(owner and not read_only and action_request),
             **(
                 {"conversation_context": conversation_context}
@@ -6369,6 +6410,10 @@ class AgentOrchestrator:
                         {"conversation_context": conversation_context}
                         if conversation_context else {}
                     ),
+                    **(
+                        {"reply_context": reply_context}
+                        if reply_context else {}
+                    ),
                 )
                 selected_response = _execute_selection(selection)
                 if selected_response is not None:
@@ -6387,6 +6432,10 @@ class AgentOrchestrator:
                 **(
                     {"conversation_context": conversation_context}
                     if conversation_context else {}
+                ),
+                **(
+                    {"reply_context": reply_context}
+                    if reply_context else {}
                 ),
             )
             if selection is None:
@@ -7061,7 +7110,7 @@ class AgentOrchestrator:
         if is_rss_subscription_refresh_write_message(lower):
             compact_rss_refresh = re.sub(r"[\s，。！？!?、；;：:]+", "", lower)
             if "全部" in compact_rss_refresh or "所有" in compact_rss_refresh:
-                return self._prepare_enabled_rss_refresh(owner=owner)
+                return self._prepare_all_rss_refresh(owner=owner)
             return self._prepare_contextual_rss_refresh(owner=owner)
 
         rss_download_request = rss_pending_download_request(lower)
@@ -7224,6 +7273,7 @@ class AgentOrchestrator:
         query_tool_rate_identity: str = "",
         llm_tool_rate_identity: str = "",
         conversation_context: list[dict[str, Any]] | None = None,
+        reply_context: dict[str, Any] | None = None,
         allow_model_routing: bool = True,
     ) -> dict[str, Any]:
         message = normalize_agent_message(value)
@@ -7277,9 +7327,6 @@ class AgentOrchestrator:
             allow_model_routing
             and not has_resource_continuation
             and not has_deterministic_media_subscription_action
-            and not _prefer_deterministic_context_route(
-                message, conversation_context
-            )
         ):
             model_routing_attempted = True
             model_read = self._query_with_model_tools(
@@ -7293,6 +7340,10 @@ class AgentOrchestrator:
                     or _is_cross_domain_rss_refresh_correction(
                         message, conversation_context
                     )
+                ),
+                **(
+                    {"reply_context": reply_context}
+                    if reply_context else {}
                 ),
             )
             if model_read is not None:
@@ -7351,6 +7402,10 @@ class AgentOrchestrator:
                 llm_rate_owner=llm_rate_owner,
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
+                **(
+                    {"reply_context": reply_context}
+                    if reply_context else {}
+                ),
             )
             if model_compound is not None:
                 return model_compound
@@ -7358,6 +7413,8 @@ class AgentOrchestrator:
             plan_kwargs: dict[str, Any] = {"owner": llm_rate_owner or owner}
             if conversation_context:
                 plan_kwargs["conversation_context"] = conversation_context
+            if reply_context:
+                plan_kwargs["reply_context"] = reply_context
             plan = select_read_plan(message, self.registry, **plan_kwargs)
             if plan is not None:
                 return self._execute_read_plan(
@@ -7795,6 +7852,10 @@ class AgentOrchestrator:
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
                 read_only=not action_request,
+                **(
+                    {"reply_context": reply_context}
+                    if reply_context else {}
+                ),
             )
         if model_routed is not None:
             return model_routed
@@ -7806,11 +7867,13 @@ class AgentOrchestrator:
                 "library.search", {"query": query, "limit": 8}, owner=owner
             )
 
-        conversation = answer_conversation(
-            message,
-            owner=llm_rate_owner or owner,
-            conversation_context=conversation_context,
-        )
+        conversation_kwargs: dict[str, Any] = {
+            "owner": llm_rate_owner or owner,
+            "conversation_context": conversation_context,
+        }
+        if reply_context:
+            conversation_kwargs["reply_context"] = reply_context
+        conversation = answer_conversation(message, **conversation_kwargs)
         if conversation is not None:
             response = {
                 "request_id": current_request_id(),
@@ -7954,11 +8017,13 @@ class AgentOrchestrator:
         if not previous_summary:
             return None
 
-        conversation = answer_conversation(
-            message,
-            owner=owner,
-            conversation_context=conversation_context,
-        )
+        conversation_kwargs: dict[str, Any] = {
+            "owner": owner,
+            "conversation_context": conversation_context,
+        }
+        if reply_context:
+            conversation_kwargs["reply_context"] = reply_context
+        conversation = answer_conversation(message, **conversation_kwargs)
         if conversation is not None:
             return self._conversation_response(
                 conversation.answer,

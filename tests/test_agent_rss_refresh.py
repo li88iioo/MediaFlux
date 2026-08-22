@@ -288,10 +288,12 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         )
         arguments = {"subscription_ids": [self.sid, second_id]}
         self.assertEqual(rss_refresh_subscriptions_arguments(arguments), arguments)
-        self.assertEqual(
-            rss_refresh_subscriptions_arguments({"scope": "all_enabled"}),
-            {"scope": "all_enabled"},
-        )
+        for scope in ("all_configured", "all_enabled"):
+            with self.subTest(scope=scope):
+                self.assertEqual(
+                    rss_refresh_subscriptions_arguments({"scope": scope}),
+                    {"scope": scope},
+                )
         invalid_arguments = (
             {},
             {"subscription_ids": []},
@@ -301,6 +303,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
             {"subscription_ids": list(range(1, 34))},
             {"subscription_ids": [self.sid], "all": True},
             {"scope": "selected"},
+            {"scope": "all_configured", "subscription_ids": [self.sid]},
             {"scope": "all_enabled", "subscription_ids": [self.sid]},
         )
         for invalid in invalid_arguments:
@@ -312,6 +315,10 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         self.assertEqual(spec["risk"], "write")
         self.assertTrue(spec["requires_confirmation"])
         self.assertFalse(spec["parameters"]["additionalProperties"])
+        self.assertEqual(
+            spec["parameters"]["properties"]["scope"]["enum"],
+            ["all_configured", "all_enabled"],
+        )
 
         with patch.object(RSSEngine, "refresh") as refresh:
             preview = preview_rss_subscriptions_refresh(arguments)
@@ -381,7 +388,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         for secret in ("secret.example", "RSS_SECRET", "second.secret.invalid", "SECOND_SECRET"):
             self.assertNotIn(secret, serialized)
 
-    def test_refresh_all_enabled_uses_complete_snapshot_beyond_summary_limit(self):
+    def test_refresh_all_configured_includes_disabled_within_scope_limit(self):
         with db.get_conn() as conn:
             conn.execute("DELETE FROM rss_items")
         ids = [
@@ -389,7 +396,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
                 f"Subscription {number}",
                 f"https://feed-{number}.invalid/rss?token=SECRET-{number}",
             )
-            for number in range(101)
+            for number in range(30)
         ]
         disabled_id = db.add_rss_subscription(
             "Disabled", "https://disabled.invalid/rss?token=DISABLED"
@@ -401,10 +408,14 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscriptions")
-        self.assertEqual(prepared["result"]["data"]["scope"], "all_enabled")
-        self.assertEqual(prepared["result"]["data"]["subscription_count"], len(ids))
-        self.assertTrue(prepared["result"]["data"]["subscriptions_truncated"])
-        self.assertEqual(len(prepared["result"]["data"]["subscriptions"]), 100)
+        self.assertEqual(prepared["result"]["data"]["scope"], "all_configured")
+        self.assertEqual(
+            prepared["result"]["data"]["subscription_count"], len(ids) + 1
+        )
+        self.assertFalse(prepared["result"]["data"]["subscriptions_truncated"])
+        self.assertEqual(
+            len(prepared["result"]["data"]["subscriptions"]), len(ids) + 1
+        )
 
         with patch.object(
             RSSEngine,
@@ -415,15 +426,59 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
                 prepared["confirmation"]["confirmation_id"], owner="owner"
             )
 
-        self.assertEqual(refresh.call_count, len(ids))
-        self.assertCountEqual([call.args[0] for call in refresh.call_args_list], ids)
+        expected_ids = [*ids, disabled_id]
+        self.assertEqual(refresh.call_count, len(expected_ids))
+        self.assertCountEqual(
+            [call.args[0] for call in refresh.call_args_list], expected_ids
+        )
         self.assertTrue(confirmed["result"]["ok"])
-        self.assertEqual(confirmed["result"]["data"]["requested"], len(ids))
-        self.assertEqual(confirmed["result"]["data"]["refreshed"], len(ids))
-        self.assertNotIn("Disabled", json.dumps(confirmed, ensure_ascii=False))
-        self.assertNotIn("SECRET-", json.dumps(confirmed, ensure_ascii=False))
+        self.assertEqual(
+            confirmed["result"]["data"]["requested"], len(expected_ids)
+        )
+        self.assertEqual(
+            confirmed["result"]["data"]["refreshed"], len(expected_ids)
+        )
+        serialized = json.dumps(confirmed, ensure_ascii=False)
+        self.assertNotIn("disabled.invalid", serialized)
+        self.assertNotIn("DISABLED", serialized)
+        self.assertNotIn("SECRET-", serialized)
 
-    def test_refresh_all_enabled_confirmation_stales_when_membership_changes(self):
+    def test_refresh_all_configured_rejects_scope_above_hard_limit(self):
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM rss_items")
+        for number in range(33):
+            subscription_id = db.add_rss_subscription(
+                f"Subscription {number}", f"https://feed-{number}.invalid/rss"
+            )
+            if number % 2:
+                db.update_rss_subscription(subscription_id, {"enabled": False})
+
+        with patch.object(RSSEngine, "refresh") as refresh:
+            response = get_agent_service().query(
+                "刷新全部 RSS 订阅", owner="owner", present=False
+            )
+
+        self.assertEqual(response["result"]["status"], "unsupported")
+        self.assertIn("当前范围包含 33 个订阅", response["result"]["summary"])
+        self.assertIn("最多选择 32 个", response["result"]["suggestions"][0])
+        self.assertNotIn("confirmation", response)
+        refresh.assert_not_called()
+
+    def test_legacy_all_enabled_scope_still_excludes_disabled_subscriptions(self):
+        disabled_id = db.add_rss_subscription(
+            "Disabled", "https://disabled.invalid/rss"
+        )
+        db.update_rss_subscription(disabled_id, {"enabled": False})
+
+        prepared = get_agent_service().prepare(
+            "rss.refresh_subscriptions", {"scope": "all_enabled"}, owner="owner"
+        )
+
+        self.assertEqual(prepared["result"]["data"]["scope"], "all_enabled")
+        self.assertEqual(prepared["result"]["data"]["subscription_count"], 1)
+        self.assertNotIn("Disabled", json.dumps(prepared, ensure_ascii=False))
+
+    def test_refresh_all_configured_confirmation_stales_when_membership_changes(self):
         prepared = get_agent_service().query("刷新所有 RSS", owner="owner")
         db.add_rss_subscription("Later", "https://later.invalid/rss")
 
@@ -597,11 +652,17 @@ class RSSRefreshAgentApiTests(IsolatedDatabaseTestCase):
         })
         self.assertEqual(rejected.status_code, 400, rejected.text)
         agent_rate_limiter.reset()
-        for _ in range(3):
-            response = self.client.post(
-                "/api/agent/query", headers=headers,
-                json={"session_id": "test_session_identifier_0001", "message": f"刷新 RSS 订阅 {self.sid}"},
-            )
-            self.assertEqual(response.status_code, 200, response.text)
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": (
+                "0" if key == "AGENT_LLM_ENABLED" else default
+            ),
+        ):
+            for _ in range(3):
+                response = self.client.post(
+                    "/api/agent/query", headers=headers,
+                    json={"session_id": "test_session_identifier_0001", "message": f"刷新 RSS 订阅 {self.sid}"},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
         limited = self.client.post(path, headers=headers, json=payload)
         self.assertEqual(limited.status_code, 429, limited.text)
