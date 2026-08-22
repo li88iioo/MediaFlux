@@ -408,6 +408,119 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         self.assertEqual(preview_calls, [])
         self.assertEqual(execute_calls, [])
 
+    def test_short_search_followup_falls_back_to_verified_media_when_planner_is_unavailable(self):
+        service, preview_calls, execute_calls, _ = self._agent()
+        context = [{
+            "role": "assistant",
+            "tool_name": "library.check_updates",
+            "status": "attention",
+            "text": "《沧元图》缺少第 91 集。",
+            "media_context": {"title": "沧元图", "media_type": "tv"},
+        }]
+
+        with patch.object(service, "_query_with_model_tools", return_value=None) as planner:
+            response = service.query(
+                "搜索一下呢",
+                owner="session-a",
+                conversation_context=context,
+                present=False,
+            )
+
+        planner.assert_called_once()
+        self.assertEqual(response["tool_call"]["name"], "indexer.search_resources")
+        self.assertEqual(response["tool_call"]["arguments"]["title"], "沧元图")
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
+    def test_short_search_followup_without_media_context_does_not_guess_a_title(self):
+        service, preview_calls, execute_calls, _ = self._agent()
+
+        with patch.object(service, "_query_with_model_tools", return_value=None):
+            response = service.query(
+                "搜索一下呢",
+                owner="session-a",
+                conversation_context=[
+                    {
+                        "role": "assistant",
+                        "tool_name": "library.check_updates",
+                        "status": "attention",
+                        "text": "《沧元图》缺少第 91 集。",
+                        "media_context": {"title": "沧元图", "media_type": "tv"},
+                    },
+                    {
+                        "role": "assistant",
+                        "tool_name": "workspace.health",
+                        "status": "healthy",
+                        "text": "系统运行正常。",
+                    },
+                ],
+                present=False,
+            )
+
+        self.assertNotEqual(
+            (response.get("tool_call") or {}).get("name"),
+            "indexer.search_resources",
+        )
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
+    def test_short_search_followup_does_not_cross_a_natural_topic_change(self):
+        service, preview_calls, execute_calls, _ = self._agent()
+        context = [
+            {
+                "role": "assistant",
+                "tool_name": "library.check_updates",
+                "status": "attention",
+                "text": "《沧元图》缺少第 91 集。",
+                "media_context": {"title": "沧元图", "media_type": "tv"},
+            },
+            {
+                "role": "assistant",
+                "status": "answered",
+                "text": "下载器异常的原因已经说明。",
+            },
+        ]
+
+        with patch.object(service, "_query_with_model_tools", return_value=None):
+            response = service.query(
+                "搜索一下呢",
+                owner="session-a",
+                conversation_context=context,
+                present=False,
+            )
+
+        self.assertNotEqual(
+            (response.get("tool_call") or {}).get("name"),
+            "indexer.search_resources",
+        )
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
+    def test_short_search_followup_requires_verified_not_tentative_media(self):
+        service, preview_calls, execute_calls, _ = self._agent()
+        context = [{
+            "role": "assistant",
+            "tool_name": "library.search",
+            "status": "empty",
+            "text": "媒体库中没有找到匹配内容。",
+            "tentative_media_context": {"title": "光明之外", "media_type": "tv"},
+        }]
+
+        with patch.object(service, "_query_with_model_tools", return_value=None):
+            response = service.query(
+                "搜索一下呢",
+                owner="session-a",
+                conversation_context=context,
+                present=False,
+            )
+
+        self.assertNotEqual(
+            (response.get("tool_call") or {}).get("name"),
+            "indexer.search_resources",
+        )
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
     def test_generic_search_supports_natural_number_followup_and_keeps_confirmation(self):
         service, preview_calls, execute_calls, _ = self._agent()
         searched = service.query("搜索光明之外资源", owner="session-a")
@@ -562,6 +675,9 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             "第3季第21集算91集吗？",
             "第三季21集是91集对不对？",
             "S03E21是91集吗？",
+            "第三季21集是91吗？",
+            "第三季21是91吗？",
+            "S03E21是91吗？",
         )
         with patch(
             "app.agent.orchestrator.answer_conversation",

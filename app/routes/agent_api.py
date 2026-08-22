@@ -1097,6 +1097,7 @@ def query(request: Request, data: Any = Body(default=None)):
         # 无会话或空历史时保持既有 service 调用契约；只有真实上下文才透传。
         if conversation_context:
             query_kwargs["conversation_context"] = conversation_context
+            query_kwargs["trusted_conversation_context"] = True
         streaming = bool(data.get("stream"))
         service = get_agent_service()
         coordinator = get_agent_operation_coordinator()
@@ -1324,6 +1325,7 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
                 "owner": owner,
                 "request_id": operation.operation_id,
                 "session_id": session_key or "",
+                "rate_identity": _agent_tool_rate_owner(request),
             }
             if confirmation_epoch is not None:
                 prepare_kwargs["expected_owner_generation"] = confirmation_epoch

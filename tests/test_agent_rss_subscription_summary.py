@@ -371,7 +371,11 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
             {"role": "assistant", "text": "可以继续刷新或查看列表。"},
         ]
 
-        listed = agent.query("列出列表", conversation_context=context)
+        listed = agent.query(
+            "列出列表",
+            conversation_context=context,
+            trusted_conversation_context=True,
+        )
         self.assertEqual(listed["tool_call"]["name"], "rss.subscription_summaries")
 
         subscription_id = db.add_rss_subscription(
@@ -383,7 +387,10 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
             agent, "prepare", return_value={"mode": "confirmation_required"}
         ) as prepare:
             refreshed = agent.query(
-                "刷新一下", owner="owner", conversation_context=context
+                "刷新一下",
+                owner="owner",
+                conversation_context=context,
+                trusted_conversation_context=True,
             )
         self.assertEqual(refreshed["mode"], "confirmation_required")
         planner.assert_not_called()
@@ -396,7 +403,10 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
         unrelated = [{"role": "assistant", "tool_name": "downloads.diagnose_queue"}]
         registry.reset_mock()
         response = agent._rss_context_followup(
-            "刷新一下", owner="owner", conversation_context=unrelated
+            "刷新一下",
+            owner="owner",
+            conversation_context=unrelated,
+            trusted_context=True,
         )
         self.assertIsNone(response)
 
@@ -407,7 +417,10 @@ class RssSubscriptionSummaryTests(IsolatedDatabaseTestCase):
         ]
         with patch.object(agent, "prepare") as stale_prepare:
             stale_response = agent._rss_context_followup(
-                "刷新一下", owner="owner", conversation_context=stale_topic
+                "刷新一下",
+                owner="owner",
+                conversation_context=stale_topic,
+                trusted_context=True,
             )
         self.assertIsNone(stale_response)
         stale_prepare.assert_not_called()

@@ -103,6 +103,9 @@ class AgentEvalDatasetTests(unittest.TestCase):
             3,
         )
         self.assertGreaterEqual(sum(case.allow_implicit for case in cases), 8)
+        self.assertEqual(
+            sum(case.trusted_conversation_context for case in cases), 1
+        )
 
     def test_schema_rejects_unknown_duplicate_and_invalid_expected_fields(self) -> None:
         base = {
@@ -142,6 +145,19 @@ class AgentEvalDatasetTests(unittest.TestCase):
             },
             "conversation_context": context,
         }
+        trusted_route = {
+            **route,
+            "case_id": "trusted-route-context",
+            "trusted_conversation_context": True,
+        }
+        validated = validate_agent_eval_rows([trusted_route])
+        self.assertTrue(validated[0].trusted_conversation_context)
+        with self.assertRaisesRegex(ValueError, "trusted_conversation_context"):
+            validate_agent_eval_rows([{
+                **trusted_route,
+                "case_id": "invalid-trusted-route-context",
+                "trusted_conversation_context": "yes",
+            }])
         self.assertEqual(len(validate_agent_eval_rows([route])), 1)
         with self.assertRaisesRegex(ValueError, "conversation_context"):
             validate_agent_eval_rows([{

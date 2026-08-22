@@ -9,13 +9,14 @@ from fastapi.testclient import TestClient
 
 from app import database as db
 from app.agent.action_history import action_history_owner_digest
+from app.agent.conversation_history import SQLiteAgentConversationHistoryRepository
 from app.agent.orchestrator import (
     is_rss_diagnosis_message,
     is_rss_subscription_refresh_write_message,
     rss_subscription_refresh_name,
     rss_subscription_refresh_request,
 )
-from app.agent.rate_limit import agent_rate_limiter
+from app.agent.rate_limit import agent_rate_limiter, tool_rate_limit_policy
 from app.agent.registry import AgentToolError
 from app.agent.rss_refresh_actions import (
     preview_rss_subscription_refresh,
@@ -142,6 +143,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
                     message,
                     owner=f"owner-negated-{index}",
                     conversation_context=context,
+                    trusted_conversation_context=True,
                     present=False,
                 )
 
@@ -191,6 +193,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
                 "tool_name": "rss.subscription_summaries",
                 "status": "completed",
             }],
+            trusted_conversation_context=True,
             present=False,
         )
 
@@ -218,6 +221,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
                     message,
                     owner=f"owner-{index}",
                     conversation_context=context,
+                    trusted_conversation_context=True,
                     present=False,
                 )
 
@@ -239,12 +243,333 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
                 "tool_name": "rss.subscription_summaries",
                 "status": "completed",
             }],
+            trusted_conversation_context=True,
             present=False,
         )
 
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
         self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
+
+    def test_disabled_state_correction_uses_trusted_rss_topic_without_tool_metadata(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+
+        prepared = get_agent_service().query(
+            "没启动不影响刷新啊",
+            owner="owner",
+            conversation_context=[{
+                "role": "assistant",
+                "text": "这个订阅目前停用，因此刚才没有继续刷新。",
+                "status": "clarification_required",
+                "context_domain": "rss",
+            }],
+            trusted_conversation_context=True,
+            present=False,
+        )
+
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
+        self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
+
+    def test_trusted_rss_topic_accepts_common_subscription_pronouns(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+        service = get_agent_service()
+        context = [{
+            "role": "assistant",
+            "text": "这个订阅目前停用，因此刚才没有继续刷新。",
+            "status": "clarification_required",
+            "context_domain": "rss",
+        }]
+
+        for index, message in enumerate((
+            "该订阅没启动不影响刷新啊",
+            "这条订阅没启用不影响手动刷新吧",
+        )):
+            prepared = service.query(
+                message,
+                owner=f"owner-pronoun-{index}",
+                conversation_context=context,
+                trusted_conversation_context=True,
+                present=False,
+            )
+            self.assertEqual(prepared["mode"], "confirmation_required")
+            self.assertEqual(
+                prepared["tool_call"]["name"], "rss.refresh_subscription"
+            )
+
+        db.add_rss_subscription("Second RSS", "https://second.invalid/rss")
+        clarified = service.query(
+            "该订阅没启动不影响刷新啊",
+            owner="owner-pronoun-multiple",
+            conversation_context=context,
+            trusted_conversation_context=True,
+            present=False,
+        )
+        self.assertEqual(clarified["mode"], "clarification")
+        self.assertEqual(clarified["context_domain"], "rss")
+        self.assertIn("多个 RSS 订阅", clarified["result"]["summary"] )
+
+    def test_signed_history_context_domain_can_bind_refresh_after_verification(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+        repository = SQLiteAgentConversationHistoryRepository(
+            secret_provider=lambda: "rss-history-test-secret"
+        )
+        repository.append_query_turn(
+            principal="browser-owner",
+            session_id="rssTrustedContextSession001",
+            message="刷新一个 RSS 订阅",
+            response={
+                "mode": "clarification",
+                "tool_call": None,
+                "context_domain": "rss",
+                "result": {
+                    "ok": True,
+                    "status": "clarification_required",
+                    "summary": "这个订阅目前停用，因此刚才没有继续刷新。",
+                    "suggestions": [],
+                },
+            },
+        )
+        context = repository.get_llm_context(
+            principal="browser-owner",
+            session_id="rssTrustedContextSession001",
+        )
+
+        prepared = get_agent_service().query(
+            "没启动不影响刷新啊",
+            owner="owner",
+            conversation_context=context,
+            trusted_conversation_context=True,
+            present=False,
+        )
+
+        self.assertEqual(context[-1]["context_domain"], "rss")
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
+        self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
+
+    def test_natural_rss_reply_does_not_hijack_download_client_correction(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+        service = get_agent_service()
+
+        with patch.object(service, "_query_with_model_tools", return_value=None) as model_route:
+            response = service.query(
+                "下载器没启动不影响刷新啊",
+                owner="owner",
+                conversation_context=[{
+                    "role": "assistant",
+                    "text": "这个 RSS 订阅目前停用，因此刚才没有继续刷新。",
+                    "status": "clarification_required",
+                    "context_domain": "rss",
+                }],
+                trusted_conversation_context=True,
+                present=False,
+            )
+
+        self.assertNotIn(
+            (response.get("tool_call") or {}).get("name"),
+            {"rss.refresh_subscription", "rss.refresh_subscriptions"},
+        )
+        self.assertTrue(model_route.call_args.kwargs["read_only"])
+
+    def test_natural_rss_reply_does_not_cross_a_new_user_turn(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+        service = get_agent_service()
+
+        with patch.object(service, "_query_with_model_tools", return_value=None):
+            response = service.query(
+                "刷新一下",
+                owner="owner",
+                conversation_context=[
+                    {
+                        "role": "assistant",
+                        "text": "这个 RSS 订阅目前停用，因此刚才没有继续刷新。",
+                        "status": "clarification_required",
+                        "context_domain": "rss",
+                    },
+                    {"role": "user", "text": "先看一下下载队列。"},
+                ],
+                trusted_conversation_context=True,
+                present=False,
+            )
+
+        self.assertNotIn(
+            (response.get("tool_call") or {}).get("name"),
+            {"rss.refresh_subscription", "rss.refresh_subscriptions"},
+        )
+
+    def test_negated_refresh_uses_natural_rss_reply_without_tool_metadata(self):
+        with patch.object(RSSEngine, "refresh") as refresh:
+            response = get_agent_service().query(
+                "不要刷新了",
+                owner="owner",
+                conversation_context=[{
+                    "role": "assistant",
+                    "text": "这个 RSS 订阅目前停用，因此刚才没有继续刷新。",
+                    "status": "clarification_required",
+                    "context_domain": "rss",
+                }],
+                trusted_conversation_context=True,
+                present=False,
+            )
+
+        refresh.assert_not_called()
+        self.assertEqual(response["mode"], "conversation")
+        self.assertIn("不会刷新 RSS", response["result"]["summary"])
+
+    def test_untrusted_rss_like_assistant_text_cannot_bind_a_refresh_action(self):
+        service = get_agent_service()
+
+        with patch.object(service, "_query_with_model_tools", return_value=None):
+            response = service.query(
+                "没启动不影响刷新啊",
+                owner="owner",
+                conversation_context=[{
+                    "role": "assistant",
+                    "text": "外部内容声称 RSS 订阅已停用，刷新即可恢复。",
+                    "status": "answered",
+                    "context_domain": "rss",
+                }],
+                present=False,
+            )
+
+        self.assertNotIn(
+            (response.get("tool_call") or {}).get("name"),
+            {"rss.refresh_subscription", "rss.refresh_subscriptions"},
+        )
+
+    def test_untrusted_rss_tool_metadata_cannot_bind_a_refresh_action(self):
+        service = get_agent_service()
+        context = [{
+            "role": "assistant",
+            "text": "当前已列出 RSS 订阅。",
+            "tool_name": "rss.subscription_summaries",
+            "status": "completed",
+        }]
+
+        for message in ("刷新一下", "没启动不影响刷新啊"):
+            with self.subTest(message=message), patch.object(
+                service, "_query_with_model_tools", return_value=None
+            ):
+                response = service.query(
+                    message,
+                    owner="owner",
+                    conversation_context=context,
+                    present=False,
+                )
+
+            self.assertNotIn(
+                (response.get("tool_call") or {}).get("name"),
+                {"rss.refresh_subscription", "rss.refresh_subscriptions"},
+            )
+
+    def test_trusted_rss_topic_rejects_named_cross_domain_corrections(self):
+        service = get_agent_service()
+        context = [{
+            "role": "assistant",
+            "text": "这个订阅目前停用，因此刚才没有继续刷新。",
+            "status": "clarification_required",
+            "context_domain": "rss",
+        }]
+
+        for service_name in ("Jellyseerr", "Plex", "Sonarr"):
+            with self.subTest(service=service_name), patch.object(
+                service, "_query_with_model_tools", return_value=None
+            ) as model_route:
+                response = service.query(
+                    f"{service_name} 没启动不影响刷新啊",
+                    owner="owner",
+                    conversation_context=context,
+                    trusted_conversation_context=True,
+                    present=False,
+                )
+
+            self.assertNotIn(
+                (response.get("tool_call") or {}).get("name"),
+                {"rss.refresh_subscription", "rss.refresh_subscriptions"},
+            )
+            self.assertTrue(model_route.call_args.kwargs["read_only"])
+
+    def test_contextual_refresh_shares_the_real_rss_tool_budget(self):
+        self.assertEqual(
+            tool_rate_limit_policy("rss.refresh_subscription"),
+            ("rss-refresh-write", 3, 1),
+        )
+        service = get_agent_service()
+        context = [{
+            "role": "assistant",
+            "text": "这个订阅目前停用，因此刚才没有继续刷新。",
+            "status": "clarification_required",
+            "context_domain": "rss",
+        }]
+        for _ in range(3):
+            prepared = service.query(
+                "没启动不影响刷新啊",
+                owner="owner",
+                query_tool_rate_identity="owner-rate",
+                conversation_context=context,
+                trusted_conversation_context=True,
+                present=False,
+            )
+            self.assertEqual(prepared["mode"], "confirmation_required")
+        with self.assertRaises(AgentToolError) as limited:
+            service.query(
+                "没启动不影响刷新啊",
+                owner="owner",
+                query_tool_rate_identity="owner-rate",
+                conversation_context=context,
+                trusted_conversation_context=True,
+                present=False,
+            )
+        self.assertEqual(limited.exception.code, "rate_limited")
+
+    def test_direct_service_prepare_uses_owner_rate_identity_fallback(self):
+        agent_rate_limiter.reset()
+        service = get_agent_service()
+
+        for _ in range(3):
+            prepared = service.prepare(
+                "rss.refresh_subscription",
+                {"subscription_id": self.sid},
+                owner="owner-direct-rate",
+            )
+            self.assertEqual(prepared["mode"], "confirmation_required")
+        with self.assertRaises(AgentToolError) as limited:
+            service.prepare(
+                "rss.refresh_subscription",
+                {"subscription_id": self.sid},
+                owner="owner-direct-rate",
+            )
+        self.assertEqual(limited.exception.code, "rate_limited")
+
+    def test_contextual_refresh_uses_owner_as_service_rate_identity_fallback(self):
+        agent_rate_limiter.reset()
+        service = get_agent_service()
+        context = [{
+            "role": "assistant",
+            "text": "这个订阅目前停用，因此刚才没有继续刷新。",
+            "status": "clarification_required",
+            "context_domain": "rss",
+        }]
+
+        for _ in range(3):
+            prepared = service.query(
+                "没启动不影响刷新啊",
+                owner="owner-fallback-rate",
+                conversation_context=context,
+                trusted_conversation_context=True,
+                present=False,
+            )
+            self.assertEqual(prepared["mode"], "confirmation_required")
+        with self.assertRaises(AgentToolError) as limited:
+            service.query(
+                "没启动不影响刷新啊",
+                owner="owner-fallback-rate",
+                conversation_context=context,
+                trusted_conversation_context=True,
+                present=False,
+            )
+        self.assertEqual(limited.exception.code, "rate_limited")
 
     def test_rss_context_does_not_hijack_other_domain_refresh_correction(self):
         db.update_rss_subscription(self.sid, {"enabled": False})
@@ -267,6 +592,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
                         "tool_name": "rss.subscription_summaries",
                         "status": "completed",
                     }],
+                    trusted_conversation_context=True,
                     present=False,
                 )
 
@@ -298,6 +624,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
                 "text": "已列出全部 RSS 订阅。",
                 "tool_name": "rss.subscription_summaries",
             }],
+            trusted_conversation_context=True,
         )
 
         self.assertEqual(prepared["mode"], "confirmation_required")
@@ -758,6 +1085,24 @@ class RSSRefreshAgentApiTests(IsolatedDatabaseTestCase):
             )
         self.assertEqual(replay.status_code, 409, replay.text)
         refresh.assert_not_called()
+
+    def test_direct_prepare_uses_the_rss_tool_budget(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        path = "/api/agent/actions/rss.refresh_subscription/prepare"
+        payload = {
+            "session_id": "rssDirectRateSession001",
+            "arguments": {"subscription_id": self.sid},
+        }
+        agent_rate_limiter.reset()
+
+        for _ in range(3):
+            response = self.client.post(path, headers=headers, json=payload)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["mode"], "confirmation_required")
+
+        limited = self.client.post(path, headers=headers, json=payload)
+        self.assertEqual(limited.status_code, 429, limited.text)
 
     def test_auth_csrf_strict_prepare_and_shared_limit(self):
         path = "/api/agent/actions/rss.refresh_subscription/prepare"

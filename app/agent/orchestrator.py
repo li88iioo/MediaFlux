@@ -222,20 +222,47 @@ def _latest_assistant_tool_context(
     return {}
 
 
+def _latest_rss_topic_context(
+    conversation_context: list[dict[str, Any]] | None,
+    *,
+    allow_structured_domain: bool = False,
+) -> dict[str, Any]:
+    """识别 RSS 话题；所有结构化元数据仅允许来自受信历史仓储。"""
+    if not allow_structured_domain:
+        return {}
+    previous = _latest_assistant_tool_context(conversation_context)
+    if str(previous.get("tool_name") or "").strip().startswith("rss."):
+        return previous
+    context = [item for item in (conversation_context or []) if isinstance(item, dict)]
+    if context and str(context[-1].get("role") or "").casefold() == "user":
+        return {}
+    previous = _last_assistant_context(conversation_context)
+    return previous if previous.get("context_domain") == "rss" else {}
+
+
 def _is_cross_domain_rss_refresh_correction(
-    message: str, conversation_context: list[dict[str, Any]] | None
+    message: str,
+    conversation_context: list[dict[str, Any]] | None,
+    *,
+    allow_structured_domain: bool = False,
 ) -> bool:
     """识别正在纠正 qB/下载器状态的句子，禁止借旧 RSS 上下文规划写操作。"""
-    previous = _latest_assistant_tool_context(conversation_context)
-    if not str(previous.get("tool_name") or "").strip().startswith("rss."):
+    previous = _latest_rss_topic_context(
+        conversation_context,
+        allow_structured_domain=allow_structured_domain,
+    )
+    if not previous:
         return False
     normalized = re.sub(
         r"[\s，。！？!?、；;：:~～]+",
         "",
         unicodedata.normalize("NFKC", str(message or "")).casefold(),
     )
+    refresh_unaffected = (
+        "不影响刷新" in normalized or "不影响手动刷新" in normalized
+    )
     return (
-        "不影响刷新" in normalized
+        refresh_unaffected
         and any(token in normalized for token in (
             "没启动", "未启动", "没启用", "未启用", "没开启", "未开启", "停用", "关闭",
         ))
@@ -3072,6 +3099,7 @@ def _is_recent_resource_question(message: str) -> bool:
         _recent_resource_selection(compact) is not None
         or _recent_resource_episode(compact) is not None
         or "季" in compact
+        or bool(re.search(r"(?i)(?<![a-z0-9])s\d{1,3}e(?:p)?\d{1,3}", compact))
     )
 
 
@@ -3176,13 +3204,13 @@ def _recent_resource_relation_fallback(
     relation = r"(?:是不是|就是|相当于|对应|等于|算(?:是|作)?|是)"
     matched = re.search(
         rf"第?\s*({_HUMAN_NUMBER_TOKEN_RE})\s*季\s*(?:第\s*)?"
-        rf"({_HUMAN_NUMBER_TOKEN_RE})\s*集\s*{relation}\s*"
-        rf"(?:第\s*)?({_HUMAN_NUMBER_TOKEN_RE})\s*集",
+        rf"({_HUMAN_NUMBER_TOKEN_RE})(?:\s*集)?\s*{relation}\s*"
+        rf"(?:第\s*)?({_HUMAN_NUMBER_TOKEN_RE})(?:\s*集)?",
         normalized,
         re.IGNORECASE,
     ) or re.search(
         rf"(?<![A-Za-z0-9])S0*([0-9]{{1,3}})\s*E(?:P)?0*([0-9]{{1,3}})"
-        rf"\s*{relation}\s*(?:第\s*)?({_HUMAN_NUMBER_TOKEN_RE})\s*集",
+        rf"\s*{relation}\s*(?:第\s*)?({_HUMAN_NUMBER_TOKEN_RE})(?:\s*集)?",
         normalized,
         re.IGNORECASE,
     )
@@ -3646,6 +3674,34 @@ def is_indexer_resource_search_message(message: str) -> bool:
         any(token in normalized for token in _RESOURCE_SEARCH_TOKENS)
         and any(token in normalized for token in _RESOURCE_SEARCH_VERBS)
     ) or bool(_extract_download_title_query(message))
+
+
+def _contextual_resource_search_title(
+    message: str,
+    conversation_context: list[dict[str, Any]] | None,
+) -> str:
+    """仅让紧邻、已验证的媒体结果承接无标题短搜索续句。"""
+    normalized = re.sub(
+        r"[\s，。！？!?、；;：:~～]+",
+        "",
+        unicodedata.normalize("NFKC", str(message or "")).casefold(),
+    )
+    if not re.fullmatch(
+        r"(?:(?:请|麻烦)?(?:帮我)?)?(?:搜索|搜)(?:一下|看看|看一下)?(?:呢|吧)?",
+        normalized,
+    ):
+        return ""
+    context = [item for item in (conversation_context or []) if isinstance(item, dict)]
+    if not context:
+        return ""
+    previous = context[-1]
+    if str(previous.get("role") or "").casefold() != "assistant":
+        return ""
+    tool_name = str(previous.get("tool_name") or "").strip()
+    if tool_name not in _MEDIA_CONTEXT_TOOL_NAMES:
+        return ""
+    media_context = _safe_media_context(previous.get("media_context"))
+    return str(media_context.get("title") or "").strip()
 
 
 def _extract_resource_search_query(message: str) -> str:
@@ -5843,7 +5899,20 @@ class AgentOrchestrator:
         expected_owner_generation: int | None = None,
         request_id: str = "",
         session_id: str = "",
+        rate_identity: str = "",
     ) -> dict[str, Any]:
+        if tool_name in {"rss.refresh_subscription", "rss.refresh_subscriptions"}:
+            effective_rate_identity = str(
+                rate_identity or _QUERY_TOOL_RATE_IDENTITY.get() or owner or ""
+            ).strip()
+            if not effective_rate_identity:
+                raise AgentToolError(
+                    "RSS 刷新预检缺少限流身份",
+                    code="precondition_failed",
+                )
+            self._reserve_query_tool_budget(
+                tool_name, rate_identity=effective_rate_identity
+            )
         trace_context = current_tool_context(
             owner=owner, request_id=request_id, session_id=session_id
         )
@@ -5936,6 +6005,16 @@ class AgentOrchestrator:
                 ["请按订阅编号分批刷新，每次最多选择 32 个。"],
             )
 
+    def _prepare_single_rss_refresh(
+        self, *, subscription_id: int, owner: str
+    ) -> dict[str, Any]:
+        """为单条 RSS 刷新统一预留真实工具预算并生成确认。"""
+        return self.prepare(
+            "rss.refresh_subscription",
+            {"subscription_id": int(subscription_id)},
+            owner=owner,
+        )
+
     def _prepare_contextual_rss_refresh(self, *, owner: str) -> dict[str, Any]:
         """刷新意图没有名称时，只有唯一订阅才自动补全。
 
@@ -5954,9 +6033,8 @@ class AgentOrchestrator:
                     "刷新 RSS 订阅需要在已登录会话中确认",
                     ["请登录后重试。"],
                 )
-            return self.prepare(
-                "rss.refresh_subscription",
-                {"subscription_id": subscription_id},
+            return self._prepare_single_rss_refresh(
+                subscription_id=subscription_id,
                 owner=owner,
             )
         names = [
@@ -5966,6 +6044,7 @@ class AgentOrchestrator:
         return self._clarification_response(
             "有多个 RSS 订阅，请告诉我要手动刷新哪一个；停用状态不影响单次手动刷新。",
             [f"刷新 {name} RSS 订阅。" for name in names],
+            context_domain="rss",
         )
 
     def _rss_context_followup(
@@ -5974,11 +6053,14 @@ class AgentOrchestrator:
         *,
         owner: str,
         conversation_context: list[dict[str, Any]] | None,
+        trusted_context: bool = False,
     ) -> dict[str, Any] | None:
         """让“列出列表 / 刷新一下”在刚讨论 RSS 时保持同一主题。"""
-        previous = _latest_assistant_tool_context(conversation_context)
-        previous_tool = str(previous.get("tool_name") or "").strip()
-        if not previous_tool.startswith("rss."):
+        previous = _latest_rss_topic_context(
+            conversation_context,
+            allow_structured_domain=trusted_context,
+        )
+        if not previous:
             return None
         normalized = re.sub(
             r"[\s，。！？!?、；;：:~～]+",
@@ -6001,18 +6083,32 @@ class AgentOrchestrator:
         previous_text = unicodedata.normalize(
             "NFKC", str(previous.get("text") or "")
         ).casefold()
-        current_mentions_rss = "rss" in normalized or "订阅" in normalized
+        current_mentions_rss = "rss" in normalized
         previous_was_refresh_topic = (
             "刷新" in previous_text
             and ("rss" in previous_text or "订阅" in previous_text)
         )
+        bare_disabled_correction = bool(re.fullmatch(
+            r"(?:这个|这条|它|该)?(?:rss)?(?:订阅)?"
+            r"(?:没启动|未启动|没启用|未启用|没开启|未开启|停用|关闭)"
+            r"(?:状态)?不影响(?:手动)?刷新(?:啊|吧|呀)?",
+            normalized,
+        ))
         other_domain = _is_cross_domain_rss_refresh_correction(
-            message, conversation_context
+            message,
+            conversation_context,
+            allow_structured_domain=trusted_context,
+        )
+        refresh_unaffected = (
+            "不影响刷新" in normalized or "不影响手动刷新" in normalized
         )
         if (
-            "不影响刷新" in normalized
+            refresh_unaffected
             and not other_domain
-            and (current_mentions_rss or previous_was_refresh_topic)
+            and (
+                current_mentions_rss
+                or (previous_was_refresh_topic and bare_disabled_correction)
+            )
             and any(token in normalized for token in (
                 "没启动", "未启动", "没启用", "未启用", "没开启", "未开启", "停用", "关闭",
             ))
@@ -6030,9 +6126,8 @@ class AgentOrchestrator:
                         "刷新 RSS 订阅需要在已登录会话中确认",
                         ["请登录后重试。"],
                     )
-                return self.prepare(
-                    "rss.refresh_subscription",
-                    {"subscription_id": resolution.subscription_id},
+                return self._prepare_single_rss_refresh(
+                    subscription_id=resolution.subscription_id,
                     owner=owner,
                 )
         return None
@@ -6164,6 +6259,7 @@ class AgentOrchestrator:
         query_tool_rate_identity: str = "",
         llm_tool_rate_identity: str = "",
         conversation_context: list[dict[str, Any]] | None = None,
+        trusted_conversation_context: bool = False,
         reply_context: dict[str, Any] | None = None,
         present: bool = True,
         confirmation_owner_generation: int | None = None,
@@ -6231,15 +6327,17 @@ class AgentOrchestrator:
                 return self._present_tool_response(
                     message, response, owner=llm_rate_owner or owner
                 )
-            previous_tool = str(
-                _latest_assistant_tool_context(conversation_context).get("tool_name") or ""
-            ).strip()
+            rss_topic = _latest_rss_topic_context(
+                conversation_context,
+                allow_structured_domain=trusted_conversation_context,
+            )
+            previous_tool = str(rss_topic.get("tool_name") or "").strip()
             if (
                 _is_negated_rss_refresh_message(message)
                 and (
                     "rss" in message.casefold()
                     or "订阅" in message
-                    or previous_tool.startswith("rss.")
+                    or bool(rss_topic)
                 )
             ):
                 return self._conversation_response("好，不会刷新 RSS 订阅。")
@@ -6247,6 +6345,7 @@ class AgentOrchestrator:
                 message,
                 owner=owner,
                 conversation_context=conversation_context,
+                trusted_context=trusted_conversation_context,
             )
             if rss_contextual is not None:
                 if not present:
@@ -6361,7 +6460,9 @@ class AgentOrchestrator:
                         not is_agent_action_request(message)
                         or danger_read_question
                         or _is_cross_domain_rss_refresh_correction(
-                            message, conversation_context
+                            message,
+                            conversation_context,
+                            allow_structured_domain=trusted_conversation_context,
                         )
                     ),
                     **(
@@ -6416,6 +6517,7 @@ class AgentOrchestrator:
                 query_tool_rate_identity=query_tool_rate_identity,
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
+                trusted_conversation_context=trusted_conversation_context,
                 reply_context=reply_context,
                 allow_model_routing=not contextual_model_attempted,
             )
@@ -7346,7 +7448,10 @@ class AgentOrchestrator:
                     "该动作需要在已登录会话中确认",
                     ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
                 )
-            return self.prepare("rss.refresh_subscription", rss_refresh_request, owner=owner)
+            return self._prepare_single_rss_refresh(
+                subscription_id=int(rss_refresh_request["subscription_id"]),
+                owner=owner,
+            )
         rss_refresh_name = rss_subscription_refresh_name(message)
         if rss_refresh_name is not None:
             resolution = resolve_rss_subscription_name(rss_refresh_name)
@@ -7356,9 +7461,8 @@ class AgentOrchestrator:
                         "该动作需要在已登录会话中确认",
                         ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
                     )
-                return self.prepare(
-                    "rss.refresh_subscription",
-                    {"subscription_id": resolution.subscription_id},
+                return self._prepare_single_rss_refresh(
+                    subscription_id=resolution.subscription_id,
                     owner=owner,
                 )
             if resolution.status == "ambiguous":
@@ -7569,6 +7673,7 @@ class AgentOrchestrator:
         query_tool_rate_identity: str = "",
         llm_tool_rate_identity: str = "",
         conversation_context: list[dict[str, Any]] | None = None,
+        trusted_conversation_context: bool = False,
         reply_context: dict[str, Any] | None = None,
         allow_model_routing: bool = True,
     ) -> dict[str, Any]:
@@ -7634,7 +7739,9 @@ class AgentOrchestrator:
                     not action_request
                     or danger_read_question
                     or _is_cross_domain_rss_refresh_correction(
-                        message, conversation_context
+                        message,
+                        conversation_context,
+                        allow_structured_domain=trusted_conversation_context,
                     )
                 ),
                 **(
@@ -8069,13 +8176,19 @@ class AgentOrchestrator:
                 )
             return self.invoke("web.search", {"query": query, "max_results": 5}, owner=owner)
 
-        if is_indexer_resource_search_message(lower):
-            inherited = _inherit_verified_media_query(
-                {"query": _extract_resource_search_query(message)},
-                conversation_context,
-                allow_tentative=True,
-            )
-            query = str(inherited.get("query") or "").strip()
+        contextual_resource_title = _contextual_resource_search_title(
+            message, conversation_context
+        )
+        if is_indexer_resource_search_message(lower) or contextual_resource_title:
+            if contextual_resource_title:
+                query = contextual_resource_title
+            else:
+                inherited = _inherit_verified_media_query(
+                    {"query": _extract_resource_search_query(message)},
+                    conversation_context,
+                    allow_tentative=True,
+                )
+                query = str(inherited.get("query") or "").strip()
             if not query:
                 return self._unsupported(
                     "请提供需要搜索资源的片名",
@@ -8346,25 +8459,28 @@ class AgentOrchestrator:
 
         if intent == "reason":
             summary = (
-                f"刚才“{label}”的结论是：{previous_summary} "
+                f"刚才“{label}”的结论是：{previous_summary}\n\n"
                 "当前保存的是安全摘要，没有足够细节时我不会猜测具体原因；"
                 "可以重新检查后再直接说明异常来源。"
             )
         elif intent == "action":
             summary = (
-                f"针对刚才“{label}”的结果，建议先执行：{suggestions[0]}。"
+                f"针对刚才“{label}”的结果，建议先执行：{suggestions[0]}。\n\n"
                 "这一步只会生成新的检查或操作预览，不会绕过确认直接写入。"
             )
         else:
             summary = (
-                f"可以继续。刚才“{label}”的结论是：{previous_summary} "
+                f"可以继续。刚才“{label}”的结论是：{previous_summary}\n\n"
                 f"下一步建议：{suggestions[0]}。"
             )
         return self._conversation_response(summary, suggestions)
 
     @staticmethod
     def _clarification_response(
-        summary: str, suggestions: list[str]
+        summary: str,
+        suggestions: list[str],
+        *,
+        context_domain: str = "",
     ) -> dict[str, Any]:
         safe_suggestions = list(suggestions[:3])
         response = {
@@ -8381,6 +8497,8 @@ class AgentOrchestrator:
         guidance = result_projection.project_public_guidance(safe_suggestions)
         if guidance:
             response["guidance"] = guidance
+        if context_domain == "rss":
+            response["context_domain"] = "rss"
         return result_projection.attach_public_display(response)
 
     @staticmethod

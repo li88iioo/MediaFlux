@@ -2862,6 +2862,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         # 历史上下文同时服务于确定性追问消歧，不能与 LLM 开关耦合。
         if conversation_context:
             query_kwargs["conversation_context"] = conversation_context
+            query_kwargs["trusted_conversation_context"] = True
         reply_context = _telegram_reply_context(message)
         if reply_context:
             query_kwargs["reply_context"] = reply_context

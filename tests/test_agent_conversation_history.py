@@ -327,6 +327,33 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
                 projection = self.repository._assistant_projection(response)
                 self.assertNotIn("usage", projection)
 
+    def test_only_allowlisted_context_domain_survives_signed_history_projection(self):
+        response = {
+            "mode": "clarification",
+            "tool_call": None,
+            "context_domain": "rss",
+            "result": {
+                "ok": True,
+                "status": "clarification_required",
+                "summary": "有多个订阅，请选择一个。",
+                "suggestions": ["刷新 Private RSS 订阅。"],
+            },
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="刷新一个 RSS 订阅",
+            response=response,
+        )
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(context[-1]["context_domain"], "rss")
+
+        response["context_domain"] = "downloads"
+        projection = self.repository._assistant_projection(response)
+        self.assertNotIn("context_domain", projection)
+
     def test_empty_media_result_keeps_tentative_context_and_pending_selection(self):
         empty_response = {
             "mode": "tool_result",

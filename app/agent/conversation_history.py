@@ -24,6 +24,7 @@ _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _SCHEMA_VERSION = 1
 _SUMMARY_STORAGE_VERSION = 1
 _UNSAFE_HISTORY_DETAIL = "[已隐藏敏感详情]"
+_SAFE_CONTEXT_DOMAINS = frozenset({"rss"})
 _MEDIA_CONTEXT_TOOL_TYPES: dict[str, str] = {
     "library.search": "",
     "library.count_series_episodes": "tv",
@@ -834,6 +835,9 @@ class SQLiteAgentConversationHistoryRepository:
                 entry["pending_subscription"] = pending_subscription
             if status:
                 entry["status"] = status
+            context_domain = str(data.get("context_domain") or "").strip()
+            if context_domain in _SAFE_CONTEXT_DOMAINS:
+                entry["context_domain"] = context_domain
             if isinstance(suggestions, list):
                 entry["suggestions"] = [
                     value
@@ -1018,6 +1022,9 @@ class SQLiteAgentConversationHistoryRepository:
             "error": self._safe_optional_output_text(result.get("error"), limit=300),
             "suggestions": safe_suggestions,
         }
+        context_domain = str(response.get("context_domain") or "").strip()
+        if context_domain in _SAFE_CONTEXT_DOMAINS:
+            projection["context_domain"] = context_domain
         presentation = (
             response.get("presentation")
             if isinstance(response.get("presentation"), dict)

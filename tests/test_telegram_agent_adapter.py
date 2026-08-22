@@ -2334,6 +2334,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertTrue(handled)
         query_kwargs = service.query.call_args.kwargs
         self.assertEqual(query_kwargs["conversation_context"], expected_context)
+        self.assertTrue(query_kwargs["trusted_conversation_context"])
         history.append_query_turn.assert_called_once()
         self.assertEqual(
             history.append_query_turn.call_args.kwargs["expected_generation"], 4

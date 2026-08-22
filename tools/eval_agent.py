@@ -69,6 +69,7 @@ _ALLOWED_KEYS = frozenset({
     "expected",
     "allow_implicit",
     "conversation_context",
+    "trusted_conversation_context",
     "tags",
     "notes",
 })
@@ -76,7 +77,9 @@ _CASE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _DOMAIN_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _TAG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_LABEL_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,95}$")
-_CONTEXT_KEYS = frozenset({"role", "text", "tool_name", "status", "media_context"})
+_CONTEXT_KEYS = frozenset({
+    "role", "text", "tool_name", "status", "media_context", "context_domain",
+})
 _MEDIA_CONTEXT_KEYS = frozenset({"title", "original_title", "year", "media_type"})
 _CONTEXT_EVALUATORS = frozenset({"route_tool", "write_tool_route", "media_rating"})
 _DIAGNOSTIC_TOOLS = frozenset(spec.tool_name for spec in _DIAGNOSTIC_READ_INTENTS)
@@ -94,6 +97,7 @@ _OFFLINE_ROUTE_TOOLS = frozenset({
     "discovery.search",
     "library.check_updates",
     "library.count_series_episodes",
+    "rss.subscription_summaries",
 })
 _OFFLINE_WRITE_ROUTE_TOOLS = frozenset({
     "config.set_feature_state",
@@ -123,6 +127,7 @@ class AgentEvalCase:
     expected: Any
     allow_implicit: bool = False
     conversation_context: tuple[dict[str, Any], ...] = ()
+    trusted_conversation_context: bool = False
     tags: tuple[str, ...] = ()
     notes: str = ""
 
@@ -266,6 +271,12 @@ def _validate_context(case_id: str, raw: Any) -> tuple[dict[str, Any], ...]:
                 raise _schema_error(
                     case_id, f"conversation_context[{index}].{key} 必须是字符串"
                 )
+        context_domain = projected.get("context_domain")
+        if context_domain is not None and context_domain != "rss":
+            raise _schema_error(
+                case_id,
+                f"conversation_context[{index}].context_domain 无效",
+            )
         media = projected.get("media_context")
         if media is not None:
             if not isinstance(media, Mapping) or set(media) - _MEDIA_CONTEXT_KEYS:
@@ -283,7 +294,7 @@ def _validate_context(case_id: str, raw: Any) -> tuple[dict[str, Any], ...]:
 def validate_agent_eval_rows(rows: Iterable[Mapping[str, Any]]) -> list[AgentEvalCase]:
     cases: list[AgentEvalCase] = []
     seen_ids: set[str] = set()
-    seen_inputs: set[tuple[str, str, bool, str]] = set()
+    seen_inputs: set[tuple[str, str, bool, bool, str]] = set()
     for index, raw in enumerate(rows, start=1):
         if not isinstance(raw, Mapping):
             raise _schema_error(f"第 {index} 行", "样本必须是 JSON object")
@@ -337,6 +348,21 @@ def validate_agent_eval_rows(rows: Iterable[Mapping[str, Any]]) -> list[AgentEva
                 case_id,
                 "conversation_context 仅供工具路由或 media_rating 使用",
             )
+        trusted_conversation_context = row.get(
+            "trusted_conversation_context", False
+        )
+        if not isinstance(trusted_conversation_context, bool):
+            raise _schema_error(
+                case_id, "trusted_conversation_context 必须是 boolean"
+            )
+        if trusted_conversation_context and not context:
+            raise _schema_error(
+                case_id, "受信会话标记必须同时提供 conversation_context"
+            )
+        if trusted_conversation_context and evaluator not in _CONTEXT_EVALUATORS:
+            raise _schema_error(
+                case_id, "受信会话标记仅供上下文工具路由使用"
+            )
         expected = row["expected"]
         _validate_expected(case_id, evaluator, expected)
 
@@ -356,6 +382,7 @@ def validate_agent_eval_rows(rows: Iterable[Mapping[str, Any]]) -> list[AgentEva
             evaluator,
             message,
             allow_implicit,
+            trusted_conversation_context,
             json.dumps(context, ensure_ascii=False, sort_keys=True),
         )
         if input_key in seen_inputs:
@@ -370,6 +397,7 @@ def validate_agent_eval_rows(rows: Iterable[Mapping[str, Any]]) -> list[AgentEva
             expected=expected,
             allow_implicit=allow_implicit,
             conversation_context=context,
+            trusted_conversation_context=trusted_conversation_context,
             tags=tuple(tags_raw),
             notes=notes,
         ))
@@ -441,6 +469,8 @@ def build_offline_agent_eval_registry() -> ToolRegistry:
 def _offline_route_projection(
     message: str,
     conversation_context: Sequence[Mapping[str, Any]] = (),
+    *,
+    trusted_conversation_context: bool = False,
 ) -> dict[str, Any] | None:
     owner = "offline-agent-eval"
     confirmation_store = ConfirmationStore()
@@ -448,12 +478,21 @@ def _offline_route_projection(
         build_offline_agent_eval_registry(),
         confirmation_store=confirmation_store,
     )
-    response = orchestrator._query_raw(
+    projected_context = [dict(item) for item in conversation_context]
+    response = orchestrator._rss_context_followup(
         message,
         owner=owner,
-        conversation_context=[dict(item) for item in conversation_context],
-        allow_model_routing=False,
+        conversation_context=projected_context,
+        trusted_context=trusted_conversation_context,
     )
+    if response is None:
+        response = orchestrator._query_raw(
+            message,
+            owner=owner,
+            conversation_context=projected_context,
+            trusted_conversation_context=trusted_conversation_context,
+            allow_model_routing=False,
+        )
     tool_call = response.get("tool_call") if isinstance(response, dict) else None
     if not isinstance(tool_call, dict) or not str(tool_call.get("name") or "").strip():
         return None
@@ -497,7 +536,11 @@ def _confusion_kind(expected: Any, actual: Any, *, matched: bool) -> str:
 def evaluate_agent_case(case: AgentEvalCase) -> AgentEvalOutcome:
     started = monotonic()
     if case.evaluator in _ROUTE_EVALUATORS:
-        actual = _offline_route_projection(case.message, case.conversation_context)
+        actual = _offline_route_projection(
+            case.message,
+            case.conversation_context,
+            trusted_conversation_context=case.trusted_conversation_context,
+        )
     elif case.evaluator == "diagnostic_tool":
         actual = match_read_intent(case.message.casefold(), _DIAGNOSTIC_READ_INTENTS)
     elif case.evaluator == "action_intent":
