@@ -1532,18 +1532,26 @@ class MediaRefreshTests(unittest.TestCase):
         self.assertTrue(client.refresh_library("library-id"))
         self.assertIn("/Items/library-id/Refresh", client._session.post.call_args.args[0])
         call = client._session.post.call_args
-        self.assertNotIn("api_key", call.kwargs["params"])
+        self.assertEqual(call.kwargs["params"], {"metadataRefreshMode": "FullRefresh"})
         self.assertIn("MediaBrowser Token", call.kwargs["headers"]["Authorization"])
 
     def test_emby_refresh_for_path_matches_virtual_folder(self):
         client = EmbyClient("http://emby.local", "token")
         client.product_kind = "emby"
-        client._request = lambda path, params=None: {
-            "Items": [{
-                "ItemId": "lib-1", "Name": "STRM", "Locations": ["D:/Media/STRM"],
-            }],
-            "TotalRecordCount": 1,
-        }
+        def request(path, params=None):
+            if path == "/Library/VirtualFolders/Query":
+                return {
+                    "Items": [{
+                        "ItemId": "lib-1", "Name": "STRM",
+                        "Locations": ["D:/Media/STRM"],
+                    }],
+                    "TotalRecordCount": 1,
+                }
+            if path == "/Items":
+                return {"Items": [], "TotalRecordCount": 0}
+            raise AssertionError(path)
+
+        client._request = request
         client.refresh_library = Mock(return_value=True)
         client.refresh_all = Mock(return_value=True)
         self.assertTrue(client.refresh_for_path("D:/Media/STRM"))

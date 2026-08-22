@@ -105,6 +105,30 @@ class MediaConfigSaveTests(unittest.TestCase):
         ])
         strm_scheduler.reload.assert_called_once_with()
         organize_scheduler.reload.assert_called_once_with()
+
+    def test_advanced_media_server_mapping_is_validated_and_canonicalized(self):
+        result, save, _, _ = self._save({
+            "JELLYFIN_PATH_MAPPINGS": json.dumps({
+                "/data/strm/电影": r"\\NAS\Media\电影",
+            }, ensure_ascii=False),
+        })
+
+        self.assertEqual(result, {"success": True})
+        saved = save.call_args.args[0]
+        self.assertEqual(json.loads(saved["JELLYFIN_PATH_MAPPINGS"]), [{
+            "local": "/data/strm/电影",
+            "server": "//NAS/Media/电影",
+        }])
+
+    def test_invalid_advanced_media_server_mapping_is_rejected(self):
+        result, save, _, _ = self._save({
+            "JELLYFIN_PATH_MAPPINGS": '[{"local":"relative","server":"/media"}]',
+        })
+
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("路径映射无效", result.body.decode("utf-8"))
+        save.assert_not_called()
+
     def test_invalid_sources_cron_and_numeric_limits_are_rejected(self):
         cases = [
             ({"GY_ORGANIZE_SOURCE_DIRS": "bad"}, "不是有效 JSON"),

@@ -87,7 +87,17 @@ _AGENT_LIBRARY_PATROL_KEYS = {
 _AGENT_SETTINGS_MANAGED_KEYS = (
     {"AGENT_ENABLED"} | _AGENT_LLM_KEYS | _WEB_SEARCH_KEYS | _AGENT_LIBRARY_PATROL_KEYS
 )
-_CONFIG_UI_MANAGED_KEYS = _AGENT_SETTINGS_MANAGED_KEYS | {"GY_STRM_BASE_URL"}
+_MEDIA_SERVER_REFRESH_KEYS = {
+    "JELLYFIN_PATH_MAPPINGS",
+    "JELLYFIN_ALLOW_GLOBAL_REFRESH_FALLBACK",
+    "EMBY_PATH_MAPPINGS",
+    "EMBY_ALLOW_GLOBAL_REFRESH_FALLBACK",
+}
+_CONFIG_UI_MANAGED_KEYS = (
+    _AGENT_SETTINGS_MANAGED_KEYS
+    | {"GY_STRM_BASE_URL"}
+    | _MEDIA_SERVER_REFRESH_KEYS
+)
 _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_ENABLED": "0",
     "AGENT_LLM_ENABLED": "0",
@@ -934,7 +944,8 @@ def save_config(request: Request, data: Any = Body(default=None)):
     allowed = {
         "ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD", "LOGIN_WALLPAPER_MODE",
         "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN", "JELLYFIN_ENABLED", "JELLYFIN_URL",
-        "JELLYFIN_API_KEY", "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY",
+        "JELLYFIN_API_KEY", *_MEDIA_SERVER_REFRESH_KEYS,
+        "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY",
         "TG_QB_CATEGORY", "TG_QB_SAVE_PATH",
         "TMDB_API_KEY", "TMDB_API_URL",
         "TMDB_MATCH_MODE", "PROXY_URL", "TG_BOT_TOKEN", "TG_CHAT_ID",
@@ -1038,6 +1049,21 @@ def save_config(request: Request, data: Any = Body(default=None)):
         nsfw_organize_updates = _validate_nsfw_organize_updates(data)
     except ValueError as exc:
         return api_error(str(exc), 400)
+    media_server_refresh_updates: dict[str, str] = {}
+    for key in ("JELLYFIN_PATH_MAPPINGS", "EMBY_PATH_MAPPINGS"):
+        if key not in data:
+            continue
+        try:
+            from app.modules.media_server_path_mapping import (
+                encode_media_server_path_mappings,
+            )
+
+            media_server_refresh_updates[key] = encode_media_server_path_mappings(
+                data[key]
+            )
+        except ValueError as exc:
+            label = "Jellyfin" if key.startswith("JELLYFIN") else "Emby"
+            return api_error(f"{label} 路径映射无效: {exc}", 400)
     agent_patrol_updates = {}
     for key in (
         "AGENT_LIBRARY_PATROL_ENABLED",
@@ -1186,6 +1212,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         nsfw_organize_updates,
         agent_patrol_updates,
         telegram_agent_updates,
+        media_server_refresh_updates,
     ):
         special_updates.update(source)
     for key, value in data.items():
