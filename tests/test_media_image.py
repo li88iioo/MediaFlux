@@ -66,13 +66,13 @@ class MediaImageProxyTests(unittest.TestCase):
             "app.routes.media_image.requests.get",
             side_effect=requests.ConnectionError("offline"),
         ), patch(
-            "app.routes.media_image.logger.warning",
-        ) as warning:
+            "app.routes.media_image.log_throttled",
+        ) as throttled:
             with self.assertRaises(HTTPException) as raised:
                 media_image(_request(b"tag=another-tag"), "jellyfin", _ITEM_ID)
 
         self.assertEqual(raised.exception.status_code, 502)
-        warning.assert_called_once()
+        throttled.assert_called_once()
 
     def test_successful_image_keeps_long_browser_cache(self):
         upstream = Mock(

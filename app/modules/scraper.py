@@ -1649,11 +1649,39 @@ def _clean_release_stem(value: str) -> tuple[str, dict[str, list[str]]]:
     ))
     stem = _CHINESE_EPISODE_TOKEN.sub(" ", stem)
     stem = _NOISE.sub(" ", stem)
-    stem = _YEAR_TOKEN.sub(" ", stem)
+    # 纯数字正式片名（2012 / 1917 / 1984 / 2001 / 2046）不能被当作
+    # 发布年份整体删除。先观察剥离技术标签后的剩余文本；只有它不再是
+    # 单一四位数字片名时，才清理普通发布年份。
+    numeric_title_probe = re.sub(r"[\[\]【】(){}]", " ", stem)
+    numeric_title_probe = re.sub(r"[._+\-·]+", " ", numeric_title_probe)
+    numeric_title_probe = re.sub(r"\s+", " ", numeric_title_probe).strip()
+    if _YEAR_TOKEN.fullmatch(numeric_title_probe):
+        stem = numeric_title_probe
+    else:
+        stem = _YEAR_TOKEN.sub(" ", stem)
     stem = re.sub(r"[\[\]【】(){}]", " ", stem)
     stem = re.sub(r"[._+\-·]+", " ", stem)
     stem = re.sub(r"\s+", " ", stem).strip()
     return stem, cleaned
+
+
+def _prefer_guessit_numeric_title(
+    guessed_title: str, cleaned_title: str, guessed_year: object,
+) -> bool:
+    """GuessIt 保留了正式数字片名时，避免清洗器把它当发布年份删掉。"""
+    guessed_text = re.sub(r"\s+", " ", str(guessed_title or "")).strip(" ._-")
+    if not guessed_text:
+        return False
+    numeric_tokens = [match.group(1) for match in _YEAR_TOKEN.finditer(guessed_text)]
+    if not numeric_tokens:
+        return False
+    cleaned_key = _comparison_key(cleaned_title)
+    if all(token in cleaned_key.split() for token in numeric_tokens):
+        return False
+    if _YEAR_TOKEN.fullmatch(guessed_text):
+        return True
+    release_year = str(guessed_year or "").strip()
+    return any(token != release_year for token in numeric_tokens)
 
 
 def _folder_context(
@@ -1823,6 +1851,8 @@ def extract_recognition_context(filename: str, parent_path: str = "") -> Recogni
     filename_title = re.sub(r"\s+", " ", _strip_season_tokens(filename_title)).strip(" ._-")
     guessed_title = re.sub(r"\s+", " ", _strip_season_tokens(guessed_title)).strip(" ._-")
     if not filename_title and guessed_title:
+        filename_title = guessed_title
+    elif _prefer_guessit_numeric_title(guessed_title, filename_title, guessed_year):
         filename_title = guessed_title
     folder_title, folder_year, folder_type, folder_season = _folder_context(
         parse_parent_path, episode_context=episode is not None,
@@ -3294,7 +3324,7 @@ class TMDBScraper:
                     self._detail_failure_cache, key, redact_sensitive_text(e)[:500]
                 )
                 self._record_tmdb_failure(e)
-            logger.error(f"TMDB 详情失败 [{tmdb_id}] [{normalized}]: {e}")
+            logger.error("TMDB 详情失败 tmdb=%s type=%s error=%s", tmdb_id, normalized, type(e).__name__)
             return {}
 
     def _season_episodes(self, tmdb_id: str, season_number: int | None) -> list | None:
@@ -3390,7 +3420,7 @@ class TMDBScraper:
                     self._detail_failure_cache, key, redact_sensitive_text(e)[:500]
                 )
                 self._record_tmdb_failure(e)
-            logger.error(f"TMDB 演职员详情失败 [{tmdb_id}] [{normalized}]: {e}")
+            logger.error("TMDB 演职员详情失败 tmdb=%s type=%s error=%s", tmdb_id, normalized, type(e).__name__)
             return {}
 
     def search_candidates(self, query: str, year: str = "",
@@ -3434,6 +3464,149 @@ class TMDBScraper:
             tmdb_id=requested_id, external_id=requested_id, provider="tmdb",
             title=title, year=date[:4], media_type=media_type,
             confidence=1.0, locked=True, status="matched", matched_by="tmdb_id",
+            threshold=1.0,
+            metadata={
+                "original_title": str(
+                    detail.get("original_name") or detail.get("original_title") or ""
+                ),
+                "poster_path": str(detail.get("poster_path") or ""),
+                "backdrop_path": str(detail.get("backdrop_path") or ""),
+            },
+        )
+
+    @staticmethod
+    def _explicit_match_evidence(
+        result: MatchResult, context: RecognitionContext,
+    ) -> dict[str, object]:
+        matched = bool(
+            result.status == "matched" and result.tmdb_id and result.title
+        )
+        anchors = _source_title_anchors(context)
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        candidate_titles = _unique_text((
+            result.title, str(metadata.get("original_title") or ""),
+        ))
+        title_score = (
+            max(
+                _title_similarity_score(anchor, candidate_title)
+                for anchor in anchors
+                for candidate_title in candidate_titles
+            )
+            if anchors and candidate_titles
+            else (1.0 if matched and not anchors else 0.0)
+        )
+        expected_year = str(
+            context.folder_year or context.filename_year or ""
+        ).strip()
+        result_year = str(result.year or "").strip()
+        year_distance: int | None = None
+        if expected_year and result_year and expected_year.isdigit() and result_year.isdigit():
+            year_distance = abs(int(expected_year) - int(result_year))
+        year_matches = not expected_year or result_year == expected_year
+        # 电影首映、地区发行与流媒体年份偶尔会相差一年。显式 ID 的类型
+        # 复核只把这种差异视为可接受，不放宽标题证据或更大的年份冲突。
+        year_compatible = bool(
+            not expected_year or year_matches or year_distance == 1
+        )
+        position_matches = (
+            result.media_type == "tv"
+            or (context.season is None and context.episode is None)
+        )
+        qualified = bool(
+            matched
+            and position_matches
+            and year_compatible
+            and (not anchors or title_score >= 0.72)
+        )
+        rank = title_score
+        if expected_year and year_matches:
+            rank += 0.2
+        elif expected_year and year_distance == 1:
+            rank += 0.1
+        if position_matches:
+            rank += 0.05
+        return {
+            "matched": matched,
+            "qualified": qualified,
+            "title_score": title_score,
+            "year_matches": year_matches,
+            "year_compatible": year_compatible,
+            "year_distance": year_distance,
+            "expected_year": expected_year,
+            "rank": rank,
+        }
+
+    @staticmethod
+    def _explicit_result_candidate(
+        result: MatchResult, evidence: dict[str, object],
+    ) -> Candidate | None:
+        if not evidence.get("matched"):
+            return None
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        return Candidate(
+            tmdb_id=str(result.tmdb_id or ""),
+            title=str(result.title or ""),
+            year=str(result.year or ""),
+            score=round(min(float(evidence.get("rank") or 0.0), 1.0), 3),
+            media_type=str(result.media_type or ""),
+            original_title=str(metadata.get("original_title") or ""),
+            poster_path=str(metadata.get("poster_path") or ""),
+            backdrop_path=str(metadata.get("backdrop_path") or ""),
+            provider="tmdb",
+            external_id=str(result.tmdb_id or ""),
+        )
+
+    def _match_inherited_tmdb(
+        self, tmdb_id: str, primary_type: str, context: RecognitionContext,
+    ) -> MatchResult:
+        """复核父目录继承的数字 ID，避免 Movie/TV 同号被错误类型吞掉。"""
+        primary_type = "tv" if primary_type == "tv" else "movie"
+        primary = self.match_from_tmdb(tmdb_id, primary_type)
+        primary_evidence = self._explicit_match_evidence(primary, context)
+        if primary_evidence["qualified"]:
+            return primary
+
+        alternate_type = "movie" if primary_type == "tv" else "tv"
+        alternate = self.match_from_tmdb(tmdb_id, alternate_type)
+        alternate_evidence = self._explicit_match_evidence(alternate, context)
+        if alternate_evidence["qualified"]:
+            return alternate
+
+        # 只有一个命名空间存在时不存在 Movie/TV 同号碰撞，继续尊重已有的
+        # 显式 TMDB 标记。这样自定义译名或跨地区标题不会被无谓打回人工确认。
+        primary_matched = bool(primary_evidence["matched"])
+        alternate_matched = bool(alternate_evidence["matched"])
+        if primary_matched != alternate_matched:
+            return primary if primary_matched else alternate
+
+        candidates = [
+            candidate
+            for candidate in (
+                self._explicit_result_candidate(primary, primary_evidence),
+                self._explicit_result_candidate(alternate, alternate_evidence),
+            )
+            if candidate is not None
+        ]
+        folder_label = str(context.folder_title or context.normalized_title or "").strip()
+        expected_year = str(
+            context.folder_year or context.filename_year or ""
+        ).strip()
+        if not candidates:
+            error = f"显式 TMDB 标记 {tmdb_id} 在电影和剧集库中均未查询到详情"
+            status = "request_error"
+        else:
+            source_label = f"「{folder_label}」" if folder_label else "当前来源"
+            year_label = f"（{expected_year}）" if expected_year else ""
+            error = (
+                f"显式 TMDB 标记 {tmdb_id} 的电影/剧集详情与"
+                f"{source_label}{year_label}不一致，需人工确认类型"
+            )
+            status = "low_confidence"
+        return MatchResult(
+            tmdb_id=str(tmdb_id or ""), external_id=str(tmdb_id or ""),
+            provider="tmdb", media_type=primary_type, confidence=0.0,
+            candidates=candidates, locked=False, need_confirm=True,
+            error=error, status=status, matched_by="tmdb_id_type_check",
             threshold=1.0,
         )
 
@@ -3538,7 +3711,7 @@ class TMDBScraper:
                 "episode": episode,
             }
         except Exception as e:
-            logger.warning(f"guessit 解析失败 [{filename}]: {e}")
+            logger.warning("guessit 解析失败 type=%s", type(e).__name__)
             return {"title": name, "year": "", "type": "movie",
                     "season": None, "episode": None}
 
@@ -3722,6 +3895,15 @@ class TMDBScraper:
         )
         if release_candidates:
             cleaned = release_candidates[0]
+        guessed_title = re.sub(
+            r"\s+", " ", _strip_season_tokens(str(guessed.get("title") or ""))
+        ).strip(" ._-")
+        if not cleaned and guessed_title:
+            cleaned = guessed_title
+        elif _prefer_guessit_numeric_title(
+            guessed_title, cleaned, guessed.get("year")
+        ):
+            cleaned = guessed_title
         cleaned = _strip_season_tokens(cleaned)
         return re.sub(r"\s+", " ", cleaned).strip(" ._-")
 
@@ -6147,12 +6329,21 @@ class TMDBScraper:
         if parsed.get("tmdb_id"):
             explicit_media_type = hint or parsed.get("type") or "movie"
             if inherited_tmdb_id and not hint and explicit_media_type != "tv":
-                context_media_type = extract_recognition_context(
-                    filename, parent_path
-                ).media_type
-                if context_media_type == "tv":
+                if raw_context.media_type == "tv":
                     explicit_media_type = "tv"
-            result = self.match_from_tmdb(parsed["tmdb_id"], explicit_media_type)
+            if (
+                inherited_tmdb_id
+                and not hint
+                and raw_context.season is None
+                and raw_context.episode is None
+            ):
+                result = self._match_inherited_tmdb(
+                    parsed["tmdb_id"], explicit_media_type, raw_context
+                )
+            else:
+                result = self.match_from_tmdb(
+                    parsed["tmdb_id"], explicit_media_type
+                )
             return self._attach_preprocess(result, processed)
         media_type = hint or parsed["type"]
 

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import hmac
 import threading
 import time
@@ -21,7 +22,7 @@ import time
 from app import database as db
 from app.bot.progress import TelegramProgress, send_typing
 from app.config import get, get_bool
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.notifier import NotificationEvent, get_bot, render_event, send_event
 
 # 保留模块级 send 名称，便于测试和兼容旧补丁。
@@ -680,7 +681,7 @@ def init_bot(stop_event: threading.Event | None = None):
                     _progress_recovery_thread = None
                 _registered_bot_id = id(bot)
             except Exception as exc:
-                logger.error(f"TG Bot 命令注册失败: {exc}")
+                logger.error("TG Bot 命令注册失败 type=%s", type(exc).__name__)
                 return None
         _bot = bot
         logger.info("TG Bot 已初始化")
@@ -1504,7 +1505,7 @@ def _register_commands(bot, telebot):
             ]
         )
     except Exception as e:
-        logger.warning(f"设置命令菜单失败: {e}")
+        logger.warning("设置命令菜单失败 type=%s", type(e).__name__)
 
 
 def _run_rss_refresh(
@@ -2993,11 +2994,14 @@ def start_bot_blocking(stop_event: threading.Event | None = None):
     bot = init_bot(stop_event=stop_event)
     if bot is None or (stop_event is not None and stop_event.is_set()):
         return
-    logger.info("TG Bot 启动 polling")
+    logger.debug("TG Bot 启动 polling")
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=30)
     except Exception as exc:
-        logger.error(f"TG Bot polling 异常退出: {exc}")
+        log_throttled(
+            logger, logging.ERROR, f"tg-bot-polling:{type(exc).__name__}",
+            "TG Bot polling 异常退出 type=%s", type(exc).__name__,
+        )
 
 
 def _start_bot_locked() -> bool:
@@ -3065,7 +3069,7 @@ def _stop_bot_locked(timeout: float = 5.0) -> None:
             bot.stop_polling()
             logger.info("TG Bot polling 已停止")
         except Exception as exc:
-            logger.warning(f"停止 TG Bot polling 失败: {exc}")
+            logger.warning("停止 TG Bot polling 失败 type=%s", type(exc).__name__)
     if thread and thread.is_alive() and thread is not threading.current_thread():
         thread.join(timeout=timeout)
     if (

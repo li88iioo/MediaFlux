@@ -41,10 +41,12 @@ class RSSMediaDedupeUITests(unittest.TestCase):
         self.assertIn('.rss-entry-actions { grid-column: 2 / -1; width: 100%;', self.css)
 
     def test_subscription_modals_follow_mobile_visual_viewport(self) -> None:
-        self.assertIn('overflow-y: auto; overscroll-behavior: contain;', self.css)
-        self.assertIn('max-height: min(820px, calc(100dvh - 28px - env(safe-area-inset-bottom)));', self.css)
+        overlay = self.css.split('.rss-sub-modal {', 1)[1].split('}', 1)[0]
+        self.assertIn('overflow: hidden;', overlay)
+        self.assertNotIn('overflow-y: auto;', overlay)
+        self.assertIn('max-height: min(820px, calc(100dvh - 28px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)));', self.css)
         self.assertIn('.subscription-modal { align-items: flex-start; padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); }', self.css)
-        self.assertIn('max-height: calc(100dvh - 16px - env(safe-area-inset-bottom));', self.css)
+        self.assertIn('max-height: calc(100dvh - 16px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));', self.css)
         self.assertNotIn('.subscription-modal-card { max-height: calc(100vh - 16px); }', self.css)
 
     def test_rss_lists_keep_cards_static_and_animate_numbers_only(self) -> None:

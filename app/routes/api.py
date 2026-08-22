@@ -1323,7 +1323,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
 
                 reset()
         except Exception as exc:
-            logger.warning(f"Telegram Bot 配置热更新失败: {exc}")
+            logger.warning("Telegram Bot 配置热更新失败 type=%s", type(exc).__name__)
         finally:
             bot_restart_ms = max(1, round((time.perf_counter() - bot_restart_started) * 1000))
     if "AGENT_ENABLED" in updates:
@@ -1365,7 +1365,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
             try:
                 manager.request_reconcile()
             except Exception as exc:
-                logger.warning(f"媒体反代配置热加载失败: {exc}")
+                logger.warning("媒体反代配置热加载失败 type=%s", type(exc).__name__)
     strm_keys = {key for key in updates if key.startswith("STRM_") or key.startswith("GY_STRM_")}
     organize_keys = {key for key in updates if key.startswith("GY_ORGANIZE_")}
     agent_patrol_keys = {

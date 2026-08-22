@@ -1088,7 +1088,9 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 16px;
+    padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+    overflow: hidden;
+    overscroll-behavior: contain;
     background: var(--overlay-strong);
     backdrop-filter: blur(10px) saturate(.92);
     -webkit-backdrop-filter: blur(10px) saturate(.92);
@@ -1096,7 +1098,8 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
 }
 .agent-model-picker-dialog {
     width: min(540px, 100%);
-    max-height: 80vh;
+    max-height: min(640px, calc(100vh - 32px));
+    max-height: min(640px, calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)));
     display: flex;
     flex-direction: column;
     border-radius: var(--modal-radius, 14px);
@@ -1161,9 +1164,11 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
 }
 .agent-model-picker-list {
     flex: 1;
-    min-height: 180px;
+    min-height: 0;
     max-height: 380px;
     overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
     padding: 10px 14px;
     display: flex;
     flex-direction: column;
@@ -1708,6 +1713,21 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     .metadata-card-head .ai-recognition-badge { width: auto; margin-bottom: 0; }
     .agent-settings-card-head { align-items: center; grid-template-columns: minmax(0, 1fr) auto; padding-inline: 12px; }
     .agent-settings-card-head .agent-settings-master-toggle { grid-column: 2; margin: 0; }
+}
+
+@media (max-width: 560px) {
+    .agent-model-picker-modal {
+        padding: max(8px, env(safe-area-inset-top, 0px)) max(8px, env(safe-area-inset-right, 0px)) max(8px, env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px));
+    }
+    .agent-model-picker-dialog {
+        width: 100%;
+        max-height: calc(100vh - 16px);
+        max-height: calc(100dvh - 16px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    }
+    .agent-model-picker-head,
+    .agent-model-picker-search-bar { padding-inline: 16px; }
+    .agent-model-picker-search-bar { align-items: stretch; flex-direction: column; gap: 8px; }
+    .agent-model-count-badge { white-space: normal; }
 }
 @media (prefers-reduced-motion: reduce) {
     .settings-page .settings-savebar .btn.is-saving svg { animation: none; }

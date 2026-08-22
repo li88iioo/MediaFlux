@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from app.clients.guangya import GuangYaFile
 from app.modules.naming import build_context, render_template
-from app.modules.organize import OrganizeRules, Organizer
+from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
 from app.modules.scraper import MatchResult
 from tests.support import IsolatedDatabaseTestCase, release_parse_result
 
@@ -87,6 +87,12 @@ class MovieFolderNamingTests(unittest.TestCase):
             "8-bit",
             Organizer._extract_media_info("Movie.1080p.HEVC.8bit.AAC.mkv"),
         )
+        self.assertEqual(
+            Organizer._extract_media_info(
+                "Show.S01E01.WEB-DL.1080p.H264.AAC.2.0.mkv"
+            ),
+            "WEB-DL.1080p.H.264.AAC.2.0",
+        )
 
     def test_movie_uses_dedicated_tmdb_directory_and_media_suffix(self):
         rules = OrganizeRules(
@@ -134,7 +140,7 @@ class MovieFolderNamingTests(unittest.TestCase):
             plan.target_path,
             "动漫/约会大作战 (2013) {tmdb-46004}/Season 5",
         )
-        self.assertEqual(plan.new_name, "约会大作战.2013.S05E12-1080p.H.264.AAC.mp4")
+        self.assertEqual(plan.new_name, "约会大作战.2013.S05E12-WEB-DL.1080p.H.264.AAC.mp4")
         match = plan.match
         self.assertEqual(organizer.build_season_dir(match, {"season": 0}), "Specials")
         self.assertEqual(
@@ -256,7 +262,23 @@ class MediaProbeTests(unittest.TestCase):
         self.assertEqual(profile.video_bitrate_bps, 0)
         self.assertEqual(profile.overall_bitrate_bps, 8_000_000)
         self.assertEqual(profile.bitrate_source, "container")
-        self.assertEqual(profile.render(), "WEBRip.1080p.H.264")
+        self.assertEqual(profile.render(), "WEBRip.1080p.H.264.8Mbps")
+
+    def test_ffprobe_profile_merges_missing_fields_from_filename_evidence(self):
+        from app.modules.media_probe import parse_ffprobe_payload
+
+        profile = parse_ffprobe_payload({
+            "streams": [{
+                "codec_type": "video", "codec_name": "hevc",
+                "width": 3840, "height": 2160,
+            }],
+        }, source_hint="Movie.2026.Remux.DoVi.2160p.HEVC.10bit.mkv")
+
+        self.assertEqual(profile.source, "Remux")
+        self.assertEqual(profile.dynamic_range, "DoVi")
+        self.assertEqual(profile.bit_depth, "10-bit")
+        self.assertEqual(profile.video_codec, "H.265")
+        self.assertEqual(profile.render(), "Remux.2160p.DoVi.H.265.10-bit")
 
     def test_ffprobe_payload_detects_explicit_dolby_vision_and_atmos(self):
         from app.modules.media_probe import parse_ffprobe_payload
@@ -324,6 +346,85 @@ class MediaProbeTests(unittest.TestCase):
         profile = parse_ffprobe_payload({"streams":[{"codec_type":"video","codec_name":"hevc","width":3840,"height":2160}]})
         self.assertEqual(profile.render(), "2160p.H.265")
 
+class MediaSourceConsensusTests(unittest.TestCase):
+    @staticmethod
+    def _plan(file: GuangYaFile, source: str, episode: int, *, season: int = 1):
+        match = MatchResult(
+            tmdb_id="236000", title="筋肉人：完美超人始祖篇",
+            year="2024", media_type="tv", confidence=1.0,
+        )
+        return OrganizePlan(
+            file_id=file.file_id, original_name=file.name, original_path=source,
+            original_parent_id=file.parent_id, size=file.size, etag=file.etag,
+            match=match, season=season, episode=episode, action="move",
+        )
+
+    def _prepare(self, files):
+        from app.modules.media_probe import MediaProfile
+
+        organizer = Organizer(client=object(), scraper=object())
+        rules = OrganizeRules(media_info_enabled=True)
+        plans = [self._plan(file, "incoming", index + 1) for index, file in enumerate(files)]
+        by_id = {file.file_id: file for file in files}
+        for plan in plans:
+            organizer._apply_media_profile_to_move_plan(
+                plan, by_id[plan.file_id], rules, plan.match,
+                {"season": plan.season, "episode": plan.episode},
+                MediaProfile(resolution="1080p", video_codec="H.264"),
+            )
+        return organizer, rules, plans, by_id
+
+    def test_consistent_same_parent_season_source_fills_unknown_episode(self):
+        files = [
+            GuangYaFile("1", "Show.S01E01.WEB-DL.mkv", False, 100, "e1", "parent"),
+            GuangYaFile("2", "Show.S01E02.WEB-DL.mkv", False, 100, "e2", "parent"),
+            GuangYaFile("3", "Show.S01E03.mkv", False, 100, "e3", "parent"),
+        ]
+        organizer, rules, plans, by_id = self._prepare(files)
+        stats = {}
+
+        organizer._apply_media_source_consensus(plans, by_id, rules=rules, stats=stats)
+
+        self.assertEqual(plans[2].media_profile.source, "WEB-DL")
+        self.assertIn("WEB-DL.1080p.H.264", plans[2].new_name)
+        self.assertEqual(stats["media_source_consensus_groups"], 1)
+        self.assertEqual(stats["media_source_consensus_items"], 1)
+
+    def test_conflicting_sources_do_not_fill_unknown_episode(self):
+        files = [
+            GuangYaFile("1", "Show.S01E01.WEB-DL.mkv", False, 100, "e1", "parent"),
+            GuangYaFile("2", "Show.S01E02.BluRay.mkv", False, 100, "e2", "parent"),
+            GuangYaFile("3", "Show.S01E03.mkv", False, 100, "e3", "parent"),
+        ]
+        organizer, rules, plans, by_id = self._prepare(files)
+        stats = {}
+
+        organizer._apply_media_source_consensus(plans, by_id, rules=rules, stats=stats)
+
+        self.assertEqual(plans[2].media_profile.source, "")
+        self.assertEqual(stats["media_source_consensus_groups"], 0)
+        self.assertEqual(stats["media_source_consensus_items"], 0)
+
+    def test_disabled_probe_does_not_mark_background_completion_pending(self):
+        file = GuangYaFile(
+            "1", "Show.S01E01.WEB-DL.mkv", False, 100, "e1", "parent",
+        )
+        organizer, _rules, plans, by_id = self._prepare([file])
+
+        organizer._probe_move_plan_profiles(
+            plans,
+            by_id,
+            {},
+            cache_prefetched=False,
+            rules=OrganizeRules(media_info_enabled=True, media_probe_enabled=False),
+            automatic=False,
+            cache_only=False,
+            stats={},
+        )
+
+        self.assertFalse(plans[0].media_probe_pending)
+
+
 class ManualCorrectionNotificationTests(unittest.TestCase):
     def test_manual_result_sends_media_event_with_target_directory(self):
         from app.modules.organize_correction import CorrectionItem, OrganizeCorrectionService
@@ -378,11 +479,11 @@ class StrmChangeLedgerIntegrationTests(IsolatedDatabaseTestCase):
                 self.assertEqual(stats["changes"], [{
                     "action": "generated",
                     "directory": "根目录",
-                    "filename": "电影.mkv.strm",
+                    "filename": "电影.strm",
                     "error": "",
                 }])
                 self.assertNotIn(root, str(stats["changes"]))
-                self.assertTrue((Path(root) / STRM_SUBDIR / "电影.mkv.strm").is_file())
+                self.assertTrue((Path(root) / STRM_SUBDIR / "电影.strm").is_file())
         finally:
             from app import database as db
             rows = db.list_strm_index(f"guangya:{source_id}")
@@ -440,7 +541,7 @@ class StrmSchedulerDetailNotificationTests(unittest.TestCase):
         stats = {"changes": [{
             "action": "generated",
             "directory": "电影/测试<&>",
-            "filename": "测试<&>.mkv.strm",
+            "filename": "测试<&>.strm",
         }]}
         sent = []
         with patch.object(scheduler, "get_bool", return_value=True), patch.object(

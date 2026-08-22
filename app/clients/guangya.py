@@ -9,6 +9,7 @@ token 持久化于运行数据目录的 guangya_token.json。
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import math
 import os
@@ -28,7 +29,7 @@ from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
 from app.config import PATHS
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.process_lock import CrossProcessLock
 from app.private_files import protect_private_file
 
@@ -233,7 +234,7 @@ def _load_raw():
             from guangyaclient import GuangyaClient as _C
             _RawClient = _C
         except ImportError as e:
-            logger.error(f"未安装 guangyaclient: {e}，光鸭功能不可用")
+            logger.error("未安装 guangyaclient，光鸭功能不可用 type=%s", type(e).__name__)
             raise
     return _RawClient
 
@@ -651,7 +652,7 @@ class GuangYaClient:
                         self._last_persisted_token = str(access or "")
                         _log_token_loaded(self._credential_fingerprint)
                 except Exception as e:
-                    logger.warning(f"加载光鸭 token 失败: {e}")
+                    logger.warning("加载光鸭 token 失败 type=%s", type(e).__name__)
 
     def _cleanup_token_temp_files(self) -> None:
         pattern = f".{self.token_file.name}.*.tmp"
@@ -979,9 +980,14 @@ class GuangYaClient:
                 metrics = self._active_read_metrics()
                 if metrics is not None:
                     metrics.record_retry(status_code)
-                logger.warning(
-                    "光鸭只读请求瞬时失败，准备重试 operation=%s status=%s error=%s",
-                    operation, status_code or "network", type(exc).__name__,
+                log_throttled(
+                    logger,
+                    logging.WARNING,
+                    f"guangya-read-retry:{operation}:{status_code or 'network'}:{type(exc).__name__}",
+                    "光鸭只读请求瞬时失败，准备重试 operation=%s status=%s type=%s",
+                    operation,
+                    status_code or "network",
+                    type(exc).__name__,
                 )
                 if status_code == 401:
                     if deadline is not None:
@@ -1088,7 +1094,7 @@ class GuangYaClient:
                 self._install_refresh_hook()
                 self._write_token_locked()
                 self._advance_credentials_after_rotation()
-        logger.info(f"光鸭登录成功: {phone}")
+        logger.info("光鸭登录成功 phone=%s****%s", phone[:3], phone[-4:])
         return True
 
     def refresh_now(self) -> dict:
@@ -1159,7 +1165,7 @@ class GuangYaClient:
             self.refresh_now()
             return True
         except Exception as e:
-            logger.error(f"光鸭 token 刷新失败: {e}")
+            logger.error("光鸭 token 刷新失败 type=%s", type(e).__name__)
             return False
 
     def validate(self) -> bool:
@@ -1274,7 +1280,7 @@ class GuangYaClient:
         res = self._call_read("file_info", lambda: self.raw.fs_detail(file_id))
         payload = _detail_file_payload(res)
         if not payload:
-            logger.warning(f"光鸭文件详情缺少有效 fileInfo: {file_id}")
+            logger.debug("光鸭文件详情缺少有效 fileInfo file=%s", file_id)
             return None
         return _to_file(payload)
 
@@ -1538,7 +1544,7 @@ class GuangYaClient:
                 "ok": False, "task_ids": task_ids, "batch_count": 0,
                 "error": error, "response": payload,
             }
-        logger.info(f"光鸭离线任务已创建: {url[:60]} → {target_dir_id}")
+        logger.info("光鸭离线任务已创建 type=%s target=%s", task_type, target_dir_id)
         return {
             "ok": True, "task_ids": task_ids, "batch_count": 1,
             "error": "", "response": payload,
@@ -1764,8 +1770,12 @@ class GuangYaClient:
                 return res.get("signedURL") or res.get("download_url") or res.get("url") or ""
             return str(res) if res else None
         except Exception as exc:
-            logger.error(
-                "光鸭获取直链失败 file=%s error=%s", file_id, type(exc).__name__
+            log_throttled(
+                logger,
+                logging.ERROR,
+                f"guangya-download-url:{type(exc).__name__}",
+                "光鸭获取直链失败 type=%s",
+                type(exc).__name__,
             )
             if raise_timeout and self._is_timeout_error(exc):
                 raise TimeoutError("光鸭获取媒体直链超时") from exc

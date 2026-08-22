@@ -1,6 +1,7 @@
 """服务聚合层：媒体服务器看板、客户端工厂。"""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import unicodedata
@@ -13,7 +14,7 @@ from app.clients.base import DashboardData, MediaServerClient
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.config import get, get_bool, get_int
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 
 logger = get_logger(__name__)
 
@@ -43,7 +44,10 @@ def build_automation_summary() -> dict:
     try:
         summary = {**_empty_automation_summary(), **db.get_dashboard_automation_summary()}
     except Exception as exc:
-        logger.warning(f"读取看板自动化状态失败: {exc}")
+        log_throttled(
+            logger, logging.WARNING, f"dashboard-automation:{type(exc).__name__}",
+            "读取看板自动化状态失败 type=%s", type(exc).__name__,
+        )
         return _empty_automation_summary(error="自动化状态暂不可用")
     issue_fields = (
         ("downloads", "downloads_review"),

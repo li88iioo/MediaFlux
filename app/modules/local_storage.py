@@ -11,6 +11,7 @@ from typing import Iterable
 
 from app.modules.local_path_mapping import PathMappingError, assert_within
 from app.modules.organize import METADATA_EXTS, VIDEO_EXTS
+from app.modules.subtitle_identity import plan_subtitle_companions
 
 
 class LocalStorageError(RuntimeError):
@@ -67,6 +68,13 @@ class LocalFileSnapshot:
     @property
     def identity(self) -> tuple[int, int, int, int]:
         return self.size, self.mtime_ns, self.device, self.inode
+
+
+@dataclass(frozen=True)
+class _SiblingMediaFile:
+    path: Path
+    name: str
+    file_id: str
 
 
 class LocalFilesystemAdapter:
@@ -146,34 +154,53 @@ class LocalFilesystemAdapter:
         return current
 
     def contains_video(self, path: Path | None = None) -> bool:
-        """有界检查路径是否包含可整理视频，用于目录条目与自动扫描预筛选。"""
+        """有界检查路径是否包含可整理视频；不可读与不存在必须显式报错。"""
         start = assert_within(Path(path) if path is not None else self.allowed_root, self.allowed_root)
         relative_parts = start.relative_to(self.allowed_root).parts
         if any(is_ignored_local_media_directory(part) for part in relative_parts):
             return False
-        if start.is_symlink():
+        try:
+            start_info = start.lstat()
+        except FileNotFoundError as exc:
+            raise LocalContentChanged(f"扫描路径不存在: {start.name}") from exc
+        except OSError as exc:
+            raise LocalStorageError(f"扫描路径暂时不可读: {start.name}") from exc
+        if stat_module.S_ISLNK(start_info.st_mode):
             return False
+
         def is_video(candidate: Path) -> bool:
+            if candidate.suffix.lower().lstrip(".") not in VIDEO_EXTS:
+                return False
             if self.is_temporary(candidate) or candidate.is_symlink():
                 return False
             try:
                 snapshot = self.snapshot(candidate)
             except (LocalStorageError, OSError):
                 return False
+            return snapshot.size >= self.min_video_size and snapshot.size > 0
+
+        if stat_module.S_ISREG(start_info.st_mode):
+            if self.is_temporary(start):
+                return False
+            snapshot = self.snapshot(start)
             return (
                 snapshot.role == "video"
                 and snapshot.size >= self.min_video_size
                 and snapshot.size > 0
             )
-
-        if start.is_file():
-            return is_video(start)
-        if not start.is_dir():
+        if not stat_module.S_ISDIR(start_info.st_mode):
             return False
+
+        walk_errors: list[OSError] = []
+
+        def record_walk_error(exc: OSError) -> None:
+            walk_errors.append(exc)
 
         base_depth = len(start.parts)
         scanned = 0
-        for current_root, dirs, files in os.walk(start, followlinks=False):
+        for current_root, dirs, files in os.walk(
+            start, followlinks=False, onerror=record_walk_error,
+        ):
             current = Path(current_root)
             depth = len(current.parts) - base_depth
             if depth > self.depth_limit:
@@ -189,6 +216,8 @@ class LocalFilesystemAdapter:
                     raise LocalScanLimitExceeded("目录文件数量超过安全上限")
                 if is_video(current / name):
                     return True
+        if walk_errors:
+            raise LocalStorageError(f"目录暂时不可完整读取: {start.name}") from walk_errors[0]
         return False
 
     def scan(self, path: Path | None = None) -> list[LocalFileSnapshot]:
@@ -200,7 +229,7 @@ class LocalFilesystemAdapter:
             raise LocalStorageError("禁止扫描符号链接")
         candidates: list[Path] = []
         if start.is_file():
-            candidates = [start]
+            candidates = self._single_video_candidates(start)
         elif start.is_dir():
             base_depth = len(start.parts)
             for current_root, dirs, files in os.walk(start, followlinks=False):
@@ -235,6 +264,48 @@ class LocalFilesystemAdapter:
                 continue
             snapshots.append(snapshot)
         return snapshots
+
+    def _single_video_candidates(self, video: Path) -> list[Path]:
+        """单视频任务只附带能唯一匹配该视频的同级字幕。"""
+        if self.role_for(video) != "video":
+            return [video]
+        try:
+            entries = sorted(video.parent.iterdir(), key=lambda item: item.name.casefold())
+        except OSError:
+            return [video]
+
+        videos: list[_SiblingMediaFile] = []
+        subtitles: list[_SiblingMediaFile] = []
+        for candidate in entries:
+            if self.is_temporary(candidate):
+                continue
+            try:
+                info = candidate.lstat()
+            except OSError:
+                continue
+            if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
+                continue
+            if info.st_size <= 0:
+                continue
+            role = self.role_for(candidate)
+            item = _SiblingMediaFile(
+                path=candidate,
+                name=candidate.name,
+                file_id=candidate.as_posix(),
+            )
+            if role == "video" and info.st_size >= self.min_video_size:
+                videos.append(item)
+            elif role == "subtitle":
+                subtitles.append(item)
+
+        selected_id = video.as_posix()
+        subtitle_result = plan_subtitle_companions(videos, subtitles)
+        matched = [
+            item.file.path
+            for item in subtitle_result.plans
+            if item.video_file_id == selected_id
+        ]
+        return [video, *matched]
 
     @staticmethod
     def same_filesystem(source: Path, target: Path) -> bool:

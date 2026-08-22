@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import threading
 from datetime import datetime, timedelta
@@ -10,7 +11,7 @@ from app import database as db
 from app.clients.guangya import GuangYaClient
 from app.clients.qbittorrent import QBittorrentClient, is_qb_torrent_complete
 from app.config import get
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.organize import OrganizeRules
 from app.modules.organize_tasks import get_organize_manager
 from app.notifier import NotificationEvent, send_event
@@ -25,6 +26,7 @@ _FAILED_STATES = {"failed", "error", "cancelled", "canceled", "invalid", -1}
 _QB_FAILED_STATES = {"error", "missingfiles"}
 _TRACKER_CURSOR_KEY = "download_tracker.active_cursor_id"
 _DEFAULT_MISSING_GRACE_SECONDS = 900
+_MAX_LOCAL_IMPORT_PROBE_ATTEMPTS = 8
 
 
 class DownloadTracker:
@@ -269,10 +271,17 @@ class DownloadTracker:
 
     def _start_local_import(self, row, task) -> None:
         # 新来源配置优先走持久化调度器；此处只上报完成事件，不执行文件写入。
-        from app.modules.local_media_scheduler import get_local_media_scheduler
+        from app.modules.local_media_scheduler import (
+            LocalMediaProbeRetryable,
+            get_local_media_scheduler,
+        )
 
         scheduler = get_local_media_scheduler()
-        local_task_id = scheduler.enqueue_completed_torrent(task, wake=False)
+        try:
+            local_task_id = scheduler.enqueue_completed_torrent(task, wake=False)
+        except LocalMediaProbeRetryable as exc:
+            self._record_local_import_probe_retry(row, task, exc)
+            return
         if local_task_id is not None:
             linked = db.link_download_request_to_local_media_task(
                 int(row["id"]), local_task_id, str(getattr(task, "content_path", "") or ""),
@@ -288,6 +297,32 @@ class DownloadTracker:
             "qB 完成任务未命中可整理的本地媒体内容 request=%s path=%s",
             int(row["id"]), content_path,
         )
+
+    def _record_local_import_probe_retry(self, row, task, error: Exception) -> None:
+        request_id = int(row["id"])
+        attempts = int(self._row_value(row, "local_import_attempts", 0) or 0) + 1
+        exhausted = attempts >= _MAX_LOCAL_IMPORT_PROBE_ATTEMPTS
+        timestamp = db.now()
+        message = str(error or "本地媒体路径暂时不可读")[:1000]
+        db.update_download_request(
+            request_id,
+            qb_content_path=str(getattr(task, "content_path", "") or ""),
+            local_import_status="failed" if exhausted else "pending",
+            local_import_attempts=attempts,
+            local_import_error=message,
+            local_import_started_at=self._row_value(row, "local_import_started_at", "") or timestamp,
+            local_import_completed_at=timestamp if exhausted else None,
+        )
+        if exhausted:
+            logger.error(
+                "qB 本地媒体路径连续 %s 次不可读，停止自动重试 request=%s error=%s",
+                attempts, request_id, message,
+            )
+        else:
+            logger.warning(
+                "qB 本地媒体路径暂时不可读，保留 pending 等待重试 request=%s attempt=%s/%s error=%s",
+                request_id, attempts, _MAX_LOCAL_IMPORT_PROBE_ATTEMPTS, message,
+            )
 
     @staticmethod
     def _settle_delay(attempt: int) -> int:
@@ -578,7 +613,10 @@ class DownloadTracker:
                 password=get("QB_PASSWORD"), api_key=get("QB_API_KEY"),
             ).list_torrents()
         except Exception as exc:
-            logger.warning("下载跟踪读取 qB 失败 type=%s", type(exc).__name__)
+            log_throttled(
+                logger, logging.WARNING, f"download-tracker-qb:{type(exc).__name__}",
+                "下载跟踪读取 qB 失败 type=%s", type(exc).__name__,
+            )
             return False, []
 
     @staticmethod
@@ -589,7 +627,10 @@ class DownloadTracker:
                 return False, []
             return True, client.list_offline_tasks()
         except Exception as exc:
-            logger.warning("下载跟踪读取光鸭失败 type=%s", type(exc).__name__)
+            log_throttled(
+                logger, logging.WARNING, f"download-tracker-guangya:{type(exc).__name__}",
+                "下载跟踪读取光鸭失败 type=%s", type(exc).__name__,
+            )
             return False, []
 
     @staticmethod
@@ -689,7 +730,10 @@ class DownloadTracker:
             try:
                 self.run_once()
             except Exception as exc:
-                logger.exception(f"下载跟踪检查失败: {exc}")
+                log_throttled(
+                    logger, logging.ERROR, f"download-tracker-loop:{type(exc).__name__}",
+                    "下载跟踪检查失败 type=%s", type(exc).__name__,
+                )
             self._wake_event.wait(timeout=30)
             self._wake_event.clear()
 

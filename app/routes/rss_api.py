@@ -280,5 +280,5 @@ def download_entry(eid: int, request: Request):
             return api_response(result, 400)
         return api_response({"success": True, "result": result})
     except Exception as e:
-        logger.error(f"RSS 下载失败 entry#{eid}: {e}")
+        logger.error("RSS 下载失败 entry=%s type=%s", eid, type(e).__name__)
         return api_error(str(e), 500)

@@ -129,6 +129,47 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(client.list_calls, 0)
         self.assertEqual(len(generated), 1)
 
+    def test_incremental_upsert_migrates_legacy_double_suffix_path(self):
+        source_id = "incremental-double-suffix"
+        source_key = f"guangya:{source_id}"
+        video = GuangYaFile("video", "Movie.mkv", False, 100, "etag", "target")
+        client = _IncrementalClient({video.file_id: video})
+        with tempfile.TemporaryDirectory() as root:
+            old_path = Path(root) / STRM_SUBDIR / "电影" / "Movie.mkv.strm"
+            old_path.parent.mkdir(parents=True)
+            payload = generate_strm(
+                video, "电影", "http://media.invalid", root
+            ).read_text(encoding="utf-8")
+            new_path = Path(root) / STRM_SUBDIR / "电影" / "Movie.strm"
+            new_path.unlink()
+            old_path.write_text(payload, encoding="utf-8")
+            db.upsert_strm_index(
+                source_key, video.file_id, video.etag, video.size, video.name,
+                str(old_path), self._fingerprint(old_path),
+            )
+
+            stats = sync_strm_incremental(
+                source_id,
+                [{
+                    "source_id": source_id, "kind": "video", "action": "upsert",
+                    "file_id": video.file_id, "rel_dir": "电影",
+                    "name": video.name, "etag": video.etag, "size": video.size,
+                    "parent_id": video.parent_id,
+                }],
+                "http://media.invalid", root, client=client,
+            )
+            row = db.list_strm_index(source_key)[0]
+            old_exists = old_path.exists()
+            new_exists = new_path.exists()
+            expected_new_path = str(new_path)
+
+        self.assertFalse(stats["fallback_required"])
+        self.assertEqual(stats["generated"], 1)
+        self.assertEqual(stats["cleaned"], 1)
+        self.assertFalse(old_exists)
+        self.assertTrue(new_exists)
+        self.assertEqual(row["strm_path"], expected_new_path)
+
     def test_incremental_rename_removes_old_index_and_old_local_file(self):
         source_id = "incremental-rename"
         source_key = f"guangya:{source_id}"
@@ -158,7 +199,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
                 "http://media.invalid", root, client=client,
             )
             rows = db.list_strm_index(source_key)
-            new_files = list((Path(root) / STRM_SUBDIR).rglob("New.mkv.strm"))
+            new_files = list((Path(root) / STRM_SUBDIR).rglob("New.strm"))
             old_exists = old_path.exists()
 
         self.assertFalse(stats["fallback_required"])
@@ -193,7 +234,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         source_key = f"guangya:{source_id}"
         winner = GuangYaFile("winner", "Movie.mkv", False, 300, "winner", source_id)
         with tempfile.TemporaryDirectory() as root:
-            target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+            target = Path(root) / STRM_SUBDIR / "Movie.strm"
             target.parent.mkdir(parents=True)
             target.write_text("old", encoding="utf-8")
             for file_id in ("old-a", "old-b"):

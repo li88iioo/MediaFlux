@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app import database as db
-from app.logger import get_logger, redact_sensitive_text
+from app.logger import get_logger, log_throttled, redact_sensitive_text
 
 logger = get_logger(__name__)
 
@@ -207,7 +208,7 @@ class MediaProfile:
     def render(self) -> str:
         return ".".join(value for value in (
             self.source, self.resolution, self.dynamic_range, self.video_codec, self.bit_depth,
-            _render_bitrate(self.video_bitrate_bps), self.fps,
+            _render_bitrate(self.video_bitrate_bps or self.overall_bitrate_bps), self.fps,
             self.audio_codec, self.audio_channels,
         ) if value)
 
@@ -248,6 +249,108 @@ def infer_media_source(value: object) -> str:
         if re.search(pattern, text, flags=re.I):
             return label
     return ""
+
+
+def infer_media_profile(value: object) -> MediaProfile:
+    """从发布名/路径提取强证据，作为 ffprobe 缺失字段的无网络降级。"""
+    text = str(value or "")
+    lowered = text.casefold()
+    compact = re.sub(r"[^a-z0-9+]", "", lowered)
+    resolution = next(
+        (token for token in ("2160p", "1080p", "720p", "480p") if token in lowered),
+        "",
+    )
+    if "dolbyvision" in compact or "dovi" in compact:
+        dynamic_range = "DoVi"
+        dolby_vision: bool | None = True
+    elif "hdr10+" in lowered or "hdr10plus" in compact:
+        dynamic_range = "HDR10+"
+        dolby_vision = None
+    elif "hdr10" in compact:
+        dynamic_range = "HDR10"
+        dolby_vision = None
+    elif re.search(r"(?:^|[._ /-])hdr(?:[._ /-]|$)", lowered):
+        dynamic_range = "HDR"
+        dolby_vision = None
+    elif re.search(r"(?:^|[._ /-])sdr(?:[._ /-]|$)", lowered):
+        dynamic_range = "SDR"
+        dolby_vision = None
+    else:
+        dynamic_range = ""
+        dolby_vision = None
+
+    if any(token in compact for token in ("h265", "x265", "hevc")):
+        video_codec = "H.265"
+    elif any(token in compact for token in ("h264", "x264", "avc")):
+        video_codec = "H.264"
+    elif "av1" in compact:
+        video_codec = "AV1"
+    else:
+        video_codec = ""
+
+    bit_depth_match = re.search(
+        r"(?<!\d)(10|12|14|16)\s*[-_. ]?\s*bit(?:s)?(?!\d)",
+        lowered,
+        re.I,
+    )
+    fps_match = re.search(r"(?<!\d)(\d{2}(?:\.\d+)?)\s*fps", lowered)
+    audio_codec = ""
+    for pattern, label in (
+        (r"truehd", "TrueHD"), (r"e-?ac-?3|eac3|ddp", "EAC3"),
+        (r"dts-?hd", "DTS-HD"), (r"dts", "DTS"),
+        (r"flac", "FLAC"), (r"aac", "AAC"), (r"ac-?3", "AC3"),
+    ):
+        if re.search(pattern, lowered):
+            audio_codec = label
+            break
+    channel_match = re.search(r"(?<!\d)([257]\.1|[12]\.0)(?!\d)", lowered)
+    atmos_evidence = re.sub(r"non[^a-z0-9]*atmos", "", lowered, flags=re.I)
+    atmos = True if (
+        re.search(r"(?:^|[^a-z0-9])atmos(?:[^a-z0-9]|$)", atmos_evidence)
+        or re.search(r"(?:^|[^a-z0-9])joc(?:[^a-z0-9]|$)", atmos_evidence)
+    ) else None
+    return MediaProfile(
+        resolution=resolution,
+        dynamic_range=dynamic_range,
+        video_codec=video_codec,
+        bit_depth=(f"{bit_depth_match.group(1)}-bit" if bit_depth_match else ""),
+        fps=(f"{fps_match.group(1)}fps" if fps_match else ""),
+        audio_codec=audio_codec,
+        audio_channels=(channel_match.group(1) if channel_match and audio_codec else ""),
+        source=infer_media_source(text),
+        dolby_vision=dolby_vision,
+        atmos=atmos,
+    )
+
+
+def merge_media_profiles(
+    primary: MediaProfile | None, fallback: MediaProfile | None,
+) -> MediaProfile:
+    """逐字段合并媒体证据；探测结果优先，发布名仅补空缺。"""
+    preferred = primary or MediaProfile()
+    secondary = fallback or MediaProfile()
+    return MediaProfile(
+        resolution=preferred.resolution or secondary.resolution,
+        dynamic_range=preferred.dynamic_range or secondary.dynamic_range,
+        video_codec=preferred.video_codec or secondary.video_codec,
+        bit_depth=preferred.bit_depth or secondary.bit_depth,
+        fps=preferred.fps or secondary.fps,
+        audio_codec=preferred.audio_codec or secondary.audio_codec,
+        audio_channels=preferred.audio_channels or secondary.audio_channels,
+        source=preferred.source or secondary.source,
+        dolby_vision=(
+            preferred.dolby_vision
+            if preferred.dolby_vision is not None else secondary.dolby_vision
+        ),
+        atmos=preferred.atmos if preferred.atmos is not None else secondary.atmos,
+        video_bitrate_bps=(
+            preferred.video_bitrate_bps or secondary.video_bitrate_bps
+        ),
+        overall_bitrate_bps=(
+            preferred.overall_bitrate_bps or secondary.overall_bitrate_bps
+        ),
+        bitrate_source=preferred.bitrate_source or secondary.bitrate_source,
+    )
 
 
 def _resolution(width, height) -> str:
@@ -366,7 +469,7 @@ def parse_ffprobe_payload(payload: dict, *, source_hint: object = "") -> MediaPr
     format_info = format_info if isinstance(format_info, dict) else {}
     video_bitrate = _positive_int(video.get("bit_rate"))
     overall_bitrate = _positive_int(format_info.get("bit_rate"))
-    return MediaProfile(
+    probed = MediaProfile(
         resolution=_resolution(video.get("width"), video.get("height")),
         dynamic_range=dynamic,
         video_codec=codec,
@@ -374,13 +477,13 @@ def parse_ffprobe_payload(payload: dict, *, source_hint: object = "") -> MediaPr
         fps=_fps(video.get("avg_frame_rate") or video.get("r_frame_rate")),
         audio_codec=audio_codec,
         audio_channels=channel_text,
-        source=infer_media_source(source_hint),
         video_bitrate_bps=video_bitrate,
         overall_bitrate_bps=overall_bitrate,
         bitrate_source="video_stream" if video_bitrate else ("container" if overall_bitrate else ""),
         dolby_vision=dolby_vision,
         atmos=atmos,
     )
+    return merge_media_profiles(probed, infer_media_profile(source_hint))
 
 
 def media_profile_from_cache(
@@ -394,9 +497,10 @@ def media_profile_from_cache(
             return None
         profile = MediaProfile(**data)
         if source_hint is not None:
-            # 来源标签来自当前路径而非媒体比特流。内容指纹缓存可以跨 file_id
-            # 复用规格，但不能把旧文件名中的 WEB-DL/Remux 等标签带到新名称。
-            profile = replace(profile, source=infer_media_source(source_hint))
+            # 来源/发布标签来自当前路径而非媒体比特流。内容指纹缓存可以跨
+            # file_id 复用技术规格，但不能把旧文件名证据带到新名称。
+            profile = replace(profile, source="")
+            profile = merge_media_profiles(profile, infer_media_profile(source_hint))
         return profile
     except (TypeError, ValueError):
         return None
@@ -428,9 +532,9 @@ def _read_probe_cache(
             allow_fingerprint_fallback=allow_fingerprint_fallback,
         )
     except Exception as exc:
-        logger.warning(
-            "读取媒体探测缓存失败 file=%s type=%s",
-            str(file_id or "")[:96], type(exc).__name__,
+        log_throttled(
+            logger, logging.WARNING, f"media-probe-cache-read:{type(exc).__name__}",
+            "读取媒体探测缓存失败 type=%s", type(exc).__name__,
         )
         return ""
 
@@ -443,9 +547,9 @@ def _write_success_cache(file_id: str, etag: str, size: int, profile: MediaProfi
             json.dumps(asdict(profile), ensure_ascii=False),
         )
     except Exception as exc:
-        logger.warning(
-            "写入媒体探测成功缓存失败 file=%s type=%s",
-            str(file_id or "")[:96], type(exc).__name__,
+        log_throttled(
+            logger, logging.WARNING, f"media-probe-cache-write:{type(exc).__name__}",
+            "写入媒体探测成功缓存失败 type=%s", type(exc).__name__,
         )
 
 
@@ -460,9 +564,9 @@ def _write_failure_cache(file, reason: str, ttl_seconds: int = 600) -> None:
             str(file.file_id), str(file.etag or ""), int(file.size or 0), payload,
         )
     except Exception as exc:
-        logger.warning(
-            "写入媒体探测失败缓存失败 file=%s type=%s",
-            str(getattr(file, "file_id", "") or ""), type(exc).__name__,
+        log_throttled(
+            logger, logging.WARNING, f"media-probe-failure-cache:{type(exc).__name__}",
+            "写入媒体探测失败缓存失败 type=%s", type(exc).__name__,
         )
 
 
@@ -708,16 +812,21 @@ def probe_media_profile(
 
     ttl_seconds = 600 if last_reason == "timeout" else 60 if last_reason == "download_url_unavailable" else 120
     _write_failure_cache(file, last_reason, ttl_seconds=ttl_seconds)
-    logger.warning(
-        "媒体探测失败 file=%s name=%s reason=%s returncode=%s attempts=%s elapsed=%.2fs detail=%s",
-        str(getattr(file, "file_id", "") or ""),
-        redact_sensitive_text(str(getattr(file, "name", "") or ""))[:160],
-        last_reason,
-        last_returncode if last_returncode is not None else "-",
-        attempts,
-        time.monotonic() - started,
-        last_detail or "-",
-    )
+    if last_reason == "ffprobe_missing":
+        log_throttled(
+            logger, logging.WARNING, "media-probe-ffprobe-missing",
+            "媒体探测不可用：未找到 ffprobe 可执行文件",
+        )
+    else:
+        logger.debug(
+            "媒体探测失败 file=%s reason=%s returncode=%s attempts=%s elapsed=%.2fs detail=%s",
+            str(getattr(file, "file_id", "") or ""),
+            last_reason,
+            last_returncode if last_returncode is not None else "-",
+            attempts,
+            time.monotonic() - started,
+            last_detail or "-",
+        )
     return None
 
 
@@ -913,10 +1022,16 @@ def probe_local_media_profile(
         reason = type(exc).__name__
 
     _write_failure_cache(cache_file, reason, ttl_seconds=300)
-    logger.warning(
-        "本地媒体探测失败 file=%s reason=%s elapsed=%.2fs",
-        redact_sensitive_text(media_path.name)[:160],
-        reason,
-        time.monotonic() - started,
-    )
+    if reason == "ffprobe_missing":
+        log_throttled(
+            logger, logging.WARNING, "local-media-probe-ffprobe-missing",
+            "本地媒体探测不可用：未找到 ffprobe 可执行文件",
+        )
+    else:
+        logger.debug(
+            "本地媒体探测失败 file=%s reason=%s elapsed=%.2fs",
+            redact_sensitive_text(media_path.name)[:160],
+            reason,
+            time.monotonic() - started,
+        )
     return None

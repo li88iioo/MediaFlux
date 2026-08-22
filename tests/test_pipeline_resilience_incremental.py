@@ -82,6 +82,10 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(manual["status"], "planned")
         self.assertEqual(automatic["status"], "requires_manual")
         self.assertIn("90%", automatic["reason"])
+        self.assertEqual(automatic["candidates"][0]["tmdb_id"], "1")
+        self.assertEqual(automatic["files"], [{"name": "Movie.2026.mkv"}])
+        self.assertTrue(automatic["snapshot_digest"])
+        self.assertTrue(automatic["rules_snapshot"])
 
     def test_high_confidence_legacy_match_without_status_remains_automatic(self):
         root, service, inspection = self._local_inspection(confidence=1.0)

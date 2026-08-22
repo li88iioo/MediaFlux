@@ -112,7 +112,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         source_id = f"unknown-{uuid.uuid4().hex}"
         video = GuangYaFile("video-1", "Movie.mkv", False, 1024, "etag-1", source_id)
         with tempfile.TemporaryDirectory() as root:
-            target = Path(root) / STRM_SUBDIR / "Movie.mkv.strm"
+            target = Path(root) / STRM_SUBDIR / "Movie.strm"
             target.parent.mkdir(parents=True)
             target.write_text("user-owned", encoding="utf-8")
 
@@ -132,7 +132,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root:
             target_dir = Path(root) / STRM_SUBDIR
             target_dir.mkdir(parents=True)
-            strm_target = target_dir / "Movie.mkv.strm"
+            strm_target = target_dir / "Movie.strm"
             nfo_target = target_dir / "Movie.nfo"
             poster_target = target_dir / "poster.jpg"
             strm_target.write_text("https://tgto.invalid/play/video-1", encoding="utf-8")
@@ -187,7 +187,7 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
                 }], "http://localhost:1258", root, client=_IncrementalClient(),
             )
             rows = db.list_strm_index(source_key)
-            new_paths = list((Path(root) / STRM_SUBDIR).rglob("New.mkv.strm"))
+            new_paths = list((Path(root) / STRM_SUBDIR).rglob("New.strm"))
 
             self.assertTrue(stats["fallback_required"])
             self.assertEqual(old_path.read_text(encoding="utf-8"), "user-owned")

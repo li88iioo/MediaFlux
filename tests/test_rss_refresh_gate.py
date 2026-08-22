@@ -312,9 +312,11 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
                 "error": RSS_REFRESH_BUSY_ERROR,
                 "busy": True,
             }
-            with self.assertLogs("app.modules.rss_scheduler", level="INFO") as captured:
+            with self.assertLogs("app.modules.rss_scheduler", level="DEBUG") as captured:
                 scheduler._execute(7, "subscribe")
-        self.assertIn("刷新跳过", "\n".join(captured.output))
+        output = "\n".join(captured.output)
+        self.assertIn("刷新跳过", output)
+        self.assertNotIn("WARNING", output)
 
 
 class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):

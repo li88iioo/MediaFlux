@@ -8,8 +8,8 @@ from unittest.mock import Mock, patch
 
 from app import database as db
 from app.clients.qbittorrent import TorrentTask
-from app.modules.local_media_scheduler import LocalMediaScheduler
-from app.modules.local_storage import LocalFilesystemAdapter
+from app.modules.local_media_scheduler import LocalMediaProbeRetryable, LocalMediaScheduler
+from app.modules.local_storage import LocalFilesystemAdapter, LocalScanLimitExceeded
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -71,6 +71,47 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             )
 
             self.assertIsNone(task_id)
+            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+
+    def test_completed_torrent_missing_path_is_retryable(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            source = Path(root_raw) / "downloads"
+            source.mkdir()
+            db.create_local_media_source(
+                name="local", qb_profile="configured:qb", qb_path_prefix="/downloads",
+                local_root=str(source), stable_seconds=0, owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            with self.assertRaisesRegex(LocalMediaProbeRetryable, "扫描路径不存在"):
+                scheduler.enqueue_completed_torrent(
+                    self.torrent("/downloads/Movie.mkv", hash_value="mount-late")
+                )
+
+            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+
+    def test_completed_torrent_scan_limit_is_retryable(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            source = Path(root_raw) / "downloads"
+            source.mkdir()
+            movie = source / "Movie.mkv"
+            movie.write_bytes(b"movie")
+            db.create_local_media_source(
+                name="local", qb_profile="configured:qb", qb_path_prefix="/downloads",
+                local_root=str(source), stable_seconds=0, owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            with patch.object(
+                LocalFilesystemAdapter,
+                "contains_video",
+                side_effect=LocalScanLimitExceeded("目录文件数量超过安全上限"),
+            ):
+                with self.assertRaisesRegex(LocalMediaProbeRetryable, "目录文件数量超过安全上限"):
+                    scheduler.enqueue_completed_torrent(
+                        self.torrent("/downloads/Movie.mkv", hash_value="too-many")
+                    )
+
             self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
 
     def test_changed_snapshot_resets_stability_wait(self):
@@ -273,7 +314,66 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(result["candidate_count"], 1)
             self.assertEqual(result["queued_count"], 1)
             task = db.get_local_media_task(result["task_ids"][0], owner="admin")
-            self.assertEqual(Path(task.content_path), media_dir)
+            self.assertEqual(Path(task.content_path), media_dir / "Movie.2026.mkv")
+
+    def test_manual_scan_splits_mixed_collection_into_independent_media_units(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "downloads"
+            target_root = root / "library"
+            source_root.mkdir()
+            target_root.mkdir()
+
+            loose_root = source_root / "Loose.Movie.2026.mkv"
+            loose_root.write_bytes(b"movie")
+            movie_dir = source_root / "Movie (2026)"
+            movie_dir.mkdir()
+            (movie_dir / "Movie.2026.mkv").write_bytes(b"movie")
+
+            anime = source_root / "动漫"
+            anime.mkdir()
+            loose_anime = anime / "Loose.Anime.S01E03.mkv"
+            loose_anime.write_bytes(b"episode")
+            show_a = anime / "Show A (2026) {tmdb-101}"
+            show_b = anime / "Show B (2026) {tmdb-102}"
+            (show_a / "Season 01").mkdir(parents=True)
+            (show_b / "Season 02").mkdir(parents=True)
+            (show_a / "Season 01" / "Show.A.S01E01.mkv").write_bytes(b"episode")
+            (show_b / "Season 02" / "Show.B.S02E02.mkv").write_bytes(b"episode")
+
+            wrapper = source_root / "Unsorted"
+            wrapped_show = wrapper / "Show C (2026)"
+            (wrapped_show / "Season 01").mkdir(parents=True)
+            (wrapped_show / "Season 01" / "Show.C.S01E04.mkv").write_bytes(b"episode")
+
+            source_id = db.create_local_media_source(
+                name="混合下载", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), enabled=False, scan_enabled=False,
+                stable_seconds=0, owner="admin",
+            )
+            db.upsert_local_library_target(
+                source_id, "default", str(target_root), owner="admin",
+            )
+
+            result = LocalMediaScheduler(service=FakeService()).enqueue_manual_scan_candidates()
+
+            expected = {
+                loose_root,
+                movie_dir / "Movie.2026.mkv",
+                loose_anime,
+                show_a / "Season 01" / "Show.A.S01E01.mkv",
+                show_b / "Season 02" / "Show.B.S02E02.mkv",
+                wrapped_show / "Season 01" / "Show.C.S01E04.mkv",
+            }
+            tasks = [
+                db.get_local_media_task(task_id, owner="admin")
+                for task_id in result["task_ids"]
+            ]
+            self.assertEqual(result["candidate_count"], len(expected))
+            self.assertEqual(result["queued_count"], len(expected))
+            self.assertEqual({Path(task.content_path) for task in tasks}, expected)
+            self.assertNotIn(anime, {Path(task.content_path) for task in tasks})
+            self.assertNotIn(wrapper, {Path(task.content_path) for task in tasks})
 
     def test_manual_scan_skips_preview_and_missing_targets_without_false_errors(self):
         with tempfile.TemporaryDirectory() as root_raw:

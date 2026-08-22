@@ -19,6 +19,7 @@ from app.modules.naming import build_context
 from app.modules.nsfw import (
     MetaTubeClient,
     MetaTubeError,
+    MetaTubeMetadata,
     NsfwRecognizer,
     clear_nsfw_cache,
     clean_nsfw_release_text,
@@ -61,6 +62,23 @@ class FakeSession:
 
 
 class NsfwIdentifierTests(unittest.TestCase):
+    def test_display_title_does_not_repeat_existing_number_variants(self):
+        cases = (
+            ("SSIS-001", "SSIS-001 测试标题"),
+            ("SSIS-001", "【SSIS001】测试标题"),
+            ("SSIS-001", "Best Selection SSIS-001 Special"),
+            ("FC2-PPV-123456", "FC2PPV-123456 测试标题"),
+            ("1PONDO-012324-001", "012324_001 一本道测试"),
+        )
+        for number, title in cases:
+            with self.subTest(number=number, title=title):
+                metadata = MetaTubeMetadata(provider="test", external_id=number, number=number, title=title)
+                self.assertEqual(metadata.display_title, title)
+
+    def test_display_title_adds_number_when_title_does_not_contain_it(self):
+        metadata = MetaTubeMetadata(provider="test", external_id="ssis001", number="SSIS-001", title="测试标题")
+        self.assertEqual(metadata.display_title, "SSIS-001 测试标题")
+
     def test_extracts_common_identifiers_and_normalizes_variants(self):
         cases = {
             "www.example.com FC2 PPV 1234567 1080p.mp4": "FC2-PPV-1234567",

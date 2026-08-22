@@ -177,6 +177,28 @@ class OrganizeNotificationOutboxTests(IsolatedDatabaseTestCase):
         self.assertEqual(sent, ["整理完成"])
         self.assertEqual(count_pending_organize_notifications(), 0)
 
+    def test_cover_is_persisted_and_forwarded_by_outbox(self):
+        sent: list[tuple[str, str, str]] = []
+
+        def send_result(text, chat_id=None, *, image_url=""):
+            sent.append((text, str(chat_id or ""), image_url))
+            return TelegramSendResult(ok=True)
+
+        with patch("app.notifier.send_result", side_effect=send_result):
+            delivered = deliver_organize_notification(
+                "task:cover",
+                "整理完成",
+                chat_id="1",
+                image_url="https://image.example/poster.jpg",
+            )
+
+        self.assertTrue(delivered)
+        self.assertEqual(sent, [(
+            "整理完成", "1", "https://image.example/poster.jpg",
+        )])
+        row = dict(list_organize_notifications()[0])
+        self.assertEqual(row["image_url"], "https://image.example/poster.jpg")
+
     def test_temporary_failure_is_retried_and_not_duplicated(self):
         sent: list[str] = []
         with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=False, error="timeout")):

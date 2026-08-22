@@ -849,7 +849,7 @@ def _safe_submit(name: str, submitter, row, **kwargs) -> dict[str, Any]:
             return {"ok": False, "task_id": "", "error": f"{name} 返回结果无效"}
         return result
     except Exception as exc:
-        logger.exception(f"{name} 下载提交异常 request#{row['id']}: {exc}")
+        logger.exception("%s 下载提交异常 request=%s type=%s", name, row["id"], type(exc).__name__)
         return {"ok": False, "task_id": "", "error": str(exc) or f"{name} 提交异常"}
 
 

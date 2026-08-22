@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import time
+import threading
 from logging.handlers import TimedRotatingFileHandler
 
 from app.config import PATHS
@@ -26,8 +27,62 @@ _TELEBOT_CONFLICT_SUMMARY = (
     "请只保留一个 Bot 实例"
 )
 _TELEBOT_CONFLICT_LOG_INTERVAL_SECONDS = 300.0
+_TELEBOT_REPEAT_LOG_INTERVAL_SECONDS = 300.0
+_TELEBOT_POLLING_SUMMARIES = frozenset({
+    _TELEBOT_CONFLICT_SUMMARY,
+    "Telegram Bot 连接超时（ConnectTimeout），将在后台自动重试",
+    "Telegram Bot 读取超时（ReadTimeout），将在后台自动重试",
+    "Telegram Bot TLS/SSL 连接异常（SSL），将在后台自动重试",
+    "Telegram Bot 网络连接异常（ConnectionError），将在后台自动重试",
+})
 
 _configured = False
+_limiter_lock = threading.RLock()
+_limiter_state: dict[tuple[str, str], tuple[float, int]] = {}
+_LOG_LIMITER_MAX_KEYS = 2048
+
+
+def log_throttled(
+    logger: logging.Logger,
+    level: int,
+    key: str,
+    message: str,
+    *args: object,
+    interval_seconds: float = 300.0,
+    exc_info: object = None,
+) -> bool:
+    """按 logger/key 限流重复日志，并在下次输出时汇总被抑制数量。
+
+    首次立即输出；窗口内同键日志静默计数；窗口结束后的下一条会附带
+    ``期间已抑制 N 条重复日志``。返回值表示本次是否真正写入日志。
+    """
+    now = time.monotonic()
+    identity = (logger.name, str(key or message))
+    with _limiter_lock:
+        previous = _limiter_state.get(identity)
+        if previous is not None:
+            last_at, suppressed = previous
+            if now - last_at < max(0.0, float(interval_seconds)):
+                _limiter_state[identity] = (last_at, suppressed + 1)
+                return False
+        else:
+            suppressed = 0
+            if len(_limiter_state) >= _LOG_LIMITER_MAX_KEYS:
+                oldest = min(_limiter_state, key=lambda item: _limiter_state[item][0])
+                _limiter_state.pop(oldest, None)
+        _limiter_state[identity] = (now, 0)
+    if suppressed:
+        message = f"{message}（期间已抑制 %s 条重复日志）"
+        args = (*args, suppressed)
+    logger.log(level, message, *args, exc_info=exc_info)
+    return True
+
+
+def reset_log_limiter() -> None:
+    """清空进程内日志限流状态，供配置热更新和测试隔离使用。"""
+    with _limiter_lock:
+        _limiter_state.clear()
+
 
 def normalize_telebot_polling_error(value: object) -> str | None:
     """把 TeleBot 长轮询网络异常收敛为不含 URL、Token 和堆栈的单行摘要。"""
@@ -101,7 +156,20 @@ class _WindowsSafeTimedRotatingFileHandler(TimedRotatingFileHandler):
 class _RedactFilter(logging.Filter):
     def __init__(self) -> None:
         super().__init__()
-        self._last_telebot_conflict_at: float | None = None
+        self._telebot_lock = threading.Lock()
+        self._telebot_last_at: dict[str, float] = {}
+        self._telebot_suppressed: dict[str, int] = {}
+
+    def _allow_telebot_message(self, key: str, interval_seconds: float) -> tuple[bool, int]:
+        now = time.monotonic()
+        with self._telebot_lock:
+            last_at = self._telebot_last_at.get(key)
+            if last_at is not None and now - last_at < interval_seconds:
+                self._telebot_suppressed[key] = self._telebot_suppressed.get(key, 0) + 1
+                return False, 0
+            suppressed = self._telebot_suppressed.pop(key, 0)
+            self._telebot_last_at[key] = now
+            return True, suppressed
 
     def filter(self, record: logging.LogRecord) -> bool:
         raw_message = record.getMessage()
@@ -111,17 +179,28 @@ class _RedactFilter(logging.Filter):
             lowered = raw_message.casefold()
             if lowered.startswith("waiting for ") and " until retry" in lowered:
                 return False
-            normalized = normalize_telebot_polling_error(raw_message)
+            if lowered.startswith("starting your bot with username:"):
+                normalized = "Telegram Bot 正在建立轮询连接"
+                key = "polling_start"
+            elif lowered == "started polling.":
+                normalized = "Telegram Bot 轮询已启动"
+                key = "polling_started"
+            else:
+                normalized = normalize_telebot_polling_error(raw_message)
+                if normalized is None and raw_message in _TELEBOT_POLLING_SUMMARIES:
+                    normalized = raw_message
+                key = f"polling_error:{normalized}" if normalized else ""
             if normalized is not None:
-                if normalized == _TELEBOT_CONFLICT_SUMMARY:
-                    now = time.monotonic()
-                    if (
-                        self._last_telebot_conflict_at is not None
-                        and now - self._last_telebot_conflict_at
-                        < _TELEBOT_CONFLICT_LOG_INTERVAL_SECONDS
-                    ):
-                        return False
-                    self._last_telebot_conflict_at = now
+                interval = (
+                    _TELEBOT_CONFLICT_LOG_INTERVAL_SECONDS
+                    if normalized == _TELEBOT_CONFLICT_SUMMARY
+                    else _TELEBOT_REPEAT_LOG_INTERVAL_SECONDS
+                )
+                allowed, suppressed = self._allow_telebot_message(key, interval)
+                if not allowed:
+                    return False
+                if suppressed:
+                    normalized = f"{normalized}（期间已抑制 {suppressed} 条重复日志）"
                 record.msg = normalized
                 record.args = ()
                 record.exc_info = None

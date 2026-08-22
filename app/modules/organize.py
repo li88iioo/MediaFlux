@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 from decimal import Decimal
 import json
+import logging
 import re
 import threading
 import time
@@ -26,7 +27,7 @@ from app import database as db
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.config import get, get_bool, get_int
 from app.database import add_organize_log, add_organize_log_items, get_media_probe_cache
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.media_variant import MediaVariant, classify_variant, variants_can_coexist
 from app.modules.recognition_policy import (
     automatic_match_confirmation_message,
@@ -552,6 +553,9 @@ class OrganizePlan:
     # 追加在末尾以保持历史位置参数构造的语义兼容。
     source_group_id: str = ""
     source_group_path: str = ""
+    media_profile: object | None = field(default=None, repr=False, compare=False)
+    media_probe_complete: bool = False
+    media_probe_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -831,7 +835,10 @@ class Organizer:
                     key[0], key[1], strip_domains=key[2], timeout=key[3]
                 )
             except ValueError as exc:
-                logger.warning("MetaTube 配置无效，已跳过成人内容识别: %s", exc)
+                log_throttled(
+                    logger, logging.WARNING, f"metatube-config:{exc}",
+                    "MetaTube 配置无效，已跳过成人内容识别: %s", exc,
+                )
                 self._nsfw_recognizers[key] = None
         return self._nsfw_recognizers[key]
 
@@ -863,10 +870,10 @@ class Organizer:
         elif rules.add_kids and kids_match:
             main = "儿童节目"
         elif match.media_type == "movie":
+            # 动画电影仍属于电影；“动漫”专用于具有季集结构的动画剧集。
+            # 这样输出目录的分类语义与再次识别时的 movie/tv 语义保持一致。
             main = "电影"
-            if GENRE_ANIME in genres:
-                main = "动漫"
-            elif GENRE_DOC in genres:
+            if GENRE_DOC in genres:
                 main = "纪录片"
         else:
             main = "剧集"
@@ -942,7 +949,10 @@ class Organizer:
         try:
             return with_variant_tags(render_template(template, context))
         except ValueError as exc:
-            logger.warning(f"命名模板无效，回退旧规则: {exc}")
+            log_throttled(
+                logger, logging.WARNING, f"file-template:{exc}",
+                "命名模板无效，回退旧规则: %s", exc,
+            )
             if is_tv:
                 season = f"S{int(parsed['season']):02d}"
                 ep = f"E{int(parsed['episode']):02d}" if parsed.get("episode") else ""
@@ -972,7 +982,10 @@ class Organizer:
         try:
             return render_template(rules.show_dir_template, context)
         except ValueError as exc:
-            logger.warning(f"剧集目录模板无效，回退旧规则: {exc}")
+            log_throttled(
+                logger, logging.WARNING, f"show-template:{exc}",
+                "剧集目录模板无效，回退旧规则: %s", exc,
+            )
             return fallback.strip()
 
     def build_media_dir(self, match: MatchResult, rules: OrganizeRules | None = None) -> str:
@@ -996,7 +1009,10 @@ class Organizer:
         try:
             return render_template(rules.movie_dir_template, context)
         except ValueError as exc:
-            logger.warning(f"电影目录模板无效，回退默认规则: {exc}")
+            log_throttled(
+                logger, logging.WARNING, f"movie-template:{exc}",
+                "电影目录模板无效，回退默认规则: %s", exc,
+            )
             return fallback.strip()
 
     @staticmethod
@@ -1033,53 +1049,11 @@ class Organizer:
 
     @staticmethod
     def _extract_media_info(filename: str) -> str:
-        f = str(filename or "").lower()
-        compact = re.sub(r"[^a-z0-9+]", "", f)
-        tags: list[str] = []
-        for token in ("2160p", "1080p", "720p", "480p"):
-            if token in f:
-                tags.append(token)
-                break
-        if "dolbyvision" in compact or "dovi" in compact:
-            tags.append("DoVi")
-        elif "hdr10+" in f or "hdr10plus" in compact:
-            tags.append("HDR10+")
-        elif "hdr10" in compact:
-            tags.append("HDR10")
-        elif re.search(r"(?:^|[._ -])hdr(?:[._ -]|$)", f):
-            tags.append("HDR")
-        elif re.search(r"(?:^|[._ -])sdr(?:[._ -]|$)", f):
-            tags.append("SDR")
-        if any(token in compact for token in ("h265", "x265", "hevc")):
-            tags.append("H.265")
-        elif any(token in compact for token in ("h264", "x264", "avc")):
-            tags.append("H.264")
-        elif "av1" in compact:
-            tags.append("AV1")
-        # 在线 ffprobe 临时不可用时，仍从发布名保留明确位深证据。
-        # 8-bit 是常规默认值，不额外写入，避免历史媒体发生无意义重命名。
-        bit_depth = re.search(
-            r"(?<!\d)(10|12|14|16)\s*[-_. ]?\s*bit(?:s)?(?!\d)", f, re.I,
-        )
-        if bit_depth:
-            tags.append(f"{bit_depth.group(1)}-bit")
-        fps = re.search(r"(?<!\d)(\d{2}(?:\.\d+)?)\s*fps", f)
-        if fps:
-            tags.append(f"{fps.group(1)}fps")
-        audio = ""
-        for pattern, label in (
-            (r"truehd", "TrueHD"), (r"e-?ac-?3|eac3|ddp", "EAC3"),
-            (r"dts-?hd", "DTS-HD"), (r"dts", "DTS"),
-            (r"flac", "FLAC"), (r"aac", "AAC"), (r"ac-?3", "AC3"),
-        ):
-            if re.search(pattern, f):
-                audio = label
-                tags.append(label)
-                break
-        channel = re.search(r"(?<!\d)([257]\.1|[12]\.0)(?!\d)", f)
-        if channel and audio:
-            tags.append(channel.group(1))
-        return ".".join(tags)
+        # 与在线探测使用同一套结构化回退，确保 ffprobe 失败时仍保留
+        # WEB-DL/BluRay、分辨率、编码、音轨等文件名强证据。
+        from app.modules.media_probe import infer_media_profile
+
+        return infer_media_profile(filename).render()
 
     # ===== 覆盖策略 =====
     def should_replace(self, existing: GuangYaFile, new_file: GuangYaFile,
@@ -1697,6 +1671,9 @@ class Organizer:
             stats=stats,
             cancel_event=context.cancel_event,
         )
+        self._apply_media_source_consensus(
+            plans, source_files_by_id, rules=rules, stats=stats,
+        )
         subtitle_plans_by_video: dict[str, list] = {}
         for rel, candidates in companion_files.items():
             subtitles = [item for item in candidates if media_role(item.name) == "subtitle"]
@@ -2261,7 +2238,7 @@ class Organizer:
                 logger.info(f"整理联动 STRM: {result}")
                 stats["strm"] = result
             except Exception as e:
-                logger.error(f"联动 STRM 失败: {e}")
+                logger.error("联动 STRM 失败 type=%s", type(e).__name__)
                 stats["strm"] = {
                     "ok": False, "error_code": "strm_trigger_failed",
                     "error": f"STRM 联动启动失败: {str(e)[:300]}",
@@ -2545,15 +2522,19 @@ class Organizer:
                 ),
                 layout="relaxed",
             )
-            sections = [render_event(summary)]
-            sections.extend(
-                render_event(event)
-                for event in build_media_events(
-                    stats.get("media_items") or [], layout="relaxed",
-                    inventory_final=not bool(attention or stopped),
-                )
+            media_events = build_media_events(
+                stats.get("media_items") or [], layout="relaxed",
+                inventory_final=not bool(attention or stopped),
             )
+            sections = [render_event(summary)]
+            sections.extend(render_event(event) for event in media_events)
             summary_body = "\n\n".join(sections)
+            # 单一媒体身份可用同一张封面承载整条任务汇总；多个不同媒体
+            # 继续保持一条纯文本汇总，避免批量整理时连续刷出多张图片。
+            summary_image_url = (
+                str(media_events[0].image_url or "").strip()
+                if len(media_events) == 1 else ""
+            )
             # 汇总与媒体卡走持久化 outbox：临时网络失败可重试，已成功的
             # 事件不会因重试而重复发送。带按钮的待确认卡另有确认投递队列。
             from app.modules.organize_notification_outbox import (
@@ -2561,12 +2542,15 @@ class Organizer:
                 summary_idempotency_key,
             )
 
+            delivery_kwargs = {"chat_id": chat_id or ""}
+            if summary_image_url:
+                delivery_kwargs["image_url"] = summary_image_url
             summary_sent = bool(deliver_organize_notification(
                 summary_idempotency_key(
                     str(stats.get("task_id") or ""), chat_id=chat_id,
                 ),
                 summary_body,
-                chat_id=chat_id or "",
+                **delivery_kwargs,
             ))
 
             confirmation_failures = 0
@@ -2635,7 +2619,7 @@ class Organizer:
                 layout="relaxed",
             ), chat_id=chat_id or None)
         except Exception as exc:
-            logger.warning(f"整理通知失败: {exc}")
+            logger.warning("整理通知失败 type=%s", type(exc).__name__)
 
     @staticmethod
     def _notification_count_summary(counts: dict, *, compact: bool = False) -> str:
@@ -3650,6 +3634,7 @@ class Organizer:
                 cache_prefetched=media_probe_cache_prefetched,
                 budget=self._probe_budget,
             )
+        plan.media_probe_complete = media_profile is not None
         self._apply_media_profile_to_move_plan(
             plan, file, rules, match, parsed, media_profile,
         )
@@ -3692,11 +3677,23 @@ class Organizer:
         parsed: dict,
         media_profile,
     ) -> None:
-        """按媒体规格重算名称与版本身份，不改变已验证的归档路径。"""
-        media_info_override = media_profile.render() if media_profile else ""
+        """按字段合并探测与发布名证据，再重算名称和版本身份。"""
+        from app.modules.media_probe import infer_media_profile, merge_media_profiles
+
+        source_hint = "/".join(
+            part for part in (
+                str(plan.original_path or ""), str(plan.original_name or ""),
+                str(file.name or ""),
+            ) if part
+        )
+        effective_profile = merge_media_profiles(
+            media_profile, infer_media_profile(source_hint),
+        )
+        media_info_override = effective_profile.render()
+        plan.media_profile = effective_profile
         plan.season = parsed.get("season")
         plan.episode = parsed.get("episode")
-        plan.variant = classify_variant(file.name, media_profile or media_info_override)
+        plan.variant = classify_variant(file.name, effective_profile)
         variant_tags = plan.variant.filename_tags(rules)
         plan.variant_label = " / ".join(variant_tags) if variant_tags else "未识别版本"
         plan.variant_suffix = ".".join(variant_tags)
@@ -3711,8 +3708,68 @@ class Organizer:
             parsed,
             rules,
             media_info_override=media_info_override,
-            media_variant_override=media_profile,
+            media_variant_override=effective_profile,
         )
+
+    def _apply_media_source_consensus(
+        self,
+        plans: list[OrganizePlan],
+        source_files_by_id: dict[str, GuangYaFile],
+        *,
+        rules: OrganizeRules,
+        stats: dict,
+    ) -> None:
+        """同父目录、同媒体、同季的来源强证据一致时补齐未知集。"""
+        from app.modules.media_probe import MediaProfile, infer_media_source
+
+        groups: dict[tuple[str, str, int], list[OrganizePlan]] = {}
+        for plan in plans:
+            if (
+                plan.action != "move"
+                or plan.match is None
+                or plan.match.media_type != "tv"
+                or plan.season is None
+            ):
+                continue
+            identity = self._match_identity_key(plan.match)
+            if not identity:
+                continue
+            key = (str(plan.original_parent_id or ""), identity, int(plan.season))
+            groups.setdefault(key, []).append(plan)
+
+        applied_groups = 0
+        applied_items = 0
+        for group_plans in groups.values():
+            explicit_sources = [
+                infer_media_source(
+                    "/".join(part for part in (plan.original_path, plan.original_name) if part)
+                )
+                for plan in group_plans
+            ]
+            explicit_sources = [source for source in explicit_sources if source]
+            if len(explicit_sources) < 2 or len(set(explicit_sources)) != 1:
+                continue
+            consensus = explicit_sources[0]
+            changed = 0
+            for plan in group_plans:
+                file = source_files_by_id.get(str(plan.file_id or ""))
+                profile = plan.media_profile
+                if file is None or (profile is not None and getattr(profile, "source", "")):
+                    continue
+                effective = replace(
+                    profile if profile is not None else MediaProfile(),
+                    source=consensus,
+                )
+                self._apply_media_profile_to_move_plan(
+                    plan, file, rules, plan.match,
+                    {"season": plan.season, "episode": plan.episode}, effective,
+                )
+                changed += 1
+            if changed:
+                applied_groups += 1
+                applied_items += changed
+        stats["media_source_consensus_groups"] = applied_groups
+        stats["media_source_consensus_items"] = applied_items
 
     def _probe_move_plan_profiles(
         self,
@@ -3731,11 +3788,20 @@ class Organizer:
         stats["media_probe_online_candidates"] = 0
         stats["media_probe_online_profiles"] = 0
         stats["media_probe_elapsed_seconds"] = 0.0
-        if (
-            cache_only
-            or not rules.media_info_enabled
-            or not rules.media_probe_enabled
-        ):
+
+        def mark_pending() -> None:
+            for plan in plans:
+                if plan.action == "move" and plan.match is not None:
+                    plan.media_probe_pending = not plan.media_probe_complete
+
+        if not rules.media_info_enabled or not rules.media_probe_enabled:
+            # 用户显式关闭媒体详情或在线探测时必须保持关闭语义，不能在
+            # 整理完成后又由后台 worker 悄悄发起 ffprobe。
+            for plan in plans:
+                plan.media_probe_pending = False
+            return
+        if cache_only:
+            mark_pending()
             return
 
         candidates: list[GuangYaFile] = []
@@ -3750,6 +3816,7 @@ class Organizer:
             seen.add(file_id)
             candidates.append(file)
         if not candidates:
+            mark_pending()
             return
 
         from app.modules.media_probe import (
@@ -3781,8 +3848,6 @@ class Organizer:
             time.monotonic() - started, 3
         )
         stats["media_probe_online_profiles"] = len(profiles)
-        if not profiles:
-            return
 
         plans_by_file_id = {
             str(plan.file_id): plan
@@ -3795,9 +3860,11 @@ class Organizer:
             if plan is None or file is None or plan.match is None:
                 continue
             parsed = {"season": plan.season, "episode": plan.episode}
+            plan.media_probe_complete = True
             self._apply_media_profile_to_move_plan(
                 plan, file, rules, plan.match, parsed, profile,
             )
+        mark_pending()
 
     def _plan_one(
         self,
@@ -4925,6 +4992,13 @@ class Organizer:
         same_variant: list[GuangYaFile] = []
         coexist_count = 0
         for candidate in target_files:
+            # 归档目录被再次作为待整理来源时，目标列表可能包含计划文件自身。
+            # 自身绝不能参与版本替换，否则会把同一 file_id 当旧版本回收。
+            if (
+                plan.file_id
+                and str(candidate.file_id or "") == str(plan.file_id)
+            ):
+                continue
             if not self._same_media_identity(plan, candidate, rules):
                 continue
             existing_variant = self._existing_variant(
@@ -5086,6 +5160,17 @@ class Organizer:
                         target_id, target_files, evidence_names
                     )
                 _target_id, target_files, evidence_names = directory_cache[plan.target_path]
+                if (
+                    plan.original_parent_id
+                    and _target_id
+                    and str(plan.original_parent_id) == str(_target_id)
+                ):
+                    note = "文件已位于目标目录，未执行重复移动、覆盖或回收"
+                    plan.action = "skip"
+                    plan.conflict_decision = "already_organized"
+                    plan.conflict_note = note
+                    plan.note = note
+                    continue
                 existing, decision, note = self._resolve_variant_conflict(
                     plan, target_files, rules, evidence_names
                 )
@@ -5175,7 +5260,10 @@ class Organizer:
         if not callable(file_info):
             # 兼容只实现最小移动接口的自定义适配器；官方光鸭客户端始终
             # 提供 file_info，因此生产链路仍执行严格复核。
-            logger.warning("远端客户端不支持 file_info，无法执行写前快照复核")
+            log_throttled(
+                logger, logging.WARNING, "organize-client-file-info-missing",
+                "远端客户端不支持 file_info，无法执行写前快照复核",
+            )
             return expected
         try:
             current = file_info(expected.file_id)
@@ -5184,7 +5272,10 @@ class Organizer:
                 f"{role}状态复核失败，请刷新目录后重试"
             ) from exc
         if current is not None and not isinstance(current, GuangYaFile):
-            logger.warning("远端客户端 file_info 返回未知类型，无法执行写前快照复核")
+            log_throttled(
+                logger, logging.WARNING, "organize-client-file-info-invalid",
+                "远端客户端 file_info 返回未知类型，无法执行写前快照复核",
+            )
             return expected
         if current is None or current.is_dir:
             raise DirectoryScrapeConflictError(
@@ -5218,6 +5309,22 @@ class Organizer:
             log_id = add_organize_log(*log_args, **log_kwargs, _conn=conn)
             try:
                 add_organize_log_items(log_id, items, _conn=conn)
+                if len(log_args) >= 5 and str(log_args[4] or "") == "success":
+                    try:
+                        db.resolve_pending_organize_logs(
+                            str(log_args[0] or ""),
+                            str(log_args[3] or ""),
+                            before_log_id=log_id,
+                            _conn=conn,
+                        )
+                    except Exception as resolve_exc:
+                        # 前置待确认记录的展示结算不能反向污染已经成功的
+                        # 云端移动；时间线仍可通过兼容查询折叠旧记录。
+                        logger.warning(
+                            "结算人工确认前置日志失败 log_id=%s type=%s",
+                            log_id,
+                            type(resolve_exc).__name__,
+                        )
             except Exception as exc:
                 item_error = exc
                 try:
@@ -5437,7 +5544,7 @@ class Organizer:
                     ),
                 )
                 cleaned += 1
-                logger.info("清理空目录: %s", dir_id)
+                logger.debug("清理空目录: %s", dir_id)
             except Exception as exc:
                 delete_failures += 1
                 reason = " ".join(str(exc or type(exc).__name__).split())[:160]

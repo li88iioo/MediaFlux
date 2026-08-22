@@ -191,7 +191,7 @@ class OrganizeCorrectionService:
                 try:
                     prepared_deletes[log_id] = self._prepare_delete_group(log_id, confirm_text)
                 except Exception as exc:
-                    logger.error(f"剧集批量删除预检失败 log={log_id}: {exc}")
+                    logger.error("剧集批量删除预检失败 log=%s type=%s", log_id, type(exc).__name__)
                     return {
                         "success": False, "action": action, "requested": len(entries),
                         "completed": [], "failed": [{"log_id": log_id, "error": str(exc)}],
@@ -228,7 +228,7 @@ class OrganizeCorrectionService:
                 completed.append({"log_id": log_id, "result": result})
                 warnings.extend(result.get("warnings") or [])
             except Exception as exc:
-                logger.error(f"剧集批量操作失败 action={action} log={log_id}: {exc}")
+                logger.error("剧集批量操作失败 action=%s log=%s type=%s", action, log_id, type(exc).__name__)
                 failed.append({"log_id": log_id, "error": str(exc)})
         return {
             "success": not failed,
@@ -489,7 +489,7 @@ class OrganizeCorrectionService:
                     ),
                 )
             except Exception as exc:
-                logger.warning(f"清理本次纠偏创建的空目录失败 {dir_id}: {exc}")
+                logger.warning("清理本次纠偏创建的空目录失败 type=%s", type(exc).__name__)
 
     def _verify_targets_available(self, targets: list[tuple[CorrectionItem, str, str]],
                                   *, allow_group_file_ids: set[str] | None = None) -> None:

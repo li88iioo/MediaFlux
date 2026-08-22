@@ -252,6 +252,10 @@
         releaseHeight();
     }
 
+    function taskDisplayName(task) {
+        return task?.display_name || task?.content_name || '未命名';
+    }
+
     function taskRow(task) {
         const state = states[task.status] || [task.status, ''];
         const workflowAction = task.status === 'requires_manual'
@@ -264,7 +268,7 @@
         return `
             <tr data-task-row="${task.id}" class="${selected ? 'is-selected' : ''}">
                 <td class="lm-task-select-cell" data-label="选择"><input class="lm-task-row-select" type="checkbox" data-task-select="${task.id}" ${selected ? 'checked' : ''} ${task.clearable ? '' : 'disabled'} aria-label="${esc(selectTitle)}" title="${esc(selectTitle)}"></td>
-                <td class="lm-task-title" data-label="日志"><strong>${esc(task.content_name || '未命名')}</strong><span>${esc(task.error || task.warning || '')}</span></td>
+                <td class="lm-task-title" data-label="日志"><strong>${esc(taskDisplayName(task))}</strong><span>${esc(task.error || task.warning || '')}</span></td>
                 <td data-label="来源">${esc(task.source_name || '—')}</td>
                 <td data-label="触发">${esc(triggerLabels[task.trigger] || task.trigger || '—')}</td>
                 <td data-label="状态"><span class="status-pill ${state[1]}">${esc(state[0])}</span></td>
@@ -281,7 +285,7 @@
             if (!query) return true;
             const stateLabel = states[task.status]?.[0] || task.status || '';
             const haystack = [
-                task.content_name, task.source_name, task.trigger, triggerLabels[task.trigger],
+                task.display_name, task.content_name, task.source_name, task.trigger, triggerLabels[task.trigger],
                 task.status, stateLabel, task.error, task.warning, task.tmdb_id,
             ].filter(Boolean).join('\n').toLocaleLowerCase();
             return haystack.includes(query);
@@ -308,7 +312,7 @@
         const filter = $('lmTaskFilter').value;
         const query = $('lmTaskSearch').value.trim().toLocaleLowerCase();
         const signature = JSON.stringify(tasks.map((task) => [
-            task.id, task.content_name, task.source_name, task.trigger, task.status,
+            task.id, task.display_name, task.content_name, task.source_name, task.trigger, task.status,
             task.updated_at, task.created_at, task.error, task.warning, task.tmdb_id, task.clearable,
         ]));
         const viewSignature = `${filter}\u0000${query}`;
@@ -336,7 +340,7 @@
         reviewList.innerHTML = review.length
             ? review.slice(0, 30).map((task) => `
                 <article class="lm-review-item">
-                    <div><strong>${esc(task.content_name || '未命名')}</strong><span>${esc(task.error || '需要重新指定 TMDB 信息')}</span></div>
+                    <div><strong>${esc(taskDisplayName(task))}</strong><span>${esc(task.error || '需要重新指定 TMDB 信息')}</span></div>
                     <button class="jump-btn" type="button" data-review-task="${task.id}"><i data-lucide="search-check"></i>人工确认</button>
                 </article>`).join('')
             : `<div class="lm-empty-state">
@@ -393,7 +397,7 @@
             : '—';
         const items = Array.isArray(data.items) ? data.items : [];
         const steps = Array.isArray(data.steps) ? data.steps : [];
-        $('lmTaskDetailTitle').textContent = task.content_name || `整理日志 #${task.id || ''}`;
+        $('lmTaskDetailTitle').textContent = taskDisplayName(task) || `整理日志 #${task.id || ''}`;
         $('lmTaskDetailSubtitle').textContent = `${task.source_name || '已删除来源'} · 日志 #${task.id || '—'}`;
         $('lmTaskDetailBody').innerHTML = `
             <section class="lm-task-detail-overview">
@@ -861,7 +865,7 @@
 
     const positionControls = window.MediaScrapePosition.create({
         root: $('lmScrapeModal'),
-        isSingleFile: () => inspection?.selected_kind === 'file',
+        isSingleFile: () => inspection?.selected_kind === 'file' || Boolean(inspection?.single_video),
         elements: {
             fields: $('lmScrapeEpisodeFields'), seasonField: $('lmScrapeSeasonField'),
             episodeField: $('lmScrapeEpisodeField'), season: $('lmScrapeSeason'),
@@ -872,7 +876,7 @@
     async function openTaskDetail(taskId, trigger = null) {
         const requestSerial = ++taskDetailRequestSerial;
         const task = tasks.find((item) => String(item.id) === String(taskId));
-        $('lmTaskDetailTitle').textContent = task?.content_name || `整理日志 #${taskId}`;
+        $('lmTaskDetailTitle').textContent = taskDisplayName(task) || `整理日志 #${taskId}`;
         $('lmTaskDetailSubtitle').textContent = `${task?.source_name || '本地媒体'} · 正在读取完整记录`;
         $('lmTaskDetailBody').innerHTML = '<div class="lm-task-detail-loading"><i data-lucide="loader-circle"></i><span>正在读取日志详情…</span></div>';
         if (taskDetailModal) taskDetailModal.open(trigger);
@@ -1024,7 +1028,7 @@
         selectedCandidate = null;
         lastPreview = null;
         appliedPreviewContext = null;
-        $('lmSearchQuery').value = inspection.selected_name || activeMediaItem?.name || '';
+        $('lmSearchQuery').value = inspection.suggested_query || inspection.selected_name || activeMediaItem?.name || '';
         positionControls.sync($('lmMediaType').value);
         $('lmScrapeInspectionSummary').textContent = `${inspection.video_count} 个视频 · ${inspection.file_count} 个扫描文件`;
         $('lmScrapeStatus').textContent = '等待匹配';
@@ -1098,7 +1102,7 @@
             activeMediaItem = {
                 source_id: result.source_id,
                 source_name: task?.source_name || '本地媒体',
-                name: result.selected_name || task?.content_name || '待确认任务',
+                name: result.primary_video_name || result.selected_name || taskDisplayName(task) || '待确认任务',
                 path: task?.content_name || result.selected_name || '',
                 organize_ready: true,
             };
@@ -1110,7 +1114,10 @@
             if (scrapeModal) scrapeModal.open(button);
             else $('lmScrapeModal').hidden = false;
             applyInspection(result);
-            positionControls.reset({season: task?.season, episode: task?.episode});
+            positionControls.reset({
+                season: task?.season ?? result.parsed_season ?? null,
+                episode: task?.episode ?? result.parsed_episode ?? null,
+            });
             positionControls.sync($('lmMediaType').value);
             await search();
         } catch (error) {

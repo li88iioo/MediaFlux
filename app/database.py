@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS organize_notification_outbox (
     idempotency_key TEXT NOT NULL UNIQUE,
     chat_id TEXT NOT NULL DEFAULT '',
     body TEXT NOT NULL,
+    image_url TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK(status IN ('pending','sending','retry_wait','sent','failed')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
@@ -286,6 +287,30 @@ CREATE TABLE IF NOT EXISTS organize_operation_steps (
     UNIQUE(log_id, operation_token, step_index)
 );
 CREATE INDEX IF NOT EXISTS idx_organize_operation_steps_log_id ON organize_operation_steps(log_id, id);
+
+CREATE TABLE IF NOT EXISTS organize_probe_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organize_log_id INTEGER NOT NULL UNIQUE,
+    provider TEXT NOT NULL DEFAULT 'guangya',
+    source_id TEXT NOT NULL DEFAULT '',
+    rel_dir TEXT NOT NULL DEFAULT '',
+    rules_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued','running','retry_wait','completed','failed','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    max_attempts INTEGER NOT NULL DEFAULT 2 CHECK(max_attempts >= 1),
+    next_attempt_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_until REAL NOT NULL DEFAULT 0,
+    last_error_type TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (organize_log_id) REFERENCES organize_log(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_organize_probe_queue_due
+    ON organize_probe_queue(status,next_attempt_at,id);
 
 CREATE TABLE IF NOT EXISTS organize_delete_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2070,6 +2095,20 @@ from app.repositories.media_probe import (  # noqa: E402
 )
 
 
+# ===== 整理后媒体规格补全队列 =====
+from app.repositories.organize_probe import (  # noqa: E402
+    cancel_organize_probe_job,
+    claim_due_organize_probe_jobs,
+    commit_organize_probe_rename,
+    complete_organize_probe_job,
+    count_organize_probe_jobs,
+    enqueue_organize_probe_completion,
+    fail_or_retry_organize_probe_job,
+    recover_stale_organize_probe_jobs,
+    release_organize_probe_job,
+)
+
+
 # ===== Emby / Jellyfin 多实例媒体反代 =====
 # 兼容门面：调用方继续使用 app.database.*；schema/连接仍由本模块持有。
 from app.repositories.media_proxy import (  # noqa: E402
@@ -2326,6 +2365,101 @@ def add_organize_log_items(
         return insert(conn)
 
 
+def resolve_pending_organize_logs(
+    source: str,
+    file_id: str,
+    *,
+    before_log_id: int,
+    _conn: sqlite3.Connection | None = None,
+) -> int:
+    """把同一文件已完成的人工确认前置审计标记为已结算。
+
+    新版待确认记录使用 ``manual``；早期版本将其误记为 ``skipped``，
+    因此仅兼容包含人工确认语义的旧跳过记录。记录保留用于审计，但统一
+    时间线会隐藏 ``confirmed`` 前置记录，只展示最终成功入库结果。
+    """
+    normalized_source = str(source or "").strip()
+    normalized_file_id = str(file_id or "").strip()
+    upper_bound = max(0, int(before_log_id or 0))
+    if not normalized_source or not normalized_file_id or upper_bound <= 0:
+        return 0
+
+    def resolve(conn: sqlite3.Connection) -> int:
+        rows = conn.execute(
+            "SELECT id FROM organize_log WHERE source=? AND file_id=? AND id<? AND ("
+            "status='manual' OR (status='skipped' AND ("
+            "instr(COALESCE(error,''),'人工确认')>0 OR "
+            "instr(COALESCE(error,''),'待确认')>0)))",
+            (normalized_source, normalized_file_id, upper_bound),
+        ).fetchall()
+        log_ids = [int(row["id"]) for row in rows]
+        if not log_ids:
+            return 0
+        placeholders = ",".join("?" for _ in log_ids)
+        stamp = now()
+        conn.execute(
+            f"UPDATE organize_log SET status='confirmed',version=version+1,updated_at=? "
+            f"WHERE id IN ({placeholders})",
+            (stamp, *log_ids),
+        )
+        conn.execute(
+            f"UPDATE organize_log_items SET status='confirmed',error='',updated_at=? "
+            f"WHERE log_id IN ({placeholders}) AND status IN ('manual','skipped')",
+            (stamp, *log_ids),
+        )
+        return len(log_ids)
+
+    if _conn is not None:
+        return resolve(_conn)
+    with get_conn() as conn:
+        return resolve(conn)
+
+
+def finalize_pending_organize_logs(
+    source: str,
+    file_ids: Iterable[str],
+    *,
+    status: str,
+    error: str = "",
+) -> int:
+    """结束仍待人工处理的整理日志；用于取消或不可重试失败。"""
+    normalized_status = str(status or "").strip()
+    if normalized_status not in {"skipped", "failed"}:
+        raise ValueError("不支持的人工确认终态")
+    normalized_source = str(source or "").strip()
+    normalized_ids = list(dict.fromkeys(
+        str(item or "").strip() for item in file_ids if str(item or "").strip()
+    ))
+    if not normalized_source or not normalized_ids:
+        return 0
+    placeholders = ",".join("?" for _ in normalized_ids)
+    stamp = now()
+    message = str(error or "").strip()
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT id FROM organize_log WHERE source=? AND file_id IN ({placeholders}) "
+            "AND (status='manual' OR (status='skipped' AND ("
+            "instr(COALESCE(error,''),'人工确认')>0 OR "
+            "instr(COALESCE(error,''),'待确认')>0)))",
+            (normalized_source, *normalized_ids),
+        ).fetchall()
+        log_ids = [int(row["id"]) for row in rows]
+        if not log_ids:
+            return 0
+        log_placeholders = ",".join("?" for _ in log_ids)
+        conn.execute(
+            f"UPDATE organize_log SET status=?,error=?,version=version+1,updated_at=? "
+            f"WHERE id IN ({log_placeholders})",
+            (normalized_status, message, stamp, *log_ids),
+        )
+        conn.execute(
+            f"UPDATE organize_log_items SET status=?,error=?,updated_at=? "
+            f"WHERE log_id IN ({log_placeholders}) AND status IN ('manual','skipped')",
+            (normalized_status, message, stamp, *log_ids),
+        )
+        return len(log_ids)
+
+
 def _organize_log_filters(status: str | None = None, keyword: str = "") -> tuple[str, list]:
     sql = " WHERE 1=1"
     params: list = []
@@ -2377,6 +2511,12 @@ def _organize_timeline_query(*, owner: str = "admin", origin: str = "all",
                 CASE
                     WHEN l.status='success' THEN 'success'
                     WHEN l.status IN ('failed','interrupted','partial_failed','revert_failed','deleted') THEN 'failed'
+                    WHEN l.status='manual' OR (
+                        l.status='skipped' AND (
+                            instr(COALESCE(l.error,''),'人工确认')>0 OR
+                            instr(COALESCE(l.error,''),'待确认')>0
+                        )
+                    ) THEN 'manual'
                     WHEN l.status='skipped' THEN 'skipped'
                     WHEN l.status='reverted' THEN 'reverted'
                     ELSE 'processing'
@@ -2391,6 +2531,20 @@ def _organize_timeline_query(*, owner: str = "admin", origin: str = "all",
                 l.created_at AS created_at, COALESCE(l.updated_at,l.created_at) AS updated_at,
                 '' AS completed_at, l.version AS version, l.legacy_incomplete AS legacy_incomplete
             FROM organize_log l
+            WHERE l.status<>'confirmed' AND NOT (
+                (
+                    l.status='manual' OR (
+                        l.status='skipped' AND (
+                            instr(COALESCE(l.error,''),'人工确认')>0 OR
+                            instr(COALESCE(l.error,''),'待确认')>0
+                        )
+                    )
+                ) AND EXISTS (
+                    SELECT 1 FROM organize_log completed
+                    WHERE completed.source=l.source AND completed.file_id=l.file_id
+                      AND completed.id>l.id AND completed.status='success'
+                )
+            )
             UNION ALL
             SELECT
                 'local' AS origin, t.id AS id, COALESCE(s.name,'已删除来源') AS source_label,
@@ -2458,7 +2612,16 @@ def count_organize_timeline_by_status(*, owner: str = "admin") -> dict[str, int]
         rows = conn.execute(
             f"SELECT status, COUNT(*) AS count FROM ({sql}) GROUP BY status", params
         ).fetchall()
-    return {str(row["status"]): int(row["count"] or 0) for row in rows}
+    counts = {
+        "success": 0,
+        "failed": 0,
+        "skipped": 0,
+        "manual": 0,
+        "processing": 0,
+        "reverted": 0,
+    }
+    counts.update({str(row["status"]): int(row["count"] or 0) for row in rows})
+    return counts
 
 
 def get_agent_organize_audit(
@@ -5253,6 +5416,62 @@ def claim_local_media_task(
             "UPDATE local_media_tasks SET status=?,attempts=attempts+1,version=version+1,"
             "error='',updated_at=? WHERE id=? AND owner=? AND status=?",
             (next_status, timestamp, int(task_id), _local_media_owner(owner), expected),
+        )
+        return cur.rowcount == 1
+
+
+def claim_local_media_confirmation_task(
+    task_id: int,
+    *,
+    owner: str = "admin",
+    expected_version: int,
+    expected_snapshot_digest: str = "",
+    tmdb_id: str,
+    media_type: str,
+    rules_snapshot: str,
+    season_override: int | None = None,
+    episode_override: int | None = None,
+    title: str = "",
+    year: str = "",
+) -> bool:
+    """把仍然有效的本地待确认任务原子转换为执行态。"""
+    normalized_type = str(media_type or "").strip().lower()
+    normalized_tmdb_id = str(tmdb_id or "").strip()
+    if not normalized_tmdb_id or normalized_type not in {"movie", "tv"}:
+        raise ValueError("候选媒体参数无效")
+    if isinstance(expected_version, bool) or int(expected_version) <= 0:
+        raise ValueError("本地媒体任务版本无效")
+    for value, minimum, maximum, label in (
+        (season_override, 0, 99, "季数"),
+        (episode_override, 1, 999, "集数"),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{label}必须是整数")
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{label}超出允许范围")
+    if normalized_type == "movie":
+        season_override = None
+        episode_override = None
+
+    where = "id=? AND owner=? AND status='requires_manual' AND version=?"
+    params: list[object] = [
+        str(rules_snapshot or ""), normalized_tmdb_id, normalized_type,
+        season_override, episode_override, str(title or ""), str(year or ""),
+        now(), int(task_id), _local_media_owner(owner), int(expected_version),
+    ]
+    expected_digest = str(expected_snapshot_digest or "").strip()
+    if expected_digest:
+        where += " AND snapshot_digest=?"
+        params.append(expected_digest)
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE local_media_tasks SET status='recognizing',attempts=attempts+1,"
+            "rules_snapshot=?,tmdb_id=?,media_type=?,season_override=?,episode_override=?,"
+            "title=?,year=?,error='',warning='',completed_at=NULL,version=version+1,updated_at=? "
+            f"WHERE {where}",
+            params,
         )
         return cur.rowcount == 1
 

@@ -36,7 +36,7 @@ def _future_stamp(delay_seconds: int, *, base_stamp: str = "") -> str:
 
 
 def enqueue_organize_notification(
-    idempotency_key: str, body: str, *, chat_id: str = "",
+    idempotency_key: str, body: str, *, chat_id: str = "", image_url: str = "",
 ) -> bool:
     """登记一条待投递通知；同一幂等键已存在时不重复入队。"""
     key = str(idempotency_key or "").strip()
@@ -48,9 +48,12 @@ def enqueue_organize_notification(
     with database.get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO organize_notification_outbox("
-            "idempotency_key,chat_id,body,status,next_attempt_at,created_at,updated_at)"
-            " VALUES(?,?,?,'pending',?,?,?) ON CONFLICT(idempotency_key) DO NOTHING",
-            (key, str(chat_id or ""), text, stamp, stamp, stamp),
+            "idempotency_key,chat_id,body,image_url,status,next_attempt_at,created_at,updated_at)"
+            " VALUES(?,?,?,?,'pending',?,?,?) ON CONFLICT(idempotency_key) DO NOTHING",
+            (
+                key, str(chat_id or ""), text, str(image_url or ""),
+                stamp, stamp, stamp,
+            ),
         )
         return bool(cur.rowcount)
 
@@ -76,7 +79,7 @@ def claim_due_organize_notifications(*, limit: int = 20) -> list[dict[str, Any]]
     with database.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
-            "SELECT id,idempotency_key,chat_id,body,attempts,status,lease_generation "
+            "SELECT id,idempotency_key,chat_id,body,image_url,attempts,status,lease_generation "
             "FROM organize_notification_outbox "
             "WHERE status IN ('pending','retry_wait') AND next_attempt_at<=? "
             "ORDER BY next_attempt_at, id LIMIT ?",
@@ -97,6 +100,7 @@ def claim_due_organize_notifications(*, limit: int = 20) -> list[dict[str, Any]]
                 "idempotency_key": str(row["idempotency_key"]),
                 "chat_id": str(row["chat_id"] or ""),
                 "body": str(row["body"] or ""),
+                "image_url": str(row["image_url"] or ""),
                 "attempts": int(row["attempts"] or 0),
                 "lease_generation": old_generation + 1,
             })

@@ -40,6 +40,7 @@ from app.modules.download_dispatcher import (
     torrent_download_input,
 )
 from app.modules.download_tracker import DownloadTracker
+from app.modules.local_media_scheduler import LocalMediaProbeRetryable
 from app.modules.media_proxy import (
     _parse_range,
     _websocket_upstream_url,
@@ -167,7 +168,7 @@ class ScraperAndOrganizerTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(
             organizer.build_new_name(match, file, {"season": 1, "episode": 2}, rules),
-            "Show_ Name.2026.S01E02-1080p.H.265.mkv",
+            "Show_ Name.2026.S01E02-WEB-DL.1080p.H.265.mkv",
         )
         self.assertEqual(
             organizer.build_show_dir(match, rules),
@@ -234,12 +235,55 @@ class ScraperAndOrganizerTests(IsolatedDatabaseTestCase):
                 [plan], OrganizeRules(), stats, {"source": [companion]}, None,
                 source_dir_id="configured-source",
             )
-        self.assertEqual(add_log.call_args.args[4], "skipped")
+        self.assertEqual(add_log.call_args.args[4], "manual")
         self.assertEqual(add_log.call_args.kwargs["source_dir_id"], "configured-source")
         saved = add_items.call_args.args[1]
         self.assertEqual([(item["role"], item["file_id"]) for item in saved], [
             ("video", "video"), ("subtitle", "sub")
         ])
+        self.assertTrue(all(item["status"] == "manual" for item in saved))
+
+    def test_success_audit_resolves_previous_manual_record(self):
+        pending_id = db.add_organize_log(
+            "guangya", "source", "", "video", "manual", "",
+            original_parent_id="source-id", original_name="Unknown.S01E01.mkv",
+            current_parent_id="source-id", current_name="Unknown.S01E01.mkv",
+            media_type="tv", title="Unknown", error="需要人工确认",
+            legacy_incomplete=False,
+        )
+        db.add_organize_log_items(pending_id, [{
+            "file_id": "video", "role": "video",
+            "original_parent_id": "source-id", "original_name": "Unknown.S01E01.mkv",
+            "current_parent_id": "source-id", "current_name": "Unknown.S01E01.mkv",
+            "status": "manual", "error": "需要人工确认",
+        }])
+
+        success_id = Organizer._write_organize_audit(
+            ("guangya", "source", "剧集/Unknown/Season 1/Unknown.S01E01.mkv", "video", "success", "1"),
+            {
+                "original_parent_id": "source-id",
+                "original_name": "Unknown.S01E01.mkv",
+                "current_parent_id": "target-id",
+                "current_name": "Unknown.S01E01.mkv",
+                "target_parent_id": "target-id",
+                "media_type": "tv",
+                "title": "Unknown",
+                "legacy_incomplete": False,
+            },
+            [{
+                "file_id": "video", "role": "video",
+                "original_parent_id": "source-id", "original_name": "Unknown.S01E01.mkv",
+                "current_parent_id": "target-id", "current_name": "Unknown.S01E01.mkv",
+                "target_parent_id": "target-id", "target_name": "Unknown.S01E01.mkv",
+                "status": "success",
+            }],
+        )
+
+        self.assertGreater(success_id, pending_id)
+        self.assertEqual(db.get_organize_log(pending_id)["status"], "confirmed")
+        self.assertEqual(db.list_organize_log_items(pending_id)[0]["status"], "confirmed")
+        timeline = db.list_organize_timeline(origin="guangya", limit=10)
+        self.assertEqual([row["id"] for row in timeline], [success_id])
 
     def test_safe_replacement_keeps_existing_until_incoming_succeeds(self):
         operations = []
@@ -503,6 +547,64 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                     request_id, 77, "/downloads/Movie.mkv"
                 ))
                 self.assertEqual(db.get_download_request(request_id)["local_import_status"], "completed")
+                self.assertEqual(db.list_active_download_requests(include_local_import=True), [])
+
+    def test_retryable_local_media_probe_recovers_without_becoming_skipped(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                request_id, _ = db.create_download_request("retryable-key", "magnet")
+                db.update_download_request(request_id, qb_status="completed", status="completed")
+                tracker = DownloadTracker()
+                scheduler = Mock()
+                scheduler.enqueue_completed_torrent.side_effect = [
+                    LocalMediaProbeRetryable("扫描路径不存在: Movie.mkv"),
+                    77,
+                ]
+                task = self._task("/downloads/Movie.mkv", "/downloads")
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    tracker._start_local_import(db.get_download_request(request_id), task)
+                    waiting = db.get_download_request(request_id)
+                    self.assertEqual(waiting["local_import_status"], "pending")
+                    self.assertEqual(waiting["local_import_attempts"], 1)
+                    self.assertIn("扫描路径不存在", waiting["local_import_error"])
+                    self.assertTrue(db.list_active_download_requests(include_local_import=True))
+
+                    tracker._start_local_import(waiting, task)
+
+                recovered = db.get_download_request(request_id)
+                self.assertEqual(recovered["local_import_status"], "pending")
+                self.assertEqual(recovered["local_import_target"], "local-media-task:77")
+                self.assertEqual(recovered["local_import_error"], "")
+
+    def test_retryable_local_media_probe_becomes_visible_failure_after_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                request_id, _ = db.create_download_request("retry-limit-key", "magnet")
+                db.update_download_request(request_id, qb_status="completed", status="completed")
+                tracker = DownloadTracker()
+                scheduler = Mock()
+                scheduler.enqueue_completed_torrent.side_effect = LocalMediaProbeRetryable(
+                    "目录暂时不可完整读取: Movie.2026"
+                )
+                task = self._task("/downloads/Movie.2026", "/downloads")
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    for _ in range(8):
+                        tracker._start_local_import(db.get_download_request(request_id), task)
+
+                failed = db.get_download_request(request_id)
+                self.assertEqual(failed["local_import_status"], "failed")
+                self.assertEqual(failed["local_import_attempts"], 8)
+                self.assertIn("暂时不可完整读取", failed["local_import_error"])
                 self.assertEqual(db.list_active_download_requests(include_local_import=True), [])
 
     def test_unmatched_completed_request_is_marked_skipped(self):
@@ -1393,7 +1495,7 @@ class STRMIndexTests(IsolatedDatabaseTestCase):
                 tree[source_id] = tree[source_id][:1]
                 second = sync_strm(source_id, "http://example", root, client=client)
                 self.assertEqual(second["cleaned"], 1)
-                self.assertFalse((Path(root) / STRM_SUBDIR / "Gone.mkv.strm").exists())
+                self.assertFalse((Path(root) / STRM_SUBDIR / "Gone.strm").exists())
         finally:
             db.delete_strm_index_ids(source_key, ["keep", "gone"])
 

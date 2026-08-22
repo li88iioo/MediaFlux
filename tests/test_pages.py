@@ -157,7 +157,7 @@ class PagesUiContractTests(unittest.TestCase):
 
     def test_settings_large_screen_layout_and_network_2col_contract(self):
         html = (SETTINGS_HTML.read_text(encoding="utf-8") + SETTINGS_JS.read_text(encoding="utf-8"))
-        self.assertIn("css/settings-agent.css') }}?v=20260818c", html)
+        self.assertIn("css/settings-agent.css') }}?v=20260821a", html)
         self.assertIn('id="settings-panel-network"', html)
         self.assertIn('class="settings-layout-2col"', html)
         self.assertIn('aria-label="网络代理遥测与探针"', html)

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import json
 import threading
 from datetime import datetime
@@ -22,7 +23,7 @@ from app import database as db
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.config import get, get_bool, get_int
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.strm import (
     DEFAULT_METADATA_EXTS, DEFAULT_VIDEO_EXTS, STRM_OPERATION_LOCK, STRM_SUBDIR,
     clean_empty_strm_dirs, clean_retired_strm_sources, configured_strm_source_plans,
@@ -155,8 +156,10 @@ class STRMScheduler:
         self._recover_change_queue()
         self._recover_notification_outbox()
         from app.modules.strm_metadata_worker import get_strm_metadata_worker
+        from app.modules.organize_probe_worker import get_organize_probe_worker
 
         get_strm_metadata_worker().start()
+        get_organize_probe_worker().start()
         logger.info("STRM 调度器已启动")
 
     @staticmethod
@@ -217,7 +220,9 @@ class STRMScheduler:
         else:
             logger.warning("STRM 工作线程未能在关闭超时内结束 trigger=%s", self._current_trigger)
         from app.modules.strm_metadata_worker import get_strm_metadata_worker
+        from app.modules.organize_probe_worker import get_organize_probe_worker
 
+        get_organize_probe_worker().stop(timeout=timeout)
         get_strm_metadata_worker().stop(timeout=timeout)
 
     def reload(self) -> None:
@@ -529,9 +534,22 @@ class STRMScheduler:
             from app.modules.strm_metadata_worker import get_strm_metadata_worker
 
             metadata_queue = get_strm_metadata_worker().status()
-        except Exception:
-            logger.exception("读取 STRM 元数据队列状态失败")
+        except Exception as exc:
+            log_throttled(
+                logger, logging.WARNING, "strm-metadata-queue-status",
+                "读取 STRM 元数据队列状态失败 type=%s", type(exc).__name__,
+            )
             metadata_queue = db.count_strm_metadata_jobs()
+        try:
+            from app.modules.organize_probe_worker import get_organize_probe_worker
+
+            organize_probe_queue = get_organize_probe_worker().status()
+        except Exception as exc:
+            log_throttled(
+                logger, logging.WARNING, "organize-probe-queue-status",
+                "读取整理媒体规格补全队列状态失败 type=%s", type(exc).__name__,
+            )
+            organize_probe_queue = db.count_organize_probe_jobs()
         return {
             "enabled": enabled,
             "cron": cron_expr,
@@ -548,6 +566,7 @@ class STRMScheduler:
             "progress": progress,
             "source_runtime": source_runtime,
             "metadata_queue": metadata_queue,
+            "organize_probe_queue": organize_probe_queue,
             "next_run": next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "",
             "last_run": self._row_to_dict(last),
         }
@@ -566,7 +585,11 @@ class STRMScheduler:
             try:
                 callback(stage, bounded_completed, bounded_total, detail)
             except Exception as exc:
-                logger.warning(f"STRM 外部进度回调失败 stage={stage}: {exc}")
+                log_throttled(
+                    logger, logging.WARNING, f"strm-progress-callback:{stage}:{type(exc).__name__}",
+                    "STRM 外部进度回调失败 stage=%s type=%s",
+                    stage, type(exc).__name__,
+                )
 
     @staticmethod
     def validate_cron(expr: str) -> bool:
@@ -681,12 +704,18 @@ class STRMScheduler:
         while not self._stop_event.is_set():
             try:
                 self._tick()
-            except Exception as e:
-                logger.error(f"STRM 调度检查异常: {e}")
+            except Exception as exc:
+                log_throttled(
+                    logger, logging.ERROR, f"strm-scheduler:{type(exc).__name__}",
+                    "STRM 调度检查异常 type=%s", type(exc).__name__,
+                )
             try:
                 self._drain_notification_outbox()
-            except Exception:
-                logger.exception("整理通知补发检查失败")
+            except Exception as exc:
+                log_throttled(
+                    logger, logging.WARNING, f"organize-outbox:{type(exc).__name__}",
+                    "整理通知补发检查失败 type=%s", type(exc).__name__,
+                )
             self._wake_event.wait(timeout=10)
             self._wake_event.clear()
 
@@ -713,7 +742,10 @@ class STRMScheduler:
             return
         error = self.validate_config(auto_only=True)
         if error:
-            logger.warning(f"STRM 定时任务配置无效: {error}")
+            log_throttled(
+                logger, logging.WARNING, f"strm-schedule-config:{error}",
+                "STRM 定时任务配置无效: %s", error,
+            )
             return
         cron_expr = get("STRM_SCHEDULE_CRON", "0 4 * * *").strip()
         now = datetime.now()
@@ -1428,7 +1460,7 @@ class STRMScheduler:
                                changed_dirs: list[str] | None = None) -> dict:
         """有 STRM 增量时刷新媒体库；整理联动可单独关闭 Emby。"""
         if not has_changes:
-            logger.info("STRM 本轮无增量变化，跳过媒体库刷新")
+            logger.debug("STRM 本轮无增量变化，跳过媒体库刷新")
             return {}
         strm_root = get("STRM_ROOT", "")
         plan = plan_refresh_targets(

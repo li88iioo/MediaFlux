@@ -161,7 +161,7 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
             self.assertEqual([row["file_id"] for row in open_rows], ["video-2"])
             resolved = db.list_strm_failures(status="resolved", limit=20)
             self.assertEqual([row["file_id"] for row in resolved], ["video-1"])
-            self.assertTrue((Path(root) / strm_module.STRM_SUBDIR / "One.mkv.strm").is_file())
+            self.assertTrue((Path(root) / strm_module.STRM_SUBDIR / "One.strm").is_file())
 
     def test_retry_re_resolves_file_moved_to_a_new_configured_source(self):
         old_source = "source-old"
@@ -208,7 +208,7 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
                 Path(root)
                 / strm_module.STRM_SUBDIR
                 / "新目录"
-                / "Renamed.mkv.strm"
+                / "Renamed.strm"
             )
             self.assertTrue(target.is_file())
             self.assertIn("/playgy/video-moved/fresh-etag/", target.read_text("utf-8"))
@@ -703,8 +703,8 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
 
         with tempfile.TemporaryDirectory() as root, self._config(root, sources):
             result = strm_module.retry_strm_failures(ids, "manual", client=client)
-            first_target = Path(root) / strm_module.STRM_SUBDIR / "电影一" / "Movie.mkv.strm"
-            second_target = Path(root) / strm_module.STRM_SUBDIR / "电影二" / "Movie.mkv.strm"
+            first_target = Path(root) / strm_module.STRM_SUBDIR / "电影一" / "Movie.strm"
+            second_target = Path(root) / strm_module.STRM_SUBDIR / "电影二" / "Movie.strm"
             self.assertTrue(first_target.is_file())
             self.assertTrue(second_target.is_file())
             first_text = first_target.read_text("utf-8")
@@ -731,10 +731,10 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root, self._config(root, sources):
             result = strm_module.retry_strm_failures(ids, "manual", client=client)
             self.assertTrue(
-                (Path(root) / strm_module.STRM_SUBDIR / "同名 (abc111)" / "A.mkv.strm").is_file()
+                (Path(root) / strm_module.STRM_SUBDIR / "同名 (abc111)" / "A.strm").is_file()
             )
             self.assertTrue(
-                (Path(root) / strm_module.STRM_SUBDIR / "同名 (xyz222)" / "B.mkv.strm").is_file()
+                (Path(root) / strm_module.STRM_SUBDIR / "同名 (xyz222)" / "B.strm").is_file()
             )
 
         self.assertEqual(result["resolved"], 2)
@@ -751,7 +751,7 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
 
         with tempfile.TemporaryDirectory() as root, self._config(root, sources):
             result = strm_module.retry_strm_failures([failure_id], "manual", client=client)
-            target = Path(root) / strm_module.STRM_SUBDIR / "新来源" / "Moved.mkv.strm"
+            target = Path(root) / strm_module.STRM_SUBDIR / "新来源" / "Moved.strm"
             rows = db.list_strm_index(f"guangya:{new_source}")
             target_exists = target.is_file()
 
