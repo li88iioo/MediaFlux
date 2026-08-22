@@ -628,6 +628,16 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
         ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}), patch(
             "app.agent.indexer_actions.download_result", dispatch
         ):
+            searched = self.client.post(
+                "/api/agent/tools/indexer.search_resources",
+                headers=headers,
+                json={
+                    "session_id": "test_session_identifier_0001",
+                    "arguments": {"title": "Demo", "sites": ["nyaa"]},
+                },
+            )
+            self.assertEqual(searched.status_code, 200, searched.text)
+
             prepared = self.client.post(
                 "/api/agent/actions/indexer.submit_resource/prepare",
                 headers=headers,

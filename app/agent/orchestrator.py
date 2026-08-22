@@ -62,6 +62,7 @@ from app.agent.recent_read_operations import READ_PLAN_OPERATION, RecentReadOper
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     public_candidate_projection,
+    safe_resource_result_ids,
 )
 from app.agent.recent_discovery_candidates import RecentDiscoveryCandidateStore
 from app.agent.recent_download_submissions import (
@@ -78,6 +79,11 @@ from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.rss_reference import resolve_rss_subscription_name
 from app.agent import result_projection
 from app.agent.session_context import AgentSessionContextRepository
+from app.agent.state_commit import (
+    active_agent_state_owns_resource,
+    commit_or_defer_agent_state,
+    stage_agent_resource_result_ids,
+)
 from app.agent.workspace_next_actions import resolve_workspace_action_handoff
 
 logger = logging.getLogger(__name__)
@@ -237,7 +243,24 @@ def _latest_rss_topic_context(
     if context and str(context[-1].get("role") or "").casefold() == "user":
         return {}
     previous = _last_assistant_context(conversation_context)
-    return previous if previous.get("context_domain") == "rss" else {}
+    if previous.get("context_domain") == "rss":
+        return previous
+    context_domains = previous.get("context_domains")
+    if isinstance(context_domains, list) and "rss" in context_domains:
+        return previous
+    return {}
+
+
+def _read_plan_context_domains(steps: list[dict[str, Any]]) -> list[str]:
+    """从已执行工具名提取不可执行的话题标签，供可信历史做续接消歧。"""
+    domains: set[str] = set()
+    for step in steps:
+        tool_name = str(step.get("tool_name") or "").strip()
+        if tool_name.startswith("rss."):
+            domains.add("rss")
+        elif tool_name.startswith("media.subscription"):
+            domains.add("media_subscription")
+    return sorted(domains)
 
 
 def _is_cross_domain_rss_refresh_correction(
@@ -5117,6 +5140,9 @@ class AgentOrchestrator:
             confirmation_id=confirmation_id,
         )
         if discarded:
+            # 取消也是同一 owner 的最新受控意图；推进 epoch，阻止已被抢占的
+            # 后台 query 在取消后重新留下新的确认票据。
+            self.invalidate_query_confirmation_epoch(owner=owner)
             agent_metrics.record_confirmation("discarded")
             ref = workflow_ref_from_context(
                 ticket.followup_context if ticket is not None else None
@@ -5217,6 +5243,10 @@ class AgentOrchestrator:
         """在创建动态限流键之前确认工具属于受控注册表。"""
         return self.registry.has(tool_name)
 
+    def is_read_tool(self, tool_name: str) -> bool:
+        """让入口在执行前区分可直调只读工具与必须确认的动作。"""
+        return self.registry.risk_for(tool_name) is RiskLevel.READ
+
     def invoke(
         self,
         tool_name: str,
@@ -5241,51 +5271,75 @@ class AgentOrchestrator:
             arguments,
             context=trace_context,
         )
-        if tool_name in {
-            "library.audit_library_episodes",
-            "library.patrol_status",
-        } and owner:
-            self.recent_patrol_store.capture(owner=owner, result=result)
-        if (
-            tool_name == "agent.job_status"
-            and owner
-            and result.status in {"updates_available", "up_to_date", "inconclusive"}
-        ):
-            self.recent_patrol_store.capture(owner=owner, result=result)
-        if tool_name in {
-            "library.search_missing_episode_resources",
-            "library.search_missing_season_resources",
-            "indexer.search_resources",
-            "media.subscription_updates",
-        } and owner:
-            self.recent_resource_store.capture(owner=owner, result=result)
-        if tool_name in {"discovery.search", "discovery.recommend"} and owner:
-            self.recent_discovery_store.capture(owner=owner, result=result)
-        if (
-            tool_name in {
-                "library.search_missing_episode_resources",
-                "library.search_missing_season_resources",
-            }
-            and owner
-            and self.missing_workflow_repository is not None
-        ):
-            try:
-                self.missing_workflow_repository.capture_search(
+        if owner:
+            # 续接状态必须与最终响应一起取得 latest-wins 发布权。流式请求被取消、
+            # 被新请求取代或断开时，迟到工具只能返回给已撤销的调用栈，不能覆盖
+            # “刚才的资源 / 重试 / 巡检”上下文。
+            state_result = deepcopy(result)
+            state_arguments = deepcopy(normalized_arguments)
+            resource_result_ids = safe_resource_result_ids(state_result)
+            if resource_result_ids:
+                stage_agent_resource_result_ids(
+                    owner=owner,
+                    result_ids=resource_result_ids,
+                )
+
+            def commit_followup_state() -> None:
+                if tool_name in {
+                    "library.audit_library_episodes",
+                    "library.patrol_status",
+                }:
+                    self.recent_patrol_store.capture(
+                        owner=owner, result=state_result
+                    )
+                if (
+                    tool_name == "agent.job_status"
+                    and state_result.status
+                    in {"updates_available", "up_to_date", "inconclusive"}
+                ):
+                    self.recent_patrol_store.capture(
+                        owner=owner, result=state_result
+                    )
+                if tool_name in {
+                    "library.search_missing_episode_resources",
+                    "library.search_missing_season_resources",
+                    "indexer.search_resources",
+                    "media.subscription_updates",
+                }:
+                    self.recent_resource_store.capture(
+                        owner=owner, result=state_result
+                    )
+                if tool_name in {"discovery.search", "discovery.recommend"}:
+                    self.recent_discovery_store.capture(
+                        owner=owner, result=state_result
+                    )
+                if (
+                    tool_name in {
+                        "library.search_missing_episode_resources",
+                        "library.search_missing_season_resources",
+                    }
+                    and self.missing_workflow_repository is not None
+                ):
+                    try:
+                        self.missing_workflow_repository.capture_search(
+                            owner=owner,
+                            tool_name=tool_name,
+                            result=state_result,
+                        )
+                    except Exception as exc:
+                        # 搜索结果仍然有效；持久进度镜像失败不能篡改只读工具响应。
+                        logger.warning(
+                            "Agent 补库工作流记录搜索失败 type=%s",
+                            type(exc).__name__,
+                        )
+                # 只记录显式白名单中的幂等只读调用，供“重试/再查一次”安全续接。
+                self.recent_read_store.capture(
                     owner=owner,
                     tool_name=tool_name,
-                    result=result,
+                    arguments=state_arguments,
                 )
-            except Exception as exc:
-                # 搜索结果仍然有效；持久进度镜像失败不能篡改只读工具响应。
-                logger.warning(
-                    "Agent 补库工作流记录搜索失败 type=%s",
-                    type(exc).__name__,
-                )
-        if owner:
-            # 只记录显式白名单中的幂等只读调用，供“重试/再查一次”安全续接。
-            self.recent_read_store.capture(
-                owner=owner, tool_name=tool_name, arguments=normalized_arguments
-            )
+
+            commit_or_defer_agent_state(commit_followup_state)
         return self._response(
             tool_name, normalized_arguments, result, elapsed_ms,
             request_id=trace_context.request_id,
@@ -5407,13 +5461,24 @@ class AgentOrchestrator:
             total_elapsed_ms,
             mode="read_plan",
         )
-        if owner and not self.recent_read_store.capture_plan(
-            owner=owner,
-            steps=normalized_steps,
-        ):
-            # 内部 invoke 会逐步覆盖最近操作；若整份计划不满足安全重放条件，
-            # 必须清除最后一步，避免用户以为“重试”会重新执行完整检查。
-            self.recent_read_store.clear_owner(owner=owner)
+        context_domains = _read_plan_context_domains(public_steps)
+        if context_domains:
+            response["context_domains"] = context_domains
+        if context_domains == ["rss"]:
+            response["context_domain"] = "rss"
+        if owner:
+            replay_steps = deepcopy(normalized_steps)
+
+            def commit_read_plan() -> None:
+                if not self.recent_read_store.capture_plan(
+                    owner=owner,
+                    steps=replay_steps,
+                ):
+                    # 内部 invoke 会逐步覆盖最近操作；若整份计划不满足安全重放条件，
+                    # 必须清除最后一步，避免用户以为“重试”会重新执行完整检查。
+                    self.recent_read_store.clear_owner(owner=owner)
+
+            commit_or_defer_agent_state(commit_read_plan)
         return response
 
     def _replay_recent_read(
@@ -5900,7 +5965,26 @@ class AgentOrchestrator:
         request_id: str = "",
         session_id: str = "",
         rate_identity: str = "",
+        trusted_resource_owner_binding: bool = False,
     ) -> dict[str, Any]:
+        if tool_name == "indexer.submit_resource":
+            result_id = (
+                str(arguments.get("result_id") or "").strip()
+                if isinstance(arguments, dict)
+                else ""
+            )
+            if not trusted_resource_owner_binding and not (
+                self.recent_resource_store.contains_result(
+                    owner=owner, result_id=result_id
+                )
+                or active_agent_state_owns_resource(
+                    owner=owner, result_id=result_id
+                )
+            ):
+                raise AgentToolError(
+                    "该资源不属于当前会话或候选已经过期，请重新搜索后再选择。",
+                    code="precondition_failed",
+                )
         if tool_name in {"rss.refresh_subscription", "rss.refresh_subscriptions"}:
             effective_rate_identity = str(
                 rate_identity or _QUERY_TOOL_RATE_IDENTITY.get() or owner or ""
@@ -6067,6 +6151,20 @@ class AgentOrchestrator:
             "",
             unicodedata.normalize("NFKC", str(message or "")).casefold(),
         )
+        context_domains = previous.get("context_domains")
+        mixed_subscription_context = bool(
+            isinstance(context_domains, list)
+            and "rss" in context_domains
+            and any(domain != "rss" for domain in context_domains)
+        )
+        if (
+            mixed_subscription_context
+            and normalized in {"刷新", "刷新一下", "再刷新", "再刷新一下", "继续刷新"}
+        ):
+            return self._clarification_response(
+                "刚才同时检查了 RSS 与媒体追更。你想手动刷新 RSS，还是重新检查媒体订阅更新？",
+                ["刷新 RSS 订阅。", "检查媒体订阅更新。"],
+            )
         if normalized in {
             "列出列表", "列出全部", "列出全部列表", "全部列表", "列表", "都有哪些", "有哪些",
         }:
@@ -6146,6 +6244,9 @@ class AgentOrchestrator:
         except AgentToolError:
             agent_metrics.record_confirmation("invalid")
             raise
+        # 票据已在当前 owner 的受控终态窗口内原子领取；立即推进 epoch，
+        # 使被本次确认抢占的后台旧 query 无法再签发未展示的迟到票据。
+        self.invalidate_query_confirmation_epoch(owner=owner)
         agent_metrics.record_confirmation("claimed")
         risk = self.registry.risk_for(ticket.tool_name)
         try:
@@ -6641,10 +6742,21 @@ class AgentOrchestrator:
             total_elapsed_ms,
             mode="read_plan",
         )
-        if owner and not self.recent_read_store.capture_plan(
-            owner=owner, steps=replay_steps
-        ):
-            self.recent_read_store.clear_owner(owner=owner)
+        context_domains = _read_plan_context_domains(public_steps)
+        if context_domains:
+            response["context_domains"] = context_domains
+        if context_domains == ["rss"]:
+            response["context_domain"] = "rss"
+        if owner:
+            deferred_replay_steps = deepcopy(replay_steps)
+
+            def commit_native_read_plan() -> None:
+                if not self.recent_read_store.capture_plan(
+                    owner=owner, steps=deferred_replay_steps
+                ):
+                    self.recent_read_store.clear_owner(owner=owner)
+
+            commit_or_defer_agent_state(commit_native_read_plan)
         return response
 
     def _query_with_model_tools(

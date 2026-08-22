@@ -105,9 +105,15 @@ from app.agent.presentation_stream import (
     select_agent_answer_stream,
 )
 from app.agent.service import get_agent_service
+from app.agent.state_commit import (
+    AgentStateCommitBuffer,
+    defer_agent_state_commits,
+)
 from app.agent.feature_gate import is_agent_enabled
 from app.agent.llm_router import (
+    begin_llm_request_budget,
     normalize_streamed_answer,
+    reset_llm_request_budget,
     stream_existing_answer,
     stream_tool_answer,
 )
@@ -509,6 +515,8 @@ async def _stream_query_events(
 ) -> AsyncIterator[bytes]:
     """流式执行 Agent 查询，并只允许当前操作发布与落库。"""
     coordinator = get_agent_operation_coordinator()
+    state_buffer = AgentStateCommitBuffer(owner=operation.owner)
+    llm_budget_token = begin_llm_request_budget(llm_owner)
 
     def cancelled_event() -> bytes:
         return _ndjson_event(
@@ -541,14 +549,15 @@ async def _stream_query_events(
             return
         yield event
 
-        query_task = asyncio.create_task(
-            asyncio.to_thread(
-                service.query,
-                message,
-                present=False,
-                **query_kwargs,
-            )
-        )
+        def execute_query() -> dict[str, Any]:
+            with defer_agent_state_commits(state_buffer):
+                return service.query(
+                    message,
+                    present=False,
+                    **query_kwargs,
+                )
+
+        query_task = asyncio.create_task(asyncio.to_thread(execute_query))
 
         def consume_detached_query(task: asyncio.Task[Any]) -> None:
             # Python 无法安全终止已进入线程池的同步调用；撤销时立即收回发布权，
@@ -669,7 +678,8 @@ async def _stream_query_events(
                 stream = _native_narrative_stream()
 
         def interrupted_event() -> bytes | None:
-            """在线性化窗口内保存已公开安全前缀，再发布中断事件。"""
+            """在线性化窗口内提交工具状态、保存安全前缀并发布中断事件。"""
+            state_buffer.commit()
             partial_answer = projector.published_answer()
             interrupted_response = _apply_streamed_answer(response, partial_answer)
             result = interrupted_response.get("result")
@@ -815,6 +825,7 @@ async def _stream_query_events(
                 )
 
         def finalize_response() -> bytes:
+            state_buffer.commit()
             persist_final()
             return _ndjson_event(
                 "final",
@@ -832,6 +843,8 @@ async def _stream_query_events(
         # 网络背压不属于进程内线性化临界区；最终事件快照已在锁内提交。
         yield final_event
     finally:
+        state_buffer.discard()
+        reset_llm_request_budget(llm_budget_token)
         coordinator.finish(operation)
 
 
@@ -1126,12 +1139,15 @@ def query(request: Request, data: Any = Body(default=None)):
                     "X-Accel-Buffering": "no",
                 },
             )
+        state_buffer = AgentStateCommitBuffer(owner=owner)
         if not coordinator.is_current(operation):
             coordinator.finish(operation)
+            state_buffer.discard()
             return api_error("本次请求已被停止", 409)
         try:
             try:
-                response = service.query(message, **query_kwargs)
+                with defer_agent_state_commits(state_buffer):
+                    response = service.query(message, **query_kwargs)
             except (AgentInputError, AgentToolError):
                 if not coordinator.is_current(operation):
                     return api_error("本次请求已被更新操作取代", 409)
@@ -1149,10 +1165,12 @@ def query(request: Request, data: Any = Body(default=None)):
 
             with coordinator.finalization_window_if_current(operation) as published:
                 if published:
+                    state_buffer.commit()
                     persist_final()
                     return api_response(response)
             return api_error("本次请求已被更新操作取代", 409)
         finally:
+            state_buffer.discard()
             coordinator.finish(operation)
     except AgentInputError as exc:
         return api_error(str(exc), 400)
@@ -1221,22 +1239,63 @@ def invoke_tool(request: Request, tool_name: str, data: Any = Body(default=None)
             if session_key is not None
             else None
         )
-        result = service.invoke(
-            tool_name,
-            arguments,
+        request_key = f"tool_{secrets.token_urlsafe(12)}"
+        read_check = getattr(service, "is_read_tool", None)
+        is_read_tool = bool(read_check(tool_name)) if callable(read_check) else True
+        if not is_read_tool:
+            # 非只读工具仍由 Registry 拒绝直接执行并引导走 prepare/confirm；
+            # 无效直调不应撤销用户已经看到的确认票据。
+            return api_response(service.invoke(
+                tool_name,
+                arguments,
+                owner=owner,
+                request_id=request_key,
+                session_id=session_key or "",
+            ))
+
+        coordinator = get_agent_operation_coordinator()
+        operation, _ = coordinator.begin_with_context(
             owner=owner,
-            request_id=f"tool_{secrets.token_urlsafe(12)}",
-            session_id=session_key or "",
+            operation_id=request_key,
+            initialize=lambda: invalidate_query_confirmation_epoch(
+                service, owner=owner
+            ),
         )
-        if session_key is not None:
-            _record_query_history(
-                request,
-                session_id=session_key,
-                message=_direct_tool_history_message(tool_name, arguments),
-                response=result,
-                expected_generation=history_generation,
-            )
-        return api_response(result)
+        state_buffer = AgentStateCommitBuffer(owner=owner)
+        try:
+            try:
+                with defer_agent_state_commits(state_buffer):
+                    result = service.invoke(
+                        tool_name,
+                        arguments,
+                        owner=owner,
+                        request_id=request_key,
+                        session_id=session_key or "",
+                    )
+            except AgentToolError:
+                if not coordinator.is_current(operation):
+                    return api_error("本次请求已被更新操作取代", 409)
+                raise
+
+            def persist_final() -> None:
+                if session_key is not None:
+                    _record_query_history(
+                        request,
+                        session_id=session_key,
+                        message=_direct_tool_history_message(tool_name, arguments),
+                        response=result,
+                        expected_generation=history_generation,
+                    )
+
+            with coordinator.finalization_window_if_current(operation) as published:
+                if published:
+                    state_buffer.commit()
+                    persist_final()
+                    return api_response(result)
+            return api_error("本次请求已被更新操作取代", 409)
+        finally:
+            state_buffer.discard()
+            coordinator.finish(operation)
     except AgentToolError as exc:
         return _agent_error(exc)
 
@@ -1264,29 +1323,59 @@ def invoke_workspace_action(request: Request, data: Any = Body(default=None)):
         action_key = data.get("action_key")
         if not isinstance(action_key, str):
             raise AgentToolError("action_key 必须是字符串")
-        response = get_agent_service().invoke_workspace_action(
-            action_key,
+        service = get_agent_service()
+        request_key = f"workspace_{secrets.token_urlsafe(12)}"
+        coordinator = get_agent_operation_coordinator()
+        operation, _ = coordinator.begin_with_context(
             owner=owner,
-            rate_identity=_agent_tool_rate_owner(request),
-            request_id=f"workspace_{secrets.token_urlsafe(12)}",
-            session_id=session_key or "",
+            operation_id=request_key,
+            initialize=lambda: invalidate_query_confirmation_epoch(
+                service, owner=owner
+            ),
         )
-        if session_key is not None:
-            tool_call = (
-                response.get("tool_call")
-                if isinstance(response, dict)
-                and isinstance(response.get("tool_call"), dict)
-                else {}
-            )
-            action_label = public_tool_label(tool_call.get("name"))
-            _record_query_history(
-                request,
-                session_id=session_key,
-                message=f"执行工作区行动 · {action_label}",
-                response=response,
-                expected_generation=history_generation,
-            )
-        return api_response(response)
+        state_buffer = AgentStateCommitBuffer(owner=owner)
+        try:
+            try:
+                with defer_agent_state_commits(state_buffer):
+                    response = service.invoke_workspace_action(
+                        action_key,
+                        owner=owner,
+                        rate_identity=_agent_tool_rate_owner(request),
+                        request_id=request_key,
+                        session_id=session_key or "",
+                    )
+            except AgentToolError:
+                if not coordinator.is_current(operation):
+                    return api_error("本次请求已被更新操作取代", 409)
+                raise
+
+            def persist_final() -> None:
+                if session_key is None:
+                    return
+                tool_call = (
+                    response.get("tool_call")
+                    if isinstance(response, dict)
+                    and isinstance(response.get("tool_call"), dict)
+                    else {}
+                )
+                action_label = public_tool_label(tool_call.get("name"))
+                _record_query_history(
+                    request,
+                    session_id=session_key,
+                    message=f"执行工作区行动 · {action_label}",
+                    response=response,
+                    expected_generation=history_generation,
+                )
+
+            with coordinator.finalization_window_if_current(operation) as published:
+                if published:
+                    state_buffer.commit()
+                    persist_final()
+                    return api_response(response)
+            return api_error("本次请求已被更新操作取代", 409)
+        finally:
+            state_buffer.discard()
+            coordinator.finish(operation)
     except AgentToolError as exc:
         return _agent_error(exc)
 

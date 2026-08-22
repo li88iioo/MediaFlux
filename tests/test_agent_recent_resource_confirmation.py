@@ -27,6 +27,10 @@ from app.agent.recent_download_submissions import (
 )
 from app.agent.registry import ToolRegistry
 from app.agent.service import reset_agent_service_for_tests
+from app.agent.state_commit import (
+    AgentStateCommitBuffer,
+    defer_agent_state_commits,
+)
 from app.main import create_app
 from app.modules.agent_download_verification_scheduler import (
     DownloadLibraryVerificationScheduler,
@@ -143,11 +147,20 @@ class RecentResourceCandidateStoreTests(unittest.TestCase):
         for secret in ("magnet:", "/private", "/secret", "secret.example"):
             self.assertNotIn(secret, serialized)
         self.assertIsNone(store.get(owner="session-b"))
+        self.assertTrue(store.contains_result(
+            owner="session-a", result_id="resource-result-0001"
+        ))
+        self.assertFalse(store.contains_result(
+            owner="session-b", result_id="resource-result-0001"
+        ))
 
         snapshot["candidates"].clear()
         self.assertEqual(len(store.get(owner="session-a")["candidates"]), 2)
         now[0] = 111.0
         self.assertIsNone(store.get(owner="session-a"))
+        self.assertFalse(store.contains_result(
+            owner="session-a", result_id="resource-result-0001"
+        ))
 
     def test_verified_missing_context_is_internal_and_invalid_context_is_dropped(self):
         store = RecentResourceCandidateStore()
@@ -379,6 +392,29 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             record_actions=record_actions,
         )
         return service, preview_calls, execute_calls, search_results
+
+    def test_same_query_can_prepare_a_staged_owner_bound_resource(self):
+        service, preview_calls, execute_calls, _ = self._agent()
+        buffer = AgentStateCommitBuffer(owner="session-a")
+
+        with defer_agent_state_commits(buffer):
+            searched = service.invoke(
+                "indexer.search_resources", {"title": "示例剧"}, owner="session-a"
+            )
+            result_id = searched["result"]["data"]["items"][0]["result_id"]
+            prepared = service.prepare(
+                "indexer.submit_resource",
+                {"result_id": result_id, "target": "qb"},
+                owner="session-a",
+            )
+
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(
+            preview_calls,
+            [{"result_id": "generic-resource-0001", "target": "qb"}],
+        )
+        self.assertEqual(execute_calls, [])
+        buffer.discard()
 
     def test_download_by_title_searches_candidates_before_any_write(self):
         for message in ("帮我下载光明之外", "帮我下载《光明之外》"):
@@ -1076,6 +1112,17 @@ class RecentResourceConfirmationAPITests(IsolatedDatabaseTestCase):
                 headers=headers_b,
                 json={"session_id": "test_session_identifier_0001", "message": "下载刚才推荐的第 1 个到 qB"},
             )
+            direct_cross_owner = self.client_b.post(
+                "/api/agent/actions/indexer.submit_resource/prepare",
+                headers=headers_b,
+                json={
+                    "session_id": "test_session_identifier_0001",
+                    "arguments": {
+                        "result_id": "resource-result-0001",
+                        "target": "qb",
+                    },
+                },
+            )
             prepared = self.client_a.post(
                 "/api/agent/query",
                 headers=headers_a,
@@ -1097,6 +1144,8 @@ class RecentResourceConfirmationAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(searched.status_code, 200, searched.text)
         self.assertEqual(blocked.status_code, 200, blocked.text)
         self.assertEqual(blocked.json()["result"]["status"], "precondition_failed")
+        self.assertEqual(direct_cross_owner.status_code, 409)
+        self.assertNotIn("confirmation", direct_cross_owner.text)
         self.assertEqual(prepared.status_code, 200, prepared.text)
         self.assertEqual(prepared.json()["mode"], "confirmation_required")
         self.assertEqual(wrong_owner.status_code, 409, wrong_owner.text)

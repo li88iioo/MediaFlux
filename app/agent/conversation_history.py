@@ -25,6 +25,7 @@ _SCHEMA_VERSION = 1
 _SUMMARY_STORAGE_VERSION = 1
 _UNSAFE_HISTORY_DETAIL = "[已隐藏敏感详情]"
 _SAFE_CONTEXT_DOMAINS = frozenset({"rss"})
+_SAFE_CONTEXT_TOPICS = frozenset({"rss", "media_subscription"})
 _MEDIA_CONTEXT_TOOL_TYPES: dict[str, str] = {
     "library.search": "",
     "library.count_series_episodes": "tv",
@@ -838,6 +839,15 @@ class SQLiteAgentConversationHistoryRepository:
             context_domain = str(data.get("context_domain") or "").strip()
             if context_domain in _SAFE_CONTEXT_DOMAINS:
                 entry["context_domain"] = context_domain
+            context_domains = data.get("context_domains")
+            if isinstance(context_domains, list):
+                safe_domains = sorted({
+                    str(value or "").strip()
+                    for value in context_domains[:4]
+                    if str(value or "").strip() in _SAFE_CONTEXT_TOPICS
+                })
+                if safe_domains:
+                    entry["context_domains"] = safe_domains
             if isinstance(suggestions, list):
                 entry["suggestions"] = [
                     value
@@ -1025,6 +1035,15 @@ class SQLiteAgentConversationHistoryRepository:
         context_domain = str(response.get("context_domain") or "").strip()
         if context_domain in _SAFE_CONTEXT_DOMAINS:
             projection["context_domain"] = context_domain
+        context_domains = response.get("context_domains")
+        if isinstance(context_domains, list):
+            safe_domains = sorted({
+                str(value or "").strip()
+                for value in context_domains[:4]
+                if str(value or "").strip() in _SAFE_CONTEXT_TOPICS
+            })
+            if safe_domains:
+                projection["context_domains"] = safe_domains
         presentation = (
             response.get("presentation")
             if isinstance(response.get("presentation"), dict)
@@ -1188,6 +1207,7 @@ class SQLiteAgentConversationHistoryRepository:
             "pending_selection",
             "pending_subscription",
             "media_context",
+            "context_domains",
         ):
             if encode_or_none() is not None:
                 break

@@ -75,6 +75,31 @@ def _submission_agent(
     calls: list[dict] = []
     registry = ToolRegistry()
     registry.register(ToolSpec(
+        name="indexer.search_resources",
+        description="search",
+        risk=RiskLevel.READ,
+        parameters={},
+        validator=lambda arguments: dict(arguments),
+        handler=lambda _arguments: ToolResult(
+            True,
+            "success",
+            "searched",
+            data={
+                "items": [
+                    {
+                        "result_id": "safe-result-00000001",
+                        "title": "Safe Resource",
+                        "site_id": "test",
+                        "site_name": "Test",
+                        "size_text": "1 GiB",
+                        "download_state": "ready",
+                        "download_kinds": ["magnet"],
+                    }
+                ]
+            },
+        ),
+    ))
+    registry.register(ToolSpec(
         name="indexer.submit_resource",
         description="submit",
         risk=RiskLevel.DANGER,
@@ -429,6 +454,9 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             request_id, targets="qb", status="downloading", qb_status="downloading"
         )
         service, calls = _submission_agent(_submission_result(request_id=request_id))
+        service.invoke(
+            "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
+        )
         prepared = service.prepare(
             "indexer.submit_resource",
             {"result_id": "safe-result-00000001", "target": "qb"},
@@ -451,6 +479,9 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
 
     def test_invalid_expired_replayed_and_stale_confirmations_do_not_capture(self):
         service, calls = _submission_agent(_submission_result(request_id=1))
+        service.invoke(
+            "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
+        )
         prepared = service.prepare(
             "indexer.submit_resource",
             {"result_id": "safe-result-00000001", "target": "qb"},
@@ -479,6 +510,9 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
         expired_service, expired_calls = _submission_agent(
             _submission_result(request_id=2), confirmation_store=expiring_store
         )
+        expired_service.invoke(
+            "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
+        )
         expired = expired_service.prepare(
             "indexer.submit_resource",
             {"result_id": "safe-result-00000001", "target": "qb"},
@@ -494,6 +528,9 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
         context = {"value": "one"}
         stale_service, stale_calls = _submission_agent(
             _submission_result(request_id=3), context=context
+        )
+        stale_service.invoke(
+            "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         stale = stale_service.prepare(
             "indexer.submit_resource",
@@ -596,6 +633,16 @@ class RecentDownloadStatusAPITests(IsolatedDatabaseTestCase):
             before = self.client_a.post(
                 "/api/agent/query", headers=headers_a, json={"session_id": "test_session_identifier_0001", "message": "刚才下载到哪了"}
             )
+            searched = self.client_a.post(
+                "/api/agent/tools/indexer.search_resources",
+                headers=headers_a,
+                json={
+                    "session_id": "test_session_identifier_0001",
+                    "arguments": {"title": "Safe Resource"},
+                },
+            )
+            self.assertEqual(searched.status_code, 200, searched.text)
+
             prepared = self.client_a.post(
                 "/api/agent/actions/indexer.submit_resource/prepare",
                 headers=headers_a,

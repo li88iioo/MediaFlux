@@ -27,7 +27,9 @@ from app.agent.conversation_history import get_agent_conversation_history_reposi
 from app.agent.confirmation_contract import sanitize_confirmation_contract
 from app.agent.feature_gate import is_agent_enabled
 from app.agent.llm_router import (
+    begin_llm_request_budget,
     normalize_streamed_answer,
+    reset_llm_request_budget,
     stream_existing_answer,
     stream_tool_answer,
 )
@@ -36,9 +38,13 @@ from app.agent.operation_coordinator import (
     get_agent_operation_coordinator,
     get_telegram_message_deduplicator,
 )
-from app.agent.query_lifecycle import begin_query_confirmation_epoch
+from app.agent.query_lifecycle import (
+    begin_query_confirmation_epoch,
+    invalidate_query_confirmation_epoch,
+)
 from app.agent.presentation_stream import (
     PublicNarrativeProjector,
+    PublicNarrativeValidationError,
     apply_streamed_answer,
     select_agent_answer_stream,
 )
@@ -53,6 +59,10 @@ from app.agent.result_projection import (
     sanitize_public_text,
 )
 from app.agent.service import get_agent_service
+from app.agent.state_commit import (
+    AgentStateCommitBuffer,
+    defer_agent_state_commits,
+)
 from app.agent.workspace_next_actions import (
     resolve_workspace_action_handoff,
     workspace_action_handoff_arguments,
@@ -1624,6 +1634,7 @@ def _publish_telegram_callback_response(
     history_message: str,
     fallback_summary: str,
     prepare_output: Callable[[], tuple[str, Any | None]],
+    state_buffer: AgentStateCommitBuffer | None = None,
 ) -> bool:
     """只让当前 callback 构造动作、发布消息并写入会话历史。"""
     allowed, prepared = coordinator.publish_if_current(operation, prepare_output)
@@ -1646,15 +1657,20 @@ def _publish_telegram_callback_response(
             _delete_stale_telegram_delivery(bot, publish_result.delivery)
         return False
 
-    finalized, _ = coordinator.finalize_if_current(
-        operation,
-        lambda: _record_telegram_callback_conversation(
+    def finalize_callback() -> None:
+        if state_buffer is not None:
+            state_buffer.commit()
+        _record_telegram_callback_conversation(
             owner,
             message=history_message,
             response=response,
             generation=history_generation,
             fallback_summary=fallback_summary,
-        ),
+        )
+
+    finalized, _ = coordinator.finalize_if_current(
+        operation,
+        finalize_callback,
     )
     if not finalized and isinstance(publish_result, _TelegramPublishResult):
         _delete_stale_telegram_delivery(bot, publish_result.delivery)
@@ -1669,7 +1685,7 @@ async def _consume_agent_stream(
     *,
     is_current: Callable[[], bool] | None = None,
     publish: Callable[[Callable[[], Any]], tuple[bool, Any | None]] | None = None,
-) -> tuple[str, bool, bool]:
+) -> tuple[str, bool, str | None]:
     """节流更新同一条 Telegram 草稿，并阻止旧操作继续发布。"""
     projector = PublicNarrativeProjector()
     published = ""
@@ -1730,11 +1746,11 @@ async def _consume_agent_stream(
         ensure_current()
         answer = projector.finalize(require_emitted=True)
         if not answer:
-            return "", False, False
+            return "", False, None
         published = answer
         emitted = True
         update_preview(force=True)
-        return answer, True, False
+        return answer, True, None
     except AgentOperationCancelled:
         raise
     except Exception as exc:
@@ -1744,13 +1760,18 @@ async def _consume_agent_stream(
             type(exc).__name__,
         )
         if not emitted:
-            return "", False, False
+            return "", False, None
+        interruption_kind = (
+            "invalid"
+            if isinstance(exc, PublicNarrativeValidationError)
+            else "interrupted"
+        )
         partial = projector.published_answer()
         if not partial:
-            return "", True, True
+            return "", True, interruption_kind
         published = partial
         update_preview(force=True, interrupted=True)
-        return partial, True, True
+        return partial, True, interruption_kind
 
 
 def _telegram_guidance(response: dict[str, Any]) -> list[dict[str, str]]:
@@ -2827,6 +2848,8 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         operation_id=f"tg_{event_key[:32]}",
         initialize=initialize_query,
     )
+    state_buffer = AgentStateCommitBuffer(owner=owner)
+    llm_budget_token = begin_llm_request_budget(owner)
     stream_target = None
     message_chat_id, _source_message_id, message_thread_id = _message_context(message)
     typing_heartbeat = _TelegramTypingHeartbeat(
@@ -2871,7 +2894,8 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         if stream_target is not None:
             # 工具选择与参数必须先完整校验；只把最终公开自然语言改成 Provider 流。
             query_kwargs["present"] = False
-        response = service.query(user_message, **query_kwargs)
+        with defer_agent_state_commits(state_buffer):
+            response = service.query(user_message, **query_kwargs)
         if not coordinator.is_current(operation):
             raise AgentOperationCancelled("Telegram Agent 操作已失效")
 
@@ -2883,7 +2907,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                 owner=owner,
             )
             if source is not None:
-                answer, emitted, interrupted = run_awaitable_sync(
+                answer, emitted, interruption_kind = run_awaitable_sync(
                     _consume_agent_stream(
                         bot,
                         telebot,
@@ -2895,7 +2919,24 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                         ),
                     )
                 )
-                if interrupted:
+                if interruption_kind is not None:
+                    interrupted_response: dict[str, Any] | None = None
+                    if answer and interruption_kind == "interrupted":
+                        interrupted_response = _apply_streamed_answer(
+                            response, answer
+                        )
+                        result = interrupted_response.get("result")
+                        if isinstance(result, dict):
+                            interrupted_result = dict(result)
+                            interrupted_result["status"] = "interrupted"
+                            interrupted_result["summary"] = answer
+                            interrupted_response["result"] = interrupted_result
+                        presentation = interrupted_response.get("presentation")
+                        if isinstance(presentation, dict):
+                            interrupted_response["presentation"] = {
+                                **presentation,
+                                "status": "interrupted",
+                            }
                     rendered = (
                         _stream_preview_html(answer, interrupted=True)
                         if answer
@@ -2922,8 +2963,19 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                             bot, publish_result.delivery
                         )
                     if allowed:
+                        def finalize_interruption() -> None:
+                            if interrupted_response is None:
+                                return
+                            state_buffer.commit()
+                            _record_telegram_conversation(
+                                owner,
+                                message=user_message,
+                                response=interrupted_response,
+                                generation=history_generation,
+                            )
+
                         finalized, _ = coordinator.finalize_if_current(
-                            operation, lambda: None
+                            operation, finalize_interruption
                         )
                         if not finalized and isinstance(
                             publish_result, _TelegramPublishResult
@@ -3017,14 +3069,18 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         if not allowed and isinstance(publish_result, _TelegramPublishResult):
             _delete_stale_telegram_delivery(bot, publish_result.delivery)
         if allowed:
-            finalized, _ = coordinator.finalize_if_current(
-                operation,
-                lambda: _record_telegram_conversation(
+            def finalize_conversation() -> None:
+                state_buffer.commit()
+                _record_telegram_conversation(
                     owner,
                     message=user_message,
                     response=response,
                     generation=history_generation,
-                ),
+                )
+
+            finalized, _ = coordinator.finalize_if_current(
+                operation,
+                finalize_conversation,
             )
             if not finalized and isinstance(
                 publish_result, _TelegramPublishResult
@@ -3080,6 +3136,8 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             ):
                 _delete_stale_telegram_delivery(bot, publish_result.delivery)
     finally:
+        state_buffer.discard()
+        reset_llm_request_budget(llm_budget_token)
         typing_heartbeat.stop()
         coordinator.finish(operation)
     return True
@@ -3124,6 +3182,8 @@ def handle_agent_patrol_callback(
     callback_answered = False
     coordinator = get_agent_operation_coordinator()
     operation = None
+    state_buffer: AgentStateCommitBuffer | None = None
+    llm_budget_token = None
     typing_heartbeat: _TelegramTypingHeartbeat | None = None
     if telegram_agent_access(chat_id, user_id) != "allowed":
         bot.answer_callback_query(call.id, "操作已过期或无效", show_alert=True)
@@ -3143,12 +3203,18 @@ def handle_agent_patrol_callback(
             )
             return
 
-        operation = coordinator.begin(
+        service = get_agent_service()
+        operation, _ = coordinator.begin_with_context(
             owner=owner,
             operation_id=_telegram_callback_operation_id(
                 owner, call, action=action
             ),
+            initialize=lambda: invalidate_query_confirmation_epoch(
+                service, owner=owner
+            ),
         )
+        state_buffer = AgentStateCommitBuffer(owner=owner)
+        llm_budget_token = begin_llm_request_budget(owner)
         bot.answer_callback_query(call.id, "正在查询，请稍候")
         callback_answered = True
         typing_heartbeat = _start_telegram_operation_typing(
@@ -3158,13 +3224,14 @@ def handle_agent_patrol_callback(
         )
         history_generation = _telegram_history_generation(owner)
         _principal, trace_session_id = _telegram_history_identity(owner)
-        response = _query_patrol_action(
-            get_agent_service(),
-            action,
-            owner=owner,
-            request_id=_trace_operation_id(operation),
-            session_id=trace_session_id,
-        )
+        with defer_agent_state_commits(state_buffer):
+            response = _query_patrol_action(
+                service,
+                action,
+                owner=owner,
+                request_id=_trace_operation_id(operation),
+                session_id=trace_session_id,
+            )
 
         def prepare_output() -> tuple[str, Any | None]:
             candidates = _resource_candidates(response)
@@ -3199,6 +3266,7 @@ def handle_agent_patrol_callback(
                 else "已完成全库巡检结果检查"
             ),
             prepare_output=prepare_output,
+            state_buffer=state_buffer,
         )
     except (AgentToolError, ValueError):
         if operation is not None and not coordinator.is_current(operation):
@@ -3232,6 +3300,10 @@ def handle_agent_patrol_callback(
         else:
             bot.answer_callback_query(call.id, "Agent 暂时不可用", show_alert=True)
     finally:
+        if state_buffer is not None:
+            state_buffer.discard()
+        if llm_budget_token is not None:
+            reset_llm_request_budget(llm_budget_token)
         _stop_telegram_typing_heartbeat(typing_heartbeat)
         if operation is not None:
             coordinator.finish(operation)
@@ -3243,6 +3315,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
     confirmed_action_completed = False
     coordinator = get_agent_operation_coordinator()
     operation = None
+    state_buffer: AgentStateCommitBuffer | None = None
     typing_heartbeat: _TelegramTypingHeartbeat | None = None
     if telegram_agent_access(chat_id, user_id) != "allowed":
         bot.answer_callback_query(call.id, "操作已过期或无效", show_alert=True)
@@ -3356,15 +3429,26 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                         fallback_summary = "操作已取消，未执行任何写入。"
                     elif action["action"] == "prepare_resource":
                         try:
+                            confirmation_epoch = begin_query_confirmation_epoch(
+                                service, owner=owner
+                            )
+                            prepare_kwargs: dict[str, Any] = {
+                                "owner": owner,
+                                "request_id": _trace_operation_id(operation),
+                                "session_id": _telegram_history_identity(owner)[1],
+                                "trusted_resource_owner_binding": True,
+                            }
+                            if confirmation_epoch is not None:
+                                prepare_kwargs["expected_owner_generation"] = (
+                                    confirmation_epoch
+                                )
                             response = service.prepare(
                                 "indexer.submit_resource",
                                 {
                                     "result_id": action["result_id"],
                                     "target": action["target"],
                                 },
-                                owner=owner,
-                                request_id=_trace_operation_id(operation),
-                                session_id=_telegram_history_identity(owner)[1],
+                                **prepare_kwargs,
                             )
                         except AgentToolError as exc:
                             prepare_error = exc
@@ -3485,10 +3569,13 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                         expires_at=action["expires_at"],
                     )
                 else:
-                    operation = coordinator.begin(
+                    operation, _ = coordinator.begin_with_context(
                         owner=owner,
                         operation_id=_telegram_callback_operation_id(
                             owner, call, action=action_kind
+                        ),
+                        initialize=lambda: invalidate_query_confirmation_epoch(
+                            service, owner=owner
                         ),
                     )
             if not allowed:
@@ -3504,10 +3591,13 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             # 撤销，而旧 callback 随后仍创建 lease 并抢占新消息。
             with coordinator.owner_window(owner):
                 action = store.resolve(action_id, owner=owner)
-                operation = coordinator.begin(
+                operation, _ = coordinator.begin_with_context(
                     owner=owner,
                     operation_id=_telegram_callback_operation_id(
                         owner, call, action=action_kind
+                    ),
+                    initialize=lambda: invalidate_query_confirmation_epoch(
+                        service, owner=owner
                     ),
                 )
 
@@ -3521,13 +3611,15 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         if action["action"] == "invoke_read_tool":
             bot.answer_callback_query(call.id, "正在查询，请稍候")
             callback_answered = True
-            response = service.invoke(
-                action["tool_name"],
-                action["arguments"],
-                owner=owner,
-                request_id=_trace_operation_id(operation),
-                session_id=_telegram_history_identity(owner)[1],
-            )
+            state_buffer = AgentStateCommitBuffer(owner=owner)
+            with defer_agent_state_commits(state_buffer):
+                response = service.invoke(
+                    action["tool_name"],
+                    action["arguments"],
+                    owner=owner,
+                    request_id=_trace_operation_id(operation),
+                    session_id=_telegram_history_identity(owner)[1],
+                )
             label = public_tool_label(action["tool_name"])
 
             def prepare_read_output() -> tuple[str, Any | None]:
@@ -3559,16 +3651,19 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 history_message=f"查看{label}",
                 fallback_summary=f"已完成{label}",
                 prepare_output=prepare_read_output,
+                state_buffer=state_buffer,
             )
             return
         if action["action"] == "invoke_workspace_action":
-            response = service.invoke_workspace_action(
-                action["action_key"],
-                owner=owner,
-                rate_identity="",
-                request_id=_trace_operation_id(operation),
-                session_id=_telegram_history_identity(owner)[1],
-            )
+            state_buffer = AgentStateCommitBuffer(owner=owner)
+            with defer_agent_state_commits(state_buffer):
+                response = service.invoke_workspace_action(
+                    action["action_key"],
+                    owner=owner,
+                    rate_identity="",
+                    request_id=_trace_operation_id(operation),
+                    session_id=_telegram_history_identity(owner)[1],
+                )
             label = sanitize_public_text(resolution.get("label"), limit=120) or "建议检查"
             _stop_telegram_typing_heartbeat(typing_heartbeat)
             typing_heartbeat = None
@@ -3583,6 +3678,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 history_message=label,
                 fallback_summary=f"已完成{label}",
                 prepare_output=lambda: (render_agent_response(response), None),
+                state_buffer=state_buffer,
             )
             return
         raise ValueError("操作已过期或无效")
@@ -3648,6 +3744,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             _remove_callback_keyboard(bot, call.message)
             bot.answer_callback_query(call.id, "Agent 暂时不可用", show_alert=True)
     finally:
+        if state_buffer is not None:
+            state_buffer.discard()
         _stop_telegram_typing_heartbeat(typing_heartbeat)
         if operation is not None:
             coordinator.finish(operation)

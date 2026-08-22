@@ -466,6 +466,63 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
         self.assertIsInstance(outcome[0], AgentToolError)
         self.assertEqual(outcome[0].code, "confirmation_invalid")
 
+    def test_confirm_and_discard_advance_epoch_against_late_prepare(self):
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="write.epoch",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={},
+            validator=lambda _arguments: {},
+            preview_handler=lambda _arguments: ToolResult(
+                True, "confirmation_required", "preview"
+            ),
+            handler=lambda _arguments: ToolResult(True, "accepted", "done"),
+            requires_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "ticket-epoch-advance-1234"),
+        )
+
+        confirm_epoch = service.begin_query_confirmation_epoch(owner="owner-a")
+        prepared = service.prepare(
+            "write.epoch",
+            {},
+            owner="owner-a",
+            expected_owner_generation=confirm_epoch,
+        )
+        service.confirm(
+            prepared["confirmation"]["confirmation_id"], owner="owner-a"
+        )
+        with self.assertRaises(AgentToolError) as late_confirm:
+            service.prepare(
+                "write.epoch",
+                {},
+                owner="owner-a",
+                expected_owner_generation=confirm_epoch,
+            )
+        self.assertEqual(late_confirm.exception.code, "confirmation_invalid")
+
+        discard_epoch = service.begin_query_confirmation_epoch(owner="owner-a")
+        prepared = service.prepare(
+            "write.epoch",
+            {},
+            owner="owner-a",
+            expected_owner_generation=discard_epoch,
+        )
+        self.assertTrue(service.discard_confirmation(
+            prepared["confirmation"]["confirmation_id"], owner="owner-a"
+        ))
+        with self.assertRaises(AgentToolError) as late_discard:
+            service.prepare(
+                "write.epoch",
+                {},
+                owner="owner-a",
+                expected_owner_generation=discard_epoch,
+            )
+        self.assertEqual(late_discard.exception.code, "confirmation_invalid")
+
     def test_orchestrator_consumes_ticket_before_failed_handler(self):
         calls = Mock()
         registry = ToolRegistry()

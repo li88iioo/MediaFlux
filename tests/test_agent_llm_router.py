@@ -26,6 +26,7 @@ from app.agent.llm_router import (
     _request_result_narrative,
     _request_selection,
     _request_text_stream,
+    _reserve_llm_provider_request,
     answer_conversation,
     begin_llm_request_budget,
     compose_tool_answer,
@@ -2474,6 +2475,30 @@ class AgentLLMSelectionTests(unittest.TestCase):
 
         self.assertEqual(admitted, ["owner-a"])
 
+    def test_nested_stream_scope_reuses_query_budget_and_minute_admission(self):
+        admitted: list[str] = []
+        outer = begin_llm_request_budget("owner-a")
+        try:
+            with patch(
+                "app.agent.llm_router._allow_llm_request",
+                side_effect=lambda owner: admitted.append(owner) or True,
+            ):
+                def route_in_worker_thread() -> bool:
+                    inner = begin_llm_request_budget("owner-a")
+                    try:
+                        return _reserve_llm_provider_request("owner-a")
+                    finally:
+                        reset_llm_request_budget(inner)
+
+                self.assertTrue(asyncio.run(asyncio.to_thread(route_in_worker_thread)))
+                # 模拟 service.query 返回后，Web/Telegram narrative 阶段继续使用
+                # 外层流式生命周期预算，而不是重新占用分钟配额。
+                self.assertTrue(_reserve_llm_provider_request("owner-a"))
+        finally:
+            reset_llm_request_budget(outer)
+
+        self.assertEqual(admitted, ["owner-a"])
+
     def test_selector_exception_fails_closed(self):
         registry = _read_registry()
         values = {"AGENT_LLM_ENABLED": "1"}
@@ -3421,6 +3446,44 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertEqual(recent[0], "agent.read_plan")
         self.assertEqual(len(recent[1]["steps"]), 2)
         presenter.assert_not_called()
+
+    def test_native_subscription_plan_projects_mixed_followup_topics(self):
+        orchestrator = AgentOrchestrator(ToolRegistry())
+        executions = [
+            {
+                "tool_name": "rss.subscription_summaries",
+                "arguments": {},
+                "response": {
+                    "tool_call": {"name": "rss.subscription_summaries"},
+                    "result": ToolResult(
+                        True, "ok", "RSS 订阅 1 个"
+                    ).to_dict(),
+                },
+            },
+            {
+                "tool_name": "media.subscription_summaries",
+                "arguments": {},
+                "response": {
+                    "tool_call": {"name": "media.subscription_summaries"},
+                    "result": ToolResult(
+                        True, "ok", "媒体追更 3 个"
+                    ).to_dict(),
+                },
+            },
+        ]
+
+        response = orchestrator._aggregate_native_read_executions(
+            executions,
+            owner="",
+            completed=True,
+            narrative_suggestions=(),
+        )
+
+        self.assertIsNotNone(response)
+        self.assertEqual(
+            response["context_domains"], ["media_subscription", "rss"]
+        )
+        self.assertNotIn("context_domain", response)
 
     def test_native_single_tool_execution_preserves_original_contract(self):
         registry = _read_registry()

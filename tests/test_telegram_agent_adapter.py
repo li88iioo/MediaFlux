@@ -14,6 +14,7 @@ from app.agent.operation_coordinator import reset_agent_operation_state_for_test
 from app.agent.orchestrator import AgentOrchestrator
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError, ToolRegistry
+from app.agent.state_commit import commit_or_defer_agent_state
 from app.bot.agent_adapter import (
     SQLiteTelegramAgentActionStore,
     TelegramAgentActionStore,
@@ -2671,6 +2672,27 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             },
         }
         history = Mock()
+        state_commits: list[str] = []
+
+        def query_with_deferred_state(*_args, **_kwargs):
+            commit_or_defer_agent_state(
+                lambda: state_commits.append("检查下载队列")
+            )
+            return {
+                "mode": "answer",
+                "tool_call": {
+                    "name": "downloads.diagnose_queue",
+                    "arguments": {},
+                },
+                "result": {
+                    "ok": True,
+                    "summary": "不应在中断后重放这个摘要",
+                    "suggestions": [],
+                    "evidence": [],
+                },
+            }
+
+        service.query.side_effect = query_with_deferred_state
 
         async def broken_stream(*_args, **_kwargs):
             yield "已经生成一部分安全回答。"
@@ -2700,7 +2722,14 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertIn("已经生成一部分安全回答", final_html)
         self.assertIn("生成中断", final_html)
         self.assertNotIn("不应在中断后重放这个摘要", final_html)
-        history.assert_not_called()
+        history.assert_called_once()
+        recorded = history.call_args.kwargs["response"]
+        self.assertEqual(recorded["result"]["status"], "interrupted")
+        self.assertEqual(
+            recorded["result"]["summary"], "已经生成一部分安全回答。"
+        )
+        self.assertEqual(recorded["presentation"]["status"], "interrupted")
+        self.assertEqual(state_commits, ["检查下载队列"])
 
     def test_message_never_publishes_unsafe_provider_delta(self):
         bot = _RichDraftBot()
@@ -2719,6 +2748,16 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             },
         }
         history = Mock()
+        state_commits: list[str] = []
+        query_response = service.query.return_value
+
+        def query_with_deferred_state(*_args, **_kwargs):
+            commit_or_defer_agent_state(
+                lambda: state_commits.append("检查下载队列")
+            )
+            return query_response
+
+        service.query.side_effect = query_with_deferred_state
 
         async def unsafe_stream(*_args, **_kwargs):
             yield "已经生成一部分安全回答。请访问 https://"
@@ -2753,6 +2792,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("private.invalid", serialized)
         self.assertNotIn("不应在中断后重放这个摘要", serialized)
         history.assert_not_called()
+        self.assertEqual(state_commits, [])
 
     def test_message_never_publishes_chinese_credential_delta(self):
         bot = _RichDraftBot()
@@ -3458,6 +3498,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             )
 
         self.assertEqual(limiter.call_count, 2)
+        service.invalidate_query_confirmation_epoch.assert_called_once_with(
+            owner="tg:v1:100\x1f200"
+        )
         service.invoke_workspace_action.assert_called_once_with(
             "review_rss",
             owner="tg:v1:100\x1f200",
@@ -4028,6 +4071,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
 
         self.assertEqual(events[0:2], ["typing_stop", "terminal_publish"])
         heartbeat.stop.assert_called_once()
+        service.invalidate_query_confirmation_epoch.assert_called_once_with(
+            owner=owner
+        )
 
     def test_patrol_summary_callback_is_owner_bound_and_replies_without_editing(self):
         bot = _TypingBot()
@@ -4067,6 +4113,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         )
         service.prepare.assert_not_called()
         service.confirm.assert_not_called()
+        service.invalidate_query_confirmation_epoch.assert_called_once_with(
+            owner="tg:v1:100\x1f200"
+        )
         self.assertEqual(len(bot.replies), 1)
         self.assertEqual(bot.edits, [])
         self.assertIn("最近巡检发现", bot.replies[0][1])
@@ -4343,6 +4392,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 owner="tg:v1:100\x1f200",
                 request_id=ANY,
                 session_id=ANY,
+                trusted_resource_owner_binding=True,
             )
             service.confirm.assert_not_called()
             confirmation_markup = bot.edits[0][3]["reply_markup"]

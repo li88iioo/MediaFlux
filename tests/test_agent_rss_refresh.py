@@ -348,6 +348,28 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
         self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
 
+    def test_mixed_subscription_plan_asks_which_domain_to_refresh(self):
+        service = get_agent_service()
+        context = [{
+            "role": "assistant",
+            "tool_name": "agent.read_plan",
+            "status": "completed",
+            "text": "已列出 RSS 与媒体追更订阅。",
+            "context_domains": ["media_subscription", "rss"],
+        }]
+
+        response = service.query(
+            "刷新一下",
+            owner="owner-mixed-subscriptions",
+            conversation_context=context,
+            trusted_conversation_context=True,
+            present=False,
+        )
+
+        self.assertEqual(response["mode"], "clarification")
+        self.assertIn("RSS 与媒体追更", response["result"]["summary"])
+        self.assertNotIn("confirmation", response)
+
     def test_natural_rss_reply_does_not_hijack_download_client_correction(self):
         db.update_rss_subscription(self.sid, {"enabled": False})
         service = get_agent_service()

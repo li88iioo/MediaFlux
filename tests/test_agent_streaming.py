@@ -10,11 +10,13 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+from app.agent.confirmation import ConfirmationStore
 from app.agent.operation_coordinator import (
     get_agent_operation_coordinator,
     reset_agent_operation_state_for_tests,
 )
 from app.agent.rate_limit import agent_rate_limiter
+from app.agent.state_commit import commit_or_defer_agent_state
 from app.clients.openai_compatible import ProviderStreamError
 from app.config import web_credentials
 from app.main import create_app
@@ -56,17 +58,118 @@ class _FakeService:
         return self.response
 
 
+class _StatefulFakeService(_FakeService):
+    def __init__(self, response: dict) -> None:
+        super().__init__(response)
+        self.state_commits: list[str] = []
+
+    def query(self, message: str, **kwargs):
+        self.calls.append((message, kwargs))
+        commit_or_defer_agent_state(
+            lambda: self.state_commits.append(message)
+        )
+        return self.response
+
+
 class _BlockingService(_FakeService):
     def __init__(self, response: dict) -> None:
         super().__init__(response)
         self.started = threading.Event()
         self.release = threading.Event()
+        self.state_commits: list[str] = []
 
     def query(self, message: str, **kwargs):
         self.calls.append((message, kwargs))
         self.started.set()
         if not self.release.wait(timeout=5):
             raise TimeoutError("测试未释放阻塞查询")
+        commit_or_defer_agent_state(
+            lambda: self.state_commits.append(message)
+        )
+        return self.response
+
+
+class _BlockingInvokeService(_FakeService):
+    def __init__(self, response: dict) -> None:
+        super().__init__(response)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.state_commits: list[str] = []
+
+    @staticmethod
+    def has_tool(_tool_name: str) -> bool:
+        return True
+
+    @staticmethod
+    def is_read_tool(_tool_name: str) -> bool:
+        return True
+
+    def invoke(self, tool_name: str, arguments: dict, **_kwargs):
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("测试未释放阻塞工具")
+        commit_or_defer_agent_state(
+            lambda: self.state_commits.append(tool_name)
+        )
+        return self.response
+
+
+class _ConfirmationRaceService(_FakeService):
+    def __init__(self, response: dict) -> None:
+        super().__init__(response)
+        self.confirmation_store = ConfirmationStore()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.owner = ""
+
+    @staticmethod
+    def has_tool(_tool_name: str) -> bool:
+        return True
+
+    @staticmethod
+    def is_read_tool(_tool_name: str) -> bool:
+        return True
+
+    def begin_query_confirmation_epoch(self, *, owner: str) -> int:
+        _revoked, generation = self.confirmation_store.rotate_owner(owner=owner)
+        return generation
+
+    def invalidate_query_confirmation_epoch(self, *, owner: str) -> int:
+        revoked, _generation = self.confirmation_store.rotate_owner(owner=owner)
+        return revoked
+
+    def query(self, message: str, **kwargs):
+        self.calls.append((message, kwargs))
+        self.owner = str(kwargs.get("owner") or "")
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("测试未释放确认查询")
+        self.confirmation_store.issue(
+            owner=self.owner,
+            tool_name="test.write",
+            arguments={"enabled": True},
+            expected_owner_generation=kwargs.get("confirmation_owner_generation"),
+        )
+        return self.response
+
+    def invoke(self, _tool_name: str, _arguments: dict, **_kwargs):
+        return self.response
+
+
+class _BlockingWorkspaceService(_FakeService):
+    def __init__(self, response: dict) -> None:
+        super().__init__(response)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.state_commits: list[str] = []
+
+    def invoke_workspace_action(self, action_key: str, **_kwargs):
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("测试未释放工作区行动")
+        commit_or_defer_agent_state(
+            lambda: self.state_commits.append(action_key)
+        )
         return self.response
 
 
@@ -206,7 +309,7 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
 
     def test_partial_stream_interruption_persists_public_prefix_and_tool_state(self):
         csrf = self._login()
-        service = _FakeService(_tool_response())
+        service = _StatefulFakeService(_tool_response())
         history = Mock()
 
         async def broken_stream(*_args, **_kwargs):
@@ -241,6 +344,7 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(saved["result"]["summary"], "下载队列已完成检查。")
         self.assertEqual(saved["tool_call"]["name"], "downloads.diagnose_queue")
         self.assertEqual(saved["presentation"]["status"], "interrupted")
+        self.assertEqual(service.state_commits, ["检查下载队列状态"])
 
     def test_split_unsafe_stream_token_is_never_publicly_emitted(self):
         csrf = self._login()
@@ -508,6 +612,7 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(events[-1]["reason"], "user_cancelled")
         self.assertNotIn('"type":"final"', response.text)
         history.assert_not_called()
+        self.assertEqual(service.state_commits, [])
 
 
     def test_stream_generator_publishes_cancel_before_worker_thread_finishes(self):
@@ -573,6 +678,139 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(first["type"], "status")
         self.assertEqual(second["type"], "cancelled")
         self.assertEqual(second["reason"], "user_cancelled")
+
+    def test_slow_direct_tool_cannot_overwrite_newer_query_state(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _BlockingInvokeService(_tool_response())
+        direct_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        direct_client.cookies.update(self.client.cookies)
+
+        try:
+            with patch("app.routes.agent_api.get_agent_service", return_value=service):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(
+                        direct_client.post,
+                        "/api/agent/tools/indexer.search_resources",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "arguments": {"title": "旧结果"},
+                        },
+                    )
+                    self.assertTrue(
+                        service.started.wait(timeout=1),
+                        "慢工具未进入执行阶段",
+                    )
+                    newer = self.client.post(
+                        "/api/agent/query",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "message": "检查下载队列状态",
+                            "request_id": "request_newer_query_0001",
+                        },
+                    )
+                    self.assertEqual(newer.status_code, 200, newer.text)
+                    service.release.set()
+                    stale = pending.result(timeout=2)
+        finally:
+            service.release.set()
+            direct_client.close()
+
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(service.state_commits, [])
+
+    def test_direct_read_revokes_superseded_query_confirmation_epoch(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _ConfirmationRaceService(_tool_response())
+        query_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        query_client.cookies.update(self.client.cookies)
+
+        try:
+            with patch("app.routes.agent_api.get_agent_service", return_value=service):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(
+                        query_client.post,
+                        "/api/agent/query",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "message": "执行受控写操作",
+                            "request_id": "request_old_confirmation_0001",
+                        },
+                    )
+                    self.assertTrue(
+                        service.started.wait(timeout=1),
+                        "旧查询未进入确认准备阶段",
+                    )
+                    direct = self.client.post(
+                        "/api/agent/tools/downloads.diagnose_queue",
+                        headers=headers,
+                        json={"session_id": SESSION_ID, "arguments": {}},
+                    )
+                    self.assertEqual(direct.status_code, 200, direct.text)
+                    service.release.set()
+                    stale = pending.result(timeout=2)
+        finally:
+            service.release.set()
+            query_client.close()
+
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertTrue(service.owner)
+        self.assertEqual(
+            service.confirmation_store.list_active_tickets(owner=service.owner),
+            [],
+        )
+
+    def test_slow_workspace_action_cannot_overwrite_newer_query_state(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _BlockingWorkspaceService(_tool_response())
+        workspace_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        workspace_client.cookies.update(self.client.cookies)
+
+        try:
+            with patch("app.routes.agent_api.get_agent_service", return_value=service):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(
+                        workspace_client.post,
+                        "/api/agent/workspace-actions/invoke",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "action_key": "review_library_patrol",
+                        },
+                    )
+                    self.assertTrue(
+                        service.started.wait(timeout=1),
+                        "慢工作区行动未进入执行阶段",
+                    )
+                    newer = self.client.post(
+                        "/api/agent/query",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "message": "检查下载队列状态",
+                            "request_id": "request_after_workspace_0001",
+                        },
+                    )
+                    self.assertEqual(newer.status_code, 200, newer.text)
+                    service.release.set()
+                    stale = pending.result(timeout=2)
+        finally:
+            service.release.set()
+            workspace_client.close()
+
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(service.state_commits, [])
 
     def test_request_id_is_validated_for_query_and_cancel(self):
         csrf = self._login()

@@ -299,7 +299,16 @@ _LLM_REQUEST_BUDGET: ContextVar[_LLMRequestBudget | None] = ContextVar(
 def begin_llm_request_budget(owner: str) -> Token[_LLMRequestBudget | None]:
     """为一次外部查询建立懒加载预算；没有 Provider 调用时不会消耗配额。"""
     rate_owner = str(owner or "anonymous").strip() or "anonymous"
-    return _LLM_REQUEST_BUDGET.set(_LLMRequestBudget(owner=rate_owner))
+    current = _LLM_REQUEST_BUDGET.get()
+    # Web/Telegram 流式入口会覆盖“工具规划 + narrative”整个生命周期；
+    # Orchestrator 内层再次建立预算时必须复用同一对象，避免后半段重新占用
+    # 分钟配额或绕过单次查询的 Provider 调用上限。
+    budget = (
+        current
+        if current is not None and current.owner == rate_owner
+        else _LLMRequestBudget(owner=rate_owner)
+    )
+    return _LLM_REQUEST_BUDGET.set(budget)
 
 
 def reset_llm_request_budget(token: Token[_LLMRequestBudget | None]) -> None:

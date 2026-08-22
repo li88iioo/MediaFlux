@@ -354,6 +354,14 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         projection = self.repository._assistant_projection(response)
         self.assertNotIn("context_domain", projection)
 
+        response["context_domains"] = [
+            "rss", "media_subscription", "downloads", "rss"
+        ]
+        projection = self.repository._assistant_projection(response)
+        self.assertEqual(
+            projection["context_domains"], ["media_subscription", "rss"]
+        )
+
     def test_empty_media_result_keeps_tentative_context_and_pending_selection(self):
         empty_response = {
             "mode": "tool_result",
