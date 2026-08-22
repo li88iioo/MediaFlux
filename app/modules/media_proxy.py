@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import hmac
 import ipaddress
+import logging
 import mimetypes
 import re
 import secrets
@@ -12,17 +13,19 @@ import socket
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import formatdate
+from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 
 import httpx
 import uvicorn
-from aiohttp import ClientSession, TCPConnector, WSMsgType
+from aiohttp import ClientSession, TCPConnector, WSServerHandshakeError, WSMsgType
 from aiohttp.abc import AbstractResolver
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -31,7 +34,7 @@ from starlette.background import BackgroundTask
 from app import database
 from app.clients.guangya import GuangYaClient
 from app.config import get
-from app.logger import get_logger
+from app.logger import get_logger, log_throttled
 from app.modules.media_proxy_recorder import PlaybackRecordWriter
 from app.modules.media_proxy_safety import safe_media_name as _safe_media_name
 from app.modules.media_server_profiles import resolve_proxy_instance
@@ -73,6 +76,7 @@ _AUTH_CLIENT_RE = re.compile(
     r'(?:^|[,\s])Client\s*=\s*(?:"([^"]+)"|([^,\s]+))',
     re.IGNORECASE,
 )
+_MEDIA_BROWSER_AUTH_RE = re.compile(r"^\s*MediaBrowser(?:\s+|$)", re.IGNORECASE)
 _HLS_PATH_RE = re.compile(r"(?:\.m3u8$|/(?:hls|master|main)/|\.ts$|\.m4s$)", re.IGNORECASE)
 _signed_url_caches: dict[int, SignedUrlCache] = {}
 _signed_url_caches_lock = threading.RLock()
@@ -82,6 +86,19 @@ PLAYGY_SIGNED_URL_TIMEOUT_SECONDS = 8.0
 _PROXY_WRITE_TIMEOUT_SECONDS = 30.0
 _PROXY_POOL_TIMEOUT_SECONDS = 5.0
 _SIGNED_MEDIA_MAX_REDIRECTS = 5
+_SIGNED_MEDIA_PROBE_MAX_CONCURRENCY = 32
+_SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS = 1.0
+_SIGNED_MEDIA_PROBE_READ_TIMEOUT_SECONDS = 10.0
+_SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS = 10.0
+# 跨所有媒体反代 runtime 共享的实际阻塞任务容量。旧 runtime 即使仍有
+# 无法取消的 DNS/SDK 调用，新 runtime 也不能绕过上限继续堆积线程。
+_signed_media_probe_worker_capacity = threading.BoundedSemaphore(
+    _SIGNED_MEDIA_PROBE_MAX_CONCURRENCY
+)
+_signed_media_probe_executor = ThreadPoolExecutor(
+    max_workers=_SIGNED_MEDIA_PROBE_MAX_CONCURRENCY,
+    thread_name_prefix="media-proxy-head",
+)
 _SIGNED_MEDIA_REQUEST_HEADERS = {
     "accept",
     "if-range",
@@ -104,6 +121,10 @@ class ProxyRequestBodyTooLarge(ValueError):
 
 class ProxyUpstreamBodyTooLarge(ValueError):
     """需要缓冲处理的上游响应超过运行时上限。"""
+
+
+class _SignedMediaProbeCapacityError(RuntimeError):
+    """原生客户端媒体探测的受控后台工作容量已满。"""
 
 
 def _bounded_megabytes_setting(key: str, default: int, hard_max: int) -> int:
@@ -131,6 +152,18 @@ def _upstream_timeout() -> httpx.Timeout:
     return httpx.Timeout(
         connect=_PROXY_CONNECT_TIMEOUT_SECONDS,
         read=None,
+        write=_PROXY_WRITE_TIMEOUT_SECONDS,
+        pool=_PROXY_POOL_TIMEOUT_SECONDS,
+    )
+
+
+def _signed_media_timeout(method: str) -> httpx.Timeout:
+    if str(method or "GET").upper() != "HEAD":
+        return _upstream_timeout()
+    # HEAD 只用于播放前探测，不能像长视频流一样无限等待响应头。
+    return httpx.Timeout(
+        connect=_PROXY_CONNECT_TIMEOUT_SECONDS,
+        read=_SIGNED_MEDIA_PROBE_READ_TIMEOUT_SECONDS,
         write=_PROXY_WRITE_TIMEOUT_SECONDS,
         pool=_PROXY_POOL_TIMEOUT_SECONDS,
     )
@@ -1723,15 +1756,19 @@ async def probe_media_proxy_instance(
     if row is None:
         raise LookupError("media proxy instance not found")
     resolved = resolve_proxy_instance(row)
+    credential = str(resolved.get("api_key") or "").strip()
+    probe_path = "/System/Info" if credential else "/System/Info/Public"
     pinned = await asyncio.to_thread(
         _pin_upstream_target,
         str(resolved.get("upstream_url") or ""),
-        "/System/Info/Public",
+        probe_path,
     )
-    headers = {"Accept": "application/json", "Host": pinned.host_header}
-    credential = str(resolved.get("api_key") or "").strip()
-    if credential:
-        headers["X-Emby-Token"] = credential
+    headers = _apply_upstream_credential(
+        {"Accept": "application/json"},
+        credential,
+        str(resolved.get("server_type") or ""),
+    )
+    headers["Host"] = pinned.host_header
 
     timeout_value = max(1.0, min(float(timeout_seconds), 15.0))
     started = time.monotonic()
@@ -1890,19 +1927,88 @@ def _signed_media_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return result
 
 
-def _request_auth_credential(request: Any) -> str:
+def _header_values(headers: Any, name: str) -> list[str]:
+    """返回同名请求头的每个字段值，避免重复鉴权头被折叠或遗漏。"""
+    raw_values: list[Any] | None = None
+    for method_name in ("getlist", "get_list"):
+        getter = getattr(headers, method_name, None)
+        if not callable(getter):
+            continue
+        try:
+            values = getter(name)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if isinstance(values, (str, bytes)):
+            raw_values = [values]
+        else:
+            raw_values = list(values or [])
+        break
+
+    if raw_values is None:
+        normalized_name = str(name).casefold()
+        items = getattr(headers, "items", None)
+        if callable(items):
+            raw_values = [
+                value
+                for key, value in items()
+                if str(key).casefold() == normalized_name
+            ]
+        else:
+            getter = getattr(headers, "get", None)
+            value = getter(name) if callable(getter) else None
+            raw_values = [] if value is None else [value]
+
+    result: list[str] = []
+    for raw_value in raw_values:
+        if isinstance(raw_value, bytes):
+            value = raw_value.decode("latin-1", errors="replace").strip()
+        else:
+            value = str(raw_value or "").strip()
+        if value:
+            result.append(value)
+    return result
+
+
+def _request_auth_credentials(request: Any) -> list[str]:
     headers = request.headers
     query = request.query_params
-    return str(
-        headers.get("X-Emby-Token")
-        or headers.get("X-MediaBrowser-Token")
-        or query.get("api_key")
-        or query.get("X-Emby-Token")
-        or query.get("X-MediaBrowser-Token")
-        or _authorization_token(headers.get("Authorization", ""))
-        or _authorization_token(headers.get("X-Emby-Authorization", ""))
-        or ""
-    ).strip()
+    values: list[str] = []
+
+    for header_name in ("X-Emby-Token", "X-MediaBrowser-Token"):
+        values.extend(_header_values(headers, header_name))
+
+    if hasattr(query, "multi_items"):
+        query_items = list(query.multi_items())
+    elif hasattr(query, "items"):
+        query_items = list(query.items())
+    else:
+        query_items = []
+    for query_name in (
+        "api_key",
+        "X-Emby-Token",
+        "X-MediaBrowser-Token",
+    ):
+        normalized_name = query_name.casefold()
+        for key, raw_value in query_items:
+            if str(key).casefold() != normalized_name:
+                continue
+            value = str(raw_value or "").strip()
+            if value:
+                values.append(value)
+
+    for header_name in ("Authorization", "X-Emby-Authorization"):
+        for header_value in _header_values(headers, header_name):
+            values.extend(_authorization_tokens(header_value))
+    return values
+
+
+def _request_auth_credential(request: Any) -> str:
+    values = _request_auth_credentials(request)
+    return values[0] if values else ""
+
+
+def _request_auth_has_conflict(request: Any) -> bool:
+    return len(set(_request_auth_credentials(request))) > 1
 
 
 def _auth_scope_fingerprint(credential: str) -> str:
@@ -1930,21 +2036,124 @@ def _request_auth_scope(request: Any) -> str:
     return _auth_scope_fingerprint(_request_auth_credential(request))
 
 
-def _upstream_request_headers(request: Any) -> dict[str, str]:
-    headers = _request_headers(request)
-    credential = _request_auth_credential(request)
-    if credential and not any(key.lower() in {"x-emby-token", "x-mediabrowser-token"} for key in headers):
-        headers["X-Emby-Token"] = credential
+def _media_browser_authorization(credential: str) -> str:
+    token = str(credential or "").strip()
+    if not token or any(character in token for character in "\r\n"):
+        return ""
+    escaped = token.replace("\\", "\\\\").replace('"', '\\"')
+    return f'MediaBrowser Token="{escaped}"'
+
+
+def _is_single_media_browser_authorization(value: str, credential: str) -> bool:
+    raw_value = str(value or "").strip()
+    tokens = _authorization_tokens(raw_value)
+    return bool(
+        _MEDIA_BROWSER_AUTH_RE.match(raw_value)
+        and len(tokens) == 1
+        and tokens[0] == str(credential or "").strip()
+    )
+
+
+def _apply_upstream_credential(
+    headers: dict[str, str],
+    credential: str,
+    server_type: str = "",
+) -> dict[str, str]:
+    token = str(credential or "").strip()
+    if not token:
+        return headers
+    normalized_type = str(server_type or "").strip().casefold()
+    lowered = {key.lower() for key in headers}
+    if normalized_type == "jellyfin":
+        # Jellyfin 12 的受保护 HTTP/WS 接口使用唯一的 canonical
+        # MediaBrowser Authorization。只有现有 Authorization 的 Token 与
+        # 已校验 credential 完全一致时才保留其客户端元数据；无关 Bearer、
+        # legacy token 与 X-Emby-Authorization 均不得覆盖 canonical token。
+        preserved_authorization = ""
+        for key in tuple(headers):
+            normalized_key = key.lower()
+            if normalized_key == "authorization":
+                value = str(headers.pop(key, "") or "").strip()
+                if (
+                    not preserved_authorization
+                    and _is_single_media_browser_authorization(value, token)
+                ):
+                    preserved_authorization = value
+            elif normalized_key in {
+                "x-emby-token",
+                "x-mediabrowser-token",
+                "x-emby-authorization",
+            }:
+                headers.pop(key, None)
+        authorization = preserved_authorization or _media_browser_authorization(token)
+        if authorization:
+            headers["Authorization"] = authorization
+        return headers
+    if not lowered.intersection({"x-emby-token", "x-mediabrowser-token"}):
+        headers["X-Emby-Token"] = token
     return headers
 
 
-def _sanitized_query_string(request: Any) -> str:
+def _upstream_request_headers(
+    request: Any,
+    server_type: str = "",
+) -> dict[str, str]:
+    credential = _request_auth_credential(request)
+    headers = _request_headers(request)
+    if str(server_type or "").strip().casefold() == "jellyfin" and credential:
+        authorization_values = _header_values(request.headers, "Authorization")
+        authorization_tokens = [
+            token
+            for value in authorization_values
+            for token in _authorization_tokens(value)
+        ]
+        preserve_authorization = (
+            len(authorization_values) == 1
+            and len(authorization_tokens) == 1
+            and _is_single_media_browser_authorization(
+                authorization_values[0], credential
+            )
+        )
+        if not preserve_authorization:
+            for key in tuple(headers):
+                if key.lower() == "authorization":
+                    headers.pop(key, None)
+    return _apply_upstream_credential(headers, credential, server_type)
+
+
+def _sanitized_query_pairs(request: Any) -> list[tuple[str, str]]:
     query_params = getattr(request, "query_params", None)
     if query_params is not None and hasattr(query_params, "multi_items"):
         pairs = query_params.multi_items()
     else:
-        pairs = parse_qsl(str(getattr(getattr(request, "url", None), "query", "")), keep_blank_values=True)
-    return urlencode([(key, value) for key, value in pairs if key.lower() not in _SENSITIVE_QUERY_KEYS], doseq=True)
+        pairs = parse_qsl(
+            str(getattr(getattr(request, "url", None), "query", "")),
+            keep_blank_values=True,
+        )
+    return [
+        (str(key), str(value))
+        for key, value in pairs
+        if str(key).lower() not in _SENSITIVE_QUERY_KEYS
+    ]
+
+
+def _sanitized_query_string(request: Any) -> str:
+    return urlencode(_sanitized_query_pairs(request), doseq=True)
+
+
+def _playback_info_query_string(request: Any) -> str:
+    """保留客户端能力参数，同时确保上游返回可直放/直传媒体源。"""
+    direct_keys = {"enabledirectplay", "enabledirectstream"}
+    pairs = [
+        (key, value)
+        for key, value in _sanitized_query_pairs(request)
+        if key.casefold() not in direct_keys
+    ]
+    pairs.extend((
+        ("EnableDirectPlay", "true"),
+        ("EnableDirectStream", "true"),
+    ))
+    return urlencode(pairs, doseq=True)
 
 
 def _parse_range(value: str, size: int) -> tuple[int, int] | None:
@@ -2196,27 +2405,54 @@ def rewrite_playback_info(
     return payload, changed
 
 
+def _authorization_tokens(value: str) -> list[str]:
+    tokens: list[str] = []
+    for match in _AUTH_TOKEN_RE.finditer(str(value or "")):
+        token = str(match.group(1) or match.group(2) or "").strip()
+        if token:
+            tokens.append(token)
+    return tokens
+
+
 def _authorization_token(value: str) -> str:
-    match = _AUTH_TOKEN_RE.search(str(value or ""))
-    if not match:
-        return ""
-    return str(match.group(1) or match.group(2) or "").strip()
+    tokens = _authorization_tokens(value)
+    return tokens[0] if tokens else ""
 
 
-async def _client_is_authorized(instance, request: Request) -> bool:
+async def _client_is_authorized(
+    instance,
+    request: Request,
+    *,
+    blocking_runner: Callable[..., Awaitable[Any]] | None = None,
+    raise_timeout: bool = False,
+) -> bool:
+    if _request_auth_has_conflict(request):
+        return False
     token = _request_auth_credential(request)
     if not token:
         return False
     try:
-        pinned = await asyncio.to_thread(
-            _pin_upstream_target, str(instance["upstream_url"]), "/Users/Me"
-        )
+        if blocking_runner is None:
+            pinned = await asyncio.to_thread(
+                _pin_upstream_target, str(instance["upstream_url"]), "/Users/Me"
+            )
+        else:
+            pinned = await blocking_runner(
+                _pin_upstream_target, str(instance["upstream_url"]), "/Users/Me"
+            )
+    except _SignedMediaProbeCapacityError:
+        raise
+    except TimeoutError:
+        if raise_timeout:
+            raise
+        return False
     except ValueError:
         return False
-    headers = _request_headers(request)
+    headers = _upstream_request_headers(
+        request,
+        str(instance.get("server_type") or ""),
+    )
     headers["Host"] = pinned.host_header
-    if not any(key.lower() == "x-emby-token" for key in headers):
-        headers["X-Emby-Token"] = token
     try:
         async with httpx.AsyncClient(follow_redirects=False, timeout=10) as client:
             upstream_request = client.build_request(
@@ -2227,6 +2463,13 @@ async def _client_is_authorized(instance, request: Request) -> bool:
             )
             response = await client.send(upstream_request)
         return 200 <= response.status_code < 300
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        if raise_timeout:
+            raise TimeoutError("媒体服务器鉴权校验超时") from exc
+        logger.warning(
+            f"媒体反代鉴权校验失败 instance={instance['id']}: {type(exc).__name__}"
+        )
+        return False
     except Exception as exc:
         logger.warning(
             f"媒体反代鉴权校验失败 instance={instance['id']}: {type(exc).__name__}"
@@ -2261,7 +2504,10 @@ def create_proxy_app(
             try:
                 await upstream_clients.aclose()
             finally:
-                await recorder.stop()
+                try:
+                    await recorder.stop()
+                finally:
+                    _release_signed_url_cache(instance_id, signed_urls)
 
     app = FastAPI(
         title=f"MediaFlux Media Proxy {instance_id}",
@@ -2273,11 +2519,71 @@ def create_proxy_app(
     app.state.upstream_clients = upstream_clients
     signed_urls = signed_urls or SignedUrlCache()
     _register_signed_url_cache(instance_id, signed_urls)
+    signed_media_probe_slots = asyncio.Semaphore(
+        _SIGNED_MEDIA_PROBE_MAX_CONCURRENCY
+    )
+
+    async def run_signed_media_probe_blocking(
+        func: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """在进程级共享有界线程池执行 HEAD 探测的同步 SDK/DNS 调用。
+
+        请求被绝对 deadline 取消后，系统级 DNS/SDK 调用未必能立刻停止；
+        worker 槽位必须等底层 Future 真正结束后再释放，避免跨 runtime
+        累积不可取消任务或空闲线程。
+        """
+        loop = asyncio.get_running_loop()
+        worker_capacity = _signed_media_probe_worker_capacity
+        worker_executor = _signed_media_probe_executor
+        capacity_deadline = (
+            loop.time()
+            + max(0.001, _SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS)
+        )
+        while not worker_capacity.acquire(blocking=False):
+            remaining = capacity_deadline - loop.time()
+            if remaining <= 0:
+                raise _SignedMediaProbeCapacityError
+            await asyncio.sleep(min(0.01, remaining))
+
+        try:
+            worker_future = worker_executor.submit(
+                partial(func, *args, **kwargs)
+            )
+        except Exception:
+            worker_capacity.release()
+            raise
+
+        def release_worker_slot(done_future) -> None:
+            try:
+                done_future.exception()
+            except BaseException:
+                pass
+            worker_capacity.release()
+
+        worker_future.add_done_callback(release_worker_slot)
+        async_future = asyncio.wrap_future(worker_future, loop=loop)
+
+        def consume_async_exception(done_future: asyncio.Future) -> None:
+            if done_future.cancelled():
+                return
+            try:
+                done_future.exception()
+            except BaseException:
+                pass
+
+        async_future.add_done_callback(consume_async_exception)
+        # shield 确保请求超时只停止等待，不会把尚在执行的同步 Future 标成
+        # 已取消；容量由上面的 concurrent Future 完成回调按真实生命周期归还。
+        return await asyncio.shield(async_future)
 
     @app.middleware("http")
     async def record_playback_attempt(request: Request, call_next):
         route_class = classify_proxy_route(request.url.path, request.method)
         credential = _request_auth_credential(request)
+        credential_conflict = _request_auth_has_conflict(request)
         auth_scope = _auth_scope_fingerprint(credential)
         playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
         stream_match = _STREAM_RE.match(request.url.path)
@@ -2297,7 +2603,11 @@ def create_proxy_app(
         upstream_session_token = _request_query_value(request, "PlaySessionId")
         capability_authorized = False
         capability_rejected = False
-        if route_class == "playback_info":
+        playback_session = None
+        if credential_conflict:
+            # 冲突凭据必须在触碰有限容量的播放会话注册表前拒绝。
+            pass
+        elif route_class == "playback_info":
             # 仅在上游 PlaybackInfo 成功且即将返回重写响应时签发 capability；
             # 失败/非法响应不得占用 capability 索引或驱逐正在播放的会话。
             playback_session = None
@@ -2366,7 +2676,9 @@ def create_proxy_app(
         request.state.proxy_cache_hit = False
         request.state.proxy_upstream_latency_ms = 0
         request.state.proxy_failure_stage = ""
-        if source_ambiguous and stream_match:
+        if credential_conflict:
+            request.state.proxy_failure_stage = "client_auth"
+        elif source_ambiguous and stream_match:
             request.state.proxy_failure_stage = "query_parameters"
         elif capability_rejected:
             request.state.proxy_failure_stage = "playback_capability"
@@ -2374,6 +2686,11 @@ def create_proxy_app(
         response: Response | None = None
         error_type = ""
         try:
+            if credential_conflict:
+                response = JSONResponse(
+                    {"error": "媒体服务器凭据参数冲突"}, status_code=400
+                )
+                return response
             if source_ambiguous and stream_match:
                 response = JSONResponse(
                     {"error": "MediaSourceId 参数重复"}, status_code=400
@@ -2452,10 +2769,11 @@ def create_proxy_app(
                     "media_name": getattr(request.state, "proxy_media_name", ""),
                 })
 
-    async def relay_signed_media(request: Request, signed_url: str) -> Response:
+    async def _relay_signed_media(request: Request, signed_url: str) -> Response:
         current_url = str(signed_url or "").strip()
         started = time.monotonic()
         relay_client: httpx.AsyncClient | None = None
+        upstream_method = request.method
 
         async def close_relay_client() -> None:
             nonlocal relay_client
@@ -2463,94 +2781,130 @@ def create_proxy_app(
                 client, relay_client = relay_client, None
                 await client.aclose()
 
-        for redirect_count in range(_SIGNED_MEDIA_MAX_REDIRECTS + 1):
-            try:
-                pinned = await asyncio.to_thread(
-                    _pin_signed_media_target,
-                    current_url,
-                )
-            except ValueError as exc:
-                await close_relay_client()
-                request.state.proxy_failure_stage = "signed_url_target"
-                logger.warning(
-                    "媒体反代浏览器回源地址无效 instance=%s reason=%s",
-                    instance_id,
-                    str(exc),
-                )
-                return JSONResponse({"error": "媒体直链地址无效"}, status_code=502)
-
-            if relay_client is None:
-                relay_client = httpx.AsyncClient(
-                    follow_redirects=False,
-                    timeout=_upstream_timeout(),
-                    limits=httpx.Limits(
-                        max_connections=2,
-                        max_keepalive_connections=0,
-                    ),
-                )
-            headers = _signed_media_request_headers(request)
-            headers["Host"] = pinned.host_header
-            upstream_request = relay_client.build_request(
-                request.method,
-                pinned.connect_url,
-                headers=headers,
-                extensions={"sni_hostname": pinned.sni_hostname},
-            )
-            try:
-                response = await relay_client.send(
-                    upstream_request,
-                    stream=True,
-                )
-            except Exception as exc:
-                await close_relay_client()
-                request.state.proxy_failure_stage = "signed_url_connect"
-                logger.warning(
-                    "媒体反代浏览器回源失败 instance=%s type=%s",
-                    instance_id,
-                    type(exc).__name__,
-                )
-                return JSONResponse({"error": "媒体直链暂不可用"}, status_code=502)
-
-            if response.status_code in {301, 302, 303, 307, 308}:
-                location = str(response.headers.get("location") or "").strip()
-                await response.aclose()
-                if not location:
-                    await close_relay_client()
-                    request.state.proxy_failure_stage = "signed_url_redirect"
-                    return JSONResponse({"error": "媒体直链重定向无效"}, status_code=502)
-                if redirect_count >= _SIGNED_MEDIA_MAX_REDIRECTS:
-                    await close_relay_client()
-                    request.state.proxy_failure_stage = "signed_url_redirect"
-                    return JSONResponse({"error": "媒体直链重定向过多"}, status_code=502)
-                current_url = urljoin(pinned.logical_url, location)
-                continue
-
-            request.state.proxy_route_class = "guangya_direct"
-            request.state.proxy_source = "guangya"
-            request.state.proxy_action = "guangya_relay"
-            request.state.proxy_upstream_latency_ms = round(
-                (time.monotonic() - started) * 1000
-            )
-            response_headers = _signed_media_response_headers(response.headers)
-            if request.method == "HEAD":
+        redirect_count = 0
+        try:
+            while True:
                 try:
-                    await response.aclose()
-                finally:
+                    if request.method == "HEAD":
+                        pinned = await run_signed_media_probe_blocking(
+                            _pin_signed_media_target,
+                            current_url,
+                        )
+                    else:
+                        pinned = await asyncio.to_thread(
+                            _pin_signed_media_target,
+                            current_url,
+                        )
+                except _SignedMediaProbeCapacityError:
                     await close_relay_client()
-                return Response(
+                    request.state.proxy_failure_stage = "signed_url_probe_capacity"
+                    return JSONResponse(
+                        {"error": "媒体直链探测繁忙，请稍后重试"},
+                        status_code=503,
+                    )
+                except ValueError as exc:
+                    await close_relay_client()
+                    request.state.proxy_failure_stage = "signed_url_target"
+                    logger.warning(
+                        "媒体反代直链回源地址无效 instance=%s reason=%s",
+                        instance_id,
+                        str(exc),
+                    )
+                    return JSONResponse({"error": "媒体直链地址无效"}, status_code=502)
+
+                if relay_client is None:
+                    relay_client = httpx.AsyncClient(
+                        follow_redirects=False,
+                        timeout=_signed_media_timeout(request.method),
+                        limits=httpx.Limits(
+                            max_connections=2,
+                            max_keepalive_connections=0,
+                        ),
+                    )
+                headers = _signed_media_request_headers(request)
+                headers["Host"] = pinned.host_header
+                upstream_request = relay_client.build_request(
+                    upstream_method,
+                    pinned.connect_url,
+                    headers=headers,
+                    extensions={"sni_hostname": pinned.sni_hostname},
+                )
+                try:
+                    response = await relay_client.send(
+                        upstream_request,
+                        stream=True,
+                    )
+                except httpx.TimeoutException as exc:
+                    await close_relay_client()
+                    request.state.proxy_failure_stage = "signed_url_timeout"
+                    logger.warning(
+                        "媒体反代直链回源超时 instance=%s type=%s",
+                        instance_id,
+                        type(exc).__name__,
+                    )
+                    return JSONResponse({"error": "媒体直链探测超时"}, status_code=504)
+                except Exception as exc:
+                    await close_relay_client()
+                    request.state.proxy_failure_stage = "signed_url_connect"
+                    logger.warning(
+                        "媒体反代直链回源失败 instance=%s type=%s",
+                        instance_id,
+                        type(exc).__name__,
+                    )
+                    return JSONResponse({"error": "媒体直链暂不可用"}, status_code=502)
+
+                if (
+                    request.method == "HEAD"
+                    and upstream_method == "HEAD"
+                    and response.status_code in {405, 501}
+                ):
+                    await response.aclose()
+                    upstream_method = "GET"
+                    continue
+
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = str(response.headers.get("location") or "").strip()
+                    await response.aclose()
+                    if not location:
+                        await close_relay_client()
+                        request.state.proxy_failure_stage = "signed_url_redirect"
+                        return JSONResponse(
+                            {"error": "媒体直链重定向无效"}, status_code=502
+                        )
+                    if redirect_count >= _SIGNED_MEDIA_MAX_REDIRECTS:
+                        await close_relay_client()
+                        request.state.proxy_failure_stage = "signed_url_redirect"
+                        return JSONResponse(
+                            {"error": "媒体直链重定向过多"}, status_code=502
+                        )
+                    redirect_count += 1
+                    current_url = urljoin(pinned.logical_url, location)
+                    continue
+
+                request.state.proxy_route_class = "guangya_direct"
+                request.state.proxy_source = "guangya"
+                request.state.proxy_action = "guangya_relay"
+                request.state.proxy_upstream_latency_ms = round(
+                    (time.monotonic() - started) * 1000
+                )
+                response_headers = _signed_media_response_headers(response.headers)
+                if request.method == "HEAD":
+                    try:
+                        await response.aclose()
+                    finally:
+                        await close_relay_client()
+                    return Response(
+                        status_code=response.status_code,
+                        headers=response_headers,
+                    )
+                streaming_client, relay_client = relay_client, None
+                return StreamingResponse(
+                    _stream_and_close(response, streaming_client),
                     status_code=response.status_code,
                     headers=response_headers,
                 )
-            streaming_client, relay_client = relay_client, None
-            return StreamingResponse(
-                _stream_and_close(response, streaming_client),
-                status_code=response.status_code,
-                headers=response_headers,
-            )
-
-        await close_relay_client()
-        request.state.proxy_failure_stage = "signed_url_redirect"
-        return JSONResponse({"error": "媒体直链重定向过多"}, status_code=502)
+        finally:
+            await close_relay_client()
 
     async def guangya_redirect(instance, request: Request, file_id: str) -> Response:
         auth_scope = getattr(request.state, "proxy_auth_scope", "")
@@ -2568,70 +2922,163 @@ def create_proxy_app(
         request.state.proxy_route_class = "guangya_direct"
         request.state.proxy_source = "guangya"
         request.state.proxy_action = "guangya_302"
-        if (
-            not getattr(request.state, "proxy_capability_authorized", False)
-            and not await _client_is_authorized(instance, request)
-        ):
-            request.state.proxy_failure_stage = "client_auth"
-            return JSONResponse({"error": "媒体服务器鉴权失败"}, status_code=401)
+        is_head_probe = request.method == "HEAD"
 
-        client = GuangYaClient()
-        if not client.logged_in:
-            request.state.proxy_failure_stage = "provider_auth"
-            signed_urls.clear()
-            return JSONResponse({"error": "光鸭未登录"}, status_code=503)
-        try:
-            raw_client = client.raw
-        except AttributeError:  # 兼容测试替身与旧包装器
-            raw_client = getattr(client, "_raw", None)
-        provider_token = str(getattr(raw_client, "token", "") or "")
-        provider_scope = _auth_scope_fingerprint(provider_token)
-        scope = f"{int(instance_id)}:{provider_scope}"
-        ua_bound = bool(
-            getattr(getattr(client, "_raw", None), "download_url_user_agent_bound", False)
-        )
+        async def resolve_signed_media_response() -> Response:
+            if not getattr(
+                request.state, "proxy_capability_authorized", False
+            ):
+                try:
+                    authorized = await _client_is_authorized(
+                        instance,
+                        request,
+                        blocking_runner=(
+                            run_signed_media_probe_blocking
+                            if is_head_probe
+                            else None
+                        ),
+                        raise_timeout=is_head_probe,
+                    )
+                except _SignedMediaProbeCapacityError:
+                    request.state.proxy_failure_stage = (
+                        "signed_url_probe_capacity"
+                    )
+                    return JSONResponse(
+                        {"error": "媒体直链探测繁忙，请稍后重试"},
+                        status_code=503,
+                    )
+                if not authorized:
+                    request.state.proxy_failure_stage = "client_auth"
+                    return JSONResponse(
+                        {"error": "媒体服务器鉴权失败"},
+                        status_code=401,
+                    )
 
-        async def fetch_url() -> str | None:
-            return await asyncio.to_thread(
-                client.get_download_url,
-                file_id,
-                timeout=PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
-                raise_timeout=True,
+            client = GuangYaClient()
+            if not client.logged_in:
+                request.state.proxy_failure_stage = "provider_auth"
+                signed_urls.clear()
+                return JSONResponse({"error": "光鸭未登录"}, status_code=503)
+            try:
+                raw_client = client.raw
+            except AttributeError:  # 兼容测试替身与旧包装器
+                raw_client = getattr(client, "_raw", None)
+            provider_token = str(getattr(raw_client, "token", "") or "")
+            provider_scope = _auth_scope_fingerprint(provider_token)
+            scope = f"{int(instance_id)}:{provider_scope}"
+            ua_bound = bool(
+                getattr(raw_client, "download_url_user_agent_bound", False)
             )
 
+            async def fetch_url() -> str | None:
+                options = {
+                    "timeout": PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
+                    "raise_timeout": True,
+                }
+                if is_head_probe:
+                    return await run_signed_media_probe_blocking(
+                        client.get_download_url,
+                        file_id,
+                        **options,
+                    )
+                return await asyncio.to_thread(
+                    client.get_download_url,
+                    file_id,
+                    **options,
+                )
+
+            try:
+                result = await signed_urls.get_or_fetch_result(
+                    file_id,
+                    fetch_url,
+                    scope=scope,
+                    user_agent=request.headers.get("user-agent", ""),
+                    ua_bound=ua_bound,
+                )
+            except _SignedMediaProbeCapacityError:
+                request.state.proxy_failure_stage = (
+                    "signed_url_probe_capacity"
+                )
+                return JSONResponse(
+                    {"error": "媒体直链探测繁忙，请稍后重试"},
+                    status_code=503,
+                )
+            except TimeoutError:
+                request.state.proxy_failure_stage = "signed_url_timeout"
+                return JSONResponse(
+                    {"error": "光鸭播放地址获取超时"},
+                    status_code=504,
+                )
+            request.state.proxy_cache_hit = result.cache_hit
+            if not result.url:
+                request.state.proxy_failure_stage = "signed_url"
+                return JSONResponse(
+                    {"error": "无法获取光鸭直链"},
+                    status_code=502,
+                )
+            if (
+                is_head_probe
+                or getattr(request.state, "proxy_browser_relay", False)
+                or _request_uses_browser_media_element(request)
+            ):
+                # 原生客户端常在真正 GET 前先发 HEAD 探测。若把 HEAD 也
+                # 302 到 CDN，部分 Jellyfin/Emby 播放器不会正确跟随或重放
+                # 探测请求，最终表现为一直加载。这里只由 MediaFlux 代做无
+                # 正文探测；随后的原生 GET 仍返回 CDN 302，不承载视频流量。
+                return await _relay_signed_media(request, result.url)
+            return RedirectResponse(
+                result.url,
+                status_code=302,
+                headers={
+                    "Cache-Control": "private, no-store, no-cache, max-age=0",
+                    "Pragma": "no-cache",
+                    "Referrer-Policy": "no-referrer",
+                },
+            )
+
+        if not is_head_probe:
+            return await resolve_signed_media_response()
+
+        # 原生 HEAD 的鉴权、排队、光鸭 signed URL 获取、DNS pinning 与
+        # CDN 探测共用一个请求级绝对 deadline；不能把各阶段超时相加。
+        loop = asyncio.get_running_loop()
+        total_timeout = max(0.001, _SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS)
+        deadline = loop.time() + total_timeout
+        queue_timeout = min(
+            max(0.001, _SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS),
+            total_timeout,
+        )
         try:
-            result = await signed_urls.get_or_fetch_result(
-                file_id,
-                fetch_url,
-                scope=scope,
-                user_agent=request.headers.get("user-agent", ""),
-                ua_bound=ua_bound,
+            await asyncio.wait_for(
+                signed_media_probe_slots.acquire(),
+                timeout=queue_timeout,
             )
         except TimeoutError:
-            request.state.proxy_failure_stage = "signed_url_timeout"
-            return JSONResponse({"error": "光鸭播放地址获取超时"}, status_code=504)
-        request.state.proxy_cache_hit = result.cache_hit
-        if not result.url:
-            request.state.proxy_failure_stage = "signed_url"
-            return JSONResponse({"error": "无法获取光鸭直链"}, status_code=502)
-        if (
-            getattr(request.state, "proxy_browser_relay", False)
-            or _request_uses_browser_media_element(request)
-        ):
-            return await relay_signed_media(request, result.url)
-        return RedirectResponse(
-            result.url,
-            status_code=302,
-            headers={
-                "Cache-Control": "private, no-store, no-cache, max-age=0",
-                "Pragma": "no-cache",
-                "Referrer-Policy": "no-referrer",
-            },
-        )
+            request.state.proxy_failure_stage = "signed_url_probe_capacity"
+            return JSONResponse(
+                {"error": "媒体直链探测繁忙，请稍后重试"},
+                status_code=503,
+            )
+
+        try:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    return await resolve_signed_media_response()
+            except TimeoutError:
+                request.state.proxy_failure_stage = "signed_url_probe_timeout"
+                return JSONResponse(
+                    {"error": "媒体直链探测超时"},
+                    status_code=504,
+                )
+        finally:
+            signed_media_probe_slots.release()
 
     @app.websocket("/{path:path}")
     async def proxy_websocket(websocket: WebSocket, path: str):
         message_limit = _proxy_websocket_message_limit()
+        if _request_auth_has_conflict(websocket):
+            await websocket.close(code=1008, reason="Conflicting credentials")
+            return
         try:
             instance = await asyncio.to_thread(_resolved_instance, instance_id)
         except ValueError as exc:
@@ -2640,7 +3087,10 @@ def create_proxy_app(
         if not instance or not int(instance["enabled"] or 0):
             await websocket.close(code=1013, reason="Media proxy disabled")
             return
-        headers = _upstream_request_headers(websocket)
+        headers = _upstream_request_headers(
+            websocket,
+            str(instance.get("server_type") or ""),
+        )
         headers = {key: value for key, value in headers.items() if not key.lower().startswith("sec-websocket-")}
         protocols = websocket.scope.get("subprotocols") or []
         session: ClientSession | None = None
@@ -2669,17 +3119,34 @@ def create_proxy_app(
                 heartbeat=30,
                 max_msg_size=message_limit,
             )
-        except Exception as exc:
-            logger.warning(
-                f"媒体反代 WebSocket 上游连接失败 instance={instance_id}: "
-                f"{type(exc).__name__}"
+        except WSServerHandshakeError as exc:
+            status = int(getattr(exc, "status", 0) or 0)
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"media-proxy-ws-handshake:{instance_id}:{status}",
+                "媒体反代 WebSocket 上游握手失败 instance=%s status=%s",
+                instance_id,
+                status,
             )
             if session is not None:
                 await session.close()
             await websocket.close(code=1011, reason="Upstream WebSocket unavailable")
             return
-        await websocket.accept(subprotocol=upstream_ws.protocol or None)
-
+        except Exception as exc:
+            error_type = type(exc).__name__
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"media-proxy-ws-connect:{instance_id}:{error_type}",
+                "媒体反代 WebSocket 上游连接失败 instance=%s type=%s",
+                instance_id,
+                error_type,
+            )
+            if session is not None:
+                await session.close()
+            await websocket.close(code=1011, reason="Upstream WebSocket unavailable")
+            return
         async def client_to_upstream():
             while True:
                 message = await websocket.receive()
@@ -2714,11 +3181,15 @@ def create_proxy_app(
                 elif message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
                     break
 
-        tasks = {
-            asyncio.create_task(client_to_upstream()),
-            asyncio.create_task(upstream_to_client()),
-        }
+        tasks: set[asyncio.Task] = set()
         try:
+            # 上游已建立后，下游可能已经离开；accept 也必须位于资源清理
+            # 边界内，避免泄漏已连接的 upstream_ws / ClientSession。
+            await websocket.accept(subprotocol=upstream_ws.protocol or None)
+            tasks = {
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+            }
             done, _pending = await asyncio.wait(
                 tasks, return_when=asyncio.FIRST_COMPLETED,
             )
@@ -2731,7 +3202,8 @@ def create_proxy_app(
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             try:
                 await upstream_ws.close()
             finally:
@@ -2803,7 +3275,12 @@ def create_proxy_app(
             request.state.proxy_failure_stage = "upstream_resolution"
             return JSONResponse({"error": str(exc)}, status_code=502)
         target = pinned.connect_url
-        sanitized_query = _sanitized_query_string(request)
+        playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
+        sanitized_query = (
+            _playback_info_query_string(request)
+            if playback_match
+            else _sanitized_query_string(request)
+        )
         if sanitized_query:
             target = f"{target}?{sanitized_query}"
         try:
@@ -2812,7 +3289,10 @@ def create_proxy_app(
             request.state.proxy_failure_stage = "request_body"
             return JSONResponse({"error": "请求体过大"}, status_code=413)
         client = upstream_clients.get(pinned)
-        upstream_headers = _upstream_request_headers(request)
+        upstream_headers = _upstream_request_headers(
+            request,
+            str(instance.get("server_type") or ""),
+        )
         upstream_headers["Host"] = pinned.host_header
         upstream_request = client.build_request(
             request.method,
@@ -2834,7 +3314,6 @@ def create_proxy_app(
             (time.monotonic() - upstream_started) * 1000
         )
 
-        playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
         if playback_match and 200 <= response.status_code < 300:
             request.state.proxy_source = "playback_info"
             try:

@@ -593,6 +593,47 @@ class PlayGyRouteRobustnessTests(unittest.TestCase):
             ("token-b", "scoped"),
         ])
 
+    def test_cache_shares_user_agents_without_sdk_capability_flag(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        class Raw:
+            def __init__(self, token: str):
+                self.token = token
+
+        class Client:
+            logged_in = True
+
+            def __init__(self, token: str):
+                self.raw = Raw(token)
+
+            def get_download_url(self, file_id: str, **_kwargs) -> str:
+                calls.append((self.raw.token, file_id))
+                return f"https://storage.invalid/{len(calls)}/{file_id}"
+
+        request_a = SimpleNamespace(headers={"user-agent": "Player/A"})
+        request_b = SimpleNamespace(headers={"user-agent": "Player/B"})
+        with patch(
+            "app.routes.proxy.GuangYaClient",
+            side_effect=[Client("same-token"), Client("same-token"), Client("same-token")],
+        ):
+            first = play_gy(
+                "ua-scoped", "etag", "1", "Movie.mkv",
+                request=request_a, **self._signed_args("ua-scoped"),
+            )
+            second = play_gy(
+                "ua-scoped", "etag", "1", "Movie.mkv",
+                request=request_b, **self._signed_args("ua-scoped"),
+            )
+            repeated = play_gy(
+                "ua-scoped", "etag", "1", "Movie.mkv",
+                request=request_b, **self._signed_args("ua-scoped"),
+            )
+
+        self.assertEqual(first.headers["location"], "https://storage.invalid/1/ua-scoped")
+        self.assertEqual(second.headers["location"], "https://storage.invalid/1/ua-scoped")
+        self.assertEqual(repeated.headers["location"], "https://storage.invalid/1/ua-scoped")
+        self.assertEqual(calls, [("same-token", "ua-scoped")])
+
     def test_provider_timeout_returns_retryable_gateway_timeout(self) -> None:
         class Client:
             logged_in = True

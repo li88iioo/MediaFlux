@@ -312,7 +312,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             raw_file_id, timeout=8.0, raise_timeout=True
         )
 
-    def test_playgy_head_uses_the_same_signed_redirect_contract(self):
+    def test_playgy_head_returns_local_probe_metadata_after_provider_validation(self):
         from app.routes.proxy import router as playgy_router
 
         url = build_play_url(
@@ -327,15 +327,114 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
 
         with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
             with TestClient(app) as client:
-                response = client.head(target, follow_redirects=False)
+                response = client.head(
+                    target,
+                    headers={
+                        "If-Range": '"probe-etag"',
+                        "Range": "bytes=0-0",
+                        "User-Agent": "Jellyfin-Android/2.6.3",
+                    },
+                    follow_redirects=False,
+                )
 
-        self.assertEqual(response.status_code, 302)
-        self.assertEqual(response.headers["location"], "https://storage.invalid/movie")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["accept-ranges"], "bytes")
+        self.assertEqual(response.headers["content-length"], "123")
+        self.assertNotIn("content-range", response.headers)
+        self.assertTrue(response.headers["etag"].startswith('"mf-'))
+        self.assertEqual(response.headers["content-type"], "video/x-matroska")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertNotIn("location", response.headers)
         self.assertEqual(response.content, b"")
         client_stub.get_download_url.assert_called_once_with(
             "file-id", timeout=8.0, raise_timeout=True
         )
 
+
+    def test_playgy_head_honors_matching_if_range_validator(self):
+        from app.routes.proxy import router as playgy_router
+
+        url = build_play_url(
+            "http://testserver", "matching-range-file", "etag", 123,
+            "Movie.mkv",
+        )
+        parsed = urlsplit(url)
+        target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        app = FastAPI()
+        app.include_router(playgy_router)
+        client_stub = Mock(logged_in=True)
+        client_stub.get_download_url.return_value = (
+            "https://storage.invalid/matching-range-file"
+        )
+
+        with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
+            with TestClient(app) as client:
+                metadata = client.head(target, follow_redirects=False)
+                response = client.head(
+                    target,
+                    headers={
+                        "If-Range": metadata.headers["etag"],
+                        "Range": "bytes=0-0",
+                    },
+                    follow_redirects=False,
+                )
+
+        self.assertEqual(metadata.status_code, 200)
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.headers["etag"], metadata.headers["etag"])
+        self.assertEqual(response.headers["content-length"], "1")
+        self.assertEqual(response.headers["content-range"], "bytes 0-0/123")
+        self.assertNotIn("location", response.headers)
+        self.assertEqual(response.content, b"")
+
+
+    def test_playgy_head_rejects_invalid_range_without_redirecting(self):
+        from app.routes.proxy import router as playgy_router
+
+        url = build_play_url(
+            "http://testserver", "range-file", "etag", 123, "Movie.mkv",
+        )
+        parsed = urlsplit(url)
+        target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        app = FastAPI()
+        app.include_router(playgy_router)
+        client_stub = Mock(logged_in=True)
+        client_stub.get_download_url.return_value = (
+            "https://storage.invalid/range-file"
+        )
+
+        with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
+            with TestClient(app) as client:
+                response = client.head(
+                    target,
+                    headers={"Range": "bytes=999-1000"},
+                    follow_redirects=False,
+                )
+
+        self.assertEqual(response.status_code, 416)
+        self.assertEqual(response.headers["content-range"], "bytes */123")
+        self.assertNotIn("location", response.headers)
+        self.assertEqual(response.content, b"")
+
+
+    def test_playgy_head_reports_provider_logout_instead_of_stale_success(self):
+        from app.routes.proxy import router as playgy_router
+
+        url = build_play_url(
+            "http://testserver", "logged-out-file", "etag", 123, "Movie.mkv",
+        )
+        parsed = urlsplit(url)
+        target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        app = FastAPI()
+        app.include_router(playgy_router)
+        client_stub = Mock(logged_in=False)
+
+        with patch("app.routes.proxy.GuangYaClient", return_value=client_stub):
+            with TestClient(app) as client:
+                response = client.head(target, follow_redirects=False)
+
+        self.assertEqual(response.status_code, 503)
+        client_stub.get_download_url.assert_not_called()
 
 
 if __name__ == "__main__":

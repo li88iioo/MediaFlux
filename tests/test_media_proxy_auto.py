@@ -7,6 +7,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from contextlib import ExitStack
 from types import SimpleNamespace
 import unittest
@@ -15,6 +16,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
+from starlette.websockets import WebSocketDisconnect
 
 from app.modules import media_proxy
 
@@ -176,11 +179,49 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(result["status_code"], 200)
         self.assertEqual(_FakeAsyncClient.send_streams, [True])
         request = _FakeAsyncClient.requests[0]
-        self.assertEqual(str(request.url), "https://203.0.113.7:8920/System/Info/Public")
+        self.assertEqual(str(request.url), "https://203.0.113.7:8920/System/Info")
         self.assertEqual(request.headers["Host"], "media.example:8920")
-        self.assertEqual(request.headers["X-Emby-Token"], "server-token")
+        self.assertEqual(
+            request.headers["Authorization"],
+            'MediaBrowser Token="server-token"',
+        )
+        self.assertNotIn("X-Emby-Token", request.headers)
         self.assertEqual(request.extensions["sni_hostname"], "media.example")
         self.assertTrue(upstream.closed)
+
+    def test_saved_emby_instance_probe_keeps_legacy_token_header(self):
+        upstream = _FakeUpstreamResponse(
+            body=b"{}", content_type="application/json"
+        )
+        _FakeAsyncClient.responses = [upstream]
+        row = {
+            "id": 7,
+            "config_source": "custom",
+            "server_type": "emby",
+            "upstream_url": "http://127.0.0.1:8096/emby",
+            "api_key": "emby-token",
+            "enabled": 1,
+        }
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=row,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                _FakeAsyncClient,
+            ),
+        ):
+            result = asyncio.run(media_proxy.probe_media_proxy_instance(7))
+
+        self.assertEqual(result["status_code"], 200)
+        request = _FakeAsyncClient.requests[0]
+        self.assertEqual(
+            str(request.url),
+            "http://127.0.0.1:8096/emby/System/Info",
+        )
+        self.assertEqual(request.headers["X-Emby-Token"], "emby-token")
+        self.assertNotIn("Authorization", request.headers)
 
     def test_saved_instance_probe_closes_oversize_response(self):
         upstream = _FakeUpstreamResponse(
@@ -468,8 +509,8 @@ class HybridMediaProxyTests(unittest.TestCase):
             TestClient(app, raise_server_exceptions=False) as client,
         ):
             response = client.get(
-                "/System/Info?api_key=query-secret&X-Emby-Token=second-secret"
-                "&X-MediaBrowser-Token=third-secret&foo=visible"
+                "/System/Info?api_key=query-secret&X-Emby-Token=query-secret"
+                "&X-MediaBrowser-Token=query-secret&foo=visible"
             )
 
         self.assertEqual(response.status_code, 200)
@@ -478,8 +519,280 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(request.headers["X-Emby-Token"], "query-secret")
         serialized = str(request.url)
         self.assertNotIn("query-secret", serialized)
-        self.assertNotIn("second-secret", serialized)
-        self.assertNotIn("third-secret", serialized)
+
+    def test_playback_info_forces_direct_play_and_stream_upstream(self):
+        payload = {"MediaSources": []}
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                _FakeAsyncClient,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/Items/direct-item/PlaybackInfo"
+                "?api_key=client-token&EnableDirectPlay=false"
+                "&enabledirectstream=false&foo=visible"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upstream = _FakeAsyncClient.requests[0]
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertEqual(query["EnableDirectPlay"], ["true"])
+        self.assertEqual(query["EnableDirectStream"], ["true"])
+        self.assertEqual(query["foo"], ["visible"])
+        self.assertNotIn("api_key", query)
+        self.assertNotIn("enabledirectstream", query)
+
+    def test_conflicting_media_server_credentials_are_rejected_before_upstream(self):
+        app = media_proxy.create_proxy_app(7)
+        instance = {**self._instance(), "server_type": "jellyfin"}
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                _FakeAsyncClient,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/System/Info?api_key=query-token",
+                headers={
+                    "Authorization": 'MediaBrowser Token="header-token"',
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {"error": "媒体服务器凭据参数冲突"},
+        )
+        self.assertEqual(_FakeAsyncClient.requests, [])
+
+    def test_duplicate_conflicting_auth_headers_are_rejected(self):
+        app = media_proxy.create_proxy_app(7)
+        instance = {**self._instance(), "server_type": "jellyfin"}
+        header_sets = (
+            [
+                ("X-Emby-Token", "first-token"),
+                ("X-Emby-Token", "second-token"),
+            ],
+            [
+                ("Authorization", 'MediaBrowser Token="first-token"'),
+                ("Authorization", 'MediaBrowser Token="second-token"'),
+            ],
+            [
+                (
+                    "Authorization",
+                    'MediaBrowser Token="first-token", Token="second-token"',
+                ),
+            ],
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                _FakeAsyncClient,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            for headers in header_sets:
+                with self.subTest(headers=headers):
+                    response = client.get("/System/Info", headers=headers)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(
+                        response.json(),
+                        {"error": "媒体服务器凭据参数冲突"},
+                    )
+
+        self.assertEqual(_FakeAsyncClient.requests, [])
+
+    def test_conflicting_credentials_do_not_touch_playback_sessions(self):
+        app = media_proxy.create_proxy_app(7)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.get(
+                "/playgy/file-id/etag/1/video.mkv?api_key=query-token",
+                headers={
+                    "Authorization": 'MediaBrowser Token="header-token"',
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(media_proxy._playback_sessions._entries, {})
+        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
+
+    def test_jellyfin_rebuilds_duplicate_physical_authorization_headers(self):
+        _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
+        app = media_proxy.create_proxy_app(7)
+        instance = {**self._instance(), "server_type": "jellyfin"}
+        duplicate_headers = [
+            (
+                "Authorization",
+                'MediaBrowser Token="same-token", Client="first"',
+            ),
+            (
+                "Authorization",
+                'MediaBrowser Token="same-token", Client="second"',
+            ),
+        ]
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                _FakeAsyncClient,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get("/System/Info", headers=duplicate_headers)
+
+        self.assertEqual(response.status_code, 200)
+        upstream = _FakeAsyncClient.requests[0]
+        self.assertEqual(
+            upstream.headers["Authorization"],
+            'MediaBrowser Token="same-token"',
+        )
+        self.assertNotIn("Client=", upstream.headers["Authorization"])
+
+    def test_jellyfin_rebuilds_repeated_identical_authorization_token(self):
+        request = SimpleNamespace(
+            headers=httpx.Headers({
+                "Authorization": (
+                    'MediaBrowser Token="same-token", Token="same-token", '
+                    'Client="Jellyfin"'
+                ),
+            }),
+            query_params=httpx.QueryParams(),
+        )
+
+        headers = media_proxy._upstream_request_headers(request, "jellyfin")
+
+        self.assertEqual(
+            headers["Authorization"],
+            'MediaBrowser Token="same-token"',
+        )
+        self.assertEqual(headers["Authorization"].count("Token="), 1)
+
+    def test_jellyfin_replaces_unrelated_authorization_with_canonical_token(self):
+        _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
+        app = media_proxy.create_proxy_app(7)
+        instance = {**self._instance(), "server_type": "jellyfin"}
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                _FakeAsyncClient,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/System/Info?api_key=valid-token",
+                headers={
+                    "Authorization": (
+                        'Bearer unrelated, MediaBrowser Token="valid-token", '
+                        'Client="Jellyfin"'
+                    ),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upstream = _FakeAsyncClient.requests[0]
+        self.assertEqual(
+            upstream.headers["Authorization"],
+            'MediaBrowser Token="valid-token"',
+        )
+        self.assertNotIn("Bearer unrelated", str(upstream.headers))
+        self.assertNotIn("X-Emby-Token", upstream.headers)
+
+    def test_duplicate_same_media_server_credential_is_canonicalized(self):
+        _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
+        app = media_proxy.create_proxy_app(7)
+        instance = {**self._instance(), "server_type": "jellyfin"}
+        authorization = 'MediaBrowser Token="same-token", Client="Jellyfin"'
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                _FakeAsyncClient,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/System/Info?api_key=same-token",
+                headers={
+                    "Authorization": authorization,
+                    "X-Emby-Token": "same-token",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upstream = _FakeAsyncClient.requests[0]
+        self.assertEqual(upstream.headers["Authorization"], authorization)
+        self.assertNotIn("X-Emby-Token", upstream.headers)
+        self.assertNotIn("same-token", str(upstream.url))
+
+    def test_jellyfin_sensitive_query_token_uses_media_browser_authorization(self):
+        _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
+        instance = {**self._instance(), "server_type": "jellyfin"}
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/System/Info?api_key=jellyfin-token&device=visible"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        request = _FakeAsyncClient.requests[0]
+        self.assertEqual(
+            str(request.url),
+            "http://127.0.0.1:8096/System/Info?device=visible",
+        )
+        self.assertEqual(
+            request.headers["Authorization"],
+            'MediaBrowser Token="jellyfin-token"',
+        )
+        self.assertNotIn("X-Emby-Token", request.headers)
+        self.assertNotIn("jellyfin-token", str(request.url))
 
     def test_websocket_target_removes_sensitive_query_tokens(self):
         websocket = SimpleNamespace(
@@ -853,6 +1166,29 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(upstream_request.headers["X-Emby-Token"], "authorization-token")
         self.assertEqual(upstream_request.headers["Host"], "127.0.0.1:8096")
 
+    def test_jellyfin_client_authorization_uses_media_browser_header(self):
+        _FakeAuthAsyncClient.requests = []
+        request = SimpleNamespace(
+            headers=httpx.Headers({}),
+            query_params={"api_key": "jellyfin-user-token"},
+        )
+        instance = {**self._instance(), "server_type": "jellyfin"}
+        with patch(
+            "app.modules.media_proxy.httpx.AsyncClient",
+            _FakeAuthAsyncClient,
+        ):
+            allowed = asyncio.run(
+                media_proxy._client_is_authorized(instance, request)
+            )
+
+        self.assertTrue(allowed)
+        upstream_request = _FakeAuthAsyncClient.requests[0]
+        self.assertEqual(
+            upstream_request.headers["Authorization"],
+            'MediaBrowser Token="jellyfin-user-token"',
+        )
+        self.assertNotIn("X-Emby-Token", upstream_request.headers)
+
     def test_x_emby_authorization_token_is_verified_with_original_header(self):
         _FakeAuthAsyncClient.requests = []
         authorization = 'MediaBrowser Client="Emby", Token="emby-auth-token"'
@@ -973,6 +1309,329 @@ class HybridMediaProxyTests(unittest.TestCase):
             ),
             "ws://127.0.0.1:8096/emby/socket?api_key=client-token",
         )
+
+    def test_websocket_rejects_conflicting_credentials_before_upstream(self):
+        app = media_proxy.create_proxy_app(7)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                with client.websocket_connect(
+                    "/socket?api_key=query-token",
+                    headers={
+                        "Authorization": (
+                            'MediaBrowser Token="header-token"'
+                        ),
+                    },
+                ):
+                    pass
+
+        self.assertEqual(closed.exception.code, 1008)
+
+    def test_websocket_duplicate_credentials_are_rejected_before_resolution(self):
+        class DuplicateCredentialWebSocket:
+            def __init__(self, headers) -> None:
+                self.headers = httpx.Headers(headers)
+                self.query_params = httpx.QueryParams()
+                self.url = SimpleNamespace(query="")
+                self.scope = {"subprotocols": []}
+                self.closed: dict[str, object] = {}
+
+            async def close(self, **kwargs) -> None:
+                self.closed = dict(kwargs)
+
+        app = media_proxy.create_proxy_app(7)
+        websocket_route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == "/{path:path}"
+            and getattr(route, "methods", None) is None
+        )
+        header_sets = (
+            [
+                ("X-Emby-Token", "first-token"),
+                ("X-Emby-Token", "second-token"),
+            ],
+            [
+                (
+                    "Authorization",
+                    'MediaBrowser Token="first-token", Token="second-token"',
+                ),
+            ],
+        )
+        with patch("app.modules.media_proxy._pin_upstream_target") as pin:
+            for headers in header_sets:
+                with self.subTest(headers=headers):
+                    websocket = DuplicateCredentialWebSocket(headers)
+                    asyncio.run(websocket_route.endpoint(websocket, "socket"))
+                    self.assertEqual(websocket.closed.get("code"), 1008)
+
+        pin.assert_not_called()
+
+    def test_websocket_duplicate_same_authorization_is_canonicalized(self):
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "upstream_url": "http://media.example:8096",
+        }
+        pinned = media_proxy._PinnedUpstreamTarget(
+            logical_url="http://media.example:8096/socket",
+            connect_url="http://203.0.113.10:8096/socket",
+            host_header="media.example:8096",
+            sni_hostname="media.example",
+            addresses=("203.0.113.10",),
+        )
+        captured: dict[str, object] = {}
+
+        class RejectingWebSocketSession:
+            def __init__(self, *, connector) -> None:
+                self.closed = False
+
+            async def ws_connect(self, target: str, **kwargs):
+                captured["target"] = target
+                captured["kwargs"] = kwargs
+                raise media_proxy.WSServerHandshakeError(
+                    None,
+                    (),
+                    status=403,
+                    message="Invalid response status",
+                )
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class DuplicateAuthorizationWebSocket:
+            def __init__(self) -> None:
+                self.headers = Headers(raw=[
+                    (
+                        b"authorization",
+                        b'MediaBrowser Token="same-token", Client="first"',
+                    ),
+                    (
+                        b"authorization",
+                        b'MediaBrowser Token="same-token", Client="second"',
+                    ),
+                ])
+                self.query_params = httpx.QueryParams()
+                self.url = SimpleNamespace(query="")
+                self.scope = {"subprotocols": []}
+                self.closed: dict[str, object] = {}
+
+            async def close(self, **kwargs) -> None:
+                self.closed = dict(kwargs)
+
+        app = media_proxy.create_proxy_app(7)
+        websocket_route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == "/{path:path}"
+            and getattr(route, "methods", None) is None
+        )
+        websocket = DuplicateAuthorizationWebSocket()
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy._pin_upstream_target",
+                return_value=pinned,
+            ),
+            patch("app.modules.media_proxy.TCPConnector", return_value=object()),
+            patch(
+                "app.modules.media_proxy.ClientSession",
+                RejectingWebSocketSession,
+            ),
+        ):
+            asyncio.run(websocket_route.endpoint(websocket, "socket"))
+
+        headers = httpx.Headers(captured["kwargs"]["headers"])
+        self.assertEqual(
+            headers["Authorization"],
+            'MediaBrowser Token="same-token"',
+        )
+        self.assertNotIn("Client=", headers["Authorization"])
+        self.assertEqual(websocket.closed.get("code"), 1011)
+
+    def test_jellyfin_websocket_translates_token_and_reports_handshake_status(self):
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "upstream_url": "http://media.example:8096",
+        }
+        pinned = media_proxy._PinnedUpstreamTarget(
+            logical_url="http://media.example:8096/socket",
+            connect_url="http://203.0.113.10:8096/socket",
+            host_header="media.example:8096",
+            sni_hostname="media.example",
+            addresses=("203.0.113.10",),
+        )
+        captured: dict[str, object] = {}
+
+        class RejectingWebSocketSession:
+            def __init__(self, *, connector) -> None:
+                captured["connector"] = connector
+                self.closed = False
+                captured["session"] = self
+
+            async def ws_connect(self, target: str, **kwargs):
+                captured["target"] = target
+                captured["kwargs"] = kwargs
+                raise media_proxy.WSServerHandshakeError(
+                    None,
+                    (),
+                    status=403,
+                    message="Invalid response status",
+                )
+
+            async def close(self) -> None:
+                self.closed = True
+
+        app = media_proxy.create_proxy_app(7)
+        connector = object()
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy._pin_upstream_target",
+                return_value=pinned,
+            ),
+            patch("app.modules.media_proxy.TCPConnector", return_value=connector),
+            patch(
+                "app.modules.media_proxy.ClientSession",
+                RejectingWebSocketSession,
+            ),
+            patch("app.modules.media_proxy.log_throttled") as throttled,
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                with client.websocket_connect(
+                    "/socket?api_key=socket-secret&device=visible",
+                    headers={
+                        "Origin": "http://mediaflux.test",
+                        "Authorization": (
+                            'Bearer unrelated, MediaBrowser Token="socket-secret", '
+                            'Client="Jellyfin"'
+                        ),
+                    },
+                    subprotocols=["jellyfin"],
+                ):
+                    pass
+
+        self.assertEqual(closed.exception.code, 1011)
+        self.assertEqual(
+            captured["target"],
+            "ws://media.example:8096/socket?device=visible",
+        )
+        kwargs = captured["kwargs"]
+        assert isinstance(kwargs, dict)
+        headers = httpx.Headers(kwargs["headers"])
+        self.assertEqual(
+            headers["Authorization"],
+            'MediaBrowser Token="socket-secret"',
+        )
+        self.assertEqual(headers["Origin"], "http://mediaflux.test")
+        self.assertNotIn("X-Emby-Token", headers)
+        self.assertFalse(
+            any(key.lower().startswith("sec-websocket-") for key in headers)
+        )
+        self.assertEqual(kwargs["protocols"], ["jellyfin"])
+        self.assertIs(captured["connector"], connector)
+        self.assertTrue(captured["session"].closed)
+        throttled.assert_called_once()
+        self.assertEqual(
+            throttled.call_args.args[2],
+            "media-proxy-ws-handshake:7:403",
+        )
+        self.assertEqual(throttled.call_args.args[5], 403)
+        self.assertEqual(len(throttled.call_args.args), 6)
+
+    def test_websocket_accept_failure_closes_connected_upstream_resources(self):
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "upstream_url": "http://media.example:8096",
+        }
+        pinned = media_proxy._PinnedUpstreamTarget(
+            logical_url="http://media.example:8096/socket",
+            connect_url="http://203.0.113.10:8096/socket",
+            host_header="media.example:8096",
+            sni_hostname="media.example",
+            addresses=("203.0.113.10",),
+        )
+
+        class ConnectedUpstreamWebSocket:
+            protocol = "jellyfin"
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        upstream = ConnectedUpstreamWebSocket()
+        captured_session: dict[str, object] = {}
+
+        class ConnectedSession:
+            def __init__(self, *, connector) -> None:
+                self.connector = connector
+                self.closed = False
+                captured_session["value"] = self
+
+            async def ws_connect(self, _target: str, **_kwargs):
+                return upstream
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class DisconnectingWebSocket:
+            def __init__(self) -> None:
+                self.headers = httpx.Headers({
+                    "Authorization": 'MediaBrowser Token="client-token"',
+                })
+                self.query_params = httpx.QueryParams()
+                self.url = SimpleNamespace(query="")
+                self.scope = {"subprotocols": ["jellyfin"]}
+                self.closed = False
+
+            async def accept(self, **_kwargs) -> None:
+                raise RuntimeError("downstream disconnected")
+
+            async def close(self, **_kwargs) -> None:
+                self.closed = True
+
+        downstream = DisconnectingWebSocket()
+        app = media_proxy.create_proxy_app(7)
+        websocket_route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == "/{path:path}"
+            and getattr(route, "methods", None) is None
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy._pin_upstream_target",
+                return_value=pinned,
+            ),
+            patch("app.modules.media_proxy.TCPConnector", return_value=object()),
+            patch(
+                "app.modules.media_proxy.ClientSession",
+                ConnectedSession,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "downstream disconnected",
+            ):
+                asyncio.run(websocket_route.endpoint(downstream, "socket"))
+
+        self.assertTrue(upstream.closed)
+        self.assertTrue(captured_session["value"].closed)
+        self.assertTrue(downstream.closed)
 
     def test_playback_info_drops_stale_content_encoding_and_length_after_aread(self):
         payload = {"MediaSources": [{"Id": "local", "Path": "/media/local.mkv"}]}
@@ -1423,6 +2082,785 @@ class HybridMediaProxyTests(unittest.TestCase):
             response.headers["location"],
             "https://signed.invalid/native-file",
         )
+
+    def test_native_head_is_relayed_as_probe_then_get_keeps_zero_bandwidth_302(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "native-probe-item", "native-probe-source", "native-probe-file"
+        )
+        self._grant_file(
+            "client-token",
+            "native-probe-item",
+            "native-probe-source",
+            "native-probe-file",
+        )
+        upstream = _FakeUpstreamResponse(
+            status_code=206,
+            body=b"must-not-be-returned",
+            content_type="video/mp4",
+            headers={
+                "accept-ranges": "bytes",
+                "content-length": "100",
+                "content-range": "bytes 0-0/100",
+            },
+        )
+        _FakeAsyncClient.responses = [upstream]
+        app = media_proxy.create_proxy_app(7)
+        headers = {
+            "If-Range": '"native-etag"',
+            "Range": "bytes=0-0",
+            "User-Agent": "Jellyfin-Android/2.6.3",
+            "X-Emby-Client": "Jellyfin Android",
+        }
+        target = (
+            "/Videos/native-probe-item/stream"
+            "?MediaSourceId=native-probe-source&api_key=client-token"
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            probe = client.head(target, headers=headers, follow_redirects=False)
+            stream = client.get(target, headers=headers, follow_redirects=False)
+
+        self.assertEqual(probe.status_code, 206)
+        self.assertEqual(probe.content, b"")
+        self.assertEqual(probe.headers["content-range"], "bytes 0-0/100")
+        self.assertEqual(probe.headers["content-length"], "100")
+        self.assertNotIn("location", probe.headers)
+        self.assertTrue(upstream.closed)
+
+        relay_request = _FakeAsyncClient.requests[0]
+        self.assertEqual(relay_request.method, "HEAD")
+        self.assertEqual(
+            str(relay_request.url),
+            "https://203.0.113.10/native-probe-file",
+        )
+        self.assertEqual(relay_request.headers["Host"], "signed.invalid")
+        self.assertEqual(relay_request.headers["Range"], "bytes=0-0")
+        self.assertEqual(relay_request.headers["If-Range"], '"native-etag"')
+        self.assertEqual(
+            relay_request.headers["User-Agent"],
+            "Jellyfin-Android/2.6.3",
+        )
+        self.assertEqual(relay_request.headers["Accept-Encoding"], "identity")
+
+        self.assertEqual(stream.status_code, 302)
+        self.assertEqual(
+            stream.headers["location"],
+            "https://signed.invalid/native-probe-file",
+        )
+        self.assertEqual(_FakeGuangYaClient.calls, ["native-probe-file"])
+
+    def test_native_head_fallback_preserves_range_conditions(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "fallback-item", "fallback-source", "fallback-file"
+        )
+        self._grant_file(
+            "client-token", "fallback-item", "fallback-source", "fallback-file"
+        )
+        rejected_head = _FakeUpstreamResponse(status_code=405)
+        fallback_get = _FakeUpstreamResponse(
+            status_code=200,
+            body=b"would-be-full-body",
+            content_type="video/mp4",
+            headers={
+                "accept-ranges": "bytes",
+                "content-length": "1000",
+            },
+        )
+        _FakeAsyncClient.responses = [rejected_head, fallback_get]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.head(
+                "/Videos/fallback-item/stream"
+                "?MediaSourceId=fallback-source&api_key=client-token",
+                headers={
+                    "If-Range": '"stale-etag"',
+                    "Range": "bytes=100-199",
+                    "User-Agent": "Jellyfin-Android/2.6.3",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"")
+        self.assertEqual(response.headers["content-length"], "1000")
+        self.assertNotIn("content-range", response.headers)
+        self.assertTrue(rejected_head.closed)
+        self.assertTrue(fallback_get.closed)
+        self.assertEqual([request.method for request in _FakeAsyncClient.requests], [
+            "HEAD", "GET",
+        ])
+        retry = _FakeAsyncClient.requests[1]
+        self.assertEqual(retry.headers["Range"], "bytes=100-199")
+        self.assertEqual(retry.headers["If-Range"], '"stale-etag"')
+        self.assertEqual(_FakeAsyncClient.init_kwargs[0]["timeout"].read, 10.0)
+
+    def test_native_head_fallback_preserves_full_redirect_budget(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "redirect-budget-item", "redirect-budget-source", "redirect-budget-file"
+        )
+        self._grant_file(
+            "client-token",
+            "redirect-budget-item",
+            "redirect-budget-source",
+            "redirect-budget-file",
+        )
+        responses = [_FakeUpstreamResponse(status_code=405)]
+        for index in range(media_proxy._SIGNED_MEDIA_MAX_REDIRECTS):
+            responses.append(
+                _FakeUpstreamResponse(
+                    status_code=302,
+                    headers={
+                        "location": f"https://edge-{index}.invalid/next"
+                    },
+                )
+            )
+        responses.append(
+            _FakeUpstreamResponse(
+                status_code=206,
+                headers={
+                    "content-length": "100",
+                    "content-range": "bytes 200-299/1000",
+                },
+            )
+        )
+        _FakeAsyncClient.responses = responses.copy()
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.head(
+                "/Videos/redirect-budget-item/stream"
+                "?MediaSourceId=redirect-budget-source&api_key=client-token",
+                headers={
+                    "If-Range": '"stale-etag"',
+                    "Range": "bytes=200-299",
+                    "User-Agent": "Jellyfin-Android/2.6.3",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, b"")
+        self.assertEqual(len(_FakeAsyncClient.requests), len(responses))
+        self.assertEqual(_FakeAsyncClient.requests[0].method, "HEAD")
+        for request in _FakeAsyncClient.requests[1:]:
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.headers["Range"], "bytes=200-299")
+            self.assertEqual(request.headers["If-Range"], '"stale-etag"')
+        self.assertTrue(all(item.closed for item in responses))
+        self.assertTrue(all(client.closed for client in _FakeAsyncClient.instances))
+
+    def test_native_head_fallback_closes_ignored_full_body_without_reading(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "ignored-range-item", "ignored-range-source", "ignored-range-file"
+        )
+        self._grant_file(
+            "client-token",
+            "ignored-range-item",
+            "ignored-range-source",
+            "ignored-range-file",
+        )
+
+        class UnreadBodyResponse(_FakeUpstreamResponse):
+            def __init__(self, **kwargs) -> None:
+                super().__init__(**kwargs)
+                self.raw_iterations = 0
+
+            async def aiter_raw(self):
+                self.raw_iterations += 1
+                yield self._body
+
+        rejected_head = _FakeUpstreamResponse(status_code=501)
+        ignored_range = UnreadBodyResponse(
+            status_code=200,
+            body=b"would-be-a-large-video-body",
+            content_type="video/mp4",
+            headers={
+                "accept-ranges": "bytes",
+                "content-length": "99999999",
+            },
+        )
+        _FakeAsyncClient.responses = [rejected_head, ignored_range]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.head(
+                "/Videos/ignored-range-item/stream"
+                "?MediaSourceId=ignored-range-source&api_key=client-token",
+                headers={"User-Agent": "Jellyfin-Android/2.6.3"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"")
+        self.assertEqual(response.headers["content-length"], "99999999")
+        self.assertEqual(ignored_range.raw_iterations, 0)
+        self.assertTrue(rejected_head.closed)
+        self.assertTrue(ignored_range.closed)
+
+    def test_native_head_probe_has_absolute_deadline_and_closes_client(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "slow-probe-item", "slow-probe-source", "slow-probe-file"
+        )
+        self._grant_file(
+            "client-token",
+            "slow-probe-item",
+            "slow-probe-source",
+            "slow-probe-file",
+        )
+
+        class SlowAsyncClient(_FakeAsyncClient):
+            requests: list[httpx.Request] = []
+            init_kwargs: list[dict] = []
+            instances: list["SlowAsyncClient"] = []
+
+            async def send(
+                self, request: httpx.Request, stream: bool = False
+            ) -> _FakeUpstreamResponse:
+                self.__class__.requests.append(request)
+                await asyncio.sleep(0.05)
+                return _FakeUpstreamResponse(status_code=206)
+
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", SlowAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            patch(
+                "app.modules.media_proxy._SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.head(
+                "/Videos/slow-probe-item/stream"
+                "?MediaSourceId=slow-probe-source&api_key=client-token",
+                headers={"User-Agent": "Jellyfin-Android/2.6.3"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.content, b"")
+        self.assertEqual(len(SlowAsyncClient.requests), 1)
+        self.assertTrue(all(client.closed for client in SlowAsyncClient.instances))
+
+    def test_native_head_request_queue_shares_the_absolute_deadline(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "queued-head-item", "queued-head-source", "queued-head-file"
+        )
+        self._grant_file(
+            "client-token",
+            "queued-head-item",
+            "queued-head-source",
+            "queued-head-file",
+        )
+        real_async_client = httpx.AsyncClient
+        first_relay_entered: asyncio.Event
+
+        class QueuedProbeAsyncClient(_FakeAsyncClient):
+            requests: list[httpx.Request] = []
+            init_kwargs: list[dict] = []
+            instances: list["QueuedProbeAsyncClient"] = []
+
+            async def send(
+                self, request: httpx.Request, stream: bool = False
+            ) -> _FakeUpstreamResponse:
+                self.__class__.requests.append(request)
+                if len(self.__class__.requests) == 1:
+                    first_relay_entered.set()
+                await asyncio.sleep(0.05)
+                return _FakeUpstreamResponse(
+                    status_code=206,
+                    headers={
+                        "accept-ranges": "bytes",
+                        "content-length": "100",
+                        "content-range": "bytes 0-0/100",
+                    },
+                )
+
+        with patch(
+            "app.modules.media_proxy._SIGNED_MEDIA_PROBE_MAX_CONCURRENCY",
+            1,
+        ):
+            app = media_proxy.create_proxy_app(7)
+
+        target = (
+            "/Videos/queued-head-item/stream"
+            "?MediaSourceId=queued-head-source&api_key=client-token"
+        )
+
+        async def scenario() -> tuple[httpx.Response, httpx.Response, float]:
+            nonlocal first_relay_entered
+            first_relay_entered = asyncio.Event()
+            transport = httpx.ASGITransport(
+                app=app,
+                raise_app_exceptions=False,
+            )
+            async with app.router.lifespan_context(app):
+                async with real_async_client(
+                    transport=transport,
+                    base_url="http://mediaflux.test",
+                ) as client:
+                    first_task = asyncio.create_task(
+                        client.head(target, follow_redirects=False)
+                    )
+                    await asyncio.wait_for(first_relay_entered.wait(), timeout=1.0)
+                    second_started = time.monotonic()
+                    second_task = asyncio.create_task(
+                        client.head(target, follow_redirects=False)
+                    )
+                    first, second = await asyncio.gather(
+                        first_task,
+                        second_task,
+                    )
+                    return first, second, time.monotonic() - second_started
+
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                QueuedProbeAsyncClient,
+            ),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            patch(
+                "app.modules.media_proxy._SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS",
+                0.08,
+            ),
+            patch(
+                "app.modules.media_proxy._SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS",
+                0.08,
+            ),
+        ):
+            first, second, second_elapsed = asyncio.run(scenario())
+
+        self.assertEqual(first.status_code, 206)
+        self.assertEqual(second.status_code, 504)
+        self.assertLess(second_elapsed, 0.11)
+        self.assertEqual(len(QueuedProbeAsyncClient.requests), 2)
+
+    def test_native_head_deadline_includes_client_authorization(self):
+        entered = asyncio.Event()
+        captured: dict[str, object] = {}
+
+        async def slow_authorize(_instance, _request, **kwargs):
+            captured.update(kwargs)
+            entered.set()
+            await asyncio.sleep(0.2)
+            return True
+
+        class UnexpectedGuangYaClient:
+            def __init__(self) -> None:
+                raise AssertionError("鉴权超时后不应初始化光鸭客户端")
+
+        app = media_proxy.create_proxy_app(7)
+        started = time.monotonic()
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=slow_authorize,
+            ),
+            patch(
+                "app.modules.media_proxy.GuangYaClient",
+                UnexpectedGuangYaClient,
+            ),
+            patch(
+                "app.modules.media_proxy._SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS",
+                0.02,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.head(
+                "/playgy/auth-timeout-file/e/1/a.mkv",
+                follow_redirects=False,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertTrue(entered.is_set())
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.content, b"")
+        self.assertLess(elapsed, 0.15)
+        self.assertTrue(captured["raise_timeout"])
+        self.assertTrue(callable(captured["blocking_runner"]))
+
+    def test_native_head_deadline_includes_signed_url_acquisition(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "slow-url-item", "slow-url-source", "slow-url-file"
+        )
+        self._grant_file(
+            "client-token",
+            "slow-url-item",
+            "slow-url-source",
+            "slow-url-file",
+        )
+
+        class SlowUrlClient(_FakeGuangYaClient):
+            finished = threading.Event()
+
+            def get_download_url(self, file_id: str, **kwargs) -> str | None:
+                try:
+                    time.sleep(0.2)
+                    return super().get_download_url(file_id, **kwargs)
+                finally:
+                    self.__class__.finished.set()
+
+        app = media_proxy.create_proxy_app(7)
+        started = time.monotonic()
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", SlowUrlClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ) as pin_target,
+            patch(
+                "app.modules.media_proxy._SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS",
+                0.02,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.head(
+                "/Videos/slow-url-item/stream"
+                "?MediaSourceId=slow-url-source&api_key=client-token",
+                headers={"User-Agent": "Jellyfin-Android/2.6.3"},
+                follow_redirects=False,
+            )
+            elapsed = time.monotonic() - started
+            self.assertTrue(SlowUrlClient.finished.wait(timeout=1.0))
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.content, b"")
+        self.assertLess(elapsed, 0.15)
+        pin_target.assert_not_called()
+        self.assertEqual(_FakeAsyncClient.requests, [])
+
+    def test_native_head_blocked_dns_keeps_worker_capacity_until_completion(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "blocked-dns-item", "blocked-dns-source", "blocked-dns-file"
+        )
+        self._grant_file(
+            "client-token",
+            "blocked-dns-item",
+            "blocked-dns-source",
+            "blocked-dns-file",
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def blocking_pin(value: str) -> media_proxy._PinnedUpstreamTarget:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                current_call = calls
+            if current_call == 1:
+                entered.set()
+                try:
+                    release.wait(timeout=1.0)
+                finally:
+                    finished.set()
+            return self._signed_target(value)
+
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                status_code=206,
+                headers={
+                    "accept-ranges": "bytes",
+                    "content-length": "100",
+                    "content-range": "bytes 0-0/100",
+                },
+            )
+        ]
+        target = (
+            "/Videos/blocked-dns-item/stream"
+            "?MediaSourceId=blocked-dns-source&api_key=client-token"
+        )
+        with patch(
+            "app.modules.media_proxy._SIGNED_MEDIA_PROBE_MAX_CONCURRENCY",
+            1,
+        ):
+            app = media_proxy.create_proxy_app(7)
+
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=blocking_pin,
+            ),
+            patch(
+                "app.modules.media_proxy._SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS",
+                0.02,
+            ),
+            patch(
+                "app.modules.media_proxy._SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS",
+                0.005,
+            ),
+            patch(
+                "app.modules.media_proxy._signed_media_probe_worker_capacity",
+                threading.BoundedSemaphore(1),
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            try:
+                first = client.head(target, follow_redirects=False)
+                self.assertTrue(entered.wait(timeout=1.0))
+                second = client.head(target, follow_redirects=False)
+                with calls_lock:
+                    calls_after_second = calls
+            finally:
+                release.set()
+            self.assertTrue(finished.wait(timeout=1.0))
+            time.sleep(0.05)
+            third = client.head(target, follow_redirects=False)
+
+        self.assertEqual(first.status_code, 504)
+        self.assertEqual(second.status_code, 503)
+        self.assertEqual(calls_after_second, 1)
+        self.assertEqual(third.status_code, 206)
+        self.assertEqual(third.content, b"")
+        with calls_lock:
+            self.assertEqual(calls, 2)
+
+    def test_native_clients_share_signed_url_when_provider_is_not_ua_bound(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "ua-item", "ua-source", "ua-file"
+        )
+        self._grant_file("client-token", "ua-item", "ua-source", "ua-file")
+        _FakeGuangYaClient.results["ua-file"] = [
+            "https://signed.invalid/ua-shared",
+        ]
+        stack, client = self._client()
+        target = (
+            "/Videos/ua-item/stream"
+            "?MediaSourceId=ua-source&api_key=client-token"
+        )
+        with stack, patch(
+            "app.modules.media_proxy.database.get_media_proxy_binding",
+            return_value=None,
+        ), client:
+            first = client.get(
+                target,
+                headers={"User-Agent": "Native-Player/A"},
+                follow_redirects=False,
+            )
+            second = client.get(
+                target,
+                headers={"User-Agent": "Native-Player/B"},
+                follow_redirects=False,
+            )
+            repeated = client.get(
+                target,
+                headers={"User-Agent": "Native-Player/B"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(first.headers["location"], "https://signed.invalid/ua-shared")
+        self.assertEqual(second.headers["location"], "https://signed.invalid/ua-shared")
+        self.assertEqual(repeated.headers["location"], "https://signed.invalid/ua-shared")
+        self.assertEqual(_FakeGuangYaClient.calls, ["ua-file"])
+
+    def test_native_clients_isolate_cache_when_provider_declares_ua_binding(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "ua-bound-item", "ua-bound-source", "ua-bound-file"
+        )
+        self._grant_file(
+            "client-token",
+            "ua-bound-item",
+            "ua-bound-source",
+            "ua-bound-file",
+        )
+        calls: list[str] = []
+
+        class BoundClient:
+            logged_in = True
+
+            def __init__(self) -> None:
+                self.raw = SimpleNamespace(
+                    token="provider-token",
+                    download_url_user_agent_bound=True,
+                )
+
+            def get_download_url(self, file_id: str, **_kwargs) -> str:
+                calls.append(file_id)
+                return f"https://signed.invalid/bound-{len(calls)}"
+
+        app = media_proxy.create_proxy_app(7)
+        target = (
+            "/Videos/ua-bound-item/stream"
+            "?MediaSourceId=ua-bound-source&api_key=client-token"
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.GuangYaClient", BoundClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            first = client.get(
+                target,
+                headers={"User-Agent": "Native-Player/A"},
+                follow_redirects=False,
+            )
+            second = client.get(
+                target,
+                headers={"User-Agent": "Native-Player/B"},
+                follow_redirects=False,
+            )
+            repeated = client.get(
+                target,
+                headers={"User-Agent": "Native-Player/B"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(first.headers["location"], "https://signed.invalid/bound-1")
+        self.assertEqual(second.headers["location"], "https://signed.invalid/bound-2")
+        self.assertEqual(repeated.headers["location"], "https://signed.invalid/bound-2")
+        self.assertEqual(calls, ["ua-bound-file", "ua-bound-file"])
 
     def test_browser_head_relays_range_headers_without_body(self):
         media_proxy._dynamic_guangya_mappings.register(
@@ -1927,14 +3365,13 @@ class HybridMediaProxyTests(unittest.TestCase):
             now[0] = 999.0
             first = client.get(direct_url, follow_redirects=False)
             now[0] = 1800.0
-            second = client.head(direct_url, follow_redirects=False)
+            second = client.get(direct_url, follow_redirects=False)
 
         self.assertEqual(playback.status_code, 200)
         self.assertEqual(first.status_code, 302)
         self.assertEqual(second.status_code, 302)
         self.assertEqual(first.headers["location"], "https://signed.invalid/long-file")
         self.assertEqual(second.headers["location"], first.headers["location"])
-        self.assertEqual(second.content, b"")
         self.assertEqual(len(_FakeAsyncClient.requests), 1)
         authorize.assert_not_awaited()
 
@@ -2186,7 +3623,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 follow_redirects=False,
             )
             accepted = client.get(sources[0]["DirectStreamUrl"], follow_redirects=False)
-            accepted_second = client.head(
+            accepted_second = client.get(
                 sources[1]["DirectStreamUrl"], follow_redirects=False
             )
 
@@ -2198,7 +3635,6 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(duplicated_same.status_code, 302)
         self.assertEqual(accepted.status_code, 302)
         self.assertEqual(accepted_second.status_code, 302)
-        self.assertEqual(accepted_second.content, b"")
         self.assertEqual(_FakeGuangYaClient.calls, ["file-a", "file-b"])
         authorize.assert_not_awaited()
         self.assertEqual(len(_FakeAsyncClient.requests), 1)
