@@ -4,12 +4,25 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-22
+
+### Added
+- 本地媒体扫描支持把多层作品/季度目录展开为独立视频单元，并过滤非媒体文件、精确绑定同级字幕；单集识别异常不再阻塞同目录其他内容（[`c6b437c`](https://github.com/li88iioo/MediaFlux/commit/c6b437c)、[`bf31930`](https://github.com/li88iioo/MediaFlux/commit/bf31930)）。
+- 本地媒体待确认任务接入 Telegram 原子确认流程，增强 qB 完成探测的重试、失败反馈和任务终态保护（[`7b339f1`](https://github.com/li88iioo/MediaFlux/commit/7b339f1)）。
+- 新增整理后媒体规格异步补全队列；实时 `ffprobe` 失败时后台低并发重试，成功后安全重命名并触发 STRM 增量同步（[`9e46a82`](https://github.com/li88iioo/MediaFlux/commit/9e46a82)）。
+- 整理与追更通知支持发送媒体封面，图片投递失败时自动降级为文本消息（[`8d826f6`](https://github.com/li88iioo/MediaFlux/commit/8d826f6)）。
+
+### Changed
+- 移除已停止维护的 Windows SMB 运行时、UNC 凭据输入和对应测试；本地媒体来源统一使用 Docker 容器绝对路径，启动时清空旧数据库中的 SMB 用户名与密码。qB 的 Windows/UNC 路径前缀映射仍保留（[`37c3ef2`](https://github.com/li88iioo/MediaFlux/commit/37c3ef2)）。
+- 动画电影统一按电影类型归档，并收敛 STRM 文件命名，降低 Jellyfin/Emby 元数据识别歧义（[`dd49f9b`](https://github.com/li88iioo/MediaFlux/commit/dd49f9b)）。
+- 高频网络、Telegram、302 与媒体接口日志增加限流和敏感信息脱敏；测试进程默认不再写入正式 `app.log`（[`2c015e9`](https://github.com/li88iioo/MediaFlux/commit/2c015e9)、[`37c3ef2`](https://github.com/li88iioo/MediaFlux/commit/37c3ef2)）。
+
 ### Fixed
-- 修复浏览器经媒体 302 反代播放光鸭视频时，HTML5 视频请求未携带媒体服务器 Token，导致已生成的短时播放会话无法恢复并错误回退上游的问题。
-- 修复媒体播放会话只显示 Item/MediaSource ID、无法识别具体视频，并将上游 `PlaySessionId` 与内部 `_mfps` 能力会话合并为同一条播放链路。
-- 修复长时间播放超过 15 分钟后短时授权、媒体源映射与播放许可过期的问题：活跃请求会续期空闲时限，并保留 12 小时绝对安全上限；播放数据仍通过 HTTP 302 由客户端直连云盘 CDN。
-- 修复部分客户端重复传递相同 `MediaSourceId` 时被误判为参数冲突的问题，同时继续拒绝不同值或空值混入的重复参数。
-- 修复包含冒号或斜杠的普通媒体标题被误判为 URI/路径而丢失名称的问题，并将播放记录上限及孤立会话清理改为周期维护，降低高频 302 请求下的 SQLite 写入压力。
+- 修复浏览器经媒体 302 反代播放时 HTML5 视频请求缺少媒体服务器 Token、播放会话无法恢复、重复参数误判，以及普通标题含冒号或斜杠时名称丢失的问题（[`90cc553`](https://github.com/li88iioo/MediaFlux/commit/90cc553)）。
+- 修复持续播放超过 15 分钟后短时授权、媒体源映射与播放许可过期的问题；活跃请求会滑动续期，并保留 12 小时绝对安全上限，视频数据继续通过 302 由终端直连云盘 CDN（[`e809255`](https://github.com/li88iioo/MediaFlux/commit/e809255)）。
+- 修复人工确认整理日志仍显示跳过、错误提供批量回退操作，以及 Telegram 整理消息封面不稳定的问题（[`8d826f6`](https://github.com/li88iioo/MediaFlux/commit/8d826f6)）。
+- 修复移动端弹窗、工具栏和虚拟键盘场景超出 visual viewport 或发生布局跳动的问题（[`8536281`](https://github.com/li88iioo/MediaFlux/commit/8536281)、[`49b27f7`](https://github.com/li88iioo/MediaFlux/commit/49b27f7)）。
+- 探索、RSS 和全局搜索中的媒体档案改为页面内弹窗打开，避免查看详情时整页跳转和状态丢失（[`7fccf61`](https://github.com/li88iioo/MediaFlux/commit/7fccf61)）。
 
 ## [0.1.1] - 2026-08-21
 
@@ -67,6 +80,7 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/li88iioo/MediaFlux/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/li88iioo/MediaFlux/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/li88iioo/MediaFlux/releases/tag/v0.1.0
