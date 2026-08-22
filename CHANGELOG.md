@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-22
+
+### Changed
+- Jellyfin/Emby Web 的光鸭播放改为由 MediaFlux 提供同源流式中继，支持 `Range`、`If-Range`、`HEAD` 与 CDN 内部重定向；Infuse、VidHub、Fileball、Jellyfin 原生客户端等非浏览器客户端仍保持 302 直连 CDN。浏览器中继会占用 MediaFlux 所在设备的网络带宽，这是绕过上游 CDN 缺少 CORS 响应头所必需的兼容路径（[`0bec9c2`](https://github.com/li88iioo/MediaFlux/commit/0bec9c2)）。
+
+### Fixed
+- 修复 Jellyfin Web 的 HTML5 视频请求跟随光鸭 CDN 302 后，因目标 CDN 未返回 `Access-Control-Allow-Origin` 而被浏览器拦截、最终无法播放的问题；Web 播放会话现在会稳定保持同源中继策略，不依赖 `Sec-Fetch-*` 请求头（[`0bec9c2`](https://github.com/li88iioo/MediaFlux/commit/0bec9c2)）。
+- 加固浏览器媒体中继的 signed URL 校验与资源释放：逐跳固定公网 DNS 地址，拒绝私网、CGNAT、链路本地、site-local、云元数据及带凭据目标，并过滤 Cookie、Authorization、媒体服务器 Token 与上游 `Set-Cookie`/`Location`（[`0bec9c2`](https://github.com/li88iioo/MediaFlux/commit/0bec9c2)）。
+
 ## [0.1.3] - 2026-08-22
 
 ### Fixed
@@ -85,7 +94,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/li88iioo/MediaFlux/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/li88iioo/MediaFlux/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/li88iioo/MediaFlux/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/li88iioo/MediaFlux/compare/v0.1.0...v0.1.1

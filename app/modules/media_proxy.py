@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 
 import httpx
 import uvicorn
@@ -69,6 +69,10 @@ _AUTH_TOKEN_RE = re.compile(
     r'(?:^|[,\s])Token\s*=\s*(?:"([^"]+)"|([^,\s]+))',
     re.IGNORECASE,
 )
+_AUTH_CLIENT_RE = re.compile(
+    r'(?:^|[,\s])Client\s*=\s*(?:"([^"]+)"|([^,\s]+))',
+    re.IGNORECASE,
+)
 _HLS_PATH_RE = re.compile(r"(?:\.m3u8$|/(?:hls|master|main)/|\.ts$|\.m4s$)", re.IGNORECASE)
 _signed_url_caches: dict[int, SignedUrlCache] = {}
 _signed_url_caches_lock = threading.RLock()
@@ -77,6 +81,21 @@ _PROXY_CONNECT_TIMEOUT_SECONDS = 10.0
 PLAYGY_SIGNED_URL_TIMEOUT_SECONDS = 8.0
 _PROXY_WRITE_TIMEOUT_SECONDS = 30.0
 _PROXY_POOL_TIMEOUT_SECONDS = 5.0
+_SIGNED_MEDIA_MAX_REDIRECTS = 5
+_SIGNED_MEDIA_REQUEST_HEADERS = {
+    "accept",
+    "if-range",
+    "range",
+    "user-agent",
+}
+_SIGNED_MEDIA_RESPONSE_HEADERS = {
+    "accept-ranges",
+    "content-length",
+    "content-range",
+    "content-type",
+    "etag",
+    "last-modified",
+}
 
 
 class ProxyRequestBodyTooLarge(ValueError):
@@ -858,6 +877,7 @@ class _PlaybackSessionLink:
     upstream_session_token: str
     expires_at: float
     capability_expires_at: float
+    browser_relay: bool = False
 
 
 class PlaybackSessionRegistry:
@@ -999,7 +1019,8 @@ class PlaybackSessionRegistry:
     def _touch_locked(self, key: tuple[str, int, str], entry: _PlaybackSessionLink,
                       *, item_id: str = "", source_id: str = "",
                       file_id: str = "", media_name: str = "",
-                      upstream_session_token: str = "") -> _PlaybackSessionLink:
+                      upstream_session_token: str = "",
+                      browser_relay: bool | None = None) -> _PlaybackSessionLink:
         if item_id:
             entry.item_id = str(item_id)
         if source_id:
@@ -1010,6 +1031,8 @@ class PlaybackSessionRegistry:
             entry.media_name = str(media_name)
         if upstream_session_token:
             self._set_upstream_session_locked(key, entry, upstream_session_token)
+        if browser_relay is not None:
+            entry.browser_relay = bool(browser_relay)
         entry.expires_at = self._clock() + self._ttl_seconds
         self._entries.move_to_end(key)
         return entry
@@ -1017,7 +1040,8 @@ class PlaybackSessionRegistry:
     def begin(self, auth_scope: str, instance_id: int, *, token: str = "",
               item_id: str = "", source_id: str = "", file_id: str = "",
               media_name: str = "", upstream_session_token: str = "",
-              server_capability: bool = False) -> _PlaybackSessionLink:
+              server_capability: bool = False,
+              browser_relay: bool = False) -> _PlaybackSessionLink:
         normalized_token = self._token(token) or secrets.token_urlsafe(24)
         key = (str(auth_scope or ""), int(instance_id), normalized_token)
         with self._lock:
@@ -1037,6 +1061,7 @@ class PlaybackSessionRegistry:
                     upstream_session_token="",
                     expires_at=now + self._ttl_seconds,
                     capability_expires_at=0.0,
+                    browser_relay=bool(browser_relay),
                 )
                 self._entries[key] = entry
                 if upstream_session_token:
@@ -1052,6 +1077,7 @@ class PlaybackSessionRegistry:
                     file_id=file_id,
                     media_name=media_name,
                     upstream_session_token=upstream_session_token,
+                    browser_relay=browser_relay,
                 )
             if server_capability:
                 self._register_capability_locked(
@@ -1094,6 +1120,7 @@ class PlaybackSessionRegistry:
         item_id: str = "",
         media_name: str = "",
         upstream_session_token: str = "",
+        browser_relay: bool = False,
     ) -> _PlaybackSessionLink:
         """成功重写 PlaybackInfo 后签发 capability，并绑定上游播放会话别名。"""
         normalized_scope = str(auth_scope or "")
@@ -1121,6 +1148,7 @@ class PlaybackSessionRegistry:
                     item_id=normalized_item,
                     media_name=media_name,
                     upstream_session_token=normalized_upstream,
+                    browser_relay=browser_relay,
                 )
             else:
                 canonical_token = normalized_upstream or normalized_token
@@ -1147,6 +1175,7 @@ class PlaybackSessionRegistry:
                         upstream_session_token="",
                         expires_at=now + self._ttl_seconds,
                         capability_expires_at=0.0,
+                        browser_relay=bool(browser_relay),
                     )
                     self._entries[key] = entry
                 else:
@@ -1155,6 +1184,7 @@ class PlaybackSessionRegistry:
                         entry,
                         item_id=normalized_item,
                         media_name=media_name,
+                        browser_relay=browser_relay,
                     )
                 if normalized_upstream:
                     self._set_upstream_session_locked(
@@ -1356,6 +1386,7 @@ def _apply_playback_session(request: Request, entry: _PlaybackSessionLink | None
         return
     request.state.proxy_playback_session_token = entry.token
     request.state.proxy_playback_session_key = _playback_sessions.persistent_key(entry)
+    request.state.proxy_browser_relay = bool(entry.browser_relay)
     if entry.item_id:
         request.state.proxy_media_item_id = entry.item_id
     if entry.source_id:
@@ -1643,6 +1674,45 @@ def _pin_upstream_target(upstream: str, request_path: str) -> _PinnedUpstreamTar
     )
 
 
+def _validate_signed_media_address(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> None:
+    """Signed URL 由外部服务返回，回源时必须拒绝所有本地网络目标。"""
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    _validate_upstream_address(address)
+    if not address.is_global or bool(getattr(address, "is_site_local", False)):
+        raise ValueError("媒体直链只能指向公网地址")
+
+
+def _pin_signed_media_target(value: str) -> _PinnedUpstreamTarget:
+    """校验带签名查询参数的媒体 URL，并将连接固定到公共 DNS 快照。"""
+    raw = str(value or "").strip()
+    try:
+        logical = httpx.URL(raw)
+    except (httpx.InvalidURL, TypeError, ValueError) as exc:
+        raise ValueError("媒体直链必须是有效的 HTTP/HTTPS URL") from exc
+    if logical.scheme not in {"http", "https"} or not logical.host:
+        raise ValueError("媒体直链必须是有效的 HTTP/HTTPS URL")
+    if logical.username or logical.password or logical.fragment:
+        raise ValueError("媒体直链不能包含凭据或片段")
+    host = str(logical.host).strip().lower()
+    if host in _BLOCKED_METADATA_HOSTS:
+        raise ValueError("媒体直链不能指向云元数据服务")
+    addresses = _resolve_upstream_addresses(logical, allow_dns_failure=False)
+    for raw_address in addresses:
+        _validate_signed_media_address(ipaddress.ip_address(raw_address))
+    connect = logical.copy_with(host=addresses[0])
+    return _PinnedUpstreamTarget(
+        logical_url=str(logical),
+        connect_url=str(connect),
+        host_header=logical.netloc.decode("ascii"),
+        sni_hostname=str(logical.host),
+        addresses=addresses,
+    )
+
+
 async def probe_media_proxy_instance(
     instance_id: int,
     *,
@@ -1755,6 +1825,69 @@ def _decoded_response_headers(headers: httpx.Headers) -> dict[str, str]:
 
 def _request_headers(request: Request) -> dict[str, str]:
     return {key: value for key, value in request.headers.items() if key.lower() not in _HOP_HEADERS}
+
+
+def _authorization_client_name(value: Any) -> str:
+    match = _AUTH_CLIENT_RE.search(str(value or ""))
+    return str((match.group(1) or match.group(2) or "") if match else "").strip()
+
+
+def _request_client_name(request: Any) -> str:
+    headers = request.headers
+    for key in ("X-Emby-Client", "X-Jellyfin-Client"):
+        value = str(headers.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("X-Emby-Authorization", "Authorization"):
+        value = _authorization_client_name(headers.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _request_is_web_client(request: Any) -> bool:
+    client_name = _request_client_name(request).casefold()
+    if client_name:
+        return "web" in client_name or "browser" in client_name
+    return "mozilla/" in str(request.headers.get("User-Agent") or "").casefold()
+
+
+def _request_uses_browser_media_element(request: Any) -> bool:
+    """浏览器 video/audio 的跨域 302 会受 CDN CORS 约束，需要同源回源。"""
+    headers = request.headers
+    destination = str(headers.get("Sec-Fetch-Dest") or "").strip().casefold()
+    if destination in {"audio", "video"}:
+        return True
+    user_agent = str(headers.get("User-Agent") or "").casefold()
+    origin = str(headers.get("Origin") or "").strip()
+    fetch_mode = str(headers.get("Sec-Fetch-Mode") or "").strip().casefold()
+    return bool(
+        origin
+        and "mozilla/" in user_agent
+        and fetch_mode in {"cors", "no-cors", "same-origin"}
+    )
+
+
+def _signed_media_request_headers(request: Any) -> dict[str, str]:
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() in _SIGNED_MEDIA_REQUEST_HEADERS
+    }
+    headers["Accept-Encoding"] = "identity"
+    return headers
+
+
+def _signed_media_response_headers(headers: httpx.Headers) -> dict[str, str]:
+    result = {
+        key: value
+        for key, value in headers.items()
+        if key.lower() in _SIGNED_MEDIA_RESPONSE_HEADERS
+    }
+    result["Cache-Control"] = "private, no-store, no-cache, max-age=0"
+    result["Pragma"] = "no-cache"
+    result["Referrer-Policy"] = "no-referrer"
+    return result
 
 
 def _request_auth_credential(request: Any) -> str:
@@ -1896,6 +2029,21 @@ def local_file_response(request: Request, path: Path) -> Response:
 
 async def _close_upstream(response: httpx.Response) -> None:
     await response.aclose()
+
+
+async def _stream_and_close(
+    response: httpx.Response,
+    client: httpx.AsyncClient | None = None,
+):
+    try:
+        async for chunk in response.aiter_raw():
+            yield chunk
+    finally:
+        try:
+            await response.aclose()
+        finally:
+            if client is not None:
+                await client.aclose()
 
 
 def _binding_value(binding: Any, key: str) -> Any:
@@ -2197,6 +2345,7 @@ def create_proxy_app(
         request.state.proxy_source_ambiguous = source_ambiguous
         request.state.proxy_playback_session_token = ""
         request.state.proxy_playback_session_key = ""
+        request.state.proxy_browser_relay = False
         request.state.proxy_media_item_id = item_id
         request.state.proxy_media_source_id = source_id
         request.state.proxy_guangya_file_id = file_id
@@ -2303,6 +2452,106 @@ def create_proxy_app(
                     "media_name": getattr(request.state, "proxy_media_name", ""),
                 })
 
+    async def relay_signed_media(request: Request, signed_url: str) -> Response:
+        current_url = str(signed_url or "").strip()
+        started = time.monotonic()
+        relay_client: httpx.AsyncClient | None = None
+
+        async def close_relay_client() -> None:
+            nonlocal relay_client
+            if relay_client is not None:
+                client, relay_client = relay_client, None
+                await client.aclose()
+
+        for redirect_count in range(_SIGNED_MEDIA_MAX_REDIRECTS + 1):
+            try:
+                pinned = await asyncio.to_thread(
+                    _pin_signed_media_target,
+                    current_url,
+                )
+            except ValueError as exc:
+                await close_relay_client()
+                request.state.proxy_failure_stage = "signed_url_target"
+                logger.warning(
+                    "媒体反代浏览器回源地址无效 instance=%s reason=%s",
+                    instance_id,
+                    str(exc),
+                )
+                return JSONResponse({"error": "媒体直链地址无效"}, status_code=502)
+
+            if relay_client is None:
+                relay_client = httpx.AsyncClient(
+                    follow_redirects=False,
+                    timeout=_upstream_timeout(),
+                    limits=httpx.Limits(
+                        max_connections=2,
+                        max_keepalive_connections=0,
+                    ),
+                )
+            headers = _signed_media_request_headers(request)
+            headers["Host"] = pinned.host_header
+            upstream_request = relay_client.build_request(
+                request.method,
+                pinned.connect_url,
+                headers=headers,
+                extensions={"sni_hostname": pinned.sni_hostname},
+            )
+            try:
+                response = await relay_client.send(
+                    upstream_request,
+                    stream=True,
+                )
+            except Exception as exc:
+                await close_relay_client()
+                request.state.proxy_failure_stage = "signed_url_connect"
+                logger.warning(
+                    "媒体反代浏览器回源失败 instance=%s type=%s",
+                    instance_id,
+                    type(exc).__name__,
+                )
+                return JSONResponse({"error": "媒体直链暂不可用"}, status_code=502)
+
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = str(response.headers.get("location") or "").strip()
+                await response.aclose()
+                if not location:
+                    await close_relay_client()
+                    request.state.proxy_failure_stage = "signed_url_redirect"
+                    return JSONResponse({"error": "媒体直链重定向无效"}, status_code=502)
+                if redirect_count >= _SIGNED_MEDIA_MAX_REDIRECTS:
+                    await close_relay_client()
+                    request.state.proxy_failure_stage = "signed_url_redirect"
+                    return JSONResponse({"error": "媒体直链重定向过多"}, status_code=502)
+                current_url = urljoin(pinned.logical_url, location)
+                continue
+
+            request.state.proxy_route_class = "guangya_direct"
+            request.state.proxy_source = "guangya"
+            request.state.proxy_action = "guangya_relay"
+            request.state.proxy_upstream_latency_ms = round(
+                (time.monotonic() - started) * 1000
+            )
+            response_headers = _signed_media_response_headers(response.headers)
+            if request.method == "HEAD":
+                try:
+                    await response.aclose()
+                finally:
+                    await close_relay_client()
+                return Response(
+                    status_code=response.status_code,
+                    headers=response_headers,
+                )
+            streaming_client, relay_client = relay_client, None
+            return StreamingResponse(
+                _stream_and_close(response, streaming_client),
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        await close_relay_client()
+        request.state.proxy_failure_stage = "signed_url_redirect"
+        return JSONResponse({"error": "媒体直链重定向过多"}, status_code=502)
+
     async def guangya_redirect(instance, request: Request, file_id: str) -> Response:
         auth_scope = getattr(request.state, "proxy_auth_scope", "")
         playback_session = _playback_sessions.resolve(
@@ -2365,6 +2614,11 @@ def create_proxy_app(
         if not result.url:
             request.state.proxy_failure_stage = "signed_url"
             return JSONResponse({"error": "无法获取光鸭直链"}, status_code=502)
+        if (
+            getattr(request.state, "proxy_browser_relay", False)
+            or _request_uses_browser_media_element(request)
+        ):
+            return await relay_signed_media(request, result.url)
         return RedirectResponse(
             result.url,
             status_code=302,
@@ -2636,6 +2890,7 @@ def create_proxy_app(
                     item_id=playback_match.group(1),
                     media_name=media_name,
                     upstream_session_token=response_session_token,
+                    browser_relay=_request_is_web_client(request),
                 )
                 _apply_playback_session(request, playback_session)
                 request.state.proxy_action = "playback_rewrite"
