@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import unittest
 from unittest.mock import patch
 from io import StringIO
@@ -10,10 +12,36 @@ from io import StringIO
 from app.logger import (
     _RedactFilter,
     _RedactingFormatter,
+    _file_logging_disabled,
     get_logger,
     log_throttled,
     reset_log_limiter,
 )
+
+
+class FileLoggingIsolationTests(unittest.TestCase):
+    def test_direct_test_execution_disables_file_logging_by_default(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            sys, "argv", ["tests/test_logger.py"]
+        ):
+            self.assertTrue(_file_logging_disabled())
+
+    def test_unittest_discovery_disables_file_logging_by_default(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            sys, "argv", ["python", "-m", "unittest", "discover", "-s", "tests"]
+        ):
+            self.assertTrue(_file_logging_disabled())
+
+    def test_explicit_zero_keeps_file_logging_enabled_for_path_contract_tests(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MEDIAFLUX_TESTING": "1",
+                "MEDIAFLUX_DISABLE_FILE_LOGGING": "0",
+            },
+            clear=True,
+        ):
+            self.assertFalse(_file_logging_disabled())
 
 
 class ThirdPartyLoggingTests(unittest.TestCase):

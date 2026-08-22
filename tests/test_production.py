@@ -40,7 +40,10 @@ from app.modules.download_dispatcher import (
     torrent_download_input,
 )
 from app.modules.download_tracker import DownloadTracker
-from app.modules.local_media_scheduler import LocalMediaProbeRetryable
+from app.modules.local_media_scheduler import (
+    LocalMediaProbeRetryable,
+    LocalMediaSourceMigrationRequired,
+)
 from app.modules.media_proxy import (
     _parse_range,
     _websocket_upstream_url,
@@ -606,6 +609,77 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                 self.assertEqual(failed["local_import_attempts"], 8)
                 self.assertIn("暂时不可完整读取", failed["local_import_error"])
                 self.assertEqual(db.list_active_download_requests(include_local_import=True), [])
+
+    def test_legacy_local_media_source_is_visible_configuration_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                request_id, _ = db.create_download_request("legacy-source-key", "magnet")
+                db.update_download_request(request_id, qb_status="completed", status="completed")
+                tracker = DownloadTracker()
+                scheduler = Mock()
+                scheduler.enqueue_completed_torrent.side_effect = (
+                    LocalMediaSourceMigrationRequired(
+                        "媒体来源仍使用已停用的 Windows/UNC 路径；"
+                        "请改为 Docker 容器路径"
+                    )
+                )
+                task = self._task(r"D:\Downloads\Movie.mkv", r"D:\Downloads")
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    tracker._start_local_import(db.get_download_request(request_id), task)
+
+                row = db.get_download_request(request_id)
+                self.assertEqual(row["local_import_status"], "failed")
+                self.assertIn("Windows/UNC", row["local_import_error"])
+                self.assertIn("Docker 容器路径", row["local_import_error"])
+                self.assertEqual(db.list_active_download_requests(include_local_import=True), [])
+
+    def test_legacy_source_failure_does_not_overwrite_terminal_import_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                tracker = DownloadTracker()
+                scheduler = Mock()
+                scheduler.enqueue_completed_torrent.side_effect = (
+                    LocalMediaSourceMigrationRequired("请改为 Docker 容器内绝对路径")
+                )
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    for index, terminal_status in enumerate(("completed", "skipped"), start=1):
+                        request_id, _ = db.create_download_request(
+                            f"terminal-legacy-{index}", "magnet"
+                        )
+                        db.update_download_request(
+                            request_id,
+                            local_import_status="pending",
+                            local_import_error="pending",
+                        )
+                        stale_row = db.get_download_request(request_id)
+                        db.update_download_request(
+                            request_id,
+                            local_import_status=terminal_status,
+                            local_import_error="terminal",
+                            local_import_completed_at="2026-08-22 00:00:00",
+                        )
+
+                        tracker._start_local_import(
+                            stale_row,
+                            self._task(r"D:\Downloads\Movie.mkv", r"D:\Downloads"),
+                        )
+
+                        current = db.get_download_request(request_id)
+                        self.assertEqual(current["local_import_status"], terminal_status)
+                        self.assertEqual(current["local_import_error"], "terminal")
+                        self.assertEqual(
+                            current["local_import_completed_at"], "2026-08-22 00:00:00"
+                        )
 
     def test_unmatched_completed_request_is_marked_skipped(self):
         with tempfile.TemporaryDirectory() as root:

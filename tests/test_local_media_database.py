@@ -44,6 +44,23 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         self.assertFalse(db.claim_local_media_task(task_id, expected="waiting_stable", owner="admin"))
         self.assertEqual(db.get_local_media_task(task_id, owner="admin").status, "recognizing")
 
+    def test_init_db_purges_deprecated_smb_credentials_but_keeps_schema_columns(self):
+        source_id = db.create_local_media_source(
+            name="legacy-smb", qb_profile="", qb_path_prefix="",
+            local_root="/media/downloads", owner="admin",
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE local_media_sources SET smb_user=?,smb_pass=? WHERE id=?",
+                ("nas-user", "nas-secret", source_id),
+            )
+        db.init_db()
+        source = db.get_local_media_source(source_id, owner="admin")
+        self.assertEqual((source.smb_user, source.smb_pass), ("", ""))
+        with db.get_conn() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(local_media_sources)")}
+        self.assertTrue({"smb_user", "smb_pass"}.issubset(columns))
+
     def test_qb_hash_is_idempotent_and_owner_isolated(self):
         source_id = db.create_local_media_source(
             name="source-idempotent", qb_profile="qb", qb_path_prefix="/downloads",

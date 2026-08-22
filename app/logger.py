@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+import sys
 import time
 import threading
 from logging.handlers import TimedRotatingFileHandler
@@ -18,7 +19,6 @@ from app.private_files import protect_private_stream
 from app.sensitive_data import redact_sensitive_text
 
 LOG_DIR = PATHS.log_dir
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s | %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
@@ -234,6 +234,46 @@ class _RedactingFormatter(logging.Formatter):
         return redact_sensitive_text(super().format(record))
 
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _is_test_process() -> bool:
+    """识别未经过 ``tests/__init__.py`` 初始化的测试进程。"""
+    if any(
+        str(os.environ.get(name, "")).strip().lower() in _TRUE_VALUES
+        for name in ("MEDIAFLUX_TESTING", "MEDIAFLUX_TEST_MODE")
+    ):
+        return True
+    if "pytest" in sys.modules:
+        return True
+    argv = [str(value or "").replace("\\", "/").lower() for value in sys.argv]
+    direct_test = any(
+        "/tests/" in value
+        or value.startswith("tests.")
+        or Path(value).name.startswith("test_") and Path(value).suffix == ".py"
+        for value in argv
+    )
+    if direct_test:
+        return True
+    if "discover" not in argv:
+        return False
+    for index, value in enumerate(argv):
+        if value in {"-s", "--start-directory"} and index + 1 < len(argv):
+            if Path(argv[index + 1]).name == "tests":
+                return True
+        if value.startswith("--start-directory=") and Path(value.split("=", 1)[1]).name == "tests":
+            return True
+    return False
+
+
+def _file_logging_disabled() -> bool:
+    """测试默认不写运行日志；显式配置始终优先，``0`` 可用于日志路径测试。"""
+    configured = os.environ.get("MEDIAFLUX_DISABLE_FILE_LOGGING")
+    if configured is not None:
+        return str(configured).strip().lower() in _TRUE_VALUES
+    return _is_test_process()
+
+
 def _setup_root() -> None:
     global _configured
     if _configured:
@@ -248,10 +288,8 @@ def _setup_root() -> None:
     console.setFormatter(_RedactingFormatter(_FORMAT, _DATEFMT))
     root.addHandler(console)
 
-    disable_file_logging = str(
-        os.environ.get("MEDIAFLUX_DISABLE_FILE_LOGGING", "")
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    if not disable_file_logging:
+    if not _file_logging_disabled():
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
         file_handler = _WindowsSafeTimedRotatingFileHandler(
             LOG_DIR / "app.log", when="midnight", backupCount=14, encoding="utf-8"
         )

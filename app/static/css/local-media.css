@@ -1540,17 +1540,6 @@ body.lm-scrape-open { overflow: hidden; }
 }
 .lm-picker-btn svg { width: 15px; height: 15px; }
 
-.lm-network-hint {
-    display: flex;
-    align-items: flex-start;
-    gap: 6px;
-    color: var(--text-muted);
-    font-size: 8.5px;
-    line-height: 1.45;
-}
-.lm-network-hint svg { width: 13px; height: 13px; color: var(--accent); flex: 0 0 13px; margin-top: 1px; }
-.lm-network-hint code { font-size: 8.5px; }
-
 .lm-target-fields {
     min-width: 0;
     display: grid;

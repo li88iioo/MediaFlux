@@ -11,7 +11,30 @@ class PathMappingError(ValueError):
     """路径无法安全映射。"""
 
 
+LEGACY_SOURCE_PATH_ERROR = (
+    "媒体来源仍使用已停用的 Windows/UNC 路径；请先在宿主机挂载目录，"
+    "再把来源改为 /media/... 形式的 Docker 容器路径"
+)
+
+
 _DRIVE_RE = re.compile(r"^[A-Za-z]:/")
+_WINDOWS_OR_UNC_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{2})")
+
+
+def is_windows_or_unc_path(raw_path: str) -> bool:
+    """判断原始路径是否是 Windows 盘符或 UNC 形式。"""
+    return bool(_WINDOWS_OR_UNC_RE.match(str(raw_path or "").strip()))
+
+
+def require_container_absolute_path(raw_path: str | Path, *, label: str = "目录路径") -> Path:
+    """返回 Docker 容器内绝对路径，并拒绝遗留 Windows/UNC 与相对路径。"""
+    raw = str(raw_path or "").strip()
+    if is_windows_or_unc_path(raw):
+        raise PathMappingError(LEGACY_SOURCE_PATH_ERROR)
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise PathMappingError(f"{label}必须是 Docker 容器内绝对路径")
+    return path
 
 
 def normalize_qb_path(raw_path: str) -> str:
@@ -59,6 +82,19 @@ def _windows_style(value: str) -> bool:
     return value.startswith("//") or bool(_DRIVE_RE.match(value))
 
 
+def _normalized_anchor_and_parts(value: str) -> tuple[str, tuple[str, ...]]:
+    """拆分规范化路径，避免 Unicode casefold 长度变化破坏后缀切片。"""
+    if value.startswith("//"):
+        anchor, remainder = "//", value[2:]
+    elif _DRIVE_RE.match(value):
+        anchor, remainder = value[:3], value[3:]
+    elif value.startswith("/"):
+        anchor, remainder = "/", value[1:]
+    else:
+        anchor, remainder = "", value
+    return anchor, tuple(part for part in remainder.split("/") if part)
+
+
 @dataclass(frozen=True)
 class PathMapping:
     qb_prefix: str
@@ -89,9 +125,17 @@ class PathMapping:
         normalized = normalize_qb_path(value)
         if not self.matches(normalized):
             raise PathMappingError("路径不匹配 qB 前缀")
-        prefix = self.normalized_prefix.rstrip("/")
-        suffix = normalized[len(prefix):].lstrip("/")
-        parts = tuple(part for part in suffix.split("/") if part)
+        prefix_anchor, prefix_parts = _normalized_anchor_and_parts(self.normalized_prefix)
+        value_anchor, value_parts = _normalized_anchor_and_parts(normalized)
+        windows_style = _windows_style(self.normalized_prefix)
+        normalize = str.casefold if windows_style else str
+        if (
+            normalize(value_anchor) != normalize(prefix_anchor)
+            or tuple(map(normalize, value_parts[:len(prefix_parts)]))
+            != tuple(map(normalize, prefix_parts))
+        ):
+            raise PathMappingError("路径不匹配 qB 前缀")
+        parts = value_parts[len(prefix_parts):]
         if any(part in {".", ".."} for part in parts):
             raise PathMappingError("路径包含非法相对段")
         return parts

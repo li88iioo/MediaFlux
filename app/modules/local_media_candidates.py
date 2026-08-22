@@ -8,7 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.modules.local_path_mapping import PathMappingError, assert_within
+from app.modules.local_path_mapping import (
+    LEGACY_SOURCE_PATH_ERROR,
+    PathMappingError,
+    assert_within,
+    require_container_absolute_path,
+)
 from app.modules.local_storage import (
     LocalFilesystemAdapter,
     LocalStorageError,
@@ -21,7 +26,7 @@ _CANDIDATE_DISCOVERY_DEPTH_LIMIT = 16
 
 
 def _source_root(source) -> Path:
-    root = Path(source.local_root).expanduser().absolute()
+    root = require_container_absolute_path(source.local_root, label="来源目录")
     return assert_within(root, root)
 
 
@@ -130,23 +135,20 @@ def discover_local_media_directory_candidates(
     source, directory: Path | str | None = None,
 ) -> tuple[list[Path], str, Path | None]:
     """读取来源内指定目录的直接媒体子项，供登录后的本地条目浏览使用。"""
-    from app.modules.windows_smb import ensure_smb_connection, parse_unc_share_root
-
-    if parse_unc_share_root(source.local_root):
-        ok, err = ensure_smb_connection(
-            source.local_root,
-            getattr(source, "smb_user", ""),
-            getattr(source, "smb_pass", ""),
-        )
-        if not ok:
-            return [], str(err or "SMB 来源连接失败"), None
     try:
         root = _source_root(source)
-        selected = assert_within(Path(directory) if directory else root, root)
+        selected_input = (
+            require_container_absolute_path(directory, label="目录路径")
+            if directory else root
+        )
+        selected = assert_within(selected_input, root)
         relative_parts = selected.relative_to(root).parts
         if any(is_ignored_local_media_directory(part) for part in relative_parts):
             raise PathMappingError("禁止浏览系统目录、临时目录或 MediaFlux 回收区")
-    except PathMappingError:
+    except PathMappingError as exc:
+        message = str(exc)
+        if message == LEGACY_SOURCE_PATH_ERROR or "Docker 容器内绝对路径" in message:
+            return [], message, None
         return [], "目录路径不安全", None
     if selected.is_symlink() or not selected.is_dir():
         return [], "目录不存在或不可访问", None

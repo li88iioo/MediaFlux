@@ -64,6 +64,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         payload = {
             "name": "qB 下载目录", "qb_profile": "configured:qb",
             "qb_path_prefix": "/downloads", "local_root": str(self.local_root),
+            # 旧客户端提交的 SMB 字段应被忽略，不再写入或通过 API 暴露。
             "smb_user": "nasadmin", "smb_pass": "secret123",
             "enabled": True, "stable_seconds": 60, "scan_enabled": True,
             "scan_interval_minutes": 10, "media_type": "movie", "mode": "move",
@@ -81,18 +82,19 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(created.json()["targets"][0]["provider"], "jellyfin")
         self.assertEqual(created.json()["targets"][0]["library_id"], "movies")
         self.assertEqual(created.json()["targets"][0]["library_name"], "电影")
-        self.assertEqual(created.json()["smb_user"], "nasadmin")
-        self.assertTrue(created.json()["has_smb_pass"])
+        self.assertNotIn("smb_user", created.json())
+        self.assertNotIn("has_smb_pass", created.json())
         self.assertNotIn("secret123", created.text)
         scheduler.return_value.reload.assert_called_once()
-        listed = self.client.get("/api/local-media/sources").json()["sources"]
-        self.assertEqual(len(listed), 1)
-        self.assertEqual(listed[0]["smb_user"], "nasadmin")
-        self.assertTrue(listed[0]["has_smb_pass"])
+        stored_source = db.get_local_media_source(source_id, owner="admin")
+        self.assertEqual((stored_source.smb_user, stored_source.smb_pass), ("", ""))
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE local_media_sources SET smb_user=?,smb_pass=? WHERE id=?",
+                ("legacy-user", "legacy-pass", source_id),
+            )
 
-        # 更新时密码留空，应保留已有密码
         payload["name"] = "主下载目录"
-        payload["smb_pass"] = ""
         payload["targets"] = [{
             "category": "default", "path": str(self.default_target),
             "provider": "emby", "library_id": "library-1", "library_name": "媒体库",
@@ -103,41 +105,40 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(updated.status_code, 200, updated.text)
         self.assertEqual(updated.json()["name"], "主下载目录")
         self.assertEqual([item["category"] for item in updated.json()["targets"]], ["default"])
-        self.assertTrue(updated.json()["has_smb_pass"])
+        self.assertNotIn("smb_user", updated.json())
+        self.assertNotIn("has_smb_pass", updated.json())
         stored_source = db.get_local_media_source(source_id, owner="admin")
-        self.assertEqual(stored_source.smb_pass, "secret123")
+        self.assertEqual((stored_source.smb_user, stored_source.smb_pass), ("", ""))
 
         deleted = self.client.delete(f"/api/local-media/sources/{source_id}", headers=headers)
         self.assertEqual(deleted.json(), {"deleted": True})
 
-    def test_create_source_with_mapped_drive_resolves_to_unc(self):
+    def test_source_paths_require_container_paths_but_qb_prefix_may_be_windows(self):
         token = self.login()
         headers = {"X-CSRF-Token": token}
-        with tempfile.TemporaryDirectory() as real_dir:
-            real_path = Path(real_dir)
-            (real_path / "Downloads").mkdir()
-            (real_path / "Movies").mkdir()
-            with patch(
-                "app.modules.windows_smb.get_windows_mapped_network_drives",
-                return_value={"W:": str(real_path)},
-            ), patch(
-                "app.modules.windows_smb.is_windows",
-                return_value=True,
-            ), patch("app.routes.local_media_api.get_local_media_scheduler"):
-                payload = {
-                    "name": "映射盘来源",
-                    "local_root": "W:\\Downloads",
-                    "targets": [{
-                        "category": "movie",
-                        "path": "W:\\Movies",
-                    }],
-                }
-                created = self.client.post("/api/local-media/sources", json=payload, headers=headers)
-                self.assertEqual(created.status_code, 200, created.text)
-                data = created.json()
-                self.assertEqual(data["local_root"], str(real_path / "Downloads"))
-                self.assertEqual(data["targets"][0]["path"], str(real_path / "Movies"))
+        base_payload = {
+            "name": "跨平台 qB 来源",
+            "qb_path_prefix": r"W:\Downloads",
+            "targets": [{"category": "movie", "path": str(self.movie_target)}],
+        }
+        for invalid_root in (r"W:\Downloads", r"\\NAS\Downloads"):
+            with self.subTest(local_root=invalid_root):
+                response = self.client.post(
+                    "/api/local-media/sources",
+                    json={**base_payload, "local_root": invalid_root},
+                    headers=headers,
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn("Docker 容器内路径", response.json()["error"])
 
+        with patch("app.routes.local_media_api.get_local_media_scheduler"):
+            created = self.client.post(
+                "/api/local-media/sources",
+                json={**base_payload, "local_root": str(self.local_root)},
+                headers=headers,
+            )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["qb_path_prefix"], r"W:\Downloads")
 
 
     def test_local_directory_browser_is_authenticated_and_source_scoped(self):
@@ -171,41 +172,89 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             )
             self.assertEqual(escaped.status_code, 400)
 
-    def test_windows_unc_root_requires_server_and_share(self):
-        from app.routes.local_media_api import _normalize_windows_unc_root
+    def test_browse_root_configuration_ignores_relative_windows_and_unc_paths(self):
+        from app.modules.local_directory_browser import _configured_roots
 
-        self.assertEqual(_normalize_windows_unc_root(r"\\NAS\Media"), "\\\\NAS\\Media\\")
-        self.assertEqual(_normalize_windows_unc_root(r"\\NAS\Media\Movies"), r"\\NAS\Media\Movies")
-        for invalid in (r"Z:\Media", r"\\NAS", "/mnt/media", ""):
-            with self.subTest(path=invalid), self.assertRaises(ValueError):
-                _normalize_windows_unc_root(invalid)
+        with tempfile.TemporaryDirectory() as root_raw, patch(
+            "app.modules.local_directory_browser.get",
+            return_value=f"app,{root_raw},C:\\Media,\\\\NAS\\Media",
+        ):
+            self.assertEqual(_configured_roots(), [Path(root_raw).resolve()])
 
-    def test_windows_unc_directory_browser_passes_scoped_network_root(self):
+    def test_legacy_source_edit_requires_container_path_migration(self):
+        token = self.login()
+        headers = {"X-CSRF-Token": token}
+        source_id = db.create_local_media_source(
+            name="旧 UNC 来源", qb_profile="", qb_path_prefix=r"\\NAS\Downloads",
+            local_root=r"\\NAS\Downloads", owner="admin",
+        )
+        response = self.client.put(
+            f"/api/local-media/sources/{source_id}",
+            json={"name": "旧 UNC 来源"},
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("Docker 容器内路径", response.json()["error"])
+
+    def test_items_and_inspect_reject_relative_paths_even_when_source_is_cwd(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        source_id = db.create_local_media_source(
+            name="cwd", qb_profile="", qb_path_prefix="", local_root=str(Path.cwd()),
+            owner="admin",
+        )
+
+        items = self.client.get(
+            "/api/local-media/items", params={"source_id": source_id, "path": "."},
+        )
+        inspected = self.client.post(
+            "/api/local-media/inspect",
+            json={"source_id": source_id, "path": "."},
+            headers=headers,
+        )
+
+        for response in (items, inspected):
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn("Docker 容器内绝对路径", response.json()["error"])
+
+    def test_items_and_inspect_explain_legacy_source_migration(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        for legacy_root in (r"D:\Downloads", r"\\NAS\Downloads"):
+            with self.subTest(legacy_root=legacy_root):
+                source_id = db.create_local_media_source(
+                    name="legacy", qb_profile="", qb_path_prefix=legacy_root,
+                    local_root=legacy_root, owner="admin",
+                )
+                items = self.client.get(
+                    "/api/local-media/items", params={"source_id": source_id},
+                )
+                inspected = self.client.post(
+                    "/api/local-media/inspect",
+                    json={"source_id": source_id},
+                    headers=headers,
+                )
+                for response in (items, inspected):
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn("Windows/UNC", response.json()["error"])
+                    self.assertIn("Docker 容器路径", response.json()["error"])
+                db.delete_local_media_source(source_id, owner="admin")
+
+    def test_legacy_unc_directory_browser_request_has_docker_mount_guidance(self):
         self.login()
-        directories = [{"id": r"\\NAS\Media\Movies", "name": "Movies", "path": r"\\NAS\Media\Movies"}]
-        with patch("app.routes.local_media_api.os", SimpleNamespace(name="nt")), patch(
-            "app.modules.windows_smb.ensure_smb_connection", return_value=(True, "")
-        ), patch(
-            "app.routes.local_media_api.assert_browse_root_allowed", side_effect=lambda path: path
-        ), patch("app.routes.local_media_api.browse_local_directories", return_value=directories) as browse:
-            response = self.client.get(
+        responses = [
+            self.client.get(
+                "/api/local-media/directories", params={"path": r"\\NAS\Media"},
+            ),
+            self.client.get(
                 "/api/local-media/directories",
-                params={"path": r"\\NAS\Media", "network_root": r"\\NAS\Media"},
-            )
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json(), directories)
-        self.assertEqual(str(browse.call_args.kwargs["allowed_root"]), "\\\\NAS\\Media\\")
-
-    def test_unc_directory_browser_is_rejected_outside_windows(self):
-        self.login()
-        with patch("app.routes.local_media_api.os", SimpleNamespace(name="posix")):
-            response = self.client.get(
-                "/api/local-media/directories",
-                params={"path": r"\\NAS\Media", "network_root": r"\\NAS\Media"},
-            )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("仅支持 Windows", response.json()["error"])
+                params={"path": "__roots__", "network_root": r"\\NAS\Media"},
+            ),
+        ]
+        for response in responses:
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn("Windows/UNC", response.json()["error"])
+            self.assertIn("容器路径", response.json()["error"])
 
     def test_media_server_library_endpoints_only_expose_enabled_profiles(self):
         self.login()

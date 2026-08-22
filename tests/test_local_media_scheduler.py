@@ -8,7 +8,11 @@ from unittest.mock import Mock, patch
 
 from app import database as db
 from app.clients.qbittorrent import TorrentTask
-from app.modules.local_media_scheduler import LocalMediaProbeRetryable, LocalMediaScheduler
+from app.modules.local_media_scheduler import (
+    LocalMediaProbeRetryable,
+    LocalMediaScheduler,
+    LocalMediaSourceMigrationRequired,
+)
 from app.modules.local_storage import LocalFilesystemAdapter, LocalScanLimitExceeded
 from tests.support import IsolatedDatabaseTestCase
 
@@ -52,6 +56,121 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(db.get_local_media_task(first, owner="admin").source_id, fast_id)
             self.assertEqual(scheduler.run_once(), 1)
             self.assertEqual(service.calls, [("admin", first, qb)])
+
+    def test_completed_torrent_matching_legacy_source_requires_container_path_migration(self):
+        db.create_local_media_source(
+            name="legacy", qb_profile="configured:qb", qb_path_prefix=r"D:\Downloads",
+            local_root=r"D:\Downloads", stable_seconds=0, owner="admin",
+        )
+        scheduler = LocalMediaScheduler(service=FakeService())
+
+        with self.assertRaisesRegex(
+            LocalMediaSourceMigrationRequired, "Windows/UNC.*Docker 容器路径",
+        ):
+            scheduler.enqueue_completed_torrent(
+                self.torrent(r"D:\Downloads\Movie.mkv", hash_value="legacy-source")
+            )
+
+        self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+
+    def test_completed_torrent_matching_relative_source_requires_absolute_container_path(self):
+        db.create_local_media_source(
+            name="relative", qb_profile="configured:qb", qb_path_prefix="/downloads",
+            local_root="relative-downloads", stable_seconds=0, owner="admin",
+        )
+        scheduler = LocalMediaScheduler(service=FakeService())
+
+        with self.assertRaisesRegex(
+            LocalMediaSourceMigrationRequired, "Docker 容器内绝对路径",
+        ):
+            scheduler.enqueue_completed_torrent(
+                self.torrent("/downloads/Movie.mkv", hash_value="relative-source")
+            )
+
+        self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+
+    def test_windows_and_unc_qb_prefixes_map_into_container_sources(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            drive_root = root / "drive"
+            unc_root = root / "unc"
+            drive_root.mkdir()
+            unc_root.mkdir()
+            (drive_root / "Movie.mkv").write_bytes(b"movie")
+            (unc_root / "Show.mkv").write_bytes(b"show")
+            drive_id = db.create_local_media_source(
+                name="drive", qb_profile="configured:qb", qb_path_prefix=r"D:\Downloads",
+                local_root=str(drive_root), stable_seconds=0, owner="admin",
+            )
+            unc_id = db.create_local_media_source(
+                name="unc", qb_profile="configured:qb", qb_path_prefix=r"\\NAS\Media",
+                local_root=str(unc_root), stable_seconds=0, owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            drive_task = scheduler.enqueue_completed_torrent(
+                self.torrent(r"d:\DOWNLOADS\Movie.mkv", hash_value="drive-prefix")
+            )
+            unc_task = scheduler.enqueue_completed_torrent(
+                self.torrent(r"\\nas\media\Show.mkv", hash_value="unc-prefix")
+            )
+
+            stored_drive = db.get_local_media_task(drive_task, owner="admin")
+            stored_unc = db.get_local_media_task(unc_task, owner="admin")
+            self.assertEqual(stored_drive.source_id, drive_id)
+            self.assertEqual(Path(stored_drive.content_path), drive_root / "Movie.mkv")
+            self.assertEqual(stored_unc.source_id, unc_id)
+            self.assertEqual(Path(stored_unc.content_path), unc_root / "Show.mkv")
+
+    def test_migrated_source_wins_when_legacy_source_shares_qb_prefix(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            migrated_root = root / "downloads"
+            migrated_root.mkdir()
+            (migrated_root / "Movie.mkv").write_bytes(b"movie")
+            db.create_local_media_source(
+                name="legacy", qb_profile="configured:qb",
+                qb_path_prefix=r"D:\Downloads", local_root=r"D:\Downloads",
+                stable_seconds=0, owner="admin",
+            )
+            migrated_id = db.create_local_media_source(
+                name="migrated", qb_profile="configured:qb",
+                qb_path_prefix=r"D:\Downloads", local_root=str(migrated_root),
+                stable_seconds=0, owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            task_id = scheduler.enqueue_completed_torrent(
+                self.torrent(r"d:\downloads\Movie.mkv", hash_value="migrated-source")
+            )
+
+            task = db.get_local_media_task(task_id, owner="admin")
+            self.assertEqual(task.source_id, migrated_id)
+            self.assertEqual(Path(task.content_path), migrated_root / "Movie.mkv")
+
+    def test_symlink_source_is_a_visible_configuration_failure(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            actual = root / "actual"
+            link = root / "downloads"
+            actual.mkdir()
+            (actual / "Movie.mkv").write_bytes(b"movie")
+            try:
+                link.symlink_to(actual, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("当前平台不支持符号链接测试")
+            db.create_local_media_source(
+                name="symlink", qb_profile="configured:qb", qb_path_prefix="/downloads",
+                local_root=str(link), stable_seconds=0, owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            with self.assertRaisesRegex(LocalMediaSourceMigrationRequired, "符号链接"):
+                scheduler.enqueue_completed_torrent(
+                    self.torrent("/downloads/Movie.mkv", hash_value="symlink-source")
+                )
+
+            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
 
     def test_completed_torrent_filters_non_media_content(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -114,6 +233,49 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
 
             self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
 
+    def test_legacy_windows_source_tasks_fail_with_actionable_migration_guidance(self):
+        source_id = db.create_local_media_source(
+            name="旧 Windows 来源", qb_profile="", qb_path_prefix=r"D:\Downloads",
+            local_root=r"D:\Downloads", stable_seconds=0, owner="admin",
+        )
+        target_root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(target_root, ignore_errors=True))
+        db.upsert_local_library_target(
+            source_id, "default", str(target_root), owner="admin",
+        )
+        task_id = db.create_local_media_task(
+            source_id, "", r"D:\Downloads\Movie.mkv", owner="admin", trigger="manual",
+        )
+        scheduler = LocalMediaScheduler(service=FakeService())
+
+        self.assertEqual(scheduler.run_once(), 0)
+        task = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(task.status, "failed")
+        self.assertIn("Windows/UNC", task.error)
+        self.assertIn("Docker 容器路径", task.error)
+
+        manual_result = scheduler.enqueue_manual_scan_candidates()
+        self.assertEqual(manual_result["queued_count"], 0)
+        self.assertIn("Windows/UNC", manual_result["sources"][0]["error"])
+
+    def test_relative_source_tasks_fail_before_filesystem_access(self):
+        source_id = db.create_local_media_source(
+            name="旧相对路径来源", qb_profile="", qb_path_prefix="/downloads",
+            local_root="relative-downloads", stable_seconds=0, owner="admin",
+        )
+        task_id = db.create_local_media_task(
+            source_id, "", "relative-downloads/Movie.mkv",
+            owner="admin", trigger="manual",
+        )
+        scheduler = LocalMediaScheduler(service=FakeService())
+
+        with patch("app.modules.local_media_scheduler.LocalFilesystemAdapter.scan") as scan:
+            self.assertEqual(scheduler.run_once(), 0)
+        scan.assert_not_called()
+        task = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(task.status, "failed")
+        self.assertIn("Docker 容器内绝对路径", task.error)
+
     def test_changed_snapshot_resets_stability_wait(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source = root / "source"; source.mkdir(); movie = source / "Movie.mkv"
@@ -170,6 +332,74 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             completed = db.get_local_media_task(task_id, owner="admin")
             self.assertEqual(completed.snapshot_digest, first_digest)
             self.assertEqual(completed.status, "completed")
+
+    def test_notification_failure_does_not_overwrite_completed_task(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            source_root = Path(root_raw) / "source"
+            source_root.mkdir()
+            movie = source_root / "Movie.mkv"
+            movie.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="local", qb_profile="", qb_path_prefix="", local_root=str(source_root),
+                stable_seconds=0, owner="admin",
+            )
+            task_id = db.create_local_media_task(
+                source_id, "", str(movie), owner="admin", trigger="manual",
+            )
+            request_id, _ = db.create_download_request("notify-completed", "magnet")
+            db.link_download_request_to_local_media_task(request_id, task_id, str(movie))
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            with patch(
+                "app.modules.local_media_scheduler.notify_local_media_task",
+                side_effect=RuntimeError("telegram unavailable"),
+            ):
+                self.assertEqual(scheduler.run_once(), 1)
+
+            task = db.get_local_media_task(task_id, owner="admin")
+            request = db.get_download_request(request_id)
+            self.assertEqual(task.status, "completed")
+            self.assertEqual(request["local_import_status"], "completed")
+
+    def test_notification_failure_does_not_overwrite_manual_review_task(self):
+        class ManualReviewService:
+            @staticmethod
+            def execute_task(owner, task_id, qb_client=None):
+                del qb_client
+                db.update_local_media_task(
+                    task_id, owner=owner, status="requires_manual", error="需要人工确认",
+                )
+                return {
+                    "status": "requires_manual",
+                    "preview": {"reason": "需要人工确认"},
+                }
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            source_root = Path(root_raw) / "source"
+            source_root.mkdir()
+            movie = source_root / "Movie.mkv"
+            movie.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="local", qb_profile="", qb_path_prefix="", local_root=str(source_root),
+                stable_seconds=0, owner="admin",
+            )
+            task_id = db.create_local_media_task(
+                source_id, "", str(movie), owner="admin", trigger="manual",
+            )
+            request_id, _ = db.create_download_request("notify-manual", "magnet")
+            db.link_download_request_to_local_media_task(request_id, task_id, str(movie))
+            scheduler = LocalMediaScheduler(service=ManualReviewService())
+
+            with patch(
+                "app.modules.local_media_scheduler.notify_local_media_task",
+                side_effect=RuntimeError("telegram unavailable"),
+            ):
+                self.assertEqual(scheduler.run_once(), 1)
+
+            task = db.get_local_media_task(task_id, owner="admin")
+            request = db.get_download_request(request_id)
+            self.assertEqual(task.status, "requires_manual")
+            self.assertEqual(request["local_import_status"], "requires_manual")
 
     def test_stability_wait_skips_repeated_full_scan_before_deadline(self):
         with tempfile.TemporaryDirectory() as root_raw:

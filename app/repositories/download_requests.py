@@ -807,6 +807,26 @@ def mark_download_request_local_media_skipped(request_id: int, content_path: str
         return cur.rowcount == 1
 
 
+def mark_download_request_local_media_failed(
+    request_id: int, content_path: str, error: str
+) -> bool:
+    """仅将未进入终态的本地入库请求标记为配置失败。"""
+    timestamp = now()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE download_requests SET local_import_status='failed',qb_content_path=?,"
+            "local_import_error=?,local_import_started_at="
+            "COALESCE(NULLIF(local_import_started_at,''),?),"
+            "local_import_completed_at=?,updated_at=? "
+            "WHERE id=? AND COALESCE(local_import_status,'') IN ('','pending')",
+            (
+                str(content_path or ""), str(error or "")[:1000], timestamp,
+                timestamp, timestamp, int(request_id),
+            ),
+        )
+        return cur.rowcount == 1
+
+
 def update_download_request_for_local_media_task(
     task_id: int, status: str, *, error: str = ""
 ) -> int:

@@ -35,7 +35,7 @@ class DirectoryPickerSecurityCodeContractTests(unittest.TestCase):
     def test_local_media_js_has_virtual_root_and_allow_root_contracts(self):
         js = LOCAL_MEDIA_JS.read_text(encoding="utf-8")
         self.assertIn("const isRootsMode = effectiveRootId === '__roots__';", js)
-        self.assertIn("allowRoot: !isRootsMode && Boolean(sourceId || networkRoot),", js)
+        self.assertIn("allowRoot: !isRootsMode && Boolean(sourceId),", js)
         self.assertIn("lower === 'undefined' || lower === 'null'", js)
         self.assertIn("input.value = safeId;", js)
         self.assertIn("input.dispatchEvent(new Event('input', {bubbles: true}));", js)
@@ -310,31 +310,27 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
                     capturedOptions = options;
                 }
             };
-            function windowsUncRoot(val) {
-                return val && val.startsWith('\\\\') ? val : '';
-            }
             global.$ = () => null;
 
-            function openLocalDirectoryPicker(input, {sourceId = 0, rootId = '__roots__', rootName = '本机目录'} = {}) {
+            function openLocalDirectoryPicker(input, {sourceId = 0, rootId = '__roots__', rootName = '容器目录'} = {}) {
                 if (!window.openGuangYaDirectoryPicker) return;
-                const currentValue = String(input?.value || '').trim();
-                const networkRoot = windowsUncRoot(currentValue);
-                const smbUser = '';
-                const smbPass = '';
                 const effectiveRootId = sourceId ? rootId : '__roots__';
-                const effectiveRootName = sourceId ? rootName : '本机目录';
+                const effectiveRootName = sourceId ? rootName : '容器目录';
                 const isRootsMode = effectiveRootId === '__roots__';
 
                 window.openGuangYaDirectoryPicker({
                     modalId: 'localMediaDirModal',
-                    title: networkRoot ? '选择 SMB 网络目录' : '选择本地目录',
+                    title: '选择容器目录',
                     rootId: effectiveRootId,
                     rootName: effectiveRootName,
-                    allowRoot: !isRootsMode && Boolean(sourceId || networkRoot),
+                    allowRoot: !isRootsMode && Boolean(sourceId),
                     fetchDirectory: async (path) => [],
                     onSelect: (directory) => {
-                        if (!directory || !directory.id || directory.id === '__roots__' || directory.id === '0') return false;
-                        input.value = directory.id;
+                        const rawId = directory?.id ?? directory?.file_id ?? directory?.path ?? '';
+                        const safeId = String(rawId).trim();
+                        const lower = safeId.toLowerCase();
+                        if (!safeId || lower === '__roots__' || lower === '0' || lower === 'undefined' || lower === 'null' || lower === '[object object]') return false;
+                        input.value = safeId;
                         input.dispatchEvent(new Event('input', {bubbles: true}));
                         input.dispatchEvent(new Event('change', {bubbles: true}));
                         return true;
@@ -350,7 +346,7 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
             const val1 = input.value;
             const events1 = [...input._events];
 
-            const res2 = capturedOptions.onSelect({ id: 'D:\\Media', name: 'Media' });
+            const res2 = capturedOptions.onSelect({ id: '/media/library', name: 'library' });
             const val2 = input.value;
             const events2 = [...input._events];
 
@@ -371,7 +367,7 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
         self.assertEqual(results.get("val1"), "")
         self.assertEqual(results.get("events1"), [])
         self.assertTrue(results.get("res2"))
-        self.assertEqual(results.get("val2"), "D:\\Media")
+        self.assertEqual(results.get("val2"), "/media/library")
         self.assertEqual(results.get("events2"), ["input", "change"])
 
 
