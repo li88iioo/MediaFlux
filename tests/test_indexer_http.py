@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 import httpx
@@ -55,6 +56,53 @@ class IndexerHttpTests(unittest.IsolatedAsyncioTestCase):
         client = getattr(self, "client", None)
         if client is not None:
             await client.aclose()
+
+    async def test_close_tolerates_only_asyncio_closed_loop_provenance(self):
+        client = self.make_client(
+            lambda request: httpx.Response(200, content=b"ok")
+        )
+        original = client._client
+        await original.aclose()
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.close()
+
+        class ClosedLoopClient:
+            async def aclose(self):
+                closed_loop.call_soon(lambda: None)
+
+        client._client = ClosedLoopClient()
+        await client.aclose()
+
+        class SameTextClient:
+            async def aclose(self):
+                raise RuntimeError("Event loop is closed")
+
+        client._client = SameTextClient()
+        with self.assertRaisesRegex(RuntimeError, "Event loop is closed"):
+            await client.aclose()
+
+        class OtherTextClient:
+            async def aclose(self):
+                raise RuntimeError("transport shutdown failed")
+
+        client._client = OtherTextClient()
+        with self.assertRaisesRegex(RuntimeError, "transport shutdown failed"):
+            await client.aclose()
+
+        class ClosedLoopSubclass(RuntimeError):
+            pass
+
+        class SubclassClient:
+            async def aclose(self):
+                try:
+                    closed_loop.call_soon(lambda: None)
+                except RuntimeError as exc:
+                    raise ClosedLoopSubclass(*exc.args) from exc
+
+        client._client = SubclassClient()
+        with self.assertRaises(ClosedLoopSubclass):
+            await client.aclose()
+        self.client = None
 
     def make_client(self, handler, *, resolver=PUBLIC_DNS, max_response_bytes=1024):
         self.client = FixedHostHttpClient(

@@ -10,10 +10,29 @@ from urllib.parse import urljoin
 
 import httpx
 
+from app.logger import get_logger
+
 from .errors import IndexerInvalidResponse, IndexerResponseTooLarge, IndexerSecurityError
 
 Resolver = Callable[[str, int], list[tuple]]
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+logger = get_logger(__name__)
+
+
+def _is_asyncio_closed_loop_error(exc: RuntimeError) -> bool:
+    """只识别 asyncio.BaseEventLoop._check_closed 产生的精确异常。"""
+    if type(exc) is not RuntimeError or exc.args != ("Event loop is closed",):
+        return False
+    traceback = exc.__traceback__
+    while traceback is not None:
+        code = traceback.tb_frame.f_code
+        filename = code.co_filename.replace("\\", "/")
+        if code.co_name == "_check_closed" and filename.endswith(
+            "/asyncio/base_events.py"
+        ):
+            return True
+        traceback = traceback.tb_next
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +131,14 @@ class FixedHostHttpClient:
         return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        try:
+            await self._client.aclose()
+        except RuntimeError as exc:
+            if not _is_asyncio_closed_loop_error(exc):
+                raise
+            # 旧 loop 已关闭后无法再调度 socket 回调；HTTPX 已先把 client
+            # 标记为 closed。记录该降级，但不让应用/TestClient 停机失败。
+            logger.warning("索引器 HTTP 客户端所属事件循环已关闭，跳过重复清理")
 
     async def get(
         self,
