@@ -1905,13 +1905,33 @@ def _request_uses_browser_media_element(request: Any) -> bool:
     )
 
 
-def _signed_media_request_headers(request: Any) -> dict[str, str]:
+def _signed_media_request_headers(
+    request: Any,
+    *,
+    head_probe: bool = False,
+) -> dict[str, str]:
     headers = {
         key: value
         for key, value in request.headers.items()
         if key.lower() in _SIGNED_MEDIA_REQUEST_HEADERS
     }
     headers["Accept-Encoding"] = "identity"
+    if head_probe:
+        # 光鸭部分 CDN 节点会对 HEAD + video/* 或 application/json 返回 406；
+        # bytes=0-0 又会异常返回 200 / Content-Length: 1。探测统一请求 1 KiB，
+        # 再由 MediaFlux 根据 Content-Range 为客户端合成正确的 HEAD 元数据。
+        has_client_range = any(
+            key.casefold() == "range" and str(value or "").strip()
+            for key, value in headers.items()
+        )
+        for key in tuple(headers):
+            lowered = key.casefold()
+            if lowered in {"accept", "range"} or (
+                lowered == "if-range" and not has_client_range
+            ):
+                headers.pop(key, None)
+        headers["Accept"] = "*/*"
+        headers["Range"] = "bytes=0-1023"
     return headers
 
 
@@ -1925,6 +1945,73 @@ def _signed_media_response_headers(headers: httpx.Headers) -> dict[str, str]:
     result["Pragma"] = "no-cache"
     result["Referrer-Policy"] = "no-referrer"
     return result
+
+
+def _head_probe_response(
+    status_code: int,
+    headers: dict[str, str],
+    *,
+    requested_range: str,
+) -> tuple[int, dict[str, str]]:
+    """把内部 1 KiB GET 探测还原为客户端预期的 HEAD 响应。"""
+    normalized = dict(headers)
+    content_range_key = next(
+        (key for key in normalized if key.casefold() == "content-range"),
+        None,
+    )
+    content_length_key = next(
+        (key for key in normalized if key.casefold() == "content-length"),
+        None,
+    )
+    content_range = normalized.get(content_range_key, "") if content_range_key else ""
+    range_match = re.fullmatch(
+        r"\s*bytes\s+(?:\d+-\d+|\*)/(\d+)\s*",
+        content_range,
+        re.I,
+    )
+    total_size: int | None = int(range_match.group(1)) if range_match else None
+
+    # 上游返回 200 表示它忽略了 Range，或 If-Range 条件未满足；必须保持
+    # 完整表示语义，不能自行伪造成 206。
+    if status_code == 200:
+        if content_length_key:
+            raw_length = str(normalized.get(content_length_key) or "").strip()
+            if raw_length.isdigit():
+                total_size = int(raw_length)
+        if content_range_key:
+            normalized.pop(content_range_key, None)
+        if total_size is not None:
+            normalized[content_length_key or "Content-Length"] = str(total_size)
+        return 200, normalized
+
+    if status_code != 206 or total_size is None:
+        return status_code, normalized
+
+    if content_range_key:
+        normalized.pop(content_range_key, None)
+    requested = str(requested_range or "").strip()
+    if not requested:
+        normalized[content_length_key or "Content-Length"] = str(total_size)
+        return 200, normalized
+
+    try:
+        selected = _parse_range(requested, total_size)
+    except (TypeError, ValueError):
+        selected = None
+    if selected is None:
+        if content_length_key:
+            normalized.pop(content_length_key, None)
+        normalized["Content-Range"] = f"bytes */{total_size}"
+        return 416, normalized
+
+    range_start, range_end = selected
+    normalized[content_length_key or "Content-Length"] = str(
+        range_end - range_start + 1
+    )
+    normalized["Content-Range"] = (
+        f"bytes {range_start}-{range_end}/{total_size}"
+    )
+    return 206, normalized
 
 
 def _header_values(headers: Any, name: str) -> list[str]:
@@ -2773,7 +2860,11 @@ def create_proxy_app(
         current_url = str(signed_url or "").strip()
         started = time.monotonic()
         relay_client: httpx.AsyncClient | None = None
-        upstream_method = request.method
+        is_head_probe = request.method == "HEAD"
+        # CDN 的 HEAD 行为并不稳定：部分节点会因 Accept 返回 406，另一些节点
+        # 会回 Content-Length: 0。统一改用流式 GET 探测响应头，正文不会被读取。
+        upstream_method = "GET" if is_head_probe else request.method
+        requested_range = str(request.headers.get("range") or "").strip()
 
         async def close_relay_client() -> None:
             nonlocal relay_client
@@ -2821,7 +2912,10 @@ def create_proxy_app(
                             max_keepalive_connections=0,
                         ),
                     )
-                headers = _signed_media_request_headers(request)
+                headers = _signed_media_request_headers(
+                    request,
+                    head_probe=is_head_probe,
+                )
                 headers["Host"] = pinned.host_header
                 upstream_request = relay_client.build_request(
                     upstream_method,
@@ -2853,15 +2947,6 @@ def create_proxy_app(
                     )
                     return JSONResponse({"error": "媒体直链暂不可用"}, status_code=502)
 
-                if (
-                    request.method == "HEAD"
-                    and upstream_method == "HEAD"
-                    and response.status_code in {405, 501}
-                ):
-                    await response.aclose()
-                    upstream_method = "GET"
-                    continue
-
                 if response.status_code in {301, 302, 303, 307, 308}:
                     location = str(response.headers.get("location") or "").strip()
                     await response.aclose()
@@ -2888,13 +2973,18 @@ def create_proxy_app(
                     (time.monotonic() - started) * 1000
                 )
                 response_headers = _signed_media_response_headers(response.headers)
-                if request.method == "HEAD":
+                if is_head_probe:
+                    status_code, response_headers = _head_probe_response(
+                        response.status_code,
+                        response_headers,
+                        requested_range=requested_range,
+                    )
                     try:
                         await response.aclose()
                     finally:
                         await close_relay_client()
                     return Response(
-                        status_code=response.status_code,
+                        status_code=status_code,
                         headers=response_headers,
                     )
                 streaming_client, relay_client = relay_client, None

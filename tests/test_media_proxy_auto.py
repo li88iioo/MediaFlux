@@ -2099,13 +2099,14 @@ class HybridMediaProxyTests(unittest.TestCase):
             content_type="video/mp4",
             headers={
                 "accept-ranges": "bytes",
-                "content-length": "100",
-                "content-range": "bytes 0-0/100",
+                "content-length": "1024",
+                "content-range": "bytes 0-1023/10000",
             },
         )
         _FakeAsyncClient.responses = [upstream]
         app = media_proxy.create_proxy_app(7)
         headers = {
+            "Accept": "application/json",
             "If-Range": '"native-etag"',
             "Range": "bytes=0-0",
             "User-Agent": "Jellyfin-Android/2.6.3",
@@ -2141,24 +2142,25 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         self.assertEqual(probe.status_code, 206)
         self.assertEqual(probe.content, b"")
-        self.assertEqual(probe.headers["content-range"], "bytes 0-0/100")
-        self.assertEqual(probe.headers["content-length"], "100")
+        self.assertEqual(probe.headers["content-range"], "bytes 0-0/10000")
+        self.assertEqual(probe.headers["content-length"], "1")
         self.assertNotIn("location", probe.headers)
         self.assertTrue(upstream.closed)
 
         relay_request = _FakeAsyncClient.requests[0]
-        self.assertEqual(relay_request.method, "HEAD")
+        self.assertEqual(relay_request.method, "GET")
         self.assertEqual(
             str(relay_request.url),
             "https://203.0.113.10/native-probe-file",
         )
         self.assertEqual(relay_request.headers["Host"], "signed.invalid")
-        self.assertEqual(relay_request.headers["Range"], "bytes=0-0")
+        self.assertEqual(relay_request.headers["Range"], "bytes=0-1023")
         self.assertEqual(relay_request.headers["If-Range"], '"native-etag"')
         self.assertEqual(
             relay_request.headers["User-Agent"],
             "Jellyfin-Android/2.6.3",
         )
+        self.assertEqual(relay_request.headers["Accept"], "*/*")
         self.assertEqual(relay_request.headers["Accept-Encoding"], "identity")
 
         self.assertEqual(stream.status_code, 302)
@@ -2168,24 +2170,26 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         self.assertEqual(_FakeGuangYaClient.calls, ["native-probe-file"])
 
-    def test_native_head_fallback_preserves_range_conditions(self):
+    def test_native_head_probe_preserves_range_conditions_and_avoids_cdn_406(self):
         media_proxy._dynamic_guangya_mappings.register(
-            7, "fallback-item", "fallback-source", "fallback-file"
+            7, "probe-accept-item", "probe-accept-source", "probe-accept-file"
         )
         self._grant_file(
-            "client-token", "fallback-item", "fallback-source", "fallback-file"
+            "client-token",
+            "probe-accept-item",
+            "probe-accept-source",
+            "probe-accept-file",
         )
-        rejected_head = _FakeUpstreamResponse(status_code=405)
-        fallback_get = _FakeUpstreamResponse(
-            status_code=200,
-            body=b"would-be-full-body",
+        upstream = _FakeUpstreamResponse(
+            status_code=206,
             content_type="video/mp4",
             headers={
                 "accept-ranges": "bytes",
                 "content-length": "1000",
+                "content-range": "bytes 0-999/1000",
             },
         )
-        _FakeAsyncClient.responses = [rejected_head, fallback_get]
+        _FakeAsyncClient.responses = [upstream]
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
@@ -2209,8 +2213,73 @@ class HybridMediaProxyTests(unittest.TestCase):
             TestClient(app, raise_server_exceptions=False) as client,
         ):
             response = client.head(
-                "/Videos/fallback-item/stream"
-                "?MediaSourceId=fallback-source&api_key=client-token",
+                "/Videos/probe-accept-item/stream"
+                "?MediaSourceId=probe-accept-source&api_key=client-token",
+                headers={
+                    "Accept": "video/*",
+                    "If-Range": '"stale-etag"',
+                    "Range": "bytes=100-199",
+                    "User-Agent": "Jellyfin-Android/2.6.3",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, b"")
+        self.assertEqual(response.headers["content-length"], "100")
+        self.assertEqual(response.headers["content-range"], "bytes 100-199/1000")
+        self.assertTrue(upstream.closed)
+        self.assertEqual(len(_FakeAsyncClient.requests), 1)
+        probe = _FakeAsyncClient.requests[0]
+        self.assertEqual(probe.method, "GET")
+        self.assertEqual(probe.headers["Accept"], "*/*")
+        self.assertEqual(probe.headers["Range"], "bytes=0-1023")
+        self.assertEqual(probe.headers["If-Range"], '"stale-etag"')
+        self.assertEqual(_FakeAsyncClient.init_kwargs[0]["timeout"].read, 10.0)
+
+    def test_native_head_if_range_miss_keeps_full_response_semantics(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "if-range-item", "if-range-source", "if-range-file"
+        )
+        self._grant_file(
+            "client-token", "if-range-item", "if-range-source", "if-range-file"
+        )
+        upstream = _FakeUpstreamResponse(
+            status_code=200,
+            body=b"must-not-be-returned",
+            content_type="video/mp4",
+            headers={
+                "accept-ranges": "bytes",
+                "content-length": "10000",
+                "etag": '"new-etag"',
+            },
+        )
+        _FakeAsyncClient.responses = [upstream]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.head(
+                "/Videos/if-range-item/stream"
+                "?MediaSourceId=if-range-source&api_key=client-token",
                 headers={
                     "If-Range": '"stale-etag"',
                     "Range": "bytes=100-199",
@@ -2221,17 +2290,13 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"")
-        self.assertEqual(response.headers["content-length"], "1000")
+        self.assertEqual(response.headers["content-length"], "10000")
         self.assertNotIn("content-range", response.headers)
-        self.assertTrue(rejected_head.closed)
-        self.assertTrue(fallback_get.closed)
-        self.assertEqual([request.method for request in _FakeAsyncClient.requests], [
-            "HEAD", "GET",
-        ])
-        retry = _FakeAsyncClient.requests[1]
-        self.assertEqual(retry.headers["Range"], "bytes=100-199")
-        self.assertEqual(retry.headers["If-Range"], '"stale-etag"')
-        self.assertEqual(_FakeAsyncClient.init_kwargs[0]["timeout"].read, 10.0)
+        self.assertTrue(upstream.closed)
+        probe = _FakeAsyncClient.requests[0]
+        self.assertEqual(probe.method, "GET")
+        self.assertEqual(probe.headers["Range"], "bytes=0-1023")
+        self.assertEqual(probe.headers["If-Range"], '"stale-etag"')
 
     def test_native_head_fallback_preserves_full_redirect_budget(self):
         media_proxy._dynamic_guangya_mappings.register(
@@ -2243,7 +2308,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "redirect-budget-source",
             "redirect-budget-file",
         )
-        responses = [_FakeUpstreamResponse(status_code=405)]
+        responses = []
         for index in range(media_proxy._SIGNED_MEDIA_MAX_REDIRECTS):
             responses.append(
                 _FakeUpstreamResponse(
@@ -2257,8 +2322,8 @@ class HybridMediaProxyTests(unittest.TestCase):
             _FakeUpstreamResponse(
                 status_code=206,
                 headers={
-                    "content-length": "100",
-                    "content-range": "bytes 200-299/1000",
+                    "content-length": "1024",
+                    "content-range": "bytes 0-1023/10000",
                 },
             )
         )
@@ -2299,15 +2364,14 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 206)
         self.assertEqual(response.content, b"")
         self.assertEqual(len(_FakeAsyncClient.requests), len(responses))
-        self.assertEqual(_FakeAsyncClient.requests[0].method, "HEAD")
-        for request in _FakeAsyncClient.requests[1:]:
+        for request in _FakeAsyncClient.requests:
             self.assertEqual(request.method, "GET")
-            self.assertEqual(request.headers["Range"], "bytes=200-299")
+            self.assertEqual(request.headers["Range"], "bytes=0-1023")
             self.assertEqual(request.headers["If-Range"], '"stale-etag"')
         self.assertTrue(all(item.closed for item in responses))
         self.assertTrue(all(client.closed for client in _FakeAsyncClient.instances))
 
-    def test_native_head_fallback_closes_ignored_full_body_without_reading(self):
+    def test_native_head_probe_injects_one_byte_range_without_reading_body(self):
         media_proxy._dynamic_guangya_mappings.register(
             7, "ignored-range-item", "ignored-range-source", "ignored-range-file"
         )
@@ -2327,17 +2391,17 @@ class HybridMediaProxyTests(unittest.TestCase):
                 self.raw_iterations += 1
                 yield self._body
 
-        rejected_head = _FakeUpstreamResponse(status_code=501)
-        ignored_range = UnreadBodyResponse(
-            status_code=200,
-            body=b"would-be-a-large-video-body",
+        one_byte_probe = UnreadBodyResponse(
+            status_code=206,
+            body=b"x" * 1024,
             content_type="video/mp4",
             headers={
                 "accept-ranges": "bytes",
-                "content-length": "99999999",
+                "content-length": "1024",
+                "content-range": "bytes 0-1023/99999999",
             },
         )
-        _FakeAsyncClient.responses = [rejected_head, ignored_range]
+        _FakeAsyncClient.responses = [one_byte_probe]
         app = media_proxy.create_proxy_app(7)
         with (
             patch(
@@ -2363,16 +2427,98 @@ class HybridMediaProxyTests(unittest.TestCase):
             response = client.head(
                 "/Videos/ignored-range-item/stream"
                 "?MediaSourceId=ignored-range-source&api_key=client-token",
-                headers={"User-Agent": "Jellyfin-Android/2.6.3"},
+                headers={
+                    "Accept": "application/json",
+                    "If-Range": '"must-be-removed"',
+                    "User-Agent": "Jellyfin-Android/2.6.3",
+                },
                 follow_redirects=False,
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"")
         self.assertEqual(response.headers["content-length"], "99999999")
-        self.assertEqual(ignored_range.raw_iterations, 0)
-        self.assertTrue(rejected_head.closed)
-        self.assertTrue(ignored_range.closed)
+        self.assertNotIn("content-range", response.headers)
+        self.assertEqual(one_byte_probe.raw_iterations, 0)
+        self.assertTrue(one_byte_probe.closed)
+        probe = _FakeAsyncClient.requests[0]
+        self.assertEqual(probe.method, "GET")
+        self.assertEqual(probe.headers["Accept"], "*/*")
+        self.assertEqual(probe.headers["Range"], "bytes=0-1023")
+        self.assertNotIn("if-range", probe.headers)
+
+    def test_native_head_invalid_ranges_return_416_and_close_upstream(self):
+        media_proxy._dynamic_guangya_mappings.register(
+            7, "invalid-range-item", "invalid-range-source", "invalid-range-file"
+        )
+        self._grant_file(
+            "client-token",
+            "invalid-range-item",
+            "invalid-range-source",
+            "invalid-range-file",
+        )
+        invalid_ranges = (
+            "bytes=bad-1",
+            "bytes=0-1,4-5",
+            "bytes=1000-",
+        )
+        upstream_responses = [
+            _FakeUpstreamResponse(
+                status_code=206,
+                content_type="video/mp4",
+                headers={
+                    "accept-ranges": "bytes",
+                    "content-length": "1000",
+                    "content-range": "bytes 0-999/1000",
+                },
+            )
+            for _ in invalid_ranges
+        ]
+        _FakeAsyncClient.responses = upstream_responses.copy()
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            responses = [
+                client.head(
+                    "/Videos/invalid-range-item/stream"
+                    "?MediaSourceId=invalid-range-source&api_key=client-token",
+                    headers={
+                        "Range": value,
+                        "User-Agent": "Jellyfin-Android/2.6.3",
+                    },
+                    follow_redirects=False,
+                )
+                for value in invalid_ranges
+            ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, 416)
+            self.assertEqual(response.content, b"")
+            self.assertEqual(response.headers["content-range"], "bytes */1000")
+            self.assertEqual(response.headers.get("content-length"), "0")
+        self.assertTrue(all(response.closed for response in upstream_responses))
+        for request in _FakeAsyncClient.requests:
+            self.assertEqual(request.method, "GET")
+            self.assertEqual(request.headers["Range"], "bytes=0-1023")
 
     def test_native_head_probe_has_absolute_deadline_and_closes_client(self):
         media_proxy._dynamic_guangya_mappings.register(
@@ -2465,7 +2611,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                     headers={
                         "accept-ranges": "bytes",
                         "content-length": "100",
-                        "content-range": "bytes 0-0/100",
+                        "content-range": "bytes 0-99/100",
                     },
                 )
 
@@ -2539,7 +2685,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         ):
             first, second, second_elapsed = asyncio.run(scenario())
 
-        self.assertEqual(first.status_code, 206)
+        self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 504)
         self.assertLess(second_elapsed, 0.11)
         self.assertEqual(len(QueuedProbeAsyncClient.requests), 2)
@@ -2690,7 +2836,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 headers={
                     "accept-ranges": "bytes",
                     "content-length": "100",
-                    "content-range": "bytes 0-0/100",
+                    "content-range": "bytes 0-99/100",
                 },
             )
         ]
@@ -2752,7 +2898,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(first.status_code, 504)
         self.assertEqual(second.status_code, 503)
         self.assertEqual(calls_after_second, 1)
-        self.assertEqual(third.status_code, 206)
+        self.assertEqual(third.status_code, 200)
         self.assertEqual(third.content, b"")
         with calls_lock:
             self.assertEqual(calls, 2)
@@ -2874,7 +3020,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             headers={
                 "accept-ranges": "bytes",
                 "content-length": "100",
-                "content-range": "bytes 0-0/100",
+                "content-range": "bytes 0-99/100",
             },
         )
         _FakeAsyncClient.responses = [upstream]
@@ -2916,8 +3062,12 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 206)
         self.assertEqual(response.content, b"")
         self.assertEqual(response.headers["content-range"], "bytes 0-0/100")
-        self.assertEqual(response.headers["content-length"], "100")
+        self.assertEqual(response.headers["content-length"], "1")
         self.assertTrue(upstream.closed)
+        relay_request = _FakeAsyncClient.requests[0]
+        self.assertEqual(relay_request.method, "GET")
+        self.assertEqual(relay_request.headers["Accept"], "*/*")
+        self.assertEqual(relay_request.headers["Range"], "bytes=0-1023")
 
     def test_browser_relay_follows_provider_redirect_internally(self):
         media_proxy._dynamic_guangya_mappings.register(
