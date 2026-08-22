@@ -902,6 +902,8 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.locator("#agentPrompt").fill("整理云盘")
         self.page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
         self.page.locator(".agent-confirmation-card").wait_for()
+        self.assertEqual(self.page.locator(".agent-confirmation-card").count(), 1)
+        self.assertEqual(self.page.locator(".agent-result-card").count(), 0)
         self.page.set_viewport_size({"width": 640, "height": 900})
         new_session_box = self.page.locator("#agentNewSession").bounding_box()
         confirm_box = self.page.locator(".agent-confirmation-submit").bounding_box()

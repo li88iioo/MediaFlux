@@ -1460,15 +1460,21 @@
         'agent.action_history': '操作历史',
     };
 
-    function renderReadPlan(data) {
+    function renderReadPlan(data, {attentionOnly = false} = {}) {
         if (!data || typeof data !== 'object' || !Array.isArray(data.steps)) return null;
-        const steps = data.steps.slice(0, 4).filter((step) => step && typeof step === 'object');
+        const steps = data.steps
+            .filter((step) => step && typeof step === 'object')
+            .filter((step) => !attentionOnly || step?.result?.ok !== true)
+            .slice(0, 4);
         if (!steps.length) return null;
 
         const wrapper = node('section', 'agent-read-plan');
         const head = node('header', 'agent-read-plan-head');
         const title = node('div');
-        title.append(node('span', 'agent-read-plan-eyebrow', 'DIAGNOSTIC RUN'), node('strong', '', '复合检查'));
+        title.append(
+            node('span', 'agent-read-plan-eyebrow', attentionOnly ? '需要留意' : '核对明细'),
+            node('strong', '', attentionOnly ? '未完成的检查' : '复合检查'),
+        );
         head.append(title, node('span', 'agent-read-plan-count', `${steps.length} 个步骤`));
         wrapper.append(head);
 
@@ -1494,9 +1500,9 @@
         return wrapper;
     }
 
-    function renderSpecializedData(toolName, data, result = {}) {
+    function renderSpecializedData(toolName, data, result = {}, {attentionOnly = false} = {}) {
         const name = String(toolName || '');
-        if (name === 'agent.read_plan') return renderReadPlan(data);
+        if (name === 'agent.read_plan') return renderReadPlan(data, {attentionOnly});
         if (name === 'workspace.next_actions') return renderWorkspaceNextActions(data);
         if (WORKSPACE_OVERVIEW_TOOLS.has(name)) return renderWorkspaceOverview(data);
         if (name === 'library.count_series_episodes') return renderSeriesEpisodeCount(data, result);
@@ -1605,7 +1611,9 @@
     function responseInspectionTrace(payload) {
         const rawItems = Array.isArray(payload?.agent_trace) ? payload.agent_trace : [];
         const partial = payload?.agent_partial?.complete === false;
-        const items = rawItems.flatMap((item) => {
+        const attentionOnly = payload?.presentation?.source === 'llm'
+            && payload?.presentation?.kind === 'narrative';
+        const projected = rawItems.flatMap((item) => {
             if (!item || typeof item !== 'object') return [];
             const label = String(item.label || '').trim().slice(0, 80);
             if (!label) return [];
@@ -1614,9 +1622,15 @@
                 ok: item.ok === true,
                 summary: String(item.summary || '').trim().slice(0, 240),
             }];
-        }).slice(0, 6);
-        if (!items.length || (items.length === 1 && !partial)) return null;
-        return {items, partial, total: rawItems.length};
+        });
+        const items = projected.filter((item) => !attentionOnly || !item.ok).slice(0, 6);
+        if (!items.length || (items.length === 1 && !partial && !attentionOnly)) return null;
+        return {
+            items,
+            partial,
+            attentionOnly,
+            total: attentionOnly ? items.length : rawItems.length,
+        };
     }
 
     function renderInspectionTrace(payload) {
@@ -1627,8 +1641,12 @@
         const head = node('div', 'agent-inspection-trace-head');
         const heading = node('div');
         heading.append(
-            node('span', 'agent-inspection-kicker', trace.partial ? 'PARTIAL CHECK' : 'VERIFIED SOURCES'),
-            node('h4', '', `本次核对 · ${trace.total} 项`),
+            node(
+                'span',
+                'agent-inspection-kicker',
+                trace.attentionOnly ? '需要留意' : (trace.partial ? '部分完成' : '核对来源'),
+            ),
+            node('h4', '', `${trace.attentionOnly ? '未完成' : '本次核对'} · ${trace.total} 项`),
         );
         head.append(
             heading,
@@ -1656,7 +1674,7 @@
             list.append(row);
         });
         section.append(head, list);
-        if (trace.total > trace.items.length) {
+        if (!trace.attentionOnly && trace.total > trace.items.length) {
             section.append(node('p', 'agent-inspection-more', `另有 ${trace.total - trace.items.length} 项已核对`));
         }
         return section;
@@ -1770,8 +1788,15 @@
         }
         const trace = renderInspectionTrace(payload);
         if (trace) card.append(trace);
-        const specializedData = renderSpecializedData(payload?.tool_call?.name, result.data, result);
-        const genericData = specializedData ? null : renderData(display.details);
+        const toolName = String(payload?.tool_call?.name || '');
+        const hideRepeatedReadPlan = toolName === 'agent.read_plan' && Boolean(narrative) && Boolean(trace);
+        const specializedData = hideRepeatedReadPlan ? null : renderSpecializedData(
+            toolName,
+            result.data,
+            result,
+            {attentionOnly: Boolean(narrative)},
+        );
+        const genericData = specializedData || hideRepeatedReadPlan ? null : renderData(display.details);
         if (specializedData) card.append(specializedData);
         else if (genericData) {
             card.append(renderResultDisclosure(genericData));
@@ -1802,18 +1827,23 @@
         const view = streamingCard
             ? {article: pendingNode, body: pendingNode.querySelector('.agent-message-body')}
             : reuseAssistantMessage(pendingNode, 'MEDIAFLUX AGENT', 'bot');
-        const renderedCard = renderResultCard(payload);
+        const confirmationRequired = payload?.mode === 'confirmation_required'
+            && payload.confirmation?.confirmation_id;
+        const renderedCard = confirmationRequired
+            ? renderConfirmation(payload.confirmation, payload.tool_call, payload)
+            : renderResultCard(payload);
         let resultCard = renderedCard;
         if (streamingCard) {
-            streamingCard.className = renderedCard.className;
-            streamingCard.removeAttribute('aria-busy');
-            streamingCard.replaceChildren(...renderedCard.childNodes);
-            resultCard = streamingCard;
+            if (confirmationRequired) {
+                streamingCard.replaceWith(renderedCard);
+            } else {
+                streamingCard.className = renderedCard.className;
+                streamingCard.removeAttribute('aria-busy');
+                streamingCard.replaceChildren(...renderedCard.childNodes);
+                resultCard = streamingCard;
+            }
         } else {
             view.body.append(resultCard);
-        }
-        if (payload?.mode === 'confirmation_required' && payload.confirmation?.confirmation_id) {
-            view.body.append(renderConfirmation(payload.confirmation, payload.tool_call));
         }
         refreshIcons(view.article);
         if (!streamingCard && window.MFAnim && typeof window.MFAnim.popIn === 'function' && !restoringHistory) {
@@ -2457,7 +2487,7 @@
         }
     }
 
-    function renderConfirmation(confirmation, toolCall = {}) {
+    function renderConfirmation(confirmation, toolCall = {}, payload = {}) {
         const confirmationId = String(confirmation.confirmation_id || '');
         const contract = confirmation?.contract && typeof confirmation.contract === 'object'
             ? confirmation.contract
@@ -2490,6 +2520,13 @@
                 : '只有确认后才会执行写操作。',
         );
         card.append(head);
+
+        const intro = renderNarrative(payload?.presentation) || renderTextBlocks(
+            payload?.display?.summary || payload?.result?.summary || '',
+            'agent-confirmation-intro agent-rich-text',
+            {promoteFirst: true},
+        );
+        if (intro) card.append(intro);
 
         const facts = node('dl', 'agent-confirmation-facts');
         [

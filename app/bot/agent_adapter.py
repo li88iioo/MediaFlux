@@ -90,6 +90,7 @@ _READ_PLAN_LABELS = {
     "indexer.diagnose_readiness": "资源站",
     "automation.diagnose_pipeline": "自动化链路",
     "library.patrol_status": "媒体库巡检",
+    "library.count_series_episodes": "统计本地集数",
     "agent.action_history": "操作历史",
 }
 _MAX_SUMMARY_LENGTH = 900
@@ -1910,7 +1911,7 @@ def _telegram_agent_trace_details(
         if not label:
             continue
         item_ok = item.get("ok") is True
-        if attention_only and item_ok and not partial:
+        if attention_only and item_ok:
             continue
         projected.append((
             label,
@@ -2042,19 +2043,19 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
         public_key == "unavailable" or public_tone == "error"
     ):
         lines = [f"<b>{public_label or '暂时无法完成'}</b>", body]
-        if error and error != body:
+        if error and error != body and error not in body:
             lines.extend(["", error])
     elif explicit_public_status and (
         public_key == "attention" or public_tone == "warning"
     ):
         lines = [f"<b>{public_label or '需要留意'}</b>", body]
-        if error and error != body:
+        if error and error != body and error not in body:
             lines.extend(["", error])
     elif explicit_public_status and public_key == "in_progress" and public_label:
         lines = [f"<b>{public_label}</b>", body]
     elif not ok:
         lines = ["<b>没能完成这次请求</b>", body]
-        if error and error != body:
+        if error and error != body and error not in body:
             lines.extend(["", error])
     else:
         lines = [body]
@@ -2107,21 +2108,19 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
             else {}
         )
         if contract:
+            action = _public_text(contract.get("action"), limit=100)
+            if action:
+                lines[0] = f"<b>需要你确认：{action}</b>"
             lines.extend([
                 "",
-                "<b>操作对象</b>",
-                _public_text(contract.get("object"), limit=160) or "当前预检选中的对象",
-                "",
-                "<b>影响</b>",
-                _public_text(contract.get("impact"), limit=220) or "确认后会执行预检通过的写操作。",
-                "",
-                "<b>撤销方式</b>",
-                _public_text(contract.get("reversibility"), limit=220) or "执行后可能需要手动撤销。",
+                f"• <b>范围：</b>{_public_text(contract.get('object'), limit=160) or '当前预检选中的对象'}",
+                f"• <b>影响：</b>{_public_text(contract.get('impact'), limit=220) or '确认后会执行预检通过的写操作。'}",
+                f"• <b>撤销：</b>{_public_text(contract.get('reversibility'), limit=220) or '执行后可能需要手动撤销。'}",
             ])
             preview = _public_text(contract.get("preflight_summary"), limit=180)
             if preview:
-                lines.extend(["", "<b>预检</b>", preview])
-        lines.extend(["", "只有点击下方确认按钮才会执行；请在 60 秒内完成确认，超时后需重新发起。"])
+                lines.append(f"• <b>预检：</b>{preview}")
+        lines.extend(["", "确认后才会执行，按钮 60 秒内有效。"])
 
     return _truncate_telegram_html("\n".join(lines))
 
@@ -2780,11 +2779,9 @@ def _render_resource_candidates(
         lines.append(f"<b>{position}.</b> {prefix}{candidate['title']}")
         if metadata:
             lines.append(f"   {metadata}")
-    example_position = page_start + (2 if len(page_candidates) > 1 else 1)
     lines.extend([
         "",
-        f"直接点按钮，或回复“第 {example_position} 个到 qB / 光鸭 / 两边”；"
-        "提交前仍会确认。",
+        "选择下方按钮即可；真正提交前还会再次确认。",
     ])
     return _truncate_telegram_html("\n".join(lines))
 

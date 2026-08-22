@@ -927,6 +927,33 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(text.count("<b>需要留意</b>"), 1)
         self.assertNotIn("<b>检查步骤</b>", text)
 
+    def test_partial_narrative_trace_only_lists_unfinished_items(self):
+        text = render_agent_response({
+            "mode": "read_plan",
+            "result": {
+                "ok": False,
+                "status": "partial",
+                "summary": "部分检查失败",
+                "suggestions": [],
+                "data": {"steps": []},
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "下载队列正常，但 RSS 暂时无法完成检查。",
+            },
+            "agent_partial": {"complete": False},
+            "agent_trace": [
+                {"label": "下载队列", "ok": True, "summary": "没有异常。"},
+                {"label": "RSS 订阅", "ok": False, "summary": "连接超时。"},
+            ],
+        })
+
+        self.assertEqual(text.count("下载队列"), 1)
+        self.assertEqual(text.count("RSS 订阅"), 1)
+        self.assertIn("连接超时", text)
+        self.assertNotIn("没有异常", text)
+
     def test_narrative_omits_guidance_already_stated_in_body(self):
         text = render_agent_response({
             "mode": "read_plan",
@@ -2254,12 +2281,13 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(markup.buttons[0].text, "确认：提交资源下载")
         rendered = bot.replies[0][1]
         for expected in (
-            "操作对象",
+            "需要你确认：提交资源下载",
+            "范围",
             "你刚才选择的资源候选",
             "影响",
-            "撤销方式",
+            "撤销",
             "预检",
-            "请在 60 秒内完成确认",
+            "按钮 60 秒内有效",
         ):
             self.assertIn(expected, rendered)
         callback_values = [button.callback_data for button in markup.buttons]
@@ -4322,7 +4350,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 confirmation_markup.buttons[0].text,
                 "确认：提交资源下载",
             )
-            self.assertIn("操作对象", bot.edits[0][0])
+            self.assertIn("范围", bot.edits[0][0])
             self.assertIn("下载器连接正常", bot.edits[0][0])
             self.assertNotIn("resource_result_123456", bot.edits[0][0])
             self.assertTrue(all(

@@ -74,6 +74,11 @@ class AgentResultProjectionTests(unittest.TestCase):
 
     def test_public_labels_and_followups_hide_internal_protocol(self):
         self.assertEqual(public_tool_label("downloads.diagnose_queue"), "下载队列检查")
+        self.assertEqual(public_tool_label("agent.capabilities"), "Agent 能力列表")
+        self.assertEqual(public_tool_label("config.indexer_sites_summary"), "资源检索站点概览")
+        self.assertEqual(public_tool_label("guangya.organize.preview"), "光鸭整理预检")
+        self.assertEqual(public_tool_label("guangya.organize.status"), "光鸭整理状态")
+        self.assertEqual(public_tool_label("library.patrol_policy"), "缺集巡检策略")
         self.assertEqual(public_tool_label("unknown.private_tool"), "MediaFlux 检查")
         self.assertEqual(public_followup_prompt("downloads"), "检查下载队列里的异常")
         self.assertEqual(public_followup_prompt("library_patrol"), "查看缺集巡检需要关注的内容")

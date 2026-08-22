@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app.agent.confirmation import ConfirmationStore, confirmation_reply_intent
+from app.agent.confirmation_contract import build_confirmation_contract
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import AgentOrchestrator, _is_strm_run_action
 from app.agent.registry import AgentToolError, ToolRegistry
@@ -20,6 +21,24 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class ConfirmationStoreTests(unittest.TestCase):
+    def test_media_subscription_confirmations_have_specific_public_copy(self):
+        preview = ToolResult(True, "preview", "预检通过")
+        created = build_confirmation_contract(
+            tool_name="media.create_subscription",
+            risk=RiskLevel.LOW_WRITE,
+            preview=preview,
+        )
+        deleted = build_confirmation_contract(
+            tool_name="media.delete_subscription",
+            risk=RiskLevel.DANGER,
+            preview=preview,
+        )
+
+        self.assertEqual(created["action"], "创建媒体追更订阅")
+        self.assertIn("不会立即搜索资源", created["impact"])
+        self.assertEqual(deleted["action"], "删除媒体追更订阅")
+        self.assertIn("删除不可撤销", deleted["reversibility"])
+
     def test_confirmation_reply_intent_is_explicit_and_non_ambiguous(self):
         for value in ("确认", "好的帮我执行。", "YES", "取消", "算了！"):
             with self.subTest(value=value):

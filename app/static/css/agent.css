@@ -1039,6 +1039,7 @@ body.agent-page-body::after { display: none; }
     font-weight: 700;
 }
 .agent-confirmation-risk.is-danger { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-border); }
+.agent-confirmation-intro { margin-top: 13px; color: var(--text-primary); font-size: 12px; line-height: 1.65; }
 .agent-confirmation-facts { display: grid; margin-top: 15px; border: 1px solid var(--agent-line); background: var(--bg-card); }
 .agent-confirmation-fact { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 12px; padding: 11px 12px; }
 .agent-confirmation-fact + .agent-confirmation-fact { border-top: 1px solid var(--agent-line); }

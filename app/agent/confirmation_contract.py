@@ -47,6 +47,18 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "暂停会停止安排新检查并失效尚未提交的候选资源；恢复会让订阅重新进入检查队列。已提交下载任务和媒体文件不受影响。",
         "reversibility": "可再次确认暂停或恢复该订阅。",
     },
+    "media.create_subscription": {
+        "action": "创建媒体追更订阅",
+        "object": "你刚才选定的影视条目和季度",
+        "impact": "会创建一条追更订阅并安排后续更新检查；不会立即搜索资源或提交下载。",
+        "reversibility": "可暂停或删除这条订阅；已经提交的下载任务和媒体文件不受影响。",
+    },
+    "media.delete_subscription": {
+        "action": "删除媒体追更订阅",
+        "object": "你指定的一条媒体追更订阅",
+        "impact": "会删除订阅记录并停止后续更新检查；不会删除已提交的下载任务或媒体文件。",
+        "reversibility": "删除不可撤销；如果只想暂时停止追更，请改为暂停订阅。",
+    },
     "rss.set_refresh_interval": {
         "action": "调整 RSS 自动刷新周期",
         "object": "你指定的 RSS 订阅",

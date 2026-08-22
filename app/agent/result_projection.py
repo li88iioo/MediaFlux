@@ -94,6 +94,7 @@ _DISPLAY_CLAUSE_RE = re.compile(r"[^，,；;：:]+(?:[，,；;：:]+|$)")
 _TRANSFER_RATE_RE = re.compile(r"(?i)\b(?:\d+(?:\.\d+)?\s*)?(?:[kmgt]?i?b|b)/s\b")
 
 _PUBLIC_TOOL_LABELS: dict[str, str] = {
+    "agent.capabilities": "Agent 能力列表",
     "agent.action_history": "Agent 操作记录",
     "agent.read_plan": "综合检查",
     "automation.diagnose_pipeline": "自动化链路诊断",
@@ -102,6 +103,7 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "config.diagnose_media_servers": "媒体服务器检查",
     "config.explain_component": "配置说明",
     "config.feature_summary": "功能状态概览",
+    "config.indexer_sites_summary": "资源检索站点概览",
     "config.set_feature_state": "功能开关修改",
     "config.set_indexer_sites": "资源检索站点修改",
     "config.safe_policy_summary": "安全策略概览",
@@ -130,6 +132,7 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "library.check_updates": "媒体更新检查",
     "library.missing_media_workflows": "缺集补库进度",
     "library.patrol_status": "缺集巡检状态",
+    "library.patrol_policy": "缺集巡检策略",
     "library.set_patrol_policy": "缺集巡检策略修改",
     "library.search": "媒体库搜索",
     "library.search_missing_episode_resources": "缺集资源搜索",
@@ -170,10 +173,12 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "strm.status": "STRM 同步状态",
     "strm.triage_failures": "STRM 失败分诊",
     "guangya.connection_status": "光鸭连接检查",
+    "guangya.organize.preview": "光鸭整理预检",
     "guangya.organize.schedule_policy": "光鸭定时整理策略",
     "guangya.organize.set_schedule_policy": "光鸭定时整理策略修改",
     "guangya.organize.clean_empty": "光鸭空目录清理",
     "guangya.organize.run_once": "光鸭整理任务",
+    "guangya.organize.status": "光鸭整理状态",
     "guangya.organize.stop": "停止光鸭整理任务",
     "web.search": "网页搜索",
     "workspace.briefing": "系统运行简报",
