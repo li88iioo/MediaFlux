@@ -556,20 +556,29 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             recent_resource_store=store
         )
 
+        messages = (
+            "第三季21集是91集吗？",
+            "第三季21集是不是91集？",
+            "第3季第21集算91集吗？",
+            "第三季21集是91集对不对？",
+            "S03E21是91集吗？",
+        )
         with patch(
             "app.agent.orchestrator.answer_conversation",
             side_effect=AssertionError("可确定的集数关系不应交给模型猜测"),
         ) as conversation:
-            response = service.query(
-                "第三季21集是91集吗？",
-                owner="session-a",
-                present=False,
-            )
+            for message in messages:
+                with self.subTest(message=message):
+                    response = service.query(
+                        message,
+                        owner="session-a",
+                        present=False,
+                    )
+                    self.assertEqual(response["mode"], "conversation")
+                    self.assertIsNone(response["tool_call"])
+                    self.assertIn("第 91 集", response["result"]["summary"])
+                    self.assertIn("季度编号", response["result"]["summary"])
 
-        self.assertEqual(response["mode"], "conversation")
-        self.assertIsNone(response["tool_call"])
-        self.assertIn("第 91 集", response["result"]["summary"])
-        self.assertIn("季度编号", response["result"]["summary"])
         self.assertEqual(preview_calls, [])
         self.assertEqual(execute_calls, [])
         conversation.assert_not_called()

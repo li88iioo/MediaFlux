@@ -101,10 +101,15 @@ def _should_try_contextual_model_first(
     return any(marker in normalized for marker in _LLM_FIRST_CONTEXT_MARKERS)
 
 
+_CONFIRMATION_FALLBACK_NARRATIVE = (
+    "操作尚未执行。预检已完成，请核对下面的影响范围；只有确认后系统才会执行。"
+)
+
+
 def _safe_confirmation_narrative(value: str) -> str:
-    """确认态的执行状态只能由服务端陈述，不能接受模型自由改写。"""
+    """确认态执行状态由服务端固定陈述，模型不能自由改写。"""
     del value
-    return "操作尚未执行。预检已完成，请核对下面的影响范围；只有确认后系统才会执行。"
+    return _CONFIRMATION_FALLBACK_NARRATIVE
 
 
 class AgentInputError(ValueError):
@@ -1136,9 +1141,61 @@ _RSS_REFRESH_REQUEST_PATTERN = re.compile(
 )
 
 
+_RSS_REFRESH_NEGATION_TOKENS = (
+    "不要", "先别", "暂时别", "不必", "无需", "不用",
+    "取消", "停止", "禁止", "勿", "暂不", "先不", "不是", "并非", "并不",
+)
+_RSS_REFRESH_POST_NEGATION_TOKENS = (
+    "不要", "别", "不必", "无需", "不用", "取消", "停止", "禁止", "勿",
+    "暂不", "先不", "不是", "并非", "并不",
+    "不执行", "不确认", "不提交", "不操作", "不继续", "不会",
+)
+
+
+def _is_negated_rss_refresh_message(message: str) -> bool:
+    compact = re.sub(
+        r"[\s，。！？!?、；;：:~～]+",
+        "",
+        unicodedata.normalize("NFKC", str(message or "")).casefold(),
+    )
+    refresh_position = compact.find("刷新")
+    if refresh_position < 0:
+        return False
+
+    for token in _RSS_REFRESH_NEGATION_TOKENS:
+        position = compact.find(token)
+        if 0 <= position < refresh_position and refresh_position - position <= 16:
+            return True
+
+    # 单字“别”仅在动作前独立表达制止时生效，不能误伤“分别/区别/别名”。
+    cursor = 0
+    while True:
+        position = compact.find("别", cursor, refresh_position)
+        if position < 0:
+            break
+        previous_char = compact[position - 1] if position else ""
+        if (
+            previous_char not in {"分", "区", "类", "个"}
+            and not compact.startswith(("别的", "别名"), position)
+            and refresh_position - position <= 10
+        ):
+            return True
+        cursor = position + 1
+
+    # “RSS 订阅不刷新 / 我先不刷新”这类紧邻动作的否定不能被当成写请求。
+    if re.search(
+        r"(?:^|我|我们|现在|暂时|先|rss(?:订阅)?|订阅)(?:先|暂时)?不(?:再)?刷新",
+        compact,
+    ):
+        return True
+
+    suffix = compact[refresh_position + len("刷新"):refresh_position + 24]
+    return any(token in suffix for token in _RSS_REFRESH_POST_NEGATION_TOKENS)
+
+
 def is_rss_subscription_refresh_write_message(message: str) -> bool:
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
-    if is_rss_diagnosis_message(normalized):
+    if is_rss_diagnosis_message(normalized) or _is_negated_rss_refresh_message(normalized):
         return False
     return "刷新" in normalized and "rss" in normalized
 
@@ -3114,10 +3171,16 @@ def _recent_resource_relation_fallback(
 ) -> str:
     """仅在候选标题与搜索目标都明确时确定性回答编号关系。"""
     normalized = unicodedata.normalize("NFKC", str(message or ""))
+    relation = r"(?:是不是|就是|相当于|对应|等于|算(?:是|作)?|是)"
     matched = re.search(
         rf"第?\s*({_HUMAN_NUMBER_TOKEN_RE})\s*季\s*(?:第\s*)?"
-        rf"({_HUMAN_NUMBER_TOKEN_RE})\s*集\s*(?:是|就是|对应|等于|相当于)\s*"
+        rf"({_HUMAN_NUMBER_TOKEN_RE})\s*集\s*{relation}\s*"
         rf"(?:第\s*)?({_HUMAN_NUMBER_TOKEN_RE})\s*集",
+        normalized,
+        re.IGNORECASE,
+    ) or re.search(
+        rf"(?<![A-Za-z0-9])S0*([0-9]{{1,3}})\s*E(?:P)?0*([0-9]{{1,3}})"
+        rf"\s*{relation}\s*(?:第\s*)?({_HUMAN_NUMBER_TOKEN_RE})\s*集",
         normalized,
         re.IGNORECASE,
     )
@@ -5795,7 +5858,10 @@ class AgentOrchestrator:
             return self._invoke_query_read("rss.subscription_summaries", {}, owner=owner)
         if normalized in {"近24小时下载几次", "近24小时下载了几次", "24小时下载几次"}:
             return self._invoke_query_read("rss.recent_activity", {}, owner=owner)
-        if normalized in {"全部刷新", "刷新全部", "刷新全部rss订阅", "全部rss订阅刷新"}:
+        if re.fullmatch(
+            r"(?:(?:全部|所有)(?:rss)?(?:订阅)?刷新|刷新(?:一下)?(?:全部|所有)(?:rss)?(?:订阅)?)",
+            normalized,
+        ):
             return self._prepare_all_rss_refresh(owner=owner)
         if normalized in {"刷新", "刷新一下", "再刷新", "再刷新一下", "继续刷新"}:
             return self._prepare_contextual_rss_refresh(owner=owner)
@@ -5821,7 +5887,9 @@ class AgentOrchestrator:
             return self._prepare_contextual_rss_refresh(owner=owner)
         named = re.fullmatch(r"刷新(?:一下)?(.+?)(?:rss)?(?:订阅)?", normalized)
         if named:
-            name = named.group(1).strip()
+            name = _clean_rss_named_target(named.group(1))
+            if name is None:
+                return self._prepare_contextual_rss_refresh(owner=owner)
             resolution = resolve_rss_subscription_name(name)
             if resolution.status == "resolved" and resolution.subscription_id is not None:
                 if not owner:
@@ -6030,6 +6098,18 @@ class AgentOrchestrator:
                 return self._present_tool_response(
                     message, response, owner=llm_rate_owner or owner
                 )
+            previous_tool = str(
+                _latest_assistant_tool_context(conversation_context).get("tool_name") or ""
+            ).strip()
+            if (
+                _is_negated_rss_refresh_message(message)
+                and (
+                    "rss" in message.casefold()
+                    or "订阅" in message
+                    or previous_tool.startswith("rss.")
+                )
+            ):
+                return self._conversation_response("好，不会刷新 RSS 订阅。")
             rss_contextual = self._rss_context_followup(
                 message,
                 owner=owner,

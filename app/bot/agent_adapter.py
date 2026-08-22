@@ -15,6 +15,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -1861,6 +1862,71 @@ def _telegram_agent_trace_details(
     return "\n".join(lines)
 
 
+def _telegram_compact_visible_text(value: str) -> str:
+    plain = html.unescape(re.sub(r"<[^>]+>", " ", str(value or "")))
+    return re.sub(r"[^0-9a-z\u3400-\u4dbf\u4e00-\u9fff]+", "", plain.casefold())
+
+
+_TELEGRAM_GUIDANCE_ADVISORY_MARKERS = (
+    "你可以", "可以", "可稍后", "建议", "不妨", "直接", "回复",
+)
+_TELEGRAM_GUIDANCE_NEGATING_MARKERS = (
+    "不要", "不建议", "不可以", "不能", "不必", "无需", "无须", "别",
+    "并非", "并不", "不是", "可以不", "可以先不", "可先不", "暂时不", "先不",
+)
+
+
+def _telegram_guidance_context_text(value: str) -> str:
+    plain = unicodedata.normalize(
+        "NFKC", html.unescape(re.sub(r"<[^>]+>", " ", str(value or "")))
+    ).casefold()
+    clauses = re.sub(r"[。！？!?；;\n\r]+", "|", plain)
+    return re.sub(r"[^0-9a-z\u3400-\u4dbf\u4e00-\u9fff|]+", "", clauses)
+
+
+def _telegram_guidance_already_advised(candidate: str, visible: str) -> bool:
+    """只把同一分句中的肯定建议视为重复；否定和执行记录必须保留 guidance。"""
+    cursor = 0
+    while True:
+        position = visible.find(candidate, cursor)
+        if position < 0:
+            return False
+        clause_start = visible.rfind("|", 0, position) + 1
+        prefix = visible[max(clause_start, position - 32):position]
+        has_advisory = (
+            prefix.endswith("请")
+            or any(marker in prefix for marker in _TELEGRAM_GUIDANCE_ADVISORY_MARKERS)
+        )
+        if has_advisory and not any(
+            marker in prefix for marker in _TELEGRAM_GUIDANCE_NEGATING_MARKERS
+        ):
+            return True
+        cursor = position + 1
+
+
+def _telegram_nonredundant_guidance(
+    guidance: list[dict[str, str]], *, visible_html: str
+) -> list[dict[str, str]]:
+    """正文已经明确建议过的下一步不再重复追加成模板栏目。"""
+    visible = _telegram_guidance_context_text(visible_html)
+    if not visible:
+        return guidance
+    projected: list[dict[str, str]] = []
+    for item in guidance:
+        candidates = (
+            _telegram_compact_visible_text(item.get("label", "")),
+            _telegram_compact_visible_text(item.get("prompt", "")),
+        )
+        if any(
+            len(candidate) >= 4
+            and _telegram_guidance_already_advised(candidate, visible)
+            for candidate in candidates
+        ):
+            continue
+        projected.append(item)
+    return projected
+
+
 def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
     """将 Agent 回复排成自然短段落，避免重复栏目和内部诊断细节。"""
     payload = response if isinstance(response, dict) else {}
@@ -1923,7 +1989,7 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
     else:
         lines = [body]
 
-    if payload.get("mode") == "read_plan":
+    if payload.get("mode") == "read_plan" and not trace_details:
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
         steps = data.get("steps") if isinstance(data.get("steps"), list) else []
         safe_steps = []
@@ -1947,7 +2013,9 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
                 *safe_steps,
             ])
 
-    guidance = _telegram_guidance(payload)
+    guidance = _telegram_nonredundant_guidance(
+        _telegram_guidance(payload), visible_html="\n".join(lines)
+    )
     show_guidance = (
         status in {
             "clarification_required", "selection_required", "partial", "incomplete", "degraded",

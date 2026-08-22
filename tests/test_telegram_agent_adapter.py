@@ -891,6 +891,169 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("/volume/private", text)
         self.assertNotIn("secret.invalid", text)
 
+    def test_narrative_does_not_duplicate_trace_and_read_plan_sections(self):
+        text = render_agent_response({
+            "mode": "read_plan",
+            "result": {
+                "ok": False,
+                "status": "partial",
+                "summary": "部分检查失败",
+                "suggestions": [],
+                "data": {
+                    "steps": [{
+                        "tool_name": "strm.status",
+                        "result": {"ok": False, "summary": "STRM 暂时不可用。"},
+                    }],
+                },
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "下载队列正常，但 STRM 暂时无法完成检查。",
+            },
+            "agent_trace": [{
+                "label": "STRM 状态",
+                "ok": False,
+                "summary": "STRM 暂时不可用。",
+            }],
+        })
+
+        self.assertEqual(text.count("STRM 状态"), 1)
+        self.assertEqual(text.count("<b>需要留意</b>"), 1)
+        self.assertNotIn("<b>检查步骤</b>", text)
+
+    def test_narrative_omits_guidance_already_stated_in_body(self):
+        text = render_agent_response({
+            "mode": "read_plan",
+            "result": {
+                "ok": False,
+                "status": "partial",
+                "summary": "部分检查失败",
+                "suggestions": ["重新检查 RSS 订阅"],
+                "data": {"steps": []},
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "RSS 暂时无法完成检查，你可以稍后重新检查 RSS 订阅。",
+            },
+        })
+
+        self.assertIn("重新检查 RSS 订阅", text)
+        self.assertNotIn("<b>接下来可以</b>", text)
+
+    def test_narrative_statement_does_not_hide_retry_guidance(self):
+        text = render_agent_response({
+            "mode": "read_plan",
+            "result": {
+                "ok": False,
+                "status": "partial",
+                "summary": "部分检查失败",
+                "suggestions": ["重新检查 RSS 订阅"],
+                "data": {"steps": []},
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "本次重新检查 RSS 订阅仍然失败。",
+            },
+        })
+
+        self.assertIn("<b>接下来可以</b>", text)
+        self.assertEqual(text.count("重新检查 RSS 订阅"), 2)
+
+    def test_narrative_multi_step_advice_omits_duplicate_guidance(self):
+        text = render_agent_response({
+            "mode": "read_plan",
+            "result": {
+                "ok": False,
+                "status": "partial",
+                "summary": "部分检查失败",
+                "suggestions": ["重新检查 RSS 订阅"],
+                "data": {"steps": []},
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "RSS 暂时不可用。你可以先查看失败详情，再重新检查 RSS 订阅。",
+            },
+        })
+
+        self.assertIn("重新检查 RSS 订阅", text)
+        self.assertNotIn("<b>接下来可以</b>", text)
+
+    def test_narrative_negation_does_not_hide_retry_guidance(self):
+        text = render_agent_response({
+            "mode": "read_plan",
+            "result": {
+                "ok": False,
+                "status": "partial",
+                "summary": "部分检查失败",
+                "suggestions": ["重新检查 RSS 订阅"],
+                "data": {"steps": []},
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "不要重新检查 RSS 订阅；当前信息可能还不完整。",
+            },
+        })
+
+        self.assertIn("<b>接下来可以</b>", text)
+        self.assertEqual(text.count("重新检查 RSS 订阅"), 2)
+
+    def test_narrative_indirect_negation_does_not_hide_retry_guidance(self):
+        for narrative in (
+            "并非建议重新检查 RSS 订阅；当前信息可能还不完整。",
+            "并不建议重新检查 RSS 订阅；当前信息可能还不完整。",
+            "这不是建议重新检查 RSS 订阅，只是在复述失败动作。",
+        ):
+            with self.subTest(narrative=narrative):
+                text = render_agent_response({
+                    "mode": "read_plan",
+                    "result": {
+                        "ok": False,
+                        "status": "partial",
+                        "summary": "部分检查失败",
+                        "suggestions": ["重新检查 RSS 订阅"],
+                        "data": {"steps": []},
+                    },
+                    "presentation": {
+                        "source": "llm",
+                        "kind": "narrative",
+                        "narrative": narrative,
+                    },
+                })
+
+                self.assertIn("<b>接下来可以</b>", text)
+                self.assertEqual(text.count("重新检查 RSS 订阅"), 2)
+
+    def test_narrative_optional_negation_does_not_hide_retry_guidance(self):
+        for narrative in (
+            "当前可以不重新检查 RSS 订阅，先等待服务恢复。",
+            "当前可以先不重新检查 RSS 订阅，先等待服务恢复。",
+            "当前可先不重新检查 RSS 订阅，先等待服务恢复。",
+        ):
+            with self.subTest(narrative=narrative):
+                text = render_agent_response({
+                    "mode": "read_plan",
+                    "result": {
+                        "ok": False,
+                        "status": "partial",
+                        "summary": "部分检查失败",
+                        "suggestions": ["重新检查 RSS 订阅"],
+                        "data": {"steps": []},
+                    },
+                    "presentation": {
+                        "source": "llm",
+                        "kind": "narrative",
+                        "narrative": narrative,
+                    },
+                })
+
+                self.assertIn("<b>接下来可以</b>", text)
+                self.assertEqual(text.count("重新检查 RSS 订阅"), 2)
+
     def test_failed_narrative_keeps_actionable_guidance(self):
         text = render_agent_response({
             "mode": "read_plan",

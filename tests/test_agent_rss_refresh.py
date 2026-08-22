@@ -86,6 +86,24 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         ):
             self.assertIsNone(rss_subscription_refresh_request(message))
         self.assertTrue(is_rss_subscription_refresh_write_message("刷新 RSS 订阅"))
+        for negated in (
+            "不要刷新所有 RSS 订阅",
+            "别刷新全部 RSS 订阅",
+            "无需手动刷新 RSS",
+            "取消 RSS 自动刷新",
+            "RSS 订阅不刷新",
+            "RSS 订阅先不刷新",
+            "刷新 RSS 订阅请不要执行",
+            "刷新 RSS 订阅吧，不要",
+            "不是刷新 RSS 订阅",
+            "并非刷新 RSS 订阅",
+            "并不刷新 RSS 订阅",
+            "请刷新 RSS 订阅，但不是现在",
+            "刷新 RSS 订阅不是要执行",
+        ):
+            with self.subTest(negated=negated):
+                self.assertFalse(is_rss_subscription_refresh_write_message(negated))
+        self.assertTrue(is_rss_subscription_refresh_write_message("请分别刷新 RSS 订阅"))
         self.assertEqual(rss_subscription_refresh_name("刷新 Mikan RSS 订阅"), "Mikan")
         self.assertEqual(rss_subscription_refresh_name("刷新 RSS Mikan"), "Mikan")
         self.assertEqual(rss_subscription_refresh_name("刷新一下《Mikan》RSS"), "Mikan")
@@ -97,6 +115,59 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         routed = get_agent_service().query(diagnosis, owner="owner")
         self.assertEqual(routed["tool_call"]["name"], "rss.diagnose")
 
+    def test_negated_refresh_never_creates_confirmation(self):
+        context = [{
+            "role": "assistant",
+            "text": "当前已列出 RSS 订阅。",
+            "tool_name": "rss.subscription_summaries",
+            "status": "completed",
+        }]
+        for index, message in enumerate((
+            "不要刷新所有 RSS 订阅",
+            "别刷新全部订阅",
+            "无需手动刷新 RSS",
+            "取消 RSS 自动刷新",
+            "RSS 订阅不刷新",
+            "RSS 订阅先不刷新",
+            "刷新 RSS 订阅请不要执行",
+            "刷新 RSS 订阅吧，不要",
+            "不是刷新 RSS 订阅",
+            "并非刷新 RSS 订阅",
+            "并不刷新 RSS 订阅",
+            "请刷新 RSS 订阅，但不是现在",
+            "刷新 RSS 订阅不是要执行",
+        )):
+            with self.subTest(message=message), patch.object(RSSEngine, "refresh") as refresh:
+                response = get_agent_service().query(
+                    message,
+                    owner=f"owner-negated-{index}",
+                    conversation_context=context,
+                    present=False,
+                )
+
+            refresh.assert_not_called()
+            self.assertEqual(response["mode"], "conversation")
+            self.assertIsNone(response["tool_call"])
+            self.assertIn("不会刷新 RSS", response["result"]["summary"])
+
+    def test_zero_width_rss_scope_is_rejected_before_routing(self):
+        with patch.object(RSSEngine, "refresh") as refresh, self.assertRaises(ValueError):
+            get_agent_service().query(
+                "刷新全\u200b部 RSS 订阅", owner="owner", present=False
+            )
+        refresh.assert_not_called()
+
+    def test_separate_refresh_wording_is_not_mistaken_for_negation(self):
+        with patch.object(RSSEngine, "refresh") as refresh:
+            prepared = get_agent_service().query(
+                "请分别刷新 RSS 订阅", owner="owner", present=False
+            )
+
+        refresh.assert_not_called()
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
+        self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
+
     def test_unique_disabled_subscription_can_still_be_manually_refreshed(self):
         db.update_rss_subscription(self.sid, {"enabled": False})
 
@@ -107,6 +178,54 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
         self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
+
+    def test_generic_refresh_one_continues_recent_rss_topic(self):
+        db.update_rss_subscription(self.sid, {"enabled": False})
+
+        prepared = get_agent_service().query(
+            "刷新一个",
+            owner="owner",
+            conversation_context=[{
+                "role": "assistant",
+                "text": "当前有一个 RSS 订阅，可以继续手动刷新。",
+                "tool_name": "rss.subscription_summaries",
+                "status": "completed",
+            }],
+            present=False,
+        )
+
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscription")
+        self.assertEqual(prepared["result"]["data"]["subscription_id"], self.sid)
+
+    def test_contextual_refresh_all_variants_keep_bulk_scope(self):
+        db.add_rss_subscription("Second RSS", "https://second.invalid/rss")
+        context = [{
+            "role": "assistant",
+            "text": "当前已列出 RSS 订阅。",
+            "tool_name": "rss.subscription_summaries",
+            "status": "completed",
+        }]
+
+        for index, message in enumerate((
+            "刷新全部订阅",
+            "刷新所有 RSS 订阅",
+            "刷新所有",
+            "所有 RSS 订阅刷新",
+        )):
+            with self.subTest(message=message), patch.object(RSSEngine, "refresh") as refresh:
+                prepared = get_agent_service().query(
+                    message,
+                    owner=f"owner-{index}",
+                    conversation_context=context,
+                    present=False,
+                )
+
+            refresh.assert_not_called()
+            self.assertEqual(prepared["mode"], "confirmation_required")
+            self.assertEqual(prepared["tool_call"]["name"], "rss.refresh_subscriptions")
+            self.assertEqual(prepared["result"]["data"]["scope"], "all_configured")
+            self.assertEqual(prepared["result"]["data"]["subscription_count"], 2)
 
     def test_disabled_state_correction_continues_recent_rss_refresh_intent(self):
         db.update_rss_subscription(self.sid, {"enabled": False})

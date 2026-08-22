@@ -2707,11 +2707,16 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
     def test_confirmation_narrative_never_trusts_model_execution_wording(self):
         expected = "操作尚未执行。预检已完成，请核对下面的影响范围；只有确认后系统才会执行。"
         for claim in (
+            "安全自然说明，尚未执行。",
             "尚未执行，但刷新完成。",
             "预检完成，刷新已成功。",
             "尚未执行，操作完成。",
             "待确认，但已经成功执行。",
             "未执行但已刷新。",
+            "尚未执行，但该操作已生效。",
+            "待确认，不过任务已落地。",
+            "尚未执行；RSS 已\u200b刷新，新增条目已经落库。",
+            "尚未执行；The RSS refresh already ran.",
         ):
             with self.subTest(claim=claim):
                 self.assertEqual(_safe_confirmation_narrative(claim), expected)
