@@ -1251,6 +1251,45 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(sources[1], payload["MediaSources"][1])
         self.assertEqual(_FakeAsyncClient.requests[0].url.path, "/emby/Items/item-emby/PlaybackInfo")
 
+    def test_post_playback_info_body_is_forwarded_and_response_is_rewritten(self):
+        payload = {
+            "MediaSources": [
+                {"Id": "cloud", "Path": "/playgy/file-post/e/1/a.mkv"}
+            ]
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        request_body = {"DeviceProfile": {"Name": "Integration Client"}}
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/item-post/PlaybackInfo?api_key=client-token",
+                json=request_body,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        direct_url = response.json()["MediaSources"][0]["DirectStreamUrl"]
+        self.assertEqual(urlsplit(direct_url).path, "/Videos/item-post/stream")
+        self.assertEqual(_FakeAsyncClient.requests[0].method, "POST")
+        self.assertEqual(
+            json.loads(_FakeAsyncClient.requests[0].content), request_body
+        )
+
     def test_playback_info_and_rewritten_stream_share_one_recording_session(self):
         class Raw:
             token = "provider-secret"
@@ -1480,6 +1519,78 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(captured[-1]["media_item_id"], "browser-item")
         self.assertEqual(captured[-1]["media_source_id"], "cloud")
         self.assertEqual(captured[-1]["guangya_file_id"], "browser-file")
+        authorize.assert_not_awaited()
+
+    def test_active_long_playback_renews_authorization_without_proxying_media(self):
+        now = [100.0]
+        sessions = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=3600,
+            capability_ttl_seconds=900,
+            capability_max_ttl_seconds=7200,
+            clock=lambda: now[0],
+        )
+        mappings = media_proxy.DynamicGuangYaMappings(
+            ttl_seconds=900,
+            max_ttl_seconds=7200,
+            clock=lambda: now[0],
+        )
+        scopes = media_proxy.ItemLevelBindingScopes(
+            ttl_seconds=900,
+            max_ttl_seconds=7200,
+            clock=lambda: now[0],
+        )
+        grants = media_proxy.PlaybackGrantRegistry(
+            ttl_seconds=900,
+            max_ttl_seconds=7200,
+            clock=lambda: now[0],
+        )
+        payload = {
+            "MediaSources": [
+                {"Id": "cloud", "Path": "/playgy/long-file/e/1/a.mkv"}
+            ]
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        authorize = AsyncMock(return_value=False)
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch.object(media_proxy, "_playback_sessions", sessions),
+            patch.object(media_proxy, "_dynamic_guangya_mappings", mappings),
+            patch.object(media_proxy, "_item_level_binding_scopes", scopes),
+            patch.object(media_proxy, "_playback_grants", grants),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy._client_is_authorized", new=authorize),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.get(
+                "/Items/long-item/PlaybackInfo?api_key=client-token"
+            )
+            direct_url = playback.json()["MediaSources"][0]["DirectStreamUrl"]
+            now[0] = 999.0
+            first = client.get(direct_url, follow_redirects=False)
+            now[0] = 1800.0
+            second = client.head(direct_url, follow_redirects=False)
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(first.status_code, 302)
+        self.assertEqual(second.status_code, 302)
+        self.assertEqual(first.headers["location"], "https://signed.invalid/long-file")
+        self.assertEqual(second.headers["location"], first.headers["location"])
+        self.assertEqual(second.content, b"")
+        self.assertEqual(len(_FakeAsyncClient.requests), 1)
         authorize.assert_not_awaited()
 
     def test_client_supplied_mfps_cannot_mint_browser_capability(self):
@@ -1725,15 +1836,25 @@ class HybridMediaProxyTests(unittest.TestCase):
                 f"{sources[0]['DirectStreamUrl']}&MediaSourceId=",
                 follow_redirects=False,
             )
+            duplicated_same = client.get(
+                f"{sources[0]['DirectStreamUrl']}&MediaSourceId=source-a",
+                follow_redirects=False,
+            )
             accepted = client.get(sources[0]["DirectStreamUrl"], follow_redirects=False)
+            accepted_second = client.head(
+                sources[1]["DirectStreamUrl"], follow_redirects=False
+            )
 
         self.assertEqual(source_a_query["_mfps"], source_b_query["_mfps"])
         self.assertNotEqual(source_a_query["_mfss"], source_b_query["_mfss"])
         self.assertEqual(mutated.status_code, 401)
         self.assertEqual(duplicated.status_code, 400)
         self.assertEqual(duplicated_empty.status_code, 400)
+        self.assertEqual(duplicated_same.status_code, 302)
         self.assertEqual(accepted.status_code, 302)
-        self.assertEqual(_FakeGuangYaClient.calls, ["file-a"])
+        self.assertEqual(accepted_second.status_code, 302)
+        self.assertEqual(accepted_second.content, b"")
+        self.assertEqual(_FakeGuangYaClient.calls, ["file-a", "file-b"])
         authorize.assert_not_awaited()
         self.assertEqual(len(_FakeAsyncClient.requests), 1)
 

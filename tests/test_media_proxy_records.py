@@ -17,6 +17,7 @@ from app import database as db
 from app.config import web_credentials
 from app.main import create_app
 from app.modules import media_proxy
+from app.modules.media_proxy_safety import safe_media_name
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -263,7 +264,9 @@ class PlaybackSessionRegistryTests(unittest.TestCase):
     def test_repeated_capabilities_share_upstream_session_and_expire_independently(self):
         now = [100.0]
         registry = media_proxy.PlaybackSessionRegistry(
-            capability_ttl_seconds=900, clock=lambda: now[0]
+            capability_ttl_seconds=900,
+            capability_max_ttl_seconds=950,
+            clock=lambda: now[0],
         )
         first = registry.finalize_capability(
             "scope",
@@ -300,7 +303,7 @@ class PlaybackSessionRegistryTests(unittest.TestCase):
             first,
         )
 
-        now[0] = 1001.0
+        now[0] = 1051.0
         self.assertIsNone(
             registry.resolve_capability(
                 7,
@@ -388,19 +391,20 @@ class PlaybackSessionRegistryTests(unittest.TestCase):
             )
         )
 
-    def test_server_capability_has_absolute_authorization_ttl(self):
+    def test_server_capability_expires_after_idle_timeout(self):
         now = [100.0]
         registry = media_proxy.PlaybackSessionRegistry(
             ttl_seconds=1800,
             capability_ttl_seconds=900,
+            capability_max_ttl_seconds=3600,
             clock=lambda: now[0],
         )
         entry = registry.begin(
             "scope", 7, item_id="item-1", server_capability=True
         )
 
-        now[0] = 999.0
-        self.assertIs(
+        now[0] = 1001.0
+        self.assertIsNone(
             registry.resolve_capability(
                 7,
                 entry.token,
@@ -408,9 +412,58 @@ class PlaybackSessionRegistryTests(unittest.TestCase):
                 source_id="source-1",
                 source_signature=self._source_signature(entry.token),
             ),
-            entry,
         )
-        now[0] = 1001.0
+
+    def test_server_capability_renews_while_playback_remains_active(self):
+        now = [100.0]
+        registry = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=3600,
+            capability_ttl_seconds=900,
+            capability_max_ttl_seconds=3600,
+            clock=lambda: now[0],
+        )
+        entry = registry.begin(
+            "scope", 7, item_id="item-1", server_capability=True
+        )
+
+        for timestamp in (999.0, 1800.0, 2600.0):
+            now[0] = timestamp
+            self.assertIs(
+                registry.resolve_capability(
+                    7,
+                    entry.token,
+                    item_id="item-1",
+                    source_id="source-1",
+                    source_signature=self._source_signature(entry.token),
+                ),
+                entry,
+            )
+
+    def test_server_capability_never_exceeds_absolute_authorization_ttl(self):
+        now = [100.0]
+        registry = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=5000,
+            capability_ttl_seconds=900,
+            capability_max_ttl_seconds=1800,
+            clock=lambda: now[0],
+        )
+        entry = registry.begin(
+            "scope", 7, item_id="item-1", server_capability=True
+        )
+
+        for timestamp in (999.0, 1799.0, 1899.0):
+            now[0] = timestamp
+            self.assertIs(
+                registry.resolve_capability(
+                    7,
+                    entry.token,
+                    item_id="item-1",
+                    source_id="source-1",
+                    source_signature=self._source_signature(entry.token),
+                ),
+                entry,
+            )
+        now[0] = 1901.0
         self.assertIsNone(
             registry.resolve_capability(
                 7,
@@ -500,6 +553,96 @@ class PlaybackSessionRegistryTests(unittest.TestCase):
         self.assertEqual(len(key), 48)
         self.assertNotIn("auth-scope-secret", key)
         self.assertNotIn("play-session-secret", key)
+
+
+class PlaybackAuthorizationLeaseTests(unittest.TestCase):
+    def test_dynamic_mapping_renews_until_absolute_limit(self):
+        now = [0.0]
+        mappings = media_proxy.DynamicGuangYaMappings(
+            ttl_seconds=10,
+            max_ttl_seconds=25,
+            clock=lambda: now[0],
+        )
+        mappings.register(7, "item", "source", "file")
+
+        for timestamp in (9.0, 18.0, 24.0):
+            now[0] = timestamp
+            self.assertEqual(mappings.get(7, "item", "source"), "file")
+        now[0] = 26.0
+        self.assertIsNone(mappings.get(7, "item", "source"))
+
+    def test_item_binding_scope_renews_until_absolute_limit(self):
+        now = [0.0]
+        scopes = media_proxy.ItemLevelBindingScopes(
+            ttl_seconds=10,
+            max_ttl_seconds=25,
+            clock=lambda: now[0],
+        )
+        scopes.register(7, "item", "source", "binding", "scope")
+
+        for timestamp in (9.0, 18.0, 24.0):
+            now[0] = timestamp
+            self.assertTrue(
+                scopes.matches(7, "item", "source", "binding", "scope")
+            )
+        now[0] = 26.0
+        self.assertFalse(
+            scopes.matches(7, "item", "source", "binding", "scope")
+        )
+
+    def test_playback_grant_renews_until_absolute_limit(self):
+        now = [0.0]
+        grants = media_proxy.PlaybackGrantRegistry(
+            ttl_seconds=10,
+            max_ttl_seconds=25,
+            clock=lambda: now[0],
+        )
+        grants.register(
+            "scope",
+            7,
+            "item",
+            "source",
+            source_type="guangya",
+            file_id="file",
+        )
+
+        for timestamp in (9.0, 18.0, 24.0):
+            now[0] = timestamp
+            self.assertTrue(grants.allows_file("scope", 7, "file"))
+        now[0] = 26.0
+        self.assertFalse(grants.allows_file("scope", 7, "file"))
+
+
+class SafeMediaNameTests(unittest.TestCase):
+    def test_human_titles_with_colons_or_slashes_are_not_treated_as_uris(self):
+        for title in (
+            "Re:Zero",
+            "Cyberpunk:Edgerunners",
+            "Face/Off",
+            "Fate/stay night",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(safe_media_name(title), title)
+
+    def test_explicit_paths_and_unsafe_opaque_uris_remain_redacted(self):
+        self.assertEqual(
+            safe_media_name(
+                "https://user:password@example.invalid/private/Movie.mkv"
+                "?api_key=secret"
+            ),
+            "Movie.mkv",
+        )
+        self.assertEqual(
+            safe_media_name("custom:/private/library/Movie.mkv"),
+            "Movie.mkv",
+        )
+        for value in (
+            "web+foo:user:password@example.invalid",
+            "javascript:alert(document.cookie)",
+            "data:text/plain,secret",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(safe_media_name(value), "")
 
 
 class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):

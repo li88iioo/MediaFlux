@@ -59,6 +59,7 @@ _BLOCKED_METADATA_IPS = {
 _PLAYBACK_SESSION_QUERY_KEY = "_mfps"
 _PLAYBACK_SOURCE_QUERY_KEY = "_mfss"
 _PLAYBACK_AUTHORIZATION_TTL_SECONDS = 15 * 60
+_PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS = 12 * 60 * 60
 _SENSITIVE_QUERY_KEYS = {
     "api_key", "x-emby-token", "x-mediabrowser-token",
     _PLAYBACK_SESSION_QUERY_KEY, _PLAYBACK_SOURCE_QUERY_KEY,
@@ -229,10 +230,11 @@ def _resolved_instance(instance_id: int) -> dict[str, Any] | None:
     return resolve_proxy_instance(row)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _DynamicGuangYaMapping:
     file_id: str
     expires_at: float
+    max_expires_at: float
 
 
 class DynamicGuangYaMappings:
@@ -241,10 +243,14 @@ class DynamicGuangYaMappings:
     def __init__(
         self,
         ttl_seconds: float = _PLAYBACK_AUTHORIZATION_TTL_SECONDS,
+        max_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         max_entries: int = 4096,
     ) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_ttl_seconds = max(
+            self._ttl_seconds, float(max_ttl_seconds)
+        )
         self._clock = clock
         self._max_entries = max(1, int(max_entries))
         self._entries: OrderedDict[
@@ -271,6 +277,7 @@ class DynamicGuangYaMappings:
             self._entries[key] = _DynamicGuangYaMapping(
                 file_id=normalized_file,
                 expires_at=now + self._ttl_seconds,
+                max_expires_at=now + self._max_ttl_seconds,
             )
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
@@ -278,10 +285,22 @@ class DynamicGuangYaMappings:
     def _prune_expired_locked(self, now: float) -> None:
         expired = [
             key for key, entry in self._entries.items()
-            if entry.expires_at <= now
+            if entry.expires_at <= now or entry.max_expires_at <= now
         ]
         for key in expired:
             self._entries.pop(key, None)
+
+    def _touch_locked(
+        self,
+        key: tuple[int, str, str],
+        entry: _DynamicGuangYaMapping,
+        now: float,
+    ) -> _DynamicGuangYaMapping:
+        entry.expires_at = min(
+            entry.max_expires_at, now + self._ttl_seconds
+        )
+        self._entries.move_to_end(key)
+        return entry
 
     def get(self, instance_id: int, item_id: str, source_id: str = "") -> str | None:
         now = self._clock()
@@ -294,8 +313,7 @@ class DynamicGuangYaMappings:
                 key = (instance_key, item_key, source_key)
                 entry = self._entries.get(key)
                 if entry:
-                    self._entries.move_to_end(key)
-                    return entry.file_id
+                    return self._touch_locked(key, entry, now).file_id
                 return None
 
             matching = [
@@ -306,7 +324,9 @@ class DynamicGuangYaMappings:
             candidates = {file_id for _, file_id in matching}
             if len(candidates) == 1:
                 for key, _ in matching:
-                    self._entries.move_to_end(key)
+                    entry = self._entries.get(key)
+                    if entry is not None:
+                        self._touch_locked(key, entry, now)
                 return next(iter(candidates))
             return None
 
@@ -572,10 +592,11 @@ class SignedUrlCacheResult:
     cache_hit: bool
 
 
-@dataclass(frozen=True)
+@dataclass
 class _ItemBindingScope:
     binding_signature: str
     expires_at: float
+    max_expires_at: float
 
 
 class ItemLevelBindingScopes:
@@ -584,10 +605,14 @@ class ItemLevelBindingScopes:
     def __init__(
         self,
         ttl_seconds: float = _PLAYBACK_AUTHORIZATION_TTL_SECONDS,
+        max_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         max_entries: int = 4096,
     ) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_ttl_seconds = max(
+            self._ttl_seconds, float(max_ttl_seconds)
+        )
         self._clock = clock
         self._max_entries = max(1, int(max_entries))
         self._entries: OrderedDict[
@@ -598,10 +623,21 @@ class ItemLevelBindingScopes:
     def _prune_expired_locked(self, now: float) -> None:
         expired = [
             key for key, entry in self._entries.items()
-            if entry.expires_at <= now
+            if entry.expires_at <= now or entry.max_expires_at <= now
         ]
         for key in expired:
             self._entries.pop(key, None)
+
+    def _touch_locked(
+        self,
+        key: tuple[str, int, str, str],
+        entry: _ItemBindingScope,
+        now: float,
+    ) -> None:
+        entry.expires_at = min(
+            entry.max_expires_at, now + self._ttl_seconds
+        )
+        self._entries.move_to_end(key)
 
     def register(
         self,
@@ -619,6 +655,7 @@ class ItemLevelBindingScopes:
             self._entries[key] = _ItemBindingScope(
                 binding_signature=str(binding_signature),
                 expires_at=now + self._ttl_seconds,
+                max_expires_at=now + self._max_ttl_seconds,
             )
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
@@ -633,10 +670,11 @@ class ItemLevelBindingScopes:
     ) -> bool:
         key = (str(auth_scope or ""), int(instance_id), str(item_id or ""), str(source_id or ""))
         with self._lock:
-            self._prune_expired_locked(self._clock())
+            now = self._clock()
+            self._prune_expired_locked(now)
             entry = self._entries.get(key)
             if entry and entry.binding_signature == str(binding_signature):
-                self._entries.move_to_end(key)
+                self._touch_locked(key, entry, now)
                 return True
             return False
 
@@ -648,7 +686,8 @@ class ItemLevelBindingScopes:
         auth_scope: str = "",
     ) -> bool:
         with self._lock:
-            self._prune_expired_locked(self._clock())
+            now = self._clock()
+            self._prune_expired_locked(now)
             matches = [
                 key for key, entry in self._entries.items()
                 if key[0] == str(auth_scope or "")
@@ -657,7 +696,10 @@ class ItemLevelBindingScopes:
                 and entry.binding_signature == str(binding_signature)
             ]
             if len(matches) == 1:
-                self._entries.move_to_end(matches[0])
+                key = matches[0]
+                entry = self._entries.get(key)
+                if entry is not None:
+                    self._touch_locked(key, entry, now)
                 return True
             return False
 
@@ -669,29 +711,48 @@ class ItemLevelBindingScopes:
 _dynamic_guangya_mappings = DynamicGuangYaMappings()
 _item_level_binding_scopes = ItemLevelBindingScopes()
 
-@dataclass(frozen=True)
+@dataclass
 class _PlaybackGrant:
     source_type: str
     file_id: str
     binding_signature: str
     expires_at: float
+    max_expires_at: float
 
 
 class PlaybackGrantRegistry:
     """按不可逆认证 scope 隔离的短时播放授权；不保存原始凭据。"""
 
     def __init__(self, ttl_seconds: float = _PLAYBACK_AUTHORIZATION_TTL_SECONDS,
+                 max_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS,
                  max_entries: int = 8192,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_ttl_seconds = max(
+            self._ttl_seconds, float(max_ttl_seconds)
+        )
         self._max_entries = max(1, int(max_entries))
         self._clock = clock
         self._entries: OrderedDict[tuple[str, int, str, str], _PlaybackGrant] = OrderedDict()
         self._lock = threading.RLock()
 
     def _prune_locked(self, now: float) -> None:
-        for key in [key for key, value in self._entries.items() if value.expires_at <= now]:
+        for key in [
+            key for key, value in self._entries.items()
+            if value.expires_at <= now or value.max_expires_at <= now
+        ]:
             self._entries.pop(key, None)
+
+    def _touch_locked(
+        self,
+        key: tuple[str, int, str, str],
+        grant: _PlaybackGrant,
+        now: float,
+    ) -> None:
+        grant.expires_at = min(
+            grant.max_expires_at, now + self._ttl_seconds
+        )
+        self._entries.move_to_end(key)
 
     def register(self, auth_scope: str, instance_id: int, item_id: str, source_id: str,
                  *, source_type: str, file_id: str = "", binding_signature: str = "") -> None:
@@ -700,8 +761,13 @@ class PlaybackGrantRegistry:
         key = (auth_scope, int(instance_id), str(item_id or ""), str(source_id or ""))
         with self._lock:
             now = self._clock(); self._prune_locked(now); self._entries.pop(key, None)
-            self._entries[key] = _PlaybackGrant(str(source_type), str(file_id or ""),
-                                                str(binding_signature or ""), now + self._ttl_seconds)
+            self._entries[key] = _PlaybackGrant(
+                str(source_type),
+                str(file_id or ""),
+                str(binding_signature or ""),
+                now + self._ttl_seconds,
+                now + self._max_ttl_seconds,
+            )
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
 
@@ -710,7 +776,8 @@ class PlaybackGrantRegistry:
         if not auth_scope:
             return False
         with self._lock:
-            self._prune_locked(self._clock())
+            now = self._clock()
+            self._prune_locked(now)
             keys = [(auth_scope, int(instance_id), str(item_id or ""), str(source_id or ""))]
             if not source_id:
                 keys = [key for key in self._entries if key[:3] == (auth_scope, int(instance_id), str(item_id or ""))]
@@ -722,16 +789,29 @@ class PlaybackGrantRegistry:
                 if binding_signature and grant.binding_signature != str(binding_signature): continue
                 matches.append(key)
             if len(matches) == 1:
-                self._entries.move_to_end(matches[0]); return True
+                key = matches[0]
+                grant = self._entries.get(key)
+                if grant is not None:
+                    self._touch_locked(key, grant, now)
+                return True
             return False
 
     def allows_file(self, auth_scope: str, instance_id: int, file_id: str) -> bool:
         if not auth_scope or not file_id: return False
         with self._lock:
-            self._prune_locked(self._clock())
-            for key, grant in self._entries.items():
-                if key[0] == auth_scope and key[1] == int(instance_id) and grant.file_id == str(file_id):
-                    self._entries.move_to_end(key); return True
+            now = self._clock()
+            self._prune_locked(now)
+            matches = [
+                (key, grant)
+                for key, grant in self._entries.items()
+                if key[0] == auth_scope
+                and key[1] == int(instance_id)
+                and grant.file_id == str(file_id)
+            ]
+            if len(matches) == 1:
+                key, grant = matches[0]
+                self._touch_locked(key, grant, now)
+                return True
             return False
 
     def clear(self) -> None:
@@ -785,16 +865,21 @@ class PlaybackSessionRegistry:
 
     def __init__(self, ttl_seconds: float = 30 * 60,
                  capability_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_TTL_SECONDS,
+                 capability_max_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS,
                  max_entries: int = 8192,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
         self._capability_ttl_seconds = max(1.0, float(capability_ttl_seconds))
+        self._capability_max_ttl_seconds = max(
+            self._capability_ttl_seconds,
+            float(capability_max_ttl_seconds),
+        )
         self._max_entries = max(1, int(max_entries))
         self._max_capabilities = max(4, self._max_entries * 4)
         self._clock = clock
         self._entries: OrderedDict[tuple[str, int, str], _PlaybackSessionLink] = OrderedDict()
         self._capability_index: OrderedDict[
-            tuple[int, str], tuple[tuple[str, int, str], float]
+            tuple[int, str], tuple[tuple[str, int, str], float, float]
         ] = OrderedDict()
         self._entry_capabilities: dict[
             tuple[str, int, str], set[tuple[int, str]]
@@ -847,7 +932,7 @@ class PlaybackSessionRegistry:
         linked = self._capability_index.pop(capability_key, None)
         if linked is None:
             return
-        key, _expires_at = linked
+        key, _expires_at, _max_expires_at = linked
         capabilities = self._entry_capabilities.get(key)
         if capabilities is not None:
             capabilities.discard(capability_key)
@@ -861,11 +946,16 @@ class PlaybackSessionRegistry:
         entry: _PlaybackSessionLink,
         token: str,
         expires_at: float,
+        max_expires_at: float,
     ) -> None:
         capability_key = (entry.instance_id, token)
         if capability_key in self._capability_index:
             self._remove_capability_locked(capability_key)
-        self._capability_index[capability_key] = (key, expires_at)
+        self._capability_index[capability_key] = (
+            key,
+            min(expires_at, max_expires_at),
+            max_expires_at,
+        )
         self._entry_capabilities.setdefault(key, set()).add(capability_key)
         entry.capability_expires_at = max(entry.capability_expires_at, expires_at)
         while len(self._capability_index) > self._max_capabilities:
@@ -875,8 +965,10 @@ class PlaybackSessionRegistry:
     def _prune_capabilities_locked(self, now: float) -> None:
         for capability_key in [
             capability_key
-            for capability_key, (_key, expires_at) in self._capability_index.items()
-            if expires_at <= now
+            for capability_key, (
+                _key, expires_at, max_expires_at
+            ) in self._capability_index.items()
+            if expires_at <= now or max_expires_at <= now
         ]:
             self._remove_capability_locked(capability_key)
 
@@ -967,6 +1059,7 @@ class PlaybackSessionRegistry:
                     entry,
                     normalized_token,
                     now + self._capability_ttl_seconds,
+                    now + self._capability_max_ttl_seconds,
                 )
             self._enforce_capacity_locked()
             return entry
@@ -1072,6 +1165,7 @@ class PlaybackSessionRegistry:
                 entry,
                 normalized_token,
                 now + self._capability_ttl_seconds,
+                now + self._capability_max_ttl_seconds,
             )
             self._enforce_capacity_locked()
             return entry
@@ -1096,7 +1190,7 @@ class PlaybackSessionRegistry:
             linked = self._capability_index.get(capability_key)
             if linked is None:
                 return None
-            key, capability_expires_at = linked
+            key, capability_expires_at, capability_max_expires_at = linked
             entry = self._entries.get(key)
             if entry is None:
                 self._remove_capability_locked(capability_key)
@@ -1104,7 +1198,11 @@ class PlaybackSessionRegistry:
             if entry.expires_at <= now:
                 self._remove_locked(key)
                 return None
-            if not entry.auth_scope or capability_expires_at <= now:
+            if (
+                not entry.auth_scope
+                or capability_expires_at <= now
+                or capability_max_expires_at <= now
+            ):
                 self._remove_capability_locked(capability_key)
                 return None
             if item_id and entry.item_id and entry.item_id != str(item_id):
@@ -1119,7 +1217,17 @@ class PlaybackSessionRegistry:
                 str(source_signature), expected_source_signature
             ):
                 return None
+            renewed_expires_at = min(
+                capability_max_expires_at,
+                now + self._capability_ttl_seconds,
+            )
+            self._capability_index[capability_key] = (
+                key,
+                renewed_expires_at,
+                capability_max_expires_at,
+            )
             self._capability_index.move_to_end(capability_key)
+            self._refresh_capability_expiry_locked(key)
             return self._touch_locked(
                 key, entry, item_id=item_id, source_id=source_id
             )
@@ -1272,12 +1380,18 @@ def _request_query_values(request: Request, *names: str) -> list[str]:
     return values
 
 
-def _request_query_occurrences(request: Request, *names: str) -> int:
+def _request_query_has_conflicting_values(
+    request: Request, *names: str
+) -> bool:
     accepted = {str(name).lower() for name in names}
-    return sum(
-        1 for key, _value in request.query_params.multi_items()
+    values = [
+        str(value or "").strip()
+        for key, value in request.query_params.multi_items()
         if str(key).lower() in accepted
-    )
+    ]
+    if len(values) <= 1:
+        return False
+    return not values[0] or any(value != values[0] for value in values[1:])
 
 
 def _extract_guangya_file_id(value: Any) -> str | None:
@@ -2014,7 +2128,9 @@ def create_proxy_app(
         item_id = (playback_match or stream_match).group(1) if (playback_match or stream_match) else ""
         source_values = _request_query_values(request, "MediaSourceId")
         source_id = source_values[0] if source_values else ""
-        source_ambiguous = _request_query_occurrences(request, "MediaSourceId") > 1
+        source_ambiguous = _request_query_has_conflicting_values(
+            request, "MediaSourceId"
+        )
         file_id = _extract_guangya_file_id(str(request.url)) or ""
         media_name = (
             _safe_media_name(str(request.url), path_value=True)

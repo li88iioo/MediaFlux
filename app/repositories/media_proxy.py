@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -251,7 +252,11 @@ _MEDIA_PROXY_ERROR_SECRET_RE = re.compile(
 _MEDIA_PROXY_RECORD_SOURCES = {
     "guangya", "upstream", "playback_info", "hls", "websocket", "unknown",
 }
+_MEDIA_PROXY_RECORD_MAX_ROWS = 10_000
+_MEDIA_PROXY_RECORD_MAINTENANCE_INTERVAL = 512
 _last_media_proxy_record_prune_key = ""
+_media_proxy_record_writes_since_prune = 0
+_media_proxy_record_maintenance_lock = threading.RLock()
 
 
 def _redact_media_proxy_record_error(value: str) -> str:
@@ -279,23 +284,41 @@ def _delete_orphan_media_proxy_playback_sessions(conn: sqlite3.Connection) -> No
     )
 
 
-def _prune_media_proxy_playback_records(conn: sqlite3.Connection) -> None:
+def _prune_media_proxy_playback_records(
+    conn: sqlite3.Connection, *, record_write: bool = False
+) -> None:
     global _last_media_proxy_record_prune_key
-    current_day = datetime.now().strftime("%Y-%m-%d")
-    prune_key = f"{resolve_db_path()}:{current_day}"
-    if _last_media_proxy_record_prune_key == prune_key:
-        return
-    conn.execute(
-        "DELETE FROM media_proxy_playback_records "
-        "WHERE created_at < datetime('now','-30 days','localtime')"
-    )
-    conn.execute(
-        "DELETE FROM media_proxy_playback_records WHERE id IN ("
-        "SELECT id FROM media_proxy_playback_records ORDER BY id DESC LIMIT -1 OFFSET 10000"
-        ")"
-    )
-    _delete_orphan_media_proxy_playback_sessions(conn)
-    _last_media_proxy_record_prune_key = prune_key
+    global _media_proxy_record_writes_since_prune
+    with _media_proxy_record_maintenance_lock:
+        interval = max(1, int(_MEDIA_PROXY_RECORD_MAINTENANCE_INTERVAL))
+        if record_write:
+            _media_proxy_record_writes_since_prune += 1
+        current_day = datetime.now().strftime("%Y-%m-%d")
+        prune_key = f"{resolve_db_path()}:{current_day}"
+        interval_due = _media_proxy_record_writes_since_prune >= interval
+        if not interval_due and _last_media_proxy_record_prune_key == prune_key:
+            return
+
+        # 采用低水位批量裁剪：维护之间最多新增 interval 条，仍保持
+        # _MEDIA_PROXY_RECORD_MAX_ROWS 的严格上限，避免每次 302 都扫描 1 万行。
+        trim_target = max(
+            1,
+            int(_MEDIA_PROXY_RECORD_MAX_ROWS) - interval,
+        )
+        conn.execute(
+            "DELETE FROM media_proxy_playback_records "
+            "WHERE created_at < datetime('now','-30 days','localtime')"
+        )
+        conn.execute(
+            "DELETE FROM media_proxy_playback_records WHERE id IN ("
+            "SELECT id FROM media_proxy_playback_records "
+            "ORDER BY id DESC LIMIT -1 OFFSET ?"
+            ")",
+            (trim_target,),
+        )
+        _delete_orphan_media_proxy_playback_sessions(conn)
+        _last_media_proxy_record_prune_key = prune_key
+        _media_proxy_record_writes_since_prune = 0
 
 
 def _upsert_media_proxy_playback_session(
@@ -399,7 +422,9 @@ def record_media_proxy_playback_attempt(*, instance_id: int, route_class: str,
     file_id = _normalized_record_identity(guangya_file_id, 512)
     timestamp = now()
     with get_conn() as conn:
-        _prune_media_proxy_playback_records(conn)
+        _prune_media_proxy_playback_records(
+            conn, record_write=True
+        )
         session_id = None
         if session_key:
             session_id = _upsert_media_proxy_playback_session(
@@ -432,12 +457,6 @@ def record_media_proxy_playback_attempt(*, instance_id: int, route_class: str,
             ),
         )
         record_id = int(cursor.lastrowid)
-        conn.execute(
-            "DELETE FROM media_proxy_playback_records WHERE id IN ("
-            "SELECT id FROM media_proxy_playback_records ORDER BY id DESC LIMIT -1 OFFSET 10000"
-            ")"
-        )
-        _delete_orphan_media_proxy_playback_sessions(conn)
         return record_id
 
 

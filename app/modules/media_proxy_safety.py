@@ -8,9 +8,27 @@ from urllib.parse import unquote, urlsplit
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:(?!\s)")
+_DANGEROUS_OPAQUE_URI_SCHEMES = {
+    "data",
+    "ed2k",
+    "file",
+    "ftp",
+    "ftps",
+    "javascript",
+    "magnet",
+    "mailto",
+    "sftp",
+    "ssh",
+    "urn",
+    "vbscript",
+}
 _SENSITIVE_QUERY_RE = re.compile(
     r"(?i)(?:^|[?&#;])(?:api[_-]?key|token|access[_-]?token|"
     r"refresh[_-]?token|authorization|auth|signature|sign|expires?)="
+)
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|"
+    r"authorization|auth|signature|sign|expires?)\s*="
 )
 
 def safe_media_name(value: Any, *, path_value: bool = False,
@@ -36,30 +54,47 @@ def safe_media_name(value: Any, *, path_value: bool = False,
         and _URI_SCHEME_RE.match(decoded)
         and not _WINDOWS_DRIVE_RE.match(decoded)
     )
-    is_uri = bool(
+    has_sensitive_query = bool(_SENSITIVE_QUERY_RE.search(decoded))
+    explicit_uri = bool(
         parsed is not None
         and (
             parsed.netloc
             or decoded.startswith("//")
             or "://" in decoded
-            or has_uri_scheme
+        )
+    )
+    path_style_uri = bool(
+        has_uri_scheme
+        and parsed is not None
+        and str(parsed.path or "").startswith("/")
+    )
+    opaque_uri = bool(
+        has_uri_scheme
+        and not explicit_uri
+        and parsed is not None
+        and (
+            str(parsed.scheme or "").lower() in _DANGEROUS_OPAQUE_URI_SCHEMES
+            or "@" in str(parsed.path or "")
+            or has_sensitive_query
+            or bool(_SENSITIVE_ASSIGNMENT_RE.search(str(parsed.path or "")))
         )
     )
     if (
-        has_uri_scheme
+        opaque_uri
         and not parsed.netloc
         and not str(parsed.path or "").startswith("/")
     ):
         return ""
+    is_uri = bool(
+        explicit_uri or path_style_uri or (path_value and has_uri_scheme)
+    )
     is_path = bool(
         path_value
-        or is_uri
+        or explicit_uri
+        or path_style_uri
         or decoded.startswith(("/", "\\"))
         or _WINDOWS_DRIVE_RE.match(decoded)
-        or "/" in decoded
-        or "\\" in decoded
     )
-    has_sensitive_query = bool(_SENSITIVE_QUERY_RE.search(decoded))
 
     if is_path or has_sensitive_query:
         if parsed is not None:
