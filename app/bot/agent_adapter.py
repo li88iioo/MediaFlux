@@ -93,7 +93,9 @@ _MAX_SUGGESTION_LENGTH = 280
 _MAX_TRACE_ITEMS = 5
 _TELEGRAM_QUERY_LIMIT_PER_MINUTE = 12
 _TELEGRAM_CALLBACK_LIMIT_PER_MINUTE = 12
-_RESOURCE_RESULT_LIMIT = 3
+_RESOURCE_PAGE_SIZE = 3
+_RESOURCE_RESULT_LIMIT = 9
+_RESOURCE_PAGE_PAYLOAD_LIMIT = 32768
 _EPISODE_FOLLOWUP_LIMIT = 3
 _WORKSPACE_ACTION_LIMIT = 5
 _TELEGRAM_STREAM_UPDATE_INTERVAL_SECONDS = 0.35
@@ -140,6 +142,60 @@ class _AgentAction:
     tool_name: str = ""
     arguments_json: str = ""
     action_key: str = ""
+
+
+def _normalize_resource_page_payload(
+    candidates: Any, page: Any, *, strict_result_ids: bool = True
+) -> dict[str, Any]:
+    """校验分页 callback 中的最小公开候选快照。"""
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("无法创建 Telegram 资源分页")
+    if len(candidates) > _RESOURCE_RESULT_LIMIT:
+        raise ValueError("无法创建 Telegram 资源分页")
+    if isinstance(page, bool):
+        raise ValueError("无法创建 Telegram 资源分页")
+    try:
+        page_number = int(page)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("无法创建 Telegram 资源分页") from exc
+
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValueError("无法创建 Telegram 资源分页")
+        result_id = str(candidate.get("result_id") or "").strip()
+        title = _redact_text(
+            html.unescape(str(candidate.get("title") or "")), limit=180
+        )
+        if (
+            (strict_result_ids and not _RESULT_ID_RE.fullmatch(result_id))
+            or (not strict_result_ids and not result_id)
+            or result_id in seen
+            or not title
+        ):
+            raise ValueError("无法创建 Telegram 资源分页")
+        seen.add(result_id)
+        normalized.append(
+            {
+                "result_id": result_id,
+                "title": title,
+                "episode": _redact_text(
+                    html.unescape(str(candidate.get("episode") or "")), limit=20
+                ),
+                "site": _redact_text(
+                    html.unescape(str(candidate.get("site") or "")), limit=60
+                ),
+                "size": _redact_text(
+                    html.unescape(str(candidate.get("size") or "")), limit=32
+                ),
+            }
+        )
+
+    total_pages = (len(normalized) + _RESOURCE_PAGE_SIZE - 1) // _RESOURCE_PAGE_SIZE
+    if page_number < 0 or page_number >= total_pages:
+        raise ValueError("无法创建 Telegram 资源分页")
+    return {"page": page_number, "candidates": normalized}
 
 
 class TelegramAgentActionStore:
@@ -233,6 +289,42 @@ class TelegramAgentActionStore:
                     group_id=f"resource:{group_key}",
                     result_id=resource_id,
                     target=target_name,
+                )
+            )
+
+    def create_resource_page(
+        self,
+        *,
+        owner: str,
+        candidates: list[dict[str, str]],
+        page: int,
+        group_id: str,
+    ) -> str:
+        """保存脱敏候选快照；callback 仅携带一次性 opaque id。"""
+        owner_key = str(owner or "").strip()
+        group_key = str(group_id or "").strip()
+        if not owner_key or not _ACTION_GROUP_RE.fullmatch(group_key):
+            raise ValueError("无法创建 Telegram 资源分页")
+        payload = _normalize_resource_page_payload(candidates, page)
+        arguments_json = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(arguments_json) > _RESOURCE_PAGE_PAYLOAD_LIMIT:
+            raise ValueError("Telegram 资源分页参数过长")
+        with self._lock:
+            now = self._clock()
+            self._prune_locked(now)
+            return self._store_locked(
+                _AgentAction(
+                    action_id=self._new_action_id_locked(),
+                    owner=owner_key,
+                    action="paginate_resources",
+                    expires_at=now + self._ttl_seconds,
+                    group_id=f"resource:{group_key}",
+                    arguments_json=arguments_json,
                 )
             )
 
@@ -410,6 +502,17 @@ class TelegramAgentActionStore:
                     "tool_name": item.tool_name,
                     "arguments": arguments,
                 }
+            if item.action == "paginate_resources":
+                try:
+                    payload = json.loads(item.arguments_json)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("操作已过期或无效") from exc
+                if not isinstance(payload, dict):
+                    raise ValueError("操作已过期或无效")
+                normalized = _normalize_resource_page_payload(
+                    payload.get("candidates"), payload.get("page")
+                )
+                return {"action": item.action, **normalized}
             if item.action == "invoke_workspace_action":
                 return {
                     "action": item.action,
@@ -444,6 +547,7 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
         "confirm",
         "cancel",
         "prepare_resource",
+        "paginate_resources",
         "invoke_read_tool",
         "invoke_workspace_action",
     })
@@ -726,6 +830,17 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
                     "tool_name": metadata["tool_name"],
                     "arguments": arguments,
                 }
+            if action == "paginate_resources":
+                try:
+                    payload = json.loads(str(row["arguments_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("操作已过期或无效") from exc
+                if not isinstance(payload, dict):
+                    raise ValueError("操作已过期或无效")
+                normalized = _normalize_resource_page_payload(
+                    payload.get("candidates"), payload.get("page")
+                )
+                return {"action": action, **normalized}
             if action == "invoke_workspace_action":
                 return {"action": action, "action_key": metadata["action_key"]}
             confirmation_id = str(row["confirmation_id"] or "")
@@ -805,6 +920,23 @@ def telegram_agent_owner(chat_id: object, user_id: object) -> str:
     if not _ALLOWED_ID_RE.fullmatch(chat) or not _ALLOWED_ID_RE.fullmatch(user):
         raise ValueError("Telegram Agent 身份无效")
     return f"tg:v1:{chat}\x1f{user}"
+
+
+def _remove_callback_keyboard(bot: Any, message: Any) -> bool:
+    """尽快撤下已消费或过期的 inline keyboard；失败不影响主流程。"""
+    edit_markup = getattr(bot, "edit_message_reply_markup", None)
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    message_id = getattr(message, "message_id", None)
+    if not callable(edit_markup) or chat_id is None or message_id is None:
+        return False
+    try:
+        edit_markup(chat_id, message_id, reply_markup=None)
+        return True
+    except Exception as exc:
+        logger.info(
+            "Telegram Agent keyboard 清理失败 type=%s", type(exc).__name__
+        )
+        return False
 
 
 def _redact_text(value: object, *, limit: int) -> str:
@@ -2299,13 +2431,22 @@ def _resource_markup(
     *,
     owner: str,
     candidates: list[dict[str, str]],
+    page: int = 0,
 ):
     if not candidates:
         return None
+    payload = _normalize_resource_page_payload(candidates, page)
+    all_candidates = payload["candidates"]
+    page_number = payload["page"]
+    total_pages = (
+        len(all_candidates) + _RESOURCE_PAGE_SIZE - 1
+    ) // _RESOURCE_PAGE_SIZE
+    page_start = page_number * _RESOURCE_PAGE_SIZE
+    page_candidates = all_candidates[page_start : page_start + _RESOURCE_PAGE_SIZE]
     store = get_telegram_agent_action_store()
     group_id = secrets.token_urlsafe(12)
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    for position, candidate in enumerate(candidates, start=1):
+    for position, candidate in enumerate(page_candidates, start=page_start + 1):
         qb_id = store.create_resource_prepare(
             owner=owner,
             result_id=candidate["result_id"],
@@ -2326,14 +2467,54 @@ def _resource_markup(
                 f"{position} · 光鸭", callback_data=f"aga:{guangya_id}"
             ),
         )
+    navigation = []
+    if page_number > 0:
+        previous_id = store.create_resource_page(
+            owner=owner,
+            candidates=all_candidates,
+            page=page_number - 1,
+            group_id=group_id,
+        )
+        navigation.append(
+            telebot.types.InlineKeyboardButton(
+                f"◀ 上一页 {page_number}/{total_pages}",
+                callback_data=f"aga:{previous_id}",
+            )
+        )
+    if page_number + 1 < total_pages:
+        next_id = store.create_resource_page(
+            owner=owner,
+            candidates=all_candidates,
+            page=page_number + 1,
+            group_id=group_id,
+        )
+        navigation.append(
+            telebot.types.InlineKeyboardButton(
+                f"查看更多 {page_number + 2}/{total_pages} ▶",
+                callback_data=f"aga:{next_id}",
+            )
+        )
+    if navigation:
+        markup.add(*navigation)
     return markup
 
 
 def _render_resource_candidates(
-    response: Any, candidates: list[dict[str, str]]
+    response: Any, candidates: list[dict[str, str]], *, page: int = 0
 ) -> str:
     if not candidates:
         return render_agent_response(response)
+
+    payload_page = _normalize_resource_page_payload(
+        candidates, page, strict_result_ids=False
+    )
+    all_candidates = payload_page["candidates"]
+    page_number = payload_page["page"]
+    total_pages = (
+        len(all_candidates) + _RESOURCE_PAGE_SIZE - 1
+    ) // _RESOURCE_PAGE_SIZE
+    page_start = page_number * _RESOURCE_PAGE_SIZE
+    page_candidates = all_candidates[page_start : page_start + _RESOURCE_PAGE_SIZE]
 
     payload = response if isinstance(response, dict) else {}
     result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
@@ -2345,9 +2526,12 @@ def _render_resource_candidates(
         limit=900,
         promote_first=True,
     )
-    lines = [summary or "已找到可下载资源。", "", "<b>候选资源</b>"]
-    for position, candidate in enumerate(candidates, start=1):
-        if position > 1:
+    heading = "<b>候选资源</b>"
+    if total_pages > 1:
+        heading += f"（第 {page_number + 1}/{total_pages} 页）"
+    lines = [summary or "已找到可下载资源。", "", heading]
+    for position, candidate in enumerate(page_candidates, start=page_start + 1):
+        if position > page_start + 1:
             lines.append("")
         metadata = " · ".join(
             value for value in (candidate["site"], candidate["size"]) if value
@@ -2357,7 +2541,7 @@ def _render_resource_candidates(
         lines.append(f"<b>{position}.</b> {prefix}{candidate['title']}")
         if metadata:
             lines.append(f"   {metadata}")
-    example_position = 2 if len(candidates) > 1 else 1
+    example_position = page_start + (2 if len(page_candidates) > 1 else 1)
     lines.extend([
         "",
         f"直接点按钮，或回复“第 {example_position} 个到 qB / 光鸭 / 两边”；"
@@ -2826,9 +3010,45 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             )
             return
 
+        action_kind = action_metadata["action"]
+
+        if action_kind == "paginate_resources":
+            with coordinator.owner_window(owner):
+                action = store.resolve(action_id, owner=owner)
+                module = telebot_module
+                if module is None:
+                    import telebot as module
+                text = _render_resource_candidates(
+                    {}, action["candidates"], page=action["page"]
+                )
+                markup = _resource_markup(
+                    module,
+                    owner=owner,
+                    candidates=action["candidates"],
+                    page=action["page"],
+                )
+            total_pages = (
+                len(action["candidates"]) + _RESOURCE_PAGE_SIZE - 1
+            ) // _RESOURCE_PAGE_SIZE
+            bot.answer_callback_query(
+                call.id, f"第 {action['page'] + 1}/{total_pages} 页"
+            )
+            callback_answered = True
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            return
+
         history_generation = _telegram_history_generation(owner)
         service = get_agent_service()
-        action_kind = action_metadata["action"]
+
+        if action_kind in {"cancel", "prepare_resource", "confirm", "invoke_read_tool"}:
+            _remove_callback_keyboard(bot, call.message)
 
         if action_kind in {"cancel", "prepare_resource", "confirm"}:
             # Telegram 网络调用永远放在 owner 临界区外；只有一次性 action 的
@@ -2998,6 +3218,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                     call.id, "请求过于频繁，请稍后重试", show_alert=True
                 )
                 return
+            _remove_callback_keyboard(bot, call.message)
             bot.answer_callback_query(call.id, "正在执行，请稍候")
             callback_answered = True
         else:
@@ -3078,6 +3299,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         raise ValueError("操作已过期或无效")
     except (AgentToolError, ValueError):
         if operation is not None and not coordinator.is_current(operation):
+            _remove_callback_keyboard(bot, call.message)
             if not callback_answered:
                 bot.answer_callback_query(
                     call.id, "操作已过期或无效", show_alert=True
@@ -3095,10 +3317,12 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             except Exception:
                 pass
         else:
+            _remove_callback_keyboard(bot, call.message)
             bot.answer_callback_query(call.id, "操作已过期或无效", show_alert=True)
     except Exception as exc:
         logger.warning("Telegram Agent 确认失败 type=%s", type(exc).__name__)
         if operation is not None and not coordinator.is_current(operation):
+            _remove_callback_keyboard(bot, call.message)
             if not callback_answered:
                 bot.answer_callback_query(
                     call.id, "Agent 暂时不可用", show_alert=True
@@ -3128,6 +3352,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 except Exception:
                     pass
         else:
+            _remove_callback_keyboard(bot, call.message)
             bot.answer_callback_query(call.id, "Agent 暂时不可用", show_alert=True)
     finally:
         if operation is not None:

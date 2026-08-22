@@ -1,3 +1,4 @@
+:root { --agent-viewport-height: 100dvh; }
 .agent-page {
     --agent-reading-width: 980px;
     --agent-line: color-mix(in srgb, var(--border) 78%, transparent);
@@ -11,10 +12,10 @@
     min-width: 0;
     margin: 0;
 }
-body.agent-page-body { overflow: hidden; height: 100vh; height: 100dvh; min-height: 0; max-height: 100dvh; display: flex; flex-direction: column; }
+body.agent-page-body { overflow: hidden; height: 100vh; height: var(--agent-viewport-height, 100dvh); min-height: 0; max-height: var(--agent-viewport-height, 100dvh); display: flex; flex-direction: column; }
 body.agent-page-body::after { display: none; }
-.agent-page-body .app-shell { height: 100%; min-height: 0; max-height: 100dvh; display: flex; flex: 1; overflow: hidden; }
-.agent-page-body .main { height: 100%; min-height: 0; max-height: 100dvh; display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+.agent-page-body .app-shell { height: 100%; min-height: 0; max-height: var(--agent-viewport-height, 100dvh); display: flex; flex: 1; overflow: hidden; }
+.agent-page-body .main { height: 100%; min-height: 0; max-height: var(--agent-viewport-height, 100dvh); display: flex; flex-direction: column; flex: 1; overflow: hidden; }
 .agent-page-body .content { padding: 0; display: flex; flex-direction: column; flex: 1; min-height: 0; max-height: 100%; overflow: hidden; max-width: 100%; animation: none; }
 .agent-page { display: flex; flex-direction: column; flex: 1; min-height: 0; max-height: 100%; }
 .agent-page button:focus-visible, .agent-page a:focus-visible, .agent-page textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
@@ -1212,7 +1213,8 @@ body.agent-page-body::after { display: none; }
 .agent-timeline-bubble-header {
     display: flex;
     align-items: center;
-    justify-content: flex-start;
+    justify-content: space-between;
+    gap: 10px;
     margin-bottom: 10px;
     padding-left: 40px;
 }
@@ -1231,6 +1233,9 @@ body.agent-page-body::after { display: none; }
     backdrop-filter: blur(14px);
 }
 .agent-timeline-bubble-pill svg { width: 14px; height: 14px; color: var(--accent); }
+.agent-shortcuts-close { flex: 0 0 36px; width: 36px; height: 36px; display: inline-grid; place-items: center; padding: 0; color: var(--text-secondary); background: color-mix(in srgb, var(--bg-card) 92%, transparent); border: 1px solid var(--agent-line); border-radius: 50%; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.06); cursor: pointer; }
+.agent-shortcuts-close:hover { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); }
+.agent-shortcuts-close svg { width: 15px; height: 15px; }
 .agent-timeline-body { padding: 0; }
 .agent-timeline-track { position: relative; padding-left: 40px; }
 .agent-timeline-stem {
@@ -1513,9 +1518,9 @@ body.agent-page-body::after { display: none; }
     .agent-composer-header { gap: 8px; }
     .agent-composer-actions { gap: 6px; }
     .agent-shortcuts-trigger {
-        width: 40px !important;
-        height: 40px !important;
-        flex: 0 0 40px !important;
+        width: 44px !important;
+        height: 44px !important;
+        flex: 0 0 44px !important;
         padding: 0 !important;
         border-radius: 50% !important;
     }
@@ -1527,10 +1532,12 @@ body.agent-page-body::after { display: none; }
         padding: 0 4px 6px 4px;
     }
     .agent-timeline-bubble-header { padding-left: 36px; }
+    .agent-shortcuts-close, .agent-history-close { min-width: 44px; min-height: 44px; width: 44px; height: 44px; }
     .agent-timeline-track { padding-left: 36px; }
     .agent-timeline-node { left: -36px; width: 26px; height: 26px; }
-    .agent-action-btn { flex-basis: 40px; width: 40px; height: 40px; }
+    .agent-action-btn { flex-basis: 44px; width: 44px; height: 44px; }
     .agent-action-btn.agent-resume-session { flex-basis: auto; width: auto; padding-inline: 11px; }
+    .agent-send, .agent-stop { flex-basis: 44px; width: 44px; height: 44px; }
     .agent-retry-draft, .agent-retry-immediate { min-height: 44px; padding-inline: 14px; }
     .agent-history-drawer { width: min(92vw, 380px); }
     .agent-confirmation-actions button { flex: 1 1 0; min-width: 0; }

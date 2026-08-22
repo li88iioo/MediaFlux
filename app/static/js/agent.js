@@ -16,6 +16,7 @@
     const sessionListNode = document.getElementById('agentSessionList');
     const sessionCountNode = document.getElementById('agentSessionCount');
     const sessionStatusNode = document.getElementById('agentSessionStatus');
+    const responseStatusNode = document.getElementById('agentResponseStatus');
     const MIN_PENDING_MS = 320;
     const AGENT_CANCEL_TIMEOUT_MS = 1500;
     const MAX_RENDERED_ITEMS = 8;
@@ -34,6 +35,8 @@
     let agentSessionId = createAgentSessionId();
     let latestSessionId = '';
     let restoringHistory = false;
+    let historyReturnFocus = true;
+    let visualViewportFrame = 0;
     const directToolActions = new WeakMap();
     const confirmationPrepareActions = new WeakMap();
 
@@ -193,6 +196,22 @@
         window.requestAnimationFrame(() => {
             sessionStatusNode.textContent = String(message || '');
         });
+    }
+
+    function announceResponseStatus(message) {
+        if (!responseStatusNode || restoringHistory) return;
+        responseStatusNode.textContent = '';
+        window.requestAnimationFrame(() => {
+            responseStatusNode.textContent = String(message || '');
+        });
+    }
+
+    function responseAnnouncement(payload) {
+        if (payload?.mode === 'confirmation_required') return 'Agent 已完成检查，需要确认后才能执行操作。';
+        const result = payload?.result && typeof payload.result === 'object' ? payload.result : {};
+        const display = payload?.display && typeof payload.display === 'object' ? payload.display : {};
+        const summary = cleanDisplayLine(display.summary || result.summary || payload?.answer || '').slice(0, 160);
+        return summary ? `Agent 回答已生成：${summary}` : 'Agent 回答已生成。';
     }
 
     async function discardStaleConfirmation(payload, sessionId) {
@@ -1801,6 +1820,7 @@
             window.MFAnim.popIn(resultCard, { duration: 0.22, y: 6 });
         }
         if (keepPinned) scrollToLatest({force: true});
+        announceResponseStatus(responseAnnouncement(payload));
         return view.article;
     }
 
@@ -1844,6 +1864,7 @@
             window.MFAnim.shake(card, { intensity: 6, duration: 0.32 });
         }
         scrollToLatest();
+        announceResponseStatus(error?.status === 429 ? '请求频率已达到限制，请稍后再试。' : 'Agent 请求失败，现有对话已保留。');
     }
 
     const AGENT_PHASE_LABELS = {
@@ -1908,6 +1929,7 @@
         }
         refreshIcons(article);
         scrollToLatest();
+        announceResponseStatus('Agent 任务已停止，结果未写入会话历史。');
     }
 
     function markStreamInterrupted(streamView, message, draft = '') {
@@ -1921,6 +1943,7 @@
         if (retryActions) streamView.card.append(retryActions);
         refreshIcons(streamView.article);
         scrollToLatest();
+        announceResponseStatus('Agent 回答生成中断，可以重试或编辑指令。');
     }
 
     async function responseError(response) {
@@ -2104,29 +2127,39 @@
             iconNode.replaceWith(replacement);
             refreshIcons(sendButton);
         }
+        syncSessionLifecycleControls();
     }
 
     function syncSessionLifecycleControls() {
-        const blocked = confirmationInFlight || sessionResetInFlight;
-        const reason = confirmationInFlight
+        const switchBlocked = requestInFlight || confirmationInFlight || sessionResetInFlight;
+        const newSessionBlocked = confirmationInFlight || sessionResetInFlight;
+        const switchReason = requestInFlight
+            ? '任务执行中，完成后可新建、切换或删除会话。'
+            : confirmationInFlight
             ? '写操作正在执行，完成后可新建、切换或删除会话。'
             : sessionResetInFlight
                 ? '会话正在更新，请稍候。'
                 : '';
-        newSessionButton.disabled = blocked;
-        newSessionButton.setAttribute('aria-busy', String(blocked));
-        newSessionButton.title = reason || '新会话';
+        const newSessionReason = confirmationInFlight
+            ? '写操作正在执行，完成后可新建会话。'
+            : sessionResetInFlight
+                ? '会话正在更新，请稍候。'
+                : '';
+        newSessionButton.disabled = newSessionBlocked;
+        newSessionButton.setAttribute('aria-busy', String(newSessionBlocked));
+        newSessionButton.title = newSessionReason || (requestInFlight ? '停止当前任务并开始新会话' : '新会话');
         if (resumeLatestSessionButton) {
-            const canResume = Boolean(latestSessionId && latestSessionId !== agentSessionId && !blocked);
+            const canResume = Boolean(latestSessionId && latestSessionId !== agentSessionId && !switchBlocked);
             resumeLatestSessionButton.disabled = !canResume;
-            resumeLatestSessionButton.setAttribute('aria-busy', String(blocked));
-            resumeLatestSessionButton.title = reason || (canResume ? '继续上次会话' : '当前没有可恢复的其他会话');
+            resumeLatestSessionButton.setAttribute('aria-busy', String(switchBlocked));
+            resumeLatestSessionButton.title = switchReason || (canResume ? '继续上次会话' : '当前没有可恢复的其他会话');
         }
         sessionListNode.querySelectorAll('button').forEach((button) => {
-            button.disabled = blocked;
-            if (reason) button.title = reason;
+            button.disabled = switchBlocked;
+            if (switchReason) button.title = switchReason;
             else button.removeAttribute('title');
         });
+        sessionListNode.setAttribute('aria-busy', String(switchBlocked));
     }
 
     function setConfirmationBusy(busy) {
@@ -2789,7 +2822,7 @@
         refreshIcons(transcript);
         transcript.scrollTop = transcript.scrollHeight;
         window.queueMicrotask(() => {
-            transcript.setAttribute('aria-live', 'polite');
+            transcript.setAttribute('aria-live', 'off');
             transcript.setAttribute('aria-busy', 'false');
         });
     }
@@ -2832,6 +2865,8 @@
                 if (isActive) openButton?.setAttribute('aria-current', 'page');
                 else openButton?.removeAttribute('aria-current');
             });
+            closeHistoryRail({returnFocus: false});
+            announceSessionStatus('历史会话已恢复，可以继续输入。');
         } catch (error) {
             if (error?.name !== 'AbortError' && generation === conversationGeneration) appendRequestError(error);
         } finally {
@@ -2839,6 +2874,7 @@
                 historyController = null;
                 sessionListNode.setAttribute('aria-busy', 'false');
                 setSessionTransitionBusy(false);
+                promptInput.focus({preventScroll: true});
             }
         }
     }
@@ -2990,15 +3026,17 @@
         historyRail.querySelector('[data-agent-history-close]')?.focus({preventScroll: true});
     }
 
-    function closeHistoryRail() {
+    function closeHistoryRail({returnFocus = true} = {}) {
         if (!historyRail?.open) return;
+        historyReturnFocus = returnFocus;
         if (typeof historyRail.close === 'function') {
             historyRail.close();
             return;
         }
         historyRail.removeAttribute('open');
         railToggleButton?.setAttribute('aria-expanded', 'false');
-        railToggleButton?.focus({preventScroll: true});
+        if (historyReturnFocus) railToggleButton?.focus({preventScroll: true});
+        historyReturnFocus = true;
     }
 
     railToggleButton?.addEventListener('click', () => {
@@ -3007,7 +3045,8 @@
     });
     historyRail?.addEventListener('close', () => {
         railToggleButton?.setAttribute('aria-expanded', 'false');
-        railToggleButton?.focus({preventScroll: true});
+        if (historyReturnFocus) railToggleButton?.focus({preventScroll: true});
+        historyReturnFocus = true;
     });
     historyRail?.addEventListener('click', (event) => {
         const target = event.target instanceof Element ? event.target : null;
@@ -3076,13 +3115,16 @@
     const shortcutsTimeline = document.getElementById('agentShortcutsTimeline');
     const shortcutsClose = document.getElementById('closeAgentShortcuts');
 
-    function toggleShortcutsTimeline(open) {
+    function toggleShortcutsTimeline(open, {restoreFocus = false} = {}) {
         if (!shortcutsTimeline) return;
         const shouldOpen = open !== undefined ? open : shortcutsTimeline.hidden;
         shortcutsTimeline.hidden = !shouldOpen;
         shortcutsTrigger?.setAttribute('aria-expanded', String(shouldOpen));
         if (shouldOpen) {
             window.renderLucideIcons?.(shortcutsTimeline);
+            window.requestAnimationFrame(() => shortcutsClose?.focus({preventScroll: true}));
+        } else if (restoreFocus) {
+            shortcutsTrigger?.focus({preventScroll: true});
         }
     }
 
@@ -3093,7 +3135,7 @@
 
     shortcutsClose?.addEventListener('click', (e) => {
         e.stopPropagation();
-        toggleShortcutsTimeline(false);
+        toggleShortcutsTimeline(false, {restoreFocus: true});
     });
 
     document.addEventListener('click', (e) => {
@@ -3105,9 +3147,33 @@
 
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && shortcutsTimeline && !shortcutsTimeline.hidden) {
-            toggleShortcutsTimeline(false);
+            toggleShortcutsTimeline(false, {restoreFocus: true});
         }
     });
+
+    function syncVisualViewport() {
+        const viewport = window.visualViewport;
+        if (!viewport) return;
+        if (visualViewportFrame) window.cancelAnimationFrame(visualViewportFrame);
+        visualViewportFrame = window.requestAnimationFrame(() => {
+            visualViewportFrame = 0;
+            const viewportHeight = Math.max(1, Math.round(viewport.height));
+            document.documentElement.style.setProperty('--agent-viewport-height', `${viewportHeight}px`);
+            const keyboardVisible = viewport.height < window.innerHeight - 80;
+            page.classList.toggle('has-visual-keyboard', keyboardVisible);
+            if (keyboardVisible && document.activeElement === promptInput) scrollToLatest({force: true});
+        });
+    }
+
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', syncVisualViewport, {passive: true});
+        window.visualViewport.addEventListener('scroll', syncVisualViewport, {passive: true});
+        window.addEventListener('pagehide', () => {
+            window.visualViewport?.removeEventListener('resize', syncVisualViewport);
+            window.visualViewport?.removeEventListener('scroll', syncVisualViewport);
+        }, {once: true});
+        syncVisualViewport();
+    }
 
     resizePrompt();
     Promise.allSettled([loadCapabilities(), loadSessions()]);

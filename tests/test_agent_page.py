@@ -72,8 +72,8 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.text.count("<main"), 1)
         self.assertIn('class="agent-page"', response.text)
-        self.assertIn('id="agentTranscript" role="log"', response.text)
-        self.assertIn('aria-live="polite"', response.text)
+        self.assertIn('id="agentTranscript" role="log" aria-live="off"', response.text)
+        self.assertIn('id="agentResponseStatus" role="status" aria-live="polite" aria-atomic="true"', response.text)
         self.assertIn('id="agentComposer"', response.text)
         self.assertIn('id="agentPrompt"', response.text)
         self.assertIn('maxlength="1000"', response.text)
@@ -95,8 +95,8 @@ class AgentPageTests(InitializedWebTestCase):
         )
         self.assertEqual(response.text.count("/static/css/agent.css"), 1)
         self.assertEqual(response.text.count("/static/js/agent.js"), 1)
-        self.assertIn("/static/css/agent.css?v=20260821a", response.text)
-        self.assertIn("/static/js/agent.js?v=20260821a", response.text)
+        self.assertIn("/static/css/agent.css?v=20260822a", response.text)
+        self.assertIn("/static/js/agent.js?v=20260822a", response.text)
         self.assertIn('id="agentResumeLatestSession"', response.text)
         self.assertIn("继续上次", response.text)
         self.assertNotRegex(response.text, re.compile(r"(?:API_KEY|PASSWORD|TOKEN)=", re.I))
@@ -258,7 +258,8 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("markStreamInterrupted(error.streamView, error.message, normalized)", source)
         self.assertIn("sessionResetInFlight", source)
         self.assertIn("transcript.setAttribute('aria-live', 'off')", source)
-        self.assertIn("transcript.setAttribute('aria-live', 'polite')", source)
+        self.assertNotIn("transcript.setAttribute('aria-live', 'polite')", source)
+        self.assertIn("announceResponseStatus(responseAnnouncement(payload))", source)
         self.assertIn("button.classList.contains('is-armed')", source)
         self.assertIn("startConfirmationCountdown", source)
         self.assertIn("error.payload = payload", source)
@@ -273,6 +274,41 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertNotIn("renderData(result.data)", source)
         self.assertIn("card.append(renderResultDisclosure(genericData))", source)
         self.assertNotIn("card.append(narrative ? renderResultDisclosure(genericData) : genericData)", source)
+
+    def test_agent_history_mobile_and_accessibility_contracts(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        styles = STYLES.read_text(encoding="utf-8")
+        template = TEMPLATE.read_text(encoding="utf-8")
+
+        self.assertIn("closeHistoryRail({returnFocus: false})", source)
+        self.assertIn("promptInput.focus({preventScroll: true})", source)
+        self.assertIn("const switchBlocked = requestInFlight || confirmationInFlight || sessionResetInFlight", source)
+        self.assertIn("const newSessionBlocked = confirmationInFlight || sessionResetInFlight", source)
+        self.assertIn("停止当前任务并开始新会话", source)
+        self.assertIn("任务执行中，完成后可新建、切换或删除会话", source)
+        self.assertIn("syncSessionLifecycleControls();", source)
+        self.assertIn("const viewport = window.visualViewport", source)
+        self.assertIn("--agent-viewport-height", source)
+        self.assertIn("window.visualViewport.addEventListener('resize'", source)
+        self.assertIn('id="closeAgentShortcuts"', template)
+        self.assertIn("shortcutsClose?.focus({preventScroll: true})", source)
+        self.assertIn("toggleShortcutsTimeline(false, {restoreFocus: true})", source)
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"@media \(max-width: 680px\)[\s\S]*?"
+                r"\.agent-action-btn \{[^}]*width: 44px;[^}]*height: 44px;",
+                re.S,
+            ),
+        )
+        self.assertRegex(
+            styles,
+            re.compile(
+                r"@media \(max-width: 680px\)[\s\S]*?"
+                r"\.agent-send, \.agent-stop \{[^}]*width: 44px;[^}]*height: 44px;",
+                re.S,
+            ),
+        )
         self.assertNotIn("!narrative ? renderData(result.data) : null", source)
         self.assertIn("payload?.display?.guidance", source)
         self.assertIn("const MAX_GENERIC_SECTIONS = 4", source)

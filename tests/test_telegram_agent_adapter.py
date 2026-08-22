@@ -17,6 +17,7 @@ from app.bot.agent_adapter import (
     SQLiteTelegramAgentActionStore,
     TelegramAgentActionStore,
     _render_resource_candidates,
+    _resource_markup,
     _safe_callback_history_response,
     _resource_candidates,
     _stream_preview_html,
@@ -57,6 +58,7 @@ class _Bot:
         self.replies = []
         self.edits = []
         self.answers = []
+        self.keyboard_edits = []
 
     def reply_to(self, message, text, **kwargs):
         self.replies.append((message, text, kwargs))
@@ -66,6 +68,9 @@ class _Bot:
 
     def answer_callback_query(self, callback_id, text, **kwargs):
         self.answers.append((callback_id, text, kwargs))
+
+    def edit_message_reply_markup(self, chat_id, message_id, **kwargs):
+        self.keyboard_edits.append((chat_id, message_id, kwargs))
 
 
 class _InputRichMessage:
@@ -430,6 +435,68 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         now[0] = 106.0
         with self.assertRaises(ValueError):
             store.resolve(other, owner="owner-a")
+
+    def test_resource_page_is_owner_bound_grouped_and_one_time(self):
+        tokens = iter(["page-action", "resource-action"])
+        store = TelegramAgentActionStore(
+            ttl_seconds=60,
+            token_factory=lambda: next(tokens),
+        )
+        candidates = [
+            {
+                "result_id": f"resource_result_{index:02d}",
+                "title": f"候选 {index}",
+                "episode": "",
+                "site": "Demo",
+                "size": "1 GB",
+            }
+            for index in range(1, 5)
+        ]
+        page_action = store.create_resource_page(
+            owner="owner-a", candidates=candidates, page=1, group_id="message-page"
+        )
+        sibling = store.create_resource_prepare(
+            owner="owner-a",
+            result_id=candidates[0]["result_id"],
+            target="qb",
+            group_id="message-page",
+        )
+
+        with self.assertRaises(ValueError):
+            store.resolve(page_action, owner="owner-b")
+        resolved = store.resolve(page_action, owner="owner-a")
+        self.assertEqual(resolved["action"], "paginate_resources")
+        self.assertEqual(resolved["page"], 1)
+        self.assertEqual(len(resolved["candidates"]), 4)
+        with self.assertRaises(ValueError):
+            store.resolve(sibling, owner="owner-a")
+
+    def test_sqlite_resource_page_persists_across_store_instances(self):
+        first = SQLiteTelegramAgentActionStore(
+            ttl_seconds=60,
+            token_factory=lambda: "sqlite-page-action",
+        )
+        candidates = [
+            {
+                "result_id": f"sqlite_result_{index:02d}",
+                "title": f"候选 {index}",
+                "episode": "S01E01",
+                "site": "Demo",
+                "size": "2 GB",
+            }
+            for index in range(1, 5)
+        ]
+        action_id = first.create_resource_page(
+            owner="owner-a", candidates=candidates, page=1, group_id="sqlite-page"
+        )
+        second = SQLiteTelegramAgentActionStore(ttl_seconds=60)
+
+        resolved = second.resolve(action_id, owner="owner-a")
+        self.assertEqual(resolved["action"], "paginate_resources")
+        self.assertEqual(resolved["page"], 1)
+        self.assertEqual(resolved["candidates"][3]["title"], "候选 4")
+        with self.assertRaises(ValueError):
+            first.resolve(action_id, owner="owner-a")
 
     def test_read_tool_actions_are_strict_owner_bound_and_one_time(self):
         store = TelegramAgentActionStore(
@@ -866,6 +933,121 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["result_id"], "result_123456789")
         self.assertEqual(candidates[0]["title"], "庆余年 S02E01 2160p")
+
+    def test_resource_candidates_keep_nine_safe_items_for_pagination(self):
+        response = {
+            "tool_call": {"name": "indexer.search_resources"},
+            "result": {
+                "ok": True,
+                "data": {
+                    "items": [
+                        {
+                            "result_id": f"resource_result_{index:02d}",
+                            "title": f"候选资源 {index}",
+                            "site_name": "Demo",
+                            "size_text": "1 GB",
+                            "download_state": "ready",
+                            "download_kinds": ["magnet"],
+                        }
+                        for index in range(1, 11)
+                    ]
+                },
+            },
+        }
+
+        candidates = _resource_candidates(response)
+
+        self.assertEqual(len(candidates), 9)
+        self.assertEqual(candidates[-1]["result_id"], "resource_result_09")
+
+    def test_resource_markup_pages_candidates_and_callback_replaces_keyboard(self):
+        token_counter = iter(range(30))
+        store = TelegramAgentActionStore(
+            ttl_seconds=60,
+            token_factory=lambda: f"page-token-{next(token_counter)}",
+        )
+        candidates = [
+            {
+                "result_id": f"resource_result_{index:02d}",
+                "title": f"候选资源 {index}",
+                "episode": "",
+                "site": "Demo",
+                "size": "1 GB",
+            }
+            for index in range(1, 6)
+        ]
+        bot = _Bot()
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        with patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ):
+            markup = _resource_markup(
+                _Telebot, owner="tg:v1:100\x1f200", candidates=candidates
+            )
+        self.assertEqual(
+            [button.text for button in markup.buttons[:6]],
+            ["1 · qB", "1 · 光鸭", "2 · qB", "2 · 光鸭", "3 · qB", "3 · 光鸭"],
+        )
+        next_button = next(
+            button for button in markup.buttons if button.text.startswith("查看更多")
+        )
+        stale_first_page_action = markup.buttons[0].callback_data.split(":", 1)[1]
+
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ):
+            handle_agent_callback(
+                bot,
+                _callback(next_button.callback_data, callback_id="resource-page"),
+                _Telebot,
+            )
+
+        self.assertEqual(bot.answers[-1][1], "第 2/2 页")
+        self.assertIn("第 2/2 页", bot.edits[-1][0])
+        self.assertIn("<b>4.</b>", bot.edits[-1][0])
+        self.assertIn("<b>5.</b>", bot.edits[-1][0])
+        self.assertTrue(any(
+            button.text.startswith("◀ 上一页")
+            for button in bot.edits[-1][3]["reply_markup"].buttons
+        ))
+        with self.assertRaises(ValueError):
+            store.resolve(stale_first_page_action, owner="tg:v1:100\x1f200")
+
+    def test_expired_callback_immediately_removes_keyboard(self):
+        bot = _Bot()
+        store = TelegramAgentActionStore()
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ):
+            handle_agent_callback(
+                bot,
+                _callback("aga:expired-action", callback_id="expired-resource"),
+                _Telebot,
+            )
+
+        self.assertEqual(bot.answers[-1][1], "操作已过期或无效")
+        self.assertEqual(
+            bot.keyboard_edits,
+            [(100, 11, {"reply_markup": None})],
+        )
 
     def test_resource_candidate_message_keeps_candidates_outside_llm_narrative(self):
         response = {

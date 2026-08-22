@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Media Agent - MediaFlux{% endblock %}
 {% block body_class %}agent-page-body{% endblock %}
-{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/agent.css') }}?v=20260821a">{% endblock %}
+{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/agent.css') }}?v=20260822a">{% endblock %}
 {% block workspace_bar %}
 <div class="agent-mobile-bar">
     <button class="icon-btn workspace-menu-btn" id="toggleSidebar" aria-label="菜单" title="打开导航"><i data-lucide="menu"></i></button>
@@ -14,7 +14,7 @@
 
     <div class="agent-workbench">
         <section class="agent-console" aria-label="Agent 对话工作区">
-            <div class="agent-transcript" id="agentTranscript" role="log" aria-live="polite" aria-relevant="additions">
+            <div class="agent-transcript" id="agentTranscript" role="log" aria-live="off" aria-relevant="additions">
                 <article class="agent-message agent-message-system" data-agent-welcome>
                     <div class="agent-message-mark"><i data-lucide="sparkles"></i></div>
                     <div class="agent-message-body">
@@ -29,6 +29,7 @@
                 <div class="agent-shortcuts-timeline-popover" id="agentShortcutsTimeline" hidden>
                     <div class="agent-timeline-bubble-header">
                         <span class="agent-timeline-bubble-pill"><i data-lucide="sparkles"></i> 常用 Agent 任务</span>
+                        <button type="button" class="agent-shortcuts-close" id="closeAgentShortcuts" aria-label="关闭常用任务" title="关闭常用任务"><i data-lucide="x"></i></button>
                     </div>
                     <div class="agent-timeline-body">
                         <div class="agent-timeline-track">
@@ -156,7 +157,8 @@
                 <p class="sr-only" id="agentSessionStatus" role="status" aria-live="polite"></p>
             </section>
         </dialog>
+        <p class="sr-only" id="agentResponseStatus" role="status" aria-live="polite" aria-atomic="true"></p>
     </div>
 </section>
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('static', path='js/agent.js') }}?v=20260821a" defer></script>{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='js/agent.js') }}?v=20260822a" defer></script>{% endblock %}
