@@ -258,6 +258,93 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
+    def test_existing_v1_playback_sessions_gain_media_name_without_data_loss(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-playback-name-schema-") as root:
+            path = Path(root) / "v1-playback-name.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    "CREATE TABLE media_proxy_playback_sessions ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "instance_id INTEGER NOT NULL,"
+                    "session_key TEXT NOT NULL,"
+                    "media_item_id TEXT NOT NULL DEFAULT '',"
+                    "media_source_id TEXT NOT NULL DEFAULT '',"
+                    "guangya_file_id TEXT NOT NULL DEFAULT '',"
+                    "request_count INTEGER NOT NULL DEFAULT 0,"
+                    "success_count INTEGER NOT NULL DEFAULT 0,"
+                    "error_count INTEGER NOT NULL DEFAULT 0,"
+                    "cache_hit_count INTEGER NOT NULL DEFAULT 0,"
+                    "cache_miss_count INTEGER NOT NULL DEFAULT 0,"
+                    "upstream_latency_ms_total INTEGER NOT NULL DEFAULT 0,"
+                    "total_latency_ms_total INTEGER NOT NULL DEFAULT 0,"
+                    "max_total_latency_ms INTEGER NOT NULL DEFAULT 0,"
+                    "last_route_class TEXT NOT NULL DEFAULT '',"
+                    "last_source TEXT NOT NULL DEFAULT 'unknown',"
+                    "last_status_code INTEGER NOT NULL DEFAULT 0,"
+                    "last_failure_stage TEXT NOT NULL DEFAULT '',"
+                    "last_error TEXT NOT NULL DEFAULT '',"
+                    "started_at TEXT NOT NULL,"
+                    "last_request_at TEXT NOT NULL,"
+                    "UNIQUE(instance_id, session_key)"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE TABLE media_proxy_playback_records ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "instance_id INTEGER NOT NULL,"
+                    "session_id INTEGER,"
+                    "route_class TEXT NOT NULL,"
+                    "method TEXT NOT NULL,"
+                    "status_code INTEGER NOT NULL DEFAULT 0,"
+                    "source TEXT NOT NULL DEFAULT 'upstream',"
+                    "cache_hit INTEGER NOT NULL DEFAULT 0,"
+                    "upstream_latency_ms INTEGER NOT NULL DEFAULT 0,"
+                    "total_latency_ms INTEGER NOT NULL DEFAULT 0,"
+                    "failure_stage TEXT DEFAULT '',"
+                    "error TEXT DEFAULT '',"
+                    "created_at TEXT NOT NULL"
+                    ")"
+                )
+                conn.execute(
+                    "INSERT INTO media_proxy_playback_sessions("
+                    "instance_id,session_key,media_item_id,request_count,"
+                    "started_at,last_request_at"
+                    ") VALUES(7,'legacy-session','legacy-item',1,"
+                    "datetime('now','localtime'),datetime('now','localtime'))"
+                )
+                conn.execute(
+                    "INSERT INTO media_proxy_playback_records("
+                    "instance_id,session_id,route_class,method,status_code,source,created_at"
+                    ") VALUES(7,1,'stream','GET',206,'upstream',datetime('now','localtime'))"
+                )
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as conn:
+                    columns = {
+                        str(row["name"])
+                        for row in conn.execute(
+                            "PRAGMA table_info(media_proxy_playback_sessions)"
+                        )
+                    }
+                    media_name = conn.execute(
+                        "SELECT media_name FROM media_proxy_playback_sessions WHERE id=1"
+                    ).fetchone()["media_name"]
+                sessions = db.list_media_proxy_playback_sessions(instance_id=7)
+                self.assertIn("media_name", columns)
+                self.assertEqual(media_name, "")
+                self.assertEqual(sessions["total"], 1)
+                self.assertEqual(sessions["items"][0]["media_item_id"], "legacy-item")
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
     def test_registered_future_migration_advances_schema_version(self) -> None:
         previous_path = db.DB_PATH
         previous_test_mode = bool(getattr(db, "_configured_test_mode", False))

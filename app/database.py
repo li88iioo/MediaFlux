@@ -1486,6 +1486,7 @@ CREATE TABLE IF NOT EXISTS media_proxy_playback_sessions (
     session_key TEXT NOT NULL,
     media_item_id TEXT NOT NULL DEFAULT '',
     media_source_id TEXT NOT NULL DEFAULT '',
+    media_name TEXT NOT NULL DEFAULT '',
     guangya_file_id TEXT NOT NULL DEFAULT '',
     request_count INTEGER NOT NULL DEFAULT 0,
     success_count INTEGER NOT NULL DEFAULT 0,

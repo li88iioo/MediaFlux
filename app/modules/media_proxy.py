@@ -33,6 +33,7 @@ from app.clients.guangya import GuangYaClient
 from app.config import get
 from app.logger import get_logger
 from app.modules.media_proxy_recorder import PlaybackRecordWriter
+from app.modules.media_proxy_safety import safe_media_name as _safe_media_name
 from app.modules.media_server_profiles import resolve_proxy_instance
 
 logger = get_logger(__name__)
@@ -56,8 +57,12 @@ _BLOCKED_METADATA_IPS = {
     ipaddress.ip_address("fd00:ec2::254"),
 }
 _PLAYBACK_SESSION_QUERY_KEY = "_mfps"
+_PLAYBACK_SOURCE_QUERY_KEY = "_mfss"
+_PLAYBACK_AUTHORIZATION_TTL_SECONDS = 15 * 60
+_PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS = 12 * 60 * 60
 _SENSITIVE_QUERY_KEYS = {
-    "api_key", "x-emby-token", "x-mediabrowser-token", _PLAYBACK_SESSION_QUERY_KEY,
+    "api_key", "x-emby-token", "x-mediabrowser-token",
+    _PLAYBACK_SESSION_QUERY_KEY, _PLAYBACK_SOURCE_QUERY_KEY,
 }
 _AUTH_SCOPE_SECRET = secrets.token_bytes(32)
 _AUTH_TOKEN_RE = re.compile(
@@ -225,10 +230,11 @@ def _resolved_instance(instance_id: int) -> dict[str, Any] | None:
     return resolve_proxy_instance(row)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _DynamicGuangYaMapping:
     file_id: str
     expires_at: float
+    max_expires_at: float
 
 
 class DynamicGuangYaMappings:
@@ -236,11 +242,15 @@ class DynamicGuangYaMappings:
 
     def __init__(
         self,
-        ttl_seconds: float = 15 * 60,
+        ttl_seconds: float = _PLAYBACK_AUTHORIZATION_TTL_SECONDS,
+        max_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         max_entries: int = 4096,
     ) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_ttl_seconds = max(
+            self._ttl_seconds, float(max_ttl_seconds)
+        )
         self._clock = clock
         self._max_entries = max(1, int(max_entries))
         self._entries: OrderedDict[
@@ -267,6 +277,7 @@ class DynamicGuangYaMappings:
             self._entries[key] = _DynamicGuangYaMapping(
                 file_id=normalized_file,
                 expires_at=now + self._ttl_seconds,
+                max_expires_at=now + self._max_ttl_seconds,
             )
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
@@ -274,10 +285,22 @@ class DynamicGuangYaMappings:
     def _prune_expired_locked(self, now: float) -> None:
         expired = [
             key for key, entry in self._entries.items()
-            if entry.expires_at <= now
+            if entry.expires_at <= now or entry.max_expires_at <= now
         ]
         for key in expired:
             self._entries.pop(key, None)
+
+    def _touch_locked(
+        self,
+        key: tuple[int, str, str],
+        entry: _DynamicGuangYaMapping,
+        now: float,
+    ) -> _DynamicGuangYaMapping:
+        entry.expires_at = min(
+            entry.max_expires_at, now + self._ttl_seconds
+        )
+        self._entries.move_to_end(key)
+        return entry
 
     def get(self, instance_id: int, item_id: str, source_id: str = "") -> str | None:
         now = self._clock()
@@ -290,8 +313,7 @@ class DynamicGuangYaMappings:
                 key = (instance_key, item_key, source_key)
                 entry = self._entries.get(key)
                 if entry:
-                    self._entries.move_to_end(key)
-                    return entry.file_id
+                    return self._touch_locked(key, entry, now).file_id
                 return None
 
             matching = [
@@ -302,7 +324,9 @@ class DynamicGuangYaMappings:
             candidates = {file_id for _, file_id in matching}
             if len(candidates) == 1:
                 for key, _ in matching:
-                    self._entries.move_to_end(key)
+                    entry = self._entries.get(key)
+                    if entry is not None:
+                        self._touch_locked(key, entry, now)
                 return next(iter(candidates))
             return None
 
@@ -568,10 +592,11 @@ class SignedUrlCacheResult:
     cache_hit: bool
 
 
-@dataclass(frozen=True)
+@dataclass
 class _ItemBindingScope:
     binding_signature: str
     expires_at: float
+    max_expires_at: float
 
 
 class ItemLevelBindingScopes:
@@ -579,11 +604,15 @@ class ItemLevelBindingScopes:
 
     def __init__(
         self,
-        ttl_seconds: float = 15 * 60,
+        ttl_seconds: float = _PLAYBACK_AUTHORIZATION_TTL_SECONDS,
+        max_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         max_entries: int = 4096,
     ) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_ttl_seconds = max(
+            self._ttl_seconds, float(max_ttl_seconds)
+        )
         self._clock = clock
         self._max_entries = max(1, int(max_entries))
         self._entries: OrderedDict[
@@ -594,10 +623,21 @@ class ItemLevelBindingScopes:
     def _prune_expired_locked(self, now: float) -> None:
         expired = [
             key for key, entry in self._entries.items()
-            if entry.expires_at <= now
+            if entry.expires_at <= now or entry.max_expires_at <= now
         ]
         for key in expired:
             self._entries.pop(key, None)
+
+    def _touch_locked(
+        self,
+        key: tuple[str, int, str, str],
+        entry: _ItemBindingScope,
+        now: float,
+    ) -> None:
+        entry.expires_at = min(
+            entry.max_expires_at, now + self._ttl_seconds
+        )
+        self._entries.move_to_end(key)
 
     def register(
         self,
@@ -615,6 +655,7 @@ class ItemLevelBindingScopes:
             self._entries[key] = _ItemBindingScope(
                 binding_signature=str(binding_signature),
                 expires_at=now + self._ttl_seconds,
+                max_expires_at=now + self._max_ttl_seconds,
             )
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
@@ -629,10 +670,11 @@ class ItemLevelBindingScopes:
     ) -> bool:
         key = (str(auth_scope or ""), int(instance_id), str(item_id or ""), str(source_id or ""))
         with self._lock:
-            self._prune_expired_locked(self._clock())
+            now = self._clock()
+            self._prune_expired_locked(now)
             entry = self._entries.get(key)
             if entry and entry.binding_signature == str(binding_signature):
-                self._entries.move_to_end(key)
+                self._touch_locked(key, entry, now)
                 return True
             return False
 
@@ -644,7 +686,8 @@ class ItemLevelBindingScopes:
         auth_scope: str = "",
     ) -> bool:
         with self._lock:
-            self._prune_expired_locked(self._clock())
+            now = self._clock()
+            self._prune_expired_locked(now)
             matches = [
                 key for key, entry in self._entries.items()
                 if key[0] == str(auth_scope or "")
@@ -653,7 +696,10 @@ class ItemLevelBindingScopes:
                 and entry.binding_signature == str(binding_signature)
             ]
             if len(matches) == 1:
-                self._entries.move_to_end(matches[0])
+                key = matches[0]
+                entry = self._entries.get(key)
+                if entry is not None:
+                    self._touch_locked(key, entry, now)
                 return True
             return False
 
@@ -665,28 +711,48 @@ class ItemLevelBindingScopes:
 _dynamic_guangya_mappings = DynamicGuangYaMappings()
 _item_level_binding_scopes = ItemLevelBindingScopes()
 
-@dataclass(frozen=True)
+@dataclass
 class _PlaybackGrant:
     source_type: str
     file_id: str
     binding_signature: str
     expires_at: float
+    max_expires_at: float
 
 
 class PlaybackGrantRegistry:
     """按不可逆认证 scope 隔离的短时播放授权；不保存原始凭据。"""
 
-    def __init__(self, ttl_seconds: float = 15 * 60, max_entries: int = 8192,
+    def __init__(self, ttl_seconds: float = _PLAYBACK_AUTHORIZATION_TTL_SECONDS,
+                 max_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS,
+                 max_entries: int = 8192,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_ttl_seconds = max(
+            self._ttl_seconds, float(max_ttl_seconds)
+        )
         self._max_entries = max(1, int(max_entries))
         self._clock = clock
         self._entries: OrderedDict[tuple[str, int, str, str], _PlaybackGrant] = OrderedDict()
         self._lock = threading.RLock()
 
     def _prune_locked(self, now: float) -> None:
-        for key in [key for key, value in self._entries.items() if value.expires_at <= now]:
+        for key in [
+            key for key, value in self._entries.items()
+            if value.expires_at <= now or value.max_expires_at <= now
+        ]:
             self._entries.pop(key, None)
+
+    def _touch_locked(
+        self,
+        key: tuple[str, int, str, str],
+        grant: _PlaybackGrant,
+        now: float,
+    ) -> None:
+        grant.expires_at = min(
+            grant.max_expires_at, now + self._ttl_seconds
+        )
+        self._entries.move_to_end(key)
 
     def register(self, auth_scope: str, instance_id: int, item_id: str, source_id: str,
                  *, source_type: str, file_id: str = "", binding_signature: str = "") -> None:
@@ -695,8 +761,13 @@ class PlaybackGrantRegistry:
         key = (auth_scope, int(instance_id), str(item_id or ""), str(source_id or ""))
         with self._lock:
             now = self._clock(); self._prune_locked(now); self._entries.pop(key, None)
-            self._entries[key] = _PlaybackGrant(str(source_type), str(file_id or ""),
-                                                str(binding_signature or ""), now + self._ttl_seconds)
+            self._entries[key] = _PlaybackGrant(
+                str(source_type),
+                str(file_id or ""),
+                str(binding_signature or ""),
+                now + self._ttl_seconds,
+                now + self._max_ttl_seconds,
+            )
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
 
@@ -705,7 +776,8 @@ class PlaybackGrantRegistry:
         if not auth_scope:
             return False
         with self._lock:
-            self._prune_locked(self._clock())
+            now = self._clock()
+            self._prune_locked(now)
             keys = [(auth_scope, int(instance_id), str(item_id or ""), str(source_id or ""))]
             if not source_id:
                 keys = [key for key in self._entries if key[:3] == (auth_scope, int(instance_id), str(item_id or ""))]
@@ -717,16 +789,29 @@ class PlaybackGrantRegistry:
                 if binding_signature and grant.binding_signature != str(binding_signature): continue
                 matches.append(key)
             if len(matches) == 1:
-                self._entries.move_to_end(matches[0]); return True
+                key = matches[0]
+                grant = self._entries.get(key)
+                if grant is not None:
+                    self._touch_locked(key, grant, now)
+                return True
             return False
 
     def allows_file(self, auth_scope: str, instance_id: int, file_id: str) -> bool:
         if not auth_scope or not file_id: return False
         with self._lock:
-            self._prune_locked(self._clock())
-            for key, grant in self._entries.items():
-                if key[0] == auth_scope and key[1] == int(instance_id) and grant.file_id == str(file_id):
-                    self._entries.move_to_end(key); return True
+            now = self._clock()
+            self._prune_locked(now)
+            matches = [
+                (key, grant)
+                for key, grant in self._entries.items()
+                if key[0] == auth_scope
+                and key[1] == int(instance_id)
+                and grant.file_id == str(file_id)
+            ]
+            if len(matches) == 1:
+                key, grant = matches[0]
+                self._touch_locked(key, grant, now)
+                return True
             return False
 
     def clear(self) -> None:
@@ -734,6 +819,31 @@ class PlaybackGrantRegistry:
 
 
 _playback_grants = PlaybackGrantRegistry()
+
+
+def _playback_media_name(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("Name", "ItemName", "Title"):
+        name = _safe_media_name(payload.get(key))
+        if name:
+            return name
+    media_sources = payload.get("MediaSources")
+    if not isinstance(media_sources, list):
+        return ""
+    for source in media_sources:
+        if not isinstance(source, dict):
+            continue
+        name = _safe_media_name(source.get("Path"), path_value=True)
+        if name:
+            return name
+    for source in media_sources:
+        if not isinstance(source, dict):
+            continue
+        name = _safe_media_name(source.get("Name"))
+        if name:
+            return name
+    return ""
 
 
 @dataclass
@@ -744,18 +854,39 @@ class _PlaybackSessionLink:
     item_id: str
     source_id: str
     file_id: str
+    media_name: str
+    upstream_session_token: str
     expires_at: float
+    capability_expires_at: float
 
 
 class PlaybackSessionRegistry:
     """把一次 PlaybackInfo/stream/HLS 请求链关联为不含原始凭据的短时会话。"""
 
-    def __init__(self, ttl_seconds: float = 30 * 60, max_entries: int = 8192,
+    def __init__(self, ttl_seconds: float = 30 * 60,
+                 capability_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_TTL_SECONDS,
+                 capability_max_ttl_seconds: float = _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS,
+                 max_entries: int = 8192,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._capability_ttl_seconds = max(1.0, float(capability_ttl_seconds))
+        self._capability_max_ttl_seconds = max(
+            self._capability_ttl_seconds,
+            float(capability_max_ttl_seconds),
+        )
         self._max_entries = max(1, int(max_entries))
+        self._max_capabilities = max(4, self._max_entries * 4)
         self._clock = clock
         self._entries: OrderedDict[tuple[str, int, str], _PlaybackSessionLink] = OrderedDict()
+        self._capability_index: OrderedDict[
+            tuple[int, str], tuple[tuple[str, int, str], float, float]
+        ] = OrderedDict()
+        self._entry_capabilities: dict[
+            tuple[str, int, str], set[tuple[int, str]]
+        ] = {}
+        self._upstream_session_index: dict[
+            tuple[str, int, str], tuple[str, int, str]
+        ] = {}
         self._lock = threading.RLock()
 
     @staticmethod
@@ -763,31 +894,136 @@ class PlaybackSessionRegistry:
         token = str(value or "").strip()
         return token if 0 < len(token) <= 256 else ""
 
+    def _set_upstream_session_locked(
+        self,
+        key: tuple[str, int, str],
+        entry: _PlaybackSessionLink,
+        token: str,
+    ) -> None:
+        normalized_token = self._token(token)
+        if not normalized_token:
+            return
+        previous = entry.upstream_session_token
+        if previous and previous != normalized_token:
+            previous_key = (entry.auth_scope, entry.instance_id, previous)
+            if self._upstream_session_index.get(previous_key) == key:
+                self._upstream_session_index.pop(previous_key, None)
+        entry.upstream_session_token = normalized_token
+        self._upstream_session_index[
+            (entry.auth_scope, entry.instance_id, normalized_token)
+        ] = key
+
+    def _refresh_capability_expiry_locked(
+        self, key: tuple[str, int, str]
+    ) -> None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return
+        entry.capability_expires_at = max(
+            (
+                self._capability_index[capability_key][1]
+                for capability_key in self._entry_capabilities.get(key, set())
+                if capability_key in self._capability_index
+            ),
+            default=0.0,
+        )
+
+    def _remove_capability_locked(self, capability_key: tuple[int, str]) -> None:
+        linked = self._capability_index.pop(capability_key, None)
+        if linked is None:
+            return
+        key, _expires_at, _max_expires_at = linked
+        capabilities = self._entry_capabilities.get(key)
+        if capabilities is not None:
+            capabilities.discard(capability_key)
+            if not capabilities:
+                self._entry_capabilities.pop(key, None)
+        self._refresh_capability_expiry_locked(key)
+
+    def _register_capability_locked(
+        self,
+        key: tuple[str, int, str],
+        entry: _PlaybackSessionLink,
+        token: str,
+        expires_at: float,
+        max_expires_at: float,
+    ) -> None:
+        capability_key = (entry.instance_id, token)
+        if capability_key in self._capability_index:
+            self._remove_capability_locked(capability_key)
+        self._capability_index[capability_key] = (
+            key,
+            min(expires_at, max_expires_at),
+            max_expires_at,
+        )
+        self._entry_capabilities.setdefault(key, set()).add(capability_key)
+        entry.capability_expires_at = max(entry.capability_expires_at, expires_at)
+        while len(self._capability_index) > self._max_capabilities:
+            oldest = next(iter(self._capability_index))
+            self._remove_capability_locked(oldest)
+
+    def _prune_capabilities_locked(self, now: float) -> None:
+        for capability_key in [
+            capability_key
+            for capability_key, (
+                _key, expires_at, max_expires_at
+            ) in self._capability_index.items()
+            if expires_at <= now or max_expires_at <= now
+        ]:
+            self._remove_capability_locked(capability_key)
+
+    def _remove_locked(self, key: tuple[str, int, str]) -> _PlaybackSessionLink | None:
+        entry = self._entries.pop(key, None)
+        for capability_key in list(self._entry_capabilities.pop(key, set())):
+            self._capability_index.pop(capability_key, None)
+        if entry and entry.upstream_session_token:
+            upstream_key = (
+                entry.auth_scope, entry.instance_id, entry.upstream_session_token
+            )
+            if self._upstream_session_index.get(upstream_key) == key:
+                self._upstream_session_index.pop(upstream_key, None)
+        return entry
+
     def _prune_locked(self, now: float) -> None:
-        for key in [key for key, value in self._entries.items() if value.expires_at <= now]:
-            self._entries.pop(key, None)
+        for key in [
+            key for key, value in self._entries.items()
+            if value.expires_at <= now
+        ]:
+            self._remove_locked(key)
+
+    def _enforce_capacity_locked(self) -> None:
+        while len(self._entries) > self._max_entries:
+            key = next(iter(self._entries))
+            self._remove_locked(key)
 
     def _touch_locked(self, key: tuple[str, int, str], entry: _PlaybackSessionLink,
                       *, item_id: str = "", source_id: str = "",
-                      file_id: str = "") -> _PlaybackSessionLink:
+                      file_id: str = "", media_name: str = "",
+                      upstream_session_token: str = "") -> _PlaybackSessionLink:
         if item_id:
             entry.item_id = str(item_id)
         if source_id:
             entry.source_id = str(source_id)
         if file_id:
             entry.file_id = str(file_id)
+        if media_name:
+            entry.media_name = str(media_name)
+        if upstream_session_token:
+            self._set_upstream_session_locked(key, entry, upstream_session_token)
         entry.expires_at = self._clock() + self._ttl_seconds
         self._entries.move_to_end(key)
         return entry
 
     def begin(self, auth_scope: str, instance_id: int, *, token: str = "",
-              item_id: str = "", source_id: str = "",
-              file_id: str = "") -> _PlaybackSessionLink:
+              item_id: str = "", source_id: str = "", file_id: str = "",
+              media_name: str = "", upstream_session_token: str = "",
+              server_capability: bool = False) -> _PlaybackSessionLink:
         normalized_token = self._token(token) or secrets.token_urlsafe(24)
         key = (str(auth_scope or ""), int(instance_id), normalized_token)
         with self._lock:
             now = self._clock()
             self._prune_locked(now)
+            self._prune_capabilities_locked(now)
             entry = self._entries.get(key)
             if entry is None:
                 entry = _PlaybackSessionLink(
@@ -797,20 +1033,208 @@ class PlaybackSessionRegistry:
                     item_id=str(item_id or ""),
                     source_id=str(source_id or ""),
                     file_id=str(file_id or ""),
+                    media_name=str(media_name or ""),
+                    upstream_session_token="",
                     expires_at=now + self._ttl_seconds,
+                    capability_expires_at=0.0,
                 )
                 self._entries[key] = entry
+                if upstream_session_token:
+                    self._set_upstream_session_locked(
+                        key, entry, upstream_session_token
+                    )
             else:
                 self._touch_locked(
-                    key, entry, item_id=item_id, source_id=source_id, file_id=file_id
+                    key,
+                    entry,
+                    item_id=item_id,
+                    source_id=source_id,
+                    file_id=file_id,
+                    media_name=media_name,
+                    upstream_session_token=upstream_session_token,
                 )
-            while len(self._entries) > self._max_entries:
-                self._entries.popitem(last=False)
+            if server_capability:
+                self._register_capability_locked(
+                    key,
+                    entry,
+                    normalized_token,
+                    now + self._capability_ttl_seconds,
+                    now + self._capability_max_ttl_seconds,
+                )
+            self._enforce_capacity_locked()
             return entry
+
+    def _upstream_entry_locked(
+        self,
+        auth_scope: str,
+        instance_id: int,
+        upstream_session_token: str,
+        item_id: str,
+    ) -> tuple[tuple[str, int, str], _PlaybackSessionLink] | None:
+        alias_key = (auth_scope, instance_id, upstream_session_token)
+        key = self._upstream_session_index.get(alias_key)
+        if key is None and alias_key in self._entries:
+            key = alias_key
+        if key is None:
+            return None
+        entry = self._entries.get(key)
+        if entry is None:
+            self._upstream_session_index.pop(alias_key, None)
+            return None
+        if item_id and entry.item_id and entry.item_id != item_id:
+            return None
+        return key, entry
+
+    def finalize_capability(
+        self,
+        auth_scope: str,
+        instance_id: int,
+        token: str,
+        *,
+        item_id: str = "",
+        media_name: str = "",
+        upstream_session_token: str = "",
+    ) -> _PlaybackSessionLink:
+        """成功重写 PlaybackInfo 后签发 capability，并绑定上游播放会话别名。"""
+        normalized_scope = str(auth_scope or "")
+        normalized_instance = int(instance_id)
+        normalized_token = self._token(token) or secrets.token_urlsafe(24)
+        normalized_upstream = self._token(upstream_session_token)
+        normalized_item = str(item_id or "")
+        with self._lock:
+            now = self._clock()
+            self._prune_locked(now)
+            self._prune_capabilities_locked(now)
+            resolved = None
+            if normalized_upstream:
+                resolved = self._upstream_entry_locked(
+                    normalized_scope,
+                    normalized_instance,
+                    normalized_upstream,
+                    normalized_item,
+                )
+            if resolved is not None:
+                key, entry = resolved
+                self._touch_locked(
+                    key,
+                    entry,
+                    item_id=normalized_item,
+                    media_name=media_name,
+                    upstream_session_token=normalized_upstream,
+                )
+            else:
+                canonical_token = normalized_upstream or normalized_token
+                key = (normalized_scope, normalized_instance, canonical_token)
+                entry = self._entries.get(key)
+                if (
+                    entry is not None
+                    and normalized_item
+                    and entry.item_id
+                    and entry.item_id != normalized_item
+                ):
+                    key = (normalized_scope, normalized_instance, normalized_token)
+                    entry = self._entries.get(key)
+                    normalized_upstream = ""
+                if entry is None:
+                    entry = _PlaybackSessionLink(
+                        token=key[2],
+                        auth_scope=key[0],
+                        instance_id=key[1],
+                        item_id=normalized_item,
+                        source_id="",
+                        file_id="",
+                        media_name=str(media_name or ""),
+                        upstream_session_token="",
+                        expires_at=now + self._ttl_seconds,
+                        capability_expires_at=0.0,
+                    )
+                    self._entries[key] = entry
+                else:
+                    self._touch_locked(
+                        key,
+                        entry,
+                        item_id=normalized_item,
+                        media_name=media_name,
+                    )
+                if normalized_upstream:
+                    self._set_upstream_session_locked(
+                        key, entry, normalized_upstream
+                    )
+            self._register_capability_locked(
+                key,
+                entry,
+                normalized_token,
+                now + self._capability_ttl_seconds,
+                now + self._capability_max_ttl_seconds,
+            )
+            self._enforce_capacity_locked()
+            return entry
+
+    def resolve_capability(
+        self,
+        instance_id: int,
+        token: str,
+        *,
+        item_id: str = "",
+        source_id: str = "",
+        source_signature: str = "",
+    ) -> _PlaybackSessionLink | None:
+        """用服务端生成的短时 token 恢复认证 scope，不保存或暴露原始凭据。"""
+        normalized_instance = int(instance_id)
+        normalized_token = self._token(token)
+        if not normalized_token:
+            return None
+        with self._lock:
+            now = self._clock()
+            capability_key = (normalized_instance, normalized_token)
+            linked = self._capability_index.get(capability_key)
+            if linked is None:
+                return None
+            key, capability_expires_at, capability_max_expires_at = linked
+            entry = self._entries.get(key)
+            if entry is None:
+                self._remove_capability_locked(capability_key)
+                return None
+            if entry.expires_at <= now:
+                self._remove_locked(key)
+                return None
+            if (
+                not entry.auth_scope
+                or capability_expires_at <= now
+                or capability_max_expires_at <= now
+            ):
+                self._remove_capability_locked(capability_key)
+                return None
+            if item_id and entry.item_id and entry.item_id != str(item_id):
+                return None
+            expected_source_signature = _playback_source_signature(
+                normalized_instance,
+                str(item_id or entry.item_id),
+                str(source_id or ""),
+                normalized_token,
+            )
+            if not source_signature or not hmac.compare_digest(
+                str(source_signature), expected_source_signature
+            ):
+                return None
+            renewed_expires_at = min(
+                capability_max_expires_at,
+                now + self._capability_ttl_seconds,
+            )
+            self._capability_index[capability_key] = (
+                key,
+                renewed_expires_at,
+                capability_max_expires_at,
+            )
+            self._capability_index.move_to_end(capability_key)
+            self._refresh_capability_expiry_locked(key)
+            return self._touch_locked(
+                key, entry, item_id=item_id, source_id=source_id
+            )
 
     def resolve(self, auth_scope: str, instance_id: int, *, token: str = "",
                 item_id: str = "", source_id: str = "", file_id: str = "",
-                create: bool = False) -> _PlaybackSessionLink | None:
+                media_name: str = "", create: bool = False) -> _PlaybackSessionLink | None:
         normalized_scope = str(auth_scope or "")
         normalized_instance = int(instance_id)
         normalized_token = self._token(token)
@@ -819,14 +1243,45 @@ class PlaybackSessionRegistry:
             if normalized_token:
                 key = (normalized_scope, normalized_instance, normalized_token)
                 entry = self._entries.get(key)
+                if entry is None:
+                    alias_key = (normalized_scope, normalized_instance, normalized_token)
+                    canonical_key = self._upstream_session_index.get(alias_key)
+                    if canonical_key is not None:
+                        entry = self._entries.get(canonical_key)
+                        if entry is None:
+                            self._upstream_session_index.pop(alias_key, None)
+                        else:
+                            key = canonical_key
+                if (
+                    entry is not None
+                    and item_id
+                    and entry.item_id
+                    and entry.item_id != str(item_id)
+                ):
+                    if create:
+                        return self.begin(
+                            normalized_scope,
+                            normalized_instance,
+                            item_id=item_id,
+                            source_id=source_id,
+                            file_id=file_id,
+                            media_name=media_name,
+                        )
+                    return None
                 if entry is not None:
                     return self._touch_locked(
-                        key, entry, item_id=item_id, source_id=source_id, file_id=file_id
+                        key,
+                        entry,
+                        item_id=item_id,
+                        source_id=source_id,
+                        file_id=file_id,
+                        media_name=media_name,
                     )
                 if create:
                     return self.begin(
                         normalized_scope, normalized_instance, token=normalized_token,
                         item_id=item_id, source_id=source_id, file_id=file_id,
+                        media_name=media_name,
                     )
                 return None
 
@@ -858,13 +1313,22 @@ class PlaybackSessionRegistry:
             if len(preferred) == 1:
                 key, entry = preferred[0]
                 return self._touch_locked(
-                    key, entry, item_id=item_id, source_id=source_id, file_id=file_id
+                    key,
+                    entry,
+                    item_id=item_id,
+                    source_id=source_id,
+                    file_id=file_id,
+                    media_name=media_name,
                 )
 
         if create and (item_id or file_id):
             return self.begin(
-                normalized_scope, normalized_instance,
-                item_id=item_id, source_id=source_id, file_id=file_id,
+                normalized_scope,
+                normalized_instance,
+                item_id=item_id,
+                source_id=source_id,
+                file_id=file_id,
+                media_name=media_name,
             )
         return None
 
@@ -879,6 +1343,9 @@ class PlaybackSessionRegistry:
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._capability_index.clear()
+            self._entry_capabilities.clear()
+            self._upstream_session_index.clear()
 
 
 _playback_sessions = PlaybackSessionRegistry()
@@ -889,17 +1356,42 @@ def _apply_playback_session(request: Request, entry: _PlaybackSessionLink | None
         return
     request.state.proxy_playback_session_token = entry.token
     request.state.proxy_playback_session_key = _playback_sessions.persistent_key(entry)
-    request.state.proxy_media_item_id = entry.item_id
-    request.state.proxy_media_source_id = entry.source_id
-    request.state.proxy_guangya_file_id = entry.file_id
+    if entry.item_id:
+        request.state.proxy_media_item_id = entry.item_id
+    if entry.source_id:
+        request.state.proxy_media_source_id = entry.source_id
+    if entry.file_id:
+        request.state.proxy_guangya_file_id = entry.file_id
+    if entry.media_name:
+        request.state.proxy_media_name = entry.media_name
 
 
 def _request_query_value(request: Request, *names: str) -> str:
+    values = _request_query_values(request, *names)
+    return values[0] if values else ""
+
+
+def _request_query_values(request: Request, *names: str) -> list[str]:
     accepted = {str(name).lower() for name in names}
+    values: list[str] = []
     for key, value in request.query_params.multi_items():
         if str(key).lower() in accepted and str(value or "").strip():
-            return str(value).strip()
-    return ""
+            values.append(str(value).strip())
+    return values
+
+
+def _request_query_has_conflicting_values(
+    request: Request, *names: str
+) -> bool:
+    accepted = {str(name).lower() for name in names}
+    values = [
+        str(value or "").strip()
+        for key, value in request.query_params.multi_items()
+        if str(key).lower() in accepted
+    ]
+    if len(values) <= 1:
+        return False
+    return not values[0] or any(value != values[0] for value in values[1:])
 
 
 def _extract_guangya_file_id(value: Any) -> str | None:
@@ -936,6 +1428,7 @@ def _direct_stream_path(
     source_id: str = "",
     prefix: str = "",
     playback_session_token: str = "",
+    playback_source_signature: str = "",
 ) -> str:
     path = f"{prefix}/Videos/{quote(str(item_id), safe='')}/stream"
     query: list[str] = []
@@ -944,6 +1437,11 @@ def _direct_stream_path(
     if playback_session_token:
         query.append(
             f"{_PLAYBACK_SESSION_QUERY_KEY}={quote(str(playback_session_token), safe='')}"
+        )
+    if playback_source_signature:
+        query.append(
+            f"{_PLAYBACK_SOURCE_QUERY_KEY}="
+            f"{quote(str(playback_source_signature), safe='')}"
         )
     return f"{path}?{'&'.join(query)}" if query else path
 
@@ -1271,6 +1769,22 @@ def _auth_scope_fingerprint(credential: str) -> str:
     return hmac.new(_AUTH_SCOPE_SECRET, value, hashlib.sha256).hexdigest() if value else ""
 
 
+def _playback_source_signature(
+    instance_id: int,
+    item_id: str,
+    source_id: str,
+    playback_session_token: str,
+) -> str:
+    token = str(playback_session_token or "").strip()
+    if not token:
+        return ""
+    payload = (
+        f"mediaflux-playback-source\0{int(instance_id)}\0{item_id}\0"
+        f"{source_id}\0{token}"
+    ).encode("utf-8")
+    return hmac.new(_AUTH_SCOPE_SECRET, payload, hashlib.sha256).hexdigest()[:48]
+
+
 def _request_auth_scope(request: Any) -> str:
     return _auth_scope_fingerprint(_request_auth_credential(request))
 
@@ -1456,6 +1970,9 @@ def rewrite_playback_info(
         if not isinstance(source, dict):
             continue
         source_id = str(source.get("Id") or "")
+        source_signature = _playback_source_signature(
+            instance_id, item_id, source_id, playback_session_token
+        )
         binding = _media_proxy_binding(
             instance_id,
             item_id,
@@ -1465,14 +1982,24 @@ def rewrite_playback_info(
         )
         if binding:
             direct_url = _direct_stream_path(
-                item_id, source_id, route_prefix, playback_session_token
+                item_id,
+                source_id,
+                route_prefix,
+                playback_session_token,
+                source_signature,
             )
             # 真实数据库绑定始终含 media_source_id；旧式无该字段的绑定对象保留旧 Path。
-            path = direct_url if _binding_has_field(binding, "media_source_id") else _direct_stream_path(
-                item_id,
-                prefix=route_prefix,
-                playback_session_token=playback_session_token,
-            )
+            if _binding_has_field(binding, "media_source_id"):
+                path = direct_url
+            else:
+                path = _direct_stream_path(
+                    item_id,
+                    prefix=route_prefix,
+                    playback_session_token=playback_session_token,
+                    playback_source_signature=_playback_source_signature(
+                        instance_id, item_id, "", playback_session_token
+                    ),
+                )
             _mark_direct_source(source, path, direct_url)
             if not str(_binding_value(binding, "media_source_id") or "").strip():
                 _item_level_binding_scopes.register(
@@ -1502,7 +2029,11 @@ def rewrite_playback_info(
         _mark_direct_source(
             source,
             _direct_stream_path(
-                item_id, source_id, route_prefix, playback_session_token
+                item_id,
+                source_id,
+                route_prefix,
+                playback_session_token,
+                source_signature,
             ),
         )
         changed = True
@@ -1590,39 +2121,78 @@ def create_proxy_app(
     @app.middleware("http")
     async def record_playback_attempt(request: Request, call_next):
         route_class = classify_proxy_route(request.url.path, request.method)
-        auth_scope = _auth_scope_fingerprint(_request_auth_credential(request))
+        credential = _request_auth_credential(request)
+        auth_scope = _auth_scope_fingerprint(credential)
         playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
         stream_match = _STREAM_RE.match(request.url.path)
         item_id = (playback_match or stream_match).group(1) if (playback_match or stream_match) else ""
-        source_id = _request_query_value(request, "MediaSourceId")
-        file_id = _extract_guangya_file_id(str(request.url)) or ""
-        session_token = _request_query_value(
-            request, _PLAYBACK_SESSION_QUERY_KEY, "PlaySessionId"
+        source_values = _request_query_values(request, "MediaSourceId")
+        source_id = source_values[0] if source_values else ""
+        source_ambiguous = _request_query_has_conflicting_values(
+            request, "MediaSourceId"
         )
+        file_id = _extract_guangya_file_id(str(request.url)) or ""
+        media_name = (
+            _safe_media_name(str(request.url), path_value=True)
+            if route_class == "guangya_direct" else ""
+        )
+        capability_token = _request_query_value(request, _PLAYBACK_SESSION_QUERY_KEY)
+        source_signature = _request_query_value(request, _PLAYBACK_SOURCE_QUERY_KEY)
+        upstream_session_token = _request_query_value(request, "PlaySessionId")
+        capability_authorized = False
+        capability_rejected = False
         if route_class == "playback_info":
+            # 仅在上游 PlaybackInfo 成功且即将返回重写响应时签发 capability；
+            # 失败/非法响应不得占用 capability 索引或驱逐正在播放的会话。
+            playback_session = None
+        elif capability_token:
+            playback_session = None
+            if stream_match and request.method in {"GET", "HEAD"}:
+                candidate = _playback_sessions.resolve_capability(
+                    instance_id,
+                    capability_token,
+                    item_id=item_id,
+                    source_id=source_id,
+                    source_signature=source_signature,
+                )
+                if candidate is not None and (
+                    not auth_scope or candidate.auth_scope == auth_scope
+                ):
+                    playback_session = candidate
+                    if not auth_scope:
+                        auth_scope = candidate.auth_scope
+                        capability_authorized = True
+                else:
+                    capability_rejected = True
+            else:
+                capability_rejected = True
+        elif route_class == "guangya_direct" and not upstream_session_token:
             playback_session = _playback_sessions.begin(
-                auth_scope, instance_id, token=session_token, item_id=item_id
-            )
-        elif route_class == "guangya_direct" and not session_token:
-            playback_session = _playback_sessions.begin(
-                auth_scope, instance_id, file_id=file_id
+                auth_scope, instance_id, file_id=file_id, media_name=media_name
             )
         else:
             playback_session = _playback_sessions.resolve(
                 auth_scope,
                 instance_id,
-                token=session_token,
+                token=upstream_session_token,
                 item_id=item_id,
                 source_id=source_id,
                 file_id=file_id,
-                create=bool(session_token) or route_class in {"stream", "guangya_direct"},
+                media_name=media_name,
+                create=(
+                    bool(upstream_session_token)
+                    or route_class in {"stream", "guangya_direct"}
+                ),
             )
         request.state.proxy_auth_scope = auth_scope
+        request.state.proxy_capability_authorized = capability_authorized
+        request.state.proxy_source_ambiguous = source_ambiguous
         request.state.proxy_playback_session_token = ""
         request.state.proxy_playback_session_key = ""
         request.state.proxy_media_item_id = item_id
         request.state.proxy_media_source_id = source_id
         request.state.proxy_guangya_file_id = file_id
+        request.state.proxy_media_name = media_name
         _apply_playback_session(request, playback_session)
         request.state.proxy_route_class = route_class
         request.state.proxy_source = {
@@ -1639,10 +2209,24 @@ def create_proxy_app(
         request.state.proxy_cache_hit = False
         request.state.proxy_upstream_latency_ms = 0
         request.state.proxy_failure_stage = ""
+        if source_ambiguous and stream_match:
+            request.state.proxy_failure_stage = "query_parameters"
+        elif capability_rejected:
+            request.state.proxy_failure_stage = "playback_capability"
         started = time.monotonic()
         response: Response | None = None
         error_type = ""
         try:
+            if source_ambiguous and stream_match:
+                response = JSONResponse(
+                    {"error": "MediaSourceId 参数重复"}, status_code=400
+                )
+                return response
+            if capability_rejected:
+                response = JSONResponse(
+                    {"error": "播放会话无效或已过期"}, status_code=401
+                )
+                return response
             response = await call_next(request)
             return response
         except Exception as exc:
@@ -1708,6 +2292,7 @@ def create_proxy_app(
                     "guangya_file_id": getattr(
                         request.state, "proxy_guangya_file_id", ""
                     ),
+                    "media_name": getattr(request.state, "proxy_media_name", ""),
                 })
 
     async def guangya_redirect(instance, request: Request, file_id: str) -> Response:
@@ -1719,13 +2304,17 @@ def create_proxy_app(
             item_id=getattr(request.state, "proxy_media_item_id", ""),
             source_id=getattr(request.state, "proxy_media_source_id", ""),
             file_id=file_id,
+            media_name=getattr(request.state, "proxy_media_name", ""),
             create=True,
         )
         _apply_playback_session(request, playback_session)
         request.state.proxy_route_class = "guangya_direct"
         request.state.proxy_source = "guangya"
         request.state.proxy_action = "guangya_302"
-        if not await _client_is_authorized(instance, request):
+        if (
+            not getattr(request.state, "proxy_capability_authorized", False)
+            and not await _client_is_authorized(instance, request)
+        ):
             request.state.proxy_failure_stage = "client_auth"
             return JSONResponse({"error": "媒体服务器鉴权失败"}, status_code=401)
 
@@ -1903,7 +2492,10 @@ def create_proxy_app(
             return JSONResponse({"error": "媒体反代实例已停用"}, status_code=503)
 
         credential = _request_auth_credential(request)
-        auth_scope = _auth_scope_fingerprint(credential)
+        auth_scope = (
+            getattr(request.state, "proxy_auth_scope", "")
+            or _auth_scope_fingerprint(credential)
+        )
         playgy_file_id = _extract_guangya_file_id(str(request.url))
         if playgy_file_id and request.method in {"GET", "HEAD"}:
             if auth_scope and not _playback_grants.allows_file(auth_scope, instance_id, playgy_file_id):
@@ -1913,7 +2505,7 @@ def create_proxy_app(
         match = _STREAM_RE.match(request.url.path)
         if match and request.method in {"GET", "HEAD"}:
             item_id = match.group(1)
-            source_id = request.query_params.get("MediaSourceId", "")
+            source_id = getattr(request.state, "proxy_media_source_id", "")
             binding = await asyncio.to_thread(
                 _media_proxy_binding,
                 instance_id,
@@ -2006,33 +2598,66 @@ def create_proxy_app(
                 ).json()
             except ValueError:
                 return Response(content=raw, status_code=response.status_code, headers=headers)
-            response_session_token = ""
-            if isinstance(payload, dict):
-                response_session_token = str(payload.get("PlaySessionId") or "").strip()
-            playback_session = _playback_sessions.begin(
-                auth_scope,
-                instance_id,
-                token=(
-                    response_session_token
-                    or getattr(request.state, "proxy_playback_session_token", "")
-                ),
-                item_id=playback_match.group(1),
+            response_session_token = (
+                str(payload.get("PlaySessionId") or "").strip()
+                if isinstance(payload, dict) else ""
             )
-            _apply_playback_session(request, playback_session)
+            if not response_session_token:
+                response_session_token = _request_query_value(
+                    request, "PlaySessionId"
+                )
+            media_name = _playback_media_name(payload)
             if auth_scope:
+                capability_token = secrets.token_urlsafe(24)
                 payload, changed = rewrite_playback_info(
                     payload,
                     instance_id,
                     playback_match.group(1),
                     route_prefix=_route_prefix(request.url.path),
                     auth_scope=auth_scope,
-                    playback_session_token=playback_session.token,
+                    playback_session_token=capability_token,
                 )
             else:
+                capability_token = ""
                 changed = False
             if changed:
+                playback_session = _playback_sessions.finalize_capability(
+                    auth_scope,
+                    instance_id,
+                    capability_token,
+                    item_id=playback_match.group(1),
+                    media_name=media_name,
+                    upstream_session_token=response_session_token,
+                )
+                _apply_playback_session(request, playback_session)
                 request.state.proxy_action = "playback_rewrite"
-                return JSONResponse(payload, status_code=response.status_code)
+                return JSONResponse(
+                    payload,
+                    status_code=response.status_code,
+                    headers={
+                        "Cache-Control": "private, no-store, no-cache, max-age=0",
+                        "Pragma": "no-cache",
+                        "Referrer-Policy": "no-referrer",
+                    },
+                )
+            if isinstance(payload, dict):
+                if response_session_token:
+                    playback_session = _playback_sessions.resolve(
+                        auth_scope,
+                        instance_id,
+                        token=response_session_token,
+                        item_id=playback_match.group(1),
+                        media_name=media_name,
+                        create=True,
+                    )
+                else:
+                    playback_session = _playback_sessions.begin(
+                        auth_scope,
+                        instance_id,
+                        item_id=playback_match.group(1),
+                        media_name=media_name,
+                    )
+                _apply_playback_session(request, playback_session)
             request.state.proxy_action = "playback_passthrough"
             return Response(content=raw, status_code=response.status_code, headers=headers)
 

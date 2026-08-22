@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import unittest
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -16,6 +17,7 @@ from app import database as db
 from app.config import web_credentials
 from app.main import create_app
 from app.modules import media_proxy
+from app.modules.media_proxy_safety import safe_media_name
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -161,6 +163,18 @@ class ProxyRouteClassificationTests(unittest.TestCase):
 
 
 class PlaybackSessionRegistryTests(unittest.TestCase):
+    @staticmethod
+    def _source_signature(
+        token: str,
+        *,
+        instance_id: int = 7,
+        item_id: str = "item-1",
+        source_id: str = "source-1",
+    ) -> str:
+        return media_proxy._playback_source_signature(
+            instance_id, item_id, source_id, token
+        )
+
     def test_new_playback_info_context_wins_over_previous_same_media_session(self):
         registry = media_proxy.PlaybackSessionRegistry()
         first = registry.begin("scope", 7, item_id="item-1")
@@ -190,6 +204,344 @@ class PlaybackSessionRegistryTests(unittest.TestCase):
 
         self.assertEqual(second.token, first.token)
 
+    def test_server_capability_recovers_authenticated_scope_without_raw_token(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        entry = registry.begin(
+            "scope", 7, item_id="item-1", server_capability=True
+        )
+
+        signature = self._source_signature(entry.token)
+        recovered = registry.resolve_capability(
+            7,
+            entry.token,
+            item_id="item-1",
+            source_id="source-1",
+            source_signature=signature,
+        )
+
+        self.assertIs(recovered, entry)
+        self.assertEqual(recovered.auth_scope, "scope")
+        self.assertIsNone(registry.resolve_capability(
+            8,
+            entry.token,
+            item_id="item-1",
+            source_id="source-1",
+            source_signature=signature,
+        ))
+        self.assertIsNone(registry.resolve_capability(
+            7,
+            entry.token,
+            item_id="item-2",
+            source_id="source-1",
+            source_signature=signature,
+        ))
+
+    def test_upstream_play_session_alias_resolves_to_server_capability_session(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        entry = registry.finalize_capability(
+            "scope",
+            7,
+            "opaque-capability",
+            item_id="item-1",
+            upstream_session_token="emby-session-1",
+            media_name="Movie.mkv",
+        )
+
+        resolved = registry.resolve(
+            "scope",
+            7,
+            token="emby-session-1",
+            item_id="item-1",
+            source_id="source-1",
+        )
+
+        self.assertIs(resolved, entry)
+        self.assertEqual(resolved.media_name, "Movie.mkv")
+        self.assertEqual(
+            registry.persistent_key(resolved), registry.persistent_key(entry)
+        )
+
+    def test_repeated_capabilities_share_upstream_session_and_expire_independently(self):
+        now = [100.0]
+        registry = media_proxy.PlaybackSessionRegistry(
+            capability_ttl_seconds=900,
+            capability_max_ttl_seconds=950,
+            clock=lambda: now[0],
+        )
+        first = registry.finalize_capability(
+            "scope",
+            7,
+            "capability-a",
+            item_id="item-1",
+            upstream_session_token="emby-session-1",
+        )
+        now[0] = 200.0
+        second = registry.finalize_capability(
+            "scope",
+            7,
+            "capability-b",
+            item_id="item-1",
+            upstream_session_token="emby-session-1",
+        )
+
+        self.assertIs(first, second)
+        for token in ("capability-a", "capability-b"):
+            self.assertIs(
+                registry.resolve_capability(
+                    7,
+                    token,
+                    item_id="item-1",
+                    source_id="source-1",
+                    source_signature=self._source_signature(token),
+                ),
+                first,
+            )
+        self.assertIs(
+            registry.resolve(
+                "scope", 7, token="emby-session-1", item_id="item-1"
+            ),
+            first,
+        )
+
+        now[0] = 1051.0
+        self.assertIsNone(
+            registry.resolve_capability(
+                7,
+                "capability-a",
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature("capability-a"),
+            )
+        )
+        self.assertIs(
+            registry.resolve_capability(
+                7,
+                "capability-b",
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature("capability-b"),
+            ),
+            first,
+        )
+
+    def test_upstream_session_alias_never_merges_different_items(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        first = registry.finalize_capability(
+            "scope",
+            7,
+            "capability-a",
+            item_id="item-a",
+            media_name="A.mkv",
+            upstream_session_token="shared-session",
+        )
+
+        second = registry.resolve(
+            "scope",
+            7,
+            token="shared-session",
+            item_id="item-b",
+            source_id="source-b",
+            media_name="B.mkv",
+            create=True,
+        )
+
+        self.assertIsNot(second, first)
+        self.assertEqual(first.item_id, "item-a")
+        self.assertEqual(first.media_name, "A.mkv")
+        self.assertEqual(second.item_id, "item-b")
+        self.assertNotEqual(
+            registry.persistent_key(first), registry.persistent_key(second)
+        )
+        self.assertIs(
+            registry.resolve(
+                "scope", 7, token="shared-session", item_id="item-a"
+            ),
+            first,
+        )
+
+    def test_server_capability_never_upgrades_anonymous_session(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        entry = registry.begin(
+            "", 7, item_id="item-1", server_capability=True
+        )
+
+        self.assertIsNone(
+            registry.resolve_capability(
+                7,
+                entry.token,
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature(entry.token),
+            )
+        )
+
+    def test_client_selected_session_token_is_not_a_server_capability(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        entry = registry.begin(
+            "scope", 7, token="client-selected", item_id="item-1"
+        )
+
+        self.assertIsNone(
+            registry.resolve_capability(
+                7,
+                entry.token,
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature(entry.token),
+            )
+        )
+
+    def test_server_capability_expires_after_idle_timeout(self):
+        now = [100.0]
+        registry = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=1800,
+            capability_ttl_seconds=900,
+            capability_max_ttl_seconds=3600,
+            clock=lambda: now[0],
+        )
+        entry = registry.begin(
+            "scope", 7, item_id="item-1", server_capability=True
+        )
+
+        now[0] = 1001.0
+        self.assertIsNone(
+            registry.resolve_capability(
+                7,
+                entry.token,
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature(entry.token),
+            ),
+        )
+
+    def test_server_capability_renews_while_playback_remains_active(self):
+        now = [100.0]
+        registry = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=3600,
+            capability_ttl_seconds=900,
+            capability_max_ttl_seconds=3600,
+            clock=lambda: now[0],
+        )
+        entry = registry.begin(
+            "scope", 7, item_id="item-1", server_capability=True
+        )
+
+        for timestamp in (999.0, 1800.0, 2600.0):
+            now[0] = timestamp
+            self.assertIs(
+                registry.resolve_capability(
+                    7,
+                    entry.token,
+                    item_id="item-1",
+                    source_id="source-1",
+                    source_signature=self._source_signature(entry.token),
+                ),
+                entry,
+            )
+
+    def test_server_capability_never_exceeds_absolute_authorization_ttl(self):
+        now = [100.0]
+        registry = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=5000,
+            capability_ttl_seconds=900,
+            capability_max_ttl_seconds=1800,
+            clock=lambda: now[0],
+        )
+        entry = registry.begin(
+            "scope", 7, item_id="item-1", server_capability=True
+        )
+
+        for timestamp in (999.0, 1799.0, 1899.0):
+            now[0] = timestamp
+            self.assertIs(
+                registry.resolve_capability(
+                    7,
+                    entry.token,
+                    item_id="item-1",
+                    source_id="source-1",
+                    source_signature=self._source_signature(entry.token),
+                ),
+                entry,
+            )
+        now[0] = 1901.0
+        self.assertIsNone(
+            registry.resolve_capability(
+                7,
+                entry.token,
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature(entry.token),
+            )
+        )
+
+    def test_finalize_capability_recreates_evicted_entry_and_restarts_ttl(self):
+        now = [100.0]
+        registry = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=1800,
+            capability_ttl_seconds=900,
+            max_entries=1,
+            clock=lambda: now[0],
+        )
+        issued = registry.begin(
+            "scope", 7, item_id="item-1", server_capability=True
+        )
+        registry.begin("other-scope", 8, item_id="other-item")
+
+        now[0] = 1001.0
+        finalized = registry.finalize_capability(
+            "scope", 7, issued.token, item_id="item-1"
+        )
+
+        self.assertIs(
+            registry.resolve_capability(
+                7,
+                issued.token,
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature(issued.token),
+            ),
+            finalized,
+        )
+        now[0] = 1902.0
+        self.assertIsNone(
+            registry.resolve_capability(
+                7,
+                issued.token,
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature(issued.token),
+            )
+        )
+
+    def test_invalid_capability_lookup_does_not_scan_all_sessions(self):
+        class NoScanOrderedDict(OrderedDict):
+            def items(self):
+                raise AssertionError("capability lookup must use the direct index")
+
+        registry = media_proxy.PlaybackSessionRegistry()
+        entry = registry.begin(
+            "scope", 7, item_id="item-1", server_capability=True
+        )
+        registry._entries = NoScanOrderedDict(registry._entries)
+
+        self.assertIsNone(registry.resolve_capability(
+            7,
+            "missing",
+            item_id="item-1",
+            source_id="source-1",
+            source_signature=self._source_signature("missing"),
+        ))
+        self.assertIs(
+            registry.resolve_capability(
+                7,
+                entry.token,
+                item_id="item-1",
+                source_id="source-1",
+                source_signature=self._source_signature(entry.token),
+            ),
+            entry,
+        )
+
     def test_persistent_key_does_not_expose_session_or_auth_scope(self):
         registry = media_proxy.PlaybackSessionRegistry()
         entry = registry.begin(
@@ -201,6 +553,96 @@ class PlaybackSessionRegistryTests(unittest.TestCase):
         self.assertEqual(len(key), 48)
         self.assertNotIn("auth-scope-secret", key)
         self.assertNotIn("play-session-secret", key)
+
+
+class PlaybackAuthorizationLeaseTests(unittest.TestCase):
+    def test_dynamic_mapping_renews_until_absolute_limit(self):
+        now = [0.0]
+        mappings = media_proxy.DynamicGuangYaMappings(
+            ttl_seconds=10,
+            max_ttl_seconds=25,
+            clock=lambda: now[0],
+        )
+        mappings.register(7, "item", "source", "file")
+
+        for timestamp in (9.0, 18.0, 24.0):
+            now[0] = timestamp
+            self.assertEqual(mappings.get(7, "item", "source"), "file")
+        now[0] = 26.0
+        self.assertIsNone(mappings.get(7, "item", "source"))
+
+    def test_item_binding_scope_renews_until_absolute_limit(self):
+        now = [0.0]
+        scopes = media_proxy.ItemLevelBindingScopes(
+            ttl_seconds=10,
+            max_ttl_seconds=25,
+            clock=lambda: now[0],
+        )
+        scopes.register(7, "item", "source", "binding", "scope")
+
+        for timestamp in (9.0, 18.0, 24.0):
+            now[0] = timestamp
+            self.assertTrue(
+                scopes.matches(7, "item", "source", "binding", "scope")
+            )
+        now[0] = 26.0
+        self.assertFalse(
+            scopes.matches(7, "item", "source", "binding", "scope")
+        )
+
+    def test_playback_grant_renews_until_absolute_limit(self):
+        now = [0.0]
+        grants = media_proxy.PlaybackGrantRegistry(
+            ttl_seconds=10,
+            max_ttl_seconds=25,
+            clock=lambda: now[0],
+        )
+        grants.register(
+            "scope",
+            7,
+            "item",
+            "source",
+            source_type="guangya",
+            file_id="file",
+        )
+
+        for timestamp in (9.0, 18.0, 24.0):
+            now[0] = timestamp
+            self.assertTrue(grants.allows_file("scope", 7, "file"))
+        now[0] = 26.0
+        self.assertFalse(grants.allows_file("scope", 7, "file"))
+
+
+class SafeMediaNameTests(unittest.TestCase):
+    def test_human_titles_with_colons_or_slashes_are_not_treated_as_uris(self):
+        for title in (
+            "Re:Zero",
+            "Cyberpunk:Edgerunners",
+            "Face/Off",
+            "Fate/stay night",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(safe_media_name(title), title)
+
+    def test_explicit_paths_and_unsafe_opaque_uris_remain_redacted(self):
+        self.assertEqual(
+            safe_media_name(
+                "https://user:password@example.invalid/private/Movie.mkv"
+                "?api_key=secret"
+            ),
+            "Movie.mkv",
+        )
+        self.assertEqual(
+            safe_media_name("custom:/private/library/Movie.mkv"),
+            "Movie.mkv",
+        )
+        for value in (
+            "web+foo:user:password@example.invalid",
+            "javascript:alert(document.cookie)",
+            "data:text/plain,secret",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(safe_media_name(value), "")
 
 
 class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
@@ -247,6 +689,74 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         for secret in ("signed.invalid", "secret-token", "access-secret", "secret-api-key"):
             self.assertNotIn(secret, serialized)
         self.assertNotIn("url", {key.lower() for key in row.keys()})
+
+    def test_authority_only_media_url_never_leaks_credentials(self):
+        db.record_media_proxy_playback_attempt(
+            instance_id=self.instance_id,
+            playback_session_key="authority-only",
+            media_item_id="item-authority",
+            media_name=(
+                "https://user:password@media.invalid"
+                "?api_key=secret#private"
+            ),
+            route_class="playback_info",
+            method="GET",
+            status_code=200,
+            source="playback_info",
+        )
+
+        summary = db.list_media_proxy_playback_sessions(
+            instance_id=self.instance_id
+        )["items"][0]
+        serialized = json.dumps(dict(summary), ensure_ascii=False)
+        self.assertEqual(summary["media_name"], "")
+        for secret in ("user", "password", "media.invalid", "api_key", "secret"):
+            self.assertNotIn(secret, serialized)
+
+    def test_encoded_media_url_is_reduced_to_safe_filename(self):
+        db.record_media_proxy_playback_attempt(
+            instance_id=self.instance_id,
+            playback_session_key="encoded-url",
+            media_item_id="item-encoded",
+            media_name=(
+                "https%3A%2F%2Fuser%3Apassword%40media.invalid%2Fprivate%2F"
+                "Encoded%20Movie.mkv%3Fapi_key%3Dsecret%23frag"
+            ),
+            route_class="playback_info",
+            method="GET",
+            status_code=200,
+            source="playback_info",
+        )
+
+        summary = db.list_media_proxy_playback_sessions(
+            instance_id=self.instance_id
+        )["items"][0]
+        serialized = json.dumps(dict(summary), ensure_ascii=False)
+        self.assertEqual(summary["media_name"], "Encoded Movie.mkv")
+        for secret in (
+            "user", "password", "media.invalid", "api_key", "secret", "%40", "%3F"
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_opaque_uri_media_name_is_not_persisted(self):
+        db.record_media_proxy_playback_attempt(
+            instance_id=self.instance_id,
+            playback_session_key="opaque-uri",
+            media_item_id="item-opaque",
+            media_name="web+foo:user:password@example.invalid",
+            route_class="playback_info",
+            method="GET",
+            status_code=200,
+            source="playback_info",
+        )
+
+        summary = db.list_media_proxy_playback_sessions(
+            instance_id=self.instance_id
+        )["items"][0]
+        serialized = json.dumps(dict(summary), ensure_ascii=False)
+        self.assertEqual(summary["media_name"], "")
+        for secret in ("user", "password", "example.invalid", "web+foo"):
+            self.assertNotIn(secret, serialized)
 
     def test_filters_pagination_and_confirmed_clear(self):
         for status, source in ((302, "guangya"), (206, "upstream"), (502, "upstream")):
@@ -301,6 +811,10 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             playback_session_key="session-digest-1",
             media_item_id="item-1",
             media_source_id="source-1",
+            media_name=(
+                "https://user:password@media.invalid/private/"
+                "Movie%20Name.mkv?api_key=secret"
+            ),
             route_class="playback_info",
             method="POST",
             status_code=200,
@@ -327,7 +841,9 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         summary = sessions["items"][0]
         self.assertEqual(summary["media_item_id"], "item-1")
         self.assertEqual(summary["media_source_id"], "source-1")
+        self.assertEqual(summary["media_name"], "Movie Name.mkv")
         self.assertEqual(summary["guangya_file_id"], "file-1")
+        self.assertNotIn("secret", json.dumps(dict(summary), ensure_ascii=False))
         self.assertEqual(summary["request_count"], 2)
         self.assertEqual(summary["success_count"], 2)
         self.assertEqual(summary["error_count"], 0)

@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from datetime import datetime
 from typing import TYPE_CHECKING
+
+from app.modules.media_proxy_safety import safe_media_name
+
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -248,7 +252,11 @@ _MEDIA_PROXY_ERROR_SECRET_RE = re.compile(
 _MEDIA_PROXY_RECORD_SOURCES = {
     "guangya", "upstream", "playback_info", "hls", "websocket", "unknown",
 }
+_MEDIA_PROXY_RECORD_MAX_ROWS = 10_000
+_MEDIA_PROXY_RECORD_MAINTENANCE_INTERVAL = 512
 _last_media_proxy_record_prune_key = ""
+_media_proxy_record_writes_since_prune = 0
+_media_proxy_record_maintenance_lock = threading.RLock()
 
 
 def _redact_media_proxy_record_error(value: str) -> str:
@@ -262,6 +270,10 @@ def _normalized_record_identity(value: str, limit: int = 255) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _normalized_record_media_name(value: str, limit: int = 256) -> str:
+    return safe_media_name(value, limit=limit)
+
+
 def _delete_orphan_media_proxy_playback_sessions(conn: sqlite3.Connection) -> None:
     conn.execute(
         "DELETE FROM media_proxy_playback_sessions "
@@ -272,23 +284,41 @@ def _delete_orphan_media_proxy_playback_sessions(conn: sqlite3.Connection) -> No
     )
 
 
-def _prune_media_proxy_playback_records(conn: sqlite3.Connection) -> None:
+def _prune_media_proxy_playback_records(
+    conn: sqlite3.Connection, *, record_write: bool = False
+) -> None:
     global _last_media_proxy_record_prune_key
-    current_day = datetime.now().strftime("%Y-%m-%d")
-    prune_key = f"{resolve_db_path()}:{current_day}"
-    if _last_media_proxy_record_prune_key == prune_key:
-        return
-    conn.execute(
-        "DELETE FROM media_proxy_playback_records "
-        "WHERE created_at < datetime('now','-30 days','localtime')"
-    )
-    conn.execute(
-        "DELETE FROM media_proxy_playback_records WHERE id IN ("
-        "SELECT id FROM media_proxy_playback_records ORDER BY id DESC LIMIT -1 OFFSET 10000"
-        ")"
-    )
-    _delete_orphan_media_proxy_playback_sessions(conn)
-    _last_media_proxy_record_prune_key = prune_key
+    global _media_proxy_record_writes_since_prune
+    with _media_proxy_record_maintenance_lock:
+        interval = max(1, int(_MEDIA_PROXY_RECORD_MAINTENANCE_INTERVAL))
+        if record_write:
+            _media_proxy_record_writes_since_prune += 1
+        current_day = datetime.now().strftime("%Y-%m-%d")
+        prune_key = f"{resolve_db_path()}:{current_day}"
+        interval_due = _media_proxy_record_writes_since_prune >= interval
+        if not interval_due and _last_media_proxy_record_prune_key == prune_key:
+            return
+
+        # 采用低水位批量裁剪：维护之间最多新增 interval 条，仍保持
+        # _MEDIA_PROXY_RECORD_MAX_ROWS 的严格上限，避免每次 302 都扫描 1 万行。
+        trim_target = max(
+            1,
+            int(_MEDIA_PROXY_RECORD_MAX_ROWS) - interval,
+        )
+        conn.execute(
+            "DELETE FROM media_proxy_playback_records "
+            "WHERE created_at < datetime('now','-30 days','localtime')"
+        )
+        conn.execute(
+            "DELETE FROM media_proxy_playback_records WHERE id IN ("
+            "SELECT id FROM media_proxy_playback_records "
+            "ORDER BY id DESC LIMIT -1 OFFSET ?"
+            ")",
+            (trim_target,),
+        )
+        _delete_orphan_media_proxy_playback_sessions(conn)
+        _last_media_proxy_record_prune_key = prune_key
+        _media_proxy_record_writes_since_prune = 0
 
 
 def _upsert_media_proxy_playback_session(
@@ -298,6 +328,7 @@ def _upsert_media_proxy_playback_session(
     session_key: str,
     media_item_id: str,
     media_source_id: str,
+    media_name: str,
     guangya_file_id: str,
     route_class: str,
     source: str,
@@ -311,12 +342,12 @@ def _upsert_media_proxy_playback_session(
 ) -> int:
     conn.execute(
         "INSERT OR IGNORE INTO media_proxy_playback_sessions("
-        "instance_id,session_key,media_item_id,media_source_id,guangya_file_id,"
-        "started_at,last_request_at"
-        ") VALUES(?,?,?,?,?,?,?)",
+        "instance_id,session_key,media_item_id,media_source_id,media_name,"
+        "guangya_file_id,started_at,last_request_at"
+        ") VALUES(?,?,?,?,?,?,?,?)",
         (
             int(instance_id), session_key, media_item_id, media_source_id,
-            guangya_file_id, timestamp, timestamp,
+            media_name, guangya_file_id, timestamp, timestamp,
         ),
     )
     success_increment = 1 if 200 <= status_code <= 399 else 0
@@ -327,6 +358,7 @@ def _upsert_media_proxy_playback_session(
         "UPDATE media_proxy_playback_sessions SET "
         "media_item_id=CASE WHEN ?<>'' THEN ? ELSE media_item_id END,"
         "media_source_id=CASE WHEN ?<>'' THEN ? ELSE media_source_id END,"
+        "media_name=CASE WHEN ?<>'' THEN ? ELSE media_name END,"
         "guangya_file_id=CASE WHEN ?<>'' THEN ? ELSE guangya_file_id END,"
         "request_count=request_count+1,success_count=success_count+?,"
         "error_count=error_count+?,cache_hit_count=cache_hit_count+?,"
@@ -341,6 +373,7 @@ def _upsert_media_proxy_playback_session(
         (
             media_item_id, media_item_id,
             media_source_id, media_source_id,
+            media_name, media_name,
             guangya_file_id, guangya_file_id,
             success_increment, error_increment,
             cache_hit_increment, cache_miss_increment,
@@ -370,7 +403,8 @@ def record_media_proxy_playback_attempt(*, instance_id: int, route_class: str,
                                         playback_session_key: str = "",
                                         media_item_id: str = "",
                                         media_source_id: str = "",
-                                        guangya_file_id: str = "") -> int:
+                                        guangya_file_id: str = "",
+                                        media_name: str = "") -> int:
     route = str(route_class or "unknown").strip()[:64] or "unknown"
     normalized_method = str(method or "GET").strip().upper()[:12] or "GET"
     normalized_source = str(source or "unknown").strip().lower()
@@ -384,10 +418,13 @@ def record_media_proxy_playback_attempt(*, instance_id: int, route_class: str,
     session_key = _normalized_record_identity(playback_session_key, 96)
     item_id = _normalized_record_identity(media_item_id)
     source_id = _normalized_record_identity(media_source_id)
+    safe_media_name = _normalized_record_media_name(media_name)
     file_id = _normalized_record_identity(guangya_file_id, 512)
     timestamp = now()
     with get_conn() as conn:
-        _prune_media_proxy_playback_records(conn)
+        _prune_media_proxy_playback_records(
+            conn, record_write=True
+        )
         session_id = None
         if session_key:
             session_id = _upsert_media_proxy_playback_session(
@@ -396,6 +433,7 @@ def record_media_proxy_playback_attempt(*, instance_id: int, route_class: str,
                 session_key=session_key,
                 media_item_id=item_id,
                 media_source_id=source_id,
+                media_name=safe_media_name,
                 guangya_file_id=file_id,
                 route_class=route,
                 source=normalized_source,
@@ -419,12 +457,6 @@ def record_media_proxy_playback_attempt(*, instance_id: int, route_class: str,
             ),
         )
         record_id = int(cursor.lastrowid)
-        conn.execute(
-            "DELETE FROM media_proxy_playback_records WHERE id IN ("
-            "SELECT id FROM media_proxy_playback_records ORDER BY id DESC LIMIT -1 OFFSET 10000"
-            ")"
-        )
-        _delete_orphan_media_proxy_playback_sessions(conn)
         return record_id
 
 
@@ -532,7 +564,7 @@ def list_media_proxy_playback_sessions(*, instance_id: int | None = None,
             legacy_params,
         ).fetchone()["count"])
         rows = conn.execute(
-            "SELECT id,instance_id,media_item_id,media_source_id,guangya_file_id,"
+            "SELECT id,instance_id,media_item_id,media_source_id,media_name,guangya_file_id,"
             "request_count,success_count,error_count,cache_hit_count,cache_miss_count,"
             "upstream_latency_ms_total,total_latency_ms_total,max_total_latency_ms,"
             "last_route_class,last_source,last_status_code,last_failure_stage,last_error,"

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from app import database as db
 from app.repositories import media_proxy as repository
@@ -108,6 +109,84 @@ class MediaProxyRepositoryTests(unittest.TestCase):
             self.assertNotIn("example.invalid", error)
             self.assertNotIn("secret", error)
             self.assertNotIn("hidden", error)
+
+    def test_record_cleanup_runs_periodically_instead_of_on_every_write(self):
+        with isolated_test_database("media-proxy-maintenance.db"):
+            prune_key = (
+                f"{repository.resolve_db_path()}:"
+                f"{repository.datetime.now().strftime('%Y-%m-%d')}"
+            )
+            with (
+                patch.object(
+                    repository,
+                    "_last_media_proxy_record_prune_key",
+                    prune_key,
+                ),
+                patch.object(
+                    repository,
+                    "_media_proxy_record_writes_since_prune",
+                    0,
+                ),
+                patch.object(
+                    repository,
+                    "_MEDIA_PROXY_RECORD_MAINTENANCE_INTERVAL",
+                    2,
+                ),
+                patch.object(
+                    repository,
+                    "_delete_orphan_media_proxy_playback_sessions",
+                    wraps=repository._delete_orphan_media_proxy_playback_sessions,
+                ) as cleanup,
+            ):
+                for _ in range(2):
+                    repository.record_media_proxy_playback_attempt(
+                        instance_id=3,
+                        route_class="video",
+                        method="GET",
+                        status_code=302,
+                        source="guangya",
+                    )
+
+            self.assertEqual(cleanup.call_count, 1)
+
+    def test_periodic_low_watermark_keeps_the_record_limit_strict(self):
+        with isolated_test_database("media-proxy-record-limit.db"):
+            with (
+                patch.object(
+                    repository,
+                    "_last_media_proxy_record_prune_key",
+                    "",
+                ),
+                patch.object(
+                    repository,
+                    "_media_proxy_record_writes_since_prune",
+                    0,
+                ),
+                patch.object(
+                    repository,
+                    "_MEDIA_PROXY_RECORD_MAX_ROWS",
+                    5,
+                ),
+                patch.object(
+                    repository,
+                    "_MEDIA_PROXY_RECORD_MAINTENANCE_INTERVAL",
+                    2,
+                ),
+            ):
+                for _ in range(12):
+                    repository.record_media_proxy_playback_attempt(
+                        instance_id=3,
+                        route_class="video",
+                        method="GET",
+                        status_code=302,
+                        source="guangya",
+                    )
+                    with repository.get_conn() as conn:
+                        total = conn.execute(
+                            "SELECT COUNT(*) AS total "
+                            "FROM media_proxy_playback_records"
+                        ).fetchone()["total"]
+                    self.assertLessEqual(total, 5)
 
 
 if __name__ == "__main__":
