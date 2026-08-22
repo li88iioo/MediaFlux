@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover - optional browser dependency
 ROOT = Path(__file__).resolve().parents[1]
 BASE_TEMPLATE = ROOT / "app/templates/base.html"
 DISCOVERY_TEMPLATE = ROOT / "app/templates/discovery.html"
+PROFILE_DIALOG = ROOT / "app/templates/_media_profile_dialog.html"
 MORE_TEMPLATE = ROOT / "app/templates/guangya_more.html"
 THEME_BOOTSTRAP = ROOT / "app/templates/_theme_bootstrap.html"
 APP_SCRIPT = ROOT / "app/static/js/app.js"
@@ -23,7 +24,10 @@ MAIN_STYLES = ROOT / "app/static/css/main.css"
 class NavigationDiscoveryUiContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.base = BASE_TEMPLATE.read_text(encoding="utf-8")
-        self.discovery = DISCOVERY_TEMPLATE.read_text(encoding="utf-8")
+        self.discovery = (
+            DISCOVERY_TEMPLATE.read_text(encoding="utf-8")
+            + PROFILE_DIALOG.read_text(encoding="utf-8")
+        )
         self.more = MORE_TEMPLATE.read_text(encoding="utf-8")
 
     def test_guangya_submenu_defaults_open_and_remembers_manual_choice(self):

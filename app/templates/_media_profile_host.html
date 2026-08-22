@@ -1,0 +1,21 @@
+<div
+    class="discovery-profile-host"
+    data-discovery-root
+    data-discovery-profile-host="true"
+    data-resource-results-enabled="{{ 'true' if resource_results_enabled else 'false' }}"
+>
+    <div hidden aria-hidden="true" data-discovery-profile-controls>
+        <div id="discovery-source-tabs"></div>
+        <div id="discovery-filter-region"></div>
+        <form id="discovery-search-form"><input id="discovery-search-query"><button id="discovery-search-submit" type="submit"></button></form>
+        <span id="discovery-provider-status"></span>
+        <div id="discovery-sections"></div>
+        <div id="discovery-grid"></div>
+        <div id="discovery-stage"></div>
+        <button id="discovery-refresh" type="button"></button>
+        <div id="discovery-load-more-row"><button id="discovery-load-more" type="button"><span></span></button></div>
+        <div id="discovery-page-sentinel"></div>
+    </div>
+    <div class="sr-only" id="discovery-live" role="status" aria-live="polite" aria-atomic="true"></div>
+    {% include "_media_profile_dialog.html" %}
+</div>

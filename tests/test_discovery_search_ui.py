@@ -6,13 +6,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "app/templates/discovery.html"
+PROFILE_DIALOG = ROOT / "app/templates/_media_profile_dialog.html"
 SCRIPT = ROOT / "app/static/js/discovery.js"
 STYLES = ROOT / "app/static/css/main.css"
 
 
 class DiscoverySearchUIContractTests(unittest.TestCase):
     def setUp(self):
-        self.template = TEMPLATE.read_text(encoding="utf-8")
+        self.template = (
+            TEMPLATE.read_text(encoding="utf-8")
+            + PROFILE_DIALOG.read_text(encoding="utf-8")
+        )
         self.script = SCRIPT.read_text(encoding="utf-8")
         self.styles = STYLES.read_text(encoding="utf-8")
 

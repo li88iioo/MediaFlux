@@ -247,6 +247,7 @@
     </div>
 </div>
 
+{% if discovery_enabled %}{% include "_media_profile_host.html" %}{% endif %}
 {% endblock %}
 
 {% block scripts %}
@@ -784,5 +785,6 @@ window.ensureRssPanelLoaded=()=>{
     return rssPanelLoadPromise;
 };
 </script>
-<script src="/static/js/subscriptions.js?v=20260820b"></script>
+{% if discovery_enabled %}<script src="{{ url_for('static', path='js/discovery.js') }}?v=20260822a" defer></script>{% endif %}
+<script src="/static/js/subscriptions.js?v=20260822a"></script>
 {% endblock %}
