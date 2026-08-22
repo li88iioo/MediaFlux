@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import re
 import sqlite3
@@ -2858,6 +2860,10 @@ def purge_expired_agent_task_history(
                 "download_verifications": 0,
                 "download_verification_notification_outbox": 0,
                 "patrol_notification_outbox": 0,
+                "action_history": 0,
+                "jobs": 0,
+                "missing_media_workflows": 0,
+                "web_search_usage": 0,
             }
         verification_notifications = conn.execute(
             "DELETE FROM agent_download_verification_notification_outbox WHERE id IN ("
@@ -2882,6 +2888,29 @@ def purge_expired_agent_task_history(
             "ORDER BY updated_at,id LIMIT ?)",
             (cutoff, cutoff, limit),
         )
+        action_history = conn.execute(
+            "DELETE FROM agent_action_history WHERE id IN ("
+            "SELECT id FROM agent_action_history WHERE finished_at<? "
+            "ORDER BY finished_at,id LIMIT ?)",
+            (cutoff, limit),
+        )
+        jobs = conn.execute(
+            "DELETE FROM agent_jobs WHERE job_id IN ("
+            "SELECT job_id FROM agent_jobs WHERE status IN ('succeeded','failed','cancelled') "
+            "AND updated_at<? ORDER BY updated_at,job_id LIMIT ?)",
+            (cutoff, limit),
+        )
+        workflows = conn.execute(
+            "DELETE FROM agent_missing_media_workflows WHERE workflow_id IN ("
+            "SELECT workflow_id FROM agent_missing_media_workflows "
+            "WHERE state IN ('visible','stale','cancelled') AND updated_at<? "
+            "ORDER BY updated_at,workflow_id LIMIT ?)",
+            (cutoff, limit),
+        )
+        web_usage = conn.execute(
+            "DELETE FROM agent_web_search_daily_usage WHERE usage_date<?",
+            (cutoff[:10],),
+        )
         conn.execute(
             "UPDATE agent_maintenance SET next_run_at=?,updated_at=? "
             "WHERE task_key='history_cleanup'",
@@ -2895,7 +2924,83 @@ def purge_expired_agent_task_history(
                 0, int(verification_notifications.rowcount)
             ),
             "patrol_notification_outbox": max(0, int(notifications.rowcount)),
+            "action_history": max(0, int(action_history.rowcount)),
+            "jobs": max(0, int(jobs.rowcount)),
+            "missing_media_workflows": max(0, int(workflows.rowcount)),
+            "web_search_usage": max(0, int(web_usage.rowcount)),
         }
+
+
+def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dict[str, int]:
+    """清除一个主体的全部 Agent 持久化数据；与单会话删除语义明确分离。"""
+    normalized_owner = str(owner or "").strip()
+    normalized_principal = str(principal if principal is not None else owner).strip()
+    if not normalized_owner or len(normalized_owner) > 512 or not normalized_principal:
+        raise ValueError("Agent 隐私清理主体无效")
+    from app.modules.web_secret import get_web_secret
+
+    secret = get_web_secret().encode("utf-8")
+
+    def digest(domain: bytes, value: str) -> str:
+        return hmac.new(
+            secret, domain + value.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+    digests = {
+        "action_history": digest(b"mediaflux-agent-action-history:v1\0", normalized_owner),
+        "session_context": digest(b"mediaflux-agent-session-context:v1\0", normalized_owner),
+        "confirmations": digest(b"mediaflux-agent-confirmation:v1\0", normalized_owner),
+        "jobs": digest(b"mediaflux-agent-durable-job:v1\0", normalized_owner),
+        "workflows": digest(b"mediaflux-agent-missing-workflow:v1\0", normalized_owner),
+        "telegram_actions": digest(b"mediaflux-telegram-agent-action:v1\0", normalized_owner),
+        "telegram_confirmations": digest(b"mediaflux-telegram-write-confirmation:v1\0", normalized_owner),
+        "conversations": digest(
+            b"mediaflux-agent-conversation-principal:v1\0", normalized_principal
+        ),
+    }
+    deleted: dict[str, int] = {}
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for key, table, column in (
+            ("action_history", "agent_action_history", "owner_digest"),
+            ("session_context", "agent_session_context", "owner_digest"),
+            ("confirmations", "agent_confirmations", "owner_digest"),
+            ("confirmation_epochs", "agent_confirmation_epochs", "owner_digest"),
+            ("jobs", "agent_jobs", "owner_digest"),
+            ("workflows", "agent_missing_media_workflows", "owner_digest"),
+            ("telegram_actions", "telegram_agent_actions", "owner_digest"),
+            ("telegram_confirmations", "telegram_write_confirmations", "owner_digest"),
+            ("conversations", "agent_conversations", "principal_digest"),
+            ("conversation_epochs", "agent_conversation_epochs", "principal_digest"),
+        ):
+            digest_key = {
+                "confirmation_epochs": "confirmations",
+                "conversation_epochs": "conversations",
+            }.get(key, key)
+            cursor = conn.execute(
+                f"DELETE FROM {table} WHERE {column}=?", (digests[digest_key],)
+            )
+            deleted[key] = max(0, int(cursor.rowcount or 0))
+    return deleted
+
+
+def maintain_sqlite_database(*, incremental_pages: int = 200) -> dict[str, int | bool]:
+    """低频执行 SQLite planner 优化，并在 incremental 模式下回收空闲页。"""
+    pages = max(1, min(int(incremental_pages), 2000))
+    with get_conn() as conn:
+        conn.execute("PRAGMA optimize")
+        auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+        freelist_before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        vacuumed = auto_vacuum == 2 and freelist_before >= pages
+        if vacuumed:
+            conn.execute(f"PRAGMA incremental_vacuum({pages})")
+        freelist_after = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    return {
+        "optimized": True,
+        "incremental_vacuum": vacuumed,
+        "freelist_before": freelist_before,
+        "freelist_after": freelist_after,
+    }
 
 
 # ===== Agent 媒体库巡检 =====

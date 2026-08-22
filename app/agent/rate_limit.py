@@ -277,19 +277,34 @@ class AgentRateLimiter:
         with db.get_conn() as conn:
             AgentRateLimiter._ensure_shared_table(conn)
             conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute(
+            row = conn.execute(
+                "SELECT window_start,count FROM agent_rate_limit_buckets "
+                "WHERE limiter_key=?",
+                (digest,),
+            ).fetchone()
+            carried = 0
+            if row is not None:
+                previous_start = int(row["window_start"])
+                previous_count = int(row["count"])
+                if previous_start == window_start:
+                    carried = previous_count
+                elif previous_start == window_start - window_seconds:
+                    remaining = max(0, window_seconds - (now_epoch - window_start))
+                    carried = (
+                        previous_count * remaining + window_seconds - 1
+                    ) // window_seconds
+            new_count = carried + cost
+            if new_count > limit:
+                return False
+            conn.execute(
                 "INSERT INTO agent_rate_limit_buckets"
                 "(limiter_key,window_start,count,updated_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(limiter_key) DO UPDATE SET "
-                "window_start=excluded.window_start,"
-                "count=CASE WHEN agent_rate_limit_buckets.window_start=excluded.window_start "
-                "THEN agent_rate_limit_buckets.count+excluded.count ELSE excluded.count END,"
-                "updated_at=excluded.updated_at "
-                "WHERE agent_rate_limit_buckets.window_start!=excluded.window_start "
-                "OR agent_rate_limit_buckets.count+excluded.count<=?",
-                (digest, window_start, cost, db.now(), limit),
+                "window_start=excluded.window_start,count=excluded.count,"
+                "updated_at=excluded.updated_at",
+                (digest, window_start, new_count, db.now()),
             )
-            return cursor.rowcount == 1
+            return True
 
     def _prune_expired_locked(self, now: float) -> None:
         expired = [

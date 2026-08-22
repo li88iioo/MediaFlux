@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import errno
 import os
 import tempfile
 import unittest
@@ -87,6 +88,14 @@ class WebSecretTests(unittest.TestCase):
 
         importlib.reload(self.web_secret)
         self.assertEqual(self.web_secret.get_web_secret(), first)
+
+    def test_fallback_secret_uses_noreplace_when_hardlinks_are_unsupported(self):
+        with patch("os.link", side_effect=OSError(errno.EPERM, "not supported")):
+            secret = self.web_secret.get_web_secret()
+        fallback = self.paths.config_dir / ".web-secret-key"
+        self.assertEqual(self.web_secret._read_fallback_secret(fallback), secret)
+        if os.name == "posix":
+            self.assertEqual(fallback.stat().st_mode & 0o777, 0o600)
 
     def test_existing_development_install_without_secret_persists_generated_secret(self):
         self.paths.config_dir.mkdir(parents=True)

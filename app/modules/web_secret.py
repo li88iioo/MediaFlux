@@ -1,6 +1,7 @@
 """Web session 与签名令牌共用的密钥提供器。"""
 from __future__ import annotations
 
+import errno
 import os
 import secrets
 import stat
@@ -119,7 +120,22 @@ def _persist_fallback_secret(path: Path, value: str) -> str:
     except FileExistsError:
         return _read_fallback_secret(path)
     except OSError as exc:
-        raise WebSecretUnavailable("无法原子发布持久化 Web Secret") from exc
+        unsupported = {
+            errno.EPERM, errno.EXDEV, errno.ENOSYS,
+            getattr(errno, "EOPNOTSUPP", errno.EPERM),
+            getattr(errno, "ENOTSUP", errno.EPERM),
+        }
+        if exc.errno not in unsupported:
+            raise WebSecretUnavailable("无法原子发布持久化 Web Secret") from exc
+        try:
+            # 某些容器卷/网络盘禁止 hard-link，但仍支持原子的 no-replace rename。
+            config._publish_noreplace(temporary, path)
+            if os.name == "nt":
+                config._apply_private_permissions(path)
+        except FileExistsError:
+            return _read_fallback_secret(path)
+        except (OSError, config.AtomicPublishError) as publish_exc:
+            raise WebSecretUnavailable("无法原子发布持久化 Web Secret") from publish_exc
     finally:
         try:
             temporary.unlink(missing_ok=True)
