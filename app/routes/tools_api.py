@@ -23,6 +23,7 @@ from app.clients.openai_compatible import (
     PROTOCOLS,
     SUPPORTED_PROTOCOLS_TEXT,
     extract_output_text,
+    is_protocol_fallback_error,
     normalize_provider_location,
     protocol_attempts,
     provider_headers,
@@ -871,9 +872,6 @@ _AI_MODEL_TEST_SCHEMA = {
     "required": ["ok"],
     "additionalProperties": False,
 }
-_AI_MODEL_TEST_FALLBACK_STATUSES = frozenset({404, 405, 415, 501})
-
-
 class _AIProviderTestFailure(RuntimeError):
     """不携带上游正文、URL 或凭据的模型测试失败信号。"""
 
@@ -974,7 +972,11 @@ async def _test_ai_provider(
             if response.status_code != 200:
                 can_fallback = (
                     index + 1 < len(protocols)
-                    and response.status_code in _AI_MODEL_TEST_FALLBACK_STATUSES
+                    and is_protocol_fallback_error(
+                        response.status_code,
+                        response.text,
+                        protocol=attempted_protocol,
+                    )
                 )
                 if can_fallback:
                     logger.info(

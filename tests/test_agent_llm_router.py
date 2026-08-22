@@ -878,6 +878,106 @@ class AgentLLMSelectionTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, log_text)
 
+    def test_auto_protocol_falls_back_on_recognizable_422_response_error(self):
+        captured = {"urls": []}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                captured["urls"].append(url)
+                if url.endswith("/responses"):
+                    return IndexerHttpResponse(
+                        url=url, status_code=422,
+                        headers={"content-type": "application/json"},
+                        body=b'{"error":"unknown parameter \'input\'"}',
+                    )
+                content = json_module.dumps({
+                    "tool_name": "workspace.health",
+                    "arguments_json": "{}",
+                })
+                return IndexerHttpResponse(
+                    url=url, status_code=200,
+                    headers={"content-type": "application/json"},
+                    body=json_module.dumps({
+                        "choices": [{"message": {"content": content}}]
+                    }).encode(),
+                )
+
+            async def aclose(self):
+                pass
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "auto",
+        }
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            selection = asyncio.run(_request_selection(
+                "检查整体健康",
+                read_tool_capabilities(_read_registry()),
+                client_factory=FakeClient,
+                fallback_budget=lambda: True,
+            ))
+
+        self.assertEqual(selection, LLMToolSelection("workspace.health", {}))
+        self.assertEqual(
+            captured["urls"],
+            ["https://ai.invalid/v1/responses", "https://ai.invalid/v1/chat/completions"],
+        )
+
+    def test_transient_429_retries_within_budget_and_succeeds(self):
+        captured = {"calls": 0}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                captured["calls"] += 1
+                if captured["calls"] == 1:
+                    return IndexerHttpResponse(
+                        url=url, status_code=429,
+                        headers={"retry-after": "0"}, body=b"{}",
+                    )
+                content = json_module.dumps({
+                    "tool_name": "workspace.health",
+                    "arguments_json": "{}",
+                })
+                return IndexerHttpResponse(
+                    url=url, status_code=200,
+                    headers={"content-type": "application/json"},
+                    body=json_module.dumps({
+                        "choices": [{"message": {"content": content}}]
+                    }).encode(),
+                )
+
+            async def aclose(self):
+                pass
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+            "AGENT_LLM_TIMEOUT_SECONDS": "2",
+        }
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            selection = asyncio.run(_request_selection(
+                "检查整体健康",
+                read_tool_capabilities(_read_registry()),
+                client_factory=FakeClient,
+            ))
+
+        self.assertEqual(selection, LLMToolSelection("workspace.health", {}))
+        self.assertEqual(captured["calls"], 2)
+
     def test_auto_protocol_fallback_stops_when_budget_is_exhausted(self):
         captured = {"urls": [], "closed": False}
 
@@ -1629,7 +1729,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
             _chat_tool_turn(("call_5", 5)),
             _chat_text_turn("五项计数均已读取，结果完整。"),
         ]
-        captured = {"requests": 0}
+        captured = {"requests": 0, "bodies": []}
 
         class FakeClient:
             def __init__(self, **kwargs):
@@ -1637,6 +1737,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
 
             async def post_json(self, url, *, json, headers, max_redirects):
                 body = scripted[captured["requests"]]
+                captured["bodies"].append(dict(json))
                 captured["requests"] += 1
                 return IndexerHttpResponse(
                     url=url, status_code=200, headers={}, body=body
@@ -1672,6 +1773,9 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertTrue(reply.completed)
         self.assertEqual(reply.answer, "五项计数均已读取,结果完整。")
         self.assertEqual(captured["requests"], 6)
+        self.assertIn("tools", captured["bodies"][4])
+        self.assertNotIn("tools", captured["bodies"][5])
+        self.assertNotIn("tool_choice", captured["bodies"][5])
         self.assertEqual(executed, [
             {"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}, {"n": 5}
         ])

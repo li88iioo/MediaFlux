@@ -10,6 +10,8 @@ from app.clients.openai_compatible import (
     extract_output_text,
     extract_provider_usage,
     infer_protocol_from_url,
+    is_protocol_fallback_error,
+    is_reasoning_model,
     append_native_tool_results,
     iter_provider_text_deltas,
     native_tool_definitions,
@@ -110,9 +112,74 @@ class LLMProviderProtocolTests(unittest.TestCase):
                 )
         self.assertEqual(resolve_protocol("auto", "https://api.example.com/v1"), "auto")
         self.assertEqual(
+            resolve_protocol("auto", "https://api.anthropic.com/v1"),
+            "anthropic_messages",
+        )
+        self.assertEqual(
             protocol_attempts("auto"), ("responses", "chat_completions")
         )
         self.assertEqual(protocol_attempts("anthropic_messages"), ("anthropic_messages",))
+
+    def test_reasoning_models_omit_sampling_and_use_completion_budget(self):
+        schema = {"type": "object", "properties": {}, "additionalProperties": False}
+        for model in ("o3-mini", "deepseek-reasoner", "vendor/qwq-32b"):
+            with self.subTest(model=model):
+                self.assertTrue(is_reasoning_model(model))
+                structured = structured_request_body(
+                    protocol="chat_completions", model=model,
+                    system_prompt="system", user_content="user",
+                    schema_name="test", schema=schema, max_tokens=321,
+                )
+                self.assertNotIn("temperature", structured)
+                self.assertNotIn("max_tokens", structured)
+                self.assertEqual(structured["max_completion_tokens"], 321)
+                native = native_tool_request_body(
+                    protocol="chat_completions", model=model,
+                    system_prompt="system", history=[], tools=[], max_tokens=222,
+                )
+                self.assertEqual(native["max_completion_tokens"], 222)
+                self.assertNotIn("temperature", native)
+                self.assertNotIn("tools", native)
+                self.assertNotIn("tool_choice", native)
+
+        regular = text_stream_request_body(
+            protocol="chat_completions", model="gpt-4.1-mini",
+            system_prompt="system", user_content="user", max_tokens=111,
+        )
+        self.assertEqual(regular["temperature"], 0)
+        self.assertEqual(regular["max_tokens"], 111)
+
+    def test_protocol_fallback_requires_endpoint_incompatibility_signal(self):
+        self.assertTrue(is_protocol_fallback_error(404, "", protocol="responses"))
+        self.assertTrue(is_protocol_fallback_error(
+            422, '{"error":"unknown parameter \'input\'"}', protocol="responses"
+        ))
+        self.assertFalse(is_protocol_fallback_error(
+            400, '{"error":"insufficient quota"}', protocol="responses"
+        ))
+        self.assertFalse(is_protocol_fallback_error(
+            422, '{"error":"unknown parameter \'input\'"}',
+            protocol="chat_completions",
+        ))
+
+    def test_reasoning_markup_is_removed_from_non_stream_turns(self):
+        content = extract_output_text(
+            {"choices": [{"message": {
+                "reasoning_content": "private chain",
+                "content": "<think>private chain</think>最终答案",
+            }}]},
+            "chat_completions",
+        )
+        self.assertEqual(content, "最终答案")
+        turn = parse_native_tool_turn(
+            {"choices": [{"message": {
+                "reasoning_content": "private chain",
+                "content": "<think>private chain</think>已完成。",
+            }}]},
+            "chat_completions",
+        )
+        self.assertEqual(turn.text, "已完成。")
+        self.assertNotIn("reasoning_content", turn.assistant_entry)
 
     def test_protocol_endpoints_are_distinct(self):
         location = normalize_provider_location("https://api.example.com/v1")
@@ -369,6 +436,19 @@ class LLMProviderStreamTests(unittest.IsolatedAsyncioTestCase):
             protocol="responses",
         )]
         self.assertEqual(deltas, ["你", "好"])
+
+    async def test_stream_filters_split_thinking_markup_and_reasoning_fields(self):
+        wire = (
+            b'data: {"choices":[{"delta":{"reasoning_content":"private","content":"<thi"}}]}\n\n'
+            b'data: {"choices":[{"delta":{"content":"nk>secret</think>public"},"finish_reason":"stop"}]}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        self.assertEqual(
+            [delta async for delta in iter_provider_text_deltas(
+                _chunks(wire), protocol="chat_completions"
+            )],
+            ["public"],
+        )
 
     async def test_chat_completions_stream_requires_terminal_event(self):
         valid = (

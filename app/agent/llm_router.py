@@ -45,6 +45,7 @@ from app.clients.openai_compatible import (
     append_native_tool_results,
     extract_output_text,
     extract_provider_usage,
+    is_protocol_fallback_error,
     iter_provider_text_deltas,
     native_tool_definitions,
     native_tool_initial_history,
@@ -52,6 +53,7 @@ from app.clients.openai_compatible import (
     normalize_provider_location,
     parse_native_tool_turn,
     protocol_attempts,
+    provider_retry_delay,
     provider_headers,
     resolve_protocol,
     structured_request_body,
@@ -67,6 +69,13 @@ logger = get_logger(__name__)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _STREAM_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _NO_TOOL_SENTINEL = "__none__"
+_PROVIDER_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+_PROVIDER_RETRY_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    httpx.TimeoutException,
+)
 _ACTION_STATUS_QUERY_PATTERNS = (
     re.compile(r"(?:是否|是不是|有无|有没有).{0,16}(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复)"),
     re.compile(r"(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复).{0,4}(?:了吗|没有|没|状态|情况)"),
@@ -381,6 +390,61 @@ def _timeout() -> int:
     return max(2, min(value, 30))
 
 
+async def _post_provider_json_with_retry(
+    client: FixedHostHttpClient,
+    url: str,
+    *,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    deadline: float,
+    protocol: str,
+) -> Any:
+    """只重放无副作用的 LLM 推理请求，并服从调用链总超时信封。"""
+    retry_index = 0
+    while True:
+        try:
+            response = await client.post_json(
+                url,
+                json=body,
+                headers=headers,
+                max_redirects=0,
+            )
+        except _PROVIDER_RETRY_EXCEPTIONS as exc:
+            if retry_index >= 2:
+                raise
+            delay = provider_retry_delay("", retry_index=retry_index)
+            if monotonic() + delay >= deadline:
+                raise
+            logger.info(
+                "Agent LLM provider event outcome=transport_retry "
+                "protocol=%s retry=%s error_type=%s",
+                protocol,
+                retry_index + 1,
+                type(exc).__name__,
+            )
+            retry_index += 1
+            await asyncio.sleep(delay)
+            continue
+
+        if response.status_code not in _PROVIDER_RETRY_STATUSES or retry_index >= 2:
+            return response
+        delay = provider_retry_delay(
+            response.headers.get("retry-after", ""), retry_index=retry_index
+        )
+        if monotonic() + delay >= deadline:
+            return response
+        logger.info(
+            "Agent LLM provider event outcome=status_retry "
+            "protocol=%s status_code=%s retry=%s delay_ms=%s",
+            protocol,
+            response.status_code,
+            retry_index + 1,
+            int(delay * 1000),
+        )
+        retry_index += 1
+        await asyncio.sleep(delay)
+
+
 def _context_window(model: str) -> int:
     return resolve_context_window(
         get("AGENT_LLM_CONTEXT_WINDOW", ""), model=model
@@ -433,6 +497,7 @@ async def _request_structured_json(
         user_agent="MediaFlux-Agent-LLM/1.0", pin_resolved_address=True,
     )
     overall_started = monotonic()
+    deadline = overall_started + timeout_seconds
 
     async def _request_protocols() -> object | None:
         for index, protocol in enumerate(protocols):
@@ -466,17 +531,23 @@ async def _request_structured_json(
                 output_reserve=max_tokens,
             ):
                 return None
-            response = await client.post_json(
+            response = await _post_provider_json_with_retry(
+                client,
                 location.endpoint(protocol),
-                json=body,
+                body=body,
                 headers=provider_headers(protocol, api_key),
-                max_redirects=0,
+                deadline=deadline,
+                protocol=protocol,
             )
             elapsed_ms = max(0, int((monotonic() - attempt_started) * 1000))
             if response.status_code != 200:
                 can_fallback = (
                     index + 1 < len(protocols)
-                    and response.status_code in {404, 405, 415, 501}
+                    and is_protocol_fallback_error(
+                        response.status_code,
+                        response.text,
+                        protocol=protocol,
+                    )
                 )
                 if can_fallback:
                     if fallback_budget is not None and not fallback_budget():
@@ -1932,6 +2003,8 @@ async def _request_native_read_agent(
     )
     user_content = _conversation_user_content(message, conversation_context)
     overall_started = monotonic()
+    overall_timeout = min(60, max(timeout_seconds, timeout_seconds * 4))
+    deadline = overall_started + overall_timeout
     state = _NativeLoopState()
 
     async def _run() -> LLMConversationReply | None:
@@ -1989,6 +2062,8 @@ async def _request_native_read_agent(
                     if include_confirmations and request_index == 0
                     else read_only_tools
                 )
+                if state.provider_requests >= _NATIVE_MAX_PROVIDER_CALLS:
+                    request_tools = []
                 request_body = native_tool_request_body(
                     protocol=protocol,
                     model=model,
@@ -2003,18 +2078,24 @@ async def _request_native_read_agent(
                     output_reserve=1000,
                 ):
                     return state.partial("context_budget_exhausted")
-                response = await client.post_json(
+                response = await _post_provider_json_with_retry(
+                    client,
                     location.endpoint(protocol),
-                    json=request_body,
+                    body=request_body,
                     headers=provider_headers(protocol, api_key),
-                    max_redirects=0,
+                    deadline=deadline,
+                    protocol=protocol,
                 )
                 elapsed_ms = max(0, int((monotonic() - attempt_started) * 1000))
                 if response.status_code != 200:
                     can_fallback = (
                         request_index == 0
                         and protocol_index + 1 < len(protocols)
-                        and response.status_code in {404, 405, 415, 501}
+                        and is_protocol_fallback_error(
+                            response.status_code,
+                            response.text,
+                            protocol=protocol,
+                        )
                     )
                     if can_fallback:
                         fallback_to_next = True
@@ -2096,7 +2177,6 @@ async def _request_native_read_agent(
         return state.partial("protocols_exhausted")
 
     try:
-        overall_timeout = min(60, max(timeout_seconds, timeout_seconds * 4))
         return await asyncio.wait_for(_run(), timeout=overall_timeout)
     except TimeoutError:
         elapsed_ms = max(0, int((monotonic() - overall_started) * 1000))

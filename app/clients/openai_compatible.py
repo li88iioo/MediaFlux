@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import codecs
 from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 import json
+import re
+import time
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit, urlunsplit
 
@@ -21,6 +25,39 @@ PROTOCOLS = frozenset({
     "anthropic_messages",
 })
 SUPPORTED_PROTOCOLS_TEXT = "auto、responses、chat_completions 或 anthropic_messages"
+_REASONING_MODEL_PREFIXES = (
+    "o1",
+    "o3",
+    "o4",
+    "deepseek-reasoner",
+    "deepseek-r1",
+    "qwq",
+)
+_THINK_BLOCK_RE = re.compile(r"(?is)<think\b[^>]*>.*?</think\s*>")
+_PROTOCOL_FALLBACK_MARKERS = (
+    "unknown endpoint",
+    "unsupported endpoint",
+    "route not found",
+    "no route",
+    "cannot post",
+    "not found: /v1/responses",
+    "unknown parameter 'input'",
+    'unknown parameter "input"',
+    "unrecognized request argument supplied: input",
+    "input is not a valid",
+    "responses api is not supported",
+)
+_NON_FALLBACK_MARKERS = (
+    "api key",
+    "authentication",
+    "authorization",
+    "billing",
+    "credit",
+    "quota",
+    "insufficient",
+    "model not found",
+    "content policy",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,9 +131,10 @@ def normalize_protocol(value: object) -> str:
 
 
 def infer_protocol_from_url(raw_url: object) -> str | None:
-    """仅依据显式端点后缀推断协议；普通 Base URL 不做猜测。"""
+    """依据显式端点或官方 Anthropic 主机推断协议。"""
     try:
-        path = urlsplit(str(raw_url or "").strip()).path.rstrip("/").lower()
+        parsed = urlsplit(str(raw_url or "").strip())
+        path = parsed.path.rstrip("/").lower()
     except ValueError:
         return None
     if path.endswith("/chat/completions"):
@@ -104,6 +142,9 @@ def infer_protocol_from_url(raw_url: object) -> str | None:
     if path.endswith("/responses"):
         return "responses"
     if path.endswith("/messages"):
+        return "anthropic_messages"
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if host == "api.anthropic.com" or host.endswith(".anthropic.com"):
         return "anthropic_messages"
     return None
 
@@ -122,6 +163,86 @@ def protocol_attempts(protocol: object) -> tuple[str, ...]:
     if normalized == "auto":
         return ("responses", "chat_completions")
     return (normalized,)
+
+
+def is_reasoning_model(model: object) -> bool:
+    """保守识别已知推理模型，避免发送其不接受的采样参数。"""
+    model_id = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    return any(model_id.startswith(prefix) for prefix in _REASONING_MODEL_PREFIXES)
+
+
+def is_protocol_fallback_error(
+    status_code: int,
+    response_text: object = "",
+    *,
+    protocol: object = "",
+) -> bool:
+    """仅把明确的端点/协议不兼容视为可回退，避免盲重放业务 400。"""
+    status = int(status_code or 0)
+    if status in {404, 405, 415, 501}:
+        return True
+    if status not in {400, 422} or normalize_protocol(protocol) != "responses":
+        return False
+    text = str(response_text or "")[:8192].casefold()
+    if any(marker in text for marker in _NON_FALLBACK_MARKERS):
+        return False
+    return any(marker in text for marker in _PROTOCOL_FALLBACK_MARKERS)
+
+
+def provider_retry_delay(
+    retry_after: object,
+    *,
+    retry_index: int,
+    max_seconds: float = 2.0,
+) -> float:
+    """解析 Retry-After，并把指数退避严格限制在总预算可控范围。"""
+    limit = max(0.0, float(max_seconds))
+    raw = str(retry_after or "").strip()
+    delay: float | None = None
+    if raw:
+        try:
+            delay = float(raw)
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                delay = parsed.timestamp() - time.time()
+            except (TypeError, ValueError, OverflowError):
+                delay = None
+    if delay is None:
+        delay = 0.2 * (2 ** max(0, int(retry_index)))
+    return min(limit, max(0.0, delay))
+
+
+def strip_reasoning_markup(value: object) -> str:
+    """移除部分兼容网关塞进正文的 ``<think>`` 内部思考。"""
+    text = str(value or "")
+    while True:
+        cleaned = _THINK_BLOCK_RE.sub("", text)
+        if cleaned == text:
+            break
+        text = cleaned
+    opening = re.search(r"(?is)<think\b", text)
+    if opening:
+        text = text[: opening.start()]
+    return re.sub(r"(?is)</think\s*>", "", text)
+
+
+def _generation_parameters(
+    *, protocol: str, model: str, max_tokens: int
+) -> dict[str, Any]:
+    normalized = normalize_protocol(protocol)
+    parameters: dict[str, Any]
+    if normalized == "responses":
+        parameters = {"max_output_tokens": max_tokens}
+    elif normalized == "chat_completions" and is_reasoning_model(model):
+        parameters = {"max_completion_tokens": max_tokens}
+    else:
+        parameters = {"max_tokens": max_tokens}
+    if not is_reasoning_model(model):
+        parameters["temperature"] = 0
+    return parameters
 
 
 def provider_headers(
@@ -201,14 +322,12 @@ def structured_request_body(
     max_tokens: int,
 ) -> dict[str, Any]:
     if protocol == "responses":
-        return {
+        body = {
             "model": model,
             "input": [
                 {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                 {"role": "user", "content": [{"type": "input_text", "text": user_content}]},
             ],
-            "temperature": 0,
-            "max_output_tokens": max_tokens,
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -218,13 +337,15 @@ def structured_request_body(
                 }
             },
         }
+        body.update(_generation_parameters(
+            protocol=protocol, model=model, max_tokens=max_tokens
+        ))
+        return body
     if protocol == "anthropic_messages":
-        return {
+        body = {
             "model": model,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_content}],
-            "temperature": 0,
-            "max_tokens": max_tokens,
             "output_config": {
                 "format": {
                     "type": "json_schema",
@@ -232,19 +353,25 @@ def structured_request_body(
                 }
             },
         }
-    return {
+        body.update(_generation_parameters(
+            protocol=protocol, model=model, max_tokens=max_tokens
+        ))
+        return body
+    body = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "temperature": 0,
-        "max_tokens": max_tokens,
         "response_format": {
             "type": "json_schema",
             "json_schema": {"name": schema_name, "strict": True, "schema": schema},
         },
     }
+    body.update(_generation_parameters(
+        protocol=protocol, model=model, max_tokens=max_tokens
+    ))
+    return body
 
 
 def _text_from_blocks(blocks: object, *, allowed_types: set[str]) -> str:
@@ -271,15 +398,19 @@ def extract_output_text(envelope: object, protocol: str) -> str:
             "refusal",
         }:
             raise ValueError("AI 响应未完整结束")
-        return _text_from_blocks(envelope.get("content"), allowed_types={"text"})
+        return strip_reasoning_markup(
+            _text_from_blocks(envelope.get("content"), allowed_types={"text"})
+        )
     if protocol == "chat_completions":
         content = envelope["choices"][0]["message"]["content"]
         if isinstance(content, str):
-            return content
-        return _text_from_blocks(content, allowed_types={"text", "output_text"})
+            return strip_reasoning_markup(content)
+        return strip_reasoning_markup(
+            _text_from_blocks(content, allowed_types={"text", "output_text"})
+        )
     direct = envelope.get("output_text")
     if isinstance(direct, str) and direct:
-        return direct
+        return strip_reasoning_markup(direct)
     parts: list[str] = []
     for item in envelope.get("output") or []:
         if not isinstance(item, dict):
@@ -293,7 +424,7 @@ def extract_output_text(envelope: object, protocol: str) -> str:
         except ValueError:
             continue
     if parts:
-        return "".join(parts)
+        return strip_reasoning_markup("".join(parts))
     raise ValueError("AI 响应格式无效")
 
 
@@ -448,32 +579,38 @@ def native_tool_request_body(
         body = {
             "model": model,
             "input": history,
-            "tools": tools,
-            "tool_choice": "auto",
-            "parallel_tool_calls": False,
-            "temperature": 0,
-            "max_output_tokens": max_tokens,
         }
+        if tools:
+            body.update({
+                "tools": tools,
+                "tool_choice": "auto",
+                "parallel_tool_calls": False,
+            })
     elif protocol == "anthropic_messages":
         body = {
             "model": model,
             "system": system_prompt,
             "messages": history,
-            "tools": tools,
-            "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
-            "temperature": 0,
-            "max_tokens": max_tokens,
         }
+        if tools:
+            body.update({
+                "tools": tools,
+                "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+            })
     else:
         body = {
             "model": model,
             "messages": history,
-            "tools": tools,
-            "tool_choice": "auto",
-            "parallel_tool_calls": False,
-            "temperature": 0,
-            "max_tokens": max_tokens,
         }
+        if tools:
+            body.update({
+                "tools": tools,
+                "tool_choice": "auto",
+                "parallel_tool_calls": False,
+            })
+    body.update(_generation_parameters(
+        protocol=protocol, model=model, max_tokens=max_tokens
+    ))
     if stream:
         body["stream"] = True
     return body
@@ -490,7 +627,7 @@ def text_stream_request_body(
     """构造不携带工具的纯文本流式请求。"""
     normalized = normalize_protocol(protocol)
     if normalized == "responses":
-        return {
+        body = {
             "model": model,
             "input": [
                 {
@@ -502,33 +639,104 @@ def text_stream_request_body(
                     "content": [{"type": "input_text", "text": user_content}],
                 },
             ],
-            "temperature": 0,
-            "max_output_tokens": max_tokens,
             "stream": True,
         }
+        body.update(_generation_parameters(
+            protocol=normalized, model=model, max_tokens=max_tokens
+        ))
+        return body
     if normalized == "anthropic_messages":
-        return {
+        body = {
             "model": model,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_content}],
-            "temperature": 0,
-            "max_tokens": max_tokens,
             "stream": True,
         }
-    return {
+        body.update(_generation_parameters(
+            protocol=normalized, model=model, max_tokens=max_tokens
+        ))
+        return body
+    body = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "temperature": 0,
-        "max_tokens": max_tokens,
         "stream": True,
     }
+    body.update(_generation_parameters(
+        protocol=normalized, model=model, max_tokens=max_tokens
+    ))
+    return body
 
 
 class ProviderStreamError(ValueError):
     """Provider 流不完整、越界或返回错误。"""
+
+
+class _ReasoningDeltaFilter:
+    """跨 SSE 分片移除兼容模型混入正文的 ``<think>`` 段。"""
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._inside = False
+
+    @staticmethod
+    def _ambiguous_suffix_length(value: str, marker: str) -> int:
+        lowered = value.casefold()
+        target = marker.casefold()
+        for length in range(min(len(lowered), len(target) - 1), 0, -1):
+            if lowered.endswith(target[:length]):
+                return length
+        return 0
+
+    def feed(self, value: str) -> str:
+        self._pending += value
+        visible: list[str] = []
+        while self._pending:
+            lowered = self._pending.casefold()
+            if self._inside:
+                close_at = lowered.find("</think")
+                if close_at < 0:
+                    keep = self._ambiguous_suffix_length(self._pending, "</think")
+                    self._pending = self._pending[-keep:] if keep else ""
+                    return "".join(visible)
+                close_end = self._pending.find(">", close_at)
+                if close_end < 0:
+                    self._pending = self._pending[close_at:]
+                    return "".join(visible)
+                self._pending = self._pending[close_end + 1:]
+                self._inside = False
+                continue
+
+            open_at = lowered.find("<think")
+            if open_at >= 0:
+                visible.append(self._pending[:open_at])
+                open_end = self._pending.find(">", open_at)
+                if open_end < 0:
+                    self._pending = self._pending[open_at:]
+                    return "".join(visible)
+                self._pending = self._pending[open_end + 1:]
+                self._inside = True
+                continue
+
+            keep = self._ambiguous_suffix_length(self._pending, "<think")
+            if keep:
+                visible.append(self._pending[:-keep])
+                self._pending = self._pending[-keep:]
+            else:
+                visible.append(self._pending)
+                self._pending = ""
+            return "".join(visible)
+        return "".join(visible)
+
+    def finalize(self) -> str:
+        if self._inside:
+            self._pending = ""
+            return ""
+        visible = strip_reasoning_markup(self._pending)
+        self._pending = ""
+        return visible
 
 
 async def _iter_sse_data(
@@ -593,6 +801,7 @@ async def iter_provider_text_deltas(
         raise ValueError("流式解析需要具体协议")
     completed = False
     accepted_finish = False
+    reasoning_filter = _ReasoningDeltaFilter()
 
     async for data in _iter_sse_data(chunks, max_event_bytes=max_event_bytes):
         if normalized == "chat_completions" and data.strip() == "[DONE]":
@@ -612,7 +821,9 @@ async def iter_provider_text_deltas(
             if event_type == "response.output_text.delta":
                 delta = event.get("delta")
                 if isinstance(delta, str) and delta:
-                    yield delta
+                    visible = reasoning_filter.feed(delta)
+                    if visible:
+                        yield visible
             elif event_type == "response.completed":
                 response = event.get("response")
                 if isinstance(response, dict) and response.get("status") not in {None, "completed"}:
@@ -636,7 +847,9 @@ async def iter_provider_text_deltas(
                         raise ProviderStreamError("纯文本流意外包含工具调用")
                     content = delta.get("content")
                     if isinstance(content, str) and content:
-                        yield content
+                        visible = reasoning_filter.feed(content)
+                        if visible:
+                            yield visible
                 finish_reason = choice.get("finish_reason")
                 if finish_reason in {"stop", "end_turn"}:
                     accepted_finish = True
@@ -652,7 +865,9 @@ async def iter_provider_text_deltas(
             if delta.get("type") == "text_delta":
                 text = delta.get("text")
                 if isinstance(text, str) and text:
-                    yield text
+                    visible = reasoning_filter.feed(text)
+                    if visible:
+                        yield visible
             elif delta.get("type") == "input_json_delta":
                 raise ProviderStreamError("纯文本流意外包含工具参数")
         elif event_type == "message_delta":
@@ -672,6 +887,9 @@ async def iter_provider_text_deltas(
         completed = False
     if not completed:
         raise ProviderStreamError("Provider 流在完成事件前中断")
+    tail = reasoning_filter.finalize()
+    if tail:
+        yield tail
 
 
 def _native_arguments(value: object) -> dict[str, Any]:
@@ -729,8 +947,9 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
         direct = envelope.get("output_text")
         if isinstance(direct, str) and direct and not text_parts:
             text_parts.append(direct)
+        visible_text = strip_reasoning_markup("".join(text_parts))
         return NativeToolTurn(
-            text="".join(text_parts),
+            text=visible_text,
             tool_calls=tuple(calls),
             assistant_entry=assistant_items,
             usage=usage,
@@ -773,14 +992,15 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
                     ),
                 },
             })
+        visible_text = strip_reasoning_markup("".join(text_parts))
         assistant_entry: dict[str, Any] = {
             "role": "assistant",
-            "content": "".join(text_parts) or None,
+            "content": visible_text or None,
         }
         if assistant_calls:
             assistant_entry["tool_calls"] = assistant_calls
         return NativeToolTurn(
-            text="".join(text_parts),
+            text=visible_text,
             tool_calls=tuple(calls),
             assistant_entry=assistant_entry,
             usage=usage,
@@ -798,8 +1018,10 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
         if block.get("type") == "text":
             text = block.get("text")
             if isinstance(text, str) and text:
-                text_parts.append(text)
-                assistant_blocks.append({"type": "text", "text": text})
+                visible = strip_reasoning_markup(text)
+                if visible:
+                    text_parts.append(visible)
+                    assistant_blocks.append({"type": "text", "text": visible})
         elif block.get("type") == "tool_use":
             call = NativeToolCall(
                 call_id=str(block.get("id") or ""),
