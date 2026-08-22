@@ -435,7 +435,8 @@ class AgentEvalNativeToolE2ETests(unittest.TestCase):
         self.assertEqual(response["mode"], "read_plan")
         self.assertEqual(response["tool_call"]["name"], "agent.read_plan")
         self.assertEqual(response["result"]["data"]["step_count"], 2)
-        self.assertEqual(calls, ["workspace.health", "downloads.diagnose_queue"])
+        # 只读 handler 允许并发完成；对 Provider 回填的 tool messages 仍须保序。
+        self.assertCountEqual(calls, ["workspace.health", "downloads.diagnose_queue"])
         self.assertEqual(len(captured), 2)
         tool_messages = [
             item
@@ -443,6 +444,10 @@ class AgentEvalNativeToolE2ETests(unittest.TestCase):
             if item.get("role") == "tool"
         ]
         self.assertEqual(len(tool_messages), 2)
+        self.assertEqual(
+            [item["tool_call_id"] for item in tool_messages],
+            ["call_health", "call_downloads"],
+        )
         self.assertIn("下载队列", response["presentation"]["narrative"])
 
     def test_mock_provider_write_plan_only_issues_confirmation(self) -> None:

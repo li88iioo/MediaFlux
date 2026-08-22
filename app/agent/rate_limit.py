@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+import hashlib
 from collections import deque
 from collections.abc import Callable
 
@@ -162,6 +163,7 @@ class AgentRateLimiter:
         max_keys: int = 4096,
         cleanup_interval: int = 128,
         clock: Callable[[], float] = time.monotonic,
+        shared: bool = False,
     ) -> None:
         if max_keys < 1:
             raise ValueError("max_keys 必须大于 0")
@@ -174,6 +176,7 @@ class AgentRateLimiter:
         self._cleanup_interval = cleanup_interval
         self._clock = clock
         self._operations = 0
+        self._shared = bool(shared)
 
     def allow(self, key: str, *, limit: int, window_seconds: int, cost: int = 1) -> bool:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
@@ -188,6 +191,11 @@ class AgentRateLimiter:
             raise ValueError("cost 必须是 1 到 limit 的整数")
 
         normalized_key = str(key)
+        if self._shared:
+            return self._allow_shared(
+                normalized_key, limit=limit,
+                window_seconds=window_seconds, cost=cost,
+            )
         with self._lock:
             now = self._clock()
             self._operations += 1
@@ -220,15 +228,68 @@ class AgentRateLimiter:
 
     def tracked_keys(self) -> int:
         """返回清理过期状态后的当前身份数量，供诊断与测试使用。"""
+        if self._shared:
+            from app import database as db
+            now_epoch = int(time.time())
+            with db.get_conn() as conn:
+                self._ensure_shared_table(conn)
+                row = conn.execute(
+                    "SELECT COUNT(*) AS total FROM agent_rate_limit_buckets "
+                    "WHERE window_start>?",
+                    (now_epoch - 86400,),
+                ).fetchone()
+            return int(row["total"] or 0)
         with self._lock:
             self._prune_expired_locked(self._clock())
             return len(self._events)
 
     def reset(self) -> None:
+        if self._shared:
+            from app import database as db
+            with db.get_conn() as conn:
+                self._ensure_shared_table(conn)
+                conn.execute("DELETE FROM agent_rate_limit_buckets")
         with self._lock:
             self._events.clear()
             self._expires_at.clear()
             self._operations = 0
+
+    @staticmethod
+    def _ensure_shared_table(conn: object) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_rate_limit_buckets ("
+            "limiter_key TEXT PRIMARY KEY,window_start INTEGER NOT NULL,"
+            "count INTEGER NOT NULL DEFAULT 0 CHECK(count>=0),updated_at TEXT NOT NULL)"
+        )
+
+    @staticmethod
+    def _allow_shared(
+        key: str, *, limit: int, window_seconds: int, cost: int
+    ) -> bool:
+        """单行固定窗口桶；跨 Worker 原子判定且不写高频事件日志。"""
+        from app import database as db
+
+        digest = hashlib.sha256(
+            b"mediaflux-agent-rate:v1\0" + key.encode("utf-8", errors="replace")
+        ).hexdigest()
+        now_epoch = int(time.time())
+        window_start = (now_epoch // window_seconds) * window_seconds
+        with db.get_conn() as conn:
+            AgentRateLimiter._ensure_shared_table(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "INSERT INTO agent_rate_limit_buckets"
+                "(limiter_key,window_start,count,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(limiter_key) DO UPDATE SET "
+                "window_start=excluded.window_start,"
+                "count=CASE WHEN agent_rate_limit_buckets.window_start=excluded.window_start "
+                "THEN agent_rate_limit_buckets.count+excluded.count ELSE excluded.count END,"
+                "updated_at=excluded.updated_at "
+                "WHERE agent_rate_limit_buckets.window_start!=excluded.window_start "
+                "OR agent_rate_limit_buckets.count+excluded.count<=?",
+                (digest, window_start, cost, db.now(), limit),
+            )
+            return cursor.rowcount == 1
 
     def _prune_expired_locked(self, now: float) -> None:
         expired = [
@@ -260,4 +321,4 @@ def allow_agent_tool(identity: str, tool_name: str) -> bool:
     )
 
 
-agent_rate_limiter = AgentRateLimiter()
+agent_rate_limiter = AgentRateLimiter(shared=True)

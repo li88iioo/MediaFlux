@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from app import database as db
 from app.agent.models import ToolResult
-from app.agent.rate_limit import agent_rate_limiter
+from app.agent.rate_limit import AgentRateLimiter, agent_rate_limiter
 from app.agent.orchestrator import AgentOrchestrator, is_discovery_search_message, is_web_search_message
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.tools import build_tool_registry
@@ -147,6 +147,34 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertTrue(second.data["cached"])
         self.assertEqual(call.call_count, 1)
         self.assertEqual(db.get_agent_web_search_daily_usage(provider="tavily", usage_date=date.today().isoformat()), 1)
+
+    def test_provider_failure_refunds_reserved_credits(self):
+        async def provider(*args, **kwargs):
+            return ToolResult(False, "timeout", "网页搜索服务响应超时")
+
+        with patch(
+            "app.agent.web_search_actions.get", side_effect=_config(self.values)
+        ), patch(
+            "app.agent.web_search_actions._search_tavily", side_effect=provider
+        ):
+            result = search_web({"query": "temporary failure"})
+
+        self.assertEqual(result.status, "timeout")
+        self.assertEqual(
+            db.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=date.today().isoformat()
+            ),
+            0,
+        )
+
+    def test_shared_rate_bucket_is_consistent_across_instances(self):
+        first = AgentRateLimiter(shared=True)
+        second = AgentRateLimiter(shared=True)
+        first.reset()
+        self.assertTrue(first.allow("same-user", limit=3, window_seconds=60))
+        self.assertTrue(second.allow("same-user", limit=3, window_seconds=60))
+        self.assertTrue(first.allow("same-user", limit=3, window_seconds=60))
+        self.assertFalse(second.allow("same-user", limit=3, window_seconds=60))
 
     def test_daily_budget_fails_closed_before_provider(self):
         self.values["TAVILY_DAILY_CREDIT_LIMIT"] = "1"

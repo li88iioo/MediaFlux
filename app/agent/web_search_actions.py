@@ -1,11 +1,10 @@
 """受控通用网页搜索（Tavily）。"""
 from __future__ import annotations
 
-import copy
+import hashlib
 import ipaddress
 import json
 import re
-import threading
 import time
 import unicodedata
 from datetime import date
@@ -39,8 +38,6 @@ _TAVILY_ENDPOINT = "https://api.tavily.com/search"
 _ALLOWED_TOPICS = frozenset({"general", "news"})
 _ALLOWED_TIME_RANGES = frozenset({"day", "week", "month", "year"})
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_cache: dict[tuple[Any, ...], tuple[float, ToolResult]] = {}
-_cache_lock = threading.RLock()
 
 
 def _int_config(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -130,41 +127,44 @@ def _safe_url(value: Any) -> str:
     return urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path, parsed.query, ""))[:800]
 
 
-def _cache_key(arguments: dict[str, Any], depth: str) -> tuple[Any, ...]:
-    return (
-        arguments["query"].casefold(),
-        arguments["max_results"],
-        arguments["topic"],
-        arguments.get("time_range", ""),
-        depth,
+def _cache_key(arguments: dict[str, Any], depth: str) -> str:
+    encoded = json.dumps(
+        [arguments["query"].casefold(), arguments["max_results"],
+         arguments["topic"], arguments.get("time_range", ""), depth],
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(b"mediaflux-web-search-cache:v1\0" + encoded).hexdigest()
+
+
+def _cached(key: str) -> ToolResult | None:
+    payload = db.get_agent_web_search_cache(key)
+    if not isinstance(payload, dict):
+        return None
+    evidence = []
+    for item in payload.get("evidence") or []:
+        if isinstance(item, dict):
+            evidence.append(Evidence(
+                str(item.get("source") or ""),
+                str(item.get("description") or ""),
+                str(item.get("collected_at") or ""),
+            ))
+    return ToolResult(
+        bool(payload.get("ok")), str(payload.get("status") or ""),
+        str(payload.get("summary") or ""),
+        data=dict(payload.get("data") or {}), evidence=evidence,
+        suggestions=[str(item) for item in payload.get("suggestions") or []],
+        error=str(payload.get("error") or ""),
     )
 
 
-def _cached(key: tuple[Any, ...]) -> ToolResult | None:
-    now = time.monotonic()
-    with _cache_lock:
-        entry = _cache.get(key)
-        if entry is None:
-            return None
-        expires_at, result = entry
-        if expires_at <= now:
-            _cache.pop(key, None)
-            return None
-        return copy.deepcopy(result)
-
-
-def _store_cache(key: tuple[Any, ...], result: ToolResult) -> None:
+def _store_cache(key: str, result: ToolResult) -> None:
     ttl = _int_config("TAVILY_CACHE_TTL_SECONDS", 900, minimum=30, maximum=86400)
-    with _cache_lock:
-        _cache[key] = (time.monotonic() + ttl, copy.deepcopy(result))
-        while len(_cache) > 256:
-            _cache.pop(next(iter(_cache)), None)
+    db.set_agent_web_search_cache(key, result.to_dict(), ttl_seconds=ttl)
 
 
 def clear_web_search_cache() -> None:
-    """清空当前进程的网页搜索结果缓存。"""
-    with _cache_lock:
-        _cache.clear()
+    """清空跨 Worker 共享的网页搜索结果缓存。"""
+    db.clear_agent_web_search_cache()
 
 
 def reset_web_search_cache_for_tests() -> None:
@@ -344,14 +344,24 @@ def search_web(arguments: dict[str, Any]) -> ToolResult:
             data={"daily_limit": daily_limit, "usage_date": usage_date},
             suggestions=["等待次日额度重置，或提高本地每日预算后重试。"],
         )
-    result = run_awaitable_sync(_search_tavily(normalized, api_key=api_key, depth=depth))
-    if result.ok:
-        result.data = dict(result.data)
-        result.data.update({
-            "provider": "tavily",
-            "search_depth": depth,
-            "credits_used": cost,
-            "cached": False,
-        })
-        _store_cache(key, result)
-    return result
+    charged = True
+    try:
+        result = run_awaitable_sync(
+            _search_tavily(normalized, api_key=api_key, depth=depth)
+        )
+        if result.ok:
+            result.data = dict(result.data)
+            result.data.update({
+                "provider": "tavily",
+                "search_depth": depth,
+                "credits_used": cost,
+                "cached": False,
+            })
+            _store_cache(key, result)
+            charged = False
+        return result
+    finally:
+        if charged:
+            db.refund_agent_web_search_credits(
+                provider="tavily", usage_date=usage_date, cost=cost
+            )

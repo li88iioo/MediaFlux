@@ -182,6 +182,7 @@ _NATIVE_MAX_PROVIDER_CALLS = 6
 _NATIVE_MAX_TOOL_ROUNDS = 5
 _NATIVE_MAX_TOOL_CALLS = 8
 _NATIVE_MAX_CAPABILITIES = 14
+_NATIVE_MAX_CONCURRENT_READ_TOOLS = 4
 _LLM_MAX_PROVIDER_CALLS_PER_QUERY = 8
 _STREAM_MAX_ANSWER_CHARS = 1800
 _STREAM_FORBIDDEN_MARKERS = (
@@ -1869,10 +1870,10 @@ async def _execute_native_tool_turn(
     allowed_aliases: frozenset[str],
     allow_confirmations: bool,
 ) -> list[tuple[Any, str]]:
-    """校验并串行执行一个 Provider turn；写能力最多只准备一张确认票据。"""
-    outputs: list[tuple[Any, str]] = []
+    """并发执行独立只读调用；确认预检保持串行且结果严格保序。"""
+    prepared: list[dict[str, Any]] = []
     round_ids: set[str] = set()
-    for call in turn.tool_calls:
+    for index, call in enumerate(turn.tool_calls):
         call_id = str(call.call_id or "").strip()
         alias = str(call.name or "").strip()
         tool_name = registry.native_tool_name(alias)
@@ -1899,8 +1900,11 @@ async def _execute_native_tool_turn(
                 status="attention",
                 summary="调用参数无效，正在重新规划。",
             )
-            outputs.append(_native_tool_output(call, response_payload))
-            state.total_tool_calls += 1
+            prepared.append({
+                "index": index, "call": call, "tool_name": tool_name,
+                "arguments": {}, "confirmation": False,
+                "payload": response_payload, "executed": False,
+            })
             continue
 
         if disposition is LLMToolDisposition.PREPARE_CONFIRMATION:
@@ -1920,30 +1924,69 @@ async def _execute_native_tool_turn(
                         suggestions=["先检查并处理当前待确认操作。"],
                     ).to_dict(),
                 }
-                outputs.append(_native_tool_output(call, response_payload))
-                state.total_tool_calls += 1
+                prepared.append({
+                    "index": index, "call": call, "tool_name": tool_name,
+                    "arguments": normalized_arguments, "confirmation": True,
+                    "payload": response_payload, "executed": False,
+                })
                 continue
             state.confirmation_prepared = True
 
         state.register_call(tool_name, normalized_arguments)
+        prepared.append({
+            "index": index, "call": call, "tool_name": tool_name,
+            "arguments": normalized_arguments,
+            "confirmation": disposition is LLMToolDisposition.PREPARE_CONFIRMATION,
+            "payload": None, "executed": True,
+        })
+
+    async def _execute(item: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         try:
             response_payload = await asyncio.to_thread(
-                execute_tool, tool_name, normalized_arguments
+                execute_tool, item["tool_name"], item["arguments"]
             )
         except AgentToolError as exc:
             if _native_tool_error_is_fatal(exc):
                 raise
             response_payload = _native_tool_error_response(
-                tool_name,
+                item["tool_name"],
                 exc,
                 status="unavailable",
                 summary="本次检查暂时无法完成。",
             )
+        return int(item["index"]), response_payload
 
-        state.record_execution(
-            tool_name, normalized_arguments, response_payload
-        )
-        outputs.append(_native_tool_output(call, response_payload))
+    results: dict[int, dict[str, Any]] = {}
+    read_items = [
+        item for item in prepared
+        if item["payload"] is None and not item["confirmation"]
+    ]
+    semaphore = asyncio.Semaphore(_NATIVE_MAX_CONCURRENT_READ_TOOLS)
+
+    async def _execute_read(item: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        async with semaphore:
+            return await _execute(item)
+
+    if read_items:
+        for index, payload in await asyncio.gather(
+            *(_execute_read(item) for item in read_items)
+        ):
+            results[index] = payload
+
+    # 写操作这里只做确认预检，但仍不得与任何只读调用并发。
+    for item in prepared:
+        if item["payload"] is None and item["confirmation"]:
+            index, payload = await _execute(item)
+            results[index] = payload
+
+    outputs: list[tuple[Any, str]] = []
+    for item in prepared:
+        response_payload = item["payload"] or results[int(item["index"])]
+        if item["executed"]:
+            state.record_execution(
+                item["tool_name"], item["arguments"], response_payload
+            )
+        outputs.append(_native_tool_output(item["call"], response_payload))
         state.total_tool_calls += 1
     return outputs
 

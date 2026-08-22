@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import json as json_module
 from pathlib import Path
 from types import SimpleNamespace
+import time
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,8 @@ from app.agent.llm_router import (
     LLMResultNarrative,
     LLMToolSelection,
     _conversation_user_content,
+    _execute_native_tool_turn,
+    _NativeLoopState,
     _native_context_text,
     _native_read_capabilities,
     _parse_selection,
@@ -55,7 +58,12 @@ from app.agent.result_projection import (
     sanitize_public_multiline_text,
 )
 from app.indexers.http import IndexerHttpResponse
-from app.clients.openai_compatible import ProviderStreamError, ProviderUsage
+from app.clients.openai_compatible import (
+    NativeToolCall,
+    NativeToolTurn,
+    ProviderStreamError,
+    ProviderUsage,
+)
 from app.routes.agent_api import _agent_llm_rate_owner, _agent_owner
 
 
@@ -1719,6 +1727,39 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertEqual(executed, [
             {"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}
         ])
+
+    def test_native_read_tools_execute_concurrently_and_preserve_call_order(self):
+        registry = _counter_read_registry()
+        turn = NativeToolTurn(
+            text="",
+            tool_calls=(
+                NativeToolCall("call_slow", "mf_demo_counter", {"n": 1}),
+                NativeToolCall("call_fast", "mf_demo_counter", {"n": 2}),
+            ),
+        )
+        completed = []
+
+        def execute(name, arguments):
+            time.sleep(0.10 if arguments["n"] == 1 else 0.02)
+            completed.append(arguments["n"])
+            return {
+                "tool_call": {"name": name, "arguments": dict(arguments)},
+                "result": ToolResult(True, "ok", f"计数 {arguments['n']}").to_dict(),
+            }
+
+        state = _NativeLoopState()
+        started = time.monotonic()
+        outputs = asyncio.run(_execute_native_tool_turn(
+            turn, registry=registry, execute_tool=execute, state=state,
+            allowed_aliases=frozenset({"mf_demo_counter"}),
+            allow_confirmations=False,
+        ))
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.18)
+        self.assertEqual(completed, [2, 1])
+        self.assertEqual([call.call_id for call, _payload in outputs], ["call_slow", "call_fast"])
+        self.assertEqual([item["arguments"]["n"] for item in state.tool_executions], [1, 2])
 
     def test_native_read_agent_allows_final_text_on_sixth_provider_request(self):
         scripted = [

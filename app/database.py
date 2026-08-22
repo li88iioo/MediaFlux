@@ -1401,6 +1401,22 @@ CREATE TABLE IF NOT EXISTS agent_web_search_daily_usage (
     PRIMARY KEY(provider, usage_date)
 );
 
+CREATE TABLE IF NOT EXISTS agent_web_search_cache (
+    cache_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_web_search_cache_expires
+    ON agent_web_search_cache(expires_at);
+
+CREATE TABLE IF NOT EXISTS agent_rate_limit_buckets (
+    limiter_key TEXT PRIMARY KEY,
+    window_start INTEGER NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0 CHECK(count >= 0),
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS media_proxy_instances (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -2033,8 +2049,12 @@ def now() -> str:
 # 兼容门面：调用方继续使用 app.database.*，事务实现按业务域拆分。
 from app.repositories.agent_web_search import (  # noqa: E402
     _validate_agent_web_search_usage_date,
+    clear_agent_web_search_cache,
+    get_agent_web_search_cache,
     get_agent_web_search_daily_usage,
+    refund_agent_web_search_credits,
     reserve_agent_web_search_credits,
+    set_agent_web_search_cache,
 )
 
 
