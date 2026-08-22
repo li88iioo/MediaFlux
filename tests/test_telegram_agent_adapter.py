@@ -17,6 +17,9 @@ from app.agent.registry import AgentToolError, ToolRegistry
 from app.bot.agent_adapter import (
     SQLiteTelegramAgentActionStore,
     TelegramAgentActionStore,
+    _TelegramTypingHeartbeat,
+    _begin_agent_stream,
+    _message_context,
     _render_resource_candidates,
     _resource_markup,
     _safe_callback_history_response,
@@ -78,9 +81,11 @@ class _TypingBot(_Bot):
     def __init__(self):
         super().__init__()
         self.typing_actions = []
+        self.typing_thread_ids = []
 
-    def send_chat_action(self, chat_id, action):
+    def send_chat_action(self, chat_id, action, message_thread_id=None):
         self.typing_actions.append((chat_id, action))
+        self.typing_thread_ids.append(message_thread_id)
 
 
 class _InputRichMessage:
@@ -1529,6 +1534,40 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(len(bot.replies), 1)
         self.assertIn("下载队列正常", bot.replies[0][1])
 
+    def test_message_thread_id_is_strictly_normalized_for_stream_and_typing(self):
+        invalid_values = (None, True, False, 0, -1, "77")
+        for index, invalid in enumerate(invalid_values):
+            with self.subTest(value=invalid):
+                message = _message(message_id=700 + index)
+                message.message_thread_id = invalid
+                self.assertIsNone(_message_context(message)[2])
+
+                class DraftBot(_Bot):
+                    def __init__(self):
+                        super().__init__()
+                        self.kwargs = None
+
+                    def send_rich_message_draft(self, *_args, **kwargs):
+                        self.kwargs = kwargs
+                        return True
+
+                    def send_rich_message(self, *_args, **_kwargs):
+                        return SimpleNamespace(message_id=1)
+
+                bot = DraftBot()
+                target = _begin_agent_stream(bot, _RichTelebot, message)
+                self.assertIsNotNone(target)
+                self.assertNotIn("message_thread_id", bot.kwargs)
+                heartbeat = _TelegramTypingHeartbeat(
+                    bot, 100, is_current=lambda: True, message_thread_id=invalid
+                )
+                self.assertIsNone(heartbeat.message_thread_id)
+                self.assertEqual(heartbeat._registry_key, "100:0")
+
+        valid_message = _message(message_id=799)
+        valid_message.message_thread_id = 77
+        self.assertEqual(_message_context(valid_message)[2], 77)
+
     def test_message_sends_typing_when_streaming_is_disabled(self):
         values = {
             "TG_AGENT_ENABLED": "1",
@@ -1555,6 +1594,113 @@ class TelegramAgentAdapterTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(bot.typing_actions), 1)
         self.assertEqual(bot.typing_actions[0], (100, "typing"))
+
+    def test_message_typing_stays_in_forum_topic(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        bot = _TypingBot()
+        service = Mock()
+        service.query.return_value = _answer_response("话题内检查完成")
+        message = _message(message_id=612)
+        message.message_thread_id = 77
+
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter._telegram_conversation_context",
+            return_value=([], 1),
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_conversation"
+        ):
+            self.assertTrue(handle_agent_message(bot, _Telebot, message))
+
+        self.assertGreaterEqual(len(bot.typing_actions), 1)
+        self.assertEqual(bot.typing_thread_ids[0], 77)
+
+    def test_replacing_live_typing_heartbeat_starts_new_worker(self):
+        first_bot = _TypingBot()
+        second_bot = _TypingBot()
+        first = _TelegramTypingHeartbeat(
+            first_bot,
+            100,
+            is_current=lambda: True,
+            interval_seconds=1.0,
+            timeout_seconds=2.0,
+        )
+        second = _TelegramTypingHeartbeat(
+            second_bot,
+            100,
+            is_current=lambda: True,
+            interval_seconds=1.0,
+            timeout_seconds=2.0,
+        )
+        try:
+            first.start()
+            deadline = time.monotonic() + 0.5
+            while not first_bot.typing_actions and time.monotonic() < deadline:
+                time.sleep(0.005)
+            second.start()
+            deadline = time.monotonic() + 0.5
+            while not second_bot.typing_actions and time.monotonic() < deadline:
+                time.sleep(0.005)
+
+            self.assertGreaterEqual(len(first_bot.typing_actions), 1)
+            self.assertGreaterEqual(len(second_bot.typing_actions), 1)
+        finally:
+            first.stop()
+            second.stop()
+
+    def test_blocked_typing_replacement_keeps_one_worker_and_hands_off_to_latest(self):
+        class BlockingTypingBot(_TypingBot):
+            def __init__(self, *, blocked=False):
+                super().__init__()
+                self.blocked = blocked
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def send_chat_action(self, chat_id, action, message_thread_id=None):
+                super().send_chat_action(chat_id, action, message_thread_id)
+                self.started.set()
+                if self.blocked:
+                    self.release.wait(timeout=3)
+
+        first_bot = BlockingTypingBot(blocked=True)
+        skipped_bot = BlockingTypingBot()
+        latest_bot = BlockingTypingBot()
+        first = _TelegramTypingHeartbeat(
+            first_bot, 991, is_current=lambda: True, interval_seconds=1, timeout_seconds=2
+        )
+        skipped = _TelegramTypingHeartbeat(
+            skipped_bot, 991, is_current=lambda: True, interval_seconds=1, timeout_seconds=2
+        )
+        latest = _TelegramTypingHeartbeat(
+            latest_bot, 991, is_current=lambda: True, interval_seconds=1, timeout_seconds=2
+        )
+        try:
+            first.start()
+            self.assertTrue(first_bot.started.wait(timeout=0.5))
+            skipped.start()
+            latest.start()
+            time.sleep(0.03)
+            self.assertEqual(skipped_bot.typing_actions, [])
+            self.assertEqual(latest_bot.typing_actions, [])
+
+            first_bot.release.set()
+            self.assertTrue(latest_bot.started.wait(timeout=0.5))
+            self.assertEqual(skipped_bot.typing_actions, [])
+            self.assertGreaterEqual(len(latest_bot.typing_actions), 1)
+        finally:
+            first_bot.release.set()
+            first.stop()
+            skipped.stop()
+            latest.stop()
 
     def test_slow_message_renews_and_stops_typing_heartbeat(self):
         values = {
@@ -3611,6 +3757,95 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("旧工作区结果不应发布", bot.replies[0][1])
         callback_history.assert_not_called()
 
+    def test_controlled_confirmation_suppresses_inflight_read_callback(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        owner = "tg:v1:100\x1f200"
+        callback_started = threading.Event()
+        release_callback = threading.Event()
+        service = Mock()
+
+        def blocked_invoke(*_args, **_kwargs):
+            callback_started.set()
+            if not release_callback.wait(timeout=5):
+                raise TimeoutError("测试未释放只读 callback")
+            return _answer_response("确认前的旧结果不应发布")
+
+        service.invoke.side_effect = blocked_invoke
+        service.confirm.return_value = {
+            "mode": "confirmed_action",
+            "result": {
+                "ok": True,
+                "status": "success",
+                "summary": "确认操作已完成",
+                "suggestions": [],
+                "evidence": [],
+            },
+        }
+        tokens = iter(("read-before-confirm", "confirm-latest"))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        read_id = store.create_read_tool(
+            owner=owner,
+            tool_name="library.search_missing_episode_resources",
+            arguments={
+                "query": "The Show",
+                "tmdb_id": "12345",
+                "season": 2,
+                "episode": 3,
+                "as_of": "2026-08-01",
+            },
+        )
+        confirm_id = store.create(
+            owner=owner, confirmation_id="ticket", action="confirm"
+        )
+        bot = _Bot()
+        callback_history = Mock()
+        try:
+            with patch(
+                "app.bot.agent_adapter.get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ), patch(
+                "app.bot.agent_adapter.get_agent_service", return_value=service
+            ), patch(
+                "app.bot.agent_adapter.get_telegram_agent_action_store",
+                return_value=store,
+            ), patch(
+                "app.bot.agent_adapter.allow_agent_tool", return_value=True
+            ), patch(
+                "app.bot.agent_adapter._record_telegram_callback_conversation",
+                callback_history,
+            ), ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    handle_agent_callback,
+                    bot,
+                    _callback(f"aga:{read_id}", callback_id="read-before-confirm"),
+                    _Telebot,
+                )
+                self.assertTrue(callback_started.wait(timeout=3))
+                handle_agent_callback(
+                    bot,
+                    _callback(f"aga:{confirm_id}", callback_id="confirm-latest"),
+                    _Telebot,
+                )
+                release_callback.set()
+                future.result(timeout=5)
+        finally:
+            release_callback.set()
+
+        service.confirm.assert_called_once_with(
+            "ticket", owner=owner, request_id=ANY, session_id=ANY
+        )
+        self.assertEqual(bot.replies, [])
+        self.assertTrue(any("确认操作已完成" in edit[0] for edit in bot.edits))
+        callback_history.assert_called_once()
+        self.assertIn(
+            "确认操作已完成",
+            callback_history.call_args.kwargs["response"]["result"]["summary"],
+        )
+
     def test_patrol_callback_new_message_suppresses_stale_reply_and_history(self):
         values = {
             "TG_AGENT_ENABLED": "1",
@@ -3668,8 +3903,105 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("旧巡检结果不应发布", bot.replies[0][1])
         callback_history.assert_not_called()
 
+    def test_patrol_callback_stops_typing_before_success_and_error_terminal_io(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        scenarios = (
+            (None, "terminal_publish"),
+            (AgentToolError("expired", code="precondition_failed"), "terminal_reply"),
+            (RuntimeError("provider unavailable"), "terminal_reply"),
+        )
+        for error, terminal_event in scenarios:
+            with self.subTest(error_type=type(error).__name__ if error else "success"):
+                events = []
+                bot = _Bot()
+                original_reply = bot.reply_to
+
+                def record_reply(*args, **kwargs):
+                    events.append("terminal_reply")
+                    return original_reply(*args, **kwargs)
+
+                bot.reply_to = record_reply
+                heartbeat = Mock()
+                heartbeat.stop.side_effect = lambda: events.append("typing_stop")
+                service = Mock()
+                if error is None:
+                    service.query.return_value = _answer_response("巡检完成")
+                else:
+                    service.query.side_effect = error
+                with patch(
+                    "app.bot.agent_adapter.get",
+                    side_effect=lambda key, default="": values.get(key, default),
+                ), patch(
+                    "app.bot.agent_adapter.get_agent_service", return_value=service
+                ), patch(
+                    "app.bot.agent_adapter._start_telegram_operation_typing",
+                    return_value=heartbeat,
+                ), patch(
+                    "app.bot.agent_adapter._publish_telegram_callback_response",
+                    side_effect=lambda *_args, **_kwargs: events.append(
+                        "terminal_publish"
+                    ),
+                ):
+                    handle_agent_patrol_callback(
+                        bot, _callback("agp:summary"), _Telebot
+                    )
+                self.assertIn(terminal_event, events)
+                self.assertEqual(events[0:2], ["typing_stop", terminal_event])
+                heartbeat.stop.assert_called_once()
+
+    def test_read_callback_stops_typing_before_terminal_publish(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        owner = "tg:v1:100\x1f200"
+        store = TelegramAgentActionStore(token_factory=lambda: "read-stop-order")
+        action_id = store.create_read_tool(
+            owner=owner,
+            tool_name="library.search_missing_episode_resources",
+            arguments={
+                "query": "The Show",
+                "tmdb_id": "12345",
+                "season": 2,
+                "episode": 3,
+                "as_of": "2026-08-01",
+            },
+        )
+        service = Mock()
+        service.invoke.return_value = _answer_response("查询完成")
+        heartbeat = Mock()
+        events = []
+        heartbeat.stop.side_effect = lambda: events.append("typing_stop")
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store", return_value=store
+        ), patch(
+            "app.bot.agent_adapter.allow_agent_tool", return_value=True
+        ), patch(
+            "app.bot.agent_adapter._start_telegram_operation_typing",
+            return_value=heartbeat,
+        ), patch(
+            "app.bot.agent_adapter._publish_telegram_callback_response",
+            side_effect=lambda *_args, **_kwargs: events.append("terminal_publish"),
+        ):
+            handle_agent_callback(
+                _Bot(), _callback(f"aga:{action_id}"), _Telebot
+            )
+
+        self.assertEqual(events[0:2], ["typing_stop", "terminal_publish"])
+        heartbeat.stop.assert_called_once()
+
     def test_patrol_summary_callback_is_owner_bound_and_replies_without_editing(self):
-        bot = _Bot()
+        bot = _TypingBot()
         service = Mock()
         service.query.return_value = {
             "mode": "tool_result",
@@ -3692,7 +4024,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         ), patch(
             "app.bot.agent_adapter.get_agent_service", return_value=service
         ):
-            handle_agent_patrol_callback(bot, _callback("agp:summary"), _Telebot)
+            call = _callback("agp:summary")
+            call.message.message_thread_id = 77
+            handle_agent_patrol_callback(bot, call, _Telebot)
 
         service.query.assert_called_once_with(
             "查看最近全库巡检结果",
@@ -3708,6 +4042,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(bot.edits, [])
         self.assertIn("最近巡检发现", bot.replies[0][1])
         self.assertEqual(bot.answers[-1][1], "正在查询，请稍候")
+        self.assertGreaterEqual(len(bot.typing_actions), 1)
+        self.assertEqual(bot.typing_thread_ids[0], 77)
 
     def test_patrol_resources_callback_refreshes_snapshot_then_offers_safe_actions(self):
         bot = _Bot()
@@ -3908,7 +4244,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(bot.answers[-1][1], "请求过于频繁，请稍后重试")
 
     def test_resource_callback_only_prepares_then_reuses_confirmation_gate(self):
-        bot = _Bot()
+        bot = _TypingBot()
         service = Mock()
         service.prepare.return_value = {
             "mode": "confirmation_required",
@@ -4012,6 +4348,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         )
         self.assertIn("下载任务已提交", bot.edits[-1][0])
         self.assertIsNone(bot.edits[-1][3]["reply_markup"])
+        self.assertGreaterEqual(len(bot.typing_actions), 2)
 
     def test_resource_prepare_failure_is_safe_and_never_confirms(self):
         bot = _Bot()
@@ -4297,6 +4634,64 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         )
         self.assertEqual(len(bot.edits), 1)
         self.assertEqual(bot.answers[-1][1], "操作已过期或无效")
+
+    def test_confirm_callback_stops_typing_before_any_error_terminal_io(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        for index, error in enumerate((
+            AgentToolError("expired", code="precondition_failed"),
+            RuntimeError("provider unavailable"),
+        )):
+            with self.subTest(error_type=type(error).__name__):
+                events = []
+                bot = _Bot()
+                original_edit = bot.edit_message_text
+
+                def record_edit(*args, **kwargs):
+                    events.append("terminal_edit")
+                    return original_edit(*args, **kwargs)
+
+                bot.edit_message_text = record_edit
+                heartbeat = Mock()
+                heartbeat.stop.side_effect = lambda: events.append("typing_stop")
+                service = Mock()
+                service.confirm.side_effect = error
+                store = TelegramAgentActionStore(
+                    token_factory=lambda: f"failure-{index}"
+                )
+                action_id = store.create(
+                    owner="tg:v1:100\x1f200",
+                    confirmation_id="ticket",
+                    action="confirm",
+                )
+                call = SimpleNamespace(
+                    id=f"callback-{index}",
+                    data=f"aga:{action_id}",
+                    from_user=SimpleNamespace(id=200),
+                    message=SimpleNamespace(
+                        chat=SimpleNamespace(id=100), message_id=11
+                    ),
+                )
+                with patch(
+                    "app.bot.agent_adapter.get",
+                    side_effect=lambda key, default="": values.get(key, default),
+                ), patch(
+                    "app.bot.agent_adapter.get_agent_service", return_value=service
+                ), patch(
+                    "app.bot.agent_adapter.get_telegram_agent_action_store",
+                    return_value=store,
+                ), patch(
+                    "app.bot.agent_adapter._start_telegram_operation_typing",
+                    return_value=heartbeat,
+                ):
+                    handle_agent_callback(bot, call)
+
+                self.assertIn("terminal_edit", events)
+                self.assertEqual(events[0:2], ["typing_stop", "terminal_edit"])
+                heartbeat.stop.assert_called_once()
 
     def test_confirm_callback_runtime_failure_reports_service_error(self):
         bot = _Bot()

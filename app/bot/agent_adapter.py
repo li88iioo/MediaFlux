@@ -57,7 +57,11 @@ from app.agent.workspace_next_actions import (
     resolve_workspace_action_handoff,
     workspace_action_handoff_arguments,
 )
-from app.bot.progress import deliver_terminal_to_existing_message, send_typing
+from app.bot.progress import (
+    _normalized_message_thread_id,
+    deliver_terminal_to_existing_message,
+    send_typing,
+)
 from app.config import get
 from app.logger import get_logger
 from app.modules.web_secret import get_web_secret
@@ -158,44 +162,46 @@ class _TelegramTypingHeartbeat:
         chat_id: object,
         *,
         is_current: Callable[[], bool],
+        message_thread_id: int | None = None,
         interval_seconds: float = _TELEGRAM_TYPING_INTERVAL_SECONDS,
         timeout_seconds: float = _TELEGRAM_TYPING_TIMEOUT_SECONDS,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
         self.is_current = is_current
+        self.message_thread_id = _normalized_message_thread_id(message_thread_id)
         self.interval_seconds = max(0.01, float(interval_seconds))
         self.timeout_seconds = max(self.interval_seconds, float(timeout_seconds))
         self._stop = threading.Event()
         self._started = threading.Event()
         self._thread: threading.Thread | None = None
-        self._registry_key = str(chat_id)
+        self._waiting_for_handoff = False
+        self._registry_key = f"{chat_id}:{self.message_thread_id or 0}"
 
     def start(self) -> "_TelegramTypingHeartbeat":
         if self.chat_id is None or not callable(getattr(self.bot, "send_chat_action", None)):
             return self
         if not self._still_current():
             return self
-        thread = threading.Thread(
-            target=self._run,
-            name="mediaflux-agent-telegram-typing",
-            daemon=True,
-        )
+        thread: threading.Thread | None = None
         with _TELEGRAM_TYPING_REGISTRY_LOCK:
             existing = _TELEGRAM_TYPING_REGISTRY.get(self._registry_key)
-            if isinstance(existing, _TelegramTypingHeartbeat):
+            if isinstance(existing, _TelegramTypingHeartbeat) and existing is not self:
                 existing._stop.set()
                 existing_thread = existing._thread
-                if existing_thread is not None and existing_thread.is_alive():
+                if (
+                    (existing_thread is not None and existing_thread.is_alive())
+                    or existing._waiting_for_handoff
+                ):
+                    # 同一 chat/topic 最多保留一个外部 typing I/O。旧调用若阻塞，
+                    # 仅登记最新 successor；旧 worker 退出时再把执行权交给它。
+                    self._waiting_for_handoff = True
+                    _TELEGRAM_TYPING_REGISTRY[self._registry_key] = self
                     return self
+            thread = self._new_thread()
             self._thread = thread
             _TELEGRAM_TYPING_REGISTRY[self._registry_key] = self
-        try:
-            thread.start()
-        except RuntimeError:
-            self._unregister()
-            self._thread = None
-            return self
+        self._launch_thread(thread)
         # 只等待后台 worker 获得调度，不等待 Telegram 外部 I/O 返回。
         self._started.wait(timeout=0.05)
         return self
@@ -203,8 +209,30 @@ class _TelegramTypingHeartbeat:
     def stop(self) -> None:
         self._stop.set()
         thread = self._thread
+        with _TELEGRAM_TYPING_REGISTRY_LOCK:
+            if (
+                _TELEGRAM_TYPING_REGISTRY.get(self._registry_key) is self
+                and (thread is None or not thread.is_alive())
+            ):
+                _TELEGRAM_TYPING_REGISTRY.pop(self._registry_key, None)
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=0.1)
+
+    def _new_thread(self) -> threading.Thread:
+        return threading.Thread(
+            target=self._run,
+            name="mediaflux-agent-telegram-typing",
+            daemon=True,
+        )
+
+    def _launch_thread(self, thread: threading.Thread) -> None:
+        try:
+            thread.start()
+        except RuntimeError:
+            with _TELEGRAM_TYPING_REGISTRY_LOCK:
+                if _TELEGRAM_TYPING_REGISTRY.get(self._registry_key) is self:
+                    _TELEGRAM_TYPING_REGISTRY.pop(self._registry_key, None)
+            self._thread = None
 
     def _still_current(self) -> bool:
         try:
@@ -217,19 +245,38 @@ class _TelegramTypingHeartbeat:
             self._started.set()
             if self._stop.is_set() or not self._still_current():
                 return
-            send_typing(self.bot, self.chat_id)
+            send_typing(
+                self.bot, self.chat_id, message_thread_id=self.message_thread_id
+            )
             deadline = time.monotonic() + self.timeout_seconds
             while not self._stop.wait(self.interval_seconds):
                 if time.monotonic() >= deadline or not self._still_current():
                     return
-                send_typing(self.bot, self.chat_id)
+                send_typing(
+                    self.bot, self.chat_id, message_thread_id=self.message_thread_id
+                )
         finally:
             self._unregister()
 
     def _unregister(self) -> None:
+        successor: _TelegramTypingHeartbeat | None = None
+        successor_thread: threading.Thread | None = None
         with _TELEGRAM_TYPING_REGISTRY_LOCK:
-            if _TELEGRAM_TYPING_REGISTRY.get(self._registry_key) is self:
+            current = _TELEGRAM_TYPING_REGISTRY.get(self._registry_key)
+            if current is self:
                 _TELEGRAM_TYPING_REGISTRY.pop(self._registry_key, None)
+            elif (
+                isinstance(current, _TelegramTypingHeartbeat)
+                and current._thread is None
+                and not current._stop.is_set()
+                and current._still_current()
+            ):
+                successor = current
+                successor_thread = current._new_thread()
+                current._waiting_for_handoff = False
+                current._thread = successor_thread
+        if successor is not None and successor_thread is not None:
+            successor._launch_thread(successor_thread)
 
 
 def _normalize_resource_page_payload(
@@ -1162,8 +1209,12 @@ def _message_context(message: Any) -> tuple[object | None, int | None, int | Non
     message_thread_id = getattr(message, "message_thread_id", None)
     return (
         chat_id,
-        source_message_id if isinstance(source_message_id, int) else None,
-        message_thread_id if isinstance(message_thread_id, int) else None,
+        (
+            source_message_id
+            if isinstance(source_message_id, int) and not isinstance(source_message_id, bool)
+            else None
+        ),
+        _normalized_message_thread_id(message_thread_id),
     )
 
 
@@ -1195,12 +1246,10 @@ def _begin_agent_stream(
     )
     if callable(send_rich_draft) and callable(send_rich) and thinking is not None:
         try:
-            if send_rich_draft(
-                chat_id,
-                draft_id,
-                thinking,
-                message_thread_id=message_thread_id,
-            ):
+            draft_kwargs: dict[str, Any] = {}
+            if message_thread_id is not None:
+                draft_kwargs["message_thread_id"] = message_thread_id
+            if send_rich_draft(chat_id, draft_id, thinking, **draft_kwargs):
                 return _StreamMessage(
                     mode="rich_draft",
                     chat_id=chat_id,
@@ -1216,12 +1265,10 @@ def _begin_agent_stream(
     send_draft = getattr(bot, "send_message_draft", None)
     if callable(send_draft):
         try:
-            if send_draft(
-                chat_id,
-                draft_id,
-                "",
-                message_thread_id=message_thread_id,
-            ):
+            draft_kwargs = {}
+            if message_thread_id is not None:
+                draft_kwargs["message_thread_id"] = message_thread_id
+            if send_draft(chat_id, draft_id, "", **draft_kwargs):
                 return _StreamMessage(
                     mode="draft",
                     chat_id=chat_id,
@@ -1282,24 +1329,23 @@ def _update_agent_stream(
             rich = _rich_message(telebot, text)
             if rich is None or target.draft_id is None:
                 return False
+            draft_kwargs: dict[str, Any] = {}
+            if target.message_thread_id is not None:
+                draft_kwargs["message_thread_id"] = target.message_thread_id
             return bool(
                 bot.send_rich_message_draft(
-                    target.chat_id,
-                    target.draft_id,
-                    rich,
-                    message_thread_id=target.message_thread_id,
+                    target.chat_id, target.draft_id, rich, **draft_kwargs
                 )
             )
         if target.mode == "draft":
             if target.draft_id is None:
                 return False
+            draft_kwargs = {"parse_mode": parse_mode}
+            if target.message_thread_id is not None:
+                draft_kwargs["message_thread_id"] = target.message_thread_id
             return bool(
                 bot.send_message_draft(
-                    target.chat_id,
-                    target.draft_id,
-                    text,
-                    message_thread_id=target.message_thread_id,
-                    parse_mode=parse_mode,
+                    target.chat_id, target.draft_id, text, **draft_kwargs
                 )
             )
         if target.mode == "edit" and target.message_id is not None:
@@ -1532,6 +1578,30 @@ def _publish_telegram_io_if_current(
 def _trace_operation_id(operation: Any) -> str:
     value = str(getattr(operation, "operation_id", "") or "").strip()
     return value or f"tg_trace_{secrets.token_urlsafe(12)}"
+
+
+def _start_telegram_operation_typing(
+    bot: Any,
+    message: Any,
+    *,
+    is_current: Callable[[], bool],
+) -> _TelegramTypingHeartbeat:
+    chat_id, _source_message_id, message_thread_id = _message_context(message)
+    return _TelegramTypingHeartbeat(
+        bot,
+        chat_id,
+        is_current=is_current,
+        message_thread_id=message_thread_id,
+        interval_seconds=_TELEGRAM_TYPING_INTERVAL_SECONDS,
+        timeout_seconds=_TELEGRAM_TYPING_TIMEOUT_SECONDS,
+    ).start()
+
+
+def _stop_telegram_typing_heartbeat(
+    heartbeat: _TelegramTypingHeartbeat | None,
+) -> None:
+    if heartbeat is not None:
+        heartbeat.stop()
 
 
 def _telegram_callback_operation_id(owner: str, call: Any, *, action: str) -> str:
@@ -2761,11 +2831,12 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         initialize=initialize_query,
     )
     stream_target = None
-    message_chat_id, _source_message_id, _message_thread_id = _message_context(message)
+    message_chat_id, _source_message_id, message_thread_id = _message_context(message)
     typing_heartbeat = _TelegramTypingHeartbeat(
         bot,
         message_chat_id,
         is_current=lambda: coordinator.is_current(operation),
+        message_thread_id=message_thread_id,
         interval_seconds=_TELEGRAM_TYPING_INTERVAL_SECONDS,
         timeout_seconds=_TELEGRAM_TYPING_TIMEOUT_SECONDS,
     )
@@ -3055,6 +3126,7 @@ def handle_agent_patrol_callback(
     callback_answered = False
     coordinator = get_agent_operation_coordinator()
     operation = None
+    typing_heartbeat: _TelegramTypingHeartbeat | None = None
     if telegram_agent_access(chat_id, user_id) != "allowed":
         bot.answer_callback_query(call.id, "操作已过期或无效", show_alert=True)
         return
@@ -3081,6 +3153,11 @@ def handle_agent_patrol_callback(
         )
         bot.answer_callback_query(call.id, "正在查询，请稍候")
         callback_answered = True
+        typing_heartbeat = _start_telegram_operation_typing(
+            bot,
+            call.message,
+            is_current=lambda: coordinator.is_current(operation),
+        )
         history_generation = _telegram_history_generation(owner)
         _principal, trace_session_id = _telegram_history_identity(owner)
         response = _query_patrol_action(
@@ -3107,6 +3184,8 @@ def handle_agent_patrol_callback(
                 ),
             )
 
+        _stop_telegram_typing_heartbeat(typing_heartbeat)
+        typing_heartbeat = None
         _publish_telegram_callback_response(
             bot,
             call.message,
@@ -3130,6 +3209,8 @@ def handle_agent_patrol_callback(
                     call.id, "操作已过期或无效", show_alert=True
                 )
             return
+        _stop_telegram_typing_heartbeat(typing_heartbeat)
+        typing_heartbeat = None
         if callback_answered:
             bot.reply_to(
                 call.message,
@@ -3142,6 +3223,8 @@ def handle_agent_patrol_callback(
         logger.warning("Telegram Agent 巡检动作失败 type=%s", type(exc).__name__)
         if operation is not None and not coordinator.is_current(operation):
             return
+        _stop_telegram_typing_heartbeat(typing_heartbeat)
+        typing_heartbeat = None
         if callback_answered:
             bot.reply_to(
                 call.message,
@@ -3151,6 +3234,7 @@ def handle_agent_patrol_callback(
         else:
             bot.answer_callback_query(call.id, "Agent 暂时不可用", show_alert=True)
     finally:
+        _stop_telegram_typing_heartbeat(typing_heartbeat)
         if operation is not None:
             coordinator.finish(operation)
 
@@ -3161,6 +3245,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
     confirmed_action_completed = False
     coordinator = get_agent_operation_coordinator()
     operation = None
+    typing_heartbeat: _TelegramTypingHeartbeat | None = None
     if telegram_agent_access(chat_id, user_id) != "allowed":
         bot.answer_callback_query(call.id, "操作已过期或无效", show_alert=True)
         return
@@ -3238,97 +3323,113 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             elif action_kind == "prepare_resource":
                 bot.answer_callback_query(call.id, "正在准备，请稍候")
                 callback_answered = True
+            if action_kind in {"prepare_resource", "confirm"}:
+                typing_heartbeat = _start_telegram_operation_typing(
+                    bot, call.message, is_current=lambda: True
+                )
 
             prepare_error: AgentToolError | None = None
-            with get_agent_operation_coordinator().owner_window(owner):
-                action = store.resolve(action_id, owner=owner)
-                if action["action"] == "cancel":
-                    service.discard_confirmation(
-                        action["confirmation_id"],
-                        owner=owner,
+            try:
+                with coordinator.owner_window(owner):
+                    action = store.resolve(action_id, owner=owner)
+                    # 受控 action 是该 owner 的最新明确意图。它不伪装成查询 lease，
+                    # 但必须撤销此前仍在执行的只读 callback，防止写入完成后发布旧快照。
+                    coordinator.invalidate_owner(
+                        owner=owner, reason="controlled_action"
                     )
-                    response = {
-                        "mode": "conversation",
-                        "result": {
-                            "ok": True,
-                            "status": "cancelled",
-                            "summary": "操作已取消，未执行任何写入。",
-                            "suggestions": [],
-                            "evidence": [],
-                        },
-                    }
-                    text = "<b>操作已取消</b>\n未执行任何写入。"
-                    markup = None
-                    history_message = "取消待处理操作"
-                    fallback_summary = "操作已取消，未执行任何写入。"
-                elif action["action"] == "prepare_resource":
-                    try:
-                        response = service.prepare(
-                            "indexer.submit_resource",
-                            {
-                                "result_id": action["result_id"],
-                                "target": action["target"],
+                    if action["action"] == "cancel":
+                        service.discard_confirmation(
+                            action["confirmation_id"],
+                            owner=owner,
+                        )
+                        response = {
+                            "mode": "conversation",
+                            "result": {
+                                "ok": True,
+                                "status": "cancelled",
+                                "summary": "操作已取消，未执行任何写入。",
+                                "suggestions": [],
+                                "evidence": [],
                             },
+                        }
+                        text = "<b>操作已取消</b>\n未执行任何写入。"
+                        markup = None
+                        history_message = "取消待处理操作"
+                        fallback_summary = "操作已取消，未执行任何写入。"
+                    elif action["action"] == "prepare_resource":
+                        try:
+                            response = service.prepare(
+                                "indexer.submit_resource",
+                                {
+                                    "result_id": action["result_id"],
+                                    "target": action["target"],
+                                },
+                                owner=owner,
+                                request_id=_trace_operation_id(operation),
+                                session_id=_telegram_history_identity(owner)[1],
+                            )
+                        except AgentToolError as exc:
+                            prepare_error = exc
+                        if prepare_error is None:
+                            confirmation = (
+                                response.get("confirmation")
+                                if isinstance(response, dict)
+                                and isinstance(response.get("confirmation"), dict)
+                                else None
+                            )
+                            confirmation_id = (
+                                str(confirmation.get("confirmation_id") or "").strip()
+                                if confirmation
+                                else ""
+                            )
+                            if (
+                                response.get("mode") != "confirmation_required"
+                                or not confirmation_id
+                            ):
+                                raise ValueError("资源预检未返回确认票据")
+                            if telebot_module is None:
+                                import telebot as telebot_module
+                            markup = _confirmation_markup(
+                                telebot_module,
+                                owner=owner,
+                                confirmation_id=confirmation_id,
+                                action=str(
+                                    sanitize_confirmation_contract(
+                                        confirmation.get("contract")
+                                    ).get("action")
+                                    or ""
+                                ),
+                            )
+                            text = render_agent_response(response, confirmation=True)
+                            history_message = "准备提交所选资源"
+                            fallback_summary = "资源提交已完成预检，等待确认。"
+                    else:
+                        response = service.confirm(
+                            action["confirmation_id"],
                             owner=owner,
                             request_id=_trace_operation_id(operation),
                             session_id=_telegram_history_identity(owner)[1],
                         )
-                    except AgentToolError as exc:
-                        prepare_error = exc
-                    if prepare_error is None:
-                        confirmation = (
-                            response.get("confirmation")
-                            if isinstance(response, dict)
-                            and isinstance(response.get("confirmation"), dict)
-                            else None
-                        )
-                        confirmation_id = (
-                            str(confirmation.get("confirmation_id") or "").strip()
-                            if confirmation
-                            else ""
-                        )
-                        if (
-                            response.get("mode") != "confirmation_required"
-                            or not confirmation_id
-                        ):
-                            raise ValueError("资源预检未返回确认票据")
-                        if telebot_module is None:
-                            import telebot as telebot_module
-                        markup = _confirmation_markup(
-                            telebot_module,
-                            owner=owner,
-                            confirmation_id=confirmation_id,
-                            action=str(
-                                sanitize_confirmation_contract(
-                                    confirmation.get("contract")
-                                ).get("action")
-                                or ""
-                            ),
-                        )
-                        text = render_agent_response(response, confirmation=True)
-                        history_message = "准备提交所选资源"
-                        fallback_summary = "资源提交已完成预检，等待确认。"
-                else:
-                    response = service.confirm(
-                        action["confirmation_id"],
-                        owner=owner,
-                        request_id=_trace_operation_id(operation),
-                        session_id=_telegram_history_identity(owner)[1],
-                    )
-                    confirmed_action_completed = True
-                    text = render_agent_response(response)
-                    markup = None
-                    history_message = "确认执行待处理操作"
-                    fallback_summary = "待处理操作已执行。"
+                        confirmed_action_completed = True
+                        text = render_agent_response(response)
+                        markup = None
+                        history_message = "确认执行待处理操作"
+                        fallback_summary = "待处理操作已执行。"
 
-                if prepare_error is None:
-                    _record_telegram_callback_conversation(
-                        owner,
-                        message=history_message,
-                        response=response,
-                        generation=history_generation,
-                        fallback_summary=fallback_summary,
-                    )
+                    if prepare_error is None:
+                        _record_telegram_callback_conversation(
+                            owner,
+                            message=history_message,
+                            response=response,
+                            generation=history_generation,
+                            fallback_summary=fallback_summary,
+                        )
+
+            finally:
+                # 受控写入只在 owner_window 内显示 typing。无论服务成功或抛错，
+                # 都在任何终态 edit/send/retry 之前停止旧 Topic 的输入状态。
+                _stop_telegram_typing_heartbeat(typing_heartbeat)
+                typing_heartbeat = None
 
             if prepare_error is not None:
                 logger.info("Telegram 资源预检被拒绝 code=%s", prepare_error.code)
@@ -3412,6 +3513,13 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                     ),
                 )
 
+        if typing_heartbeat is None and operation is not None:
+            typing_heartbeat = _start_telegram_operation_typing(
+                bot,
+                call.message,
+                is_current=lambda: coordinator.is_current(operation),
+            )
+
         if action["action"] == "invoke_read_tool":
             bot.answer_callback_query(call.id, "正在查询，请稍候")
             callback_answered = True
@@ -3440,6 +3548,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                     ),
                 )
 
+            _stop_telegram_typing_heartbeat(typing_heartbeat)
+            typing_heartbeat = None
             _publish_telegram_callback_response(
                 bot,
                 call.message,
@@ -3462,6 +3572,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 session_id=_telegram_history_identity(owner)[1],
             )
             label = sanitize_public_text(resolution.get("label"), limit=120) or "建议检查"
+            _stop_telegram_typing_heartbeat(typing_heartbeat)
+            typing_heartbeat = None
             _publish_telegram_callback_response(
                 bot,
                 call.message,
@@ -3484,6 +3596,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                     call.id, "操作已过期或无效", show_alert=True
                 )
             return
+        _stop_telegram_typing_heartbeat(typing_heartbeat)
+        typing_heartbeat = None
         if callback_answered:
             try:
                 bot.edit_message_text(
@@ -3507,6 +3621,8 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                     call.id, "Agent 暂时不可用", show_alert=True
                 )
             return
+        _stop_telegram_typing_heartbeat(typing_heartbeat)
+        typing_heartbeat = None
         if callback_answered:
             if confirmed_action_completed:
                 delivered = deliver_terminal_to_existing_message(
@@ -3534,5 +3650,6 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             _remove_callback_keyboard(bot, call.message)
             bot.answer_callback_query(call.id, "Agent 暂时不可用", show_alert=True)
     finally:
+        _stop_telegram_typing_heartbeat(typing_heartbeat)
         if operation is not None:
             coordinator.finish(operation)

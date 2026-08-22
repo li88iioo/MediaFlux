@@ -1342,7 +1342,11 @@ def _register_commands(bot, telebot):
         try:
             from app.modules.download_dispatcher import create_request, torrent_download_input
 
-            send_typing(bot, msg.chat.id)
+            send_typing(
+                bot,
+                msg.chat.id,
+                message_thread_id=getattr(msg, "message_thread_id", None),
+            )
             file_info = bot.get_file(document.file_id)
             data = bot.download_file(file_info.file_path)
             item = torrent_download_input(filename, data)
@@ -1382,7 +1386,11 @@ def _register_commands(bot, telebot):
         if _reject_unauthorized_group_write(bot, msg):
             return
         try:
-            send_typing(bot, msg.chat.id)
+            send_typing(
+                bot,
+                msg.chat.id,
+                message_thread_id=getattr(msg, "message_thread_id", None),
+            )
             if route_download_url(url) == "guangya_share":
                 _inspect_telegram_share(bot, msg, url, telebot)
                 return

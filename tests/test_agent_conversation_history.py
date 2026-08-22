@@ -16,6 +16,7 @@ from app.agent.registry import AgentToolError
 from app.agent.rate_limit import agent_rate_limiter
 from app.config import web_credentials
 from app.main import create_app
+from app.routes.agent_api import _public_session_projection
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -122,6 +123,171 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
             '"arguments"',
         ):
             self.assertNotIn(forbidden, raw)
+
+    def test_multiline_narrative_is_persisted_and_restored_safely(self):
+        response = _response(summary="底层工具摘要")
+        response["presentation"] = {
+            "source": "llm",
+            "kind": "narrative",
+            "narrative": "第一段直接回答。\n\n- 第二段保留换行",
+            "guidance": [],
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="第一行问题\n第二行补充",
+            response=response,
+        )
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(history["title"], "第一行问题 第二行补充")
+        self.assertEqual(
+            history["messages"][0]["data"]["text"],
+            "第一行问题\n第二行补充",
+        )
+        assistant = history["messages"][1]["data"]
+        self.assertEqual(
+            assistant["narrative"],
+            "第一段直接回答。\n\n- 第二段保留换行",
+        )
+        projected = _public_session_projection(history)
+        restored_narrative = projected["messages"][1]["data"]["narrative"]
+        self.assertIn("第一段直接回答。", restored_narrative)
+        self.assertIn("\n- 第二段保留换行", restored_narrative)
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertIn("第一段直接回答", context[-1]["text"])
+        self.assertNotIn("底层工具摘要", context[-1]["text"])
+
+    def test_oversized_multibyte_narrative_is_trimmed_without_losing_turn(self):
+        response = _response(summary="摘" * 600)
+        response["result"]["suggestions"] = ["建" * 180 for _ in range(4)]
+        response["presentation"] = {
+            "source": "llm",
+            "kind": "narrative",
+            "narrative": "答" * 1200,
+            "guidance": [],
+        }
+
+        self.assertTrue(self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="保存这轮结果",
+            response=response,
+        ))
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        assistant = history["messages"][1]["data"]
+        self.assertEqual(assistant["summary"], "摘" * 600)
+        self.assertTrue(assistant.get("narrative"))
+        self.assertTrue(assistant["suggestions"])
+        self.assertLess(len(assistant["narrative"]), 1200)
+        self.assertLess(len(assistant["suggestions"]), 4)
+        with db.get_conn() as conn:
+            payload = str(conn.execute(
+                "SELECT payload FROM agent_conversation_messages "
+                "WHERE role='assistant' ORDER BY id DESC LIMIT 1"
+            ).fetchone()["payload"])
+        self.assertLessEqual(len(payload.encode("utf-8")), self.repository.max_payload_bytes)
+
+    def test_plain_urls_in_narrative_never_reach_storage_or_llm_context(self):
+        for index, unsafe_uri in enumerate((
+            "https://intranet.example/a",
+            "ftp://private-host/a",
+            "file:///tmp/private-a",
+        )):
+            with self.subTest(uri=unsafe_uri):
+                session_id = f"agent_url_history_{index:02d}"
+                response = _response(summary="已完成安全检查")
+                response["presentation"] = {
+                    "source": "llm",
+                    "kind": "narrative",
+                    "narrative": f"详情位于 {unsafe_uri}",
+                    "guidance": [],
+                }
+                self.repository.append_query_turn(
+                    principal="browser-principal-a",
+                    session_id=session_id,
+                    message="给我安全结果",
+                    response=response,
+                )
+                history = self.repository.get_session(
+                    principal="browser-principal-a", session_id=session_id
+                )
+                projected = _public_session_projection(history)
+                context = self.repository.get_llm_context(
+                    principal="browser-principal-a", session_id=session_id
+                )
+                with db.get_conn() as conn:
+                    raw = "\n".join(
+                        str(row["payload"])
+                        for row in conn.execute(
+                            "SELECT payload FROM agent_conversation_messages "
+                            "WHERE conversation_id=("
+                            "SELECT id FROM agent_conversations "
+                            "WHERE session_id=? ORDER BY id DESC LIMIT 1)",
+                            (session_id,),
+                        ).fetchall()
+                    )
+                combined = "\n".join((
+                    raw,
+                    json.dumps(history, ensure_ascii=False),
+                    json.dumps(projected, ensure_ascii=False),
+                    json.dumps(context, ensure_ascii=False),
+                ))
+                self.assertNotIn(unsafe_uri, combined)
+                self.assertIn("[已隐藏敏感详情]", combined)
+
+    def test_sensitive_narrative_is_redacted_from_storage_public_projection_and_context(self):
+        response = _response(summary="已完成安全检查")
+        response["presentation"] = {
+            "source": "llm",
+            "kind": "narrative",
+            "narrative": (
+                "token=super-secret https://private.invalid /private/path "
+                "magnet:?xt=urn:btih:private"
+            ),
+            "guidance": [],
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="给我安全结果",
+            response=response,
+        )
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        projected = _public_session_projection(history)
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        with db.get_conn() as conn:
+            raw = "\n".join(
+                str(row["payload"])
+                for row in conn.execute(
+                    "SELECT payload FROM agent_conversation_messages ORDER BY id"
+                ).fetchall()
+            )
+        combined = "\n".join((
+            raw,
+            json.dumps(projected, ensure_ascii=False),
+            json.dumps(context, ensure_ascii=False),
+        ))
+        for forbidden in (
+            "super-secret",
+            "private.invalid",
+            "/private/path",
+            "magnet:?",
+        ):
+            self.assertNotIn(forbidden, combined)
+        self.assertIn("[已隐藏敏感详情]", combined)
 
     def test_usage_is_signed_and_stored_but_not_sent_back_to_llm(self):
         response = _response()

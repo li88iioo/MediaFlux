@@ -117,11 +117,23 @@ def _rich_message(telebot: Any, rendered: str) -> Any | None:
         return None
 
 
-def send_typing(bot: Any, chat_id: object) -> None:
+def _normalized_message_thread_id(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def send_typing(
+    bot: Any, chat_id: object, *, message_thread_id: int | None = None
+) -> None:
     action = getattr(bot, "send_chat_action", None)
     if callable(action):
         try:
-            action(chat_id, "typing")
+            kwargs: dict[str, Any] = {}
+            normalized_thread_id = _normalized_message_thread_id(message_thread_id)
+            if normalized_thread_id is not None:
+                kwargs["message_thread_id"] = normalized_thread_id
+            action(chat_id, "typing", **kwargs)
         except Exception:
             pass
 
@@ -145,8 +157,12 @@ class TelegramProgress:
 
     def begin(self, rendered: str) -> "TelegramProgress":
         source = self.source_message
-        self.message_thread_id = getattr(source, "message_thread_id", None)
-        send_typing(self.bot, self.chat_id)
+        self.message_thread_id = _normalized_message_thread_id(
+            getattr(source, "message_thread_id", None)
+        )
+        send_typing(
+            self.bot, self.chat_id, message_thread_id=self.message_thread_id
+        )
         self.draft_id = secrets.randbelow(2_147_483_647) + 1
 
         rich = _rich_message(self.telebot, rendered)
@@ -194,6 +210,7 @@ class TelegramProgress:
             "mode": self.mode,
             "message_id": self.message_id,
             "draft_id": self.draft_id,
+            "message_thread_id": self.message_thread_id,
             "started_at": int(time.time()),
             "deadline": int(time.time() + max(30.0, float(self.timeout_seconds))),
         })
@@ -233,7 +250,9 @@ class TelegramProgress:
                     "后台任务可能仍在继续；完成后仍会发送结果，可使用 /status 查看运行状态。"
                 )
                 return
-            send_typing(self.bot, self.chat_id)
+            send_typing(
+                self.bot, self.chat_id, message_thread_id=self.message_thread_id
+            )
 
     def _send_real(self, rendered: str, *, reply_markup: Any = None) -> Any:
         kwargs: dict[str, Any] = {
@@ -483,7 +502,9 @@ def deliver_terminal_to_existing_message(
     )
     operation.mode = "edit"
     operation.message_id = int(message_id)
-    operation.message_thread_id = getattr(source_message, "message_thread_id", None)
+    operation.message_thread_id = _normalized_message_thread_id(
+        getattr(source_message, "message_thread_id", None)
+    )
     stamp = int(time.time())
     _register_pending({
         "id": operation.operation_id,
@@ -491,6 +512,7 @@ def deliver_terminal_to_existing_message(
         "label": str(operation.label)[:160],
         "mode": "edit",
         "message_id": operation.message_id,
+        "message_thread_id": operation.message_thread_id,
         "started_at": stamp,
         "deadline": stamp + 180,
         "terminal_text": str(rendered),
@@ -516,14 +538,22 @@ def _clear_stale_draft(bot: Any, telebot_module: Any, row: dict[str, Any]) -> bo
     if mode not in {"draft", "rich_draft"} or not draft_id or not chat_id:
         return False
     try:
+        kwargs: dict[str, Any] = {}
+        message_thread_id = _normalized_message_thread_id(row.get("message_thread_id"))
+        if message_thread_id is not None:
+            kwargs["message_thread_id"] = message_thread_id
         if mode == "rich_draft":
             rich = _rich_message(telebot_module, "")
             sender = getattr(bot, "send_rich_message_draft", None)
-            if callable(sender) and rich is not None and sender(chat_id, int(draft_id), rich):
+            if (
+                callable(sender)
+                and rich is not None
+                and sender(chat_id, int(draft_id), rich, **kwargs)
+            ):
                 return True
         sender = getattr(bot, "send_message_draft", None)
         if callable(sender):
-            return bool(sender(chat_id, int(draft_id), ""))
+            return bool(sender(chat_id, int(draft_id), "", **kwargs))
     except Exception as exc:
         logger.info("Telegram 中断草稿清理失败 type=%s", type(exc).__name__)
     return False
@@ -694,7 +724,13 @@ def recover_stale_operations(
                         type(exc).__name__,
                     )
             if not delivered and callable(getattr(bot, "send_message", None)):
-                bot.send_message(chat_id, text, parse_mode="HTML")
+                send_kwargs: dict[str, Any] = {"parse_mode": "HTML"}
+                message_thread_id = _normalized_message_thread_id(
+                    row.get("message_thread_id")
+                )
+                if message_thread_id is not None:
+                    send_kwargs["message_thread_id"] = message_thread_id
+                bot.send_message(chat_id, text, **send_kwargs)
                 delivered = True
             if not delivered:
                 continue

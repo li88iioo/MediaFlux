@@ -95,6 +95,7 @@ from app.agent.result_projection import (
     project_agent_result_for_user,
     project_public_guidance,
     public_tool_label,
+    sanitize_public_multiline_text,
     sanitize_public_text,
 )
 from app.agent.presentation_stream import (
@@ -307,6 +308,12 @@ def _public_history_text(value: Any, *, limit: int, fallback: str = "") -> str:
     return sanitize_public_text(value, limit=limit) or fallback
 
 
+def _public_history_multiline_text(
+    value: Any, *, limit: int, fallback: str = ""
+) -> str:
+    return sanitize_public_multiline_text(value, limit=limit) or fallback
+
+
 def _public_session_projection(session: dict[str, Any]) -> dict[str, Any]:
     """只向浏览器返回面向用户的历史投影，不暴露内部工具协议。"""
     projected = {
@@ -325,11 +332,18 @@ def _public_session_projection(session: dict[str, Any]) -> dict[str, Any]:
             tool_name = str(public_data.pop("tool_name", "") or "").strip()
             if tool_name:
                 public_data["tool_label"] = public_tool_label(tool_name)
-            public_data["summary"] = _public_history_text(
+            public_data["summary"] = _public_history_multiline_text(
                 public_data.get("summary"),
                 limit=600,
                 fallback="Agent 已返回结果",
             )
+            narrative = _public_history_multiline_text(
+                public_data.get("narrative"), limit=1200
+            )
+            if narrative:
+                public_data["narrative"] = narrative
+            else:
+                public_data.pop("narrative", None)
             error = _public_history_text(public_data.get("error"), limit=300)
             if error:
                 public_data["error"] = error
@@ -345,7 +359,7 @@ def _public_session_projection(session: dict[str, Any]) -> dict[str, Any]:
             if guidance:
                 public_data["guidance"] = guidance
         elif role == "user":
-            public_data["text"] = _public_history_text(
+            public_data["text"] = _public_history_multiline_text(
                 public_data.get("text"),
                 limit=1000,
                 fallback="历史消息已隐藏",

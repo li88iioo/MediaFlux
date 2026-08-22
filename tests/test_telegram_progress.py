@@ -25,8 +25,8 @@ class _RichBot:
         self.actions = []
         self.messages = []
 
-    def send_chat_action(self, chat_id, action):
-        self.actions.append((chat_id, action))
+    def send_chat_action(self, chat_id, action, message_thread_id=None):
+        self.actions.append((chat_id, action, message_thread_id))
 
     def send_rich_message_draft(self, chat_id, draft_id, message, **kwargs):
         self.rich_drafts.append((chat_id, draft_id, message.html, kwargs))
@@ -144,6 +144,54 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
         self.assertFalse(progress.update("不应覆盖终态"))
         self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
 
+    def test_progress_typing_stays_in_forum_topic(self):
+        bot = _RichBot()
+        source = SimpleNamespace(
+            chat=SimpleNamespace(id="100"),
+            message_id=44,
+            message_thread_id=77,
+        )
+        progress = TelegramProgress(
+            bot,
+            _TELEBOT,
+            "100",
+            "资源搜索",
+            source_message=source,
+            timeout_seconds=60,
+        )
+        progress.begin("搜索中")
+        try:
+            self.assertIn(("100", "typing", 77), bot.actions)
+            self.assertEqual(bot.rich_drafts[-1][3]["message_thread_id"], 77)
+        finally:
+            progress.finish("搜索完成")
+
+    def test_restart_recovery_keeps_draft_cleanup_and_fallback_in_forum_topic(self):
+        _register_pending({
+            "id": "topic-recovery",
+            "chat_id": "100",
+            "label": "资源搜索",
+            "mode": "rich_draft",
+            "draft_id": 99,
+            "message_id": 44,
+            "message_thread_id": 77,
+            "started_at": 1,
+            "deadline": 2,
+            "terminal_text": "<b>搜索已中断</b>",
+            "terminal_pending": True,
+        })
+
+        class RecoveryBot(_RichBot):
+            def edit_message_text(self, *_args, **_kwargs):
+                raise RuntimeError("message is no longer editable")
+
+        bot = RecoveryBot()
+        self.assertEqual(recover_stale_operations(bot, _TELEBOT), 1)
+        self.assertEqual(bot.rich_drafts[-1][1:3], (99, ""))
+        self.assertEqual(bot.rich_drafts[-1][3]["message_thread_id"], 77)
+        self.assertEqual(bot.messages[-1][2]["message_thread_id"], 77)
+        self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
+
     def test_falls_back_to_text_draft_then_editable_message(self):
         draft_bot = _TextDraftBot()
         draft = TelegramProgress(draft_bot, _TELEBOT, "100", "RSS", timeout_seconds=60)
@@ -246,13 +294,14 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
             "label": "Agent 操作结果",
             "mode": "edit",
             "message_id": 44,
+            "message_thread_id": 77,
             "started_at": 1,
             "deadline": 2,
             "terminal_text": "<b>操作已完成</b>",
             "terminal_pending": True,
             "clear_reply_markup": True,
         })
-        bot = _EditBot()
+        bot = _FailingFinalEditBot()
         stop_event = __import__("threading").Event()
 
         recovered = _retry_terminal_until_delivered(
@@ -260,7 +309,8 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
         )
 
         self.assertEqual(recovered, 1)
-        self.assertEqual(bot.edits[-1][2], "<b>操作已完成</b>")
+        self.assertEqual(bot.messages[-1][1], "<b>操作已完成</b>")
+        self.assertEqual(bot.messages[-1][2]["message_thread_id"], 77)
         self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
 
     def test_pending_operations_are_not_silently_truncated(self):

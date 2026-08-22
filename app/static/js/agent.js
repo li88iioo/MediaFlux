@@ -2800,10 +2800,19 @@
                     appendUserMessage(data.text);
                     article = transcript.lastElementChild;
                 } else if (entry?.role === 'assistant') {
+                    const narrative = typeof data.narrative === 'string'
+                        ? data.narrative.trim()
+                        : '';
                     article = appendAssistantResponse({
                         mode: data.mode || 'read_only',
                         tool_call: {},
                         guidance: Array.isArray(data.guidance) ? data.guidance : [],
+                        presentation: narrative ? {
+                            source: 'llm',
+                            kind: 'narrative',
+                            narrative,
+                            guidance: Array.isArray(data.guidance) ? data.guidance : [],
+                        } : undefined,
                         result: {
                             ok: data.ok === true,
                             status: data.status || 'unknown',

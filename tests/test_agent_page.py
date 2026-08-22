@@ -267,6 +267,8 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("renderConsumedConfirmation(card, error.payload)", source)
         self.assertIn("function responseGuidance(payload)", source)
         self.assertIn("function renderNarrative(presentation)", source)
+        self.assertIn("presentation: narrative ? {", source)
+        self.assertIn("narrative,", source)
         self.assertIn("function renderNarrativeState(display, result)", source)
         self.assertIn("function renderResultDisclosure(content", source)
         self.assertIn("const display = payload?.display", source)

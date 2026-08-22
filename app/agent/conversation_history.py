@@ -47,11 +47,13 @@ _HISTORY_CREDENTIAL_RE = re.compile(
     r"|(?:密码|口令|密钥|令牌|访问码|授权码|提取码)\s+(?:是\s*)?[^\s，。；,;]{4,}"
     r")"
 )
+_HISTORY_MULTILINE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _UNSAFE_OUTPUT_RE = re.compile(
     r"(?ix)(?:"
     r"\b(?:magnet|ed2k)\s*:\s*"
     r"|\bfile\s*:\s*(?:/{1,3}|\\)"
     r"|\b(?:cookie|set-cookie)\s*[:=]\s*[^\s;,]+"
+    r"|\b(?:https?|ftp|file)\s*:\s*//"
     r"|\b[a-z][a-z0-9+.-]{1,20}\s*:\s*//[^\s]*@"
     r"|(?:^|[\s:：(\"'\[\{])/(?!/)[^\s]+"
     r"|(?:^|[\s:：(\"'\[\{])\\\\[^\s]+"
@@ -105,10 +107,12 @@ class SQLiteAgentConversationHistoryRepository:
     ) -> bool:
         principal_digest = self._principal_digest(principal)
         session_key = self._session_id(session_id)
-        raw_user_text = " ".join(str(message or "").split()).strip()
+        raw_user_text = str(message or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if self._contains_unsafe_history_text(raw_user_text):
             raise ValueError("包含敏感详情的 Agent 消息不会写入历史")
-        user_text = self._text(raw_user_text, limit=1000, label="message")
+        user_text = self._safe_output_text(
+            raw_user_text, limit=1000, label="message"
+        )
         assistant = self._assistant_projection(response)
         title = self._title(user_text)
         created_at = db.now()
@@ -118,10 +122,9 @@ class SQLiteAgentConversationHistoryRepository:
             role="user",
             data={"text": user_text},
         )
-        assistant_payload = self._encode(
+        assistant_payload = self._encode_assistant_projection(
             principal_digest=principal_digest,
             session_id=session_key,
-            role="assistant",
             data=assistant,
         )
         with db.get_conn() as conn:
@@ -791,7 +794,11 @@ class SQLiteAgentConversationHistoryRepository:
         )
         if data is None:
             return None
-        text = data.get("text") if role == "user" else data.get("summary")
+        text = (
+            data.get("text")
+            if role == "user"
+            else data.get("narrative") or data.get("summary")
+        )
         normalized = " ".join(str(text or "").split()).strip()
         if not normalized or self._contains_unsafe_history_text(normalized):
             return None
@@ -957,7 +964,8 @@ class SQLiteAgentConversationHistoryRepository:
 
     @staticmethod
     def _title(message: str) -> str:
-        return message if len(message) <= 48 else f"{message[:47].rstrip()}…"
+        single_line = " ".join(str(message or "").split()).strip()
+        return single_line if len(single_line) <= 48 else f"{single_line[:47].rstrip()}…"
 
     @staticmethod
     def _validated_usage(value: Any) -> dict[str, int] | None:
@@ -1010,6 +1018,20 @@ class SQLiteAgentConversationHistoryRepository:
             "error": self._safe_optional_output_text(result.get("error"), limit=300),
             "suggestions": safe_suggestions,
         }
+        presentation = (
+            response.get("presentation")
+            if isinstance(response.get("presentation"), dict)
+            else {}
+        )
+        if (
+            presentation.get("source") == "llm"
+            and presentation.get("kind") == "narrative"
+        ):
+            narrative = self._safe_optional_output_text(
+                presentation.get("narrative"), limit=1200
+            )
+            if narrative:
+                projection["narrative"] = narrative
         usage = self._validated_usage(response.get("llm_usage"))
         if usage is not None:
             projection["usage"] = usage
@@ -1063,19 +1085,174 @@ class SQLiteAgentConversationHistoryRepository:
             or bool(_UNSAFE_OUTPUT_RE.search(normalized))
         )
 
+    @staticmethod
+    def _normalize_multiline_text(value: Any, *, limit: int) -> str:
+        raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+        if _HISTORY_MULTILINE_CONTROL_RE.search(raw):
+            return ""
+        lines: list[str] = []
+        previous_blank = False
+        for raw_line in raw.split("\n"):
+            line = " ".join(raw_line.split()).strip()
+            if not line:
+                if lines and not previous_blank:
+                    lines.append("")
+                previous_blank = True
+                continue
+            previous_blank = False
+            lines.append(line)
+        return "\n".join(lines).strip()[:max(1, int(limit))].rstrip()
+
     def _safe_output_text(self, value: Any, *, limit: int, label: str) -> str:
-        raw = " ".join(str(value or "").split()).strip()
+        raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if self._contains_unsafe_history_text(raw):
             return _UNSAFE_HISTORY_DETAIL
-        return self._text(raw, limit=limit, label=label)
+        normalized = self._normalize_multiline_text(raw, limit=limit)
+        if not normalized:
+            raise ValueError(f"Agent 历史 {label} 为空")
+        return normalized
 
     def _safe_optional_output_text(self, value: Any, *, limit: int) -> str:
-        normalized = " ".join(str(value or "").split()).strip()
-        if not normalized:
+        raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not raw:
             return ""
-        if self._contains_unsafe_history_text(normalized):
+        if self._contains_unsafe_history_text(raw):
             return _UNSAFE_HISTORY_DETAIL
-        return normalized[:limit]
+        return self._normalize_multiline_text(raw, limit=limit)
+
+    def _encode_assistant_projection(
+        self,
+        *,
+        principal_digest: str,
+        session_id: str,
+        data: dict[str, Any],
+    ) -> str:
+        """按真实 UTF-8 包络大小裁剪可选字段，确保安全历史不会静默丢轮。"""
+        projection = dict(data)
+
+        def encode_or_none() -> str | None:
+            try:
+                return self._encode(
+                    principal_digest=principal_digest,
+                    session_id=session_id,
+                    role="assistant",
+                    data=projection,
+                )
+            except ValueError as exc:
+                if str(exc) != "Agent 历史消息过大":
+                    raise
+                return None
+
+        encoded = encode_or_none()
+        if encoded is not None:
+            return encoded
+
+        narrative = projection.pop("narrative", None)
+
+        # 先让原有安全投影落入预算：建议从尾部裁剪，摘要最后才缩短。
+        suggestions = projection.get("suggestions")
+        if isinstance(suggestions, list):
+            while suggestions and encode_or_none() is None:
+                suggestions = suggestions[:-1]
+                projection["suggestions"] = suggestions
+
+        for optional_key in ("error", "usage"):
+            if encode_or_none() is not None:
+                break
+            projection.pop(optional_key, None)
+
+        if encode_or_none() is None:
+            summary = str(projection.get("summary") or "Agent 已返回结果")
+            low, high, best = 1, len(summary), ""
+            while low <= high:
+                middle = (low + high) // 2
+                projection["summary"] = summary[:middle].rstrip() or "结果"
+                if encode_or_none() is not None:
+                    best = projection["summary"]
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            projection["summary"] = best or "结果已精简"
+
+        # 极端上下文投影仍必须可落盘；这些字段丢失只影响 follow-up 增强，
+        # 不包含可重放参数，且下一轮仍可重新查询。
+        for optional_key in (
+            "tentative_media_context",
+            "pending_selection",
+            "pending_subscription",
+            "media_context",
+        ):
+            if encode_or_none() is not None:
+                break
+            projection.pop(optional_key, None)
+
+        encoded = encode_or_none()
+        if encoded is None:
+            projection["tool_name"] = str(projection.get("tool_name") or "")[:32]
+            projection["status"] = str(projection.get("status") or "unknown")[:24]
+            projection["mode"] = str(projection.get("mode") or "read_only")[:24]
+            encoded = encode_or_none()
+        if encoded is None:
+            # max_payload_bytes 最低为 1024；该固定最小投影应始终可编码。
+            projection = {
+                "mode": "read_only",
+                "tool_name": "",
+                "ok": bool(data.get("ok")),
+                "status": "truncated",
+                "summary": "结果已精简",
+                "error": "",
+                "suggestions": [],
+            }
+            encoded = self._encode(
+                principal_digest=principal_digest,
+                session_id=session_id,
+                role="assistant",
+                data=projection,
+            )
+
+        if not isinstance(narrative, str) or not narrative:
+            return encoded
+
+        def fit_narrative_prefix() -> tuple[str, str | None]:
+            projection.pop("narrative", None)
+            low, high, best = 1, len(narrative), ""
+            best_encoded: str | None = None
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = narrative[:middle].rstrip()
+                if not candidate:
+                    low = middle + 1
+                    continue
+                projection["narrative"] = candidate
+                candidate_encoded = encode_or_none()
+                if candidate_encoded is not None:
+                    best = candidate
+                    best_encoded = candidate_encoded
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            if best:
+                projection["narrative"] = best
+            else:
+                projection.pop("narrative", None)
+            return best, best_encoded
+
+        best, best_encoded = fit_narrative_prefix()
+        if best_encoded is not None:
+            return best_encoded
+
+        # 若包络刚好占满，牺牲最后一条建议，为自然叙事至少留出空间。
+        suggestions = projection.get("suggestions")
+        if isinstance(suggestions, list) and suggestions:
+            projection["suggestions"] = suggestions[:-1]
+            baseline = encode_or_none()
+            if baseline is not None:
+                best, best_encoded = fit_narrative_prefix()
+                if best_encoded is not None:
+                    return best_encoded
+                return baseline
+
+        return encoded
 
     def _encode(
         self,
