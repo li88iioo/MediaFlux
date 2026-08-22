@@ -1751,6 +1751,12 @@ def init_db() -> None:
             # 未打版本的早期数据库也可能已有 v1 约束表；幂等检查后补齐。
             _migrate_agent_session_context_v2(conn)
             conn.executescript(_SCHEMA)
+            # Docker-only 版本不再使用应用内 SMB 凭据；保留旧列兼容 schema，
+            # 但主动清除历史敏感值，避免无业务用途的 NAS 密码继续进入备份。
+            conn.execute(
+                "UPDATE local_media_sources SET smb_user='',smb_pass='' "
+                "WHERE COALESCE(smb_user,'')<>'' OR COALESCE(smb_pass,'')<>''"
+            )
             # 播放诊断保留期在启动时也执行，避免长期无新播放时旧媒体标识滞留。
             conn.execute(
                 "DELETE FROM media_proxy_playback_records "
@@ -3214,6 +3220,7 @@ from app.repositories.download_requests import (  # noqa: E402
     get_download_request_by_request_keys,
     link_download_request_to_local_media_task,
     list_active_download_requests,
+    mark_download_request_local_media_failed,
     mark_download_request_local_media_skipped,
     update_download_request,
     update_download_request_and_sync_media_admission,
@@ -4821,7 +4828,7 @@ def create_local_media_source(
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 safe_owner, safe_name, str(qb_profile or ""), str(qb_path_prefix or ""), safe_root,
-                str(smb_user or "").strip(), str(smb_pass or "").strip(),
+                "", "",
                 1 if enabled else 0, max(0, int(stable_seconds)), 1 if scan_enabled else 0,
                 max(1, int(scan_interval_minutes)), str(media_type or "auto"), safe_mode,
                 timestamp, timestamp,
@@ -4888,7 +4895,7 @@ def save_local_media_source_bundle(
                 "enabled,stable_seconds,scan_enabled,scan_interval_minutes,media_type,mode,created_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (safe_owner, safe_name, str(qb_profile or "").strip(), str(qb_path_prefix or "").strip(),
-                 safe_root, str(smb_user or "").strip(), str(smb_pass or "").strip(),
+                 safe_root, "", "",
                  1 if enabled else 0, max(0, int(stable_seconds)),
                  1 if scan_enabled else 0, max(1, int(scan_interval_minutes)),
                  safe_media_type, safe_mode, timestamp, timestamp),
@@ -4902,7 +4909,7 @@ def save_local_media_source_bundle(
                 "enabled=?,stable_seconds=?,scan_enabled=?,scan_interval_minutes=?,media_type=?,mode=?,updated_at=? "
                 "WHERE id=? AND owner=?",
                 (safe_name, str(qb_profile or "").strip(), str(qb_path_prefix or "").strip(),
-                 safe_root, str(smb_user or "").strip(), str(smb_pass or "").strip(),
+                 safe_root, "", "",
                  1 if enabled else 0, max(0, int(stable_seconds)),
                  1 if scan_enabled else 0, max(1, int(scan_interval_minutes)),
                  safe_media_type, safe_mode, timestamp, saved_id, safe_owner),
@@ -5629,7 +5636,7 @@ def list_local_media_operation_steps(task_id: int, *, owner: str = "admin") -> l
 def update_local_media_source(source_id: int, *, owner: str = "admin", **fields) -> bool:
     allowed = {
         "name", "qb_profile", "qb_path_prefix", "local_root", "enabled", "stable_seconds",
-        "scan_enabled", "scan_interval_minutes", "media_type", "mode", "smb_user", "smb_pass",
+        "scan_enabled", "scan_interval_minutes", "media_type", "mode",
     }
     sets: list[str] = []
     params: list[object] = []
@@ -5644,8 +5651,6 @@ def update_local_media_source(source_id: int, *, owner: str = "admin", **fields)
             value = max(0, int(value))
         elif key == "scan_interval_minutes":
             value = max(1, int(value))
-        elif key in {"smb_user", "smb_pass"}:
-            value = str(value or "").strip()
         else:
             value = str(value or "").strip()
         if key in {"name", "local_root"} and not value:

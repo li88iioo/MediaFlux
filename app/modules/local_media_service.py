@@ -13,7 +13,11 @@ from typing import Any
 from app import database as db
 from app.clients.guangya import GuangYaFile
 from app.modules.local_move_transaction import LocalMoveTransaction, MoveTransactionResult
-from app.modules.local_path_mapping import assert_within, validate_source_target_roots
+from app.modules.local_path_mapping import (
+    assert_within,
+    require_container_absolute_path,
+    validate_source_target_roots,
+)
 from app.modules.local_storage import (
     LocalContentChanged, LocalFileSnapshot, LocalFilesystemAdapter, snapshot_digest,
 )
@@ -132,9 +136,11 @@ class LocalMediaService:
         source = db.get_local_media_source(source_id, owner=owner)
         if source is None:
             raise LocalMediaServiceError("本地媒体来源不存在")
-        root = Path(source.local_root).expanduser().absolute()
+        root = require_container_absolute_path(source.local_root, label="来源目录")
         assert_within(root, root)
-        selected = assert_within(Path(path), root)
+        selected = assert_within(
+            require_container_absolute_path(path, label="目录路径"), root,
+        )
         snapshots = LocalFilesystemAdapter(root).scan(selected)
         videos = [item for item in snapshots if item.role == "video"]
         if not videos:

@@ -10,7 +10,9 @@ from app.modules.local_path_mapping import (
     PathMappingError,
     PathMappingSet,
     assert_within,
+    is_windows_or_unc_path,
     normalize_qb_path,
+    require_container_absolute_path,
     validate_source_target_roots,
 )
 
@@ -26,6 +28,22 @@ class LocalPathMappingTests(unittest.TestCase):
             Path("/mnt/fast/Movies/A.mkv").resolve(strict=False),
         )
 
+    def test_windows_or_unc_path_detection_does_not_reject_container_paths(self):
+        self.assertTrue(is_windows_or_unc_path(r"D:\Downloads"))
+        self.assertTrue(is_windows_or_unc_path(r"\\NAS\Media"))
+        self.assertTrue(is_windows_or_unc_path("//NAS/Media"))
+        self.assertFalse(is_windows_or_unc_path("/media/downloads"))
+        self.assertFalse(is_windows_or_unc_path("relative/path"))
+
+    def test_container_absolute_path_rejects_legacy_and_relative_inputs(self):
+        self.assertEqual(
+            require_container_absolute_path("/media/downloads"), Path("/media/downloads")
+        )
+        for value in (".", "relative/path", r"D:\Downloads", r"\\NAS\Media"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(PathMappingError, "Docker 容器"):
+                    require_container_absolute_path(value)
+
     def test_windows_drive_and_unc_are_case_insensitive(self):
         mappings = PathMappingSet([
             PathMapping(r"D:\Downloads", Path("/mnt/d")),
@@ -33,6 +51,17 @@ class LocalPathMappingTests(unittest.TestCase):
         ])
         self.assertEqual(mappings.map_qb_path(r"d:\DOWNLOADS\TV\A.mkv"), Path("/mnt/d/TV/A.mkv").resolve(strict=False))
         self.assertEqual(mappings.map_qb_path(r"\\nas\media\Movie\B.mkv"), Path("/mnt/nas/Movie/B.mkv").resolve(strict=False))
+
+    def test_unicode_casefold_does_not_corrupt_windows_or_unc_suffix(self):
+        drive = PathMapping(r"C:\Straße", Path("/mnt/drive"))
+        unc = PathMapping(r"\\Straße\MÉDIA", Path("/mnt/unc"))
+        self.assertEqual(
+            drive.relative_parts(r"c:\STRASSE\Movie.mkv"), ("Movie.mkv",)
+        )
+        self.assertEqual(
+            unc.relative_parts(r"\\STRASSE\média\Show\Episode.mkv"),
+            ("Show", "Episode.mkv"),
+        )
 
     def test_prefix_boundary_and_ambiguous_prefix_are_rejected(self):
         mappings = PathMappingSet([PathMapping("/downloads/1", Path("/mnt/one"))])

@@ -79,6 +79,10 @@ def global_search(request: Request):
         result=result,
         search_error=error,
         discovery_enabled=config.get_bool("DISCOVERY_ENABLED", False),
+        resource_results_enabled=config.get_bool(
+            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
+            True,
+        ),
     )
 
 
@@ -221,7 +225,15 @@ def guangya_more(request: Request, view: str = "share"):
 
 @router.get("/rss", name="pages.rss")
 def rss(request: Request):
-    return _page(request, "rss.html", "rss")
+    return _page(
+        request,
+        "rss.html",
+        "rss",
+        resource_results_enabled=config.get_bool(
+            "DISCOVERY_RESOURCE_RESULTS_ENABLED",
+            True,
+        ),
+    )
 
 
 @router.get("/downloads", name="pages.downloads")

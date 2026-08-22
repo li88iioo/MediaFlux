@@ -41,6 +41,13 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn("正在读取来源配置", page.text)
         self.assertRegex(page.text, re.compile(r'class="[^"]*\blocal-media-page\b[^"]*"'))
         self.assertIn('class="app-modal lm-modal"', page.text)
+        self.assertIn("MediaFlux 容器路径", page.text)
+        self.assertIn("/media/downloads", page.text)
+        for legacy_marker in (
+            'data-windows-package', 'id="lmSmbAuthSection"', 'id="lmSmbUser"',
+            'id="lmSmbPass"', "SMB 网络共享", "NAS 访问账号",
+        ):
+            self.assertNotIn(legacy_marker, page.text)
         self.assertNotIn("下载完成，直接进入媒体库", page.text)
         self.assertNotIn("LOCAL MEDIA PIPELINE", page.text)
         self.assertNotIn("硬链接", page.text)
@@ -67,7 +74,7 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn("library_id: libraryId, library_name: libraryName", js)
         self.assertIn("lmSourceMode", page.text)
         self.assertIn("row.dataset.libraryRequest", js)
-        self.assertIn("allowRoot: !isRootsMode && Boolean(sourceId || networkRoot)", js)
+        self.assertIn("allowRoot: !isRootsMode && Boolean(sourceId)", js)
         self.assertIn('id="lmTaskMore"', page.text)
         self.assertIn("taskDisplayLimit = 60", js)
         self.assertIn("function schedulePoll()", js)

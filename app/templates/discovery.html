@@ -74,29 +74,10 @@
         </div>
     </section>
 
-    <dialog class="discovery-dialog" id="discovery-detail-dialog" aria-labelledby="discovery-detail-title">
-        <div class="discovery-dialog-frame">
-            <header class="discovery-dialog-head">
-                <div>
-                    <h2 id="discovery-detail-title">CATALOGUE RECORD / 媒体档案</h2>
-                </div>
-                <button class="icon-btn" type="button" data-discovery-dialog-close aria-label="关闭" title="关闭"><i data-lucide="x" aria-hidden="true"></i></button>
-            </header>
-            <aside class="discovery-dialog-notice" id="discovery-dialog-notice" data-discovery-dialog-notice role="status" aria-live="polite" hidden>
-                <span class="discovery-dialog-notice-icon" id="discovery-dialog-notice-icon" aria-hidden="true"><i data-lucide="circle-check-big" aria-hidden="true"></i></span>
-                <div class="discovery-dialog-notice-copy">
-                    <span>RESOURCE DISPATCH</span>
-                    <strong id="discovery-dialog-notice-title">下载任务状态</strong>
-                    <p id="discovery-dialog-notice-text"></p>
-                </div>
-                <button class="icon-btn discovery-dialog-notice-close" id="discovery-dialog-notice-close" type="button" aria-label="关闭资源通知"><i data-lucide="x" aria-hidden="true"></i></button>
-            </aside>
-            <div class="discovery-dialog-body" id="discovery-detail-body"></div>
-        </div>
-    </dialog>
+    {% include "_media_profile_dialog.html" %}
 </div>
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/discovery.js') }}?v=20260820c" defer></script>
+<script src="{{ url_for('static', path='js/discovery.js') }}?v=20260822a" defer></script>
 {% endblock %}

@@ -3,7 +3,7 @@
 {% block page_title %}本地媒体{% endblock %}
 {% block body_class %}local-media-page{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260821j">
+<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260822a">
 <script>
 (() => {
     const hashTab = (window.location.hash || '').replace('#', '').trim();
@@ -17,7 +17,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="lm-page" data-windows-package="{{ '1' if package_type == 'windows' else '0' }}">
+<div class="lm-page">
     <div class="lm-command-strip" aria-label="本地媒体运行状态">
         <div class="lm-stat"><span>媒体来源</span><strong id="lmSourceCount">—</strong></div>
         <div class="lm-stat"><span>处理中</span><strong id="lmPendingCount">—</strong></div>
@@ -196,13 +196,7 @@
                     <div class="lm-form-grid">
                         <label class="lm-field"><span>来源名称</span><input class="form-input" id="lmSourceName" required maxlength="128" placeholder="例如：下载目录 1"></label>
                         <label class="lm-field"><span>qB 路径前缀</span><input class="form-input" id="lmQbPrefix" placeholder="/downloads"></label>
-                        <label class="lm-field lm-wide"><span>MediaFlux 本地路径</span><span class="lm-path-control"><input class="form-input" id="lmLocalRoot" required placeholder="{% if package_type == 'windows' %}D:\Downloads 或 \\NAS\Downloads{% else %}/mnt/downloads{% endif %}"><button class="jump-btn lm-picker-btn" type="button" id="lmPickLocalRootBtn" aria-label="浏览本地目录" title="浏览本地目录"><i data-lucide="folder-open"></i></button></span>{% if package_type == 'windows' %}<small class="lm-network-hint"><i data-lucide="network"></i><span>SMB 网络共享请直接填写 <code>\\NAS\共享名</code>。若 NAS 设置了账号密码，可在下方配置访问凭据自动挂载。</span></small>{% endif %}</label>
-                        {% if package_type == 'windows' %}
-                        <div class="lm-form-grid lm-wide lm-smb-auth-grid" id="lmSmbAuthSection">
-                            <label class="lm-field"><span>NAS 访问账号 <small class="text-muted">（可选，免密留空）</small></span><input class="form-input" id="lmSmbUser" placeholder="例如：admin 或 nasuser" autocomplete="username"></label>
-                            <label class="lm-field"><span>NAS 访问密码 <small class="text-muted">（可选，免密留空）</small></span><input class="form-input" id="lmSmbPass" type="password" placeholder="NAS 共享密码" autocomplete="current-password"></label>
-                        </div>
-                        {% endif %}
+                        <label class="lm-field lm-wide"><span>MediaFlux 容器路径</span><span class="lm-path-control"><input class="form-input" id="lmLocalRoot" required placeholder="例如：/media/downloads"><button class="jump-btn lm-picker-btn" type="button" id="lmPickLocalRootBtn" aria-label="浏览容器目录" title="浏览容器目录"><i data-lucide="folder-open"></i></button></span></label>
                         <div class="lm-form-grid-3 lm-wide">
                             <label class="lm-field"><span>识别范围</span><select class="form-select" id="lmSourceMediaType"><option value="auto">自动判断</option><option value="movie">仅电影</option><option value="tv">剧集 / 动漫</option></select></label>
                             <label class="lm-field"><span>稳定等待</span><div class="lm-input-unit"><input class="form-input" id="lmStableSeconds" type="number" min="0" max="86400" value="300"><span>秒</span></div></label>
@@ -229,5 +223,5 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260821a"></script>
-<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260821i"></script>
+<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260822a"></script>
 {% endblock %}

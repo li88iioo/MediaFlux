@@ -1,19 +1,20 @@
 """本地媒体来源、检查、预览与任务 API。"""
 from __future__ import annotations
 
-import os
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
 
 from app import database as db
 from app.logger import get_logger
-from app.modules.local_directory_browser import (
-    VIRTUAL_ROOT, assert_browse_root_allowed, browse_local_directories,
-)
+from app.modules.local_directory_browser import VIRTUAL_ROOT, browse_local_directories
 from app.modules.local_path_mapping import (
-    PathMappingError, assert_within, validate_source_target_roots,
+    LEGACY_SOURCE_PATH_ERROR,
+    PathMappingError,
+    assert_within,
+    is_windows_or_unc_path,
+    validate_source_target_roots,
 )
 from app.modules.local_media_candidates import (
     candidate_payload,
@@ -95,8 +96,6 @@ def _source_payload(source) -> dict:
     return {
         "id": source.id, "name": source.name, "qb_profile": source.qb_profile,
         "qb_path_prefix": source.qb_path_prefix, "local_root": source.local_root,
-        "smb_user": getattr(source, "smb_user", "") or "",
-        "has_smb_pass": bool(getattr(source, "smb_pass", "")),
         "enabled": source.enabled, "stable_seconds": source.stable_seconds,
         "scan_enabled": source.scan_enabled,
         "scan_interval_minutes": source.scan_interval_minutes,
@@ -180,10 +179,8 @@ def _safe_error(exc: Exception) -> JSONResponse:
     if isinstance(exc, (ValueError, LookupError, LocalMediaServiceError, FileNotFoundError, PathMappingError)):
         return api_error(str(exc), 400)
     if isinstance(exc, OSError):
-        from app.modules.windows_smb import explain_windows_network_error
-        friendly_msg = explain_windows_network_error(exc)
-        logger.warning("本地媒体网络/文件系统异常: %s (type=%s)", friendly_msg, type(exc).__name__)
-        return api_error(friendly_msg, 400)
+        logger.warning("本地媒体文件系统异常 type=%s", type(exc).__name__)
+        return api_error("本地目录访问失败，请检查 Docker 卷挂载与容器目录权限", 400)
     logger.error("本地媒体 API 失败 type=%s", type(exc).__name__)
     return api_error("本地媒体请求失败", 500)
 
@@ -222,65 +219,35 @@ def _validated_targets(payload: dict) -> list[dict[str, str]] | None:
     return normalized
 
 
-def _normalize_windows_unc_root(value: str) -> str:
+def _validated_container_directory(value: str, label: str) -> Path:
     raw = str(value or "").strip()
-    candidate = PureWindowsPath(raw)
-    anchor = str(candidate.anchor)
-    server_share = [part for part in anchor.strip("\\").split("\\") if part]
-    if (
-        not raw.startswith("\\\\")
-        or not candidate.is_absolute()
-        or not anchor.startswith("\\\\")
-        or len(server_share) < 2
-    ):
-        raise ValueError(r"网络共享必须使用 UNC 路径，例如 \\NAS\Media")
-    return str(candidate)
+    if is_windows_or_unc_path(raw):
+        raise ValueError(
+            f"{label}必须填写 Docker 容器内路径；请先把宿主机或 NAS 目录挂载到容器，"
+            "再填写例如 /media/downloads 的路径"
+        )
+    directory = Path(raw).expanduser()
+    try:
+        if not directory.is_absolute() or not directory.exists() or not directory.is_dir():
+            raise ValueError(f"{label}必须是容器内已存在的绝对目录: {raw}")
+        return assert_within(directory, directory)
+    except OSError as exc:
+        raise ValueError(f"{label}无法访问，请检查 Docker 卷挂载与容器目录权限") from exc
 
 
 def _validate_source_paths(
     local_root: str,
     targets: list[dict[str, str]],
-    *,
-    smb_user: str = "",
-    smb_pass: str = "",
 ) -> tuple[str, list[dict[str, str]]]:
-    from app.modules.windows_smb import (
-        ensure_smb_connection, explain_windows_network_error, parse_unc_share_root,
-        resolve_drive_or_unc_path,
-    )
-    resolved_local_root = resolve_drive_or_unc_path(local_root)
-    if parse_unc_share_root(resolved_local_root):
-        ok, err = ensure_smb_connection(resolved_local_root, smb_user, smb_pass)
-        if not ok and err:
-            raise ValueError(err)
-
-    source = Path(resolved_local_root).expanduser()
-    try:
-        if not source.is_absolute() or not source.exists() or not source.is_dir():
-            raise ValueError(f"来源目录必须是已存在的绝对目录: {local_root}")
-    except OSError as exc:
-        raise ValueError(explain_windows_network_error(exc, resolved_local_root)) from exc
-    assert_within(source, source)
+    source = _validated_container_directory(local_root, "来源目录")
     target_paths: list[Path] = []
     normalized_targets: list[dict[str, str]] = []
     for item in targets:
-        target_str = item["path"]
-        resolved_target = resolve_drive_or_unc_path(target_str)
-        if parse_unc_share_root(resolved_target):
-            ok, err = ensure_smb_connection(resolved_target, smb_user, smb_pass)
-            if not ok and err:
-                raise ValueError(err)
-        target = Path(resolved_target).expanduser()
-        try:
-            if not target.is_absolute() or not target.exists() or not target.is_dir():
-                raise ValueError(f"媒体库目标必须是已存在的绝对目录: {target_str}")
-        except OSError as exc:
-            raise ValueError(explain_windows_network_error(exc, resolved_target)) from exc
-        assert_within(target, target)
+        target = _validated_container_directory(item["path"], "媒体库目标")
         target_paths.append(target)
-        normalized_targets.append({**item, "path": resolved_target})
+        normalized_targets.append({**item, "path": str(target)})
     validate_source_target_roots(source, target_paths)
-    return resolved_local_root, normalized_targets
+    return str(source), normalized_targets
 
 
 @router.get("/directories")
@@ -288,35 +255,16 @@ def list_directories(
     request: Request,
     path: str = VIRTUAL_ROOT,
     source_id: int = 0,
-    network_root: str = "",
-    smb_user: str = "",
-    smb_pass: str = "",
 ):
     require_api_login(request)
     try:
+        if str(request.query_params.get("network_root") or "").strip():
+            return api_error(LEGACY_SOURCE_PATH_ERROR, 400)
         allowed_root = None
-        if network_root:
-            if os.name != "nt":
-                return api_error("UNC 网络共享浏览仅支持 Windows 环境", 400)
-            normalized_root = _normalize_windows_unc_root(network_root)
-            from app.modules.windows_smb import ensure_smb_connection
-            ok, err = ensure_smb_connection(normalized_root, smb_user, smb_pass)
-            if not ok and err:
-                return api_error(err, 400)
-            allowed_root = assert_browse_root_allowed(Path(normalized_root))
-            if not path or path == VIRTUAL_ROOT:
-                path = normalized_root
-        elif source_id:
+        if source_id:
             source = db.get_local_media_source(source_id, owner=_OWNER)
             if source is None:
                 return api_error("本地媒体来源不存在", 404)
-            from app.modules.windows_smb import ensure_smb_connection, parse_unc_share_root
-            effective_user = smb_user or getattr(source, "smb_user", "")
-            effective_pass = smb_pass or getattr(source, "smb_pass", "")
-            if parse_unc_share_root(source.local_root):
-                ok, err = ensure_smb_connection(source.local_root, effective_user, effective_pass)
-                if not ok and err:
-                    return api_error(err, 400)
             allowed_root = Path(source.local_root)
             if path == VIRTUAL_ROOT:
                 path = source.local_root
@@ -372,16 +320,12 @@ def create_source(request: Request, data: dict | None = Body(default=None)):
     try:
         targets = _validated_targets(payload) or []
         local_root = _text(payload, "local_root", required=True)
-        smb_user = _text(payload, "smb_user")
-        smb_pass = _text(payload, "smb_pass")
-        local_root, targets = _validate_source_paths(local_root, targets, smb_user=smb_user, smb_pass=smb_pass)
+        local_root, targets = _validate_source_paths(local_root, targets)
         source_id = db.save_local_media_source_bundle(
             name=_text(payload, "name", required=True, max_length=128),
             qb_profile=_text(payload, "qb_profile", max_length=64) or "configured:qb",
             qb_path_prefix=_text(payload, "qb_path_prefix"),
             local_root=local_root,
-            smb_user=smb_user,
-            smb_pass=smb_pass,
             enabled=_boolean(payload, "enabled", True),
             stable_seconds=_integer(payload, "stable_seconds", 300, 0, 86400),
             scan_enabled=_boolean(payload, "scan_enabled", False),
@@ -411,24 +355,16 @@ def update_source(source_id: int, request: Request, data: dict | None = Body(def
         ]
         effective_targets = targets if targets is not None else existing_targets
         local_root = _text(payload, "local_root", required=True) if "local_root" in payload else source.local_root
-        smb_user = _text(payload, "smb_user") if "smb_user" in payload else getattr(source, "smb_user", "")
-        if "smb_pass" in payload:
-            submitted_pass = _text(payload, "smb_pass")
-            if not submitted_pass and getattr(source, "smb_pass", ""):
-                smb_pass = source.smb_pass
-            else:
-                smb_pass = submitted_pass
-        else:
-            smb_pass = getattr(source, "smb_pass", "")
-        local_root, effective_targets = _validate_source_paths(local_root, effective_targets, smb_user=smb_user, smb_pass=smb_pass)
+        local_root, effective_targets = _validate_source_paths(local_root, effective_targets)
         db.save_local_media_source_bundle(
             source_id=source_id, owner=_OWNER,
             name=_text(payload, "name", required=True, max_length=128) if "name" in payload else source.name,
             qb_profile=_text(payload, "qb_profile", max_length=64) if "qb_profile" in payload else source.qb_profile,
             qb_path_prefix=_text(payload, "qb_path_prefix") if "qb_path_prefix" in payload else source.qb_path_prefix,
             local_root=local_root,
-            smb_user=smb_user,
-            smb_pass=smb_pass,
+            # 旧 schema 列保留兼容，但废弃凭据必须在编辑时清空。
+            smb_user="",
+            smb_pass="",
             enabled=_boolean(payload, "enabled", source.enabled) if "enabled" in payload else source.enabled,
             stable_seconds=_integer(payload, "stable_seconds", source.stable_seconds, 0, 86400) if "stable_seconds" in payload else source.stable_seconds,
             scan_enabled=_boolean(payload, "scan_enabled", source.scan_enabled) if "scan_enabled" in payload else source.scan_enabled,

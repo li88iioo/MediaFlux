@@ -52,7 +52,7 @@
             </div>
         </div>
         <div class="global-top-actions">
-            <a class="global-primary-action" href="{{ top_match.url }}" {{ 'target="_blank" rel="noopener"' if top_match.external else '' }}>{% if top_match.is_local %}<i data-lucide="play"></i>打开媒体{% else %}<i data-lucide="book-open"></i>查看媒体档案{% endif %}</a>
+            <a class="global-primary-action" href="{{ top_match.url }}"{% if discovery_enabled and not top_match.is_local %} data-media-profile-link{% endif %} {{ 'target="_blank" rel="noopener"' if top_match.external else '' }}>{% if top_match.is_local %}<i data-lucide="play"></i>打开媒体{% else %}<i data-lucide="book-open"></i>查看媒体档案{% endif %}</a>
             {% if discovery_enabled and top_match.is_local %}<a class="global-secondary-action" href="{{ top_match.resource_url or url_for('pages.discovery') ~ '?q=' ~ result.query|urlencode }}"><i data-lucide="search"></i>搜索资源</a>{% endif %}
         </div>
     </section>
@@ -65,7 +65,7 @@
         {% if secondary_media_items %}
         <div class="global-media-grid">
             {% for item in secondary_media_items %}
-            <a class="global-media-card" href="{{ item.url }}" {{ 'target="_blank" rel="noopener"' if item.external else '' }} title="{{ item.title }}">
+            <a class="global-media-card" href="{{ item.url }}"{% if discovery_enabled and not item.is_local %} data-media-profile-link{% endif %} {{ 'target="_blank" rel="noopener"' if item.external else '' }} title="{{ item.title }}">
                 <span class="global-media-poster">{% if item.image_url %}<img src="{{ item.image_url }}" alt="{{ item.title }}" loading="lazy">{% else %}<span><i data-lucide="film"></i></span>{% endif %}<small>{{ item.provider|upper }}</small><em class="global-media-type">{{ item.type_label }}</em>{% if item.is_local %}<b><i data-lucide="server"></i></b>{% endif %}</span>
                 <span class="global-media-copy"><strong>{{ item.title }}</strong><small>{{ item.episode_context or item.original_title or item.subtitle }}</small></span>
                 <span class="global-media-meta"><em>{{ item.year or item.type_label }}</em><b>{% if item.rating %}{{ '%.1f'|format(item.rating) }}{% else %}{{ item.type_label }}{% endif %}</b></span>
@@ -128,6 +128,7 @@
     </div>
     {% endif %}
 </div>
+{% if discovery_enabled %}{% include "_media_profile_host.html" %}{% endif %}
 {% endblock %}
 {% block scripts %}
 <script>
@@ -140,4 +141,5 @@
     });
 })();
 </script>
+{% if discovery_enabled %}<script src="{{ url_for('static', path='js/discovery.js') }}?v=20260822a" defer></script>{% endif %}
 {% endblock %}

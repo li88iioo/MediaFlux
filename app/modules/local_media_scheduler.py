@@ -15,7 +15,13 @@ from app.logger import get_logger, log_throttled
 from app.modules.local_media_service import LocalMediaService
 from app.modules.local_media_candidates import discover_local_media_candidates
 from app.modules.local_media_notifications import notify_local_media_task
-from app.modules.local_path_mapping import PathMapping, PathMappingError, assert_within
+from app.modules.local_path_mapping import (
+    LEGACY_SOURCE_PATH_ERROR,
+    PathMapping,
+    PathMappingError,
+    assert_within,
+    require_container_absolute_path,
+)
 from app.modules.local_storage import LocalFilesystemAdapter, LocalStorageError, snapshot_digest
 
 logger = get_logger(__name__)
@@ -27,6 +33,19 @@ SILENT_MANUAL_SCAN_TOKEN_PREFIX = "silent-manual-scan:"
 
 class LocalMediaProbeRetryable(RuntimeError):
     """qB 完成内容暂时无法可靠判断，调用方应保留任务并稍后重试。"""
+
+
+class LocalMediaSourceMigrationRequired(RuntimeError):
+    """qB 已命中遗留来源，但该来源必须迁移为 Docker 容器路径。"""
+
+
+def _source_path_error(source) -> str:
+    try:
+        root = require_container_absolute_path(source.local_root, label="来源目录")
+        assert_within(root, root)
+    except PathMappingError as exc:
+        return str(exc)
+    return ""
 
 
 class LocalMediaScheduler:
@@ -94,15 +113,26 @@ class LocalMediaScheduler:
         for source in db.list_local_media_sources(owner=self.owner, enabled_only=True):
             if source.qb_profile and source.qb_profile not in {"qb", "configured:qb", "default"}:
                 continue
+            source_error = _source_path_error(source)
             try:
-                mapping = PathMapping(source.qb_path_prefix or source.local_root, Path(source.local_root))
+                mapping = PathMapping(
+                    source.qb_path_prefix or source.local_root,
+                    Path("/") if source_error else Path(source.local_root),
+                )
                 if mapping.matches(raw_path):
-                    matches.append((len(mapping.comparison_prefix), source, mapping))
+                    matches.append((
+                        len(mapping.comparison_prefix), source, mapping, source_error,
+                    ))
             except PathMappingError:
                 continue
         if not matches:
             return None
-        _, source, mapping = max(matches, key=lambda item: item[0])
+        longest_prefix = max(item[0] for item in matches)
+        strongest_matches = [item for item in matches if item[0] == longest_prefix]
+        valid_matches = [item for item in strongest_matches if not item[3]]
+        if not valid_matches:
+            raise LocalMediaSourceMigrationRequired(strongest_matches[0][3])
+        _, source, mapping, _ = valid_matches[0]
         local_path = assert_within(
             mapping.local_root.joinpath(*mapping.relative_parts(raw_path)),
             mapping.local_root,
@@ -136,6 +166,14 @@ class LocalMediaScheduler:
             if last_scan is not None and now - last_scan < source.scan_interval_minutes * 60:
                 continue
             self._last_scan_at[source.id] = now
+            source_error = _source_path_error(source)
+            if source_error:
+                log_throttled(
+                    logger, logging.WARNING, f"invalid_source:{source.id}",
+                    "本地媒体来源扫描失败 %s: %s", source.name, source_error,
+                    interval_seconds=3600.0,
+                )
+                continue
             candidates, error = self._source_candidates(source)
             if error:
                 logger.warning("本地媒体来源扫描失败 %s: %s", source.name, error)
@@ -159,6 +197,14 @@ class LocalMediaScheduler:
         task_ids: list[int] = []
         source_results: list[dict[str, object]] = []
         for source in db.list_local_media_sources(owner=self.owner):
+            source_error = _source_path_error(source)
+            if source_error:
+                source_results.append({
+                    "id": source.id, "name": source.name, "candidates": 0,
+                    "queued": 0, "skipped": True, "reason": "",
+                    "error": source_error,
+                })
+                continue
             if source.mode == "preview_only":
                 source_results.append({
                     "id": source.id, "name": source.name, "candidates": 0,
@@ -257,17 +303,15 @@ class LocalMediaScheduler:
                 task.id, "failed", error=error,
             )
             return False
-        from app.modules.windows_smb import ensure_smb_connection, parse_unc_share_root
-        if parse_unc_share_root(source.local_root):
-            ok, err = ensure_smb_connection(source.local_root, getattr(source, "smb_user", ""), getattr(source, "smb_pass", ""))
-            if not ok and err:
-                db.update_local_media_task(
-                    task.id, owner=self.owner, status="failed", error=err,
-                )
-                db.update_download_request_for_local_media_task(
-                    task.id, "failed", error=err,
-                )
-                return False
+        source_error = _source_path_error(source)
+        if source_error:
+            db.update_local_media_task(
+                task.id, owner=self.owner, status="failed", error=source_error,
+            )
+            db.update_download_request_for_local_media_task(
+                task.id, "failed", error=source_error,
+            )
+            return False
         key = str(Path(task.content_path).expanduser().resolve(strict=False))
         with self._guard:
             if key in self._path_locks:
@@ -289,22 +333,54 @@ class LocalMediaScheduler:
                 return False
             qb_client = self.qb_factory() if task.qb_hash else None
             result = self.service.execute_task(self.owner, task.id, qb_client=qb_client)
-            if not self._is_silent_task(task):
-                notify_local_media_task(task.id, result, owner=self.owner)
-            db.update_download_request_for_local_media_task(
-                task.id, str(result.get("status") or "failed"),
-                error=str(result.get("preview", {}).get("reason") or ""),
-            )
-            return True
         except Exception as exc:
             current = db.get_local_media_task(task.id, owner=self.owner)
-            if current and current.status != "failed":
-                db.update_local_media_task(task.id, owner=self.owner, status="failed", error=str(exc))
+            terminal_statuses = {"completed", "requires_manual", "failed"}
+            if current and current.status not in terminal_statuses:
+                db.update_local_media_task(
+                    task.id, owner=self.owner, status="failed", error=str(exc),
+                )
+                current = db.get_local_media_task(task.id, owner=self.owner)
             logger.error("本地媒体任务执行失败 task=%s type=%s", task.id, type(exc).__name__)
+            if current and current.status in terminal_statuses:
+                try:
+                    db.update_download_request_for_local_media_task(
+                        task.id, current.status, error=str(current.error or exc),
+                    )
+                except Exception as sync_exc:
+                    logger.error(
+                        "本地媒体失败状态回写异常 task=%s type=%s",
+                        task.id, type(sync_exc).__name__,
+                    )
             if not self._is_silent_task(task):
-                notify_local_media_task(task.id, owner=self.owner, error=str(exc))
-            db.update_download_request_for_local_media_task(task.id, "failed", error=str(exc))
+                try:
+                    notify_local_media_task(task.id, owner=self.owner, error=str(exc))
+                except Exception as notify_exc:
+                    logger.warning(
+                        "本地媒体失败通知发送异常 task=%s type=%s",
+                        task.id, type(notify_exc).__name__,
+                    )
             return False
+        else:
+            try:
+                db.update_download_request_for_local_media_task(
+                    task.id, str(result.get("status") or "failed"),
+                    error=str(result.get("preview", {}).get("reason") or ""),
+                )
+            except Exception as sync_exc:
+                logger.error(
+                    "本地媒体完成状态回写异常 task=%s type=%s",
+                    task.id, type(sync_exc).__name__,
+                )
+            if not self._is_silent_task(task):
+                try:
+                    notify_local_media_task(task.id, result, owner=self.owner)
+                except Exception as notify_exc:
+                    logger.warning(
+                        "本地媒体完成通知发送异常 task=%s type=%s",
+                        task.id, type(notify_exc).__name__,
+                    )
+            return True
         finally:
             with self._guard:
                 self._path_locks.discard(key)

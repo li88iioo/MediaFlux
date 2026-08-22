@@ -323,6 +323,7 @@
             const titleWrap = node('div');
             const title = node('a', '', item.title || '未命名媒体');
             title.href = mediaSubscriptionLink(item);
+            title.dataset.mediaProfileLink = '';
             titleWrap.append(title);
             const meta = node('div', 'media-subscription-meta');
             [item.year, `TMDB ${item.tmdb_id}`, monitorLabel(item)].filter(Boolean).forEach((value) => meta.append(node('span', '', value)));
@@ -479,6 +480,7 @@
             card.dataset.mediaType = item.media_type || '';
             const poster = node('a', 'subscription-watch-poster');
             poster.href = watchlistLink(item);
+            poster.dataset.mediaProfileLink = '';
             if (item.poster_url) {
                 const image = document.createElement('img');
                 image.src = item.poster_url; image.alt = `${item.title || '媒体'} 海报`; image.loading = 'lazy'; image.width = 180; image.height = 270;
@@ -486,7 +488,9 @@
                 poster.append(image);
             } else poster.append(icon(item.media_type === 'movie' ? 'film' : 'tv'));
             const body = node('div', 'subscription-watch-body');
-            const title = node('a', '', item.title || '未命名媒体'); title.href = watchlistLink(item);
+            const title = node('a', '', item.title || '未命名媒体');
+            title.href = watchlistLink(item);
+            title.dataset.mediaProfileLink = '';
             const meta = node('div', 'subscription-watch-meta');
             [item.year, item.provider?.toUpperCase(), item.media_type === 'movie' ? '电影' : '剧集'].filter(Boolean).forEach((value) => meta.append(node('span', '', value)));
             body.append(title, meta);
@@ -513,6 +517,7 @@
             ].forEach(([iconName, label, href]) => {
                 const action = node('a', 'icon-action subscription-watch-icon');
                 action.href = href;
+                action.dataset.mediaProfileLink = '';
                 action.title = label;
                 action.setAttribute('aria-label', label);
                 action.append(icon(iconName));

@@ -4,6 +4,7 @@
 
     const root = document.querySelector('[data-discovery-root]');
     if (!root) return;
+    const profileOnly = root.dataset.discoveryProfileHost === 'true';
 
     const SKELETON_DELAY_MS = 300;
     const SKELETON_MIN_VISIBLE_MS = 300;
@@ -275,8 +276,15 @@
         return true;
     }
 
-    function detailIdentityFromLocation() {
-        const params = new URLSearchParams(window.location.search);
+    function detailIdentityFromURL(value) {
+        let url;
+        try {
+            url = new URL(value, window.location.origin);
+        } catch (_error) {
+            return null;
+        }
+        if (url.origin !== window.location.origin || url.pathname !== '/discovery') return null;
+        const params = url.searchParams;
         const provider = String(params.get('detail_provider') || '').trim().toLowerCase();
         const mediaType = String(params.get('detail_type') || '').trim().toLowerCase();
         const externalId = String(params.get('detail_id') || '').trim();
@@ -289,6 +297,10 @@
         if (provider === 'bangumi' && mediaType !== 'tv') return null;
         if ((provider === 'tmdb' || provider === 'bangumi') && !/^\d{1,20}$/.test(externalId)) return null;
         return {provider, media_type: mediaType, external_id: externalId, resource_focus: resourceFocus};
+    }
+
+    function detailIdentityFromLocation() {
+        return detailIdentityFromURL(window.location.href);
     }
 
     function detailReturnLocation() {
@@ -319,6 +331,7 @@
 
     function leaveDetailLocation() {
         if (state.detailExitInProgress) return;
+        if (profileOnly) return;
         const returnTo = detailReturnLocation();
         if (!returnTo) {
             clearDetailLocation();
@@ -2918,7 +2931,7 @@
     elements.loadMore.addEventListener('click', loadNextPage);
 
     function restoreDetailFocus() {
-        const target = state.activeCard?.querySelector('.discovery-card-open') || elements.searchQuery;
+        const target = state.activeCard?.querySelector?.('.discovery-card-open') || state.activeCard || elements.searchQuery;
         state.activeCard = null;
         window.requestAnimationFrame(() => target?.focus?.({preventScroll: true}));
     }
@@ -2957,7 +2970,19 @@
         window.setTimeout(flushPendingResourceNotifications, 0);
     });
 
+    if (profileOnly) {
+        document.addEventListener('click', (event) => {
+            if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+            const link = event.target.closest?.('a[data-media-profile-link]');
+            if (!link || link.target === '_blank' || link.hasAttribute('download')) return;
+            const identity = detailIdentityFromURL(link.href);
+            if (!identity) return;
+            event.preventDefault();
+            void openDetail(identity, link);
+        });
+    }
+
     const initialDetail = detailIdentityFromLocation();
-    loadActive();
+    if (!profileOnly) loadActive();
     if (initialDetail) openDetail(initialDetail, null);
 })();

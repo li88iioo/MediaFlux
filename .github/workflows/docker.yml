@@ -41,6 +41,9 @@ jobs:
       - name: Run tests
         env:
           PYTHONUNBUFFERED: "1"
+          MEDIAFLUX_TESTING: "1"
+          MEDIAFLUX_TEST_MODE: "1"
+          MEDIAFLUX_DISABLE_FILE_LOGGING: "1"
         run: python -m unittest discover -s tests -t . -p "test_*.py" -v
 
   smoke:

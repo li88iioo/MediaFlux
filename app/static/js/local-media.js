@@ -21,7 +21,6 @@
         ['documentary', '纪录片'], ['variety', '综艺'], ['concert', '演唱会'], ['kids', '儿童'],
     ];
     const categoryLabels = Object.fromEntries(categories);
-    const windowsPackage = document.querySelector('.lm-page')?.dataset.windowsPackage === '1';
     const states = {
         waiting_stable: ['等待稳定', 'paused'], recognizing: ['识别中', 'running'],
         requires_manual: ['待确认', 'paused'], planned: ['已规划', 'running'],
@@ -730,71 +729,24 @@
         icons($('lmTargetRows'));
     }
 
-    function windowsUncRoot(value) {
-        if (!windowsPackage) return '';
-        const normalized = String(value || '').trim();
-        const match = normalized.match(/^(\\\\[^\\]+\\[^\\]+)/);
-        return match ? match[1] : '';
-    }
-
-    function updateSmbAuthGuidance() {
-        const localRootInput = $('lmLocalRoot');
-        const smbUser = $('lmSmbUser');
-        const smbPass = $('lmSmbPass');
-        const smbAuthSection = $('lmSmbAuthSection');
-        const hintEl = document.querySelector('.lm-network-hint span');
-        if (!localRootInput || !smbAuthSection) return;
-
-        const pathVal = localRootInput.value.trim();
-        const isUnc = /^(\\\\[^\\]+|[\/]{2}[^\/]+)/.test(pathVal);
-        const isMappedDrive = /^[a-zA-Z]:/.test(pathVal);
-        const hasCredentials = Boolean((smbUser?.value || '').trim() || (smbPass?.value || '').trim() || (smbPass?.placeholder || '').includes('已保存'));
-
-        if ((isUnc || isMappedDrive) && !hasCredentials) {
-            smbAuthSection.classList.add('is-highlighted');
-            if (hintEl) {
-                hintEl.innerHTML = isUnc
-                    ? '检测到 UNC 网络共享路径。若 NAS 未开启匿名访问，请在下方填写<strong>「NAS 访问账号」</strong>与<strong>「NAS 访问密码」</strong>。'
-                    : '若当前盘符为网络映射驱动器且需要身份验证，请在下方填写 NAS 访问账号和密码以便自动挂载。';
-            }
-        } else {
-            smbAuthSection.classList.remove('is-highlighted');
-            if (hintEl) {
-                hintEl.innerHTML = 'SMB 网络共享请直接填写 <code>\\\\NAS\\共享名</code>。若 NAS 设置了账号密码，可在下方配置访问凭据自动挂载。';
-            }
-        }
-    }
-
-    function openLocalDirectoryPicker(input, {sourceId = 0, rootId = '__roots__', rootName = '本机目录'} = {}) {
+    function openLocalDirectoryPicker(input, {sourceId = 0, rootId = '__roots__', rootName = '容器目录'} = {}) {
         if (!window.openGuangYaDirectoryPicker) return;
-        const currentValue = String(input?.value || '').trim();
-        const networkRoot = windowsUncRoot(currentValue);
-        const smbUser = $('lmSmbUser')?.value.trim() || '';
-        const smbPass = $('lmSmbPass')?.value.trim() || '';
 
-        // rootId 基准入口始终支持从 __roots__ 导航。
-        // 若指定了具体 sourceId 作用域，则锁定在该来源的 rootId；否则始终基于 __roots__ 导航。
+        // 指定来源时锁定在该来源目录；新建来源时从已允许的容器挂载根开始。
         const effectiveRootId = sourceId ? rootId : '__roots__';
-        const effectiveRootName = sourceId ? rootName : '本机目录';
+        const effectiveRootName = sourceId ? rootName : '容器目录';
         const isRootsMode = effectiveRootId === '__roots__';
 
         window.openGuangYaDirectoryPicker({
             modalId: 'localMediaDirModal',
-            title: networkRoot ? '选择 SMB 网络目录' : '选择本地目录',
+            title: '选择容器目录',
             rootId: effectiveRootId,
             rootName: effectiveRootName,
-            allowRoot: !isRootsMode && Boolean(sourceId || networkRoot),
+            allowRoot: !isRootsMode && Boolean(sourceId),
             fetchDirectory: async (path) => {
                 const isRootsPath = !path || path === '__roots__';
                 const query = new URLSearchParams({path});
-                if (networkRoot && !isRootsPath) {
-                    query.set('network_root', networkRoot);
-                }
-                if (sourceId) {
-                    query.set('source_id', String(sourceId));
-                }
-                if (smbUser) query.set('smb_user', smbUser);
-                if (smbPass) query.set('smb_pass', smbPass);
+                if (sourceId) query.set('source_id', String(sourceId));
 
                 try {
                     const data = await api(`/api/local-media/directories?${query.toString()}`);
@@ -809,7 +761,6 @@
                         };
                     });
                 } catch (error) {
-                    // 若非 __roots__ 且无 sourceId 强作用域限制时加载失败（例如 1326 认证失败），安全降级回退到 __roots__ 并展示所有可用盘符
                     if (!isRootsPath && !sourceId) {
                         try {
                             const fallbackData = await api('/api/local-media/directories?path=__roots__');
@@ -823,7 +774,7 @@
                                     is_dir: true,
                                 };
                             });
-                        } catch (fallbackErr) {
+                        } catch {
                             throw error;
                         }
                     }
@@ -936,20 +887,12 @@
         $('lmSourceName').value = source?.name || '';
         $('lmQbPrefix').value = source?.qb_path_prefix || '';
         $('lmLocalRoot').value = source?.local_root || '';
-        if ($('lmSmbUser')) $('lmSmbUser').value = source?.smb_user || '';
-        if ($('lmSmbPass')) {
-            $('lmSmbPass').value = '';
-            $('lmSmbPass').placeholder = source?.has_smb_pass
-                ? '已保存密码（保持为空则不修改）'
-                : 'NAS 共享密码';
-        }
         $('lmStableSeconds').value = source?.stable_seconds ?? 300;
         $('lmScanMinutes').value = source?.scan_interval_minutes ?? 10;
         $('lmSourceEnabled').checked = source?.enabled ?? true;
         $('lmScanEnabled').checked = source?.scan_enabled ?? false;
         $('lmSourceMediaType').value = source?.media_type || 'auto';
         targetRows(Object.fromEntries((source?.targets || []).map((target) => [target.category, target])));
-        updateSmbAuthGuidance();
         if (sourceModal) sourceModal.open(trigger);
         else $('lmSourceModal').hidden = false;
         icons($('lmSourceModal'));
@@ -982,8 +925,6 @@
             qb_profile: 'configured:qb',
             qb_path_prefix: $('lmQbPrefix').value.trim(),
             local_root: $('lmLocalRoot').value.trim(),
-            smb_user: $('lmSmbUser')?.value.trim() || '',
-            smb_pass: $('lmSmbPass')?.value.trim() || '',
             enabled: $('lmSourceEnabled').checked,
             stable_seconds: Number($('lmStableSeconds').value) || 0,
             scan_enabled: $('lmScanEnabled').checked,
@@ -1568,10 +1509,6 @@
     $('lmClearTasksBtn').addEventListener('click', clearSelectedTasks);
     $('lmLoadMoreTasksBtn').addEventListener('click', () => { taskDisplayLimit += 60; renderTasks(true, true); });
     $('lmPickLocalRootBtn').addEventListener('click', () => openLocalDirectoryPicker($('lmLocalRoot')));
-    $('lmLocalRoot')?.addEventListener('input', updateSmbAuthGuidance);
-    $('lmLocalRoot')?.addEventListener('change', updateSmbAuthGuidance);
-    $('lmSmbUser')?.addEventListener('input', updateSmbAuthGuidance);
-    $('lmSmbPass')?.addEventListener('input', updateSmbAuthGuidance);
     $('lmItemFilter').addEventListener('input', () => renderMediaItems(true, false));
     $('lmItemSourceFilter').addEventListener('change', () => renderMediaItems(true, false));
     $('lmRefreshItemsBtn').addEventListener('click', refreshMediaItems);
