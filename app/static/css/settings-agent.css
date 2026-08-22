@@ -1247,7 +1247,50 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     animation: agent-model-state-pulse 1s ease-in-out infinite;
 }
 .agent-field > .agent-model-hint[data-tone="success"] { color: var(--success); }
+.agent-field > .agent-model-hint[data-tone="warning"] { color: var(--warning); }
 .agent-field > .agent-model-hint[data-tone="error"] { color: var(--danger); }
+.agent-model-capabilities {
+    min-height: 24px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    visibility: hidden;
+}
+.agent-model-capabilities[data-visible="true"] { visibility: visible; }
+.agent-model-capabilities > span {
+    min-height: 22px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 8px;
+    color: var(--text-muted);
+    background: var(--bg-input);
+    border: 1px solid var(--border-soft);
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 650;
+    line-height: 1.2;
+}
+.agent-model-capabilities > span::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    flex: 0 0 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+.agent-model-capabilities > span[data-supported="true"] {
+    color: var(--success);
+    border-color: color-mix(in srgb, var(--success) 28%, var(--border-soft));
+}
+.agent-model-capabilities > span[data-supported="false"] {
+    color: var(--warning);
+    border-color: color-mix(in srgb, var(--warning) 30%, var(--border-soft));
+}
+.agent-model-capabilities > span[data-supported="pending"]::before {
+    animation: agent-model-state-pulse 1s ease-in-out infinite;
+}
 @keyframes agent-model-state-pulse {
     50% { opacity: 1; transform: scale(1.45); }
 }

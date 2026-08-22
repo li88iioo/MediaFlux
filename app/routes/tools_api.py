@@ -24,11 +24,17 @@ from app.clients.openai_compatible import (
     SUPPORTED_PROTOCOLS_TEXT,
     extract_output_text,
     is_protocol_fallback_error,
+    iter_provider_text_deltas,
+    native_tool_definitions,
+    native_tool_initial_history,
+    native_tool_request_body,
     normalize_provider_location,
+    parse_native_tool_turn,
     protocol_attempts,
     provider_headers,
     resolve_protocol,
     structured_request_body,
+    text_stream_request_body,
 )
 from app.indexers.errors import IndexerError
 from app.indexers.http import FixedHostHttpClient
@@ -932,7 +938,7 @@ async def _test_ai_provider(
     model: str,
     timeout_seconds: int,
 ) -> dict[str, object]:
-    """发送一条最小结构化请求，验证地址、鉴权、协议、模型和 JSON Schema。"""
+    """验证结构化输出，并独立探测工具调用与流式输出能力。"""
     location = normalize_provider_location(base_url, https_only=True, public_only=True)
     protocols = protocol_attempts(protocol)
     client = FixedHostHttpClient(
@@ -944,6 +950,91 @@ async def _test_ai_provider(
         pin_resolved_address=True,
     )
     overall_started = perf_counter()
+    probe_timeout = max(1.0, min(4.0, timeout_seconds / 3))
+
+    async def _probe_tool_calling(attempted_protocol: str) -> bool:
+        probe_name = "mediaflux_connectivity_probe"
+        system_prompt = (
+            "You are a capability probe. Call the supplied tool exactly once and do "
+            "not answer with plain text."
+        )
+        capabilities = [{
+            "name": probe_name,
+            "description": "Confirm native tool-calling support.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        }]
+        history = native_tool_initial_history(
+            attempted_protocol,
+            system_prompt=system_prompt,
+            user_content="Call mediaflux_connectivity_probe now.",
+        )
+        response = await client.post_json(
+            location.endpoint(attempted_protocol),
+            json=native_tool_request_body(
+                protocol=attempted_protocol,
+                model=model,
+                system_prompt=system_prompt,
+                history=history,
+                tools=native_tool_definitions(attempted_protocol, capabilities),
+                max_tokens=64,
+            ),
+            headers=provider_headers(attempted_protocol, api_key),
+            max_redirects=0,
+        )
+        if response.status_code != 200:
+            return False
+        envelope = json.loads(response.text)
+        turn = parse_native_tool_turn(envelope, attempted_protocol)
+        return (
+            len(turn.tool_calls) == 1
+            and turn.tool_calls[0].name == probe_name
+            and turn.tool_calls[0].arguments == {}
+        )
+
+    async def _probe_streaming(attempted_protocol: str) -> bool:
+        body = text_stream_request_body(
+            protocol=attempted_protocol,
+            model=model,
+            system_prompt="You are a streaming capability probe. Reply with OK.",
+            user_content="Reply with OK.",
+            max_tokens=16,
+        )
+        async with client.stream_post_json(
+            location.endpoint(attempted_protocol),
+            json=body,
+            headers=provider_headers(attempted_protocol, api_key, stream=True),
+            max_redirects=0,
+        ) as response:
+            if response.status_code != 200:
+                return False
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "text/event-stream" not in content_type:
+                return False
+            received_text = False
+            async for delta in iter_provider_text_deltas(
+                response.aiter_bytes(), protocol=attempted_protocol
+            ):
+                received_text = received_text or bool(str(delta).strip())
+            return received_text
+
+    async def _safe_capability_probe(probe) -> bool:
+        try:
+            return bool(await asyncio.wait_for(probe, timeout=probe_timeout))
+        except (
+            asyncio.TimeoutError,
+            httpx.HTTPError,
+            IndexerError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+        ):
+            return False
 
     async def _request_protocols() -> dict[str, object]:
         for index, attempted_protocol in enumerate(protocols):
@@ -1025,10 +1116,20 @@ async def _test_ai_provider(
                 raise _AIProviderTestFailure(
                     "invalid_response", protocol=attempted_protocol, status_code=200
                 )
+
+            tool_calling = await _safe_capability_probe(
+                _probe_tool_calling(attempted_protocol)
+            )
+            streaming = await _safe_capability_probe(
+                _probe_streaming(attempted_protocol)
+            )
             elapsed_ms = max(1, int((perf_counter() - overall_started) * 1000))
             logger.info(
-                "AI 模型测试 event=success protocol=%s status_code=200 elapsed_ms=%s",
+                "AI 模型测试 event=success protocol=%s status_code=200 "
+                "structured_output=true tool_calling=%s streaming=%s elapsed_ms=%s",
                 attempted_protocol,
+                str(tool_calling).lower(),
+                str(streaming).lower(),
                 elapsed_ms,
             )
             return {
@@ -1036,6 +1137,11 @@ async def _test_ai_provider(
                 "protocol": attempted_protocol,
                 "status_code": 200,
                 "elapsed_ms": elapsed_ms,
+                "capabilities": {
+                    "structured_output": True,
+                    "tool_calling": tool_calling,
+                    "streaming": streaming,
+                },
             }
         raise _AIProviderTestFailure("upstream_status")
 

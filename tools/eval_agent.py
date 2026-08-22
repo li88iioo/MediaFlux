@@ -28,9 +28,11 @@ from app.agent.llm_router import (
 )
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import (
+    AgentInputError,
     AgentOrchestrator,
     _DIAGNOSTIC_READ_INTENTS,
     contextual_media_rating_request,
+    normalize_agent_message,
     recent_discovery_candidate_request,
     recent_resource_submit_request,
 )
@@ -48,6 +50,7 @@ EVALUATORS = frozenset({
     "resource_followup",
     "media_rating",
     "sensitive_input",
+    "input_validation",
 })
 CATEGORIES = frozenset({
     "read",
@@ -106,6 +109,7 @@ _MATRIX_EVALUATORS = frozenset({
     "action_intent",
     "confirmation_planning",
     "sensitive_input",
+    "input_validation",
 })
 
 
@@ -167,7 +171,9 @@ def _validate_expected(case_id: str, evaluator: str, expected: Any) -> None:
             allowed_tools=_OFFLINE_WRITE_ROUTE_TOOLS,
         )
         return
-    if evaluator in {"action_intent", "confirmation_planning", "sensitive_input"}:
+    if evaluator in {
+        "action_intent", "confirmation_planning", "sensitive_input", "input_validation"
+    }:
         if not isinstance(expected, bool):
             raise _schema_error(case_id, "expected 必须是 boolean")
         return
@@ -309,13 +315,17 @@ def validate_agent_eval_rows(rows: Iterable[Mapping[str, Any]]) -> list[AgentEva
         if evaluator not in EVALUATORS:
             raise _schema_error(case_id, "evaluator 无效")
         message = row["message"]
+        message_limit = 5000 if evaluator == "input_validation" else 1000
         if (
             not isinstance(message, str)
             or not message.strip()
             or message != message.strip()
-            or len(message) > 1000
+            or len(message) > message_limit
         ):
-            raise _schema_error(case_id, "message 必须是首尾无空白的非空字符串")
+            raise _schema_error(
+                case_id,
+                f"message 必须是首尾无空白且不超过 {message_limit} 字符的非空字符串",
+            )
         allow_implicit = row.get("allow_implicit", False)
         if not isinstance(allow_implicit, bool):
             raise _schema_error(case_id, "allow_implicit 必须是 boolean")
@@ -511,6 +521,13 @@ def evaluate_agent_case(case: AgentEvalCase) -> AgentEvalOutcome:
         )
     elif case.evaluator == "sensitive_input":
         actual = contains_sensitive_credential(case.message)
+    elif case.evaluator == "input_validation":
+        try:
+            normalize_agent_message(case.message)
+        except AgentInputError:
+            actual = False
+        else:
+            actual = True
     else:  # pragma: no cover - schema validation owns this branch
         raise ValueError(f"unsupported evaluator: {case.evaluator}")
     matched = actual == case.expected

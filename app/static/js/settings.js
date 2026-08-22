@@ -125,6 +125,7 @@
     }));
 
     const agentModelState=document.getElementById('agentModelState');
+    const agentModelCapabilities=document.getElementById('agentModelCapabilities');
     const fetchAgentModelsButton=document.getElementById('fetchAgentModelsBtn');
     const testAgentModelButton=document.getElementById('testAgentModelBtn');
     const openAgentModelPickerButton=document.getElementById('openAgentModelPickerBtn');
@@ -191,6 +192,15 @@
         agentModelState.textContent=message;
         agentModelState.dataset.tone=tone;
     }
+    function renderAgentModelCapabilities(capabilities=null,{testing=false}={}){
+        if(!agentModelCapabilities)return;
+        agentModelCapabilities.dataset.visible=(capabilities||testing)?'true':'false';
+        agentModelCapabilities.setAttribute('aria-hidden',(capabilities||testing)?'false':'true');
+        agentModelCapabilities.querySelectorAll('[data-capability]').forEach(item=>{
+            const key=item.dataset.capability;
+            item.dataset.supported=testing?'pending':(capabilities?.[key]===true?'true':'false');
+        });
+    }
     function setAgentModelActionsBusy(activeButton,busy){
         [fetchAgentModelsButton,testAgentModelButton,openAgentModelPickerButton].forEach(button=>{if(button) button.disabled=busy;});
         activeButton.classList.toggle('is-loading',busy);
@@ -231,14 +241,22 @@
         const draft=getAgentModelDraft();
         if(!draft.base_url){setAgentModelState('请先填写 API Base URL','error');form.querySelector('[data-key="AGENT_LLM_API_URL"]').focus();return;}
         if(!draft.model){setAgentModelState('请先输入或选择模型名称','error');document.getElementById('agentLlmModel').focus();return;}
-        setAgentModelActionsBusy(testAgentModelButton,true);setAgentModelState('正在验证地址、鉴权、协议与结构化输出…','testing');
+        setAgentModelActionsBusy(testAgentModelButton,true);setAgentModelState('正在验证结构化输出、工具调用与流式输出…','testing');renderAgentModelCapabilities(null,{testing:true});
         try{
             const response=await fetch('/api/tools/ai/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draft)});
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'模型连接测试失败');
             const protocol=agentProtocolLabels[data.protocol]||data.protocol||'模型服务';
-            setAgentModelState(`连接正常 · ${protocol} · ${data.elapsed_ms||0} ms`,'success');
-        }catch(error){setAgentModelState(error.message||'模型连接测试失败','error');}
+            const capabilities=data.capabilities&&typeof data.capabilities==='object'?data.capabilities:{structured_output:true,tool_calling:false,streaming:false};
+            renderAgentModelCapabilities(capabilities);
+            const fullyCapable=capabilities.structured_output===true&&capabilities.tool_calling===true&&capabilities.streaming===true;
+            setAgentModelState(
+                fullyCapable
+                    ? `全功能可用 · ${protocol} · ${data.elapsed_ms||0} ms`
+                    : `连接正常，但部分 Agent 能力不可用 · ${protocol} · ${data.elapsed_ms||0} ms`,
+                fullyCapable?'success':'warning'
+            );
+        }catch(error){renderAgentModelCapabilities(null);setAgentModelState(error.message||'模型连接测试失败','error');}
         finally{setAgentModelActionsBusy(testAgentModelButton,false);}
     });
 

@@ -16,6 +16,7 @@ from typing import Any, AsyncIterator, Callable
 import httpx
 
 from app.agent.async_bridge import run_awaitable_sync
+from app.agent.metrics import agent_metrics
 from app.agent.conversation_summary import (
     contains_unsafe_summary_text,
     conversation_summary_schema,
@@ -68,6 +69,14 @@ from app.sensitive_data import contains_sensitive_credential
 logger = get_logger(__name__)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _STREAM_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _llm_status_outcome(status_code: int) -> str:
+    if int(status_code or 0) == 429:
+        return "rate_limited"
+    if int(status_code or 0) >= 500:
+        return "upstream_5xx"
+    return "upstream_status"
 _NO_TOOL_SENTINEL = "__none__"
 _PROVIDER_RETRY_STATUSES = frozenset({429, 502, 503, 504})
 _PROVIDER_RETRY_EXCEPTIONS = (
@@ -295,6 +304,9 @@ class _NativeLoopState:
     tool_executions: list[dict[str, Any]] = field(default_factory=list)
     usage: ProviderUsage | None = None
     confirmation_prepared: bool = False
+    llm_ms: int = 0
+    tools_ms: int = 0
+    breakdown_recorded: bool = False
 
     def reserve_provider_request(
         self, fallback_budget: Callable[[], bool] | None
@@ -354,6 +366,16 @@ class _NativeLoopState:
     def record_usage(self, usage: ProviderUsage | None) -> None:
         if usage is not None:
             self.usage = usage if self.usage is None else self.usage + usage
+
+    def record_breakdown(self) -> None:
+        if self.breakdown_recorded or not (self.provider_requests or self.total_tool_calls):
+            return
+        self.breakdown_recorded = True
+        agent_metrics.record_query_breakdown(
+            turns=self.provider_requests,
+            llm_ms=self.llm_ms,
+            tools_ms=self.tools_ms,
+        )
 
 
 @dataclass(slots=True)
@@ -499,9 +521,12 @@ async def _request_structured_json(
     )
     overall_started = monotonic()
     deadline = overall_started + timeout_seconds
+    last_protocol = configured_protocol
 
     async def _request_protocols() -> object | None:
+        nonlocal last_protocol
         for index, protocol in enumerate(protocols):
+            last_protocol = protocol
             attempt_started = monotonic()
             empty_body = structured_request_body(
                 protocol=protocol, model=model, system_prompt=system_prompt,
@@ -520,6 +545,9 @@ async def _request_structured_json(
                     "protocol=%s",
                     protocol,
                 )
+                agent_metrics.record_llm_request(
+                    protocol, model, outcome="context_budget_exhausted", elapsed_ms=0
+                )
                 return None
             body = structured_request_body(
                 protocol=protocol, model=model, system_prompt=system_prompt,
@@ -531,6 +559,9 @@ async def _request_structured_json(
                 context_window=_context_window(model),
                 output_reserve=max_tokens,
             ):
+                agent_metrics.record_llm_request(
+                    protocol, model, outcome="context_budget_exhausted", elapsed_ms=0
+                )
                 return None
             response = await _post_provider_json_with_retry(
                 client,
@@ -557,17 +588,30 @@ async def _request_structured_json(
                             "protocol=%s status_code=%s elapsed_ms=%s",
                             protocol, response.status_code, elapsed_ms,
                         )
+                        agent_metrics.record_llm_request(
+                            protocol, model, outcome="fallback_budget_exhausted",
+                            elapsed_ms=elapsed_ms,
+                        )
                         return None
                     logger.info(
                         "Agent LLM provider event outcome=protocol_fallback "
                         "protocol=%s status_code=%s elapsed_ms=%s",
                         protocol, response.status_code, elapsed_ms,
                     )
+                    agent_metrics.record_llm_request(
+                        protocol, model, outcome="protocol_fallback",
+                        elapsed_ms=elapsed_ms,
+                    )
                     continue
                 logger.warning(
                     "Agent LLM provider event outcome=upstream_status "
                     "protocol=%s status_code=%s elapsed_ms=%s",
                     protocol, response.status_code, elapsed_ms,
+                )
+                agent_metrics.record_llm_request(
+                    protocol, model,
+                    outcome=_llm_status_outcome(response.status_code),
+                    elapsed_ms=elapsed_ms,
                 )
                 return None
             envelope = json.loads(response.text)
@@ -578,6 +622,9 @@ async def _request_structured_json(
                     "protocol=%s status_code=200 elapsed_ms=%s",
                     protocol, elapsed_ms,
                 )
+                agent_metrics.record_llm_request(
+                    protocol, model, outcome="invalid_response", elapsed_ms=elapsed_ms
+                )
                 return None
             parsed = json.loads(content)
             usage = extract_provider_usage(envelope, protocol)
@@ -587,6 +634,12 @@ async def _request_structured_json(
                 "Agent LLM provider event outcome=success "
                 "protocol=%s status_code=200 elapsed_ms=%s",
                 protocol, elapsed_ms,
+            )
+            agent_metrics.record_llm_request(
+                protocol, model, outcome="success", elapsed_ms=elapsed_ms, usage=usage
+            )
+            agent_metrics.record_query_breakdown(
+                turns=1, llm_ms=elapsed_ms, tools_ms=0
             )
             return parsed
         return None
@@ -599,6 +652,9 @@ async def _request_structured_json(
             "Agent LLM provider event outcome=timeout elapsed_ms=%s",
             elapsed_ms,
         )
+        agent_metrics.record_llm_request(
+            last_protocol, model, outcome="timeout", elapsed_ms=elapsed_ms
+        )
         return None
     except (httpx.HTTPError, IndexerError) as exc:
         elapsed_ms = max(0, int((monotonic() - overall_started) * 1000))
@@ -606,6 +662,19 @@ async def _request_structured_json(
             "Agent LLM provider event outcome=transport_error "
             "error_type=%s elapsed_ms=%s",
             type(exc).__name__, elapsed_ms,
+        )
+        agent_metrics.record_llm_request(
+            last_protocol, model, outcome="transport_error", elapsed_ms=elapsed_ms
+        )
+        return None
+    except json.JSONDecodeError as exc:
+        elapsed_ms = max(0, int((monotonic() - overall_started) * 1000))
+        logger.warning(
+            "Agent LLM provider event outcome=invalid_json error_type=%s elapsed_ms=%s",
+            type(exc).__name__, elapsed_ms,
+        )
+        agent_metrics.record_llm_request(
+            last_protocol, model, outcome="invalid_json", elapsed_ms=elapsed_ms
         )
         return None
     except (KeyError, IndexError, TypeError, ValueError) as exc:
@@ -615,6 +684,9 @@ async def _request_structured_json(
             "error_type=%s elapsed_ms=%s",
             type(exc).__name__, elapsed_ms,
         )
+        agent_metrics.record_llm_request(
+            last_protocol, model, outcome="invalid_response", elapsed_ms=elapsed_ms
+        )
         return None
     except Exception as exc:
         elapsed_ms = max(0, int((monotonic() - overall_started) * 1000))
@@ -622,6 +694,9 @@ async def _request_structured_json(
             "Agent LLM provider event outcome=unexpected_error "
             "error_type=%s elapsed_ms=%s",
             type(exc).__name__, elapsed_ms,
+        )
+        agent_metrics.record_llm_request(
+            last_protocol, model, outcome="unexpected_error", elapsed_ms=elapsed_ms
         )
         return None
     finally:
@@ -2049,9 +2124,12 @@ async def _request_native_read_agent(
     overall_timeout = min(60, max(timeout_seconds, timeout_seconds * 4))
     deadline = overall_started + overall_timeout
     state = _NativeLoopState()
+    last_protocol = configured_protocol
 
     async def _run() -> LLMConversationReply | None:
+        nonlocal last_protocol
         for protocol_index, protocol in enumerate(protocols):
+            last_protocol = protocol
             tools = native_tool_definitions(protocol, native_capabilities)
             read_only_tools = native_tool_definitions(protocol, read_only_capabilities)
             if not tools:
@@ -2080,6 +2158,9 @@ async def _request_native_read_agent(
                     "Agent LLM native event outcome=context_budget_exhausted "
                     "protocol=%s",
                     protocol,
+                )
+                agent_metrics.record_llm_request(
+                    protocol, model, outcome="context_budget_exhausted", elapsed_ms=0
                 )
                 return state.partial("context_budget_exhausted")
             protocol_state = _NativeProtocolState(
@@ -2120,6 +2201,12 @@ async def _request_native_read_agent(
                     context_window=_context_window(model),
                     output_reserve=1000,
                 ):
+                    agent_metrics.record_llm_request(
+                        protocol,
+                        model,
+                        outcome="context_budget_exhausted",
+                        elapsed_ms=0,
+                    )
                     return state.partial("context_budget_exhausted")
                 response = await _post_provider_json_with_retry(
                     client,
@@ -2130,6 +2217,7 @@ async def _request_native_read_agent(
                     protocol=protocol,
                 )
                 elapsed_ms = max(0, int((monotonic() - attempt_started) * 1000))
+                state.llm_ms += elapsed_ms
                 if response.status_code != 200:
                     can_fallback = (
                         request_index == 0
@@ -2147,17 +2235,30 @@ async def _request_native_read_agent(
                             "protocol=%s status_code=%s elapsed_ms=%s",
                             protocol, response.status_code, elapsed_ms,
                         )
+                        agent_metrics.record_llm_request(
+                            protocol, model, outcome="protocol_fallback",
+                            elapsed_ms=elapsed_ms,
+                        )
                         break
                     logger.warning(
                         "Agent LLM native event outcome=upstream_status "
                         "protocol=%s status_code=%s elapsed_ms=%s",
                         protocol, response.status_code, elapsed_ms,
                     )
+                    agent_metrics.record_llm_request(
+                        protocol, model,
+                        outcome=_llm_status_outcome(response.status_code),
+                        elapsed_ms=elapsed_ms,
+                    )
                     return state.partial("upstream_status")
 
                 envelope = json.loads(response.text)
                 turn = parse_native_tool_turn(envelope, protocol)
                 state.record_usage(turn.usage)
+                agent_metrics.record_llm_request(
+                    protocol, model, outcome="success", elapsed_ms=elapsed_ms,
+                    usage=turn.usage,
+                )
                 logger.info(
                     "Agent LLM native event outcome=turn_success protocol=%s "
                     "tool_calls=%s elapsed_ms=%s",
@@ -2200,6 +2301,7 @@ async def _request_native_read_agent(
                     )
                     return state.partial("tool_call_limit")
 
+                tools_started = monotonic()
                 outputs = await _execute_native_tool_turn(
                     turn,
                     registry=registry,
@@ -2209,6 +2311,9 @@ async def _request_native_read_agent(
                     allow_confirmations=bool(
                         include_confirmations and request_index == 0
                     ),
+                )
+                state.tools_ms += max(
+                    0, int((monotonic() - tools_started) * 1000)
                 )
                 protocol_state.history = append_native_tool_results(
                     protocol, protocol_state.history, turn, outputs
@@ -2223,10 +2328,38 @@ async def _request_native_read_agent(
         return await asyncio.wait_for(_run(), timeout=overall_timeout)
     except TimeoutError:
         elapsed_ms = max(0, int((monotonic() - overall_started) * 1000))
+        state.llm_ms = max(state.llm_ms, max(0, elapsed_ms - state.tools_ms))
         logger.warning(
             "Agent LLM native event outcome=timeout elapsed_ms=%s", elapsed_ms
         )
+        agent_metrics.record_llm_request(
+            last_protocol, model, outcome="timeout", elapsed_ms=elapsed_ms
+        )
         return state.partial("timeout")
+    except json.JSONDecodeError:
+        agent_metrics.record_llm_request(
+            last_protocol,
+            model,
+            outcome="invalid_json",
+            elapsed_ms=max(0, int((monotonic() - overall_started) * 1000)),
+        )
+        return state.partial("invalid_json")
+    except (httpx.HTTPError, IndexerError) as exc:
+        elapsed_ms = max(0, int((monotonic() - overall_started) * 1000))
+        state.llm_ms = max(state.llm_ms, max(0, elapsed_ms - state.tools_ms))
+        logger.warning(
+            "Agent LLM native event outcome=transport_error "
+            "error_type=%s elapsed_ms=%s",
+            type(exc).__name__,
+            elapsed_ms,
+        )
+        agent_metrics.record_llm_request(
+            last_protocol, model, outcome="transport_error", elapsed_ms=elapsed_ms
+        )
+        partial = state.partial("transport_error")
+        if partial is not None:
+            return partial
+        raise
     except AgentToolError:
         partial = state.partial("tool_error")
         if partial is not None:
@@ -2238,6 +2371,7 @@ async def _request_native_read_agent(
             return partial
         raise
     finally:
+        state.record_breakdown()
         await client.aclose()
 
 
@@ -2301,14 +2435,33 @@ async def _request_text_stream(
     emitted = False
     accumulated = ""
     published_length = 0
+    last_protocol = configured_protocol
+    breakdown_recorded = False
+
+    def record_stream_event(
+        protocol: str, outcome: str, elapsed_ms: int, *, final: bool = False
+    ) -> None:
+        nonlocal breakdown_recorded
+        agent_metrics.record_llm_request(
+            protocol, model, outcome=outcome, elapsed_ms=elapsed_ms
+        )
+        if final and not breakdown_recorded:
+            breakdown_recorded = True
+            agent_metrics.record_query_breakdown(
+                turns=1, llm_ms=elapsed_ms, tools_ms=0
+            )
 
     try:
         async with asyncio.timeout(timeout_seconds):
             for index, protocol in enumerate(protocols):
+                last_protocol = protocol
                 if index > 0 and fallback_budget is not None and not fallback_budget():
                     logger.info(
                         "Agent LLM stream event outcome=fallback_budget_exhausted protocol=%s",
                         protocol,
+                    )
+                    record_stream_event(
+                        protocol, "fallback_budget_exhausted", 0, final=True
                     )
                     return
                 attempt_started = monotonic()
@@ -2328,6 +2481,9 @@ async def _request_text_stream(
                         output_reserve=max_tokens,
                     )
                     if fitted_user_content is None:
+                        record_stream_event(
+                            protocol, "context_budget_exhausted", 0, final=True
+                        )
                         return
                     request_body = text_stream_request_body(
                         protocol=protocol,
@@ -2341,6 +2497,9 @@ async def _request_text_stream(
                         context_window=_context_window(model),
                         output_reserve=max_tokens,
                     ):
+                        record_stream_event(
+                            protocol, "context_budget_exhausted", 0, final=True
+                        )
                         return
                     async with client.stream_post_json(
                         location.endpoint(protocol),
@@ -2365,6 +2524,12 @@ async def _request_text_stream(
                                     response.status_code,
                                     elapsed_ms,
                                 )
+                                record_stream_event(
+                                    protocol,
+                                    _llm_status_outcome(response.status_code),
+                                    elapsed_ms,
+                                    final=True,
+                                )
                                 return
                         else:
                             content_type = str(
@@ -2378,6 +2543,12 @@ async def _request_text_stream(
                                         "protocol=%s elapsed_ms=%s",
                                         protocol,
                                         elapsed_ms,
+                                    )
+                                    record_stream_event(
+                                        protocol,
+                                        "invalid_content_type",
+                                        elapsed_ms,
+                                        final=True,
                                     )
                                     return
                             else:
@@ -2437,6 +2608,12 @@ async def _request_text_stream(
                                     protocol,
                                     max(0, int((monotonic() - attempt_started) * 1000)),
                                 )
+                                record_stream_event(
+                                    protocol,
+                                    "success",
+                                    max(0, int((monotonic() - attempt_started) * 1000)),
+                                    final=True,
+                                )
                                 return
                 except ProviderStreamError as exc:
                     retry_next = not emitted and index + 1 < len(protocols)
@@ -2446,6 +2623,17 @@ async def _request_text_stream(
                             "protocol=%s error_type=%s",
                             protocol,
                             type(exc).__name__,
+                        )
+                        stream_outcome = (
+                            "invalid_json"
+                            if "JSON" in str(exc) or "UTF-8" in str(exc)
+                            else "invalid_response"
+                        )
+                        record_stream_event(
+                            protocol,
+                            stream_outcome,
+                            max(0, int((monotonic() - attempt_started) * 1000)),
+                            final=True,
                         )
                         if emitted:
                             raise
@@ -2457,6 +2645,11 @@ async def _request_text_stream(
                         "Agent LLM stream event outcome=protocol_fallback protocol=%s",
                         protocol,
                     )
+                    record_stream_event(
+                        protocol,
+                        "protocol_fallback",
+                        max(0, int((monotonic() - attempt_started) * 1000)),
+                    )
                     continue
                 return
     except TimeoutError:
@@ -2464,6 +2657,8 @@ async def _request_text_stream(
             "Agent LLM stream event outcome=timeout elapsed_ms=%s",
             max(0, int((monotonic() - overall_started) * 1000)),
         )
+        elapsed_ms = max(0, int((monotonic() - overall_started) * 1000))
+        record_stream_event(last_protocol, "timeout", elapsed_ms, final=True)
         if emitted:
             raise ProviderStreamError("Provider 流式回答超时")
     except (httpx.HTTPError, IndexerError) as exc:
@@ -2471,6 +2666,10 @@ async def _request_text_stream(
             "Agent LLM stream event outcome=transport_error error_type=%s elapsed_ms=%s",
             type(exc).__name__,
             max(0, int((monotonic() - overall_started) * 1000)),
+        )
+        elapsed_ms = max(0, int((monotonic() - overall_started) * 1000))
+        record_stream_event(
+            last_protocol, "transport_error", elapsed_ms, final=True
         )
         if emitted:
             raise ProviderStreamError("Provider 流式连接中断") from exc

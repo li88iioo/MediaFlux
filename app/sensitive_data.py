@@ -94,6 +94,7 @@ _EXACT_SENSITIVE_LABELS = frozenset(
         "authorization",
         "auth",
         "api_key",
+        "agent_metrics_scrape_key",
         "apikey",
         "access_token",
         "accesstoken",

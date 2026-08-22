@@ -19,6 +19,7 @@ services:
       ENV_WEB_PASSPORT: "${ENV_WEB_PASSPORT:?set ENV_WEB_PASSPORT in .env}"
       ENV_WEB_PASSWORD: "${ENV_WEB_PASSWORD:?set ENV_WEB_PASSWORD in .env}"
       SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-0}"
+      AGENT_METRICS_SCRAPE_KEY: "${AGENT_METRICS_SCRAPE_KEY:-}"
       LOCAL_MEDIA_BROWSE_ROOTS: "${LOCAL_MEDIA_BROWSE_ROOTS:-/media/downloads,/media/library}"
     volumes:
       - ./db:/app/db

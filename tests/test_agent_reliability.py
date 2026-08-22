@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import re
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -196,6 +198,72 @@ class AgentTraceAndMetricsTests(IsolatedDatabaseTestCase):
         self.assertEqual(snapshot["latency_ms"]["query"]["count"], 32)
         self.assertGreaterEqual(snapshot["latency_ms"]["query"]["p95"], 90)
 
+    def test_metrics_distinguish_llm_failures_usage_breakdown_and_contention(self) -> None:
+        collector = AgentMetricsCollector(max_latency_samples=32)
+        db._reset_sqlite_contention_metrics_for_tests()
+        for outcome in ("timeout", "rate_limited", "invalid_json", "upstream_5xx"):
+            collector.record_llm_request(
+                "chat_completions",
+                "model/test\nunsafe",
+                outcome=outcome,
+                elapsed_ms=25,
+            )
+        collector.record_llm_request(
+            "chat_completions",
+            "model/test\nunsafe",
+            outcome="success",
+            elapsed_ms=12,
+            usage=SimpleNamespace(
+                prompt_tokens=30,
+                completion_tokens=9,
+                cached_tokens=4,
+                reasoning_tokens=2,
+            ),
+        )
+        collector.record_query_breakdown(turns=3, llm_ms=80, tools_ms=17)
+        db._observe_sqlite_contention(
+            db.sqlite3.OperationalError("database is locked"),
+            phase="operation",
+            elapsed_ms=3,
+        )
+
+        snapshot = collector.snapshot()
+        provider = snapshot["llm"]["providers"][0]
+        self.assertEqual(provider["model"], "model/test_unsafe")
+        for outcome in ("timeout", "rate_limited", "invalid_json", "upstream_5xx"):
+            self.assertEqual(provider["outcomes"][outcome], 1)
+        self.assertEqual(provider["tokens"]["prompt"], 30)
+        self.assertEqual(provider["tokens"]["completion"], 9)
+        self.assertEqual(snapshot["llm"]["turns"]["max"], 3)
+        self.assertEqual(snapshot["llm"]["llm_ms"]["max"], 80)
+        self.assertEqual(snapshot["llm"]["tools_ms"]["max"], 17)
+        self.assertEqual(snapshot["sqlite_contention"]["locked"], 1)
+
+        prometheus = collector.prometheus()
+        self.assertIn('outcome="rate_limited"', prometheus)
+        self.assertIn("mediaflux_agent_llm_tokens_total", prometheus)
+        self.assertIn("mediaflux_agent_query_breakdown", prometheus)
+        self.assertIn("mediaflux_sqlite_contention_total", prometheus)
+        self.assertNotIn("\nunsafe", prometheus)
+
+        collector.record_llm_request(
+            "responses", "second-model", outcome="success", elapsed_ms=8
+        )
+        sample_families = []
+        for line in collector.prometheus().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            sample_families.append(line.split("{", 1)[0].split(" ", 1)[0])
+        completed_families = set()
+        previous = ""
+        for family in sample_families:
+            if family != previous:
+                self.assertNotIn(family, completed_families)
+                if previous:
+                    completed_families.add(previous)
+                previous = family
+        db._reset_sqlite_contention_metrics_for_tests()
+
 
 class AgentMetricsApiTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
@@ -245,6 +313,37 @@ class AgentMetricsApiTests(IsolatedDatabaseTestCase):
         self.assertIn("mediaflux_agent_queries_total", text_response.text)
         self.assertIn('tool="trace.read"', text_response.text)
         self.assertTrue(text_response.headers["content-type"].startswith("text/plain"))
+
+    def test_metrics_scrape_key_is_independent_and_scoped_to_metrics(self) -> None:
+        from app.routes import agent_api
+
+        original_get = agent_api.config.get
+
+        def configured_value(key: str, default: str = "") -> str:
+            if key == "AGENT_METRICS_SCRAPE_KEY":
+                return "metrics-only-secret-123456"
+            return original_get(key, default)
+
+        with patch.object(agent_api.config, "get", side_effect=configured_value):
+            wrong = self.client.get(
+                "/api/agent/metrics",
+                headers={"Authorization": "Bearer wrong-key"},
+            )
+            self.assertEqual(wrong.status_code, 401)
+
+            allowed = self.client.get(
+                "/api/agent/metrics?format=prometheus",
+                headers={"Authorization": "Bearer metrics-only-secret-123456"},
+            )
+            self.assertEqual(allowed.status_code, 200, allowed.text)
+            self.assertIn("mediaflux_agent_queries_total", allowed.text)
+            self.assertNotIn("metrics-only-secret-123456", allowed.text)
+
+            other_route = self.client.get(
+                "/api/agent/capabilities",
+                headers={"Authorization": "Bearer metrics-only-secret-123456"},
+            )
+            self.assertEqual(other_route.status_code, 401)
 
 
 if __name__ == "__main__":

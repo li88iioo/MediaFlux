@@ -126,6 +126,8 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertNotIn('id="testTelegramBtn"', telegram_savebar)
         self.assertIn('id="testAgentModelBtn"', agent_panel)
         self.assertIn('aria-describedby="agentModelState"', agent_panel)
+        self.assertIn('id="agentModelCapabilities"', agent_panel)
+        self.assertIn('data-capability="tool_calling"', agent_panel)
         self.assertIn('class="agent-field agent-field-wide agent-model-field"', agent_panel)
         self.assertIn('class="agent-field agent-timeout-field"', agent_panel)
         fetch_model_button = re.search(
@@ -147,8 +149,8 @@ class AgentSettingsUiTests(unittest.TestCase):
             self.assertIn('aria-busy="false"', button)
             self.assertNotRegex(button, r'</i>\s*[^<\s]')
         self.assertIn("/api/tools/ai/test", html)
-        self.assertIn("正在验证地址、鉴权、协议与结构化输出…", html)
-        self.assertIn("连接正常 · ${protocol} · ${data.elapsed_ms||0} ms", html)
+        self.assertIn("正在验证结构化输出、工具调用与流式输出…", html)
+        self.assertIn("全功能可用 · ${protocol} · ${data.elapsed_ms||0} ms", html)
         self.assertIn("settings-agent.css", html)
         self.assertIn('class="settings-panel settings-panel-split active" id="settings-panel-console"', html)
         self.assertIn('class="settings-panel settings-panel-split" id="settings-panel-telegram"', html)
@@ -483,8 +485,24 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn("鉴权失败", serialized)
         self.assertNotIn("not-returned", serialized)
 
-    def test_model_test_auto_falls_back_and_requires_strict_probe_output(self):
+    def test_model_test_auto_falls_back_and_reports_full_capability_matrix(self):
         from app.routes import tools_api
+
+        class FakeStream:
+            status_code = 200
+            headers = {"content-type": "text/event-stream; charset=utf-8"}
+
+            async def aiter_bytes(self):
+                yield b'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}]}\n\n'
+                yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                yield b'data: [DONE]\n\n'
+
+        class StreamContext:
+            async def __aenter__(self):
+                return FakeStream()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
 
         class FakeClient:
             instance = None
@@ -492,6 +510,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             def __init__(self, **kwargs):
                 self.kwargs = kwargs
                 self.calls = []
+                self.stream_calls = []
                 self.closed = False
                 self.responses = [
                     SimpleNamespace(status_code=404, text="{}"),
@@ -501,12 +520,32 @@ class AgentSettingsUiTests(unittest.TestCase):
                             "choices": [{"message": {"content": '{"ok": true}'}}]
                         }),
                     ),
+                    SimpleNamespace(
+                        status_code=200,
+                        text=json.dumps({
+                            "choices": [{"message": {
+                                "content": None,
+                                "tool_calls": [{
+                                    "id": "call_probe",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mediaflux_connectivity_probe",
+                                        "arguments": "{}",
+                                    },
+                                }],
+                            }}]
+                        }),
+                    ),
                 ]
                 FakeClient.instance = self
 
             async def post_json(self, url, *, json, headers, max_redirects):
                 self.calls.append((url, json, headers, max_redirects))
                 return self.responses.pop(0)
+
+            def stream_post_json(self, url, *, json, headers, max_redirects):
+                self.stream_calls.append((url, json, headers, max_redirects))
+                return StreamContext()
 
             async def aclose(self):
                 self.closed = True
@@ -525,11 +564,17 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertEqual(result["protocol"], "chat_completions")
         self.assertEqual(result["status_code"], 200)
         self.assertTrue(result["ok"])
+        self.assertEqual(result["capabilities"], {
+            "structured_output": True,
+            "tool_calling": True,
+            "streaming": True,
+        })
         self.assertTrue(client.closed)
         self.assertEqual(
             [call[0] for call in client.calls],
             [
                 "https://api.example.test/v1/responses",
+                "https://api.example.test/v1/chat/completions",
                 "https://api.example.test/v1/chat/completions",
             ],
         )
@@ -540,10 +585,72 @@ class AgentSettingsUiTests(unittest.TestCase):
             tools_api._AI_MODEL_TEST_SCHEMA,
         )
         self.assertNotIn("tools", chat_body)
+        tool_body = client.calls[2][1]
+        self.assertIn("tools", tool_body)
+        self.assertEqual(
+            tool_body["tools"][0]["function"]["name"],
+            "mediaflux_connectivity_probe",
+        )
+        self.assertTrue(client.stream_calls[0][1]["stream"])
         self.assertNotIn("provider-secret", json.dumps(chat_body))
         self.assertEqual(
             client.calls[1][2]["Authorization"], "Bearer provider-secret"
         )
+
+    def test_model_test_does_not_claim_json_only_provider_supports_tools(self):
+        from app.routes import tools_api
+
+        class UnsupportedStream:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+
+        class StreamContext:
+            async def __aenter__(self):
+                return UnsupportedStream()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.responses = [
+                    SimpleNamespace(
+                        status_code=200,
+                        text=json.dumps({
+                            "choices": [{"message": {"content": '{"ok": true}'}}]
+                        }),
+                    ),
+                    SimpleNamespace(
+                        status_code=200,
+                        text=json.dumps({
+                            "choices": [{"message": {"content": "工具不可用"}}]
+                        }),
+                    ),
+                ]
+
+            async def post_json(self, *args, **kwargs):
+                return self.responses.pop(0)
+
+            def stream_post_json(self, *args, **kwargs):
+                return StreamContext()
+
+            async def aclose(self):
+                return None
+
+        with patch.object(tools_api, "FixedHostHttpClient", FakeClient):
+            result = asyncio.run(tools_api._test_ai_provider(
+                base_url="https://api.example.test/v1",
+                api_key="",
+                protocol="chat_completions",
+                model="json-only-model",
+                timeout_seconds=12,
+            ))
+
+        self.assertEqual(result["capabilities"], {
+            "structured_output": True,
+            "tool_calling": False,
+            "streaming": False,
+        })
 
     def test_config_save_rejects_environment_managed_agent_field(self):
         with patch(

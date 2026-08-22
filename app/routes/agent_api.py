@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import re
@@ -13,6 +14,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
+from app import config
 from app.agent.confirmation import confirmation_reply_intent
 from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.metrics import agent_metrics
@@ -115,8 +117,28 @@ from app.agent.operation_coordinator import (
 from app.clients.openai_compatible import ProviderStreamError
 from app.web import api_error, api_response, csrf_token, require_api_login
 
+
+def _metrics_scrape_authorized(request: Request) -> bool:
+    """允许监控系统用独立 Bearer Key 抓取且不扩散到其他 Agent API。"""
+    expected = str(config.get("AGENT_METRICS_SCRAPE_KEY", "") or "").strip()
+    if not 24 <= len(expected) <= 512 or any(ord(char) < 33 for char in expected):
+        return False
+    authorization = str(request.headers.get("authorization") or "")
+    if len(authorization) > 520 or not authorization.lower().startswith("bearer "):
+        return False
+    supplied = authorization[7:]
+    if not supplied or supplied != supplied.strip():
+        return False
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
 def _require_agent_enabled(request: Request) -> None:
-    require_api_login(request)
+    scrape_request = (
+        request.url.path == "/api/agent/metrics"
+        and _metrics_scrape_authorized(request)
+    )
+    if not scrape_request:
+        require_api_login(request)
     if not is_agent_enabled():
         raise HTTPException(
             status_code=409,
@@ -807,7 +829,8 @@ def capabilities(request: Request):
 
 @router.get("/metrics")
 def metrics(request: Request, format: str = "json"):
-    require_api_login(request)
+    if not _metrics_scrape_authorized(request):
+        require_api_login(request)
     output_format = str(format or "json").strip().lower()
     if output_format == "json":
         return api_response(agent_metrics.snapshot())

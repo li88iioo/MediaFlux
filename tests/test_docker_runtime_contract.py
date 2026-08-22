@@ -130,6 +130,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
                 "WEB_PORT",
                 "ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD",
                 "SESSION_COOKIE_SECURE", "LOCAL_MEDIA_BROWSE_ROOTS",
+                "AGENT_METRICS_SCRAPE_KEY",
             },
         )
         self.assertEqual(environment["APP_ENV"], "production")
@@ -156,6 +157,10 @@ class DockerRuntimeContractTests(unittest.TestCase):
             environment["SESSION_COOKIE_SECURE"],
             "${SESSION_COOKIE_SECURE:-0}",
         )
+        self.assertEqual(
+            environment["AGENT_METRICS_SCRAPE_KEY"],
+            "${AGENT_METRICS_SCRAPE_KEY:-}",
+        )
 
     def test_image_bundles_ffprobe_before_switching_to_non_root_user(self) -> None:
         self.assertIn("apt-get install -y --no-install-recommends ffmpeg", self.dockerfile)
@@ -181,6 +186,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertIn("secrets.token_urlsafe", self.env_example)
         self.assertNotRegex(self.env_example, r"(?m)^ENV_WEB_PASSPORT=admin\s*$")
         self.assertNotRegex(self.env_example, r"(?m)^ENV_WEB_PASSWORD=123456\s*$")
+        self.assertIn("AGENT_METRICS_SCRAPE_KEY=", self.env_example)
         self.assertIn("MEDIAFLUX_PUBLISH_HOST=127.0.0.1", self.env_example)
         self.assertIn("局域网访问时显式改为 0.0.0.0", self.env_example)
         self.assertIn("WEB_PORT 只控制宿主机发布端口", self.env_example)
