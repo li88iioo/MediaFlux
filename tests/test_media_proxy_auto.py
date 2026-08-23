@@ -527,7 +527,72 @@ class HybridMediaProxyTests(unittest.TestCase):
         serialized = str(request.url)
         self.assertNotIn("query-secret", serialized)
 
-    def test_playback_info_forces_direct_play_and_stream_upstream(self):
+    def test_camel_case_api_key_is_recognized_and_removed_from_upstream_url(self):
+        _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/System/Info?ApiKey=android-secret&foo=visible"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        request = _FakeAsyncClient.requests[0]
+        self.assertEqual(
+            str(request.url),
+            "http://127.0.0.1:8096/System/Info?foo=visible",
+        )
+        self.assertEqual(request.headers["X-Emby-Token"], "android-secret")
+        self.assertNotIn("android-secret", str(request.url))
+
+    def test_playback_info_defaults_direct_play_and_stream_upstream(self):
+        payload = {"MediaSources": []}
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch(
+                "app.modules.media_proxy.httpx.AsyncClient",
+                _FakeAsyncClient,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/Items/direct-item/PlaybackInfo"
+                "?api_key=client-token&foo=visible"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upstream = _FakeAsyncClient.requests[0]
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertEqual(query["EnableDirectPlay"], ["true"])
+        self.assertEqual(query["EnableDirectStream"], ["true"])
+        self.assertEqual(query["foo"], ["visible"])
+        self.assertNotIn("api_key", query)
+
+    def test_playback_info_preserves_explicit_direct_fallback_upstream(self):
         payload = {"MediaSources": []}
         _FakeAsyncClient.responses = [
             _FakeUpstreamResponse(
@@ -560,11 +625,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         upstream = _FakeAsyncClient.requests[0]
         query = parse_qs(urlsplit(str(upstream.url)).query)
-        self.assertEqual(query["EnableDirectPlay"], ["true"])
-        self.assertEqual(query["EnableDirectStream"], ["true"])
+        self.assertEqual(query["EnableDirectPlay"], ["false"])
+        self.assertEqual(query["enabledirectstream"], ["false"])
         self.assertEqual(query["foo"], ["visible"])
         self.assertNotIn("api_key", query)
-        self.assertNotIn("enabledirectstream", query)
+        self.assertNotIn("EnableDirectStream", query)
 
     def test_conflicting_media_server_credentials_are_rejected_before_upstream(self):
         app = media_proxy.create_proxy_app(7)
@@ -800,6 +865,311 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         self.assertNotIn("X-Emby-Token", request.headers)
         self.assertNotIn("jellyfin-token", str(request.url))
+
+    def test_jellyfin_hls_keeps_current_user_token_in_upstream_query(self):
+        manifest = b"#EXTM3U\nmain.m3u8?MediaSourceId=source&api_key=user-token\n"
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=manifest,
+                content_type="application/vnd.apple.mpegurl",
+            )
+        ]
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "api_key": "instance-admin-token",
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/Videos/hls-item/master.m3u8"
+                "?MediaSourceId=source&api_key=user-token"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, manifest)
+        upstream = _FakeAsyncClient.requests[0]
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertEqual(query["MediaSourceId"], ["source"])
+        self.assertEqual(query["api_key"], ["user-token"])
+        self.assertEqual(
+            upstream.headers["Authorization"],
+            'MediaBrowser Token="user-token"',
+        )
+        self.assertNotIn("instance-admin-token", str(upstream.url))
+        self.assertNotIn("instance-admin-token", str(upstream.headers))
+
+    def test_jellyfin_hls_header_only_token_stays_out_of_upstream_query(self):
+        manifest = b"#EXTM3U\nmain.m3u8?MediaSourceId=source\n"
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=manifest,
+                content_type="application/vnd.apple.mpegurl",
+            )
+        ]
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "api_key": "instance-admin-token",
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/Videos/hls-item/master.m3u8?MediaSourceId=source",
+                headers={
+                    "Authorization": (
+                        'MediaBrowser Client="Jellyfin Web", '
+                        'Token="header-token"'
+                    ),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upstream = _FakeAsyncClient.requests[0]
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertEqual(query["MediaSourceId"], ["source"])
+        self.assertNotIn("api_key", query)
+        self.assertEqual(
+            upstream.headers["Authorization"],
+            'MediaBrowser Client="Jellyfin Web", Token="header-token"',
+        )
+        self.assertNotIn("header-token", str(upstream.url))
+
+    def test_jellyfin_hls1_segment_keeps_query_token(self):
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=b"segment",
+                content_type="video/mp4",
+            )
+        ]
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "api_key": "instance-admin-token",
+        }
+        app = media_proxy.create_proxy_app(7)
+        path = "/Videos/hls-item/hls1/playlist/0.mp4"
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                f"{path}?MediaSourceId=source&api_key=user-token"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(media_proxy.classify_proxy_route(path), "upstream_hls")
+        upstream = _FakeAsyncClient.requests[0]
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertEqual(query["MediaSourceId"], ["source"])
+        self.assertEqual(query["api_key"], ["user-token"])
+        self.assertEqual(
+            upstream.headers["Authorization"],
+            'MediaBrowser Token="user-token"',
+        )
+        self.assertNotIn("instance-admin-token", str(upstream.url))
+        self.assertNotIn("instance-admin-token", str(upstream.headers))
+
+    def test_emby_hls_does_not_readd_query_token(self):
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=b"#EXTM3U\n",
+                content_type="application/vnd.apple.mpegurl",
+            )
+        ]
+        instance = {
+            **self._instance(),
+            "server_type": "emby",
+            "api_key": "instance-admin-token",
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/Videos/hls-item/master.m3u8"
+                "?MediaSourceId=source&api_key=user-token"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        upstream = _FakeAsyncClient.requests[0]
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertEqual(query["MediaSourceId"], ["source"])
+        self.assertNotIn("api_key", query)
+        self.assertEqual(upstream.headers["X-Emby-Token"], "user-token")
+
+    def test_jellyfin_hls_never_uses_instance_key_for_anonymous_child(self):
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                status_code=401,
+                body=b"unauthorized",
+                content_type="text/plain",
+            )
+        ]
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "api_key": "instance-admin-token",
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/Videos/hls-item/hls1/playlist/0.mp4?MediaSourceId=source"
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            media_proxy.classify_proxy_route(
+                "/Videos/hls-item/hls1/playlist/0.mp4"
+            ),
+            "upstream_hls",
+        )
+        upstream = _FakeAsyncClient.requests[0]
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertNotIn("api_key", query)
+        self.assertNotIn("Authorization", upstream.headers)
+        self.assertNotIn("instance-admin-token", str(upstream.url))
+        self.assertNotIn("instance-admin-token", str(upstream.headers))
+
+    def test_exoplayer_cross_protocol_signed_url_relays_https_unchanged(self):
+        media_body = b"cross-protocol-media"
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                status_code=206,
+                body=media_body,
+                content_type="video/x-matroska",
+                headers={
+                    "accept-ranges": "bytes",
+                    "content-length": str(len(media_body)),
+                    "content-range": "bytes 0-19/100",
+                },
+            )
+        ]
+        _FakeGuangYaClient.results["cross-protocol-file"] = [
+            "https://signed.invalid/cross-protocol-file"
+        ]
+        self._grant_file(
+            "client-token",
+            "cross-protocol-item",
+            "cross-protocol-source",
+            "cross-protocol-file",
+        )
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get(
+                "/playgy/cross-protocol-file/e/1/video.mkv"
+                "?api_key=client-token",
+                headers={
+                    "Range": "bytes=0-19",
+                    "User-Agent": "ExoPlayerLib/1.8.0",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, media_body)
+        self.assertNotIn("location", response.headers)
+        relay_request = _FakeAsyncClient.requests[0]
+        self.assertEqual(relay_request.url.scheme, "https")
+        self.assertEqual(relay_request.url.host, "203.0.113.10")
+        self.assertEqual(relay_request.headers["Host"], "signed.invalid")
+        self.assertEqual(relay_request.headers["Range"], "bytes=0-19")
+        self.assertFalse(_FakeAsyncClient.init_kwargs[0]["trust_env"])
+
+    def test_working_third_party_clients_keep_cross_protocol_https_redirect(self):
+        cases = (
+            ("Yamby", "Yamby/2.0.5.5 ExoPlayerLib/1.8.0", "yamby-file"),
+            ("Moonfin", "Moonfin/0.10 Media3/1.8.0", "moonfin-file"),
+        )
+        for _client_name, _user_agent, file_id in cases:
+            _FakeGuangYaClient.results[file_id] = [
+                f"https://signed.invalid/{file_id}"
+            ]
+            self._grant_file(
+                "client-token",
+                f"{file_id}-item",
+                f"{file_id}-source",
+                file_id,
+            )
+
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            for client_name, user_agent, file_id in cases:
+                with self.subTest(client=client_name):
+                    response = client.get(
+                        f"/playgy/{file_id}/e/1/video.mkv"
+                        "?api_key=client-token",
+                        headers={
+                            "X-Emby-Client": client_name,
+                            "User-Agent": user_agent,
+                        },
+                        follow_redirects=False,
+                    )
+                    self.assertEqual(response.status_code, 302)
+                    self.assertEqual(
+                        response.headers["location"],
+                        f"https://signed.invalid/{file_id}",
+                    )
+
+        self.assertEqual(_FakeAsyncClient.requests, [])
 
     def test_websocket_target_removes_sensitive_query_tokens(self):
         websocket = SimpleNamespace(
@@ -1772,6 +2142,97 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(mappings.get(7, "item-c", "source"), "file-c")
         self.assertEqual(mappings.entry_count, 2)
 
+    def test_dynamic_mapping_and_grant_accept_equivalent_jellyfin_uuid_formats(self):
+        hyphenated = "b3851937-35e9-8d81-287b-2b7ccc84fe42"
+        compact = "b385193735e98d81287b2b7ccc84fe42"
+        mappings = media_proxy.DynamicGuangYaMappings()
+        grants = media_proxy.PlaybackGrantRegistry()
+
+        mappings.register(7, hyphenated, hyphenated, "uuid-file")
+        grants.register(
+            "scope",
+            7,
+            hyphenated,
+            hyphenated,
+            source_type="dynamic",
+            file_id="uuid-file",
+        )
+
+        self.assertEqual(mappings.get(7, compact, compact), "uuid-file")
+        self.assertTrue(
+            grants.matches(
+                "scope", 7, compact, compact, file_id="uuid-file"
+            )
+        )
+
+    def test_uuid_normalization_rejects_noncanonical_dash_layouts_and_isolates_scopes(self):
+        canonical = "b3851937-35e9-8d81-287b-2b7ccc84fe42"
+        compact = "b385193735e98d81287b2b7ccc84fe42"
+        malformed = "b385-193735e98d81287b2b7ccc84fe42"
+        mappings = media_proxy.DynamicGuangYaMappings()
+        grants = media_proxy.PlaybackGrantRegistry()
+        scopes = media_proxy.ItemLevelBindingScopes()
+
+        mappings.register(7, malformed, malformed, "malformed-file")
+        grants.register(
+            "scope-a",
+            7,
+            canonical,
+            canonical,
+            source_type="dynamic",
+            file_id="uuid-file",
+        )
+        scopes.register(7, canonical, canonical, "binding", "scope-a")
+
+        self.assertEqual(
+            media_proxy._normalized_media_identifier(malformed), malformed
+        )
+        self.assertIsNone(mappings.get(7, compact, compact))
+        self.assertTrue(
+            grants.matches(
+                "scope-a", 7, compact, compact, file_id="uuid-file"
+            )
+        )
+        self.assertFalse(
+            grants.matches(
+                "scope-b", 7, compact, compact, file_id="uuid-file"
+            )
+        )
+        self.assertTrue(
+            scopes.matches(7, compact, compact, "binding", "scope-a")
+        )
+        self.assertFalse(
+            scopes.matches(7, compact, compact, "binding", "scope-b")
+        )
+
+    def test_manual_binding_lookup_accepts_equivalent_uuid_database_formats(self):
+        canonical = "b3851937-35e9-8d81-287b-2b7ccc84fe42"
+        compact = "b385193735e98d81287b2b7ccc84fe42"
+        stored_canonical = canonical.upper()
+        binding = {
+            "id": 9,
+            "source_type": "guangya",
+            "guangya_file_id": "manual-uuid-file",
+            "media_item_id": stored_canonical,
+            "media_source_id": stored_canonical,
+        }
+        calls = []
+
+        def lookup(instance_id, item_id, source_id=""):
+            calls.append((instance_id, item_id, source_id))
+            if item_id == stored_canonical and source_id == stored_canonical:
+                return binding
+            return None
+
+        with patch(
+            "app.modules.media_proxy.database.get_media_proxy_binding",
+            side_effect=lookup,
+        ):
+            resolved = media_proxy._media_proxy_binding(7, compact, compact)
+
+        self.assertIs(resolved, binding)
+        self.assertIn((7, stored_canonical, stored_canonical), calls)
+
     def test_signed_url_cache_uses_bounded_lru_eviction(self):
         try:
             cache = media_proxy.SignedUrlCache(ttl_seconds=60, max_entries=2)
@@ -1888,16 +2349,16 @@ class HybridMediaProxyTests(unittest.TestCase):
         for stale_field in (
             "TranscodingUrl",
             "TranscodingContainer",
-            "TranscodingSubProtocol",
             "TranscodingInfo",
         ):
             self.assertNotIn(stale_field, absolute)
+        self.assertEqual(absolute["TranscodingSubProtocol"], "hls")
         self.assertEqual(
             relative["DirectStreamUrl"],
             "/Videos/item-1/stream?MediaSourceId=cloud-relative",
         )
         self.assertFalse(relative["SupportsTranscoding"])
-        self.assertNotIn("TranscodingSubProtocol", relative)
+        self.assertEqual(relative["TranscodingSubProtocol"], "hls")
         self.assertEqual(local_after, local_before)
         self.assertEqual(unknown_after, unknown_before)
         self.assertEqual(
@@ -1945,7 +2406,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(sources[1], payload["MediaSources"][1])
         self.assertEqual(_FakeAsyncClient.requests[0].url.path, "/emby/Items/item-emby/PlaybackInfo")
 
-    def test_jellyfin_web_direct_stream_relays_same_origin_and_clears_hls_metadata(self):
+    def test_jellyfin_web_preserves_transcoding_decision_and_relays_direct_stream(self):
         payload = {
             "MediaSources": [
                 {
@@ -2030,16 +2491,16 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
 
         self.assertEqual(playback.status_code, 200)
-        self.assertTrue(source["SupportsDirectPlay"])
-        self.assertTrue(source["SupportsDirectStream"])
-        self.assertFalse(source["SupportsTranscoding"])
-        for stale_field in (
-            "TranscodingUrl",
-            "TranscodingContainer",
-            "TranscodingSubProtocol",
-            "TranscodingInfo",
-        ):
-            self.assertNotIn(stale_field, source)
+        self.assertFalse(source["SupportsDirectPlay"])
+        self.assertFalse(source["SupportsDirectStream"])
+        self.assertTrue(source["SupportsTranscoding"])
+        self.assertEqual(
+            source["TranscodingUrl"],
+            "/Videos/browser-item/main.m3u8?api_key=client-token",
+        )
+        self.assertEqual(source["TranscodingContainer"], "ts")
+        self.assertEqual(source["TranscodingInfo"], {"Protocol": "hls"})
+        self.assertEqual(source["TranscodingSubProtocol"], "hls")
         self.assertEqual(stream.status_code, 206)
         self.assertEqual(stream.content, media_body)
         self.assertEqual(stream.headers["accept-ranges"], "bytes")
@@ -2064,6 +2525,418 @@ class HybridMediaProxyTests(unittest.TestCase):
             "x-emby-token",
         ):
             self.assertNotIn(secret_header, relay_request.headers)
+
+    def test_jellyfin_web_true_302_is_bound_to_upstream_direct_play_source(self):
+        payload = {
+            "PlaySessionId": "web-direct-session",
+            "MediaSources": [
+                {
+                    "Id": "direct-source",
+                    "Path": "/playgy/web-direct-file/e/1/direct.mp4",
+                    "Protocol": "File",
+                    "Container": "mp4",
+                    "SupportsDirectPlay": True,
+                    "SupportsDirectStream": True,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": "/Videos/web-direct-item/master.m3u8",
+                    "TranscodingContainer": "ts",
+                    "TranscodingSubProtocol": "hls",
+                },
+                {
+                    "Id": "transcode-source",
+                    "Path": "/playgy/web-transcode-file/e/1/transcode.mkv",
+                    "Protocol": "File",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": False,
+                    "SupportsDirectStream": False,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": "/Videos/web-direct-item/master.m3u8",
+                    "TranscodingContainer": "ts",
+                    "TranscodingSubProtocol": "hls",
+                },
+            ],
+        }
+        relay_response = _FakeUpstreamResponse(
+            status_code=206,
+            body=b"relay",
+            content_type="video/x-matroska",
+            headers={
+                "content-length": "5",
+                "content-range": "bytes 0-4/100",
+            },
+        )
+        manifest_response = _FakeUpstreamResponse(
+            body=b"#EXTM3U\n",
+            content_type="application/vnd.apple.mpegurl",
+        )
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            relay_response,
+            manifest_response,
+        ]
+        app = media_proxy.create_proxy_app(7)
+        authorization = (
+            'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
+            'Token="client-token"'
+        )
+        browser_headers = {
+            "Origin": "http://testserver",
+            "Range": "bytes=0-4",
+            "Sec-Fetch-Dest": "video",
+            "Sec-Fetch-Mode": "no-cors",
+            "User-Agent": "Mozilla/5.0 Jellyfin Web",
+        }
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.get(
+                "/Items/web-direct-item/PlaybackInfo",
+                headers={"X-Emby-Authorization": authorization},
+            )
+            direct_source, transcode_source = playback.json()["MediaSources"]
+            direct = client.get(
+                direct_source["Path"],
+                headers=browser_headers,
+                follow_redirects=False,
+            )
+            relayed = client.get(
+                transcode_source["DirectStreamUrl"],
+                headers=browser_headers,
+                follow_redirects=False,
+            )
+            hls = client.get(
+                direct_source["TranscodingUrl"],
+                headers={"X-Emby-Authorization": authorization},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertTrue(direct_source["SupportsDirectPlay"])
+        self.assertTrue(direct_source["SupportsTranscoding"])
+        self.assertEqual(
+            direct_source["TranscodingUrl"],
+            "/Videos/web-direct-item/master.m3u8",
+        )
+        self.assertEqual(direct.status_code, 302)
+        self.assertEqual(
+            direct.headers["location"],
+            "https://signed.invalid/web-direct-file",
+        )
+        self.assertFalse(transcode_source["SupportsDirectPlay"])
+        self.assertTrue(transcode_source["SupportsTranscoding"])
+        self.assertEqual(relayed.status_code, 206)
+        self.assertEqual(relayed.content, b"relay")
+        self.assertNotIn("location", relayed.headers)
+        self.assertEqual(hls.status_code, 200)
+        self.assertEqual(hls.content, b"#EXTM3U\n")
+        self.assertNotIn("location", hls.headers)
+        self.assertEqual(
+            _FakeGuangYaClient.calls,
+            ["web-direct-file", "web-transcode-file"],
+        )
+        self.assertEqual(len(_FakeAsyncClient.requests), 3)
+        self.assertTrue(relay_response.closed)
+        self.assertTrue(manifest_response.closed)
+        direct_query = parse_qs(urlsplit(direct_source["Path"]).query)
+        transcode_query = parse_qs(
+            urlsplit(transcode_source["DirectStreamUrl"]).query
+        )
+        self.assertTrue(
+            media_proxy._playback_sessions.capability_allows_browser_direct_redirect(
+                7,
+                direct_query["_mfps"][0],
+                direct_query["_mfss"][0],
+            )
+        )
+        self.assertFalse(
+            media_proxy._playback_sessions.capability_allows_browser_direct_redirect(
+                7,
+                transcode_query["_mfps"][0],
+                transcode_query["_mfss"][0],
+            )
+        )
+
+    def test_web_direct_redirect_permissions_are_scoped_per_capability(self):
+        now = [100.0]
+        sessions = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=3600,
+            capability_ttl_seconds=10,
+            capability_max_ttl_seconds=60,
+            clock=lambda: now[0],
+        )
+        first_signature = "a" * 48
+        second_signature = "b" * 48
+
+        first = sessions.finalize_capability(
+            "scope",
+            7,
+            "capability-a",
+            item_id="item",
+            upstream_session_token="shared-upstream-session",
+            browser_relay=True,
+            browser_direct_redirect_signatures=(first_signature,),
+        )
+        second = sessions.finalize_capability(
+            "scope",
+            7,
+            "capability-b",
+            item_id="item",
+            upstream_session_token="shared-upstream-session",
+            browser_relay=True,
+            browser_direct_redirect_signatures=(second_signature,),
+        )
+
+        self.assertIs(first, second)
+        self.assertTrue(
+            sessions.capability_allows_browser_direct_redirect(
+                7, "capability-a", first_signature
+            )
+        )
+        self.assertTrue(
+            sessions.capability_allows_browser_direct_redirect(
+                7, "capability-b", second_signature
+            )
+        )
+        self.assertFalse(
+            sessions.capability_allows_browser_direct_redirect(
+                7, "capability-a", second_signature
+            )
+        )
+        self.assertFalse(
+            sessions.capability_allows_browser_direct_redirect(
+                7, "capability-b", first_signature
+            )
+        )
+        now[0] = 111.0
+        self.assertFalse(
+            sessions.capability_allows_browser_direct_redirect(
+                7, "capability-a", first_signature
+            )
+        )
+        self.assertFalse(
+            sessions.capability_allows_browser_direct_redirect(
+                7, "capability-b", second_signature
+            )
+        )
+
+    def test_web_direct_redirect_rejects_ambiguous_media_source_identity(self):
+        for source_ids in (("", ""), ("duplicate", "duplicate")):
+            with self.subTest(source_ids=source_ids):
+                payload = {
+                    "MediaSources": [
+                        {
+                            "Id": source_ids[0],
+                            "Path": "/playgy/ambiguous-direct/e/1/direct.mp4",
+                            "SupportsDirectPlay": True,
+                        },
+                        {
+                            "Id": source_ids[1],
+                            "Path": "/playgy/ambiguous-transcode/e/1/transcode.mkv",
+                            "SupportsDirectPlay": False,
+                            "SupportsTranscoding": True,
+                        },
+                    ]
+                }
+                allowed_signatures: set[str] = set()
+                with patch(
+                    "app.modules.media_proxy.database.get_media_proxy_binding",
+                    return_value=None,
+                ):
+                    _rewritten, changed = media_proxy.rewrite_playback_info(
+                        payload,
+                        7,
+                        "ambiguous-item",
+                        playback_session_token="ambiguous-capability",
+                        native_client_mode="web",
+                        browser_direct_redirect_signatures=allowed_signatures,
+                    )
+
+                self.assertTrue(changed)
+                self.assertEqual(allowed_signatures, set())
+
+    def test_ambiguous_web_direct_source_relays_instead_of_returning_302(self):
+        payload = {
+            "MediaSources": [
+                {
+                    "Id": "",
+                    "Path": "/playgy/ambiguous-direct/e/1/direct.mp4",
+                    "SupportsDirectPlay": True,
+                },
+                {
+                    "Id": "",
+                    "Path": "/playgy/ambiguous-transcode/e/1/transcode.mkv",
+                    "SupportsDirectPlay": False,
+                    "SupportsTranscoding": True,
+                },
+            ]
+        }
+        relay_response = _FakeUpstreamResponse(
+            status_code=206,
+            body=b"ambiguous-relay",
+            content_type="video/x-matroska",
+            headers={
+                "content-length": "15",
+                "content-range": "bytes 0-14/100",
+            },
+        )
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            relay_response,
+        ]
+        app = media_proxy.create_proxy_app(7)
+        authorization = (
+            'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
+            'Token="client-token"'
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.get(
+                "/Items/ambiguous-web-item/PlaybackInfo",
+                headers={"X-Emby-Authorization": authorization},
+            )
+            direct_source = playback.json()["MediaSources"][0]
+            stream = client.get(
+                direct_source["Path"],
+                headers={
+                    "Origin": "http://testserver",
+                    "Range": "bytes=0-14",
+                    "Sec-Fetch-Dest": "video",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(stream.status_code, 206)
+        self.assertEqual(stream.content, b"ambiguous-relay")
+        self.assertNotIn("location", stream.headers)
+        self.assertEqual(_FakeGuangYaClient.calls, ["ambiguous-transcode"])
+        self.assertTrue(relay_response.closed)
+
+    def test_legacy_item_binding_web_direct_path_keeps_true_302(self):
+        payload = {
+            "MediaSources": [
+                {
+                    "Id": "legacy-source",
+                    "Path": "/mounted/legacy.mp4",
+                    "Container": "mp4",
+                    "SupportsDirectPlay": True,
+                    "SupportsDirectStream": True,
+                    "SupportsTranscoding": True,
+                }
+            ]
+        }
+        legacy_binding = {
+            "id": 91,
+            "source_type": "guangya",
+            "guangya_file_id": "legacy-web-file",
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        app = media_proxy.create_proxy_app(7)
+        authorization = (
+            'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
+            'Token="client-token"'
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=legacy_binding,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.get(
+                "/Items/legacy-web-item/PlaybackInfo",
+                headers={"X-Emby-Authorization": authorization},
+            )
+            source = playback.json()["MediaSources"][0]
+            stream = client.get(
+                source["Path"],
+                headers={
+                    "Origin": "http://testserver",
+                    "Range": "bytes=0-1",
+                    "Sec-Fetch-Dest": "video",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        path_query = parse_qs(urlsplit(source["Path"]).query)
+        direct_query = parse_qs(urlsplit(source["DirectStreamUrl"]).query)
+        self.assertNotIn("MediaSourceId", path_query)
+        self.assertEqual(
+            direct_query["MediaSourceId"], ["legacy-source"]
+        )
+        self.assertTrue(
+            media_proxy._playback_sessions.capability_allows_browser_direct_redirect(
+                7, path_query["_mfps"][0], path_query["_mfss"][0]
+            )
+        )
+        self.assertEqual(stream.status_code, 302)
+        self.assertEqual(
+            stream.headers["location"],
+            "https://signed.invalid/legacy-web-file",
+        )
 
     def test_native_https_client_keeps_zero_bandwidth_302_redirect(self):
         media_proxy._dynamic_guangya_mappings.register(
@@ -3211,7 +4084,167 @@ class HybridMediaProxyTests(unittest.TestCase):
             json.loads(_FakeAsyncClient.requests[0].content), request_body
         )
 
-    def test_android_and_yamby_use_standard_file_stream_after_playback_info(self):
+    def test_android_retry_two_preserves_upstream_direct_stream_contract(self):
+        payload = {
+            "PlaySessionId": "android-retry-two-session",
+            "MediaSources": [
+                {
+                    "Id": "android-retry-two-source",
+                    "Path": "/playgy/android-retry-two/e/1/video.mkv",
+                    "Protocol": "File",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": False,
+                    "SupportsDirectStream": True,
+                    "SupportsTranscoding": True,
+                    "DirectStreamUrl": "/Videos/android-retry-two/stream.mkv",
+                    "TranscodingUrl": "/Videos/android-retry-two/master.m3u8",
+                    "TranscodingContainer": "ts",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        request_body = {
+            "MediaSourceId": "android-retry-two-source",
+            "EnableDirectPlay": False,
+        }
+        authorize = AsyncMock(return_value=True)
+        app = media_proxy.create_proxy_app(7)
+        headers = {
+            "Authorization": (
+                'MediaBrowser Client="Jellyfin for Android", '
+                'Device="Pixel 10 Pro", DeviceId="android-retry-device", '
+                'Version="2.7.0", Token="client-token"'
+            ),
+            "User-Agent": "Jellyfin-Android/2.7.0",
+        }
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/android-retry-two/PlaybackInfo",
+                headers=headers,
+                json=request_body,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        source = response.json()["MediaSources"][0]
+        self.assertFalse(source["SupportsDirectPlay"])
+        self.assertTrue(source["SupportsDirectStream"])
+        self.assertTrue(source["SupportsTranscoding"])
+        self.assertEqual(
+            source["TranscodingUrl"],
+            "/Videos/android-retry-two/master.m3u8",
+        )
+        upstream = _FakeAsyncClient.requests[0]
+        self.assertEqual(json.loads(upstream.content), request_body)
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertNotIn("EnableDirectPlay", query)
+        self.assertNotIn("EnableDirectStream", query)
+        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
+        self.assertEqual(media_proxy._playback_grants._entries, {})
+        authorize.assert_not_awaited()
+
+    def test_android_retry_three_preserves_upstream_transcoding_contract(self):
+        payload = {
+            "PlaySessionId": "android-retry-three-session",
+            "MediaSources": [
+                {
+                    "Id": "android-retry-three-source",
+                    "Path": "/playgy/android-retry-three/e/1/video.mkv",
+                    "Protocol": "File",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": False,
+                    "SupportsDirectStream": False,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": "/Videos/android-retry-three/master.m3u8",
+                    "TranscodingContainer": "ts",
+                    "TranscodingSubProtocol": "hls",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        request_body = {
+            "MediaSourceId": "android-retry-three-source",
+            "EnableDirectPlay": False,
+            "EnableDirectStream": False,
+        }
+        authorize = AsyncMock(return_value=True)
+        app = media_proxy.create_proxy_app(7)
+        headers = {
+            "Authorization": (
+                'MediaBrowser Client="Jellyfin for Android", '
+                'Device="Pixel 10 Pro", DeviceId="android-retry-device", '
+                'Version="2.7.0", Token="client-token"'
+            ),
+            "User-Agent": "Jellyfin-Android/2.7.0",
+        }
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/android-retry-three/PlaybackInfo",
+                headers=headers,
+                json=request_body,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        source = response.json()["MediaSources"][0]
+        self.assertFalse(source["SupportsDirectPlay"])
+        self.assertFalse(source["SupportsDirectStream"])
+        self.assertTrue(source["SupportsTranscoding"])
+        self.assertEqual(
+            source["TranscodingUrl"],
+            "/Videos/android-retry-three/master.m3u8",
+        )
+        self.assertEqual(source["TranscodingSubProtocol"], "hls")
+        upstream = _FakeAsyncClient.requests[0]
+        self.assertEqual(json.loads(upstream.content), request_body)
+        query = parse_qs(urlsplit(str(upstream.url)).query)
+        self.assertNotIn("EnableDirectPlay", query)
+        self.assertNotIn("EnableDirectStream", query)
+        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
+        self.assertEqual(media_proxy._playback_grants._entries, {})
+        authorize.assert_not_awaited()
+
+    def test_android_direct_stream_and_yamby_direct_play_after_playback_info(self):
         cases = (
             (
                 "android-item",
@@ -3225,6 +4258,12 @@ class HybridMediaProxyTests(unittest.TestCase):
                 "Yamby",
                 "Yamby/2.0.5.5",
             ),
+            (
+                "moonfin-item",
+                "moonfin-file",
+                "Moonfin for Android",
+                "Moonfin/2.4.0 Media3/1.8.0",
+            ),
         )
         _FakeAsyncClient.responses = [
             _FakeUpstreamResponse(
@@ -3236,6 +4275,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                                 "Id": "cloud",
                                 "Path": f"/playgy/{file_id}/etag/1/video.mkv",
                                 "Protocol": "Http",
+                                "Container": "mkv",
                                 "SupportsTranscoding": True,
                                 "TranscodingUrl": f"/Videos/{item_id}/master.m3u8",
                             }
@@ -3282,15 +4322,29 @@ class HybridMediaProxyTests(unittest.TestCase):
                     self.assertEqual(playback.status_code, 200)
                     source = playback.json()["MediaSources"][0]
                     self.assertEqual(source["Protocol"], "File")
-                    self.assertTrue(source["SupportsDirectPlay"])
+                    self.assertEqual(
+                        source["SupportsDirectPlay"],
+                        client_name != "Jellyfin for Android",
+                    )
                     self.assertTrue(source["SupportsDirectStream"])
                     self.assertFalse(source["SupportsTranscoding"])
                     self.assertNotIn("TranscodingUrl", source)
+                    # jellyfin-sdk-kotlin 1.7.1 将该字段定义为非空必填；
+                    # 关闭转码时仍需返回合法占位，避免原生客户端反序列化失败。
+                    self.assertEqual(source["TranscodingSubProtocol"], "http")
+                    expected_suffix = ".mkv" if client_name == "Jellyfin for Android" else ""
+                    self.assertEqual(
+                        urlsplit(source["DirectStreamUrl"]).path,
+                        f"/Videos/{item_id}/stream{expected_suffix}",
+                    )
 
-                    # Jellyfin Android 2.7 对 File 来源不会使用 Path，而是生成
-                    # 标准 Jellyfin stream URL；该请求不携带 MediaFlux capability。
+                    # Android 2.7 进入 File DirectStream 并请求带容器扩展名的
+                    # stream URL；Yamby/Moonfin 保留已验证可用的 File DirectPlay。
+                    stream_suffix = (
+                        ".mkv" if client_name == "Jellyfin for Android" else ""
+                    )
                     stream = client.get(
-                        f"/Videos/{item_id}/stream"
+                        f"/Videos/{item_id}/stream{stream_suffix}"
                         "?static=true&MediaSourceId=cloud"
                         f"&PlaySessionId=session-{item_id}&DeviceId=device-1",
                         headers=headers,
@@ -3304,164 +4358,29 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         self.assertEqual(
             _FakeGuangYaClient.calls,
-            ["android-file", "yamby-file"],
+            ["android-file", "yamby-file", "moonfin-file"],
         )
 
-    def test_android_http_stream_recovers_tokenless_session_and_relays_https_cdn(self):
+    def test_android_standard_direct_stream_accepts_sdk_api_key_without_play_session(self):
         payload = {
-            "PlaySessionId": "android-tokenless-session",
+            "PlaySessionId": "android-upstream-session",
             "MediaSources": [
                 {
-                    "Id": "android-source",
-                    "Path": "/playgy/android-tokenless-file/etag/1/video.mkv",
+                    "Id": "android-sdk-item",
+                    "Path": "/playgy/android-sdk-file/e/1/video.mkv",
                     "Protocol": "File",
+                    "Container": "mkv",
                 }
             ],
         }
-        wrong_session_response = _FakeUpstreamResponse(
-            body=b"wrong-session-fallback",
-            content_type="video/x-matroska",
-        )
-        wrong_device_response = _FakeUpstreamResponse(
-            body=b"wrong-device-fallback",
-            content_type="video/x-matroska",
-        )
-        media_response = _FakeUpstreamResponse(
-            status_code=206,
-            body=b"android-media",
-            content_type="video/x-matroska",
-            headers={
-                "content-length": "13",
-                "content-range": "bytes 0-12/100",
-            },
-        )
         _FakeAsyncClient.responses = [
             _FakeUpstreamResponse(
                 body=json.dumps(payload).encode("utf-8"),
                 content_type="application/json",
-            ),
-            wrong_session_response,
-            wrong_device_response,
-            media_response,
+            )
         ]
-        authorize = AsyncMock(return_value=True)
-        app = media_proxy.create_proxy_app(7)
-        playback_headers = {
-            "Authorization": (
-                'MediaBrowser Client="Jellyfin for Android", '
-                'Device="Pixel 10 Pro", DeviceId="android-device", '
-                'Version="2.7.0", Token="client-token"'
-            ),
-            "User-Agent": "Jellyfin Android",
-        }
-        with (
-            patch(
-                "app.modules.media_proxy.database.get_media_proxy_instance",
-                return_value=self._instance(),
-            ),
-            patch(
-                "app.modules.media_proxy.database.get_media_proxy_binding",
-                return_value=None,
-            ),
-            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
-            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
-            patch(
-                "app.modules.media_proxy._client_is_authorized",
-                new=authorize,
-            ),
-            patch(
-                "app.modules.media_proxy._pin_signed_media_target",
-                side_effect=self._signed_target,
-            ),
-            TestClient(app, raise_server_exceptions=False) as client,
-        ):
-            playback = client.post(
-                "/Items/android-tokenless-item/PlaybackInfo",
-                headers=playback_headers,
-                json={"IsPlayback": True},
-            )
-            source = playback.json()["MediaSources"][0]
-
-            conflicting_session = client.get(
-                "/Videos/android-tokenless-item/stream"
-                "?static=true&mediaSourceId=android-source"
-                "&playSessionId=android-tokenless-session"
-                "&PlaySessionId=other-session&deviceId=android-device",
-                headers={"Range": "bytes=0-12", "User-Agent": "Jellyfin Android"},
-                follow_redirects=False,
-            )
-            wrong_session = client.get(
-                "/Videos/android-tokenless-item/stream"
-                "?static=true&mediaSourceId=android-source"
-                "&playSessionId=wrong-session&deviceId=android-device",
-                headers={"Range": "bytes=0-12", "User-Agent": "Jellyfin Android"},
-                follow_redirects=False,
-            )
-            wrong_device = client.get(
-                "/Videos/android-tokenless-item/stream"
-                "?static=true&mediaSourceId=android-source"
-                "&playSessionId=android-tokenless-session&deviceId=other-device",
-                headers={"Range": "bytes=0-12", "User-Agent": "Jellyfin Android"},
-                follow_redirects=False,
-            )
-            self.assertEqual(_FakeGuangYaClient.calls, [])
-
-            stream = client.get(
-                "/Videos/android-tokenless-item/stream"
-                "?static=true&mediaSourceId=android-source"
-                "&playSessionId=android-tokenless-session&deviceId=android-device",
-                headers={"Range": "bytes=0-12", "User-Agent": "Jellyfin Android"},
-                follow_redirects=False,
-            )
-
-        self.assertEqual(playback.status_code, 200)
-        self.assertEqual(source["Protocol"], "File")
-        self.assertIn("_mfps=", source["DirectStreamUrl"])
-        self.assertEqual(conflicting_session.status_code, 400)
-        self.assertEqual(wrong_session.status_code, 200)
-        self.assertEqual(wrong_session.content, b"wrong-session-fallback")
-        self.assertEqual(wrong_device.status_code, 200)
-        self.assertEqual(wrong_device.content, b"wrong-device-fallback")
-        self.assertEqual(stream.status_code, 206)
-        self.assertEqual(stream.content, b"android-media")
-        self.assertNotIn("location", stream.headers)
-        self.assertEqual(_FakeGuangYaClient.calls, ["android-tokenless-file"])
-        self.assertEqual(len(_FakeAsyncClient.requests), 4)
-        self.assertTrue(wrong_session_response.closed)
-        self.assertTrue(wrong_device_response.closed)
-        self.assertTrue(media_response.closed)
-        authorize.assert_awaited_once()
-
-    def test_android_tokenless_session_is_bound_to_client_address(self):
-        payload = {
-            "PlaySessionId": "address-bound-session",
-            "MediaSources": [
-                {
-                    "Id": "cloud",
-                    "Path": "/playgy/address-bound-file/etag/1/video.mkv",
-                }
-            ],
-        }
-        media_response = _FakeUpstreamResponse(
-            status_code=206,
-            body=b"same-client-media",
-            content_type="video/x-matroska",
-            headers={
-                "content-length": "17",
-                "content-range": "bytes 0-16/100",
-            },
-        )
-        fallback = _FakeUpstreamResponse(
-            body=b"upstream-only",
-            content_type="video/x-matroska",
-        )
-        _FakeAsyncClient.responses = [
-            _FakeUpstreamResponse(
-                body=json.dumps(payload).encode("utf-8"),
-                content_type="application/json",
-            ),
-            media_response,
-            fallback,
+        _FakeGuangYaClient.results["android-sdk-file"] = [
+            "http://signed.invalid/android-sdk-file"
         ]
         authorize = AsyncMock(return_value=True)
         app = media_proxy.create_proxy_app(7)
@@ -3488,9 +4407,723 @@ class HybridMediaProxyTests(unittest.TestCase):
                 "app.modules.media_proxy._client_is_authorized",
                 new=authorize,
             ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.post(
+                "/Items/android-sdk-item/PlaybackInfo",
+                headers=playback_headers,
+                json={"IsPlayback": True},
+            )
+            stream = client.get(
+                "/Videos/android-sdk-item/stream.mkv"
+                "?ApiKey=client-token&DeviceId=android-device"
+                "&MediaSourceId=android-sdk-item&static=true&Tag=media-tag",
+                headers={"User-Agent": "Dalvik/2.1.0"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(stream.status_code, 302)
+        self.assertEqual(
+            stream.headers["location"],
+            "http://signed.invalid/android-sdk-file",
+        )
+        self.assertEqual(_FakeGuangYaClient.calls, ["android-sdk-file"])
+        self.assertEqual(len(_FakeAsyncClient.requests), 1)
+        self.assertEqual(authorize.await_count, 2)
+
+    def test_android_http_stream_recovers_tokenless_session_and_uses_same_protocol_cdn(self):
+        payload = {
+            "PlaySessionId": "android-tokenless-session",
+            "MediaSources": [
+                {
+                    "Id": "android-source",
+                    "Path": "/playgy/android-tokenless-file/etag/1/video.mkv",
+                    "Protocol": "File",
+                    "Container": "mkv",
+                }
+            ],
+        }
+        wrong_session_response = _FakeUpstreamResponse(
+            body=b"wrong-session-fallback",
+            content_type="video/x-matroska",
+        )
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            wrong_session_response,
+        ]
+        authorize = AsyncMock(return_value=True)
+        _FakeGuangYaClient.results["android-tokenless-file"] = [
+            "http://signed.invalid/android-tokenless-file"
+        ] * 8
+        app = media_proxy.create_proxy_app(7)
+        playback_headers = {
+            "Authorization": (
+                'MediaBrowser Client="Jellyfin for Android", '
+                'Device="Pixel 10 Pro", DeviceId="android-device", '
+                'Version="2.7.0", Token="client-token"'
+            ),
+            "User-Agent": "Jellyfin Android",
+        }
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.post(
+                "/Items/android-tokenless-item/PlaybackInfo",
+                headers=playback_headers,
+                json={"IsPlayback": True},
+            )
+            source = playback.json()["MediaSources"][0]
+
+            conflicting_session = client.get(
+                "/Videos/android-tokenless-item/stream.mkv"
+                "?static=true&mediaSourceId=android-source"
+                "&playSessionId=android-tokenless-session"
+                "&PlaySessionId=other-session&deviceId=android-device",
+                headers={"Range": "bytes=0-12", "User-Agent": "Jellyfin Android"},
+                follow_redirects=False,
+            )
+            wrong_session = client.get(
+                "/Videos/android-tokenless-item/stream.mkv"
+                "?static=true&mediaSourceId=android-source"
+                "&playSessionId=wrong-session&deviceId=android-device",
+                headers={"Range": "bytes=0-12", "User-Agent": "Jellyfin Android"},
+                follow_redirects=False,
+            )
+            self.assertEqual(_FakeGuangYaClient.calls, [])
+            wrong_device = client.get(
+                "/Videos/android-tokenless-item/stream.mkv"
+                "?static=true&mediaSourceId=android-source"
+                "&playSessionId=android-tokenless-session&deviceId=other-device",
+                headers={"Range": "bytes=0-12", "User-Agent": "Jellyfin Android"},
+                follow_redirects=False,
+            )
+
+            stream = client.get(
+                "/Videos/android-tokenless-item/stream.mkv"
+                "?static=true&mediaSourceId=android-source"
+                "&playSessionId=android-tokenless-session&deviceId=android-device",
+                headers={"Range": "bytes=0-12", "User-Agent": "Jellyfin Android"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(source["Protocol"], "File")
+        self.assertFalse(source["SupportsDirectPlay"])
+        self.assertTrue(source["SupportsDirectStream"])
+        self.assertEqual(
+            urlsplit(source["DirectStreamUrl"]).path,
+            "/Videos/android-tokenless-item/stream.mkv",
+        )
+        self.assertIn("_mfps=", source["DirectStreamUrl"])
+        self.assertEqual(conflicting_session.status_code, 400)
+        self.assertEqual(wrong_session.status_code, 200)
+        self.assertEqual(wrong_session.content, b"wrong-session-fallback")
+        self.assertEqual(wrong_device.status_code, 302)
+        self.assertEqual(
+            wrong_device.headers["location"],
+            "http://signed.invalid/android-tokenless-file",
+        )
+        self.assertEqual(stream.status_code, 302)
+        self.assertEqual(
+            stream.headers["location"],
+            "http://signed.invalid/android-tokenless-file",
+        )
+        self.assertEqual(_FakeGuangYaClient.calls, ["android-tokenless-file"])
+        self.assertEqual(len(_FakeAsyncClient.requests), 2)
+        self.assertTrue(wrong_session_response.closed)
+        authorize.assert_awaited_once()
+
+    def test_web_rewrite_preserves_upstream_transcoding_contract_verbatim(self):
+        source = {
+            "Id": "web-source",
+            "Path": "/playgy/web-file/e/1/video.mkv",
+            "SupportsDirectPlay": False,
+            "SupportsDirectStream": False,
+            "SupportsTranscoding": True,
+            "TranscodingUrl": "/Videos/web-item/master.m3u8",
+            "TranscodingContainer": "ts",
+        }
+        payload = {"MediaSources": [source]}
+
+        with patch(
+            "app.modules.media_proxy.database.get_media_proxy_binding",
+            return_value=None,
+        ):
+            rewritten, changed = media_proxy.rewrite_playback_info(
+                payload, 7, "web-item", native_client_mode="web"
+            )
+
+        self.assertTrue(changed)
+        rewritten_source = rewritten["MediaSources"][0]
+        self.assertFalse(rewritten_source["SupportsDirectPlay"])
+        self.assertFalse(rewritten_source["SupportsDirectStream"])
+        self.assertTrue(rewritten_source["SupportsTranscoding"])
+        self.assertEqual(
+            rewritten_source["TranscodingUrl"],
+            "/Videos/web-item/master.m3u8",
+        )
+        self.assertEqual(rewritten_source["TranscodingContainer"], "ts")
+        self.assertNotIn("TranscodingSubProtocol", rewritten_source)
+
+    def test_android_embedded_webview_uses_web_playback_contract(self):
+        payload = {
+            "PlaySessionId": "android-web-session",
+            "MediaSources": [
+                {
+                    "Id": "android-web-source",
+                    "Path": "/playgy/android-web-file/e/1/video.mkv",
+                    "Protocol": "File",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": False,
+                    "SupportsDirectStream": False,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": "/Videos/android-web-item/master.m3u8",
+                    "TranscodingContainer": "ts",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        authorize = AsyncMock(return_value=True)
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.post(
+                "/Items/android-web-item/PlaybackInfo",
+                headers={
+                    "X-Emby-Token": "client-token",
+                    "X-Emby-Client": "Jellyfin for Android",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Linux; Android 16; device; wv) "
+                        "AppleWebKit/537.36 Chrome/151 Mobile Safari/537.36"
+                    ),
+                },
+                json={
+                    "IsPlayback": True,
+                    "DeviceProfile": {
+                        "Name": "",
+                        "DirectPlayProfiles": [{}, {}],
+                        "TranscodingProfiles": [{}, {}],
+                    },
+                },
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        source = playback.json()["MediaSources"][0]
+        self.assertFalse(source["SupportsDirectPlay"])
+        self.assertFalse(source["SupportsDirectStream"])
+        self.assertTrue(source["SupportsTranscoding"])
+        self.assertEqual(
+            source["TranscodingUrl"],
+            "/Videos/android-web-item/master.m3u8",
+        )
+        self.assertEqual(source["TranscodingContainer"], "ts")
+        self.assertTrue(
+            any(
+                entry.browser_relay
+                for entry in media_proxy._playback_sessions._entries.values()
+            )
+        )
+        authorize.assert_not_awaited()
+
+    def test_android_webview_direct_play_source_keeps_true_302(self):
+        payload = {
+            "PlaySessionId": "android-web-direct-session",
+            "MediaSources": [
+                {
+                    "Id": "android-web-direct-source",
+                    "Path": "/playgy/android-web-direct-file/e/1/video.mp4",
+                    "Protocol": "File",
+                    "Container": "mp4",
+                    "SupportsDirectPlay": True,
+                    "SupportsDirectStream": True,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": "/Videos/android-web-direct-item/master.m3u8",
+                    "TranscodingContainer": "ts",
+                    "TranscodingSubProtocol": "hls",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        authorize = AsyncMock(return_value=True)
+        app = media_proxy.create_proxy_app(7)
+        headers = {
+            "X-Emby-Token": "client-token",
+            "X-Emby-Client": "Jellyfin for Android",
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 16; device; wv) "
+                "AppleWebKit/537.36 Chrome/151 Mobile Safari/537.36"
+            ),
+        }
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.post(
+                "/Items/android-web-direct-item/PlaybackInfo",
+                headers=headers,
+                json={
+                    "IsPlayback": True,
+                    "DeviceProfile": {
+                        "Name": "",
+                        "DirectPlayProfiles": [{"Container": "mp4"}],
+                        "TranscodingProfiles": [{"Container": "ts"}],
+                    },
+                },
+            )
+            source = playback.json()["MediaSources"][0]
+            stream = client.get(
+                source["Path"],
+                headers={
+                    **headers,
+                    "Origin": "http://testserver",
+                    "Range": "bytes=0-1",
+                    "Sec-Fetch-Dest": "video",
+                    "Sec-Fetch-Mode": "no-cors",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertTrue(source["SupportsDirectPlay"])
+        self.assertTrue(source["SupportsTranscoding"])
+        self.assertEqual(stream.status_code, 302)
+        self.assertEqual(
+            stream.headers["location"],
+            "https://signed.invalid/android-web-direct-file",
+        )
+        self.assertEqual(
+            _FakeGuangYaClient.calls,
+            ["android-web-direct-file"],
+        )
+        authorize.assert_awaited_once()
+
+    def test_android_native_profile_overrides_webview_user_agent(self):
+        request = SimpleNamespace(
+            headers=Headers({
+                "X-Emby-Client": "Jellyfin for Android",
+                "User-Agent": (
+                    "Mozilla/5.0 (Linux; Android 16; device; wv) "
+                    "AppleWebKit/537.36 Chrome/151 Mobile Safari/537.36"
+                ),
+            })
+        )
+
+        mode = media_proxy._native_playback_rewrite_mode(
+            request,
+            {"DeviceProfile": {"Name": "Jellyfin for Android"}},
+        )
+
+        self.assertEqual(mode, "jellyfin_android")
+
+    def test_android_infers_missing_container_and_uses_direct_stream(self):
+        cases = (
+            (
+                {
+                    "Id": "android-source-a",
+                    "Path": "/playgy/android-a/e/1/video.mkv",
+                },
+                "/Videos/android-item/stream.mkv",
+            ),
+            (
+                {
+                    "Id": "android-source-b",
+                    "Path": "/playgy/android-b/e/1/video",
+                    "Container": "mkv;unsafe",
+                },
+                "/Videos/android-item/stream",
+            ),
+        )
+
+        for source, expected_path in cases:
+            with self.subTest(source=source):
+                payload = {"MediaSources": [copy.deepcopy(source)]}
+                with patch(
+                    "app.modules.media_proxy.database.get_media_proxy_binding",
+                    return_value=None,
+                ):
+                    rewritten, changed = media_proxy.rewrite_playback_info(
+                        payload,
+                        7,
+                        "android-item",
+                        native_client_mode="jellyfin_android",
+                    )
+
+                self.assertTrue(changed)
+                rewritten_source = rewritten["MediaSources"][0]
+                self.assertEqual(
+                    urlsplit(rewritten_source["DirectStreamUrl"]).path,
+                    expected_path,
+                )
+                self.assertFalse(rewritten_source["SupportsDirectPlay"])
+                self.assertTrue(rewritten_source["SupportsDirectStream"])
+                self.assertFalse(rewritten_source["SupportsTranscoding"])
+                if expected_path.endswith(".mkv"):
+                    self.assertEqual(rewritten_source["Container"], "mkv")
+                self.assertEqual(
+                    rewritten_source["TranscodingSubProtocol"], "http"
+                )
+
+    def test_findroid_capability_relays_full_redirect_chain_and_rejects_same_nat_standard_url(self):
+        payload = {
+            "PlaySessionId": "findroid-upstream-session",
+            "MediaSources": [
+                {
+                    "Id": "findroid-source",
+                    "Path": "/playgy/findroid-file/etag/1/video.mkv",
+                    "Protocol": "Http",
+                    "Container": "mkv",
+                }
+            ]
+        }
+        first_hop = _FakeUpstreamResponse(
+            status_code=302,
+            headers={"location": "https://edge.invalid/final.mkv"},
+        )
+        final_media = _FakeUpstreamResponse(
+            status_code=206,
+            body=b"x",
+            content_type="video/x-matroska",
+            headers={
+                "accept-ranges": "bytes",
+                "content-length": "1",
+                "content-range": "bytes 0-0/100",
+            },
+        )
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            first_hop,
+            final_media,
+            _FakeUpstreamResponse(
+                body=b"unauthorized-standard-stream-fallback",
+                content_type="video/x-matroska",
+            ),
+        ]
+        app = media_proxy.create_proxy_app(7)
+        _FakeGuangYaClient.results["findroid-file"] = [
+            "http://signed.invalid/findroid-file"
+        ]
+        headers = {
+            "Authorization": (
+                'MediaBrowser Client="Findroid", Device="Pixel 10 Pro", '
+                'DeviceId="findroid-device", Version="1.1.0", '
+                'Token="client-token"'
+            ),
+            "User-Agent": "ExoPlayerLib/1.10.1",
+        }
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
             patch(
                 "app.modules.media_proxy._pin_signed_media_target",
                 side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.post(
+                "/Items/findroid-item/PlaybackInfo",
+                headers=headers,
+                json={"IsPlayback": True},
+            )
+            source = playback.json()["MediaSources"][0]
+            # Findroid 的 DataSource 请求可能不再携带 Findroid/ExoPlayer 标记；
+            # capability 关联出的已验证会话仍必须接管完整 signed URL 跳转链。
+            stream = client.get(
+                source["Path"],
+                headers={
+                    "Range": "bytes=0-0",
+                    "User-Agent": "okhttp/4.12.0",
+                },
+                follow_redirects=False,
+            )
+            # 即使网络对端地址与刚完成 PlaybackInfo 的 Findroid 相同，没有
+            # capability / token / PlaySessionId 的标准 URL也不能复用授权。
+            same_nat_standard_stream = client.get(
+                "/Videos/findroid-item/stream"
+                "?static=true&MediaSourceId=findroid-source",
+                headers={"Range": "bytes=0-0"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(source["Protocol"], "Http")
+        self.assertTrue(source["SupportsDirectPlay"])
+        self.assertTrue(source["SupportsDirectStream"])
+        self.assertTrue(source["IsRemote"])
+        self.assertEqual(
+            urlsplit(source["Path"]).path,
+            "/Videos/findroid-item/stream",
+        )
+        self.assertEqual(urlsplit(source["Path"]).scheme, "http")
+        self.assertEqual(urlsplit(source["Path"]).netloc, "testserver")
+        self.assertIn("_mfps=", source["Path"])
+        self.assertEqual(source["TranscodingSubProtocol"], "http")
+        self.assertEqual(stream.status_code, 206)
+        self.assertEqual(stream.content, b"x")
+        self.assertNotIn("location", stream.headers)
+        self.assertEqual(stream.headers["content-range"], "bytes 0-0/100")
+        first_request = _FakeAsyncClient.requests[1]
+        final_request = _FakeAsyncClient.requests[2]
+        self.assertEqual(first_request.url.scheme, "http")
+        self.assertEqual(first_request.url.host, "203.0.113.10")
+        self.assertEqual(first_request.headers["Host"], "signed.invalid")
+        self.assertEqual(first_request.headers["Range"], "bytes=0-0")
+        self.assertEqual(final_request.url.scheme, "https")
+        self.assertEqual(final_request.url.host, "203.0.113.10")
+        self.assertEqual(final_request.headers["Host"], "edge.invalid")
+        self.assertEqual(final_request.headers["Range"], "bytes=0-0")
+        self.assertTrue(first_hop.closed)
+        self.assertTrue(final_media.closed)
+        self.assertEqual(same_nat_standard_stream.status_code, 200)
+        self.assertEqual(
+            same_nat_standard_stream.content,
+            b"unauthorized-standard-stream-fallback",
+        )
+        self.assertEqual(_FakeGuangYaClient.calls, ["findroid-file"])
+
+    def test_invalid_findroid_token_does_not_mint_capability_path(self):
+        payload = {
+            "PlaySessionId": "findroid-invalid-session",
+            "MediaSources": [
+                {
+                    "Id": "findroid-invalid-source",
+                    "Path": "/playgy/findroid-invalid-file/e/1/video.mkv",
+                    "Protocol": "Http",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        authorize = AsyncMock(return_value=False)
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.post(
+                "/Items/findroid-invalid-item/PlaybackInfo",
+                headers={
+                    "Authorization": (
+                        'MediaBrowser Client="Findroid", Device="Pixel", '
+                        'DeviceId="findroid-device", Version="1.1.0", '
+                        'Token="invalid-token"'
+                    ),
+                    "User-Agent": "ExoPlayerLib/1.10.1",
+                },
+                json={"IsPlayback": True},
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        source = playback.json()["MediaSources"][0]
+        self.assertEqual(source["Path"], payload["MediaSources"][0]["Path"])
+        self.assertNotIn("_mfps=", source["Path"])
+        self.assertEqual(_FakeGuangYaClient.calls, [])
+        authorize.assert_awaited_once()
+
+    def test_android_playback_info_without_device_recovers_stream_with_device_via_verified_token_scope(self):
+        payload = {
+            "PlaySessionId": "android-no-device-session",
+            "MediaSources": [
+                {
+                    "Id": "android-no-device-source",
+                    "Path": "/playgy/android-no-device-file/e/1/video.mkv",
+                    "Container": "mkv",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        app = media_proxy.create_proxy_app(7)
+        playback_headers = {
+            "Authorization": (
+                'MediaBrowser Client="Jellyfin for Android", '
+                'Device="Pixel", Version="2.7.0", Token="client-token"'
+            ),
+            "User-Agent": "Jellyfin Android",
+        }
+        authorize = AsyncMock(return_value=True)
+        _FakeGuangYaClient.results["android-no-device-file"] = [
+            "http://signed.invalid/android-no-device-file"
+        ]
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.post(
+                "/Items/android-no-device-item/PlaybackInfo",
+                headers=playback_headers,
+                json={"IsPlayback": True},
+            )
+            stream = client.get(
+                "/Videos/android-no-device-item/stream.mkv"
+                "?static=true&MediaSourceId=android-no-device-source"
+                "&PlaySessionId=android-no-device-session&DeviceId=android-device",
+                headers={
+                    "Range": "bytes=0-0",
+                    "User-Agent": "ExoPlayerLib/1.4.1",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(stream.status_code, 302)
+        self.assertEqual(
+            stream.headers["location"],
+            "http://signed.invalid/android-no-device-file",
+        )
+        self.assertEqual(_FakeGuangYaClient.calls, ["android-no-device-file"])
+        authorize.assert_awaited_once()
+
+    def test_android_tokenless_session_is_bound_to_client_address(self):
+        payload = {
+            "PlaySessionId": "address-bound-session",
+            "MediaSources": [
+                {
+                    "Id": "cloud",
+                    "Path": "/playgy/address-bound-file/etag/1/video.mkv",
+                }
+            ],
+        }
+        fallback = _FakeUpstreamResponse(
+            body=b"upstream-only",
+            content_type="video/x-matroska",
+        )
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            fallback,
+        ]
+        authorize = AsyncMock(return_value=True)
+        _FakeGuangYaClient.results["address-bound-file"] = [
+            "http://signed.invalid/address-bound-file"
+        ]
+        app = media_proxy.create_proxy_app(7)
+        playback_headers = {
+            "Authorization": (
+                'MediaBrowser Client="Jellyfin for Android", '
+                'Device="Pixel", DeviceId="android-device", '
+                'Version="2.7.0", Token="client-token"'
+            ),
+            "User-Agent": "Jellyfin Android",
+        }
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
             ),
         ):
             with TestClient(
@@ -3531,13 +5164,124 @@ class HybridMediaProxyTests(unittest.TestCase):
                 )
 
         self.assertEqual(playback.status_code, 200)
-        self.assertEqual(same_client_capability.status_code, 206)
-        self.assertEqual(same_client_capability.content, b"same-client-media")
+        self.assertEqual(same_client_capability.status_code, 302)
+        self.assertEqual(
+            same_client_capability.headers["location"],
+            "http://signed.invalid/address-bound-file",
+        )
         self.assertEqual(stolen_capability.status_code, 401)
         self.assertEqual(stream.status_code, 200)
         self.assertEqual(stream.content, b"upstream-only")
         self.assertEqual(_FakeGuangYaClient.calls, ["address-bound-file"])
-        self.assertTrue(media_response.closed)
+        self.assertTrue(fallback.closed)
+        authorize.assert_awaited_once()
+
+    def test_android_device_session_does_not_inherit_ambiguous_previous_source(self):
+        payload = {
+            "PlaySessionId": "multi-source-session",
+            "MediaSources": [
+                {
+                    "Id": "source-a",
+                    "Path": "/playgy/multi-source-file-a/e/1/a.mkv",
+                    "Container": "mkv",
+                },
+                {
+                    "Id": "source-b",
+                    "Path": "/playgy/multi-source-file-b/e/1/b.mkv",
+                    "Container": "mkv",
+                },
+            ],
+        }
+        fallback = _FakeUpstreamResponse(
+            body=b"ambiguous-source-upstream",
+            content_type="video/x-matroska",
+        )
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            fallback,
+        ]
+        authorize = AsyncMock(return_value=True)
+        _FakeGuangYaClient.results["multi-source-file-a"] = [
+            "http://signed.invalid/multi-source-file-a"
+        ]
+        _FakeGuangYaClient.results["multi-source-file-b"] = [
+            "http://signed.invalid/multi-source-file-b"
+        ]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+        ):
+            with TestClient(
+                app,
+                client=("10.0.0.10", 50000),
+                raise_server_exceptions=False,
+            ) as client:
+                playback = client.post(
+                    "/Items/multi-source-item/PlaybackInfo",
+                    headers={
+                        "Authorization": (
+                            'MediaBrowser Client="Jellyfin for Android", '
+                            'Device="Pixel", DeviceId="android-device", '
+                            'Version="2.7.0", Token="client-token"'
+                        ),
+                        "User-Agent": "Jellyfin Android",
+                    },
+                    json={"IsPlayback": True},
+                )
+                source_a = client.get(
+                    "/Videos/multi-source-item/stream"
+                    "?MediaSourceId=source-a&PlaySessionId=multi-source-session"
+                    "&DeviceId=android-device",
+                    headers={"User-Agent": "Jellyfin Android"},
+                    follow_redirects=False,
+                )
+                ambiguous = client.get(
+                    "/Videos/multi-source-item/stream"
+                    "?PlaySessionId=multi-source-session&DeviceId=android-device",
+                    headers={"User-Agent": "Jellyfin Android"},
+                    follow_redirects=False,
+                )
+                source_b = client.get(
+                    "/Videos/multi-source-item/stream"
+                    "?MediaSourceId=source-b&PlaySessionId=multi-source-session"
+                    "&DeviceId=android-device",
+                    headers={"User-Agent": "Jellyfin Android"},
+                    follow_redirects=False,
+                )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(source_a.status_code, 302)
+        self.assertEqual(
+            source_a.headers["location"],
+            "http://signed.invalid/multi-source-file-a",
+        )
+        self.assertEqual(ambiguous.status_code, 200)
+        self.assertEqual(ambiguous.content, b"ambiguous-source-upstream")
+        self.assertEqual(source_b.status_code, 302)
+        self.assertEqual(
+            source_b.headers["location"],
+            "http://signed.invalid/multi-source-file-b",
+        )
+        self.assertEqual(
+            _FakeGuangYaClient.calls,
+            ["multi-source-file-a", "multi-source-file-b"],
+        )
         self.assertTrue(fallback.closed)
         authorize.assert_awaited_once()
 
@@ -3571,6 +5315,80 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(_FakeAsyncClient.requests, [])
+        authorize.assert_not_awaited()
+
+    def test_android_transcode_fallback_bypasses_native_auth_capacity(self):
+        payload = {
+            "PlaySessionId": "busy-fallback-session",
+            "MediaSources": [
+                {
+                    "Id": "busy-fallback-source",
+                    "Path": "/playgy/busy-fallback-file/etag/1/video.mkv",
+                    "SupportsDirectPlay": False,
+                    "SupportsDirectStream": False,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": "/Videos/busy-fallback/master.m3u8",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+
+        class UnexpectedCapacity:
+            @staticmethod
+            def acquire(*, blocking):
+                raise AssertionError("fallback must not acquire native auth capacity")
+
+            @staticmethod
+            def release():
+                raise AssertionError("fallback must not release native auth capacity")
+
+        authorize = AsyncMock(return_value=True)
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=authorize,
+            ),
+            patch(
+                "app.modules.media_proxy._native_android_auth_capacity",
+                new=UnexpectedCapacity(),
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/busy-fallback/PlaybackInfo",
+                headers={
+                    "Authorization": (
+                        'MediaBrowser Client="Jellyfin for Android", '
+                        'Device="Pixel", DeviceId="android-device", '
+                        'Version="2.7.0", Token="client-token"'
+                    ),
+                    "User-Agent": "Jellyfin Android",
+                },
+                json={
+                    "EnableDirectPlay": False,
+                    "EnableDirectStream": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), payload)
+        self.assertEqual(media_proxy._playback_sessions._capability_index, {})
+        self.assertEqual(media_proxy._playback_grants._entries, {})
         authorize.assert_not_awaited()
 
     def test_android_playback_info_fails_fast_when_auth_capacity_is_full(self):
@@ -3638,7 +5456,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(
             response.json(),
-            {"error": "Android 播放鉴权繁忙，请稍后重试"},
+            {"error": "原生客户端播放鉴权繁忙，请稍后重试"},
         )
         authorize.assert_not_awaited()
 
@@ -4170,6 +5988,87 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(captured[-1]["guangya_file_id"], "browser-file")
         self.assertTrue(media_response.closed)
         authorize.assert_not_awaited()
+
+    def test_web_standard_stream_accepts_compact_uuid_after_hyphenated_playback_info(self):
+        item_hyphenated = "b3851937-35e9-8d81-287b-2b7ccc84fe42"
+        item_compact = "b385193735e98d81287b2b7ccc84fe42"
+        payload = {
+            "MediaSources": [
+                {
+                    "Id": item_hyphenated,
+                    "Path": "/playgy/uuid-browser-file/e/1/a.mkv",
+                    "SupportsDirectPlay": True,
+                    "SupportsDirectStream": True,
+                    "SupportsTranscoding": True,
+                    "TranscodingSubProtocol": "hls",
+                }
+            ]
+        }
+        media_response = _FakeUpstreamResponse(
+            status_code=206,
+            body=b"uuid-browser",
+            content_type="video/x-matroska",
+            headers={
+                "content-length": "12",
+                "content-range": "bytes 0-11/120",
+            },
+        )
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            media_response,
+        ]
+        app = media_proxy.create_proxy_app(7)
+        authorization = (
+            'MediaBrowser Client="Jellyfin Web", Device="Chrome", '
+            'Token="client-token"'
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.get(
+                f"/Items/{item_hyphenated}/PlaybackInfo?api_key=client-token",
+                headers={"X-Emby-Authorization": authorization},
+            )
+            stream = client.get(
+                f"/Videos/{item_compact}/stream"
+                f"?static=true&MediaSourceId={item_compact}&api_key=client-token",
+                headers={
+                    "Range": "bytes=0-11",
+                    "Origin": "http://testserver",
+                    "Sec-Fetch-Dest": "video",
+                    "Sec-Fetch-Mode": "cors",
+                    "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(stream.status_code, 206)
+        self.assertEqual(stream.content, b"uuid-browser")
+        self.assertNotIn("location", stream.headers)
+        self.assertEqual(_FakeGuangYaClient.calls, ["uuid-browser-file"])
+        self.assertTrue(media_response.closed)
 
     def test_active_long_playback_renews_authorization_without_proxying_media(self):
         now = [100.0]
