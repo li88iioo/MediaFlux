@@ -82,7 +82,8 @@ def upsert_media_external_id(
             "INSERT INTO media_external_ids(provider,external_id,media_type,tmdb_id,title,year,confidence,confirmed,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(provider,external_id,media_type) DO UPDATE SET "
             "tmdb_id=excluded.tmdb_id,title=excluded.title,year=excluded.year,"
-            "confidence=excluded.confidence,confirmed=excluded.confirmed,updated_at=excluded.updated_at "
+            "confidence=excluded.confidence,confirmed=excluded.confirmed,"
+            "version=media_external_ids.version+1,updated_at=excluded.updated_at "
             "WHERE media_external_ids.confirmed=0 OR excluded.confirmed=1",
             (
                 str(provider), str(external_id), str(media_type), str(tmdb_id),
@@ -91,6 +92,52 @@ def upsert_media_external_id(
                 1 if confirmed else 0, database.now(),
             ),
         )
+
+
+def confirm_media_external_id_if_unchanged(
+    provider: str,
+    external_id: str,
+    media_type: str,
+    tmdb_id: str,
+    title: str,
+    year: str,
+    expected: dict | None,
+) -> bool:
+    """仅当来源映射仍与确认预检快照一致时写入 confirmed 映射。"""
+    database = _database()
+    identity = (str(provider), str(external_id), str(media_type))
+    values = (
+        str(tmdb_id),
+        str(title or ""),
+        str(year or ""),
+        1.0,
+        1,
+        database.now(),
+    )
+    with database.get_conn() as conn:
+        if expected is None:
+            cur = conn.execute(
+                "INSERT INTO media_external_ids("
+                "provider,external_id,media_type,tmdb_id,title,year,confidence,confirmed,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(provider,external_id,media_type) DO NOTHING",
+                (*identity, *values),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE media_external_ids SET tmdb_id=?,title=?,year=?,confidence=?,"
+                "confirmed=?,updated_at=?,version=version+1 "
+                "WHERE provider=? AND external_id=? AND media_type=? AND version=? "
+                "AND COALESCE(tmdb_id,'')=? AND COALESCE(confirmed,0)=?",
+                (
+                    *values,
+                    *identity,
+                    max(0, int(expected.get("version") or 0)),
+                    str(expected.get("tmdb_id") or ""),
+                    1 if bool(expected.get("confirmed")) else 0,
+                ),
+            )
+        return int(cur.rowcount or 0) == 1
 
 
 def _watchlist_key(provider: str, external_id: str, media_type: str) -> str:

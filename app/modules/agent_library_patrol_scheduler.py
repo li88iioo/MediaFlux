@@ -96,6 +96,21 @@ class AgentLibraryPatrolScheduler:
                 db.discard_agent_library_patrol_notifications()
         self._wake_event.set()
 
+    def trigger_now(self) -> dict[str, object]:
+        """按当前策略将巡检排到现在；不修改配置，也不取消运行租约。"""
+        if not self._enabled():
+            return {"ok": False, "status": "disabled"}
+        current = self._now()
+        queued = db.reschedule_agent_library_patrol(next_run_at=current)
+        row = db.get_agent_library_patrol()
+        task_status = str(row["status"] or "") if row is not None else ""
+        self._wake_event.set()
+        if queued:
+            return {"ok": True, "status": "queued", "task_status": task_status}
+        if task_status == "running":
+            return {"ok": True, "status": "already_running", "task_status": task_status}
+        return {"ok": False, "status": "unavailable", "task_status": task_status}
+
     def status(self) -> dict[str, object]:
         return {
             "running": bool(self._thread and self._thread.is_alive()),

@@ -1214,6 +1214,65 @@ def is_rss_subscription_summaries_message(message: str) -> bool:
     )
 
 
+def _rss_entry_numbers(message: str) -> list[int]:
+    normalized = unicodedata.normalize("NFKC", str(message or ""))
+    matched = re.search(r"(?:rss\s*)?条目(?:编号)?\s*([0-9\s,，、和及]+)", normalized, re.IGNORECASE)
+    if not matched:
+        return []
+    values = [int(item) for item in re.findall(r"\d{1,9}", matched.group(1))]
+    return list(dict.fromkeys(value for value in values if value > 0))[:50]
+
+
+def rss_entry_summaries_request(message: str) -> dict[str, Any] | None:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    if "rss" not in normalized or "条目" not in normalized:
+        return None
+    if any(token in normalized for token in ("标记", "下载", "提交", "重试", "刷新")):
+        return None
+    if not any(token in normalized for token in ("列出", "查看", "看看", "有哪些", "最近", "待处理", "失败", "已下载")):
+        return None
+    status = "pending"
+    if "失败" in normalized:
+        status = "failed"
+    elif "已下载" in normalized:
+        status = "downloaded"
+    elif "全部" in normalized or "所有" in normalized or "最近" in normalized:
+        status = "all"
+    result: dict[str, Any] = {"status": status, "limit": 20}
+    matched = re.search(r"rss\s*订阅(?:编号)?\s*[#:]?\s*(\d{1,9})", normalized)
+    if matched:
+        result["subscription_number"] = int(matched.group(1))
+    return result
+
+
+def rss_entry_mark_request(message: str) -> dict[str, Any] | None:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    if "rss" not in normalized or "条目" not in normalized or "标记" not in normalized:
+        return None
+    numbers = _rss_entry_numbers(normalized)
+    if not numbers:
+        return None
+    if any(token in normalized for token in ("未处理", "恢复待处理", "取消已处理")):
+        processed = False
+    elif "已处理" in normalized:
+        processed = True
+    else:
+        return None
+    return {"entry_numbers": numbers, "processed": processed}
+
+
+def rss_entry_submit_request(message: str) -> dict[str, Any] | None:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    if "rss" not in normalized or "条目" not in normalized:
+        return None
+    if not any(token in normalized for token in ("qb", "qbittorrent", "q b")):
+        return None
+    if not any(token in normalized for token in ("下载", "提交", "推送")):
+        return None
+    numbers = _rss_entry_numbers(normalized)
+    return {"entry_numbers": numbers} if numbers else None
+
+
 _RSS_REFRESH_REQUEST_PATTERN = re.compile(
     r"^(?:请(?:帮我)?\s*)?刷新\s*rss\s*(?:订阅)?\s*"
     r"(?:(?:id|编号)\s*)?[#:]?\s*(\d{1,9})\s*(?:一次|一下)?[.!。！]?$",
@@ -3282,11 +3341,21 @@ def recent_discovery_candidate_request(
         and any(token in normalized for token in ("资源", "种子", "磁力"))
     ):
         return {**base, "action": "resource_search"}
+    if "映射" in normalized and any(token in normalized for token in ("候选", "匹配", "tmdb", "查看", "看看")):
+        return {**base, "action": "mapping"}
     if any(token in normalized for token in (
         "看看", "查看", "详情", "介绍", "是什么", "是哪部", "哪一个",
     )):
         return {**base, "action": "inspect"}
     return None
+
+
+def discovery_mapping_confirmation_request(message: str) -> dict[str, Any] | None:
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if "映射" not in normalized or not any(token in normalized for token in ("确认", "保存", "采用", "选择")):
+        return None
+    position = _recent_resource_selection(normalized)
+    return {"candidate_number": position} if position is not None else None
 
 
 def discovery_watchlist_summary_request(message: str) -> dict[str, Any] | None:
@@ -5187,6 +5256,51 @@ def _extract_search_query(message: str) -> str:
     return ""
 
 
+def is_strm_run_history_message(message: str) -> bool:
+    normalized = _normalize_intent_message(message)
+    return bool(
+        "strm" in normalized
+        and any(token in normalized for token in ("历史", "最近", "上次", "运行记录", "失败上下文", "队列"))
+        and any(token in normalized for token in ("运行", "同步", "失败", "队列", "情况", "记录"))
+    )
+
+
+def guangya_directory_scrape_request(message: str) -> tuple[str, dict[str, Any]] | None:
+    original = unicodedata.normalize("NFKC", str(message or "")).strip()
+    normalized = original.casefold()
+    if "光鸭" not in normalized or not any(token in normalized for token in ("刮削", "匹配", "整理")):
+        return None
+    if any(token in normalized for token in ("执行刚才", "执行预览", "确认执行", "开始执行")) and "预览" in normalized:
+        return "guangya.directory_scrape.run", {}
+    if "预览" in normalized and (position := _recent_resource_selection(normalized)) is not None:
+        return "guangya.directory_scrape.preview", {"candidate_number": position, "numbering_mode": "auto"}
+    if any(token in normalized for token in ("搜索", "搜一下", "找匹配", "搜索匹配", "匹配候选")):
+        arguments: dict[str, Any] = {"media_type": "auto"}
+        quoted = _MEDIA_RATING_QUOTED_TITLE_RE.search(str(message or ""))
+        if quoted:
+            arguments["query"] = quoted.group(1).strip()
+        return "guangya.directory_scrape.search", arguments
+    matched = re.search(
+        r"(目录|文件)\s*(?:id|编号)?\s*[#：:]?\s*([A-Za-z0-9._:-]{1,180})",
+        original,
+        flags=re.IGNORECASE,
+    )
+    if matched and any(token in normalized for token in ("检查", "刮削", "看看", "识别")):
+        key = "directory_id" if matched.group(1) == "目录" else "file_id"
+        return "guangya.directory_scrape.inspect", {key: matched.group(2)}
+    return None
+
+
+def is_patrol_trigger_now_message(message: str) -> bool:
+    normalized = _normalize_intent_message(message)
+    if any(token in normalized for token in ("不要", "别", "取消", "关闭", "停用", "设置", "修改")):
+        return False
+    has_scope = any(token in normalized for token in ("巡检", "缺集检查", "媒体库检查"))
+    has_now = any(token in normalized for token in ("立即", "现在", "马上", "立刻"))
+    has_policy = any(token in normalized for token in ("当前策略", "现有策略", "按策略", "自动巡检"))
+    return has_scope and has_now and has_policy
+
+
 def _is_strm_run_action(message: str) -> bool:
     normalized = _normalize_intent_message(message)
     if "strm" not in normalized or _is_dangerous_action_discussion(normalized):
@@ -6398,6 +6512,7 @@ class AgentOrchestrator:
         request_id: str = "",
         session_id: str = "",
         rate_identity: str = "",
+        budget_already_reserved: bool = False,
         trusted_resource_owner_binding: bool = False,
     ) -> dict[str, Any]:
         if tool_name == "indexer.submit_resource_batch":
@@ -6441,13 +6556,23 @@ class AgentOrchestrator:
                     "该资源不属于当前会话或候选已经过期，请重新搜索后再选择。",
                     code="precondition_failed",
                 )
-        if tool_name in {"rss.refresh_subscription", "rss.refresh_subscriptions"}:
+        if not budget_already_reserved and tool_name in {
+            "rss.refresh_subscription",
+            "rss.refresh_subscriptions",
+            "rss.mark_entries",
+            "rss.submit_entries_to_qb",
+            "rss.submit_pending_to_qb",
+            "rss.retry_failed_to_qb",
+            "discovery.confirm_mapping",
+            "guangya.directory_scrape.run",
+            "library.trigger_patrol_now",
+        }:
             effective_rate_identity = str(
                 rate_identity or _QUERY_TOOL_RATE_IDENTITY.get() or owner or ""
             ).strip()
             if not effective_rate_identity:
                 raise AgentToolError(
-                    "RSS 刷新预检缺少限流身份",
+                    "确认预检缺少限流身份",
                     code="precondition_failed",
                 )
             self._reserve_query_tool_budget(
@@ -7330,7 +7455,10 @@ class AgentOrchestrator:
                         code="tool_not_exposed",
                     )
                 return self.prepare(
-                    tool_name, normalized_arguments, owner=owner
+                    tool_name,
+                    normalized_arguments,
+                    owner=owner,
+                    budget_already_reserved=True,
                 )
             if disposition is LLMToolDisposition.EXECUTE_READ:
                 return self.invoke(
@@ -7365,6 +7493,7 @@ class AgentOrchestrator:
                     selection.tool_name,
                     normalized_arguments,
                     owner=owner,
+                    budget_already_reserved=True,
                 )
             if disposition is LLMToolDisposition.EXECUTE_READ:
                 if rate_identity and not allow_agent_tool(
@@ -7565,6 +7694,17 @@ class AgentOrchestrator:
         conversation_context: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """处理最近探索结果与探索收藏的确定性续句。"""
+        mapping_confirmation = discovery_mapping_confirmation_request(message)
+        if mapping_confirmation is not None:
+            if not owner:
+                return self._unsupported(
+                    "确认影视映射需要在已登录会话中执行",
+                    ["请登录后重新查询映射候选。"],
+                )
+            return self.prepare(
+                "discovery.confirm_mapping", mapping_confirmation, owner=owner
+            )
+
         watchlist_subscription_request = discovery_watchlist_subscription_request(message)
         if watchlist_subscription_request is not None:
             if not owner:
@@ -7677,17 +7817,34 @@ class AgentOrchestrator:
                     },
                     owner=owner,
                 )
-            if recent_discovery_request["action"] == "inspect":
+            if recent_discovery_request["action"] in {"inspect", "mapping"}:
+                tool_name = (
+                    "discovery.mapping_candidates"
+                    if recent_discovery_request["action"] == "mapping"
+                    else "discovery.detail"
+                )
+                if self.registry.has(tool_name):
+                    return self._invoke_query_read(
+                        tool_name,
+                        {
+                            "provider": candidate["provider"],
+                            "external_id": candidate["external_id"],
+                            "media_type": candidate["media_type"],
+                        },
+                        owner=owner,
+                        rate_identity=query_tool_rate_identity,
+                    )
+                if recent_discovery_request["action"] == "mapping":
+                    return self._clarification_response(
+                        "当前工具集没有启用影视映射候选查询。",
+                        ["查看这个条目的详情。"],
+                    )
                 label = "电视剧" if candidate.get("media_type") == "tv" else "电影"
                 year = str(candidate.get("year") or "").strip()
                 year_text = f"（{year}）" if year else ""
                 return self._conversation_response(
                     f"第 {position} 个是{label}《{candidate['title']}》{year_text}。",
-                    [
-                        f"收藏第 {position} 个",
-                        f"订阅第 {position} 个",
-                        f"搜第 {position} 部资源",
-                    ],
+                    [f"收藏第 {position} 个", f"订阅第 {position} 个", f"搜第 {position} 部资源"],
                 )
             if query_tool_rate_identity and not allow_agent_tool(
                 query_tool_rate_identity, "indexer.search_resources"
@@ -7850,6 +8007,14 @@ class AgentOrchestrator:
                 "已取消最近巡检结果的资源接力",
                 ["如需继续，请明确回复：把刚才巡检发现的缺集找资源。"],
             )
+        if is_patrol_trigger_now_message(message):
+            if not owner:
+                return self._unsupported(
+                    "立即排队巡检需要在已登录会话中确认",
+                    ["请登录后重试：按当前策略立即巡检媒体库。"],
+                )
+            return self.prepare("library.trigger_patrol_now", {}, owner=owner)
+
         patrol_policy_request = library_patrol_policy_request(lower)
         if patrol_policy_request is not None:
             if not owner:
@@ -8166,8 +8331,28 @@ class AgentOrchestrator:
             )
         if is_rss_recent_activity_message(message):
             return self._invoke_query_read("rss.recent_activity", {}, owner=owner)
+
+        entry_list_request = rss_entry_summaries_request(message)
+        if entry_list_request is not None:
+            return self._invoke_query_read("rss.entry_summaries", entry_list_request, owner=owner)
         if is_rss_subscription_summaries_message(message):
             return self._invoke_query_read("rss.subscription_summaries", {}, owner=owner)
+        entry_mark_request = rss_entry_mark_request(message)
+        if entry_mark_request is not None:
+            if not owner:
+                return self._unsupported(
+                    "RSS 条目标记需要在已登录会话中确认",
+                    ["请登录后重新指定 RSS 条目编号。"],
+                )
+            return self.prepare("rss.mark_entries", entry_mark_request, owner=owner)
+        entry_submit_request = rss_entry_submit_request(message)
+        if entry_submit_request is not None:
+            if not owner:
+                return self._unsupported(
+                    "RSS 条目下载需要在已登录会话中确认",
+                    ["请登录后重新指定 RSS 条目编号。"],
+                )
+            return self.prepare("rss.submit_entries_to_qb", entry_submit_request, owner=owner)
 
         rss_control_request = rss_subscription_control_request(message)
         if rss_control_request is not None:
@@ -8324,6 +8509,11 @@ class AgentOrchestrator:
                 "Agent 不会自动修复、清理或删除 STRM 失败记录。",
                 ["可先查看 STRM 失败状态，或明确请求重试生成失败/元数据失败。"],
             )
+        if is_strm_run_history_message(lower):
+            return self._invoke_query_read(
+                "strm.run_history", {"limit": 8, "status": "all"}, owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
         if is_strm_failure_triage_message(lower):
             return self._invoke_query_read("strm.triage_failures", {})
         if _is_strm_run_action(lower):
@@ -8346,6 +8536,20 @@ class AgentOrchestrator:
             return self._clarification_response(
                 "你是要立即运行一次 STRM 同步，还是只查看当前状态？",
                 ["立即运行一次 STRM 同步", "查看 STRM 状态"],
+            )
+        directory_scrape = guangya_directory_scrape_request(message)
+        if directory_scrape is not None:
+            tool_name, arguments = directory_scrape
+            if not owner:
+                return self._unsupported(
+                    "光鸭目录刮削链需要在已登录会话中执行",
+                    ["请登录后重新指定目录或文件。"],
+                )
+            if tool_name == "guangya.directory_scrape.run":
+                return self.prepare(tool_name, arguments, owner=owner)
+            return self._invoke_query_read(
+                tool_name, arguments, owner=owner,
+                rate_identity=query_tool_rate_identity,
             )
         if is_guangya_organize_stop_message(lower):
             if not owner:

@@ -964,6 +964,94 @@ def update_rss_entries_processed(entry_ids: list[int], processed: bool) -> int:
         return cur.rowcount
 
 
+def update_rss_entries_processed_snapshot(
+    expected_rows: list[dict], processed: bool
+) -> int:
+    """按确认时冻结的完整状态原子标记 RSS 条目；任一变化则全量拒绝。"""
+    if not isinstance(processed, bool) or not isinstance(expected_rows, list):
+        return 0
+    normalized: list[dict] = []
+    seen: set[int] = set()
+    for raw in expected_rows:
+        if not isinstance(raw, dict):
+            return 0
+        try:
+            entry_id = int(raw.get("id") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if entry_id <= 0 or entry_id in seen:
+            return 0
+        seen.add(entry_id)
+        normalized.append({
+            "id": entry_id,
+            "status": str(raw.get("status") or ""),
+            "processed": bool(raw.get("processed")),
+            "created_at": str(raw.get("created_at") or ""),
+            "failure_code": str(raw.get("failure_code") or ""),
+            "failure_retryable": bool(raw.get("failure_retryable")),
+        })
+    if not normalized or len(normalized) > 50:
+        return 0
+    allowed_statuses = (
+        {"pending", "failed", "skipped"} if processed else {"failed", "skipped"}
+    )
+    if any(item["status"] not in allowed_statuses for item in normalized):
+        return 0
+
+    ids = [item["id"] for item in normalized]
+    placeholders = ",".join("?" for _ in ids)
+    target_status = "skipped" if processed else "pending"
+    processed_at = now() if processed else None
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT id,status,processed,created_at,failure_code,failure_retryable "
+            f"FROM rss_entries WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        by_id = {int(row["id"]): row for row in rows}
+        current = [{
+            "id": item["id"],
+            "status": str(by_id[item["id"]]["status"] or "") if item["id"] in by_id else "missing",
+            "processed": bool(by_id[item["id"]]["processed"]) if item["id"] in by_id else False,
+            "created_at": str(by_id[item["id"]]["created_at"] or "") if item["id"] in by_id else "",
+            "failure_code": str(by_id[item["id"]]["failure_code"] or "") if item["id"] in by_id else "",
+            "failure_retryable": bool(by_id[item["id"]]["failure_retryable"]) if item["id"] in by_id else False,
+        } for item in normalized]
+        if current != normalized:
+            conn.rollback()
+            return 0
+        allowed = ",".join("?" for _ in allowed_statuses)
+        cur = conn.execute(
+            f"UPDATE rss_entries SET processed=?,processed_at=?,status=?,"
+            "failure_code='',failure_retryable=0,failed_at=NULL "
+            f"WHERE id IN ({placeholders}) AND status IN ({allowed})",
+            [
+                1 if processed else 0,
+                processed_at,
+                target_status,
+                *ids,
+                *sorted(allowed_statuses),
+            ],
+        )
+        if int(cur.rowcount or 0) != len(normalized):
+            conn.rollback()
+            return 0
+        if not processed:
+            for table in ("rss_guangya_download_claims", "rss_qb_download_claims"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE status='unknown' "
+                    f"AND first_entry_id IN ({placeholders})",
+                    ids,
+                )
+            conn.execute(
+                f"UPDATE rss_entry_media SET skip_reason='',updated_at=? "
+                f"WHERE rss_entry_id IN ({placeholders})",
+                [now(), *ids],
+            )
+        return int(cur.rowcount or 0)
+
+
 def get_rss_diagnostic_summary(
     current_time: str | None = None,
     *,

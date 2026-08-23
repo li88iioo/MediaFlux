@@ -421,11 +421,65 @@ class DiscoveryServiceTests(unittest.TestCase):
         result = service.map_to_tmdb("douban", "7", "movie", "Movie", "1999")
         self.assertEqual((result["tmdb_id"], result["confirmed"]), ("550", True))
 
+    def test_legacy_unconfirmed_mapping_does_not_hide_new_candidates(self):
+        database.upsert_media_external_id(
+            "douban", "legacy-tentative", "movie", "550", "旧自动候选",
+            "1999", 0.96, False,
+        )
+        scraper = SimpleNamespace(
+            search_candidates=lambda *args, **kwargs: [SimpleNamespace(
+                tmdb_id="551", title="可确认候选", year="2000",
+                score=0.91, media_type="movie",
+            )]
+        )
+        service = DiscoveryService(
+            registry=self.registry, cache=self.cache, scraper_factory=lambda: scraper
+        )
+
+        result = service.lookup_tmdb_mapping(
+            "douban", "legacy-tentative", "movie", "Movie", "1999"
+        )
+
+        self.assertFalse(result["confirmed"])
+        self.assertEqual(result["tmdb_id"], "")
+        self.assertEqual(result["candidates"][0]["tmdb_id"], "551")
+
+    def test_explicit_confirmation_does_not_overwrite_existing_confirmed_mapping(self):
+        database.upsert_media_external_id(
+            "douban", "confirmed-7", "movie", "550", "Existing Movie",
+            "1999", 1.0, True,
+        )
+        scraper = SimpleNamespace(
+            search_candidates=lambda *args, **kwargs: self.fail("search should not run"),
+            match_from_tmdb=lambda *args, **kwargs: self.fail("verify should not run"),
+        )
+        service = DiscoveryService(
+            registry=self.registry, cache=self.cache, scraper_factory=lambda: scraper
+        )
+
+        result = service.map_to_tmdb(
+            "douban", "confirmed-7", "movie", "Movie", "1999",
+            confirmed_tmdb_id="551", confirmed_title="Other", confirmed_year="2000",
+        )
+
+        stored = database.get_media_external_id("douban", "confirmed-7", "movie")
+        self.assertEqual((result["tmdb_id"], result["confirmed"]), ("550", True))
+        self.assertEqual(
+            (stored["tmdb_id"], stored["title"], stored["year"], stored["confirmed"]),
+            ("550", "Existing Movie", "1999", 1),
+        )
+
     def test_explicit_confirmation_corrects_existing_unconfirmed_mapping(self):
         database.upsert_media_external_id(
             "douban", "7", "movie", "550", "Wrong Movie", "1998", 0.96, False,
         )
-        scraper = SimpleNamespace(search_candidates=lambda *args, **kwargs: self.fail("search should not run"))
+        scraper = SimpleNamespace(
+            search_candidates=lambda *args, **kwargs: self.fail("search should not run"),
+            match_from_tmdb=lambda tmdb_id, media_type: SimpleNamespace(
+                need_confirm=False, tmdb_id=tmdb_id, media_type=media_type,
+                title="Correct Movie", year="2000",
+            ),
+        )
         service = DiscoveryService(registry=self.registry, cache=self.cache, scraper_factory=lambda: scraper)
 
         result = service.map_to_tmdb(
@@ -440,15 +494,16 @@ class DiscoveryServiceTests(unittest.TestCase):
             ("551", "Correct Movie", "2000", 1),
         )
 
-    def test_high_confidence_mapping_is_saved_but_low_confidence_requires_confirmation(self):
+    def test_mapping_candidate_lookup_never_persists_without_confirmation(self):
         high = SimpleNamespace(tmdb_id="550", title="Fight Club", year="1999", score=0.96, media_type="movie")
         low = SimpleNamespace(tmdb_id="551", title="Maybe", year="2000", score=0.72, media_type="movie")
         candidates = [high]
         scraper = SimpleNamespace(search_candidates=lambda *args, **kwargs: list(candidates))
         service = DiscoveryService(registry=self.registry, cache=self.cache, scraper_factory=lambda: scraper)
         result = service.map_to_tmdb("douban", "8", "movie", "Fight Club", "1999")
-        self.assertEqual((result["tmdb_id"], result["confirmed"]), ("550", False))
-        self.assertEqual(database.get_media_external_id("douban", "8", "movie")["tmdb_id"], "550")
+        self.assertEqual((result["tmdb_id"], result["confirmed"]), ("", False))
+        self.assertEqual(result["candidates"][0]["tmdb_id"], "550")
+        self.assertIsNone(database.get_media_external_id("douban", "8", "movie"))
 
         candidates[:] = [low]
         result = service.map_to_tmdb("douban", "9", "movie", "Maybe", "2000")

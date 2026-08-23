@@ -98,12 +98,20 @@ _OFFLINE_ROUTE_TOOLS = frozenset({
     "library.check_updates",
     "library.count_series_episodes",
     "rss.subscription_summaries",
+    "rss.entry_summaries",
+    "strm.run_history",
+    "guangya.directory_scrape.inspect",
 })
 _OFFLINE_WRITE_ROUTE_TOOLS = frozenset({
     "config.set_feature_state",
     "config.set_safe_policy",
     "library.set_patrol_policy",
+    "library.trigger_patrol_now",
     "media.set_subscription_enabled",
+    "rss.mark_entries",
+    "rss.submit_entries_to_qb",
+    "discovery.confirm_mapping",
+    "guangya.directory_scrape.run",
 })
 _ROUTE_EVALUATORS = frozenset({"route_tool", "write_tool_route"})
 _MATRIX_EVALUATORS = frozenset({
@@ -422,6 +430,16 @@ def load_agent_eval_cases(path: Path | str = DEFAULT_FIXTURE) -> list[AgentEvalC
     return validate_agent_eval_rows(rows)
 
 
+class _OfflineEvalOrchestrator(AgentOrchestrator):
+    """离线路由评测不消耗生产工具预算，也不依赖持久化限流状态。"""
+
+    @staticmethod
+    def _reserve_query_tool_budget(
+        tool_name: str, *, rate_identity: str = ""
+    ) -> None:
+        del tool_name, rate_identity
+
+
 def build_offline_agent_eval_registry() -> ToolRegistry:
     """构建无业务 I/O 的工具注册表，用于冻结编排器的确定性路由契约。"""
     registry = ToolRegistry()
@@ -474,7 +492,7 @@ def _offline_route_projection(
 ) -> dict[str, Any] | None:
     owner = "offline-agent-eval"
     confirmation_store = ConfirmationStore()
-    orchestrator = AgentOrchestrator(
+    orchestrator = _OfflineEvalOrchestrator(
         build_offline_agent_eval_registry(),
         confirmation_store=confirmation_store,
     )

@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-import hashlib
-import json
 import threading
 from typing import Any
 
 from app import database as db
+from app.agent.confirmation import confirmation_context_fingerprint
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
 from app.logger import get_logger
@@ -39,17 +38,6 @@ def rss_failure_retry_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"limit": limit}
 
 
-def _stable_hash(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-
-
 def _row_snapshot(row: Any) -> dict[str, Any]:
     return {
         "id": int(row["id"]),
@@ -77,26 +65,11 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
     )
     has_more = len(rows) > limit
     entries = [_row_snapshot(row) for row in rows[:limit]]
-    fingerprint_entries = [{
-        "id": item["id"],
-        "rss_item_id": item["rss_item_id"],
-        "created_at": item["created_at"],
-        "failed_at": item["failed_at"],
-        "failure_code": item["failure_code"],
-        "failure_retryable": item["failure_retryable"],
-        "retry_count": item["retry_count"],
-        "content_sha256": _stable_hash({
-            "title": item["title"],
-            "payload": item["payload"],
-            "download_method": item["download_method"],
-            "qb_save_path": item["qb_save_path"],
-        }),
-    } for item in entries]
     payload = {
         "limit": limit,
-        "entries": fingerprint_entries,
+        "entries": entries,
         "has_more": has_more,
-        "runtime_sha256": _stable_hash(runtime_config),
+        "runtime_config": runtime_config,
         "config_error": str(config_error or ""),
     }
     return {
@@ -105,7 +78,9 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
         "has_more": has_more,
         "runtime_config": runtime_config,
         "config_error": str(config_error or ""),
-        "fingerprint": _stable_hash(payload),
+        "fingerprint": confirmation_context_fingerprint(
+            payload, domain="rss-retry-failed-to-qb"
+        ),
     }
 
 

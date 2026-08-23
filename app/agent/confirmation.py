@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import hashlib
+import hmac
+import json
 import secrets
 import threading
 import time
@@ -10,6 +13,26 @@ import unicodedata
 from typing import Any, Callable
 
 from app.agent.registry import AgentToolError
+from app.modules.web_secret import get_web_secret
+
+
+def confirmation_context_fingerprint(value: Any, *, domain: str) -> str:
+    """生成部署密钥绑定的确认上下文指纹，避免敏感快照形成离线校验 oracle。"""
+    normalized_domain = str(domain or "").strip().casefold()
+    if not normalized_domain or len(normalized_domain) > 80:
+        raise ValueError("确认上下文指纹域无效")
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    message = (
+        b"mediaflux-agent-confirmation-context:v1\0"
+        + normalized_domain.encode("ascii")
+        + b"\0"
+        + payload
+    )
+    return hmac.new(
+        get_web_secret().encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()
 
 
 @dataclass(frozen=True)

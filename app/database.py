@@ -1086,6 +1086,7 @@ CREATE TABLE IF NOT EXISTS media_external_ids (
     year TEXT DEFAULT '',
     confidence REAL DEFAULT 0,
     confirmed INTEGER DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     UNIQUE(provider, external_id, media_type)
 );
@@ -3327,6 +3328,7 @@ from app.repositories.rss import (  # noqa: E402
     recover_stale_submitting_rss_entries,
     record_rss_entry_failure,
     update_rss_entries_processed,
+    update_rss_entries_processed_snapshot,
     update_rss_entry_status,
     update_rss_subscription,
 )
@@ -4841,6 +4843,7 @@ def get_agent_persistent_health_summary() -> dict[str, dict[str, object]]:
 # 兼容门面：外部调用和测试继续使用 app.database.*；实现已按业务域拆分。
 from app.repositories.discovery import (  # noqa: E402
     add_media_watchlist,
+    confirm_media_external_id_if_unchanged,
     delete_media_watchlist,
     get_discovery_cache,
     get_media_external_id,

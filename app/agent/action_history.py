@@ -21,6 +21,8 @@ _TOOL_LABELS = {
     "downloads.resume_task": "下载任务恢复",
     "downloads.delete_task": "下载任务移除",
     "downloads.retry_submission": "下载请求重新提交",
+    "rss.mark_entries": "RSS 条目标记",
+    "rss.submit_entries_to_qb": "RSS 指定条目提交",
     "rss.submit_pending_to_qb": "RSS 待处理条目提交",
     "rss.retry_failed_to_qb": "RSS 失败条目重试",
     "rss.refresh_subscription": "RSS 订阅刷新",
@@ -45,18 +47,21 @@ _TOOL_LABELS = {
     "local_media.retry_task": "本地媒体任务重试",
     "local_media.refresh_task_library": "本地媒体任务精准刷新",
     "recognition.set_rule_enabled": "识别规则启停",
+    "discovery.confirm_mapping": "发现身份映射确认",
     "discovery.add_watchlist": "探索收藏添加",
     "discovery.remove_watchlist": "探索收藏移除",
     "strm.retry_failures": "STRM 失败项重试",
     "strm.run_once": "STRM 手动同步",
     "strm.set_schedule_policy": "STRM 调度策略修改",
     "guangya.organize.set_schedule_policy": "光鸭定时整理策略修改",
+    "guangya.directory_scrape.run": "光鸭目录刮削执行",
     "guangya.organize.run_once": "光鸭整理任务",
     "guangya.organize.clean_empty": "光鸭空目录清理",
     "guangya.organize.stop": "停止光鸭整理任务",
     "indexer.submit_resource": "资源下载提交",
     "indexer.submit_resource_batch": "批量资源下载提交",
     "library.set_patrol_policy": "缺集巡检策略修改",
+    "library.trigger_patrol_now": "立即全库缺集巡检",
     "library.start_episode_audit": "后台全库剧集检查",
     "agent.cancel_job": "取消后台全库剧集检查",
 }
@@ -69,8 +74,16 @@ _SAFE_FIELDS = {
         "target", "status", "created", "duplicate", "succeeded", "failed",
         "source_attention_preserved",
     },
-    "rss.submit_pending_to_qb": {"target", "requested", "claimed", "submitted", "failed"},
-    "rss.retry_failed_to_qb": {"target", "requested", "claimed", "submitted", "failed"},
+    "rss.mark_entries": {"affected", "processed"},
+    "rss.submit_entries_to_qb": {
+        "target", "requested", "claimed", "submitted", "failed", "outcome_unknown",
+    },
+    "rss.submit_pending_to_qb": {
+        "target", "requested", "claimed", "submitted", "failed", "outcome_unknown",
+    },
+    "rss.retry_failed_to_qb": {
+        "target", "requested", "claimed", "submitted", "failed", "outcome_unknown",
+    },
     "rss.refresh_subscription": {"subscription_id", "total", "new", "skipped"},
     "rss.refresh_subscriptions": {
         "requested", "refreshed", "failed", "total", "new", "skipped",
@@ -121,6 +134,7 @@ _SAFE_FIELDS = {
         "operation", "task_number", "refreshed", "matched_paths",
     },
     "recognition.set_rule_enabled": {"operation", "rule_type", "rule_id", "enabled", "affected"},
+    "discovery.confirm_mapping": {"affected", "provider", "media_type", "candidate_number", "mapping_confirmed"},
     "discovery.add_watchlist": {"operation", "watchlist_number", "affected"},
     "discovery.remove_watchlist": {"operation", "watchlist_number", "affected"},
     "strm.retry_failures": {
@@ -129,6 +143,7 @@ _SAFE_FIELDS = {
     "strm.run_once": {"accepted", "trigger"},
     "strm.set_schedule_policy": {"runtime_refreshed"},
     "guangya.organize.set_schedule_policy": {"runtime_refreshed"},
+    "guangya.directory_scrape.run": {"queued", "queue_position", "replayed", "plan_count"},
     "guangya.organize.run_once": {"trigger_type", "source_count"},
     "guangya.organize.clean_empty": {"cleaned", "failed", "source_count"},
     "guangya.organize.stop": {"accepted"},
@@ -139,6 +154,7 @@ _SAFE_FIELDS = {
         "target", "total", "succeeded", "failed", "duplicate",
     },
     "library.set_patrol_policy": {"runtime_refreshed"},
+    "library.trigger_patrol_now": {"queued", "reused", "task_status"},
     "library.start_episode_audit": {
         "accepted", "created", "reused", "max_series", "progress_current", "progress_total",
     },
@@ -159,6 +175,7 @@ _STATUS_LABELS = {
     "unavailable": "暂时不可用",
     "confirmation_stale": "确认已失效",
     "busy": "正在执行",
+    "review_required": "需人工核对",
 }
 
 _OUTCOME_LABELS = {"all": "全部", "success": "成功", "failed": "失败"}
@@ -170,11 +187,13 @@ _COUNT_FIELDS = {
     "refresh_interval_minutes", "deleted_entries",
     "max_series", "progress_current", "progress_total", "instance_number", "rule_id",
     "subscription_number", "watchlist_number", "source_number", "task_number", "season",
+    "candidate_number", "queue_position", "plan_count", "outcome_unknown",
     "expired_candidates", "cancelled_admissions", "cancelled_runs", "refreshed", "matched_paths",
 }
 _BOOL_FIELDS = {
     "accepted", "enabled", "runtime_refreshed", "created", "duplicate", "delete_files",
-    "reused", "cancelled", "cancel_requested", "sent",
+    "reused", "cancelled", "cancel_requested", "sent", "processed", "queued",
+    "replayed", "mapping_confirmed",
     "source_attention_preserved",
 }
 _ENUM_FIELDS = {
@@ -203,6 +222,9 @@ _ENUM_FIELDS = {
     "rule_type": {"preprocess_rule", "tmdb_regex_rule", "knowledge_entry"},
     "preferred_server": {"any", "jellyfin", "emby"},
     "preferred_download_target": {"qb", "guangya", "both"},
+    "provider": {"tmdb", "douban", "bangumi"},
+    "media_type": {"movie", "tv"},
+    "task_status": {"pending", "running", "retry_wait", "not_scheduled"},
     "operation": {
         "pause", "resume", "delete", "enable", "disable", "set_interval",
         "add", "remove", "create", "restore", "retry", "precise_refresh",

@@ -113,6 +113,18 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "会依次抓取一次最新条目并更新订阅记录，不会自动创建下载任务。",
         "reversibility": "刷新请求无法撤回；新增条目仍可在订阅页查看和处理。",
     },
+    "rss.mark_entries": {
+        "action": "标记 RSS 条目",
+        "object": "本次预检选中的精确 RSS 条目",
+        "impact": "只会更新本地处理状态，不会删除订阅、下载任务或媒体文件。",
+        "reversibility": "可对仍允许修改的条目再次确认恢复处理状态。",
+    },
+    "rss.submit_entries_to_qb": {
+        "action": "提交指定 RSS 条目",
+        "object": "本次预检冻结的精确待处理条目集合",
+        "impact": "会在 qBittorrent 创建下载任务并更新条目状态。",
+        "reversibility": "可在下载器中暂停或删除任务；已发出的提交请求无法撤回。",
+    },
     "rss.submit_pending_to_qb": {
         "action": "提交 RSS 待处理条目",
         "object": "本次预检选中的条目",
@@ -124,6 +136,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "object": "本次预检判定可安全重试的条目",
         "impact": "会再次向 qBittorrent 提交任务，并更新失败条目的处理状态。",
         "reversibility": "可在下载器中暂停或删除任务；已发出的重试请求无法撤回。",
+    },
+    "discovery.confirm_mapping": {
+        "action": "确认影视身份映射",
+        "object": "当前会话最近查询并重新核验的一个 TMDB 候选",
+        "impact": "会保存一条确认过的跨来源身份映射；不会收藏、订阅、搜索资源或下载。",
+        "reversibility": "可通过后续显式确认改正为另一候选；本次写入不会改动媒体文件。",
     },
     "discovery.add_watchlist": {
         "action": "加入探索收藏",
@@ -215,6 +233,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "会重新安排后续定时整理，不会立即启动或中断整理任务。",
         "reversibility": "可再次修改策略恢复；环境变量锁定的配置不会被覆盖。",
     },
+    "guangya.directory_scrape.run": {
+        "action": "执行光鸭目录刮削预览",
+        "object": "当前会话最近生成并冻结的刮削计划",
+        "impact": "会把计划提交到光鸭整理队列，并可能移动和重命名选中范围内的云盘文件。",
+        "reversibility": "执行前会再次核对内容和计划；已经完成的云盘移动不能自动撤销。",
+    },
     "guangya.organize.run_once": {
         "action": "立即执行一次光鸭整理",
         "object": "当前已配置的整理来源",
@@ -244,6 +268,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "object": "你刚才选择的资源候选",
         "impact": "会向所选下载目标创建任务；不会向模型或页面暴露下载链接。",
         "reversibility": "可在目标下载器或云盘任务中暂停或删除；提交请求无法撤回。",
+    },
+    "library.trigger_patrol_now": {
+        "action": "立即排队全库缺集巡检",
+        "object": "当前巡检策略对应的后台单例任务",
+        "impact": "只会把任务排到现在并唤醒调度器；不会修改策略、搜索资源或下载。",
+        "reversibility": "已开始的只读巡检不会在此动作中取消；重复请求不会创建第二个任务。",
     },
     "library.set_patrol_policy": {
         "action": "更新全库缺集巡检策略",

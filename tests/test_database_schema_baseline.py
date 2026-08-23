@@ -22,6 +22,10 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(media_proxy_playback_records)")
             }
+            mapping_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(media_external_ids)")
+            }
             action_indexes = {
                 str(row["name"])
                 for row in conn.execute("PRAGMA index_list(agent_action_history)")
@@ -43,6 +47,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertIn("season_override", task_columns)
         self.assertIn("episode_override", task_columns)
         self.assertIn("session_id", playback_columns)
+        self.assertIn("version", mapping_columns)
         self.assertIn("idx_agent_action_history_owner_id", action_indexes)
         self.assertEqual(rss_indexes.get("idx_rss_entries_item_guid"), 1)
         self.assertEqual(rss_indexes.get("idx_rss_entries_failure_retry"), 0)

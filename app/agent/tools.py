@@ -58,6 +58,18 @@ from app.agent.rss_download_actions import (
     rss_pending_download_confirmation_context,
     submit_pending_rss_to_qb,
 )
+from app.agent.rss_entry_actions import (
+    list_rss_entry_summaries,
+    mark_rss_entries,
+    mark_rss_entries_confirmed,
+    prepare_mark_rss_entries,
+    prepare_submit_rss_entries,
+    rss_entry_summaries_arguments,
+    rss_mark_entries_arguments,
+    rss_submit_entries_arguments,
+    submit_rss_entries,
+    submit_rss_entries_confirmed,
+)
 from app.agent.rss_refresh_actions import (
     clear_confirmation_state as clear_rss_refresh_confirmation_state,
     prepare_rss_subscriptions_refresh,
@@ -140,6 +152,10 @@ from app.agent.rss_retry_actions import (
     rss_failure_retry_arguments,
     rss_failure_retry_confirmation_context,
 )
+from app.agent.strm_history_actions import (
+    get_strm_run_history,
+    strm_run_history_arguments,
+)
 from app.agent.strm_failure_actions import (
     strm_failure_triage_arguments,
     triage_strm_failures,
@@ -188,6 +204,16 @@ from app.agent.discovery_actions import (
     search_arguments as discovery_search_arguments,
     search_discovery,
 )
+from app.agent.discovery_mapping_actions import (
+    confirm_discovery_mapping,
+    confirm_discovery_mapping_confirmed,
+    discovery_confirm_mapping_arguments,
+    discovery_detail_arguments,
+    discovery_mapping_candidates_arguments,
+    get_discovery_detail,
+    get_discovery_mapping_candidates,
+    prepare_confirm_discovery_mapping,
+)
 from app.agent.discovery_watchlist_actions import (
     add_watchlist,
     add_watchlist_arguments,
@@ -233,6 +259,12 @@ from app.agent.library_patrol_config_actions import (
     set_patrol_policy,
     set_patrol_policy_confirmed,
     summarize_patrol_policy,
+)
+from app.agent.library_patrol_trigger_actions import (
+    patrol_trigger_arguments,
+    prepare_trigger_patrol_now,
+    trigger_patrol_now,
+    trigger_patrol_now_confirmed,
 )
 from app.agent.update_actions import check_library_updates
 from app.agent.episode_resource_actions import (
@@ -368,6 +400,18 @@ from app.agent.guangya_schedule_config_actions import (
     set_guangya_organize_schedule_policy,
     set_guangya_organize_schedule_policy_confirmed,
     summarize_guangya_organize_schedule_policy,
+)
+from app.agent.guangya_directory_scrape_actions import (
+    directory_scrape_inspect_arguments,
+    directory_scrape_preview_arguments,
+    directory_scrape_run_arguments,
+    directory_scrape_search_arguments,
+    inspect_directory_scrape,
+    prepare_run_directory_scrape,
+    preview_directory_scrape,
+    run_directory_scrape,
+    run_directory_scrape_confirmed,
+    search_directory_scrape,
 )
 from app.agent.organize_actions import (
     clean_empty_guangya_organize_sources,
@@ -1734,6 +1778,76 @@ def build_tool_registry() -> ToolRegistry:
         ),
     ))
     registry.register(ToolSpec(
+        name="rss.entry_summaries",
+        description="安全列出 RSS 条目的公开编号、标题、状态、季集线索和固定失败分类；不返回 GUID、payload、下载 URL、路径或凭据。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "properties": {
+                "subscription_number": {"type": "integer", "minimum": 1},
+                "status": {
+                    "type": "string",
+                    "enum": ["all", "pending", "submitting", "downloaded", "failed", "skipped"],
+                    "default": "pending",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            },
+            "additionalProperties": False,
+        },
+        handler=list_rss_entry_summaries,
+        validator=rss_entry_summaries_arguments,
+        llm_read=True,
+        llm_examples=("列出 RSS 待处理条目", "看看 RSS 失败条目", "RSS 订阅 1 最近有哪些条目"),
+    ))
+    registry.register(ToolSpec(
+        name="rss.mark_entries",
+        description="预检并在用户确认后把精确 RSS 条目编号标记为已处理或未处理；不会覆盖正在提交或已下载的条目。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["entry_numbers", "processed"],
+            "properties": {
+                "entry_numbers": {
+                    "type": "array", "minItems": 1, "maxItems": 50, "uniqueItems": True,
+                    "items": {"type": "integer", "minimum": 1},
+                },
+                "processed": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        handler=mark_rss_entries,
+        validator=rss_mark_entries_arguments,
+        requires_confirmation=True,
+        confirmed_handler=mark_rss_entries_confirmed,
+        confirmation_preparer=prepare_mark_rss_entries,
+        llm_confirmation=True,
+        llm_examples=("把 RSS 条目 12 标记为已处理", "把 RSS 条目 12 和 13 恢复为未处理"),
+    ))
+    registry.register(ToolSpec(
+        name="rss.submit_entries_to_qb",
+        description="预检并在用户确认后把精确的 pending RSS 条目集合提交到 qBittorrent；集合与配置会在确认时重新核对。",
+        risk=RiskLevel.DANGER,
+        parameters={
+            "type": "object",
+            "required": ["entry_numbers"],
+            "properties": {
+                "entry_numbers": {
+                    "type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": True,
+                    "items": {"type": "integer", "minimum": 1},
+                },
+            },
+            "additionalProperties": False,
+        },
+        handler=submit_rss_entries,
+        validator=rss_submit_entries_arguments,
+        requires_confirmation=True,
+        confirmed_handler=submit_rss_entries_confirmed,
+        confirmation_preparer=prepare_submit_rss_entries,
+        llm_confirmation=True,
+        llm_examples=("下载 RSS 条目 12 到 qB", "把 RSS 条目 12 和 13 提交到 qBittorrent"),
+    ))
+
+    registry.register(ToolSpec(
         name="rss.refresh_subscription",
         description="预检并在用户确认后刷新一个指定 RSS 订阅；不自动下载且不返回 URL、过滤词、条目正文或凭据。",
         risk=RiskLevel.WRITE,
@@ -2097,6 +2211,29 @@ def build_tool_registry() -> ToolRegistry:
         ),
     ))
     registry.register(ToolSpec(
+        name="strm.run_history",
+        description="读取最近 STRM 运行的安全历史、固定统计、失败聚合和队列计数；不返回运行 ID、来源、路径、文件名、对象标识或错误正文。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
+                "status": {
+                    "type": "string",
+                    "enum": ["all", "running", "success", "partial", "failed", "skipped"],
+                    "default": "all",
+                },
+            },
+            "additionalProperties": False,
+        },
+        handler=get_strm_run_history,
+        validator=strm_run_history_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        llm_examples=("看看 STRM 最近运行历史", "STRM 最近为什么失败", "查看 STRM 队列和失败上下文"),
+    ))
+
+    registry.register(ToolSpec(
         name="strm.triage_failures",
         description="只读汇总 STRM 失败账本的状态与动作类别，不返回路径、文件名、来源、对象标识或错误正文。",
         risk=RiskLevel.READ,
@@ -2269,6 +2406,81 @@ def build_tool_registry() -> ToolRegistry:
         llm_read_plan=True,
     ))
     registry.register(ToolSpec(
+        name="guangya.directory_scrape.inspect",
+        description="按当前整理规则只读检查一个精确光鸭目录或视频文件，并在当前会话保存短期检查上下文；不返回对象 ID、文件名或路径。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "properties": {
+                "directory_id": {"type": "string", "minLength": 1, "maxLength": 180},
+                "file_id": {"type": "string", "minLength": 1, "maxLength": 180},
+            },
+            "oneOf": [{"required": ["directory_id"]}, {"required": ["file_id"]}],
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=inspect_directory_scrape,
+        validator=directory_scrape_inspect_arguments,
+        llm_read=True,
+        llm_examples=("检查光鸭目录 123 是否能刮削", "检查光鸭文件 abc123"),
+    ))
+    registry.register(ToolSpec(
+        name="guangya.directory_scrape.search",
+        description="基于当前会话最近一次光鸭刮削检查搜索 TMDB/MetaTube 匹配候选；不写入映射或云盘。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 120},
+                "media_type": {"type": "string", "enum": ["auto", "movie", "tv"], "default": "auto"},
+                "year": {"type": "string", "pattern": "^[0-9]{4}$"},
+            },
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=search_directory_scrape,
+        validator=directory_scrape_search_arguments,
+        llm_read=True,
+        llm_examples=("给刚才的光鸭目录搜索匹配", "用沧元图搜索刮削候选"),
+    ))
+    registry.register(ToolSpec(
+        name="guangya.directory_scrape.preview",
+        description="按当前会话最近的匹配候选生成安全刮削预览；只做 dry-run，不移动、重命名或删除云盘文件。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["candidate_number"],
+            "properties": {
+                "candidate_number": {"type": "integer", "minimum": 1, "maximum": 10},
+                "season": {"type": "integer", "minimum": 0, "maximum": 99},
+                "episode": {"type": "integer", "minimum": 1, "maximum": 999},
+                "numbering_mode": {
+                    "type": "string", "enum": ["auto", "absolute", "season", "merged_cour"], "default": "auto"
+                },
+            },
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=preview_directory_scrape,
+        validator=directory_scrape_preview_arguments,
+        llm_read=True,
+        llm_examples=("预览刚才第 1 个刮削候选",),
+    ))
+    registry.register(ToolSpec(
+        name="guangya.directory_scrape.run",
+        description="预检并在用户确认后把当前会话最近的光鸭刮削预览提交到现有整理互斥队列；执行前会重新核对内容与计划。",
+        risk=RiskLevel.DANGER,
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=run_directory_scrape,
+        validator=directory_scrape_run_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_run_directory_scrape,
+        context_confirmed_handler=run_directory_scrape_confirmed,
+        llm_confirmation=True,
+        llm_examples=("执行刚才的光鸭刮削预览", "确认整理刚才检查的光鸭目录"),
+    ))
+
+    registry.register(ToolSpec(
         name="guangya.organize.preview",
         description="按当前服务端配置只读预览光鸭整理计划，不移动、改名或删除内容。",
         risk=RiskLevel.READ,
@@ -2392,6 +2604,65 @@ def build_tool_registry() -> ToolRegistry:
         validator=media_rating_arguments,
         llm_read=True,
     ))
+    registry.register(ToolSpec(
+        name="discovery.detail",
+        description="读取一个精确影视来源条目的安全详情和映射确认状态；不会写入映射、收藏、订阅或下载任务。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["provider", "external_id", "media_type"],
+            "properties": {
+                "provider": {"type": "string", "enum": ["tmdb", "douban", "bangumi"]},
+                "external_id": {"type": "string", "minLength": 1, "maxLength": 180},
+                "media_type": {"type": "string", "enum": ["movie", "tv"]},
+            },
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=get_discovery_detail,
+        validator=discovery_detail_arguments,
+        llm_read=True,
+        llm_examples=("查看刚才第 2 个影视详情",),
+    ))
+    registry.register(ToolSpec(
+        name="discovery.mapping_candidates",
+        description="只读查询一个非 TMDB 来源条目的 TMDB 映射候选，并将内部候选身份短期绑定到当前会话；不会自动保存高置信映射。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["provider", "external_id", "media_type"],
+            "properties": {
+                "provider": {"type": "string", "enum": ["tmdb", "douban", "bangumi"]},
+                "external_id": {"type": "string", "minLength": 1, "maxLength": 180},
+                "media_type": {"type": "string", "enum": ["movie", "tv"]},
+            },
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=get_discovery_mapping_candidates,
+        validator=discovery_mapping_candidates_arguments,
+        llm_read=True,
+        llm_examples=("查看刚才第 2 个的 TMDB 映射候选",),
+    ))
+    registry.register(ToolSpec(
+        name="discovery.confirm_mapping",
+        description="预检并在用户确认后保存当前会话最近映射候选中的一个；候选会重新通过 TMDB 详情核验。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["candidate_number"],
+            "properties": {"candidate_number": {"type": "integer", "minimum": 1, "maximum": 5}},
+            "additionalProperties": False,
+        },
+        handler=confirm_discovery_mapping,
+        validator=discovery_confirm_mapping_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_confirm_discovery_mapping,
+        context_confirmed_handler=confirm_discovery_mapping_confirmed,
+        llm_confirmation=True,
+        llm_examples=("确认第 1 个映射",),
+    ))
+
     registry.register(ToolSpec(
         name="discovery.watchlist_summaries",
         description="只读列出有界探索收藏摘要，仅含收藏编号、来源、媒体类型、标题和年份。",
@@ -2919,6 +3190,20 @@ def build_tool_registry() -> ToolRegistry:
         confirmed_handler=set_patrol_policy_confirmed,
         confirmation_preparer=prepare_patrol_policy_confirmation,
         llm_confirmation=True,
+    ))
+
+    registry.register(ToolSpec(
+        name="library.trigger_patrol_now",
+        description="预检并在用户确认后，按当前全库缺集巡检策略把单例后台任务排到现在；不修改策略、不搜索资源、不下载。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=trigger_patrol_now,
+        validator=patrol_trigger_arguments,
+        requires_confirmation=True,
+        confirmed_handler=trigger_patrol_now_confirmed,
+        confirmation_preparer=prepare_trigger_patrol_now,
+        llm_confirmation=True,
+        llm_examples=("按当前策略立即巡检媒体库", "现在执行一次自动缺集巡检"),
     ))
 
     registry.register(ToolSpec(

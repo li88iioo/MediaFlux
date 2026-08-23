@@ -233,9 +233,10 @@ class DiscoveryService:
     def list_watchlist() -> list[dict[str, Any]]:
         return [dict(row) for row in database.list_media_watchlist()]
 
-    def map_to_tmdb(self, provider: str, external_id: str, media_type: str,
-                    title: str, year: str = "", *, confirmed_tmdb_id: str = "",
-                    confirmed_title: str = "", confirmed_year: str = "") -> dict[str, Any]:
+    def lookup_tmdb_mapping(
+        self, provider: str, external_id: str, media_type: str, title: str, year: str = ""
+    ) -> dict[str, Any]:
+        """只读返回已确认映射或 TMDB 候选；绝不写入映射表。"""
         if provider == "tmdb":
             return {"tmdb_id": str(external_id), "confirmed": True, "candidates": []}
         if media_type not in {"movie", "tv"}:
@@ -243,31 +244,101 @@ class DiscoveryService:
         existing = database.get_media_external_id(provider, external_id, media_type)
         if existing and bool(existing["confirmed"]):
             return {
-                "tmdb_id": existing["tmdb_id"], "confirmed": bool(existing["confirmed"]),
+                "tmdb_id": str(existing["tmdb_id"] or ""),
+                "confirmed": True,
+                "candidates": [],
+            }
+        candidates = self._scraper_factory().search_candidates(title, year, media_type)
+        serialized = [self._candidate_dict(candidate) for candidate in candidates]
+        return {
+            "tmdb_id": "",
+            "confirmed": False,
+            "candidates": serialized,
+        }
+
+    def confirm_tmdb_mapping(
+        self, provider: str, external_id: str, media_type: str, tmdb_id: str
+    ) -> dict[str, Any]:
+        """核验显式 TMDB 身份后持久化 confirmed 映射。"""
+        if provider == "tmdb":
+            if str(external_id) != str(tmdb_id):
+                raise ValueError("TMDB 来源身份不一致")
+            return {"tmdb_id": str(tmdb_id), "confirmed": True, "candidates": []}
+        verified = self.verify_tmdb_mapping_candidate(tmdb_id, media_type)
+        requested_id = verified["tmdb_id"]
+        database.upsert_media_external_id(
+            provider, external_id, media_type, requested_id,
+            verified["title"],
+            verified["year"],
+            1.0, True,
+        )
+        return {"tmdb_id": requested_id, "confirmed": True, "candidates": []}
+
+    def confirm_tmdb_mapping_if_unchanged(
+        self,
+        provider: str,
+        external_id: str,
+        media_type: str,
+        tmdb_id: str,
+        expected_mapping: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """核验候选并以 CAS 保存；映射已变化时返回 ``None``。"""
+        if provider == "tmdb":
+            if str(external_id) != str(tmdb_id):
+                raise ValueError("TMDB 来源身份不一致")
+            return {"tmdb_id": str(tmdb_id), "confirmed": True, "candidates": []}
+        verified = self.verify_tmdb_mapping_candidate(tmdb_id, media_type)
+        requested_id = verified["tmdb_id"]
+        if not database.confirm_media_external_id_if_unchanged(
+            provider,
+            external_id,
+            media_type,
+            requested_id,
+            verified["title"],
+            verified["year"],
+            expected_mapping,
+        ):
+            return None
+        return {"tmdb_id": requested_id, "confirmed": True, "candidates": []}
+
+    def verify_tmdb_mapping_candidate(self, tmdb_id: str, media_type: str) -> dict[str, str]:
+        """只读核验一个显式 TMDB 候选，供预检与最终提交共同复用。"""
+        if media_type not in {"movie", "tv"}:
+            raise ValueError("媒体类型无效")
+        requested_id = str(tmdb_id or "").strip()
+        if not requested_id.isdigit() or not 1 <= len(requested_id) <= 10:
+            raise ValueError("TMDB ID 无效")
+        match = self._scraper_factory().match_from_tmdb(requested_id, media_type)
+        if bool(getattr(match, "need_confirm", True)) or str(getattr(match, "tmdb_id", "")) != requested_id:
+            raise ValueError("无法核验所选 TMDB 映射")
+        return {
+            "tmdb_id": requested_id,
+            "title": str(getattr(match, "title", "") or ""),
+            "year": str(getattr(match, "year", "") or ""),
+            "media_type": media_type,
+        }
+
+    def map_to_tmdb(self, provider: str, external_id: str, media_type: str,
+                    title: str, year: str = "", *, confirmed_tmdb_id: str = "",
+                    confirmed_title: str = "", confirmed_year: str = "") -> dict[str, Any]:
+        """兼容入口：复用既有确认；仅新显式 tmdb_id 会核验后写入。"""
+        del confirmed_title, confirmed_year
+        if provider == "tmdb":
+            return {"tmdb_id": str(external_id), "confirmed": True, "candidates": []}
+        if media_type not in {"movie", "tv"}:
+            raise ValueError("媒体类型无效")
+        existing = database.get_media_external_id(provider, external_id, media_type)
+        if existing and bool(existing["confirmed"]):
+            return {
+                "tmdb_id": str(existing["tmdb_id"] or ""),
+                "confirmed": True,
                 "candidates": [],
             }
         if confirmed_tmdb_id:
-            database.upsert_media_external_id(
-                provider, external_id, media_type, confirmed_tmdb_id,
-                confirmed_title or title, confirmed_year or year, 1.0, True,
+            return self.confirm_tmdb_mapping(
+                provider, external_id, media_type, confirmed_tmdb_id
             )
-            return {"tmdb_id": str(confirmed_tmdb_id), "confirmed": True, "candidates": []}
-        if existing:
-            return {
-                "tmdb_id": existing["tmdb_id"], "confirmed": False,
-                "candidates": [],
-            }
-
-        candidates = self._scraper_factory().search_candidates(title, year, media_type)
-        serialized = [self._candidate_dict(candidate) for candidate in candidates]
-        if serialized and float(serialized[0]["score"] or 0) >= 0.9:
-            best = serialized[0]
-            database.upsert_media_external_id(
-                provider, external_id, media_type, best["tmdb_id"], best["title"],
-                best["year"], best["score"], False,
-            )
-            return {"tmdb_id": best["tmdb_id"], "confirmed": False, "candidates": serialized}
-        return {"tmdb_id": "", "confirmed": False, "candidates": serialized}
+        return self.lookup_tmdb_mapping(provider, external_id, media_type, title, year)
 
     async def map_to_tmdb_async(
         self,
