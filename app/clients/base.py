@@ -332,21 +332,26 @@ class MediaServerClient:
             total = len(items)
         return items, max(total, len(items))
 
-    def has_tmdb_media(self, tmdb_id: str, media_type: str) -> bool:
-        """按 ProviderIds.Tmdb 精确判断电影或剧集是否已存在。"""
+    def has_tmdb_media(
+        self, tmdb_id: str, media_type: str, *, parent_id: str = ""
+    ) -> bool:
+        """按 ProviderIds.Tmdb 精确判断电影或剧集是否存在，可限定媒体库。"""
         normalized_id = self._provider_tmdb_id({"Tmdb": tmdb_id})
         normalized_type = "Series" if str(media_type).strip().lower() == "tv" else "Movie"
         if not normalized_id:
             raise ValueError("TMDB ID 无效")
+        params = {
+            "Recursive": "true",
+            "Limit": 20,
+            "IncludeItemTypes": normalized_type,
+            "Fields": "ProviderIds",
+            "AnyProviderIdEquals": f"Tmdb.{normalized_id}",
+        }
+        if str(parent_id or "").strip():
+            params["ParentId"] = str(parent_id).strip()
         data = self._request(
             f"/Users/{self._user_id()}/Items",
-            params={
-                "Recursive": "true",
-                "Limit": 20,
-                "IncludeItemTypes": normalized_type,
-                "Fields": "ProviderIds",
-                "AnyProviderIdEquals": f"Tmdb.{normalized_id}",
-            },
+            params=params,
         )
         items, _total = self._items_payload(data)
         return any(
@@ -710,9 +715,13 @@ class MediaServerClient:
         return result
 
     def refresh_for_paths(
-        self, paths: list[str], *, allowed_library_ids: tuple[str, ...] = (),
+        self,
+        paths: list[str],
+        *,
+        allowed_library_ids: tuple[str, ...] = (),
+        allow_library_fallback: bool = True,
     ) -> dict[str, Any]:
-        """按真实变化路径刷新最深父 Item，可约束到已绑定的媒体库。"""
+        """按真实变化路径刷新最深父 Item，可约束媒体库并禁止库级降级。"""
         allowed_ids = {
             str(item or "").strip() for item in allowed_library_ids or ()
             if str(item or "").strip()
@@ -895,6 +904,14 @@ class MediaServerClient:
         libraries = [
             item for item in dict.fromkeys(library_fallbacks) if item not in refreshed
         ]
+        if libraries and not allow_library_fallback:
+            result["fallback"] = (
+                f"{len(libraries)} 个目标只能定位到媒体库，严格模式已安全跳过"
+            )
+            result["scope"] = "skipped"
+            result["skipped"] = True
+            result["ok"] = False
+            return result
         if not refreshed and not libraries:
             if failed_item_listings:
                 result["fallback"] = (

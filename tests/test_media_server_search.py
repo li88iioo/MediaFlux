@@ -320,6 +320,14 @@ class MediaServerSearchTests(unittest.TestCase):
                 request.call_args.kwargs["params"]["ParentId"], "library-1"
             )
 
+            with self.subTest(client=type(client).__name__, movie=True), patch.object(
+                client, "_request", return_value=payload
+            ) as request:
+                client.has_tmdb_media("12345", "movie", parent_id=" library-1 ")
+            self.assertEqual(
+                request.call_args.kwargs["params"]["ParentId"], "library-1"
+            )
+
             with self.subTest(client=type(client).__name__, unscoped=True), patch.object(
                 client, "_request", return_value=payload
             ) as request:

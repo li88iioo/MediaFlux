@@ -345,6 +345,23 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertTrue(result["fallback"])
                 self.assertEqual(result["scope"], "library")
 
+    def test_strict_mode_never_degrades_to_library_refresh(self):
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), {"lib-tv": []})
+
+                result = client.refresh_for_paths(
+                    [f"{ROOT}/剧集/新作品/Season 01"],
+                    allowed_library_ids=("lib-tv",),
+                    allow_library_fallback=False,
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["skipped"])
+                self.assertEqual(result["scope"], "skipped")
+                self.assertEqual(recorder.refreshed, [])
+                self.assertEqual(recorder.refresh_all_calls, 0)
+
     def test_item_listing_failure_is_safely_skipped(self):
         clients = (
             JellyfinClient("http://jf", "token", allow_global_refresh_fallback=True),

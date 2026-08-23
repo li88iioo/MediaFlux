@@ -1,6 +1,7 @@
 """Agent 短期会话上下文的安全 SQLite 持久化。"""
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -21,6 +22,7 @@ _CONTEXT_TYPES = frozenset({
     "resource_candidates",
     "discovery_candidates",
     "read_operation",
+    "local_media_tasks",
 })
 _SCHEMA_VERSION = 1
 _DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024
@@ -46,6 +48,15 @@ class AgentSessionContextRepository(Protocol):
         payload: dict[str, Any],
         expires_at: float,
     ) -> None: ...
+
+    def mutate_latest(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        updater: Callable[[dict[str, Any] | None], dict[str, Any]],
+        expires_at: float,
+    ) -> PersistedAgentContext: ...
 
     def append_download(
         self,
@@ -146,6 +157,54 @@ class SQLiteAgentSessionContextRepository:
                 (owner_digest, normalized_type, encoded, expiry, db.now()),
             )
             self._bound_rows(conn)
+
+    def mutate_latest(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        updater: Callable[[dict[str, Any] | None], dict[str, Any]],
+        expires_at: float,
+    ) -> PersistedAgentContext:
+        """在单个写事务中读取、更新并替换 owner 最新上下文。"""
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        expiry = self._expiry(expires_at)
+        now = float(self._clock())
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._prune(conn, now=now)
+            row = conn.execute(
+                "SELECT payload,expires_at FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=? AND expires_at>? "
+                "ORDER BY id DESC LIMIT 1",
+                (owner_digest, normalized_type, now),
+            ).fetchone()
+            current = self._decode_row(
+                row, owner_digest=owner_digest, context_type=normalized_type
+            )
+            payload = updater(
+                deepcopy(current.payload) if current is not None else None
+            )
+            encoded = self._encode(
+                owner_digest=owner_digest,
+                context_type=normalized_type,
+                payload=payload,
+                expires_at=expiry,
+            )
+            conn.execute(
+                "DELETE FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=?",
+                (owner_digest, normalized_type),
+            )
+            conn.execute(
+                "INSERT INTO agent_session_context("
+                "owner_digest,context_type,payload,expires_at,created_at"
+                ") VALUES(?,?,?,?,?)",
+                (owner_digest, normalized_type, encoded, expiry, db.now()),
+            )
+            self._bound_rows(conn)
+        return PersistedAgentContext(payload=deepcopy(payload), expires_at=expiry)
 
     def append_download(
         self,

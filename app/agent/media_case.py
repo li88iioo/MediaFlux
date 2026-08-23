@@ -38,6 +38,11 @@ _MEDIA_CASE_STAGE_BY_TOOL: Final[dict[str, str]] = {
     "downloads.recent_submission_status": "acquisition_tracking",
     "downloads.verify_recent_submission_library": "library_verification",
     "library.missing_media_workflows": "acquisition_tracking",
+    "local_media.inspect_task": "organize_review",
+    "local_media.preview_task": "organize_review",
+    "local_media.retry_task": "organize_review",
+    "local_media.refresh_task_library": "library_verification",
+    "local_media.verify_task_library_visibility": "library_verification",
 }
 
 

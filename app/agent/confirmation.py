@@ -142,6 +142,42 @@ class ConfirmationStore:
                 confirmation_contract=deepcopy(ticket.confirmation_contract),
             )
 
+    def claim_and_rotate_owner(
+        self, *, owner: str, confirmation_id: str
+    ) -> ConfirmationTicket:
+        """原子领取一张票据并推进 owner epoch，撤销同会话其余票据。"""
+        owner_key = str(owner or "").strip()
+        ticket_id = str(confirmation_id or "").strip()
+        now = self._clock()
+        with self._lock:
+            self._prune_locked(now)
+            ticket = self._tickets.get(ticket_id)
+            if (
+                ticket is None
+                or not owner_key
+                or not secrets.compare_digest(ticket.owner, owner_key)
+                or ticket.owner_generation != self._owner_generation_locked(
+                    owner_key, now=now, touch=True
+                )
+            ):
+                raise AgentToolError("确认请求无效或已过期", code="confirmation_invalid")
+            generation = self._new_owner_generation_locked()
+            self._owner_generations[owner_key] = (generation, now)
+            for key, active in list(self._tickets.items()):
+                if secrets.compare_digest(active.owner, owner_key):
+                    self._tickets.pop(key, None)
+            return ConfirmationTicket(
+                confirmation_id=ticket.confirmation_id,
+                owner=ticket.owner,
+                tool_name=ticket.tool_name,
+                arguments=deepcopy(ticket.arguments),
+                context_fingerprint=ticket.context_fingerprint,
+                expires_at=ticket.expires_at,
+                owner_generation=ticket.owner_generation,
+                followup_context=deepcopy(ticket.followup_context),
+                confirmation_contract=deepcopy(ticket.confirmation_contract),
+            )
+
     def list_active_tickets(self, *, owner: str) -> list[ConfirmationTicket]:
         """返回 owner 当前世代的有效票据快照，不消费票据。"""
         owner_key = str(owner or "").strip()
@@ -503,6 +539,65 @@ class SQLiteConfirmationStore(ConfirmationStore):
                 "UPDATE agent_confirmation_epochs SET touched_at=?,updated_at=? "
                 "WHERE owner_digest=?",
                 (now, self._timestamp(), owner_digest),
+            )
+        return ConfirmationTicket(
+            confirmation_id=str(row["confirmation_id"]),
+            owner=owner_key,
+            tool_name=str(row["tool_name"]),
+            arguments=self._load_json_object(row["arguments_json"]),
+            context_fingerprint=str(row["context_fingerprint"] or ""),
+            expires_at=float(row["expires_at"]),
+            owner_generation=int(row["owner_generation"]),
+            followup_context=self._load_json_object(row["followup_context_json"]),
+            confirmation_contract=self._load_json_object(
+                row["confirmation_contract_json"]
+            ),
+        )
+
+    def claim_and_rotate_owner(
+        self, *, owner: str, confirmation_id: str
+    ) -> ConfirmationTicket:
+        """在同一 SQLite 事务中领取票据、推进 epoch 并撤销同 owner 票据。"""
+        from app import database as db
+
+        owner_key = str(owner or "").strip()
+        ticket_id = str(confirmation_id or "").strip()
+        if not owner_key or not ticket_id:
+            raise AgentToolError("确认请求无效或已过期", code="confirmation_invalid")
+        owner_digest = self._owner_digest(owner_key)
+        now = self._clock()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+            row = conn.execute(
+                "SELECT confirmation_id,tool_name,arguments_json,context_fingerprint,"
+                "expires_at,owner_generation,followup_context_json,"
+                "confirmation_contract_json FROM agent_confirmations "
+                "WHERE confirmation_id=? AND owner_digest=?",
+                (ticket_id, owner_digest),
+            ).fetchone()
+            epoch = conn.execute(
+                "SELECT generation FROM agent_confirmation_epochs WHERE owner_digest=?",
+                (owner_digest,),
+            ).fetchone()
+            if (
+                row is None
+                or epoch is None
+                or float(row["expires_at"]) <= now
+                or int(row["owner_generation"]) != int(epoch["generation"])
+            ):
+                raise AgentToolError(
+                    "确认请求无效或已过期", code="confirmation_invalid"
+                )
+            generation = self._new_owner_generation(conn)
+            conn.execute(
+                "UPDATE agent_confirmation_epochs SET generation=?,touched_at=?,updated_at=? "
+                "WHERE owner_digest=?",
+                (generation, now, self._timestamp(), owner_digest),
+            )
+            conn.execute(
+                "DELETE FROM agent_confirmations WHERE owner_digest=?", (owner_digest,)
             )
         return ConfirmationTicket(
             confirmation_id=str(row["confirmation_id"]),

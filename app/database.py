@@ -1284,6 +1284,15 @@ CREATE INDEX IF NOT EXISTS idx_agent_confirmations_owner_expiry
 CREATE INDEX IF NOT EXISTS idx_agent_confirmations_expiry
     ON agent_confirmations(expires_at);
 
+CREATE TABLE IF NOT EXISTS agent_action_leases (
+    lease_key TEXT PRIMARY KEY,
+    lease_token TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_action_leases_expiry
+    ON agent_action_leases(expires_at);
+
 CREATE TABLE IF NOT EXISTS telegram_agent_actions (
     action_id TEXT PRIMARY KEY,
     owner_digest TEXT NOT NULL,
@@ -1780,6 +1789,10 @@ def init_db() -> None:
             )
             conn.execute(
                 "DELETE FROM agent_confirmations WHERE expires_at<=?",
+                (time.time(),),
+            )
+            conn.execute(
+                "DELETE FROM agent_action_leases WHERE expires_at<=?",
                 (time.time(),),
             )
             conn.execute(
@@ -5735,6 +5748,72 @@ def reset_local_media_task(
             params,
         )
         return cur.rowcount == 1
+
+
+def claim_agent_action_lease(
+    lease_key: str, *, ttl_seconds: int = 90
+) -> str | None:
+    """跨 owner/Worker 原子领取短期外部动作去重租约。"""
+    import uuid
+
+    normalized = str(lease_key or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise ValueError("Agent 动作租约键无效")
+    ttl = max(5, min(int(ttl_seconds), 300))
+    current = time.time()
+    token = uuid.uuid4().hex
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM agent_action_leases WHERE expires_at<=?", (current,)
+        )
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO agent_action_leases("
+            "lease_key,lease_token,expires_at,created_at) VALUES(?,?,?,?)",
+            (normalized, token, current + ttl, now()),
+        )
+        return token if cur.rowcount == 1 else None
+
+
+def reset_local_media_task_if_current(
+    task_id: int,
+    *,
+    owner: str = "admin",
+    expected_version: int,
+    expected_status: str,
+) -> bool:
+    """按任务版本与可重试终态原子重新排队，并切换新的操作幂等标识。"""
+    import uuid
+
+    safe_status = str(expected_status or "").strip().lower()
+    if safe_status not in {"failed", "requires_manual"}:
+        return False
+    if isinstance(expected_version, bool) or int(expected_version) < 1:
+        return False
+    stamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',"
+            "snapshot_digest='',operation_token=?,error='',warning='',completed_at=NULL,"
+            "version=version+1,updated_at=? WHERE id=? AND owner=? AND version=? AND status=?",
+            (
+                uuid.uuid4().hex,
+                stamp,
+                int(task_id),
+                _local_media_owner(owner),
+                int(expected_version),
+                safe_status,
+            ),
+        )
+        if cur.rowcount == 1:
+            # 旧 attempt 的目标路径不可参与新 attempt 的精准刷新或可见性核验。
+            conn.execute(
+                "DELETE FROM local_media_task_items WHERE task_id=?",
+                (int(task_id),),
+            )
+            return True
+        return False
 
 
 def delete_local_library_target(source_id: int, category: str, *, owner: str = "admin") -> bool:

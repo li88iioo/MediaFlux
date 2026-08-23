@@ -34,6 +34,7 @@ from app.agent.observability import (
 )
 from app.agent.intents import ReadIntentSpec, match_read_intent
 from app.agent import local_media_intents
+from app.agent.local_media_task_actions import clear_local_media_agent_context
 from app.agent.indexer_config_actions import current_indexer_site_ids
 from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
 from app.agent.llm_router import (
@@ -5281,6 +5282,7 @@ class AgentOrchestrator:
         self.recent_discovery_store.clear_owner(owner=owner_key)
         self.recent_download_store.clear_owner(owner=owner_key)
         self.recent_read_store.clear_owner(owner=owner_key)
+        clear_local_media_agent_context(owner=owner_key)
         persisted = 0
         if self.session_context_repository is not None:
             try:
@@ -6498,15 +6500,23 @@ class AgentOrchestrator:
             owner=owner, request_id=request_id, session_id=session_id
         )
         try:
-            ticket = self.confirmation_store.claim(
-                owner=owner, confirmation_id=confirmation_id
+            claim_and_rotate = getattr(
+                self.confirmation_store, "claim_and_rotate_owner", None
             )
+            if callable(claim_and_rotate):
+                ticket = claim_and_rotate(
+                    owner=owner, confirmation_id=confirmation_id
+                )
+                self._reconcile_missing_confirmations(owner, ())
+            else:
+                ticket = self.confirmation_store.claim(
+                    owner=owner, confirmation_id=confirmation_id
+                )
+                # 兼容外部自定义 store；内置 store 会在同一事务中领取并推进 epoch。
+                self.invalidate_query_confirmation_epoch(owner=owner)
         except AgentToolError:
             agent_metrics.record_confirmation("invalid")
             raise
-        # 票据已在当前 owner 的受控终态窗口内原子领取；立即推进 epoch，
-        # 使被本次确认抢占的后台旧 query 无法再签发未展示的迟到票据。
-        self.invalidate_query_confirmation_epoch(owner=owner)
         agent_metrics.record_confirmation("claimed")
         risk = self.registry.risk_for(ticket.tool_name)
         try:
@@ -7590,6 +7600,25 @@ class AgentOrchestrator:
                     "启用本地媒体来源 2 的目录自动扫描",
                     "查看本地媒体来源 2 详情",
                 ],
+            )
+        local_task_request = local_media_intents.local_media_task_request(message)
+        if local_task_request is not None:
+            tool_name, arguments = local_task_request
+            if not owner:
+                return self._unsupported(
+                    "本地媒体任务操作需要在已登录会话中执行",
+                    ["请登录后重新列出本地媒体任务。"],
+                )
+            if tool_name in {
+                "local_media.retry_task",
+                "local_media.refresh_task_library",
+            }:
+                return self.prepare(tool_name, arguments, owner=owner)
+            return self._invoke_query_read(
+                tool_name,
+                arguments,
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
             )
         local_source_summary = local_media_intents.local_media_source_summary_request(message)
         if local_source_summary is not None:

@@ -76,6 +76,34 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
             outcomes = sorted(pool.map(lambda _index: claim_once(), range(2)))
         self.assertEqual(outcomes, ["claimed", "confirmation_invalid"])
 
+    def test_claim_and_rotate_is_atomic_for_two_tickets_across_instances(self) -> None:
+        tokens = iter((
+            "atomic-ticket-first-123456789",
+            "atomic-ticket-second-12345678",
+        ))
+        issuer = SQLiteConfirmationStore(token_factory=lambda: next(tokens))
+        tickets = [
+            issuer.issue(owner="owner-a", tool_name="write.test", arguments={})
+            for _ in range(2)
+        ]
+        barrier = threading.Barrier(2)
+
+        def claim(ticket_id: str) -> str:
+            barrier.wait(timeout=3)
+            try:
+                SQLiteConfirmationStore().claim_and_rotate_owner(
+                    owner="owner-a", confirmation_id=ticket_id
+                )
+            except AgentToolError as exc:
+                return exc.code
+            return "claimed"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = sorted(pool.map(
+                claim, [item.confirmation_id for item in tickets]
+            ))
+        self.assertEqual(outcomes, ["claimed", "confirmation_invalid"])
+
     def test_owner_rotation_revokes_tickets_across_instances(self) -> None:
         first = SQLiteConfirmationStore(
             token_factory=lambda: "rotated-ticket-1234567890"

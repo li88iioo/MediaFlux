@@ -58,6 +58,33 @@ class ConfirmationStoreTests(unittest.TestCase):
         self.assertEqual([item.confirmation_id for item in second], [ticket.confirmation_id])
         self.assertEqual(store.claim(owner="owner-a", confirmation_id=ticket.confirmation_id).arguments, {"id": 1})
 
+    def test_claim_and_rotate_revokes_same_owner_but_not_other_owner(self):
+        tokens = iter((
+            "ticket-owner-a-first-123456",
+            "ticket-owner-a-second-12345",
+            "ticket-owner-b-first-123456",
+        ))
+        store = ConfirmationStore(token_factory=lambda: next(tokens))
+        first = store.issue(owner="owner-a", tool_name="write.test", arguments={})
+        second = store.issue(owner="owner-a", tool_name="write.test", arguments={})
+        other = store.issue(owner="owner-b", tool_name="write.test", arguments={})
+
+        claimed = store.claim_and_rotate_owner(
+            owner="owner-a", confirmation_id=first.confirmation_id
+        )
+
+        self.assertEqual(claimed.confirmation_id, first.confirmation_id)
+        with self.assertRaises(AgentToolError):
+            store.claim_and_rotate_owner(
+                owner="owner-a", confirmation_id=second.confirmation_id
+            )
+        self.assertEqual(
+            store.claim_and_rotate_owner(
+                owner="owner-b", confirmation_id=other.confirmation_id
+            ).owner,
+            "owner-b",
+        )
+
     def test_ticket_is_single_use_and_arguments_are_copied(self):
         store = ConfirmationStore(token_factory=lambda: "ticket-1234567890abcdef")
         arguments = {"items": ["one"]}

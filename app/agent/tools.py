@@ -281,6 +281,22 @@ from app.agent.local_media_actions import (
     summarize_local_media_history,
     summarize_local_media_review_queue,
 )
+from app.modules.local_media_models import LOCAL_TASK_STATUSES
+from app.agent.local_media_task_actions import (
+    inspect_local_media_task,
+    list_local_media_task_summaries,
+    local_media_inspection_arguments,
+    local_media_task_number_arguments,
+    local_media_task_summaries_arguments,
+    prepare_refresh_local_media_task_library,
+    prepare_retry_local_media_task,
+    preview_local_media_task,
+    refresh_local_media_task_library,
+    refresh_local_media_task_library_confirmed,
+    retry_local_media_task,
+    retry_local_media_task_confirmed,
+    verify_local_media_task_library_visibility,
+)
 from app.agent.local_media_source_actions import (
     get_local_media_source_summary,
     list_local_media_source_summaries,
@@ -1090,6 +1106,106 @@ def build_tool_registry() -> ToolRegistry:
         validator=local_media_review_queue_arguments,
         llm_read=True,
         llm_read_plan=True,
+    ))
+    registry.register(ToolSpec(
+        name="local_media.task_summaries",
+        description="只读列出本地媒体任务的 owner 绑定短期公开序号、媒体标题、阶段和可用动作，不返回路径、哈希、数据库 ID 或错误正文。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["all", "attention", "active", "history", *sorted(LOCAL_TASK_STATUSES)],
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=list_local_media_task_summaries,
+        validator=local_media_task_summaries_arguments,
+        llm_read=True,
+        llm_examples=("列出本地媒体任务", "查看失败的本地整理任务"),
+    ))
+    registry.register(ToolSpec(
+        name="local_media.inspect_task",
+        description="只读检查一个短期公开序号对应的待人工确认任务，生成 owner 绑定检查序号；不返回路径、错误正文或内部句柄。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["task_number"],
+            "properties": {"task_number": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=inspect_local_media_task,
+        validator=local_media_task_number_arguments,
+        llm_read=True,
+    ))
+    registry.register(ToolSpec(
+        name="local_media.preview_task",
+        description="基于 owner 绑定短期检查序号生成本地整理匹配预览；只读且不返回路径、TMDB ID、规则快照或内部检查 ID。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["inspection_number"],
+            "properties": {"inspection_number": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=preview_local_media_task,
+        validator=local_media_inspection_arguments,
+        llm_read=True,
+    ))
+    registry.register(ToolSpec(
+        name="local_media.retry_task",
+        description="预检并确认后仅重试 failed 或 requires_manual 的本地媒体任务；使用版本条件原子重新排队，不直接移动文件。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["task_number"],
+            "properties": {"task_number": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        handler=retry_local_media_task,
+        validator=local_media_task_number_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_retry_local_media_task,
+        context_confirmed_handler=retry_local_media_task_confirmed,
+        llm_confirmation=True,
+    ))
+    registry.register(ToolSpec(
+        name="local_media.refresh_task_library",
+        description="预检并确认后，仅对已完成任务重新解析出的唯一绑定媒体服务器与媒体库执行精准路径刷新；不接受 URL、路径或内部 ID。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["task_number"],
+            "properties": {"task_number": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        handler=refresh_local_media_task_library,
+        validator=local_media_task_number_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_refresh_local_media_task_library,
+        context_confirmed_handler=refresh_local_media_task_library_confirmed,
+        llm_confirmation=True,
+    ))
+    registry.register(ToolSpec(
+        name="local_media.verify_task_library_visibility",
+        description="只读核验已完成任务的媒体是否已在唯一绑定媒体库中索引，并明确标记未执行真实播放探测。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["task_number"],
+            "properties": {"task_number": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=verify_local_media_task_library_visibility,
+        validator=local_media_task_number_arguments,
+        llm_read=True,
     ))
     registry.register(ToolSpec(
         name="local_media.history_summary",

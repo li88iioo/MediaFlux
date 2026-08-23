@@ -232,6 +232,67 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         self.assertNotIn("secret-task", serialized)
         self.assertNotIn("/private/path", serialized)
 
+    def test_local_media_action_history_keeps_tool_identity_and_safe_counts(self):
+        cases = (
+            (
+                "local_media.retry_task",
+                {
+                    "operation": "retry",
+                    "task_number": 2,
+                    "affected": 1,
+                    "runtime_refreshed": True,
+                    "path": "/private/source",
+                },
+            ),
+            (
+                "local_media.refresh_task_library",
+                {
+                    "operation": "precise_refresh",
+                    "task_number": 3,
+                    "refreshed": 1,
+                    "matched_paths": 2,
+                    "library_id": "private-library",
+                    "server_url": "http://private-server",
+                },
+            ),
+        )
+        for tool_name, data in cases:
+            record_confirmed_result(
+                owner=OWNER,
+                tool_name=tool_name,
+                risk=RiskLevel.LOW_WRITE,
+                result=ToolResult(True, "completed", "done", data=data),
+                elapsed_ms=3,
+            )
+        items = list_action_history(
+            {"limit": 10, "outcome": "all"}, ToolContext(owner=OWNER)
+        ).data["items"]
+        by_tool = {item["tool"]: item for item in items}
+        self.assertIn("local_media.retry_task", by_tool)
+        self.assertIn("local_media.refresh_task_library", by_tool)
+        self.assertEqual(
+            by_tool["local_media.retry_task"]["details"],
+            {
+                "operation": "retry",
+                "task_number": 2,
+                "affected": 1,
+                "runtime_refreshed": True,
+            },
+        )
+        self.assertEqual(
+            by_tool["local_media.refresh_task_library"]["details"],
+            {
+                "operation": "precise_refresh",
+                "task_number": 3,
+                "refreshed": 1,
+                "matched_paths": 2,
+            },
+        )
+        serialized = json.dumps(items, ensure_ascii=False)
+        self.assertNotIn("/private", serialized)
+        self.assertNotIn("private-library", serialized)
+        self.assertNotIn("private-server", serialized)
+
     def test_clean_empty_history_keeps_only_aggregate_counts(self):
         record_confirmed_result(
             owner=OWNER,

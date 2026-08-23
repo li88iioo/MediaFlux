@@ -46,6 +46,9 @@ _MEDIA_CONTEXT_TOOL_TYPES: dict[str, str] = {
     "downloads.recent_submission_status": "tv",
     "downloads.verify_recent_submission_library": "tv",
     "library.missing_media_workflows": "tv",
+    "local_media.inspect_task": "",
+    "local_media.preview_task": "",
+    "local_media.verify_task_library_visibility": "",
 }
 _MEDIA_CONTEXT_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 _HISTORY_CREDENTIAL_RE = re.compile(

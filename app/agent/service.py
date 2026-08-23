@@ -6,6 +6,10 @@ import threading
 from app.agent.orchestrator import AgentOrchestrator
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.missing_media_workflows import SQLiteMissingMediaWorkflowRepository
+from app.agent.local_media_task_actions import (
+    configure_local_media_agent_context,
+    reset_local_media_agent_context_for_tests,
+)
 from app.agent.recent_download_submissions import (
     RecentDownloadSubmissionStore,
     enqueue_recent_download_library_verification,
@@ -27,6 +31,7 @@ def get_agent_service() -> AgentOrchestrator:
         with _lock:
             if _service is None:
                 context_repository = SQLiteAgentSessionContextRepository()
+                configure_local_media_agent_context(context_repository)
                 missing_workflow_repository = SQLiteMissingMediaWorkflowRepository()
                 _service = AgentOrchestrator(
                     build_tool_registry(),
@@ -60,3 +65,4 @@ def reset_agent_service_for_tests() -> None:
     global _service
     with _lock:
         _service = None
+        reset_local_media_agent_context_for_tests()

@@ -147,3 +147,59 @@ def is_local_media_diagnosis_message(message: str) -> bool:
     return any(scope in normalized for scope in _LOCAL_MEDIA_DIAGNOSIS_SCOPES) and any(
         intent in normalized for intent in _LOCAL_MEDIA_DIAGNOSIS_INTENTS
     )
+
+
+def local_media_task_request(
+    message: str,
+) -> tuple[str, dict[str, Any]] | None:
+    """解析本地媒体任务列表、检查、重试、精准刷新和可见性核验。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not any(scope in normalized for scope in _LOCAL_MEDIA_DIAGNOSIS_SCOPES):
+        return None
+
+    inspection = re.search(
+        r"(?:检查|预览)(?:编号|序号)?\s*[#:]?\s*(\d{1,5})", normalized
+    )
+    if inspection and "预览" in normalized and "检查" in normalized:
+        number = int(inspection.group(1))
+        return (
+            "local_media.preview_task",
+            {"inspection_number": number},
+        ) if number > 0 else None
+
+    task_match = re.search(
+        r"(?:任务|记录)(?:编号|序号)?\s*[#:]?\s*(\d{1,5})", normalized
+    )
+    if task_match:
+        number = int(task_match.group(1))
+        if number <= 0:
+            return None
+        arguments = {"task_number": number}
+        if any(token in normalized for token in ("重试", "重新处理", "再处理", "重新排队")):
+            return "local_media.retry_task", arguments
+        if (
+            any(token in normalized for token in (
+                "刷新媒体库", "刷新入库", "刷新绑定库", "重新刷新",
+            ))
+            or ("刷新" in normalized and "媒体库" in normalized)
+        ):
+            return "local_media.refresh_task_library", arguments
+        if any(token in normalized for token in (
+            "入库可见", "库中可见", "是否入库", "索引了吗", "已索引", "可播放吗",
+        )):
+            return "local_media.verify_task_library_visibility", arguments
+        if any(token in normalized for token in ("检查", "查看", "详情", "复核")):
+            return "local_media.inspect_task", arguments
+
+    if "任务" not in normalized and "记录" not in normalized:
+        return None
+    if not any(token in normalized for token in ("列出", "列表", "查看", "看看", "有哪些")):
+        return None
+    scope = "all"
+    if any(token in normalized for token in ("失败", "待确认", "需人工", "需要关注")):
+        scope = "attention"
+    elif any(token in normalized for token in ("处理中", "进行中", "活动")):
+        scope = "active"
+    elif any(token in normalized for token in ("历史", "已完成")):
+        scope = "history"
+    return "local_media.task_summaries", {"scope": scope, "limit": 12}

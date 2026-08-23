@@ -38,6 +38,8 @@ _TOOL_LABELS = {
     "telegram.send_test_notification": "Telegram 测试通知",
     "media_proxy.set_instance_enabled": "媒体反代实例启停",
     "local_media.set_source_trigger_enabled": "本地媒体来源触发器启停",
+    "local_media.retry_task": "本地媒体任务重试",
+    "local_media.refresh_task_library": "本地媒体任务精准刷新",
     "recognition.set_rule_enabled": "识别规则启停",
     "discovery.add_watchlist": "探索收藏添加",
     "discovery.remove_watchlist": "探索收藏移除",
@@ -98,6 +100,12 @@ _SAFE_FIELDS = {
     "local_media.set_source_trigger_enabled": {
         "operation", "source_number", "trigger", "enabled", "affected", "runtime_refreshed",
     },
+    "local_media.retry_task": {
+        "operation", "task_number", "affected", "runtime_refreshed",
+    },
+    "local_media.refresh_task_library": {
+        "operation", "task_number", "refreshed", "matched_paths",
+    },
     "recognition.set_rule_enabled": {"operation", "rule_type", "rule_id", "enabled", "affected"},
     "discovery.add_watchlist": {"operation", "watchlist_number", "affected"},
     "discovery.remove_watchlist": {"operation", "watchlist_number", "affected"},
@@ -147,7 +155,8 @@ _COUNT_FIELDS = {
     "total", "new", "skipped", "site_count", "affected",
     "refresh_interval_minutes", "deleted_entries",
     "max_series", "progress_current", "progress_total", "instance_number", "rule_id",
-    "subscription_number", "watchlist_number", "source_number", "season", "expired_candidates", "cancelled_admissions", "cancelled_runs",
+    "subscription_number", "watchlist_number", "source_number", "task_number", "season",
+    "expired_candidates", "cancelled_admissions", "cancelled_runs", "refreshed", "matched_paths",
 }
 _BOOL_FIELDS = {
     "accepted", "enabled", "runtime_refreshed", "created", "duplicate", "delete_files",
@@ -178,7 +187,10 @@ _ENUM_FIELDS = {
     "trigger": {"manual", "qb_completed", "scan"},
     "trigger_type": {"manual"},
     "rule_type": {"preprocess_rule", "tmdb_regex_rule", "knowledge_entry"},
-    "operation": {"pause", "resume", "delete", "enable", "disable", "set_interval", "add", "remove", "create", "restore"},
+    "operation": {
+        "pause", "resume", "delete", "enable", "disable", "set_interval",
+        "add", "remove", "create", "restore", "retry", "precise_refresh",
+    },
     "status": {"accepted", "submitted", "completed", "partial", "failed", "duplicate"},
 }
 
