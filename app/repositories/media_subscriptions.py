@@ -571,6 +571,46 @@ def finish_media_subscription_run(
         return cur.rowcount == 1
 
 
+def _enqueue_run_notification(
+    conn: Any,
+    *,
+    subscription_id: int,
+    run_id: int,
+    subscription_revision: int,
+    event_type: str,
+    payload: dict[str, Any],
+    stamp: str,
+) -> bool:
+    flag = {
+        "missing": "notify_on_missing",
+        "satisfied": "notify_on_satisfied",
+        "error": "notify_on_error",
+    }.get(str(event_type))
+    if flag is None:
+        return False
+    rule = conn.execute(
+        f"SELECT enabled,{flag} AS event_enabled "
+        "FROM media_subscription_notification_rules WHERE subscription_id=?",
+        (int(subscription_id),),
+    ).fetchone()
+    if rule is None or not int(rule["enabled"] or 0) or not int(rule["event_enabled"] or 0):
+        return False
+    event_key = f"media-subscription-run:{int(run_id)}:{event_type}"
+    encoded = _json(payload, {})
+    cur = conn.execute(
+        "INSERT INTO media_subscription_notification_outbox("
+        "event_key,subscription_id,subscription_revision,run_id,event_type,payload_json,"
+        "status,attempts,lease_generation,next_attempt_at,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,'pending',0,0,?,?,?) "
+        "ON CONFLICT(event_key) DO NOTHING",
+        (
+            event_key, int(subscription_id), int(subscription_revision), int(run_id),
+            str(event_type), encoded, stamp, stamp, stamp,
+        ),
+    )
+    return cur.rowcount == 1
+
+
 def finalize_media_subscription_check(
     subscription_id: int,
     run_id: int,
@@ -615,6 +655,27 @@ def finalize_media_subscription_check(
             "WHERE id=? AND status='running'",
             (final_status, final_summary, _json(payload, {}), final_error, stamp, int(run_id)),
         )
+        if committed and final_status in {"missing", "satisfied"}:
+            subscription = conn.execute(
+                "SELECT title FROM media_subscriptions WHERE id=?",
+                (int(subscription_id),),
+            ).fetchone()
+            _enqueue_run_notification(
+                conn,
+                subscription_id=subscription_id,
+                run_id=run_id,
+                subscription_revision=subscription_revision,
+                event_type=final_status,
+                payload={
+                    "subscription_number": int(subscription_id),
+                    "title": str(subscription["title"] or "") if subscription else "",
+                    "status": final_status,
+                    "expected_count": int(expected_count),
+                    "local_count": int(local_count),
+                    "missing_count": int(missing_count),
+                },
+                stamp=stamp,
+            )
         return committed
 
 
@@ -648,6 +709,24 @@ def fail_media_subscription_check(
             "WHERE id=? AND status='running'",
             (run_status, run_message, run_message, stamp, int(run_id)),
         )
+        if committed:
+            subscription = conn.execute(
+                "SELECT title FROM media_subscriptions WHERE id=?",
+                (int(subscription_id),),
+            ).fetchone()
+            _enqueue_run_notification(
+                conn,
+                subscription_id=subscription_id,
+                run_id=run_id,
+                subscription_revision=subscription_revision,
+                event_type="error",
+                payload={
+                    "subscription_number": int(subscription_id),
+                    "title": str(subscription["title"] or "") if subscription else "",
+                    "status": "error",
+                },
+                stamp=stamp,
+            )
         return committed
 
 

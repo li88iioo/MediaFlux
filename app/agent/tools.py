@@ -110,6 +110,29 @@ from app.agent.media_subscription_actions import (
     set_media_subscription_policy,
     set_media_subscription_policy_confirmed,
 )
+from app.agent.media_consumption_actions import (
+    clear_preferences,
+    clear_preferences_confirmed,
+    continue_watching_arguments,
+    empty_arguments as media_consumption_empty_arguments,
+    get_continue_watching,
+    get_preferences,
+    get_subscription_notification_rule,
+    get_today_summary,
+    notification_rule_arguments,
+    notification_rule_update_arguments,
+    preferences_update_arguments,
+    prepare_clear_preferences,
+    prepare_reset_subscription_notification_rule,
+    prepare_set_preferences,
+    prepare_set_subscription_notification_rule,
+    reset_subscription_notification_rule,
+    reset_subscription_notification_rule_confirmed,
+    set_preferences,
+    set_preferences_confirmed,
+    set_subscription_notification_rule,
+    set_subscription_notification_rule_confirmed,
+)
 from app.agent.rss_retry_actions import (
     clear_confirmation_state as clear_rss_retry_confirmation_state,
     preview_rss_failure_retry,
@@ -313,11 +336,13 @@ from app.agent.media_server_actions import (
 )
 from app.agent.media_proxy_actions import (
     media_proxy_enabled_arguments,
+    media_proxy_failure_summary_arguments,
     media_proxy_status_arguments,
     media_proxy_test_arguments,
     prepare_set_media_proxy_instance_enabled,
     set_media_proxy_instance_enabled,
     set_media_proxy_instance_enabled_confirmed,
+    summarize_media_proxy_playback_failures,
     summarize_media_proxy_status,
     test_media_proxy_instance,
 )
@@ -1410,6 +1435,7 @@ def build_tool_registry() -> ToolRegistry:
             "我订阅了哪些媒体",
             "列出当前的追更订阅",
             "查看我的订阅",
+            "看看我的媒体订阅",
         ),
     ))
     registry.register(ToolSpec(
@@ -1559,6 +1585,136 @@ def build_tool_registry() -> ToolRegistry:
         requires_confirmation=True,
         confirmed_handler=set_media_subscription_enabled_confirmed,
         confirmation_preparer=prepare_set_media_subscription_enabled,
+        llm_confirmation=True,
+    ))
+    registry.register(ToolSpec(
+        name="media.continue_watching",
+        description="读取显式配置媒体用户的继续观看列表；不会回退管理员或其他用户，也不返回用户 ID、媒体内部 ID、URL、路径或凭据。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "properties": {
+                "server": {"type": "string", "enum": ["auto", "jellyfin", "emby"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 12},
+            },
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=get_continue_watching,
+        validator=continue_watching_arguments,
+        llm_read=True,
+        llm_examples=("继续观看", "查看 Jellyfin 继续观看", "Emby 还有哪些没看完"),
+    ))
+    registry.register(ToolSpec(
+        name="media.preferences",
+        description="读取当前会话显式保存的媒体服务器与下载目标偏好；不从聊天摘要或模型记忆推断。",
+        risk=RiskLevel.READ,
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=get_preferences,
+        validator=media_consumption_empty_arguments,
+        llm_read=True,
+        llm_examples=("查看我的媒体偏好", "下载默认到哪里", "我偏好哪个媒体服务器"),
+    ))
+    registry.register(ToolSpec(
+        name="media.set_preferences",
+        description="预检并在用户确认后保存当前会话的显式媒体偏好；偏好按会话身份隔离，不修改系统全局配置。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "preferred_server": {"type": "string", "enum": ["any", "jellyfin", "emby"]},
+                "preferred_download_target": {"type": "string", "enum": ["qb", "guangya", "both"]},
+            },
+            "additionalProperties": False,
+        },
+        handler=set_preferences,
+        validator=preferences_update_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_set_preferences,
+        context_confirmed_handler=set_preferences_confirmed,
+        llm_confirmation=True,
+        llm_examples=("以后默认下载到光鸭", "优先用 Jellyfin", "默认下载目标改为两边"),
+    ))
+    registry.register(ToolSpec(
+        name="media.clear_preferences",
+        description="预检并在用户确认后清除当前会话保存的显式媒体偏好，恢复产品默认值。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=clear_preferences,
+        validator=media_consumption_empty_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_clear_preferences,
+        context_confirmed_handler=clear_preferences_confirmed,
+        llm_confirmation=True,
+    ))
+    registry.register(ToolSpec(
+        name="media.today_summary",
+        description="按本机今天的日期汇总全局管理员范围内的追更检查、整理入库、RSS 与下载内容事件；不返回路径、磁力、凭据或错误正文。",
+        risk=RiskLevel.READ,
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=get_today_summary,
+        validator=media_consumption_empty_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        llm_examples=("今天媒体有什么更新", "今日内容摘要", "今天下载和入库了什么"),
+    ))
+    registry.register(ToolSpec(
+        name="media.subscription_notification_rule",
+        description="读取指定全局媒体追更订阅的通知规则；只返回公开订阅编号、标题和布尔开关。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["subscription_number"],
+            "properties": {"subscription_number": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=get_subscription_notification_rule,
+        validator=notification_rule_arguments,
+        llm_read=True,
+        llm_examples=("查看媒体订阅 1 的通知规则",),
+    ))
+    registry.register(ToolSpec(
+        name="media.set_subscription_notification_rule",
+        description="预检并在用户确认后修改指定全局媒体追更订阅的缺集、满足或错误通知开关；不会改变订阅巡检策略。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["subscription_number"],
+            "properties": {
+                "subscription_number": {"type": "integer", "minimum": 1},
+                "enabled": {"type": "boolean"},
+                "notify_on_missing": {"type": "boolean"},
+                "notify_on_satisfied": {"type": "boolean"},
+                "notify_on_error": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        handler=set_subscription_notification_rule,
+        validator=notification_rule_update_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_set_subscription_notification_rule,
+        context_confirmed_handler=set_subscription_notification_rule_confirmed,
+        llm_confirmation=True,
+        llm_examples=("开启媒体订阅 1 的缺集通知", "关闭媒体订阅 2 的错误通知"),
+    ))
+    registry.register(ToolSpec(
+        name="media.reset_subscription_notification_rule",
+        description="预检并在用户确认后删除指定全局媒体追更订阅的显式通知规则，恢复默认关闭状态。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["subscription_number"],
+            "properties": {"subscription_number": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        handler=reset_subscription_notification_rule,
+        validator=notification_rule_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_reset_subscription_notification_rule,
+        context_confirmed_handler=reset_subscription_notification_rule_confirmed,
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -1718,6 +1874,25 @@ def build_tool_registry() -> ToolRegistry:
         validator=media_proxy_status_arguments,
         llm_read=True,
         llm_read_plan=True,
+    ))
+    registry.register(ToolSpec(
+        name="media_proxy.playback_failure_summary",
+        description="按固定时间窗聚合已记录的媒体反代播放请求、失败阶段、路由类别、缓存命中与平均时延；不返回媒体名、用户、会话、URL、路径或错误正文。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["hours"],
+            "properties": {
+                "hours": {"type": "integer", "enum": [1, 6, 24, 72]},
+                "instance_number": {"type": "integer", "minimum": 1, "maximum": 10000},
+            },
+            "additionalProperties": False,
+        },
+        handler=summarize_media_proxy_playback_failures,
+        validator=media_proxy_failure_summary_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        llm_examples=("查看最近 24 小时播放失败摘要", "媒体反代最近 6 小时哪里失败最多"),
     ))
     registry.register(ToolSpec(
         name="media_proxy.test_instance",

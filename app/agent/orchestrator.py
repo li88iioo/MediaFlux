@@ -1569,6 +1569,153 @@ def _has_media_subscription_scope(message: str) -> bool:
     return bool(re.search(_MEDIA_SUBSCRIPTION_SCOPE_PATTERN, message, re.IGNORECASE))
 
 
+_MEDIA_SUBSCRIPTION_NOTIFICATION_TOKENS = ("通知", "提醒", "消息")
+_MEDIA_SUBSCRIPTION_NOTIFICATION_WRITE_TOKENS = (
+    "开启", "启用", "打开", "关闭", "停用", "禁用", "设置", "修改", "调整", "改为", "改成",
+)
+
+
+def _media_subscription_notification_number(message: str) -> int | None:
+    normalized = _normalize_intent_message(message)
+    patterns = (
+        r"(?:媒体|影视)?(?:追更)?订阅\s*(?:编号|id)?\s*[#:]?\s*(\d{1,9})",
+        r"追更\s*(?:编号|id)?\s*[#:]?\s*(\d{1,9})",
+    )
+    found: set[int] = set()
+    for pattern in patterns:
+        for matched in re.finditer(pattern, normalized, re.IGNORECASE):
+            value = int(matched.group(1))
+            if value > 0:
+                found.add(value)
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def is_media_subscription_notification_rule_message(message: str) -> bool:
+    normalized = _normalize_intent_message(message)
+    return bool(
+        "rss" not in normalized
+        and ("订阅" in normalized or "追更" in normalized)
+        and any(token in normalized for token in _MEDIA_SUBSCRIPTION_NOTIFICATION_TOKENS)
+    )
+
+
+def media_subscription_notification_rule_request(
+    message: str,
+) -> tuple[str, dict[str, Any]] | None:
+    """解析订阅级通知规则；必须显式绑定唯一公开订阅编号。"""
+    normalized = _normalize_intent_message(message)
+    if not is_media_subscription_notification_rule_message(normalized):
+        return None
+    number = _media_subscription_notification_number(normalized)
+    if number is None:
+        return None
+    arguments: dict[str, Any] = {"subscription_number": number}
+    if any(token in normalized for token in ("重置", "恢复默认", "清除规则", "删除规则")):
+        return "media.reset_subscription_notification_rule", arguments
+    wants_enable = any(token in normalized for token in ("开启", "启用", "打开"))
+    wants_disable = any(token in normalized for token in ("关闭", "停用", "禁用"))
+    write_scope = wants_enable or wants_disable or any(
+        token in normalized for token in ("设置", "修改", "调整", "改为", "改成")
+    )
+    if not write_scope:
+        return "media.subscription_notification_rule", arguments
+    if wants_enable and wants_disable:
+        return None
+    requested = True if wants_enable else False if wants_disable else None
+    event_fields: list[str] = []
+    if any(token in normalized for token in ("缺集", "有更新", "发现更新", "待补")):
+        event_fields.append("notify_on_missing")
+    if any(token in normalized for token in ("已满足", "已齐", "无缺集", "全部到齐", "追更完成")):
+        event_fields.append("notify_on_satisfied")
+    if any(token in normalized for token in ("异常", "错误", "失败", "报错")):
+        event_fields.append("notify_on_error")
+    if requested is None:
+        return None
+    if event_fields:
+        for field in event_fields:
+            arguments[field] = requested
+        if requested:
+            arguments["enabled"] = True
+    else:
+        arguments["enabled"] = requested
+    return "media.set_subscription_notification_rule", arguments
+
+
+_MEDIA_CONTINUE_WATCHING_TOKENS = ("继续观看", "继续播放", "接着看", "没看完", "未看完")
+_MEDIA_PREFERENCE_SCOPES = ("媒体偏好", "观看偏好", "下载偏好", "默认下载", "默认媒体服务器")
+
+
+def continue_watching_request(message: str) -> dict[str, Any] | None:
+    normalized = _normalize_intent_message(message)
+    if not any(token in normalized for token in _MEDIA_CONTINUE_WATCHING_TOKENS):
+        return None
+    server = "auto"
+    if "jellyfin" in normalized:
+        server = "jellyfin"
+    elif "emby" in normalized:
+        server = "emby"
+    arguments: dict[str, Any] = {"server": server, "limit": 8}
+    matched = re.search(r"(?:前|最多|显示|列出)?\s*(\d{1,2})\s*(?:个|项|部)", normalized)
+    if matched and 1 <= int(matched.group(1)) <= 12:
+        arguments["limit"] = int(matched.group(1))
+    return arguments
+
+
+def media_preferences_request(message: str) -> tuple[str, dict[str, Any]] | None:
+    normalized = _normalize_intent_message(message)
+    if not any(scope in normalized for scope in _MEDIA_PREFERENCE_SCOPES):
+        return None
+    unsupported_tokens = (
+        "画质", "质量", "高画质", "省空间", "原声", "语言",
+        "国语", "普通话", "中文配音", "中配",
+    )
+    if any(token in normalized for token in unsupported_tokens):
+        # 不对混合请求做部分落库，交由统一澄清响应说明当前支持范围。
+        return None
+    if any(token in normalized for token in ("清除", "重置", "恢复默认", "删除")):
+        return "media.clear_preferences", {}
+    write_scope = any(token in normalized for token in (
+        "设置", "修改", "调整", "改成", "改为", "设为", "以后", "默认到", "优先",
+    ))
+    if not write_scope:
+        return "media.preferences", {}
+    arguments: dict[str, Any] = {}
+    if "jellyfin" in normalized:
+        arguments["preferred_server"] = "jellyfin"
+    elif "emby" in normalized:
+        arguments["preferred_server"] = "emby"
+    elif any(token in normalized for token in ("自动选择服务器", "任意服务器", "服务器不限")):
+        arguments["preferred_server"] = "any"
+    if any(token in normalized for token in ("两边", "两个后端", "qb和光鸭", "q b 和光鸭")):
+        arguments["preferred_download_target"] = "both"
+    elif "光鸭" in normalized:
+        arguments["preferred_download_target"] = "guangya"
+    elif any(token in normalized for token in ("qb", "qbittorrent", "q b")):
+        arguments["preferred_download_target"] = "qb"
+    return ("media.set_preferences", arguments) if arguments else None
+
+
+def is_media_preferences_message(message: str) -> bool:
+    normalized = _normalize_intent_message(message)
+    return any(scope in normalized for scope in _MEDIA_PREFERENCE_SCOPES)
+
+
+def is_today_media_summary_message(message: str) -> bool:
+    normalized = _normalize_intent_message(message)
+    if not any(token in normalized for token in ("今天", "今日")):
+        return False
+    if any(token in normalized for token in ("新番", "放送", "播出表", "日历", "播什么")):
+        return False
+    return bool(
+        "今日内容摘要" in normalized
+        or "今天媒体" in normalized
+        or (
+            any(token in normalized for token in ("下载", "入库", "整理", "rss", "追更", "内容"))
+            and any(token in normalized for token in ("摘要", "汇总", "有什么", "什么", "更新", "情况", "发生"))
+        )
+    )
+
+
 def media_subscription_policy_request(
     message: str,
 ) -> tuple[str, dict[str, Any]] | None:
@@ -3046,6 +3193,40 @@ def is_media_proxy_test_request_message(message: str) -> bool:
     return any(token in normalized for token in _MEDIA_PROXY_TEST_INTENTS)
 
 
+def media_proxy_playback_failure_summary_request(message: str) -> dict[str, int] | None:
+    normalized = _normalize_intent_message(message)
+    if not _has_media_proxy_scope(normalized):
+        return None
+    if not any(token in normalized for token in ("播放", "直链", "转码")):
+        return None
+    if not any(token in normalized for token in ("失败", "故障", "异常", "错误", "卡顿", "慢")):
+        return None
+    if any(token in normalized for token in _MEDIA_PROXY_EDIT_REJECT_TOKENS):
+        return None
+    hours = 24
+    matches = [int(value) for value in re.findall(r"(\d{1,3})\s*(?:小时|h)", normalized)]
+    if matches:
+        if len(set(matches)) != 1 or matches[0] not in {1, 6, 24, 72}:
+            return None
+        hours = matches[0]
+    numbers = _media_proxy_instance_numbers(normalized)
+    if len(numbers) > 1:
+        return None
+    arguments = {"hours": hours}
+    if numbers:
+        arguments["instance_number"] = numbers[0]
+    return arguments
+
+
+def is_media_proxy_playback_failure_summary_message(message: str) -> bool:
+    normalized = _normalize_intent_message(message)
+    return bool(
+        _has_media_proxy_scope(normalized)
+        and any(token in normalized for token in ("播放", "直链", "转码"))
+        and any(token in normalized for token in ("失败", "故障", "异常", "错误", "卡顿", "慢"))
+    )
+
+
 def is_media_proxy_status_summary_message(message: str) -> bool:
     normalized = _normalize_intent_message(message)
     if not _has_media_proxy_scope(normalized):
@@ -3466,7 +3647,7 @@ def recent_resource_batch_submit_request(
         return None
     has_reference = any(token in normalized for token in _RECENT_RESOURCE_REFERENCES)
     target, has_target = _recent_resource_target(normalized)
-    if not has_target or target not in {"qb", "guangya", "both"}:
+    if has_target and target not in {"qb", "guangya", "both"}:
         return None
     has_action = any(token in normalized for token in _RECENT_RESOURCE_ACTIONS) or any(
         token in normalized for token in ("下到", "下去", "推送", "提交")
@@ -5138,6 +5319,7 @@ def _has_deterministic_media_subscription_binding(message: str) -> bool:
         or media_subscription_title_request(message) is not None
         or media_subscription_delete_request(message) is not None
         or is_media_subscription_delete_write_message(message)
+        or is_media_subscription_notification_rule_message(message)
     )
 
 
@@ -5794,6 +5976,12 @@ class AgentOrchestrator:
             )
         target = request.get("target")
         if target not in {"qb", "guangya", "both"}:
+            from app.agent.media_consumption_actions import (
+                explicit_preferred_download_target,
+            )
+
+            target = explicit_preferred_download_target(owner)
+        if target not in {"qb", "guangya", "both"}:
             return self._clarification_response(
                 "批量资源要提交到哪里？请选择 qB、光鸭或两边。",
                 ["把第 1、2 个到 qB。", "把前 3 个到两边。"],
@@ -5884,6 +6072,12 @@ class AgentOrchestrator:
                 f"最近资源推荐中没有第 {position} 项",
                 target=target if isinstance(target, str) else "",
             )
+        if target not in {"qb", "guangya", "both"}:
+            from app.agent.media_consumption_actions import (
+                explicit_preferred_download_target,
+            )
+
+            target = explicit_preferred_download_target(owner)
         if target not in {"qb", "guangya", "both"}:
             return self._resource_selection_response(
                 snapshot,
@@ -7767,6 +7961,27 @@ class AgentOrchestrator:
                 ["例如：暂停下载任务《Example.Show.S01E01》。"],
             )
 
+        notification_rule_request = media_subscription_notification_rule_request(message)
+        if notification_rule_request is not None:
+            tool_name, arguments = notification_rule_request
+            if tool_name == "media.subscription_notification_rule":
+                return self._invoke_query_read(tool_name, arguments, owner=owner)
+            if not owner:
+                return self._unsupported(
+                    "修改媒体追更通知规则需要在已登录会话中确认",
+                    ["请登录后重新提交，并在预检后确认修改。"],
+                )
+            return self.prepare(tool_name, arguments, owner=owner)
+        if is_media_subscription_notification_rule_message(message):
+            return self._clarification_response(
+                "请明确一个媒体追更订阅编号，以及要查看或修改的通知开关。",
+                [
+                    "查看媒体订阅 1 的通知规则。",
+                    "开启媒体订阅 1 的缺集通知。",
+                    "关闭媒体订阅 1 的错误通知。",
+                ],
+            )
+
         media_policy_request = media_subscription_policy_request(message)
         if media_policy_request is not None:
             tool_name, arguments = media_policy_request
@@ -7865,6 +8080,57 @@ class AgentOrchestrator:
                 ],
             )
 
+        return None
+
+    def _handle_media_consumption_requests(
+        self,
+        message: str,
+        *,
+        owner: str,
+        query_tool_rate_identity: str = "",
+    ) -> dict[str, Any] | None:
+        """处理继续观看、显式偏好与今日内容摘要。"""
+        resume = continue_watching_request(message)
+        if resume is not None:
+            if not owner:
+                return self._unsupported(
+                    "继续观看需要已登录会话和显式媒体用户配置",
+                    ["请登录后重试；系统不会回退读取管理员观看历史。"],
+                )
+            return self._invoke_query_read(
+                "media.continue_watching", resume, owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+
+        preference = media_preferences_request(message)
+        if preference is not None:
+            tool_name, arguments = preference
+            if not owner:
+                return self._unsupported(
+                    "媒体偏好按登录会话独立保存",
+                    ["请登录后查看或修改媒体偏好。"],
+                )
+            if tool_name == "media.preferences":
+                return self._invoke_query_read(
+                    tool_name, arguments, owner=owner,
+                    rate_identity=query_tool_rate_identity,
+                )
+            return self.prepare(tool_name, arguments, owner=owner)
+        if is_media_preferences_message(message):
+            return self._clarification_response(
+                "当前显式媒体偏好仅支持默认媒体服务器和默认下载目标；请明确要查看、清除或修改哪一项。",
+                [
+                    "查看我的媒体偏好。",
+                    "以后默认下载到光鸭。",
+                    "媒体偏好设为 Jellyfin，默认下载到两边。",
+                ],
+            )
+
+        if is_today_media_summary_message(message):
+            return self._invoke_query_read(
+                "media.today_summary", {}, owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
         return None
 
     def _handle_rss_requests(
@@ -8309,6 +8575,14 @@ class AgentOrchestrator:
         if download_and_subscription is not None:
             return download_and_subscription
 
+        media_consumption_response = self._handle_media_consumption_requests(
+            message,
+            owner=owner,
+            query_tool_rate_identity=query_tool_rate_identity,
+        )
+        if media_consumption_response is not None:
+            return media_consumption_response
+
         rss_response = self._handle_rss_requests(
             message, lower=lower, owner=owner
         )
@@ -8500,6 +8774,22 @@ class AgentOrchestrator:
             return self._clarification_response(
                 "请说明要测试第几个媒体反代实例；测试只会访问该实例已保存的上游地址。",
                 ["查看媒体反代状态", "测试媒体反代实例 1"],
+            )
+        media_proxy_failure_request = media_proxy_playback_failure_summary_request(lower)
+        if media_proxy_failure_request is not None:
+            return self._invoke_query_read(
+                "media_proxy.playback_failure_summary",
+                media_proxy_failure_request,
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+        if is_media_proxy_playback_failure_summary_message(lower):
+            return self._clarification_response(
+                "播放故障摘要只支持最近 1、6、24 或 72 小时；如指定实例，请只给一个公开序号。",
+                [
+                    "查看媒体反代最近 24 小时播放失败摘要。",
+                    "查看媒体反代实例 1 最近 6 小时播放故障。",
+                ],
             )
         if is_media_proxy_status_summary_message(lower):
             return self._invoke_query_read("media_proxy.status_summary", {})

@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from app.modules.media_proxy_safety import safe_media_name
@@ -604,3 +604,69 @@ def clear_media_proxy_playback_records(instance_id: int | None = None) -> int:
                 (int(instance_id),),
             )
         return int(cursor.rowcount)
+
+
+def get_media_proxy_playback_failure_summary(
+    *, hours: int = 24, instance_id: int | None = None
+) -> dict:
+    """聚合固定时间窗内已记录的反代请求，不返回媒体身份或错误正文。"""
+    normalized_hours = int(hours)
+    if normalized_hours not in {1, 6, 24, 72}:
+        raise ValueError("播放故障摘要仅支持 1、6、24 或 72 小时")
+    cutoff = (datetime.now() - timedelta(hours=normalized_hours)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    clauses = ["created_at>=?"]
+    params: list = [cutoff]
+    if instance_id is not None:
+        clauses.append("instance_id=?")
+        params.append(int(instance_id))
+    where = " AND ".join(clauses)
+    with get_conn() as conn:
+        _prune_media_proxy_playback_records(conn)
+        totals = conn.execute(
+            "SELECT COUNT(*) AS total,"
+            "SUM(CASE WHEN status_code=0 OR status_code>=400 THEN 1 ELSE 0 END) AS failed,"
+            "SUM(CASE WHEN cache_hit=1 THEN 1 ELSE 0 END) AS cache_hits,"
+            "AVG(CASE WHEN total_latency_ms>=0 THEN total_latency_ms END) AS avg_latency "
+            f"FROM media_proxy_playback_records WHERE {where}",
+            params,
+        ).fetchone()
+        stages = conn.execute(
+            "SELECT CASE WHEN TRIM(failure_stage)='' THEN 'unknown' ELSE failure_stage END AS value,"
+            "COUNT(*) AS total FROM media_proxy_playback_records "
+            f"WHERE {where} AND (status_code=0 OR status_code>=400) "
+            "GROUP BY value ORDER BY total DESC,value LIMIT 8",
+            params,
+        ).fetchall()
+        routes = conn.execute(
+            "SELECT route_class AS value,COUNT(*) AS total "
+            f"FROM media_proxy_playback_records WHERE {where} "
+            "GROUP BY route_class ORDER BY total DESC,value LIMIT 8",
+            params,
+        ).fetchall()
+        last = conn.execute(
+            "SELECT MAX(created_at) AS last_seen FROM media_proxy_playback_records "
+            f"WHERE {where}", params,
+        ).fetchone()
+    total = int(totals["total"] or 0) if totals else 0
+    failed = int(totals["failed"] or 0) if totals else 0
+    return {
+        "window_hours": normalized_hours,
+        "total_recorded": total,
+        "failed": failed,
+        "success": max(0, total - failed),
+        "cache_hits": int(totals["cache_hits"] or 0) if totals else 0,
+        "average_latency_ms": (
+            round(float(totals["avg_latency"]), 1)
+            if totals is not None and totals["avg_latency"] is not None else None
+        ),
+        "failure_stages": [
+            {"stage": str(row["value"]), "count": int(row["total"])} for row in stages
+        ],
+        "route_classes": [
+            {"route": str(row["value"]), "count": int(row["total"])} for row in routes
+        ],
+        "last_seen_at": str(last["last_seen"] or "") if last else "",
+        "coverage": "recorded_proxy_requests_only",
+    }

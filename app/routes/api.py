@@ -943,8 +943,9 @@ def save_config(request: Request, data: Any = Body(default=None)):
         data[key] = ""
     allowed = {
         "ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD", "LOGIN_WALLPAPER_MODE",
-        "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN", "JELLYFIN_ENABLED", "JELLYFIN_URL",
-        "JELLYFIN_API_KEY", *_MEDIA_SERVER_REFRESH_KEYS,
+        "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN", "EMBY_USER_ID",
+        "JELLYFIN_ENABLED", "JELLYFIN_URL", "JELLYFIN_API_KEY", "JELLYFIN_USER_ID",
+        *_MEDIA_SERVER_REFRESH_KEYS,
         "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY",
         "TG_QB_CATEGORY", "TG_QB_SAVE_PATH",
         "TMDB_API_KEY", "TMDB_API_URL",
@@ -1049,6 +1050,20 @@ def save_config(request: Request, data: Any = Body(default=None)):
         nsfw_organize_updates = _validate_nsfw_organize_updates(data)
     except ValueError as exc:
         return api_error(str(exc), 400)
+    for key in ("JELLYFIN_USER_ID", "EMBY_USER_ID"):
+        if key not in data:
+            continue
+        raw_user_id = str(data[key] or "").strip()
+        if not raw_user_id:
+            data[key] = ""
+            continue
+        try:
+            from app.clients.base import normalize_explicit_media_user_id
+
+            data[key] = normalize_explicit_media_user_id(raw_user_id)
+        except ValueError as exc:
+            label = "Jellyfin" if key.startswith("JELLYFIN") else "Emby"
+            return api_error(f"{label} 共享用户 ID 无效: {exc}", 400)
     media_server_refresh_updates: dict[str, str] = {}
     for key in ("JELLYFIN_PATH_MAPPINGS", "EMBY_PATH_MAPPINGS"):
         if key not in data:
@@ -1383,8 +1398,8 @@ def save_config(request: Request, data: Any = Body(default=None)):
 
     clear_dashboard_cache()
     media_proxy_keys = {
-        "JELLYFIN_ENABLED", "JELLYFIN_URL", "JELLYFIN_API_KEY",
-        "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN",
+        "JELLYFIN_ENABLED", "JELLYFIN_URL", "JELLYFIN_API_KEY", "JELLYFIN_USER_ID",
+        "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN", "EMBY_USER_ID",
     }
     if media_proxy_keys & updates.keys():
         manager = getattr(request.app.state, "media_proxy_manager", None)

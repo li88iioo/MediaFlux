@@ -165,7 +165,7 @@ class STRMScheduler:
 
     @staticmethod
     def _recover_notification_outbox() -> None:
-        """恢复上次进程中断遗留的整理通知，避免结果通知永久丢失。"""
+        """恢复上次进程中断遗留的通知 lease，避免结果永久卡住。"""
         try:
             from app.modules.organize_notification_outbox import (
                 recover_organize_notifications,
@@ -174,6 +174,14 @@ class STRMScheduler:
             recover_organize_notifications()
         except Exception:
             logger.exception("恢复整理通知投递队列失败")
+        try:
+            from app.modules.media_subscription_notifications import (
+                recover_media_subscription_notifications,
+            )
+
+            recover_media_subscription_notifications()
+        except Exception:
+            logger.exception("恢复媒体订阅通知投递队列失败")
 
     def _recover_change_queue(self) -> None:
         """启动时恢复上次进程中断遗留的变化目标，避免变化永久卡在队列里。"""
@@ -724,18 +732,35 @@ class STRMScheduler:
 
     @staticmethod
     def _drain_notification_outbox() -> None:
-        """周期补发到期的整理通知；无待发项时只做一次计数查询。"""
-        from app.repositories.organize_notifications import (
-            count_pending_organize_notifications,
-        )
+        """周期补发到期通知；各 outbox 相互隔离，单类失败不阻塞另一类。"""
+        try:
+            from app.repositories.organize_notifications import (
+                count_pending_organize_notifications,
+            )
 
-        if not count_pending_organize_notifications():
-            return
-        from app.modules.organize_notification_outbox import (
-            drain_organize_notifications,
-        )
+            if count_pending_organize_notifications():
+                from app.modules.organize_notification_outbox import (
+                    drain_organize_notifications,
+                )
 
-        drain_organize_notifications()
+                drain_organize_notifications()
+        except Exception as exc:
+            log_throttled(
+                logger, logging.WARNING, f"organize-outbox:{type(exc).__name__}",
+                "整理通知补发检查失败 type=%s", type(exc).__name__,
+            )
+        try:
+            from app.modules.media_subscription_notifications import (
+                drain_media_subscription_notifications,
+            )
+
+            drain_media_subscription_notifications(limit=20)
+        except Exception as exc:
+            log_throttled(
+                logger, logging.WARNING,
+                f"media-subscription-outbox:{type(exc).__name__}",
+                "媒体订阅通知补发检查失败 type=%s", type(exc).__name__,
+            )
 
     def _tick(self) -> None:
         if not get_bool("STRM_SCHEDULE_ENABLED", False):

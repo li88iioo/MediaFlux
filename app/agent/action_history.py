@@ -32,6 +32,10 @@ _TOOL_LABELS = {
     "media.delete_subscription": "媒体追更删除",
     "media.set_subscription_enabled": "媒体追更状态修改",
     "media.set_subscription_policy": "媒体追更策略修改",
+    "media.set_preferences": "媒体偏好修改",
+    "media.clear_preferences": "媒体偏好清除",
+    "media.set_subscription_notification_rule": "媒体追更通知规则修改",
+    "media.reset_subscription_notification_rule": "媒体追更通知规则重置",
     "config.set_feature_state": "功能开关修改",
     "config.set_indexer_sites": "资源检索站点修改",
     "config.set_safe_policy": "安全策略修改",
@@ -87,6 +91,16 @@ _SAFE_FIELDS = {
     },
     "media.set_subscription_policy": {
         "subscription_number", "updated_fields", "expired_candidates", "runtime_refreshed",
+    },
+    "media.set_preferences": {
+        "operation", "affected", "preferred_server", "preferred_download_target",
+    },
+    "media.clear_preferences": {"operation", "affected"},
+    "media.set_subscription_notification_rule": {
+        "operation", "subscription_number", "affected", "enabled",
+    },
+    "media.reset_subscription_notification_rule": {
+        "operation", "subscription_number", "affected",
     },
     "config.set_feature_state": {
         "feature", "enabled", "runtime_refreshed", "verification_state",
@@ -187,9 +201,13 @@ _ENUM_FIELDS = {
     "trigger": {"manual", "qb_completed", "scan"},
     "trigger_type": {"manual"},
     "rule_type": {"preprocess_rule", "tmdb_regex_rule", "knowledge_entry"},
+    "preferred_server": {"any", "jellyfin", "emby"},
+    "preferred_download_target": {"qb", "guangya", "both"},
     "operation": {
         "pause", "resume", "delete", "enable", "disable", "set_interval",
         "add", "remove", "create", "restore", "retry", "precise_refresh",
+        "set_preferences", "clear_preferences", "set_notification_rule",
+        "reset_notification_rule",
     },
     "status": {"accepted", "submitted", "completed", "partial", "failed", "duplicate"},
 }

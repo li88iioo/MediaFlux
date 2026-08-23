@@ -634,6 +634,16 @@ class MediaSubscriptionService:
                     status_code=409,
                     code="cancelled",
                 )
+            try:
+                from app.modules.media_subscription_notifications import (
+                    drain_media_subscription_notifications,
+                )
+                drain_media_subscription_notifications(limit=5)
+            except Exception as exc:
+                logger.warning(
+                    "媒体订阅通知投递失败，已保留 outbox type=%s",
+                    type(exc).__name__,
+                )
             return {"subscription": self.get_subscription(subscription_id), "result": public_result}
         except asyncio.CancelledError:
             db.cancel_media_subscription_run(
@@ -666,13 +676,24 @@ class MediaSubscriptionService:
     def _finish_failed_check(
         self, subscription_id: int, run_id: int, interval: int, revision: int, error: str
     ) -> None:
-        db.fail_media_subscription_check(
+        committed = db.fail_media_subscription_check(
             subscription_id,
             run_id,
             interval_minutes=interval,
             error=error,
             subscription_revision=revision,
         )
+        if committed:
+            try:
+                from app.modules.media_subscription_notifications import (
+                    drain_media_subscription_notifications,
+                )
+                drain_media_subscription_notifications(limit=5)
+            except Exception as exc:
+                logger.warning(
+                    "媒体订阅异常通知投递失败，已保留 outbox type=%s",
+                    type(exc).__name__,
+                )
 
     @staticmethod
     def _ensure_active_check(

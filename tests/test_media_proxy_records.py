@@ -1036,3 +1036,97 @@ class PlaybackRecordApiTests(IsolatedDatabaseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlaybackFailureSummaryTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM media_proxy_playback_records")
+            conn.execute("DELETE FROM media_proxy_playback_sessions")
+            conn.execute("DELETE FROM media_proxy_instances")
+        self.first = db.add_media_proxy_instance(
+            name="第一反代",
+            server_type="jellyfin",
+            config_source="custom",
+            upstream_url="http://127.0.0.1:8096",
+            api_key="secret-api-key",
+            listen_host="127.0.0.1",
+            listen_port=19101,
+            enabled=1,
+        )
+        self.second = db.add_media_proxy_instance(
+            name="第二反代",
+            server_type="emby",
+            config_source="custom",
+            upstream_url="http://127.0.0.1:8097",
+            api_key="secret-emby-key",
+            listen_host="127.0.0.1",
+            listen_port=19102,
+            enabled=1,
+        )
+
+    def test_failure_summary_aggregates_only_safe_diagnostics(self):
+        db.record_media_proxy_playback_attempt(
+            instance_id=self.first,
+            route_class="guangya_direct",
+            method="GET",
+            status_code=206,
+            source="guangya",
+            cache_hit=True,
+            upstream_latency_ms=5,
+            total_latency_ms=10,
+            media_name="PRIVATE MOVIE",
+        )
+        db.record_media_proxy_playback_attempt(
+            instance_id=self.first,
+            route_class="guangya_direct",
+            method="GET",
+            status_code=502,
+            source="guangya",
+            cache_hit=False,
+            upstream_latency_ms=15,
+            total_latency_ms=20,
+            failure_stage="signed_url",
+            error="PRIVATE https://secret.invalid/file?token=SECRET",
+            media_name="PRIVATE MOVIE",
+        )
+        db.record_media_proxy_playback_attempt(
+            instance_id=self.first,
+            route_class="upstream_transcode",
+            method="GET",
+            status_code=0,
+            source="upstream",
+            cache_hit=False,
+            upstream_latency_ms=25,
+            total_latency_ms=30,
+            failure_stage="upstream",
+            error="PRIVATE /private/path",
+        )
+        db.record_media_proxy_playback_attempt(
+            instance_id=self.second,
+            route_class="upstream_direct",
+            method="GET",
+            status_code=200,
+            source="upstream",
+            total_latency_ms=40,
+        )
+
+        summary = db.get_media_proxy_playback_failure_summary(
+            hours=24, instance_id=self.first
+        )
+        self.assertEqual(summary["total_recorded"], 3)
+        self.assertEqual(summary["failed"], 2)
+        self.assertEqual(summary["success"], 1)
+        self.assertEqual(summary["cache_hits"], 1)
+        self.assertEqual(summary["average_latency_ms"], 20.0)
+        self.assertEqual(
+            {item["stage"] for item in summary["failure_stages"]},
+            {"signed_url", "upstream"},
+        )
+        serialized = json.dumps(summary, ensure_ascii=False)
+        for secret in ("PRIVATE", "secret.invalid", "SECRET", "/private"):
+            self.assertNotIn(secret, serialized)
+
+    def test_failure_summary_rejects_unbounded_windows(self):
+        with self.assertRaises(ValueError):
+            db.get_media_proxy_playback_failure_summary(hours=48)

@@ -14,6 +14,7 @@ _PROFILE_KEYS = {
         "JELLYFIN_URL",
         "JELLYFIN_API_KEY",
         "JELLYFIN_ENABLED",
+        "JELLYFIN_USER_ID",
     ),
     "configured:emby": (
         "emby",
@@ -21,6 +22,7 @@ _PROFILE_KEYS = {
         "EMBY_URL",
         "EMBY_TOKEN",
         "EMBY_ENABLED",
+        "EMBY_USER_ID",
     ),
 }
 
@@ -33,6 +35,7 @@ class MediaServerProfile:
     url: str
     credential: str
     enabled: bool
+    user_id: str = ""
 
     @property
     def configured(self) -> bool:
@@ -46,12 +49,13 @@ class MediaServerProfile:
             "url": self.url,
             "enabled": self.enabled,
             "configured": self.configured,
+            "user_configured": bool(self.user_id),
         }
 
 
 def _profile(source: str) -> MediaServerProfile:
     try:
-        server_type, label, url_key, credential_key, enabled_key = _PROFILE_KEYS[source]
+        server_type, label, url_key, credential_key, enabled_key, user_key = _PROFILE_KEYS[source]
     except KeyError as exc:
         raise ValueError("媒体服务器来源无效") from exc
     return MediaServerProfile(
@@ -61,6 +65,7 @@ def _profile(source: str) -> MediaServerProfile:
         url=str(config.get(url_key, "") or "").strip(),
         credential=str(config.get(credential_key, "") or "").strip(),
         enabled=config.get_bool(enabled_key, False),
+        user_id=str(config.get(user_key, "") or "").strip(),
     )
 
 

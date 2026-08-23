@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 import math
+import re
 import time
 from typing import Any, Optional
 
@@ -41,6 +42,14 @@ def runtime_ticks_to_minutes(value: Any) -> int:
     if ticks <= 0 or ticks > _MAX_RUNTIME_MINUTES * _RUNTIME_TICKS_PER_MINUTE:
         return 0
     return max(1, (ticks + _RUNTIME_TICKS_PER_MINUTE // 2) // _RUNTIME_TICKS_PER_MINUTE)
+
+
+def normalize_explicit_media_user_id(value: Any) -> str:
+    """校验可安全嵌入 MediaBrowser 路径段的显式用户标识。"""
+    normalized = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", normalized):
+        raise ValueError("媒体服务器用户标识无效")
+    return normalized
 
 
 def normalize_playback_progress(value: Any) -> float:
@@ -282,6 +291,10 @@ class MediaServerClient:
     def recent_media(self, limit: int = 60) -> list[MediaItem]:
         """返回最近入库媒体，供独立媒体中心页面使用。"""
         return self._recent_added(limit=max(1, min(int(limit or 60), 200)))
+
+    def continue_watching(self, user_id: str, *, limit: int = 12) -> list[MediaItem]:
+        """按显式上游用户读取继续观看；不得回退管理员用户。"""
+        raise NotImplementedError
 
     def search_media(self, query: str, limit: int = 12) -> list[MediaItem]:
         """按标题搜索媒体服务器内容。"""

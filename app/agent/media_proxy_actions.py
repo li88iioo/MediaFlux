@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 import hashlib
 import json
+import re
 import secrets
 from typing import Any, Mapping
 
@@ -26,6 +27,11 @@ _ALLOWED_SERVER_TYPES = {"jellyfin", "emby"}
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _safe_diagnostic_label(value: Any) -> str:
+    normalized = str(value or "").strip().casefold()
+    return normalized if re.fullmatch(r"[a-z0-9_-]{1,48}", normalized) else "unknown"
 
 
 def _strict_instance_number(value: Any) -> int:
@@ -408,4 +414,72 @@ def set_media_proxy_instance_enabled_confirmed(
             if runtime_refreshed
             else ["配置已保存；请重启 MediaFlux 使媒体反代运行时读取新状态。"]
         ),
+    )
+
+
+def media_proxy_failure_summary_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        raise AgentToolError("工具参数必须是 JSON 对象")
+    if set(arguments) - {"hours", "instance_number"}:
+        raise AgentToolError("播放故障摘要只接受 hours 和 instance_number")
+    hours = arguments.get("hours", 24)
+    if isinstance(hours, bool) or not isinstance(hours, int) or hours not in {1, 6, 24, 72}:
+        raise AgentToolError("hours 仅支持 1、6、24 或 72")
+    result: dict[str, Any] = {"hours": hours}
+    if "instance_number" in arguments:
+        result["instance_number"] = _strict_instance_number(arguments["instance_number"])
+    return result
+
+
+def summarize_media_proxy_playback_failures(arguments: dict[str, Any]) -> ToolResult:
+    from app.repositories.media_proxy import get_media_proxy_playback_failure_summary
+
+    instance_number = arguments.get("instance_number")
+    instance_id = None
+    server_type = "all"
+    if instance_number is not None:
+        rows = _ordered_rows()
+        index = int(instance_number) - 1
+        if index < 0 or index >= len(rows):
+            raise AgentToolError("媒体反代实例序号不存在", code="precondition_failed")
+        instance_id = int(_row_value(rows[index], "id", 0) or 0)
+        server_type = _server_type(rows[index])
+    summary = get_media_proxy_playback_failure_summary(
+        hours=int(arguments["hours"]), instance_id=instance_id
+    )
+    summary["failure_stages"] = [
+        {
+            "stage": _safe_diagnostic_label(item.get("stage")),
+            "count": max(0, int(item.get("count") or 0)),
+        }
+        for item in summary.get("failure_stages", [])[:8]
+        if isinstance(item, dict)
+    ]
+    summary["route_classes"] = [
+        {
+            "route": _safe_diagnostic_label(item.get("route")),
+            "count": max(0, int(item.get("count") or 0)),
+        }
+        for item in summary.get("route_classes", [])[:8]
+        if isinstance(item, dict)
+    ]
+    failed = int(summary["failed"])
+    return ToolResult(
+        True,
+        "attention" if failed else ("empty" if not summary["total_recorded"] else "completed"),
+        (
+            f"最近 {summary['window_hours']} 小时已记录 {failed} 次媒体反代失败"
+            if failed else f"最近 {summary['window_hours']} 小时未记录到媒体反代失败"
+        ),
+        data={
+            "instance_number": instance_number,
+            "server_type": server_type,
+            **summary,
+        },
+        evidence=[Evidence(
+            "sqlite:media_proxy_playback_records",
+            "仅聚合反代诊断记录中的状态、失败阶段、路由类别与时延；不返回媒体名、用户、会话、文件标识、URL、路径或错误正文。记录为 best-effort，不能代表媒体服务器全部播放请求。",
+            _now(),
+        )],
+        suggestions=["可按失败阶段继续检查对应媒体反代实例连接。"] if failed else [],
     )

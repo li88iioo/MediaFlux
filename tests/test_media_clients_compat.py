@@ -299,3 +299,50 @@ class PartialDashboardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExplicitContinueWatchingTests(unittest.TestCase):
+    def _assert_explicit_resume_contract(self, client) -> None:
+        calls = []
+
+        def request(path, params=None):
+            calls.append((path, dict(params or {})))
+            return {
+                "Items": [{
+                    "Id": "item-1",
+                    "Name": "第 7 集",
+                    "SeriesName": "示例动画",
+                    "Type": "Episode",
+                    "ParentIndexNumber": 2,
+                    "IndexNumber": 7,
+                    "UserData": {"PlayedPercentage": 37.5},
+                }]
+            }
+
+        client._request = request
+        client._user_id = Mock(side_effect=AssertionError("不得回退枚举管理员用户"))
+        items = client.continue_watching("explicit-user", limit=5)
+        self.assertEqual(calls[0][0], "/Users/explicit-user/Items/Resume")
+        self.assertEqual(calls[0][1]["Limit"], 5)
+        self.assertEqual(items[0].display_name, "示例动画")
+        self.assertEqual(items[0].progress, 37.5)
+        client._user_id.assert_not_called()
+
+    def test_jellyfin_uses_only_explicit_user(self):
+        self._assert_explicit_resume_contract(
+            JellyfinClient("http://jellyfin.local", "key")
+        )
+
+    def test_emby_uses_only_explicit_user(self):
+        self._assert_explicit_resume_contract(
+            EmbyClient("http://emby.local", "token")
+        )
+
+    def test_explicit_user_rejects_path_like_identifiers(self):
+        for client in (
+            JellyfinClient("http://jellyfin.local", "key"),
+            EmbyClient("http://emby.local", "token"),
+        ):
+            for invalid in ("../admin", "user?admin=true", "user#fragment", "user%2fadmin"):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    client.continue_watching(invalid)

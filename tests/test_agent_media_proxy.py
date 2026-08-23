@@ -283,3 +283,81 @@ if __name__ == "__main__":
     import unittest
 
     unittest.main()
+
+
+class AgentMediaProxyPlaybackFailureTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM media_proxy_playback_records")
+            conn.execute("DELETE FROM media_proxy_playback_sessions")
+            conn.execute("DELETE FROM media_proxy_instances")
+        reset_agent_service_for_tests()
+        agent_rate_limiter.reset()
+        self.instance_id = db.add_media_proxy_instance(
+            name="PRIVATE INSTANCE NAME",
+            server_type="jellyfin",
+            config_source="custom",
+            upstream_url="http://private-upstream.invalid:8096",
+            api_key="PRIVATE-API-KEY",
+            listen_host="127.0.0.1",
+            listen_port=19111,
+            local_root="/private/library",
+            enabled=1,
+        )
+
+    def tearDown(self) -> None:
+        reset_agent_service_for_tests()
+        agent_rate_limiter.reset()
+
+    def test_tool_returns_attention_as_successful_safe_aggregate(self):
+        db.record_media_proxy_playback_attempt(
+            instance_id=self.instance_id,
+            playback_session_key="PRIVATE-SESSION",
+            media_item_id="PRIVATE-ITEM",
+            media_name="PRIVATE MOVIE",
+            route_class="guangya_direct",
+            method="GET",
+            status_code=502,
+            source="guangya",
+            failure_stage="signed_url",
+            error="PRIVATE https://secret.invalid/file?token=SECRET /private/path",
+            total_latency_ms=55,
+        )
+        response = get_agent_service().invoke(
+            "media_proxy.playback_failure_summary",
+            {"hours": 24, "instance_number": 1},
+            owner="owner-a",
+        )
+        result = response["result"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "attention")
+        self.assertEqual(result["data"]["failed"], 1)
+        self.assertEqual(result["data"]["failure_stages"][0]["stage"], "signed_url")
+        serialized = json.dumps(response, ensure_ascii=False)
+        for secret in (
+            "PRIVATE", "secret.invalid", "SECRET", "/private", "PRIVATE-SESSION"
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_natural_query_precedes_generic_proxy_status(self):
+        from app.agent.orchestrator import (
+            media_proxy_playback_failure_summary_request,
+        )
+
+        self.assertEqual(
+            media_proxy_playback_failure_summary_request(
+                "查看媒体反代实例 1 最近 6 小时播放失败摘要"
+            ),
+            {"hours": 6, "instance_number": 1},
+        )
+        response = get_agent_service().query(
+            "查看媒体反代最近 24 小时播放失败摘要", present=False
+        )
+        self.assertEqual(
+            response["tool_call"]["name"],
+            "media_proxy.playback_failure_summary",
+        )
+        clarified = get_agent_service().query(
+            "查看媒体反代最近 48 小时播放失败摘要", present=False
+        )
+        self.assertEqual(clarified["result"]["status"], "clarification_required")

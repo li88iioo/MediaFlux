@@ -463,6 +463,7 @@ CREATE TABLE IF NOT EXISTS agent_download_verification_notification_outbox (
         CHECK(status IN ('pending','sending','retry_wait','sent','discarded')),
     attempts INTEGER NOT NULL DEFAULT 0,
     lease_generation INTEGER NOT NULL DEFAULT 0,
+    lease_until TEXT NOT NULL DEFAULT '',
     next_attempt_at TEXT NOT NULL,
     last_error_type TEXT NOT NULL DEFAULT '',
     sent_at TEXT,
@@ -525,6 +526,7 @@ CREATE TABLE IF NOT EXISTS agent_library_patrol_notification_outbox (
         CHECK(status IN ('pending','sending','retry_wait','sent','discarded')),
     attempts INTEGER NOT NULL DEFAULT 0,
     lease_generation INTEGER NOT NULL DEFAULT 0,
+    lease_until TEXT NOT NULL DEFAULT '',
     next_attempt_at TEXT NOT NULL,
     last_error_type TEXT NOT NULL DEFAULT '',
     sent_at TEXT,
@@ -763,6 +765,56 @@ CREATE TABLE IF NOT EXISTS media_subscription_candidates (
 );
 CREATE INDEX IF NOT EXISTS idx_media_subscription_candidates_lookup
     ON media_subscription_candidates(subscription_id, status, media_key, id DESC);
+
+CREATE TABLE IF NOT EXISTS agent_media_preferences (
+    owner_digest TEXT PRIMARY KEY,
+    preferred_server TEXT NOT NULL DEFAULT 'any'
+        CHECK(preferred_server IN ('any','jellyfin','emby')),
+    preferred_download_target TEXT NOT NULL DEFAULT 'guangya'
+        CHECK(preferred_download_target IN ('qb','guangya','both')),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS media_subscription_notification_rules (
+    subscription_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    notify_on_missing INTEGER NOT NULL DEFAULT 1 CHECK(notify_on_missing IN (0,1)),
+    notify_on_satisfied INTEGER NOT NULL DEFAULT 0 CHECK(notify_on_satisfied IN (0,1)),
+    notify_on_error INTEGER NOT NULL DEFAULT 1 CHECK(notify_on_error IN (0,1)),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (subscription_id) REFERENCES media_subscriptions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS media_subscription_notification_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    subscription_id INTEGER NOT NULL,
+    subscription_revision INTEGER NOT NULL,
+    run_id INTEGER,
+    event_type TEXT NOT NULL
+        CHECK(event_type IN ('missing','satisfied','error')),
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','sending','retry_wait','sent','failed','discarded')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    lease_generation INTEGER NOT NULL DEFAULT 0,
+    lease_until TEXT NOT NULL DEFAULT '',
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT NOT NULL DEFAULT '',
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (subscription_id) REFERENCES media_subscriptions(id) ON DELETE CASCADE,
+    FOREIGN KEY (run_id) REFERENCES media_subscription_runs(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_media_subscription_notification_due
+    ON media_subscription_notification_outbox(status, next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS idx_media_subscription_notification_subscription
+    ON media_subscription_notification_outbox(subscription_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_media_subscription_candidates_expiry
     ON media_subscription_candidates(status, expires_at, id);
 
@@ -2140,6 +2192,7 @@ from app.repositories.media_proxy import (  # noqa: E402
     delete_media_proxy_instance,
     get_media_proxy_binding,
     get_media_proxy_instance,
+    get_media_proxy_playback_failure_summary,
     list_media_proxy_bindings,
     list_media_proxy_instances,
     list_media_proxy_playback_records,

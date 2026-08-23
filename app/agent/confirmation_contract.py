@@ -53,6 +53,30 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "会更新后续追更范围、动作模式、下载目标或检查周期，并失效旧候选；若启用自动模式，后续匹配资源会无需再次确认自动提交。本操作不会主动发起检查。",
         "reversibility": "可再次修改后续策略；已进入提交阶段或已经提交的下载任务无法由本次修改撤回。",
     },
+    "media.set_preferences": {
+        "action": "保存媒体偏好",
+        "object": "当前登录会话的显式媒体偏好",
+        "impact": "会保存媒体服务器或下载目标偏好，供后续媒体请求参考；不会修改系统全局配置或立即创建下载。",
+        "reversibility": "可再次修改，或确认清除后恢复产品默认值。",
+    },
+    "media.clear_preferences": {
+        "action": "清除媒体偏好",
+        "object": "当前登录会话已保存的显式媒体偏好",
+        "impact": "会删除本会话的偏好记录并恢复产品默认值；不会修改媒体服务器、下载器或已有任务。",
+        "reversibility": "清除后可重新保存显式偏好。",
+    },
+    "media.set_subscription_notification_rule": {
+        "action": "修改媒体追更通知规则",
+        "object": "你指定的一条媒体追更订阅",
+        "impact": "会影响后续缺集、已满足或检查异常事件是否发送 Telegram 通知；不会立即巡检、下载或修改追更策略。",
+        "reversibility": "可再次修改开关，或重置为默认关闭规则。",
+    },
+    "media.reset_subscription_notification_rule": {
+        "action": "重置媒体追更通知规则",
+        "object": "你指定的一条媒体追更订阅",
+        "impact": "会删除该订阅的显式通知规则并恢复默认关闭状态；已发送通知不会撤回。",
+        "reversibility": "可再次确认创建新的通知规则。",
+    },
     "media.create_subscription": {
         "action": "创建媒体追更订阅",
         "object": "你刚才选定的影视条目和季度",

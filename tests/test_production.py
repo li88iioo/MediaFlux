@@ -3261,6 +3261,9 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn('data-save-media="jellyfin"', dashboard.text)
         self.assertIn('data-test-media="jellyfin"', dashboard.text)
         self.assertIn('data-test-media="emby"', dashboard.text)
+        self.assertIn('data-key="JELLYFIN_USER_ID"', dashboard.text)
+        self.assertIn('data-key="EMBY_USER_ID"', dashboard.text)
+        self.assertIn("不回退管理员历史", dashboard.text)
         self.assertEqual(settings.status_code, 200)
         self.assertEqual(organize.status_code, 200)
         self.assertEqual(organize_rules.status_code, 200)
@@ -4256,6 +4259,7 @@ class SecurityTests(InitializedWebTestCase):
                     "JELLYFIN_ENABLED": "1",
                     "JELLYFIN_URL": "http://jellyfin.local",
                     "JELLYFIN_API_KEY": "********",
+                    "JELLYFIN_USER_ID": "user-guid-1",
                 },
                 headers=headers,
             )
@@ -4263,7 +4267,20 @@ class SecurityTests(InitializedWebTestCase):
         save.assert_called_once_with({
             "JELLYFIN_ENABLED": "1",
             "JELLYFIN_URL": "http://jellyfin.local",
+            "JELLYFIN_USER_ID": "user-guid-1",
         })
+
+    def test_config_endpoint_rejects_unsafe_media_user_id(self):
+        headers = self._authenticated()
+        with patch("app.routes.api.config.set_and_save") as save:
+            response = self.client.post(
+                "/api/config",
+                json={"EMBY_USER_ID": "../admin?token=secret"},
+                headers=headers,
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("共享用户 ID 无效", response.json()["error"])
+        save.assert_not_called()
 
     def test_config_endpoint_maps_concurrent_save_to_single_line_conflict(self):
         headers = self._authenticated()
