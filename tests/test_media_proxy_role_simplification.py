@@ -195,6 +195,7 @@ class MediaProxyLoggingBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(config.call_args.kwargs["log_config"])
         self.assertFalse(config.call_args.kwargs["access_log"])
         self.assertEqual(config.call_args.kwargs["lifespan"], "on")
+        self.assertFalse(config.call_args.kwargs["proxy_headers"])
         self.assertEqual(
             config.call_args.kwargs["ws_max_size"],
             media_proxy._proxy_websocket_message_limit(),

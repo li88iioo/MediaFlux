@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
 import mimetypes
 import re
@@ -25,7 +26,9 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 
 import httpx
 import uvicorn
-from aiohttp import ClientSession, TCPConnector, WSServerHandshakeError, WSMsgType
+from aiohttp import (
+    ClientSession, TCPConnector, TraceConfig, WSServerHandshakeError, WSMsgType,
+)
 from aiohttp.abc import AbstractResolver
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -46,6 +49,13 @@ _PLAYGY_RE = re.compile(r"^(?:/emby)?/playgy/([^/]+)(?:/.*)?$", re.IGNORECASE)
 _HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+}
+_FORWARDED_CLIENT_HEADERS = {
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
 }
 _ALLOWED_HOSTS = {"127.0.0.1", "0.0.0.0", "::1", "::"}
 _BLOCKED_METADATA_HOSTS = {
@@ -137,6 +147,22 @@ class ProxyUpstreamBodyTooLarge(ValueError):
 
 class _SignedMediaProbeCapacityError(RuntimeError):
     """原生客户端媒体探测的受控后台工作容量已满。"""
+
+
+class _WebSocketRedirectBlocked(RuntimeError):
+    """上游 WebSocket 握手试图跨跳重定向。"""
+
+
+async def _reject_websocket_redirect(*_args: Any, **_kwargs: Any) -> None:
+    # aiohttp 的 ws_connect 默认会跟随 3xx；重定向后的 IP literal 会绕过
+    # 首跳 pinned resolver，因此必须在任何第二跳连接发生前终止。
+    raise _WebSocketRedirectBlocked("WebSocket upstream redirects are disabled")
+
+
+def _websocket_trace_config() -> TraceConfig:
+    trace = TraceConfig()
+    trace.on_request_redirect.append(_reject_websocket_redirect)
+    return trace
 
 
 def _bounded_megabytes_setting(key: str, default: int, hard_max: int) -> int:
@@ -1669,6 +1695,14 @@ def _request_query_values(request: Request, *names: str) -> list[str]:
     return values
 
 
+def _request_query_has_key(request: Request, *names: str) -> bool:
+    accepted = {str(name).casefold() for name in names}
+    return any(
+        str(key).casefold() in accepted
+        for key, _value in request.query_params.multi_items()
+    )
+
+
 def _request_query_has_conflicting_values(
     request: Request, *names: str
 ) -> bool:
@@ -2147,6 +2181,56 @@ def _request_headers(request: Request) -> dict[str, str]:
     return {key: value for key, value in request.headers.items() if key.lower() not in _HOP_HEADERS}
 
 
+def _canonical_client_ip(request: Any) -> str:
+    """返回 ASGI 已确认的 socket 客户端地址，不信任下游自带转发头。"""
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", "") or "").strip()
+    if not host and isinstance(client, (tuple, list)) and client:
+        host = str(client[0] or "").strip()
+    if not host:
+        return ""
+    if host.startswith("[") and "]" in host:
+        host = host[1:host.index("]")]
+    if "%" in host:
+        host = host.split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return ""
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return str(address)
+
+
+def _canonical_forwarded_scheme(request: Any) -> str:
+    scheme = str(
+        getattr(getattr(request, "url", None), "scheme", "") or ""
+    ).casefold()
+    if scheme not in {"http", "https", "ws", "wss"}:
+        return ""
+    return {"ws": "http", "wss": "https"}.get(scheme, scheme)
+
+
+def _apply_canonical_forwarded_headers(
+    headers: dict[str, str],
+    request: Any,
+) -> dict[str, str]:
+    """覆盖客户端可伪造的 forwarding headers，并统一供 HTTP/WS 上游使用。"""
+    for key in tuple(headers):
+        if key.casefold() in _FORWARDED_CLIENT_HEADERS:
+            headers.pop(key, None)
+    client_ip = _canonical_client_ip(request)
+    if client_ip:
+        headers["X-Forwarded-For"] = client_ip
+        headers["X-Real-IP"] = client_ip
+    scheme = _canonical_forwarded_scheme(request)
+    if scheme:
+        headers["X-Forwarded-Proto"] = scheme
+    # X-Forwarded-Host 不能从客户端可控的 Host 派生；缺少受信任的公开
+    # origin 配置时，宁可不发送，也不能让 Jellyfin 将其当作可信代理值。
+    return headers
+
+
 def _authorization_client_name(value: Any) -> str:
     match = _AUTH_CLIENT_RE.search(str(value or ""))
     return str((match.group(1) or match.group(2) or "") if match else "").strip()
@@ -2240,6 +2324,274 @@ def _diagnostic_dict_value(data: Any, *names: str) -> Any:
         if str(name).casefold() in folded:
             return folded[str(name).casefold()]
     return None
+
+
+def _diagnostic_dict_has_key(data: Any, name: str) -> bool:
+    if not isinstance(data, dict):
+        return False
+    target = str(name).casefold()
+    return any(str(key).casefold() == target for key in data)
+
+
+def _profile_tokens(value: Any) -> set[str]:
+    return {
+        token.strip().casefold()
+        for token in str(value or "").split(",")
+        if token.strip()
+    }
+
+
+def _normalized_codec(value: Any) -> str:
+    codec = str(value or "").strip().casefold().replace("_", "").replace("-", "")
+    return {
+        "h265": "hevc",
+        "x265": "hevc",
+        "avc": "h264",
+        "avc1": "h264",
+        "ec3": "eac3",
+        "eac3": "eac3",
+        "ac3": "ac3",
+    }.get(codec, codec)
+
+
+def _profile_supports_value(value: Any, candidate: Any, *, codec: bool = False) -> bool:
+    declared = _profile_tokens(value)
+    if not declared:
+        return True
+    normalized_candidate = (
+        _normalized_codec(candidate)
+        if codec
+        else str(candidate or "").strip().casefold()
+    )
+    normalized_declared = (
+        {_normalized_codec(token) for token in declared}
+        if codec
+        else declared
+    )
+    if normalized_candidate in normalized_declared:
+        return True
+    if not codec and normalized_candidate in {"mkv", "matroska"}:
+        return bool(normalized_declared.intersection({"mkv", "matroska"}))
+    return False
+
+
+def _optional_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _audio_stream_is_commentary(stream: dict[str, Any]) -> bool:
+    if bool(stream.get("IsCommentary")):
+        return True
+    label = " ".join(
+        str(stream.get(key) or "")
+        for key in ("Title", "DisplayTitle")
+    ).casefold()
+    return any(marker in label for marker in (
+        "commentary", "comment", "解说", "评论音轨",
+    ))
+
+
+def _web_direct_audio_retry_payload(
+    request_payload: Any,
+    response_payload: Any,
+) -> dict[str, Any] | None:
+    """在不伪造设备能力的前提下，为 Web 尝试一次可直放默认音轨。
+
+    仅当当前音轨就是 Jellyfin 给出的默认音轨时才允许替换，避免覆盖用户
+    已显式选择的语言或评论音轨。第二次 PlaybackInfo 仍由 Jellyfin 最终判定
+    是否支持 DirectPlay；未提升直放能力时必须保留首次 HLS/转码合同。
+    """
+    if not isinstance(request_payload, dict) or not isinstance(response_payload, dict):
+        return None
+    profile = _diagnostic_dict_value(request_payload, "DeviceProfile")
+    direct_profiles = _diagnostic_dict_value(profile, "DirectPlayProfiles")
+    if not isinstance(direct_profiles, list):
+        return None
+    video_profiles = [
+        item
+        for item in direct_profiles
+        if isinstance(item, dict)
+        and str(_diagnostic_dict_value(item, "Type") or "").casefold() == "video"
+    ]
+    if not video_profiles:
+        return None
+
+    requested_source = _normalized_media_identifier(
+        str(_diagnostic_dict_value(request_payload, "MediaSourceId") or "")
+    )
+    media_sources = response_payload.get("MediaSources")
+    if not isinstance(media_sources, list):
+        return None
+    candidate_sources = [item for item in media_sources if isinstance(item, dict)]
+    if not requested_source and len(candidate_sources) != 1:
+        return None
+    for source in candidate_sources:
+        if not isinstance(source, dict) or source.get("SupportsDirectPlay") is True:
+            continue
+        source_id = _normalized_media_identifier(str(source.get("Id") or ""))
+        if requested_source and source_id != requested_source:
+            continue
+        if not _extract_guangya_file_id(str(source.get("Path") or "")):
+            continue
+        streams = source.get("MediaStreams")
+        if not isinstance(streams, list):
+            continue
+        video_stream = next(
+            (
+                item
+                for item in streams
+                if isinstance(item, dict)
+                and str(item.get("Type") or "").casefold() == "video"
+            ),
+            None,
+        )
+        audio_streams = [
+            item
+            for item in streams
+            if isinstance(item, dict)
+            and str(item.get("Type") or "").casefold() == "audio"
+            and _optional_int(item.get("Index")) is not None
+        ]
+        if video_stream is None or len(audio_streams) < 2:
+            continue
+        container = _native_stream_container(source)
+        video_codec = video_stream.get("Codec")
+        matching_profiles = [
+            item
+            for item in video_profiles
+            if _profile_supports_value(
+                _diagnostic_dict_value(item, "Container"), container
+            )
+            and _profile_supports_value(
+                _diagnostic_dict_value(item, "VideoCodec"),
+                video_codec,
+                codec=True,
+            )
+        ]
+        if not matching_profiles:
+            continue
+
+        default_audio_index = _optional_int(source.get("DefaultAudioStreamIndex"))
+        if default_audio_index is None:
+            default_audio_index = next(
+                (
+                    _optional_int(item.get("Index"))
+                    for item in audio_streams
+                    if bool(item.get("IsDefault"))
+                ),
+                None,
+            )
+        requested_audio_index = _optional_int(
+            _diagnostic_dict_value(request_payload, "AudioStreamIndex")
+        )
+        if requested_audio_index is None:
+            requested_audio_index = default_audio_index
+        # 非默认 index 通常来自用户手动选轨，自动 302 不能改变其选择。
+        if (
+            requested_audio_index is None
+            or default_audio_index is None
+            or requested_audio_index != default_audio_index
+        ):
+            continue
+        current_audio = next(
+            (
+                item
+                for item in audio_streams
+                if _optional_int(item.get("Index")) == requested_audio_index
+            ),
+            None,
+        )
+        if current_audio is None or _audio_stream_is_commentary(current_audio):
+            continue
+        if any(
+            _profile_supports_value(
+                _diagnostic_dict_value(item, "AudioCodec"),
+                current_audio.get("Codec"),
+                codec=True,
+            )
+            for item in matching_profiles
+        ):
+            continue
+
+        current_language = str(current_audio.get("Language") or "").strip().casefold()
+        compatible_audio = [
+            item
+            for item in audio_streams
+            if _optional_int(item.get("Index")) != requested_audio_index
+            and not _audio_stream_is_commentary(item)
+            and (
+                str(item.get("Language") or "").strip().casefold()
+                == current_language
+            )
+            and any(
+                _profile_supports_value(
+                    _diagnostic_dict_value(candidate, "AudioCodec"),
+                    item.get("Codec"),
+                    codec=True,
+                )
+                for candidate in matching_profiles
+            )
+        ]
+        if not compatible_audio:
+            continue
+        compatible_audio.sort(
+            key=lambda item: (
+                not bool(item.get("IsDefault")),
+                -(_optional_int(item.get("Channels")) or 0),
+                _optional_int(item.get("Index")) or 0,
+            )
+        )
+        selected_index = _optional_int(compatible_audio[0].get("Index"))
+        if selected_index is None:
+            continue
+        retry_payload = dict(request_payload)
+        retry_payload["AudioStreamIndex"] = selected_index
+        if source_id:
+            retry_payload["MediaSourceId"] = str(source.get("Id") or "")
+        return retry_payload
+    return None
+
+
+def _playback_source_direct_state(
+    payload: Any,
+    source_id: str,
+) -> bool | None:
+    if not isinstance(payload, dict):
+        return None
+    media_sources = payload.get("MediaSources")
+    if not isinstance(media_sources, list):
+        return None
+    sources = [source for source in media_sources if isinstance(source, dict)]
+    normalized_source = _normalized_media_identifier(source_id)
+    if normalized_source:
+        matches = [
+            source
+            for source in sources
+            if _normalized_media_identifier(str(source.get("Id") or ""))
+            == normalized_source
+        ]
+        if len(matches) != 1:
+            return None
+        return matches[0].get("SupportsDirectPlay") is True
+    if len(sources) != 1:
+        return None
+    return sources[0].get("SupportsDirectPlay") is True
+
+
+def _playback_source_gained_direct_play(
+    initial_payload: Any,
+    retry_payload: Any,
+    source_id: str,
+) -> bool:
+    return (
+        _playback_source_direct_state(initial_payload, source_id) is False
+        and _playback_source_direct_state(retry_payload, source_id) is True
+    )
 
 
 def _native_playback_diagnostic_summary(
@@ -2718,7 +3070,9 @@ def _upstream_request_headers(
     server_type: str = "",
 ) -> dict[str, str]:
     credential = _request_auth_credential(request)
-    headers = _request_headers(request)
+    headers = _apply_canonical_forwarded_headers(
+        _request_headers(request), request
+    )
     if str(server_type or "").strip().casefold() == "jellyfin" and credential:
         authorization_values = _header_values(request.headers, "Authorization")
         authorization_tokens = [
@@ -4106,7 +4460,10 @@ def create_proxy_app(
                 resolver=_PinnedResolver(pinned.sni_hostname, pinned.addresses),
                 use_dns_cache=True,
             )
-            session = ClientSession(connector=connector)
+            session = ClientSession(
+                connector=connector,
+                trace_configs=[_websocket_trace_config()],
+            )
             upstream_ws = await session.ws_connect(
                 target,
                 headers=headers,
@@ -4115,6 +4472,20 @@ def create_proxy_app(
                 heartbeat=30,
                 max_msg_size=message_limit,
             )
+        except _WebSocketRedirectBlocked:
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"media-proxy-ws-redirect:{instance_id}",
+                "媒体反代 WebSocket 拒绝上游重定向 instance=%s",
+                instance_id,
+            )
+            if session is not None:
+                await session.close()
+            await websocket.close(
+                code=1011, reason="Upstream WebSocket redirect rejected"
+            )
+            return
         except WSServerHandshakeError as exc:
             status = int(getattr(exc, "status", 0) or 0)
             log_throttled(
@@ -4323,6 +4694,11 @@ def create_proxy_app(
         playback_request_payload = (
             _playback_info_request_payload(body) if playback_match else {}
         )
+        playback_rewrite_mode = (
+            _native_playback_rewrite_mode(request, playback_request_payload)
+            if playback_match
+            else ""
+        )
         direct_fallback_requested = bool(
             playback_match
             and _playback_info_direct_fallback_requested(
@@ -4393,6 +4769,86 @@ def create_proxy_app(
                 ).json()
             except ValueError:
                 return Response(content=raw, status_code=response.status_code, headers=headers)
+            if (
+                request.method == "POST"
+                and playback_rewrite_mode == "web"
+                and not direct_fallback_requested
+                # Query 中的选轨无法安全地用 JSON body 覆盖；无论其是否等于
+                # 默认轨，都按客户端显式选择处理，避免 query/body 冲突。
+                and not _request_query_has_key(request, "AudioStreamIndex")
+                and not _diagnostic_dict_has_key(
+                    playback_request_payload, "AudioStreamIndex"
+                )
+            ):
+                retry_payload = _web_direct_audio_retry_payload(
+                    playback_request_payload,
+                    payload,
+                )
+                if retry_payload is not None:
+                    retry_started = time.monotonic()
+                    retry_request = client.build_request(
+                        request.method,
+                        target,
+                        headers=upstream_headers,
+                        content=json.dumps(
+                            retry_payload,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8"),
+                        extensions={"sni_hostname": pinned.sni_hostname},
+                    )
+                    retry_response: httpx.Response | None = None
+                    try:
+                        retry_response = await client.send(
+                            retry_request,
+                            stream=True,
+                        )
+                        if 200 <= retry_response.status_code < 300:
+                            retry_raw = await _read_bounded_upstream_body(
+                                retry_response,
+                                _playback_info_response_limit(),
+                            )
+                            retry_headers = _decoded_response_headers(
+                                retry_response.headers
+                            )
+                            retry_result = httpx.Response(
+                                status_code=200,
+                                content=retry_raw,
+                                headers={
+                                    "content-type": retry_headers.get(
+                                        "content-type", "application/json"
+                                    )
+                                },
+                            ).json()
+                            retry_source_id = str(
+                                _diagnostic_dict_value(
+                                    retry_payload, "MediaSourceId"
+                                )
+                                or ""
+                            )
+                            if _playback_source_gained_direct_play(
+                                payload, retry_result, retry_source_id
+                            ):
+                                raw = retry_raw
+                                headers = retry_headers
+                                payload = retry_result
+                                playback_request_payload = retry_payload
+                                request.state.proxy_action = (
+                                    "playback_web_audio_direct_retry"
+                                )
+                    except (
+                        ValueError,
+                        ProxyUpstreamBodyTooLarge,
+                        httpx.HTTPError,
+                    ):
+                        # 自动优化失败时必须无损回到首次 HLS/转码合同。
+                        pass
+                    finally:
+                        if retry_response is not None:
+                            await retry_response.aclose()
+                        request.state.proxy_upstream_latency_ms += round(
+                            (time.monotonic() - retry_started) * 1000
+                        )
             payload_session_token = (
                 str(payload.get("PlaySessionId") or "").strip()
                 if isinstance(payload, dict) else ""
@@ -4403,10 +4859,7 @@ def create_proxy_app(
             media_name = _playback_media_name(payload)
             android_device_id = _request_device_id(request)
             native_client_fingerprint = _request_client_fingerprint(request)
-            native_mode = _native_playback_rewrite_mode(
-                request,
-                playback_request_payload,
-            )
+            native_mode = playback_rewrite_mode
             native_capability_requires_verification = native_mode in {
                 "jellyfin_android",
                 "findroid",
@@ -4794,6 +5247,9 @@ class MediaProxyManager:
             log_config=None,
             access_log=False,
             lifespan="on",
+            # 不能继承 FORWARDED_ALLOW_IPS 后让 Uvicorn 先改写 ASGI client；
+            # 本反代只把真实 TCP peer 作为可信客户端来源。
+            proxy_headers=False,
             ws_max_size=_proxy_websocket_message_limit(),
         )
         server = uvicorn.Server(config)

@@ -1,126 +1,247 @@
-# 进阶实战：Jellyfin / Emby 媒体库搭建与 STRM 302 直链播放
+# 实战：Jellyfin / Emby 媒体库与 STRM 302 播放
 
-本实战指南面向希望使用 Jellyfin、Emby 或 Plex 搭建家庭影院，并结合 MediaFlux 实现光鸭云盘海量影视「零服务器转码流量、秒级 302 直链播放」的用户。
+本指南介绍如何让 Jellyfin / Emby 读取 MediaFlux 生成的光鸭 STRM，并通过 **媒体反代实例**自动协商播放链路。
+
+> **先说明一个关键概念：配置了 302，不代表所有请求都会返回 302。**
+> MediaFlux 会根据媒体来源、客户端能力、协议和 Jellyfin / Emby 的 `PlaybackInfo` 结果，在“真 302、兼容中继、HLS / 转码”之间自动选择。用户只需要配置一套媒体反代，不需要为不同客户端再创建额外的 302 策略。
 
 ---
 
-## 1. 播放架构与数据流向
+## 1. 三种实际播放链路
+
+### 1.1 真 HTTP 302：客户端直接从光鸭 CDN 取视频
 
 ```text
-┌────────────────────────────────────────────────────────┐
-│                   客户端播放器                         │
-│ (Infuse / VidHub / Fileball / Jellyfin Official App)   │
-└───────────┬───────────────────────────────▲────────────┘
-            │ 1. 浏览媒体库与发起播放请求     │ 5. 直连 CDN 拉取视频流
-            ▼                               │    (不占服务器下行带宽)
-┌───────────────────────┐                   │
-│   Jellyfin / Emby     │                   │
-│ (读取本地 .strm 文件) │                   │
-└───────────┬───────────┘                   │
-            │ 2. 解析 .strm 内的 URL 地址   │
-            ▼                               │
-┌───────────────────────┐                   │
-│   MediaFlux 服务端    │                   │
-│  (/playgy 302 鉴权)   ├───────────────────┘
-└───────────┬───────────┘   4. HTTP 302 重定向到 CDN 直链
-            │ 3. 向云盘获取短时 signedURL
-            ▼
-┌───────────────────────┐
-│     光鸭云盘 API      │
-└───────────────────────┘
+客户端播放器
+   │ 1. 通过媒体反代端口访问 Jellyfin / Emby
+   ▼
+MediaFlux 媒体反代 ───────► Jellyfin / Emby
+   │                         │
+   │ 2. 获取播放信息          │ 读取本地 .strm
+   │ 3. 获取短时 signed URL   │
+   ▼                         │
+光鸭云盘 API                 │
+   │                         │
+   └── 4. MediaFlux 返回 HTTP 302 + Location: https://...guangyacdn...
+                              │
+客户端播放器 ────────────────┴──► 光鸭 CDN
+             5. 直接拉取视频数据
 ```
 
-### 核心收益
-1. **零 CPU 占用**：服务端无需实时压制转码，所有解码工作由客户端硬件完成（支持 4K HDR、杜比视界 Profile 8/5）。
-2. **零服务器带宽消耗**：媒体服务器仅返回 302 重定向，客户端播放器直接连接云端 CDN 高速节点拉取视频数据。
-3. **元数据完整**：Jellyfin/Emby 正常刮削演员、海报、剧集概述、演职员表和分季信息。
+真 302 时：
+
+- Jellyfin / Emby 和 MediaFlux 仍负责登录、海报墙、播放协商与鉴权；
+- 实际视频数据由播放器直接向光鸭 CDN 请求；
+- MediaFlux 只处理控制请求和短时播放地址，不承载持续的视频下行流量；
+- CDN 看到的是播放器出口 IP，而不是 MediaFlux 服务器出口 IP。
+
+### 1.2 兼容中继：视频经过 MediaFlux，但不一定转码
+
+```text
+客户端播放器 ◄──── HTTP 200 / 206 ──── MediaFlux ◄──── 光鸭 CDN
+```
+
+当客户端无法安全跟随当前重定向链、浏览器受到跨域限制，或 Media3 / ExoPlayer 遇到 HTTP → HTTPS 跨协议兼容问题时，MediaFlux 会代理 Range 请求。此时通常仍是原始媒体直放，但视频流量会经过 MediaFlux。
+
+### 1.3 HLS、转封装或转码：由 Jellyfin / Emby 负责
+
+```text
+客户端播放器 ◄──── .m3u8 / .ts / .m4s ──── Jellyfin / Emby
+```
+
+当容器、视频、音频或字幕不符合客户端能力时，Jellyfin / Emby 可能选择 HLS、转封装或转码。这类请求不会强制改成 302，以免得到“显示为直连、实际无法播放”的错误结果。
 
 ---
 
-## 2. 媒体库目录结构规划
+## 2. 当前客户端如何自动选择链路
 
-推荐在宿主机统一规划 STRM 输出目录，并挂载给 Jellyfin / Emby：
+| 客户端 / 场景 | 常见链路 | 说明 |
+| --- | --- | --- |
+| Infuse、VidHub、Fileball | **真 302 优先** | 客户端能跟随重定向且可直接解码该媒体时，视频数据直连 CDN |
+| Yamby、Moonfin | **真 302 优先** | MediaFlux 保留其已验证可用的 signed URL 直连路径 |
+| Jellyfin Android 原生播放器 | 真 302 或兼容中继 | 同协议链路可使用 302；MediaFlux 为 Media3 / ExoPlayer 的 HTTP → HTTPS 场景自动使用兼容中继 |
+| Findroid | **兼容中继** | 当前使用已验证的完整 signed-media 中继链，播放成功不等于网络面板必须出现 302 |
+| Jellyfin Web / Android 网页播放器 | 真 302、兼容中继或 HLS | 只有准确媒体版本被上游判定为可 Direct Play 时才允许真 302；仍受浏览器编解码和 CDN CORS 限制 |
+| Jellyfin / Emby 本地实体视频 | 上游直放、转封装或转码 | 本地视频不属于光鸭 STRM 302 链路，继续交给上游媒体服务器处理 |
+
+以下请求本来就不应被判断为“真 302 视频流”：
+
+- 登录、海报、字幕、媒体详情、播放进度和 WebSocket；
+- `HEAD` 探测请求；
+- HLS 清单与分片（`.m3u8`、`.ts`、`.m4s`）；
+- 客户端显式关闭 Direct Play / Direct Stream 的请求；
+- 无法唯一绑定到光鸭文件、鉴权失败或 signed URL 获取失败的请求。
+
+---
+
+## 3. 媒体库目录结构规划
+
+推荐在宿主机统一规划 STRM 输出目录，并只读挂载给 Jellyfin / Emby：
 
 ```text
 /data/strm/
-├── 电影/
-│   └── 肖申克的救赎 (1994) [tmdbid-278]/
-│       └── 肖申克的救赎.1994.2160p.strm
-└── 剧集/
-    └── 葬送的芙莉莲 (2023) [tmdbid-209867]/
-        ├── Season 1/
-        │   ├── 葬送的芙莉莲.2023.S01E01.1080p.strm
-        │   └── 葬送的芙莉莲.2023.S01E02.1080p.strm
-        └── Specials/
-            └── 葬送的芙莉莲.2023.S00E01.OVA.1080p.strm
+└── 光鸭云盘/
+    ├── 电影/
+    │   └── 肖申克的救赎 (1994) {tmdb-278}/
+    │       └── 肖申克的救赎.1994.2160p.strm
+    └── 剧集/
+        └── 葬送的芙莉莲 (2023) {tmdb-209867}/
+            ├── Season 1/
+            │   ├── 葬送的芙莉莲.2023.S01E01.1080p.strm
+            │   └── 葬送的芙莉莲.2023.S01E02.1080p.strm
+            └── Specials/
+                └── 葬送的芙莉莲.2023.S00E01.OVA.1080p.strm
 ```
+
+Jellyfin / Emby 看到的路径可以与 MediaFlux 不同，但二者必须挂载同一批文件。只有绝对路径确实不一致时，才需要在媒体服务器配置中添加高级路径映射。
 
 ---
 
-## 3. Docker Compose 挂载配置
+## 4. Docker Compose 端口与挂载示例
 
-在 `docker-compose.yml` 中确保 MediaFlux 与 Jellyfin 共享挂载该目录：
+下面只展示与本教程有关的部分，请把它合并到自己的完整 Compose 配置中：
 
 ```yaml
 services:
   mediaflux:
     image: ghcr.io/li88iioo/mediaflux:latest
     container_name: mediaflux
-    environment:
-      - STRM_ROOT=/data/strm
-    volumes:
-      - ./db:/app/db
-      - /mnt/media/strm-data:/data/strm
     ports:
-      - "127.0.0.1:1258:1258"
+      # MediaFlux Web 与 STRM /playgy 播放入口
+      - "0.0.0.0:1258:1258"
+      # 媒体反代实例示例端口；必须与页面中的实例监听端口一致
+      - "0.0.0.0:18096:18096"
+    volumes:
+      - ./mediaflux-data:/app/db
+      - /mnt/media/strm-data:/data/strm
 
   jellyfin:
     image: jellyfin/jellyfin:latest
     container_name: jellyfin
     volumes:
-      - /mnt/media/strm-data/电影:/media/movies:ro
-      - /mnt/media/strm-data/剧集:/media/tvshows:ro
+      - /mnt/media/strm-data:/media/strm:ro
       - ./jellyfin-config:/config
     ports:
       - "8096:8096"
 ```
 
----
+注意：
 
-## 4. MediaFlux 控制台关键配置
-
-进入 Web 侧边栏 **「STRM」**：
-
-1. **设置 `GY_STRM_BASE_URL`**（重点）：
-   - 填入 Jellyfin 容器能够直接访问 MediaFlux 的 IP 与端口。
-   - 局域网环境：`http://192.168.1.100:1258`
-   - 同一 Docker 网络：`http://mediaflux:1258`
-   - **严禁填写 `http://127.0.0.1:1258` 或 `http://localhost:1258`**（否则 Jellyfin 容器内部请求回环地址会连接失败）。
-2. **勾选源目录**：选择云盘内已经整理完毕的影视目录。
-3. **点击「立即全量同步」**：系统将在秒级内生成全部 `.strm` 文件，并建立 SQLite 索引。
+- MediaFlux 容器内部 Web 端口固定为 `1258`；宿主机端口可按部署配置调整；
+- `18096` 只是媒体反代实例的示例端口，每个实例都可以使用不同端口；
+- Docker bridge 网络下，新增或更换实例端口后，要同步发布对应端口；
+- 局域网示例使用 `0.0.0.0` 便于其他设备访问。公网部署应使用防火墙、鉴权和有效 HTTPS 反向代理，不要直接裸露管理端口。
 
 ---
 
-## 5. 媒体服务器自动刷新与播放器配置
+## 5. MediaFlux 与媒体服务器配置
 
-### 5.1 媒体库自动刷新
-1. 在 Jellyfin 中生成 API Key：`控制台 -> API 密钥 -> 添加`。
-2. 在 MediaFlux 的「设置」中填入 Jellyfin URL 与 API Key。
-3. 勾选 **「整理/STRM 完成后刷新媒体服务器」**。后续每当有新影视归档或同步，Jellyfin 将自动触发增量扫描。
+### 5.1 设置 STRM 播放地址
 
-### 5.2 播放器客户端推荐
-- **iOS / macOS / Apple TV**：Infuse Pro、VidHub、Fileball
-- **Android / Android TV**：Jellyfin 官方客户端（ExoPlayer 模式）、Kodi（结合 Jellyfin 插件）
-- **Windows / Mac**：Jellyfin Media Player (MPV 内核)
+进入 **「STRM → 光鸭 STRM」**，找到 **「媒体反代播放服务地址」**：
+
+1. 填写 Jellyfin / Emby 与实际播放器都能访问的 MediaFlux 地址，例如：
+   - 局域网：`http://192.168.1.100:1258`
+   - HTTPS 域名：`https://media.example.com`
+2. 不要填写 `localhost` 或 `127.0.0.1`，除非媒体服务器和播放器确实与 MediaFlux 处于同一个网络命名空间；
+3. 地址保存后执行一次**完整刷新 / 完整校准**，让已有 `.strm` 批量写入新地址；
+4. 选择已整理的光鸭源目录并执行完整同步。
+
+`.strm` 文件中写入的是 MediaFlux `/playgy` 播放入口。signed URL 是短时地址，由 MediaFlux 在播放时实时获取，不要把 CDN signed URL 手工写进 STRM。
+
+### 5.2 创建媒体反代实例
+
+进入 **「媒体反代 → 反代实例」**：
+
+1. 选择已配置的 Jellyfin / Emby，或填写自定义上游地址；
+2. 上游地址填写真实媒体服务器地址，例如 Docker 网络内的 `http://jellyfin:8096`；
+3. 设置独立监听地址与端口，例如 `0.0.0.0:18096`；
+4. 保存并加载后，确认实例显示“运行中”且连接测试正常；
+5. **播放器以后连接媒体反代入口**，例如 `http://192.168.1.100:18096`，而不是绕过 MediaFlux 直接连接上游 `:8096`。
+
+媒体反代负责转发 Jellyfin / Emby API、WebSocket 和本地视频请求，并只对能够精确识别的光鸭媒体改写播放链路。绕过媒体反代直接访问 `8096` 时，本文描述的客户端自动协商不会生效。
+
+### 5.3 添加 Jellyfin / Emby 媒体库
+
+以 Jellyfin 为例：
+
+1. 在 Jellyfin 中添加电影、剧集等媒体库；
+2. 目录选择容器内的 STRM 挂载路径，例如 `/media/strm/光鸭云盘/电影`；
+3. 在 Jellyfin 控制台创建 API Key，并在 MediaFlux 的媒体服务器配置中保存；
+4. 启用整理或 STRM 完成后的媒体库刷新；
+5. 首次同步后执行一次媒体库扫描。
 
 ---
 
-## 6. 相关专题教程推荐
+## 6. 如何确认当前到底是不是“真 302”
+
+不要只看“能否播放”，也不要用 `curl -I` 判断。MediaFlux 会把 `HEAD` 当作安全探测处理，它不代表真实视频 GET 的最终链路。
+
+检查播放器实际发出的媒体 `GET` 请求：
+
+| 现象 | 当前链路 |
+| --- | --- |
+| MediaFlux 返回 `HTTP 302`，并带有 `Location: https://...guangyacdn...` | **真 302**；后续大流量由客户端直连 CDN |
+| MediaFlux 持续返回 `HTTP 200 / 206` 和 Range 数据 | **兼容中继**；视频流量经过 MediaFlux |
+| 请求 URL 包含 `.m3u8`、`.ts`、`.m4s`、`/hls` 或 `/master` | **Jellyfin / Emby HLS、转封装或转码链路** |
+| 本地视频直接由 Jellyfin / Emby 返回 | 正常本地媒体链路，不属于光鸭 302 |
+
+真 302 下，MediaFlux 只会出现获取 signed URL 和返回重定向的短请求，不应持续产生与视频码率相当的下行流量。
+
+---
+
+## 7. 客户端 IP 与 Jellyfin “Known Proxies”
+
+MediaFlux 会丢弃客户端伪造的转发头，并把它实际看到的 TCP 对端 IP 安全转发给 Jellyfin。若希望 Jellyfin 设备页显示真实客户端 IP：
+
+1. 让客户端直接访问媒体反代实例；
+2. 在 Jellyfin 网络设置的 **Known Proxies（已知代理）** 中，仅加入 MediaFlux 实际连接 Jellyfin 时使用的可信 IP；
+3. 不要把任意网段或公网来源无条件设为可信代理。
+
+若媒体反代前面还有 Nginx、Caddy 或负载均衡器，MediaFlux 默认看到的是前置代理 IP，而不是最终播放器 IP；这是防止伪造 `X-Forwarded-For` 的安全边界。此时 Jellyfin 显示前置代理或 MediaFlux 地址并不影响 302 播放本身。
+
+另外：
+
+- 真 302 时，光鸭 CDN 看到播放器出口 IP；
+- 兼容中继时，光鸭 CDN 看到 MediaFlux 服务器出口 IP；
+- Jellyfin 设备页显示的 IP 与 CDN 实际取流 IP 不是同一个概念。
+
+---
+
+## 8. 常见问题
+
+### 播放器能登录，但光鸭 STRM 不走 302
+
+依次检查：
+
+1. 播放器连接的是媒体反代实例端口，而不是上游 Jellyfin / Emby 端口；
+2. 媒体反代实例已启用，且监听端口已由 Docker / 防火墙放行；
+3. STRM 内的 MediaFlux 地址可被媒体服务器和播放器访问；
+4. 当前媒体能唯一匹配到光鸭文件，没有错误的 Item / MediaSource 映射；
+5. 当前客户端是否进入了兼容中继或 HLS——这可能是正确降级，不一定是故障。
+
+### Jellyfin Web 能打开媒体，但浏览器播放失败
+
+浏览器除编解码能力外，还受 CDN CORS 和媒体元素安全策略限制。即使 Jellyfin 报告 `SupportsDirectPlay=true`，浏览器环境也不保证像原生播放器一样稳定跟随 CDN 直链。需要优先验证：
+
+- 是否实际请求了 HLS 清单；
+- 浏览器控制台是否出现 CORS 或 codec 错误；
+- 同一媒体在 Infuse、VidHub、Yamby、Moonfin 等原生客户端是否正常。
+
+不要为了追求网络面板中的“302”而强制关闭 Jellyfin 的必要转码或 HLS 回退。
+
+### 本地视频没有 302
+
+这是正常行为。本地实体视频继续由 Jellyfin / Emby 负责 Direct Play、Direct Stream 或转码；MediaFlux 不会把本地文件伪装成光鸭 CDN 直链。
+
+---
+
+## 9. 相关专题教程推荐
 
 - 🧭 [**自动化流转全景与工作流程**](00_自动化流转全景与工作流程.md)
 - 🌸 [**Mikan 番组计划全自动追番与标签过滤**](02_Mikan全自动追番与标签过滤实战.md)
 - 📂 [**本地媒体安全移动与 qBittorrent 联动**](03_本地媒体安全移动与qBittorrent联动实战.md)
 - ☁️ [**光鸭云盘影视归档、冲突策略与分享转存**](04_云盘大容量影视归档与冲突策略实战.md)
 - 🛡️ [**整理纠偏审计、一键回退与映射锁实战**](05_纠偏审计与数据回退实战.md)
-- 📺 [**Apple TV / Infuse / VidHub 终极 302 直连播放**](06_AppleTV与Infuse及VidHub终极直连配置.md)
+- 📺 [**Apple TV / Infuse / VidHub 302 直连配置与验证**](06_AppleTV与Infuse及VidHub终极直连配置.md)
 - 🚀 [**性能调优与大规模媒体库优化指南**](07_性能调优与大规模媒体库优化指南.md)

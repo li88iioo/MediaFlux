@@ -769,6 +769,50 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         self.assertEqual(headers["Authorization"].count("Token="), 1)
 
+    def test_jellyfin_forwarded_headers_replace_untrusted_client_chain(self):
+        request = SimpleNamespace(
+            headers=httpx.Headers({
+                "Authorization": 'MediaBrowser Token="same-token"',
+                "Host": "media.example:18096",
+                "Forwarded": "for=10.0.0.8;proto=http;host=evil.invalid",
+                "X-Forwarded-For": "10.0.0.8, 198.51.100.9",
+                "X-Forwarded-Host": "evil.invalid",
+                "X-Forwarded-Proto": "http",
+                "X-Real-IP": "10.0.0.8",
+            }),
+            query_params=httpx.QueryParams(),
+            client=("::ffff:203.0.113.77", 43123),
+            url=SimpleNamespace(scheme="https"),
+        )
+
+        headers = media_proxy._upstream_request_headers(request, "jellyfin")
+
+        self.assertEqual(headers["X-Forwarded-For"], "203.0.113.77")
+        self.assertEqual(headers["X-Real-IP"], "203.0.113.77")
+        self.assertEqual(headers["X-Forwarded-Proto"], "https")
+        self.assertNotIn("X-Forwarded-Host", headers)
+        self.assertNotIn("Forwarded", headers)
+        self.assertNotIn("10.0.0.8", str(headers))
+        self.assertNotIn("evil.invalid", str(headers))
+
+    def test_jellyfin_forwarded_headers_drop_spoofed_chain_without_peer_ip(self):
+        request = SimpleNamespace(
+            headers=httpx.Headers({
+                "Authorization": 'MediaBrowser Token="same-token"',
+                "X-Forwarded-For": "10.0.0.8",
+                "X-Real-IP": "10.0.0.8",
+            }),
+            query_params=httpx.QueryParams(),
+            client=("testclient", 43123),
+            url=SimpleNamespace(scheme="http"),
+        )
+
+        headers = media_proxy._upstream_request_headers(request, "jellyfin")
+
+        self.assertNotIn("X-Forwarded-For", headers)
+        self.assertNotIn("X-Real-IP", headers)
+        self.assertEqual(headers["X-Forwarded-Proto"], "http")
+
     def test_jellyfin_replaces_unrelated_authorization_with_canonical_token(self):
         _FakeAsyncClient.responses = [_FakeUpstreamResponse(body=b"upstream")]
         app = media_proxy.create_proxy_app(7)
@@ -1761,7 +1805,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class RejectingWebSocketSession:
-            def __init__(self, *, connector) -> None:
+            def __init__(self, *, connector, trace_configs=None) -> None:
                 self.closed = False
 
             async def ws_connect(self, target: str, **kwargs):
@@ -1846,8 +1890,9 @@ class HybridMediaProxyTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class RejectingWebSocketSession:
-            def __init__(self, *, connector) -> None:
+            def __init__(self, *, connector, trace_configs=None) -> None:
                 captured["connector"] = connector
+                captured["trace_configs"] = trace_configs
                 self.closed = False
                 captured["session"] = self
 
@@ -1888,6 +1933,11 @@ class HybridMediaProxyTests(unittest.TestCase):
                     "/socket?api_key=socket-secret&device=visible",
                     headers={
                         "Origin": "http://mediaflux.test",
+                        "Forwarded": "for=10.0.0.8;proto=https",
+                        "X-Forwarded-For": "10.0.0.8",
+                        "X-Forwarded-Host": "evil.invalid",
+                        "X-Forwarded-Proto": "https",
+                        "X-Real-IP": "10.0.0.8",
                         "Authorization": (
                             'Bearer unrelated, MediaBrowser Token="socket-secret", '
                             'Client="Jellyfin"'
@@ -1910,7 +1960,15 @@ class HybridMediaProxyTests(unittest.TestCase):
             'MediaBrowser Token="socket-secret"',
         )
         self.assertEqual(headers["Origin"], "http://mediaflux.test")
+        self.assertNotIn("Forwarded", headers)
+        self.assertNotIn("X-Forwarded-For", headers)
+        self.assertNotIn("X-Forwarded-Host", headers)
+        self.assertNotIn("X-Real-IP", headers)
+        self.assertNotIn("10.0.0.8", str(headers))
         self.assertNotIn("X-Emby-Token", headers)
+        trace_configs = captured["trace_configs"]
+        self.assertEqual(len(trace_configs), 1)
+        self.assertEqual(len(trace_configs[0].on_request_redirect), 1)
         self.assertFalse(
             any(key.lower().startswith("sec-websocket-") for key in headers)
         )
@@ -1924,6 +1982,65 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         self.assertEqual(throttled.call_args.args[5], 403)
         self.assertEqual(len(throttled.call_args.args), 6)
+
+    def test_websocket_upstream_redirect_is_rejected_before_second_hop(self):
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "upstream_url": "http://media.example:8096",
+        }
+        pinned = media_proxy._PinnedUpstreamTarget(
+            logical_url="http://media.example:8096/socket",
+            connect_url="http://203.0.113.10:8096/socket",
+            host_header="media.example:8096",
+            sni_hostname="media.example",
+            addresses=("203.0.113.10",),
+        )
+        captured: dict[str, object] = {}
+
+        class RedirectingWebSocketSession:
+            def __init__(self, *, connector, trace_configs=None) -> None:
+                captured["trace_configs"] = trace_configs
+                self.closed = False
+                captured["session"] = self
+
+            async def ws_connect(self, _target: str, **_kwargs):
+                trace = captured["trace_configs"][0]
+                callback = trace.on_request_redirect[0]
+                await callback(None, None, None)
+                raise AssertionError("redirect callback must abort the second hop")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy._pin_upstream_target",
+                return_value=pinned,
+            ),
+            patch("app.modules.media_proxy.TCPConnector", return_value=object()),
+            patch(
+                "app.modules.media_proxy.ClientSession",
+                RedirectingWebSocketSession,
+            ),
+            patch("app.modules.media_proxy.log_throttled") as throttled,
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                with client.websocket_connect("/socket"):
+                    pass
+
+        self.assertEqual(closed.exception.code, 1011)
+        self.assertTrue(captured["session"].closed)
+        self.assertEqual(
+            throttled.call_args.args[2],
+            "media-proxy-ws-redirect:7",
+        )
 
     def test_websocket_accept_failure_closes_connected_upstream_resources(self):
         instance = {
@@ -1952,7 +2069,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         captured_session: dict[str, object] = {}
 
         class ConnectedSession:
-            def __init__(self, *, connector) -> None:
+            def __init__(self, *, connector, trace_configs=None) -> None:
                 self.connector = connector
                 self.closed = False
                 captured_session["value"] = self
@@ -4083,6 +4200,486 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(
             json.loads(_FakeAsyncClient.requests[0].content), request_body
         )
+
+    def test_web_playback_retries_default_audio_and_grants_true_302(self):
+        first_payload = {
+            "PlaySessionId": "web-audio-session",
+            "MediaSources": [{
+                "Id": "web-audio-source",
+                "Path": "/playgy/web-audio-file/e/1/video.mkv",
+                "Container": "mkv",
+                "SupportsDirectPlay": False,
+                "SupportsDirectStream": True,
+                "SupportsTranscoding": True,
+                "TranscodingUrl": "/Videos/web-audio/master.m3u8",
+                "DefaultAudioStreamIndex": 1,
+                "MediaStreams": [
+                    {"Type": "Video", "Index": 0, "Codec": "h264"},
+                    {
+                        "Type": "Audio", "Index": 1, "Codec": "eac3",
+                        "Language": "eng", "IsDefault": True, "Channels": 6,
+                    },
+                    {
+                        "Type": "Audio", "Index": 2, "Codec": "aac",
+                        "Language": "eng", "Channels": 2,
+                    },
+                ],
+            }],
+        }
+        retry_payload = copy.deepcopy(first_payload)
+        retry_payload["MediaSources"][0]["SupportsDirectPlay"] = True
+        first_response = _FakeUpstreamResponse(
+            body=json.dumps(first_payload).encode("utf-8"),
+            content_type="application/json",
+        )
+        retry_response = _FakeUpstreamResponse(
+            body=json.dumps(retry_payload).encode("utf-8"),
+            content_type="application/json",
+        )
+        _FakeAsyncClient.responses = [first_response, retry_response]
+        request_body = {
+            "DeviceProfile": {
+                "Name": "Jellyfin Web",
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                }],
+            },
+        }
+        authorization = (
+            'MediaBrowser Client="Jellyfin Web", Device="Browser", '
+            'DeviceId="web-device", Version="10.10.7", Token="client-token"'
+        )
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch("app.modules.media_proxy.GuangYaClient", _FakeGuangYaClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "app.modules.media_proxy._pin_signed_media_target",
+                side_effect=self._signed_target,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.post(
+                "/Items/web-audio-item/PlaybackInfo",
+                json=request_body,
+                headers={
+                    "X-Emby-Authorization": authorization,
+                    "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                },
+            )
+            source = playback.json()["MediaSources"][0]
+            direct = client.get(
+                source["Path"],
+                headers={
+                    "X-Emby-Authorization": authorization,
+                    "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                },
+                follow_redirects=False,
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertTrue(source["SupportsDirectPlay"])
+        self.assertEqual(direct.status_code, 302)
+        self.assertEqual(
+            direct.headers["location"],
+            "https://signed.invalid/web-audio-file",
+        )
+        self.assertEqual(len(_FakeAsyncClient.requests), 2)
+        self.assertEqual(
+            json.loads(_FakeAsyncClient.requests[0].content),
+            request_body,
+        )
+        retried_request = json.loads(_FakeAsyncClient.requests[1].content)
+        self.assertEqual(retried_request["AudioStreamIndex"], 2)
+        self.assertEqual(retried_request["MediaSourceId"], "web-audio-source")
+        self.assertEqual(
+            retried_request["DeviceProfile"],
+            request_body["DeviceProfile"],
+        )
+        self.assertTrue(first_response.closed)
+        self.assertTrue(retry_response.closed)
+
+    def test_web_explicit_default_audio_track_is_not_overridden(self):
+        payload = {
+            "MediaSources": [{
+                "Id": "web-default-source",
+                "Path": "/playgy/web-default/e/1/video.mkv",
+                "Container": "mkv",
+                "SupportsDirectPlay": False,
+                "DefaultAudioStreamIndex": 1,
+                "MediaStreams": [
+                    {"Type": "Video", "Index": 0, "Codec": "h264"},
+                    {
+                        "Type": "Audio", "Index": 1, "Codec": "eac3",
+                        "Language": "eng", "IsDefault": True,
+                    },
+                    {"Type": "Audio", "Index": 2, "Codec": "aac", "Language": "eng"},
+                ],
+            }],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        request_body = {
+            "AudioStreamIndex": 1,
+            "DeviceProfile": {
+                "Name": "Jellyfin Web",
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                }],
+            },
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/web-default-item/PlaybackInfo?api_key=client-token",
+                json=request_body,
+                headers={"User-Agent": "Mozilla/5.0 Jellyfin Web"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(_FakeAsyncClient.requests), 1)
+        self.assertEqual(
+            json.loads(_FakeAsyncClient.requests[0].content)["AudioStreamIndex"],
+            1,
+        )
+
+    def test_web_audio_retry_preserves_explicit_non_default_track(self):
+        request_payload = {
+            "MediaSourceId": "cloud",
+            "AudioStreamIndex": 3,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                }],
+            },
+        }
+        response_payload = {
+            "MediaSources": [{
+                "Id": "cloud",
+                "Path": "/playgy/file/e/1/video.mkv",
+                "Container": "mkv",
+                "SupportsDirectPlay": False,
+                "DefaultAudioStreamIndex": 1,
+                "MediaStreams": [
+                    {"Type": "Video", "Index": 0, "Codec": "h264"},
+                    {
+                        "Type": "Audio", "Index": 1, "Codec": "eac3",
+                        "Language": "eng", "IsDefault": True,
+                    },
+                    {"Type": "Audio", "Index": 2, "Codec": "aac", "Language": "eng"},
+                    {"Type": "Audio", "Index": 3, "Codec": "eac3", "Language": "eng"},
+                ],
+            }],
+        }
+
+        self.assertIsNone(
+            media_proxy._web_direct_audio_retry_payload(
+                request_payload, response_payload
+            )
+        )
+
+    def test_web_audio_retry_without_direct_gain_keeps_first_hls_contract(self):
+        first_payload = {
+            "PlaySessionId": "web-hls-session",
+            "MediaSources": [
+                {
+                    "Id": "web-hls-source",
+                    "Path": "/playgy/web-hls-file/e/1/video.mkv",
+                    "Container": "mkv",
+                    "SupportsDirectPlay": False,
+                    "SupportsDirectStream": True,
+                    "SupportsTranscoding": True,
+                    "TranscodingUrl": "/Videos/web-hls/first-master.m3u8",
+                    "DefaultAudioStreamIndex": 1,
+                    "MediaStreams": [
+                        {"Type": "Video", "Index": 0, "Codec": "h264"},
+                        {
+                            "Type": "Audio", "Index": 1, "Codec": "eac3",
+                            "Language": "eng", "IsDefault": True,
+                        },
+                        {
+                            "Type": "Audio", "Index": 2, "Codec": "aac",
+                            "Language": "eng",
+                        },
+                    ],
+                },
+                {
+                    "Id": "other-source",
+                    "Path": "/playgy/other-file/e/1/video.mp4",
+                    "Container": "mp4",
+                    "SupportsDirectPlay": False,
+                },
+            ],
+        }
+        second_payload = copy.deepcopy(first_payload)
+        second_payload["MediaSources"][0]["TranscodingUrl"] = (
+            "/Videos/web-hls/retry-master.m3u8"
+        )
+        # 全局 DirectPlay 数量虽然增加，但目标 source 仍不可直放；
+        # 必须保留首次 HLS 合同，不能误采纳另一个媒体版本。
+        second_payload["MediaSources"][1]["SupportsDirectPlay"] = True
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(first_payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            _FakeUpstreamResponse(
+                body=json.dumps(second_payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+        ]
+        request_body = {
+            "MediaSourceId": "web-hls-source",
+            "DeviceProfile": {
+                "Name": "Jellyfin Web",
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                }],
+            },
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/web-hls-item/PlaybackInfo?api_key=client-token",
+                json=request_body,
+                headers={"User-Agent": "Mozilla/5.0 Jellyfin Web"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        source = response.json()["MediaSources"][0]
+        self.assertFalse(source["SupportsDirectPlay"])
+        self.assertEqual(
+            source["TranscodingUrl"],
+            "/Videos/web-hls/first-master.m3u8",
+        )
+        self.assertEqual(len(_FakeAsyncClient.requests), 2)
+
+    def test_web_query_audio_selection_is_never_overridden_by_retry(self):
+        payload = {
+            "MediaSources": [{
+                "Id": "web-query-source",
+                "Path": "/playgy/web-query/e/1/video.mkv",
+                "Container": "mkv",
+                "SupportsDirectPlay": False,
+                "DefaultAudioStreamIndex": 1,
+                "MediaStreams": [
+                    {"Type": "Video", "Index": 0, "Codec": "h264"},
+                    {
+                        "Type": "Audio", "Index": 1, "Codec": "eac3",
+                        "Language": "eng", "IsDefault": True,
+                    },
+                    {"Type": "Audio", "Index": 2, "Codec": "aac", "Language": "eng"},
+                    {"Type": "Audio", "Index": 3, "Codec": "eac3", "Language": "eng"},
+                ],
+            }],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        request_body = {
+            "MediaSourceId": "web-query-source",
+            "DeviceProfile": {
+                "Name": "Jellyfin Web",
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                }],
+            },
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/web-query-item/PlaybackInfo"
+                "?api_key=client-token&AudioStreamIndex=3",
+                json=request_body,
+                headers={"User-Agent": "Mozilla/5.0 Jellyfin Web"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(_FakeAsyncClient.requests), 1)
+        query = parse_qs(urlsplit(str(_FakeAsyncClient.requests[0].url)).query)
+        self.assertEqual(query["AudioStreamIndex"], ["3"])
+
+    def test_web_empty_query_audio_key_is_not_auto_overridden(self):
+        payload = {
+            "MediaSources": [{
+                "Id": "web-empty-query-source",
+                "Path": "/playgy/web-empty-query/e/1/video.mkv",
+                "Container": "mkv",
+                "SupportsDirectPlay": False,
+                "DefaultAudioStreamIndex": 1,
+                "MediaStreams": [
+                    {"Type": "Video", "Index": 0, "Codec": "h264"},
+                    {
+                        "Type": "Audio", "Index": 1, "Codec": "eac3",
+                        "Language": "eng", "IsDefault": True,
+                    },
+                    {"Type": "Audio", "Index": 2, "Codec": "aac", "Language": "eng"},
+                ],
+            }],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        request_body = {
+            "DeviceProfile": {
+                "Name": "Jellyfin Web",
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                }],
+            },
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/web-empty-query-item/PlaybackInfo"
+                "?api_key=client-token&AudioStreamIndex=",
+                json=request_body,
+                headers={"User-Agent": "Mozilla/5.0 Jellyfin Web"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(_FakeAsyncClient.requests), 1)
+
+    def test_web_explicit_direct_fallback_does_not_retry_audio_track(self):
+        payload = {
+            "MediaSources": [{
+                "Id": "web-fallback-source",
+                "Path": "/playgy/web-fallback/e/1/video.mkv",
+                "Container": "mkv",
+                "SupportsDirectPlay": False,
+                "DefaultAudioStreamIndex": 1,
+                "MediaStreams": [
+                    {"Type": "Video", "Index": 0, "Codec": "h264"},
+                    {"Type": "Audio", "Index": 1, "Codec": "eac3", "Language": "eng"},
+                    {"Type": "Audio", "Index": 2, "Codec": "aac", "Language": "eng"},
+                ],
+            }],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        request_body = {
+            "MediaSourceId": "web-fallback-source",
+            "AudioStreamIndex": 1,
+            "EnableDirectPlay": False,
+            "DeviceProfile": {
+                "Name": "Jellyfin Web",
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                }],
+            },
+        }
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/web-fallback-item/PlaybackInfo?api_key=client-token",
+                json=request_body,
+                headers={"User-Agent": "Mozilla/5.0 Jellyfin Web"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(_FakeAsyncClient.requests), 1)
 
     def test_android_retry_two_preserves_upstream_direct_stream_contract(self):
         payload = {
