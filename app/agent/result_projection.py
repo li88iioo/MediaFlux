@@ -397,6 +397,7 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "ignored_specials": "未计入特别篇",
     "ignored_unknown": "未编号条目",
     "jobs": "近期任务",
+    "interval_hours": "巡检间隔（小时）",
     "max_series": "每批检查上限",
     "media_type": "媒体类型",
     "matched_source_count": "匹配来源数量",
@@ -428,6 +429,10 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "not_configured": "未配置数量",
     "online": "在线",
     "operation": "操作",
+    "operation_ref": "操作编号",
+    "task": "任务",
+    "queue": "排队状态",
+    "schedule": "调度计划",
     "pending": "待处理",
     "patrol_status": "检查结论",
     "pending_count": "待处理数量",
@@ -598,7 +603,7 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
 _PUBLIC_TEXT_VALUE_KEYS = frozenset({
     "area", "as_of", "changed_fields", "cron", "current_value", "display_value", "domain", "effects", "episode",
     "label", "managed_fields", "media_type", "next_run", "provider", "requested_value", "runtime_scope", "season", "severity",
-    "schedule_state", "source", "state", "status", "operation", "status_filter", "summary", "patrol_status", "task_status", "task_status_label",
+    "schedule_state", "source", "state", "status", "operation", "operation_ref", "status_filter", "summary", "patrol_status", "task_status", "task_status_label",
     "title", "year", "origin", "scope", "updated_at", "server_type", "runtime_status", "connection_status", "rule_type",
     "target_categories", "trigger", "subscription_name", "query", "original_title", "rating_source", "source_method",
     "codec", "release_source", "resolution", "site_name", "size_text",
@@ -1055,6 +1060,11 @@ def _safe_value(
     if isinstance(value, float):
         return value if value == value and abs(value) != float("inf") else None
     if isinstance(value, str):
+        if source_key == "operation_ref":
+            operation_ref = value.strip().upper()
+            return operation_ref if re.fullmatch(
+                r"GY-(?:[0-9A-F]{4}-){7}[0-9A-F]{4}", operation_ref
+            ) else None
         normalized_status = value.strip().casefold()
         if source_key in _PUBLIC_STATUS_VALUE_KEYS and normalized_status in _PUBLIC_STATUS_LABELS:
             return _PUBLIC_STATUS_LABELS[normalized_status]

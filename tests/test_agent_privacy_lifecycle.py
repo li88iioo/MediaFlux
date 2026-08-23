@@ -42,6 +42,12 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
                 (digests["session"], "latest_tool", "{}", time.time() + 60, now),
             )
             conn.execute(
+                "INSERT INTO agent_session_context_epochs("
+                "owner_digest,context_type,generation,touched_at,updated_at"
+                ") VALUES(?,?,?,?,?)",
+                (digests["session"], "directory_scrape", 1, time.time(), now),
+            )
+            conn.execute(
                 "INSERT INTO agent_confirmation_epochs(owner_digest,generation,touched_at,updated_at) VALUES(?,?,?,?)",
                 (digests["confirmation"], 1, time.time(), now),
             )
@@ -52,6 +58,16 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
             conn.execute(
                 "INSERT INTO agent_jobs(job_id,owner_digest,job_type,dedupe_key,status,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                 ("job_privacy_00000001", digests["job"], "library_episode_audit", "one", "pending", now, now, now),
+            )
+            conn.execute(
+                "INSERT INTO organize_operation_jobs("
+                "job_id,job_kind,owner_digest,operation,reference,payload_json,"
+                "dedupe_digest,status,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "a" * 32, "agent_directory_scrape", digests["job"],
+                    "目录刮削", "", "{}", "b" * 64, "pending", now, now,
+                ),
             )
             conn.execute(
                 "INSERT INTO agent_missing_media_workflows(workflow_id,owner_digest,source_tool,title,tmdb_id,season,as_of,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -91,14 +107,29 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
                     "INSERT INTO agent_missing_media_workflows(workflow_id,owner_digest,source_tool,title,tmdb_id,season,as_of,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (f"workflow_ttl_{suffix}", "b" * 64, "library.search_missing_episode_resources", "Demo", "1", 1, "2026-07-01", state, old, old),
                 )
+        with db.get_conn() as conn:
+            for suffix, status in (("done", "completed"), ("active", "running")):
+                conn.execute(
+                    "INSERT INTO organize_operation_jobs("
+                    "job_id,job_kind,owner_digest,operation,reference,payload_json,"
+                    "dedupe_digest,status,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        ("c" if suffix == "done" else "d") * 32,
+                        "agent_directory_scrape", "e" * 64, "目录刮削", "", "{}",
+                        ("f" if suffix == "done" else "1") * 64, status, old, old,
+                    ),
+                )
         result = db.purge_expired_agent_task_history(
             current_time=now, next_cleanup_at="2026-08-23 00:00:00",
             terminal_before="2026-08-01 00:00:00", limit_per_table=50,
         )
         self.assertEqual(result["jobs"], 1)
+        self.assertEqual(result["organize_operation_jobs"], 1)
         self.assertEqual(result["missing_media_workflows"], 1)
         with db.get_conn() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM agent_jobs").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM organize_operation_jobs").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM agent_missing_media_workflows").fetchone()[0], 1)
         maintenance = db.maintain_sqlite_database(incremental_pages=1)
         self.assertTrue(maintenance["optimized"])

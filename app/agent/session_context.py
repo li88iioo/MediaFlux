@@ -23,10 +23,13 @@ _CONTEXT_TYPES = frozenset({
     "discovery_candidates",
     "read_operation",
     "local_media_tasks",
+    "discovery_mapping",
+    "directory_scrape",
 })
 _SCHEMA_VERSION = 1
 _DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024
 _DEFAULT_MAX_ROWS = 4096
+_DEFAULT_MAX_EPOCHS = 8192
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,16 @@ class PersistedAgentContext:
 
     payload: dict[str, Any]
     expires_at: float
+    revision: int = 0
+    generation: int = 0
+
+
+@dataclass(frozen=True)
+class AgentContextWriteGuard:
+    """owner/context 维度的 latest-wins 写入令牌。"""
+
+    generation: int
+    revision: int
 
 
 class AgentSessionContextRepository(Protocol):
@@ -108,6 +121,30 @@ class AgentSessionContextRepository(Protocol):
 
     def delete_owner(self, *, owner: str) -> int: ...
 
+    def begin_context(self, *, owner: str, context_type: str) -> AgentContextWriteGuard: ...
+
+    def replace_latest_guarded(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        payload: dict[str, Any],
+        expires_at: float,
+        guard: AgentContextWriteGuard,
+    ) -> PersistedAgentContext | None: ...
+
+    def consume_latest_guarded(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        guard: AgentContextWriteGuard,
+    ) -> bool: ...
+
+    def invalidate_owner(
+        self, *, owner: str, context_types: tuple[str, ...]
+    ) -> int: ...
+
 
 class SQLiteAgentSessionContextRepository:
     """只保存安全投影、按会话指纹隔离且自动过期的 SQLite 仓储。"""
@@ -119,11 +156,13 @@ class SQLiteAgentSessionContextRepository:
         clock: Callable[[], float] = time.time,
         max_payload_bytes: int = _DEFAULT_MAX_PAYLOAD_BYTES,
         max_rows: int = _DEFAULT_MAX_ROWS,
+        max_epochs: int = _DEFAULT_MAX_EPOCHS,
     ) -> None:
         self._secret_provider = secret_provider
         self._clock = clock
         self.max_payload_bytes = max(1024, int(max_payload_bytes))
         self.max_rows = max(128, int(max_rows))
+        self.max_epochs = max(128, int(max_epochs))
 
     def replace_latest(
         self,
@@ -144,7 +183,12 @@ class SQLiteAgentSessionContextRepository:
         )
         now = float(self._clock())
         with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._prune(conn, now=now)
+            existing_count = self._context_row_count(
+                conn, owner_digest=owner_digest, context_type=normalized_type,
+            )
+            self._require_row_capacity(conn, reclaimed_rows=existing_count)
             conn.execute(
                 "DELETE FROM agent_session_context "
                 "WHERE owner_digest=? AND context_type=?",
@@ -156,7 +200,176 @@ class SQLiteAgentSessionContextRepository:
                 ") VALUES(?,?,?,?,?)",
                 (owner_digest, normalized_type, encoded, expiry, db.now()),
             )
-            self._bound_rows(conn)
+
+    def begin_context(
+        self, *, owner: str, context_type: str,
+    ) -> AgentContextWriteGuard:
+        """原子开启一个新的 owner-bound 工作流世代，并撤销旧 latest。"""
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        now = float(self._clock())
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._prune(conn, now=now)
+            self._require_epoch_capacity(
+                conn, owner_digest=owner_digest, context_type=normalized_type,
+            )
+            generation = self._advance_generation(
+                conn, owner_digest=owner_digest, context_type=normalized_type, now=now,
+            )
+            conn.execute(
+                "DELETE FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=?",
+                (owner_digest, normalized_type),
+            )
+        return AgentContextWriteGuard(generation=generation, revision=0)
+
+    def replace_latest_guarded(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        payload: dict[str, Any],
+        expires_at: float,
+        guard: AgentContextWriteGuard,
+    ) -> PersistedAgentContext | None:
+        """仅当工作流世代与 latest revision 均未变化时替换上下文。"""
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        expiry = self._expiry(expires_at)
+        generation = self._positive_int(guard.generation, "generation")
+        revision = self._nonnegative_int(guard.revision, "revision")
+        encoded = self._encode(
+            owner_digest=owner_digest,
+            context_type=normalized_type,
+            payload=payload,
+            expires_at=expiry,
+        )
+        now = float(self._clock())
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._prune(conn, now=now)
+            epoch = conn.execute(
+                "SELECT generation FROM agent_session_context_epochs "
+                "WHERE owner_digest=? AND context_type=?",
+                (owner_digest, normalized_type),
+            ).fetchone()
+            current = conn.execute(
+                "SELECT id,context_generation FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=? AND expires_at>? "
+                "ORDER BY id DESC LIMIT 1",
+                (owner_digest, normalized_type, now),
+            ).fetchone()
+            current_revision = int(current["id"]) if current is not None else 0
+            if (
+                epoch is None
+                or int(epoch["generation"]) != generation
+                or current_revision != revision
+                or (
+                    current is not None
+                    and int(current["context_generation"] or 0) != generation
+                )
+            ):
+                return None
+            existing_count = self._context_row_count(
+                conn, owner_digest=owner_digest, context_type=normalized_type,
+            )
+            try:
+                self._require_row_capacity(conn, reclaimed_rows=existing_count)
+            except RuntimeError:
+                return None
+            conn.execute(
+                "DELETE FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=?",
+                (owner_digest, normalized_type),
+            )
+            cursor = conn.execute(
+                "INSERT INTO agent_session_context("
+                "owner_digest,context_type,payload,expires_at,context_generation,created_at"
+                ") VALUES(?,?,?,?,?,?)",
+                (
+                    owner_digest, normalized_type, encoded, expiry,
+                    generation, db.now(),
+                ),
+            )
+            self._touch_generation(
+                conn, owner_digest=owner_digest, context_type=normalized_type, now=now,
+            )
+            new_revision = int(cursor.lastrowid)
+        return PersistedAgentContext(
+            payload=deepcopy(payload), expires_at=expiry,
+            revision=new_revision, generation=generation,
+        )
+
+    def consume_latest_guarded(
+        self,
+        *,
+        owner: str,
+        context_type: str,
+        guard: AgentContextWriteGuard,
+    ) -> bool:
+        """原子消费指定 revision，防止跨 Worker 重复执行同一 continuation。"""
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        generation = self._positive_int(guard.generation, "generation")
+        revision = self._positive_int(guard.revision, "revision")
+        now = float(self._clock())
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._prune(conn, now=now)
+            epoch = conn.execute(
+                "SELECT generation FROM agent_session_context_epochs "
+                "WHERE owner_digest=? AND context_type=?",
+                (owner_digest, normalized_type),
+            ).fetchone()
+            if epoch is None or int(epoch["generation"]) != generation:
+                return False
+            deleted = conn.execute(
+                "DELETE FROM agent_session_context "
+                "WHERE id=? AND owner_digest=? AND context_type=? "
+                "AND context_generation=? AND expires_at>?",
+                (
+                    revision, owner_digest, normalized_type, generation, now,
+                ),
+            )
+            if deleted.rowcount == 1:
+                self._touch_generation(
+                    conn, owner_digest=owner_digest,
+                    context_type=normalized_type, now=now,
+                )
+                return True
+            return False
+
+    def invalidate_owner(
+        self, *, owner: str, context_types: tuple[str, ...],
+    ) -> int:
+        """原子推进指定上下文世代并删除 owner 的全部持久化上下文。"""
+        owner_digest = self._owner_digest(owner)
+        normalized_types = tuple(dict.fromkeys(
+            self._context_type(value, allow_download=False) for value in context_types
+        ))
+        now = float(self._clock())
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._prune(conn, now=now)
+            for context_type in normalized_types:
+                exists = conn.execute(
+                    "SELECT 1 FROM agent_session_context_epochs "
+                    "WHERE owner_digest=? AND context_type=?",
+                    (owner_digest, context_type),
+                ).fetchone()
+                if exists is not None:
+                    self._advance_generation(
+                        conn,
+                        owner_digest=owner_digest,
+                        context_type=context_type,
+                        now=now,
+                    )
+            deleted = conn.execute(
+                "DELETE FROM agent_session_context WHERE owner_digest=?",
+                (owner_digest,),
+            )
+        return max(0, int(deleted.rowcount or 0))
 
     def mutate_latest(
         self,
@@ -175,7 +388,8 @@ class SQLiteAgentSessionContextRepository:
             conn.execute("BEGIN IMMEDIATE")
             self._prune(conn, now=now)
             row = conn.execute(
-                "SELECT payload,expires_at FROM agent_session_context "
+                "SELECT id,payload,expires_at,context_generation "
+                "FROM agent_session_context "
                 "WHERE owner_digest=? AND context_type=? AND expires_at>? "
                 "ORDER BY id DESC LIMIT 1",
                 (owner_digest, normalized_type, now),
@@ -192,6 +406,10 @@ class SQLiteAgentSessionContextRepository:
                 payload=payload,
                 expires_at=expiry,
             )
+            existing_count = self._context_row_count(
+                conn, owner_digest=owner_digest, context_type=normalized_type,
+            )
+            self._require_row_capacity(conn, reclaimed_rows=existing_count)
             conn.execute(
                 "DELETE FROM agent_session_context "
                 "WHERE owner_digest=? AND context_type=?",
@@ -203,7 +421,6 @@ class SQLiteAgentSessionContextRepository:
                 ") VALUES(?,?,?,?,?)",
                 (owner_digest, normalized_type, encoded, expiry, db.now()),
             )
-            self._bound_rows(conn)
         return PersistedAgentContext(payload=deepcopy(payload), expires_at=expiry)
 
     def append_download(
@@ -225,7 +442,13 @@ class SQLiteAgentSessionContextRepository:
         bounded_items = max(1, min(int(max_items), 32))
         now = float(self._clock())
         with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._prune(conn, now=now)
+            existing_count = self._context_row_count(
+                conn, owner_digest=owner_digest, context_type="download_submission",
+            )
+            reclaimed_rows = max(0, existing_count + 1 - bounded_items)
+            self._require_row_capacity(conn, reclaimed_rows=reclaimed_rows)
             conn.execute(
                 "INSERT INTO agent_session_context("
                 "owner_digest,context_type,payload,expires_at,created_at"
@@ -241,7 +464,6 @@ class SQLiteAgentSessionContextRepository:
                 ")",
                 (owner_digest, owner_digest, bounded_items),
             )
-            self._bound_rows(conn)
 
     def append_snapshot(
         self,
@@ -264,7 +486,13 @@ class SQLiteAgentSessionContextRepository:
         bounded_items = max(1, min(int(max_items), 16))
         now = float(self._clock())
         with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             self._prune(conn, now=now)
+            existing_count = self._context_row_count(
+                conn, owner_digest=owner_digest, context_type=normalized_type,
+            )
+            reclaimed_rows = max(0, existing_count + 1 - bounded_items)
+            self._require_row_capacity(conn, reclaimed_rows=reclaimed_rows)
             conn.execute(
                 "INSERT INTO agent_session_context("
                 "owner_digest,context_type,payload,expires_at,created_at"
@@ -277,7 +505,6 @@ class SQLiteAgentSessionContextRepository:
                 "WHERE owner_digest=? AND context_type=? ORDER BY id DESC LIMIT ?)",
                 (owner_digest, normalized_type, owner_digest, normalized_type, bounded_items),
             )
-            self._bound_rows(conn)
 
     def get_latest(
         self,
@@ -292,7 +519,8 @@ class SQLiteAgentSessionContextRepository:
         with db.get_conn() as conn:
             self._prune(conn, now=current)
             row = conn.execute(
-                "SELECT payload,expires_at FROM agent_session_context "
+                "SELECT id,payload,expires_at,context_generation "
+                "FROM agent_session_context "
                 "WHERE owner_digest=? AND context_type=? AND expires_at>? "
                 "ORDER BY id DESC LIMIT 1",
                 (owner_digest, normalized_type, current),
@@ -465,6 +693,12 @@ class SQLiteAgentSessionContextRepository:
                 return None
             envelope = json.loads(encoded)
             expires_at = float(row["expires_at"])
+            row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+            revision = int(row["id"] or 0) if "id" in row_keys else 0
+            generation = (
+                int(row["context_generation"] or 0)
+                if "context_generation" in row_keys else 0
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
         if (
@@ -484,7 +718,10 @@ class SQLiteAgentSessionContextRepository:
         )
         if not hmac.compare_digest(envelope["auth"], expected_auth):
             return None
-        return PersistedAgentContext(payload=envelope["data"], expires_at=expires_at)
+        return PersistedAgentContext(
+            payload=envelope["data"], expires_at=expires_at,
+            revision=max(0, revision), generation=max(0, generation),
+        )
 
     def _auth_tag(
         self,
@@ -528,13 +765,103 @@ class SQLiteAgentSessionContextRepository:
         return parsed
 
     @staticmethod
+    def _positive_int(value: int, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"Agent 会话上下文 {label} 无效")
+        return int(value)
+
+    @staticmethod
+    def _nonnegative_int(value: int, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"Agent 会话上下文 {label} 无效")
+        return int(value)
+
+    @staticmethod
+    def _advance_generation(
+        conn: Any, *, owner_digest: str, context_type: str, now: float,
+    ) -> int:
+        cursor = conn.execute(
+            "INSERT INTO agent_session_context_generation_sequence DEFAULT VALUES"
+        )
+        generation = int(cursor.lastrowid)
+        conn.execute(
+            "DELETE FROM agent_session_context_generation_sequence WHERE id=?",
+            (generation,),
+        )
+        conn.execute(
+            "INSERT INTO agent_session_context_epochs("
+            "owner_digest,context_type,generation,touched_at,updated_at"
+            ") VALUES(?,?,?,?,?) ON CONFLICT(owner_digest,context_type) DO UPDATE SET "
+            "generation=excluded.generation,touched_at=excluded.touched_at,"
+            "updated_at=excluded.updated_at",
+            (owner_digest, context_type, generation, now, db.now()),
+        )
+        return generation
+
+    @staticmethod
+    def _touch_generation(
+        conn: Any, *, owner_digest: str, context_type: str, now: float,
+    ) -> None:
+        conn.execute(
+            "UPDATE agent_session_context_epochs SET touched_at=?,updated_at=? "
+            "WHERE owner_digest=? AND context_type=?",
+            (now, db.now(), owner_digest, context_type),
+        )
+
+    @staticmethod
     def _prune(conn: Any, *, now: float) -> None:
         conn.execute("DELETE FROM agent_session_context WHERE expires_at<=?", (now,))
-
-    def _bound_rows(self, conn: Any) -> None:
         conn.execute(
-            "DELETE FROM agent_session_context WHERE id NOT IN ("
-            "SELECT id FROM agent_session_context ORDER BY id DESC LIMIT ?"
-            ")",
-            (self.max_rows,),
+            "DELETE FROM agent_session_context_epochs WHERE touched_at<=? AND "
+            "NOT EXISTS(SELECT 1 FROM agent_session_context c "
+            "WHERE c.owner_digest=agent_session_context_epochs.owner_digest "
+            "AND c.context_type=agent_session_context_epochs.context_type)",
+            (now - 3600.0,),
         )
+
+    @staticmethod
+    def _context_row_count(
+        conn: Any, *, owner_digest: str, context_type: str,
+    ) -> int:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM agent_session_context "
+            "WHERE owner_digest=? AND context_type=?",
+            (owner_digest, context_type),
+        ).fetchone()[0] or 0)
+
+    def _require_row_capacity(self, conn: Any, *, reclaimed_rows: int) -> None:
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM agent_session_context"
+        ).fetchone()[0] or 0)
+        if total - max(0, int(reclaimed_rows)) + 1 > self.max_rows:
+            raise RuntimeError("Agent 会话上下文容量已满")
+
+    def _require_epoch_capacity(
+        self, conn: Any, *, owner_digest: str, context_type: str,
+    ) -> None:
+        exists = conn.execute(
+            "SELECT 1 FROM agent_session_context_epochs "
+            "WHERE owner_digest=? AND context_type=?",
+            (owner_digest, context_type),
+        ).fetchone()
+        if exists is not None:
+            return
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM agent_session_context_epochs"
+        ).fetchone()[0] or 0)
+        if total < self.max_epochs:
+            return
+        conn.execute(
+            "DELETE FROM agent_session_context_epochs WHERE rowid IN ("
+            "SELECT e.rowid FROM agent_session_context_epochs e "
+            "WHERE NOT EXISTS(SELECT 1 FROM agent_session_context c "
+            "WHERE c.owner_digest=e.owner_digest AND c.context_type=e.context_type) "
+            "ORDER BY e.touched_at ASC LIMIT ?"
+            ")",
+            (total - self.max_epochs + 1,),
+        )
+        remaining = int(conn.execute(
+            "SELECT COUNT(*) FROM agent_session_context_epochs"
+        ).fetchone()[0] or 0)
+        if remaining >= self.max_epochs:
+            raise RuntimeError("Agent 会话上下文世代容量已满")

@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -1274,6 +1274,40 @@ CREATE TABLE IF NOT EXISTS task_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_task_runs_name_id ON task_runs(task_name, id DESC);
 
+CREATE TABLE IF NOT EXISTS organize_operation_jobs (
+    job_id TEXT PRIMARY KEY,
+    job_kind TEXT NOT NULL
+        CHECK(job_kind IN ('agent_directory_scrape','directory_scrape')),
+    owner_digest TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    reference TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    payload_auth TEXT NOT NULL DEFAULT '',
+    dedupe_digest TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','running','completed','partial','failed','cancelled','manual_review')),
+    lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),
+    result_json TEXT NOT NULL DEFAULT '{}',
+    error_code TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
+    expires_at REAL NOT NULL DEFAULT 0,
+    purged_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_organize_operation_jobs_pending
+    ON organize_operation_jobs(status, created_at, job_id);
+CREATE INDEX IF NOT EXISTS idx_organize_operation_jobs_updated
+    ON organize_operation_jobs(updated_at DESC, job_id);
+CREATE INDEX IF NOT EXISTS idx_organize_operation_jobs_owner_updated
+    ON organize_operation_jobs(owner_digest, updated_at DESC, job_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_organize_operation_jobs_active_dedupe
+    ON organize_operation_jobs(owner_digest, dedupe_digest)
+    WHERE status IN ('pending','running');
+
 CREATE TABLE IF NOT EXISTS agent_action_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_digest TEXT NOT NULL DEFAULT '',
@@ -1304,12 +1338,28 @@ CREATE TABLE IF NOT EXISTS agent_session_context (
     context_type TEXT NOT NULL,
     payload TEXT NOT NULL,
     expires_at REAL NOT NULL,
+    context_generation INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_session_context_lookup
     ON agent_session_context(owner_digest, context_type, expires_at, id DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_session_context_expiry
     ON agent_session_context(expires_at);
+
+CREATE TABLE IF NOT EXISTS agent_session_context_epochs (
+    owner_digest TEXT NOT NULL,
+    context_type TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    touched_at REAL NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(owner_digest, context_type)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_session_context_epochs_touched
+    ON agent_session_context_epochs(touched_at);
+
+CREATE TABLE IF NOT EXISTS agent_session_context_generation_sequence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT
+);
 
 CREATE TABLE IF NOT EXISTS agent_confirmation_epochs (
     owner_digest TEXT PRIMARY KEY,
@@ -1503,6 +1553,7 @@ CREATE TABLE IF NOT EXISTS agent_rate_limit_buckets (
     limiter_key TEXT PRIMARY KEY,
     window_start INTEGER NOT NULL,
     count INTEGER NOT NULL DEFAULT 0 CHECK(count >= 0),
+    expires_at INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 
@@ -1663,6 +1714,17 @@ def _migrate_agent_session_context_v2(conn: sqlite3.Connection) -> None:
     table_sql = str(row[0] or "").casefold()
     if "check" not in table_sql or "context_type" not in table_sql:
         return
+    legacy_columns = {
+        str(column[1])
+        for column in conn.execute(
+            "PRAGMA table_info(agent_session_context)"
+        ).fetchall()
+    }
+    generation_expression = (
+        "COALESCE(context_generation,0)"
+        if "context_generation" in legacy_columns
+        else "0"
+    )
     conn.execute("ALTER TABLE agent_session_context RENAME TO agent_session_context_v1")
     conn.execute(
         "CREATE TABLE agent_session_context ("
@@ -1671,13 +1733,15 @@ def _migrate_agent_session_context_v2(conn: sqlite3.Connection) -> None:
         "context_type TEXT NOT NULL,"
         "payload TEXT NOT NULL,"
         "expires_at REAL NOT NULL,"
+        "context_generation INTEGER NOT NULL DEFAULT 0,"
         "created_at TEXT NOT NULL"
         ")"
     )
     conn.execute(
         "INSERT INTO agent_session_context("
-        "id,owner_digest,context_type,payload,expires_at,created_at"
-        ") SELECT id,owner_digest,context_type,payload,expires_at,created_at "
+        "id,owner_digest,context_type,payload,expires_at,context_generation,created_at"
+        ") SELECT id,owner_digest,context_type,payload,expires_at,"
+        f"{generation_expression},created_at "
         "FROM agent_session_context_v1"
     )
     conn.execute("DROP TABLE agent_session_context_v1")
@@ -1691,9 +1755,124 @@ def _migrate_agent_session_context_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_agent_session_context_v3(conn: sqlite3.Connection) -> None:
+    """为跨 Worker 工作流增加 fencing generation 与持久化 epoch。"""
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='agent_session_context'"
+    ).fetchone()
+    if table_exists is not None:
+        columns = {
+            str(column[1])
+            for column in conn.execute(
+                "PRAGMA table_info(agent_session_context)"
+            ).fetchall()
+        }
+        if "context_generation" not in columns:
+            conn.execute(
+                "ALTER TABLE agent_session_context ADD COLUMN "
+                "context_generation INTEGER NOT NULL DEFAULT 0"
+            )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_session_context_epochs ("
+        "owner_digest TEXT NOT NULL,"
+        "context_type TEXT NOT NULL,"
+        "generation INTEGER NOT NULL CHECK(generation > 0),"
+        "touched_at REAL NOT NULL,"
+        "updated_at TEXT NOT NULL,"
+        "PRIMARY KEY(owner_digest, context_type)"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_session_context_epochs_touched "
+        "ON agent_session_context_epochs(touched_at)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_session_context_generation_sequence ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT"
+        ")"
+    )
+
+
+def _migrate_organize_operation_jobs_v4(conn: sqlite3.Connection) -> None:
+    """增加可恢复的光鸭单次操作队列与终态记录。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS organize_operation_jobs ("
+        "job_id TEXT PRIMARY KEY,"
+        "job_kind TEXT NOT NULL CHECK(job_kind IN "
+        "('agent_directory_scrape','directory_scrape')),"
+        "owner_digest TEXT NOT NULL,"
+        "operation TEXT NOT NULL,reference TEXT NOT NULL DEFAULT '',"
+        "payload_json TEXT NOT NULL DEFAULT '{}',payload_auth TEXT NOT NULL DEFAULT '',"
+        "dedupe_digest TEXT NOT NULL,"
+        "status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN "
+        "('pending','running','completed','partial','failed','cancelled','manual_review')),"
+        "lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),"
+        "result_json TEXT NOT NULL DEFAULT '{}',error_code TEXT NOT NULL DEFAULT '',"
+        "error TEXT NOT NULL DEFAULT '',"
+        "cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),"
+        "expires_at REAL NOT NULL DEFAULT 0,purged_at TEXT,"
+        "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,started_at TEXT,finished_at TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_organize_operation_jobs_pending "
+        "ON organize_operation_jobs(status, created_at, job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_organize_operation_jobs_updated "
+        "ON organize_operation_jobs(updated_at DESC, job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_organize_operation_jobs_owner_updated "
+        "ON organize_operation_jobs(owner_digest, updated_at DESC, job_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_organize_operation_jobs_active_dedupe "
+        "ON organize_operation_jobs(owner_digest,dedupe_digest) "
+        "WHERE status IN ('pending','running')"
+    )
+
+
+def _migrate_organize_operation_jobs_v5(conn: sqlite3.Connection) -> None:
+    """强化主体隔离、确认过期、载荷完整性与隐私取消语义。"""
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(organize_operation_jobs)")
+    }
+    additions = {
+        "payload_auth": "TEXT NOT NULL DEFAULT ''",
+        "cancel_requested": "INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1))",
+        "expires_at": "REAL NOT NULL DEFAULT 0",
+        "purged_at": "TEXT",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE organize_operation_jobs ADD COLUMN {name} {definition}"
+            )
+    conn.execute("DROP INDEX IF EXISTS idx_organize_operation_jobs_active_dedupe")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_organize_operation_jobs_active_dedupe "
+        "ON organize_operation_jobs(owner_digest,dedupe_digest) "
+        "WHERE status IN ('pending','running')"
+    )
+    timestamp = now()
+    conn.execute(
+        "UPDATE organize_operation_jobs SET status='cancelled',payload_json='{}',"
+        "payload_auth='',error_code='UpgradeRequiresReconfirmation',"
+        "error='服务升级后需重新预检确认',finished_at=COALESCE(finished_at,?),"
+        "updated_at=? WHERE status='pending' AND COALESCE(payload_auth,'')=''",
+        (timestamp, timestamp),
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
+    2: _migrate_agent_session_context_v3,
+    3: _migrate_organize_operation_jobs_v4,
+    4: _migrate_organize_operation_jobs_v5,
 }
 
 
@@ -1813,6 +1992,11 @@ def init_db() -> None:
             # 未打版本的早期数据库也可能已有 v1 约束表；幂等检查后补齐。
             _migrate_agent_session_context_v2(conn)
             conn.executescript(_SCHEMA)
+            conn.execute(
+                "UPDATE agent_rate_limit_buckets SET expires_at="
+                "MAX(window_start + 120, ?) WHERE expires_at<=0",
+                (int(time.time()) + 60,),
+            )
             # Docker-only 版本不再使用应用内 SMB 凭据；保留旧列兼容 schema，
             # 但主动清除历史敏感值，避免无业务用途的 NAS 密码继续进入备份。
             conn.execute(
@@ -3099,6 +3283,7 @@ def purge_expired_agent_task_history(
                 "patrol_notification_outbox": 0,
                 "action_history": 0,
                 "jobs": 0,
+                "organize_operation_jobs": 0,
                 "missing_media_workflows": 0,
                 "web_search_usage": 0,
             }
@@ -3137,6 +3322,13 @@ def purge_expired_agent_task_history(
             "AND updated_at<? ORDER BY updated_at,job_id LIMIT ?)",
             (cutoff, limit),
         )
+        organize_jobs = conn.execute(
+            "DELETE FROM organize_operation_jobs WHERE job_id IN ("
+            "SELECT job_id FROM organize_operation_jobs WHERE status IN "
+            "('completed','partial','failed','cancelled','manual_review') "
+            "AND updated_at<? ORDER BY updated_at,job_id LIMIT ?)",
+            (cutoff, limit),
+        )
         workflows = conn.execute(
             "DELETE FROM agent_missing_media_workflows WHERE workflow_id IN ("
             "SELECT workflow_id FROM agent_missing_media_workflows "
@@ -3163,6 +3355,7 @@ def purge_expired_agent_task_history(
             "patrol_notification_outbox": max(0, int(notifications.rowcount)),
             "action_history": max(0, int(action_history.rowcount)),
             "jobs": max(0, int(jobs.rowcount)),
+            "organize_operation_jobs": max(0, int(organize_jobs.rowcount)),
             "missing_media_workflows": max(0, int(workflows.rowcount)),
             "web_search_usage": max(0, int(web_usage.rowcount)),
         }
@@ -3201,6 +3394,7 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
         for key, table, column in (
             ("action_history", "agent_action_history", "owner_digest"),
             ("session_context", "agent_session_context", "owner_digest"),
+            ("session_context_epochs", "agent_session_context_epochs", "owner_digest"),
             ("confirmations", "agent_confirmations", "owner_digest"),
             ("confirmation_epochs", "agent_confirmation_epochs", "owner_digest"),
             ("jobs", "agent_jobs", "owner_digest"),
@@ -3212,12 +3406,33 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
         ):
             digest_key = {
                 "confirmation_epochs": "confirmations",
+                "session_context_epochs": "session_context",
+                "organize_operation_jobs": "jobs",
                 "conversation_epochs": "conversations",
             }.get(key, key)
             cursor = conn.execute(
                 f"DELETE FROM {table} WHERE {column}=?", (digests[digest_key],)
             )
             deleted[key] = max(0, int(cursor.rowcount or 0))
+        # 已进入远端写操作的任务不能直接删行：执行线程可能已持有参数快照。
+        # 先最小化持久数据并设置取消位，worker 会在真正写入前再次检查；
+        # 未运行任务和终态可立即删除。
+        purge_time = now()
+        running = conn.execute(
+            "UPDATE organize_operation_jobs SET cancel_requested=1,purged_at=?,"
+            "payload_json='{}',payload_auth='',reference='',result_json='{}',"
+            "error_code='',error='',updated_at=? "
+            "WHERE owner_digest=? AND status='running'",
+            (purge_time, purge_time, digests["jobs"]),
+        )
+        removable = conn.execute(
+            "DELETE FROM organize_operation_jobs WHERE owner_digest=? AND status<>'running'",
+            (digests["jobs"],),
+        )
+        deleted["organize_operation_jobs"] = (
+            max(0, int(running.rowcount or 0))
+            + max(0, int(removable.rowcount or 0))
+        )
     return deleted
 
 
@@ -4625,6 +4840,10 @@ def list_task_runs(task_name: str = "", limit: int = 20) -> list[sqlite3.Row]:
 
 
 # ===== Agent 受确认动作审计 =====
+_AGENT_ACTION_HISTORY_PER_OWNER_LIMIT = 2000
+_AGENT_ACTION_HISTORY_GLOBAL_LIMIT = 20_000
+
+
 def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
                              status: str, ok: bool, summary: str,
                              safe_details: dict | None = None,
@@ -4677,10 +4896,36 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
         )
         history_id = int(cursor.lastrowid)
         conn.execute(
-            "DELETE FROM agent_action_history WHERE id NOT IN ("
-            "SELECT id FROM agent_action_history ORDER BY id DESC LIMIT 2000"
-            ")"
+            "DELETE FROM agent_action_history WHERE owner_digest=? AND id NOT IN ("
+            "SELECT id FROM agent_action_history WHERE owner_digest=? "
+            "ORDER BY id DESC LIMIT ?"
+            ")",
+            (
+                normalized_owner,
+                normalized_owner,
+                _AGENT_ACTION_HISTORY_PER_OWNER_LIMIT,
+            ),
         )
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM agent_action_history"
+        ).fetchone()[0] or 0)
+        if total > _AGENT_ACTION_HISTORY_GLOBAL_LIMIT:
+            # 一次收敛到全局容量：先按 owner 内新旧排序，再按轮次公平保留。
+            # 这样会优先保留每个 owner 的最新记录，并确保当前新审计不因
+            # 旧数据库已超限而被静默丢弃。
+            conn.execute(
+                "DELETE FROM agent_action_history WHERE id NOT IN ("
+                "SELECT id FROM ("
+                "SELECT id,ROW_NUMBER() OVER ("
+                "PARTITION BY owner_digest ORDER BY id DESC"
+                ") AS owner_rank FROM agent_action_history"
+                ") WHERE owner_rank<=? ORDER BY owner_rank ASC,id DESC LIMIT ?"
+                ")",
+                (
+                    _AGENT_ACTION_HISTORY_PER_OWNER_LIMIT,
+                    _AGENT_ACTION_HISTORY_GLOBAL_LIMIT,
+                ),
+            )
         return history_id
 
 

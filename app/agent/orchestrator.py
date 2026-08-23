@@ -35,6 +35,8 @@ from app.agent.observability import (
 from app.agent.intents import ReadIntentSpec, match_read_intent
 from app.agent import local_media_intents
 from app.agent.local_media_task_actions import clear_local_media_agent_context
+from app.agent.discovery_mapping_actions import clear_discovery_mapping_context
+from app.agent.guangya_directory_scrape_actions import clear_directory_scrape_context
 from app.agent.indexer_config_actions import current_indexer_site_ids
 from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
 from app.agent.llm_router import (
@@ -5573,19 +5575,32 @@ class AgentOrchestrator:
             raise AgentToolError("当前会话无法重置", code="confirmation_invalid")
         revoked = self.confirmation_store.revoke_owner(owner=owner_key)
         self._reconcile_missing_confirmations(owner_key, ())
+        persisted = 0
+        if self.session_context_repository is not None:
+            try:
+                invalidate_owner = getattr(
+                    self.session_context_repository, "invalidate_owner", None
+                )
+                if callable(invalidate_owner):
+                    persisted = invalidate_owner(
+                        owner=owner_key,
+                        context_types=("discovery_mapping", "directory_scrape"),
+                    )
+                else:
+                    persisted = self.session_context_repository.delete_owner(
+                        owner=owner_key
+                    )
+            except Exception as exc:
+                logger.warning("Agent 会话持久化上下文清理失败 type=%s", type(exc).__name__)
+                raise AgentToolError("会话重置暂时无法完成，请稍后重试") from exc
         self.recent_patrol_store.clear_owner(owner=owner_key)
         self.recent_resource_store.clear_owner(owner=owner_key)
         self.recent_discovery_store.clear_owner(owner=owner_key)
         self.recent_download_store.clear_owner(owner=owner_key)
         self.recent_read_store.clear_owner(owner=owner_key)
         clear_local_media_agent_context(owner=owner_key)
-        persisted = 0
-        if self.session_context_repository is not None:
-            try:
-                persisted = self.session_context_repository.delete_owner(owner=owner_key)
-            except Exception as exc:
-                logger.warning("Agent 会话持久化上下文清理失败 type=%s", type(exc).__name__)
-                raise AgentToolError("会话重置暂时无法完成，请稍后重试") from exc
+        clear_discovery_mapping_context(owner=owner_key, delete_persisted=False)
+        clear_directory_scrape_context(owner=owner_key, delete_persisted=False)
         return {
             "reset": True,
             "revoked_confirmations": revoked,

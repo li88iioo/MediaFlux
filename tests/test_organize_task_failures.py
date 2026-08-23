@@ -578,6 +578,34 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         self.assertEqual(manager.task_result(queued["task_id"])["status"], "completed")
         manager.begin_shutdown()
 
+    def test_manual_operation_queue_rolls_back_when_dispatcher_start_fails(self):
+        manager = OrganizeTaskManager()
+        manager._lock = threading.Lock()
+        manager._lock.acquire()
+        dispatcher = MagicMock()
+        dispatcher.is_alive.return_value = False
+        dispatcher.start.side_effect = RuntimeError("thread unavailable")
+        try:
+            with patch(
+                "app.modules.organize_tasks.threading.Thread",
+                return_value=dispatcher,
+            ):
+                result = manager.start_operation(
+                    "目录刮削",
+                    "queue-start-failure",
+                    lambda: {"stats": {"moved": 1}},
+                    queue_if_busy=True,
+                    dedupe_key="manual:queue-start-failure",
+                )
+        finally:
+            manager._lock.release()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["error_code"], "queue_dispatcher_start_failed")
+        self.assertEqual(manager.task_status()["operation_queue"]["items"], [])
+        self.assertIsNone(manager._operation_dispatcher)
+
     def test_shutdown_records_queued_manual_operation_as_stopped(self):
         manager = OrganizeTaskManager()
         manager._lock = threading.Lock()

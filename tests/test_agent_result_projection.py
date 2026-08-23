@@ -155,6 +155,28 @@ class AgentResultProjectionTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, serialized)
 
+    def test_projection_keeps_patrol_interval_hours(self):
+        projected = project_agent_response_for_llm({
+            "tool_call": {"name": "library.patrol_policy", "arguments": {}},
+            "result": {
+                "ok": True,
+                "status": "completed",
+                "summary": "已读取缺集巡检策略",
+                "data": {
+                    "policy": {
+                        "enabled": True,
+                        "interval_hours": 12,
+                        "max_series": 50,
+                    }
+                },
+                "evidence": [],
+                "suggestions": [],
+                "error": "",
+            },
+        })
+        self.assertIsNotNone(projected)
+        self.assertEqual(projected["data"]["策略"]["巡检间隔（小时）"], 12)
+
     def test_public_business_statuses_survive_llm_projection_and_render_readably(self):
         labels = {
             "updates_available": "发现需要关注的内容",
@@ -423,6 +445,28 @@ class AgentResultProjectionTests(unittest.TestCase):
         self.assertIsNotNone(projected)
         self.assertLessEqual(len(projected["data"]["项目"]), 16)
         self.assertLess(len(repr(projected).encode("utf-8")), 10_240)
+
+    def test_projection_keeps_only_valid_public_operation_reference(self):
+        response = {
+            "mode": "confirmed_action",
+            "tool_call": {"name": "guangya.directory_scrape.run", "arguments": {}},
+            "result": {
+                "ok": True, "status": "accepted", "summary": "目录刮削已排队",
+                "data": {
+                    "operation_ref": "GY-ABCD-EF01-2345-6789-ABCD-EF01-2345-6789",
+                    "task_id": "private-task-id",
+                    "queued": True,
+                },
+            },
+        }
+
+        projected = project_agent_response_for_llm(response)
+
+        self.assertEqual(
+            projected["data"]["操作编号"],
+            "GY-ABCD-EF01-2345-6789-ABCD-EF01-2345-6789",
+        )
+        self.assertNotIn("private-task-id", repr(projected))
 
     def test_projection_requires_completed_tool_response(self):
         self.assertIsNone(project_agent_response_for_llm({}))

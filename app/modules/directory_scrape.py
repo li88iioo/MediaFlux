@@ -452,6 +452,17 @@ class PreviewSnapshotGuangYaClient:
         return getattr(self._client, name)
 
 
+
+class _CallbackCancelEvent:
+    """把 durable DB 取消检查适配为 Organizer 现有的 Event 契约。"""
+
+    def __init__(self, callback: Callable[[], None]):
+        self._callback = callback
+
+    def is_set(self) -> bool:
+        self._callback()
+        return False
+
 class DirectoryScrapeService:
     def __init__(
         self,
@@ -981,12 +992,23 @@ class DirectoryScrapeService:
     def preview_reference(self, owner: str, preview_id: str) -> str:
         return self.store.get_preview(owner, preview_id).inspection.directory_name
 
-    def execute_preview(self, owner: str, preview_id: str) -> dict:
+    def execute_preview(
+        self, owner: str, preview_id: str, *,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> dict:
         record = self.store.claim_preview(owner, preview_id)
+        cancel_event = _CallbackCancelEvent(cancel_check) if cancel_check else None
+
+        def check_cancel() -> None:
+            if cancel_check is not None:
+                cancel_check()
+
         try:
+            check_cancel()
             current_rules = self.rules_loader()
             if asdict(current_rules) != asdict(record.rules):
                 raise DirectoryScrapeConflictError("光鸭整理规则已变化，请重新检查并生成预览")
+            check_cancel()
             try:
                 current = self._inspect_scope(
                     record.scope_type,
@@ -997,6 +1019,7 @@ class DirectoryScrapeService:
                 raise DirectoryScrapeConflictError("目录内容已变化，请重新检查并生成预览") from exc
             if current.fingerprint != record.inspection.fingerprint:
                 raise DirectoryScrapeConflictError("目录内容已变化，请重新检查并生成预览")
+            check_cancel()
             existing_ids = {
                 int(row["id"])
                 for row in db.list_organize_logs(limit=5000)
@@ -1020,6 +1043,7 @@ class DirectoryScrapeService:
                 client=PreviewSnapshotGuangYaClient(organizer.client, current),
                 scraper=organizer.scraper,
             )
+            check_cancel()
             current_plans, _current_stats = signature_organizer.organize(
                 record.inspection.directory_id,
                 record.rules,
@@ -1031,6 +1055,7 @@ class DirectoryScrapeService:
             )
             if self._plan_signature(current_plans, current_companions) != record.signature:
                 raise DirectoryScrapeConflictError("归档计划已变化，请重新检查并确认")
+            check_cancel()
             self._begin_source_scan(organizer)
             _plans, stats = organizer.organize(
                 record.inspection.directory_id,
@@ -1042,14 +1067,18 @@ class DirectoryScrapeService:
                 # 执行阶段只读探测缓存，保证最终文件名与用户确认过的预览
                 # 完全一致；缓存由预览阶段的在线探测负责预热。
                 media_probe_cache_only=True,
+                cancel_event=cancel_event,  # type: ignore[arg-type]
             )
+            check_cancel()
             self._apply_pending_stats(stats, current)
             self._cleanup_selected_source(record, current, stats)
+            check_cancel()
             Organizer.notify_directory_results(
                 stats,
                 record.rules,
                 source_name=record.inspection.directory_name,
             )
+            check_cancel()
             Organizer.trigger_post_actions(
                 stats,
                 record.rules,

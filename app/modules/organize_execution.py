@@ -364,6 +364,8 @@ def execute_organize_plans(
                     replacement_backup_name = (
                         f"{existing.name}.mediaflux-backup-{existing.file_id[-8:]}"
                     )
+                    if cancel_event:
+                        cancel_event.is_set()
                     organizer.client.rename(existing.file_id, replacement_backup_name)
                     stats["conflict"] += 1
                 else:
@@ -388,10 +390,14 @@ def execute_organize_plans(
                     ),
                     role="待整理视频",
                 )
+                if cancel_event:
+                    cancel_event.is_set()
                 video_move_attempted = True
                 organizer.client.move([p.file_id], target_id)
                 video_moved_to_target = True
                 if rules.rename_enabled and p.new_name and p.new_name != p.original_name:
+                    if cancel_event:
+                        cancel_event.is_set()
                     organizer.client.rename(p.file_id, p.new_name)
                     actual_name = p.new_name
                     video_renamed = True
@@ -409,6 +415,8 @@ def execute_organize_plans(
                         "current_name": item.name,
                     }
                     companion_journal.append(journal_entry)
+                    if cancel_event:
+                        cancel_event.is_set()
                     organizer.client.move([item.file_id], target_id)
                     subtitle_plan = subtitle_plan_by_id.get(item.file_id)
                     target_name = (
@@ -419,6 +427,8 @@ def execute_organize_plans(
                         )
                     )
                     if rules.rename_enabled and target_name != item.name:
+                        if cancel_event:
+                            cancel_event.is_set()
                         organizer.client.rename(item.file_id, target_name)
                         journal_entry["current_name"] = target_name
                     moved_metadata.append((item, target_name))
@@ -513,6 +523,8 @@ def execute_organize_plans(
                         )
                     else:
                         try:
+                            if cancel_event:
+                                cancel_event.is_set()
                             result = execute_recycle_bin_delete(
                                 organizer.client, trigger="replacement",
                                 reason=conflict_note or "同版本新文件胜出",

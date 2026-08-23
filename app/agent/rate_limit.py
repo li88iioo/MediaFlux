@@ -291,10 +291,12 @@ class AgentRateLimiter:
             now_epoch = int(time.time())
             with db.get_conn() as conn:
                 self._ensure_shared_table(conn)
+                conn.execute(
+                    "DELETE FROM agent_rate_limit_buckets WHERE expires_at<=?",
+                    (now_epoch,),
+                )
                 row = conn.execute(
-                    "SELECT COUNT(*) AS total FROM agent_rate_limit_buckets "
-                    "WHERE window_start>?",
-                    (now_epoch - 86400,),
+                    "SELECT COUNT(*) AS total FROM agent_rate_limit_buckets",
                 ).fetchone()
             return int(row["total"] or 0)
         with self._lock:
@@ -313,16 +315,46 @@ class AgentRateLimiter:
             self._operations = 0
 
     @staticmethod
-    def _ensure_shared_table(conn: object) -> None:
+    def _ensure_shared_table(
+        conn: object, *, legacy_window_seconds: int = 60,
+    ) -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS agent_rate_limit_buckets ("
             "limiter_key TEXT PRIMARY KEY,window_start INTEGER NOT NULL,"
-            "count INTEGER NOT NULL DEFAULT 0 CHECK(count>=0),updated_at TEXT NOT NULL)"
+            "count INTEGER NOT NULL DEFAULT 0 CHECK(count>=0),"
+            "expires_at INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL)"
+        )
+        columns = {
+            str(row["name"] if hasattr(row, "keys") else row[1])
+            for row in conn.execute("PRAGMA table_info(agent_rate_limit_buckets)").fetchall()
+        }
+        if "expires_at" not in columns:
+            try:
+                conn.execute(
+                    "ALTER TABLE agent_rate_limit_buckets "
+                    "ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0"
+                )
+            except Exception:
+                refreshed = {
+                    str(row["name"] if hasattr(row, "keys") else row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(agent_rate_limit_buckets)"
+                    ).fetchall()
+                }
+                if "expires_at" not in refreshed:
+                    raise
+        now_epoch = int(time.time())
+        legacy_window = max(1, int(legacy_window_seconds))
+        # 历史表新增列时 DEFAULT 0 只代表“尚未迁移”，不能直接当作过期；
+        # 先保守保留两个旧窗口，避免部署瞬间重置仍在生效的预算。
+        conn.execute(
+            "UPDATE agent_rate_limit_buckets SET expires_at="
+            "MAX(window_start + ?, ?) WHERE expires_at<=0",
+            (2 * legacy_window, now_epoch + legacy_window),
         )
 
-    @staticmethod
     def _allow_shared(
-        key: str, *, limit: int, window_seconds: int, cost: int
+        self, key: str, *, limit: int, window_seconds: int, cost: int
     ) -> bool:
         """单行固定窗口桶；跨 Worker 原子判定且不写高频事件日志。"""
         from app import database as db
@@ -333,13 +365,30 @@ class AgentRateLimiter:
         now_epoch = int(time.time())
         window_start = (now_epoch // window_seconds) * window_seconds
         with db.get_conn() as conn:
-            AgentRateLimiter._ensure_shared_table(conn)
+            AgentRateLimiter._ensure_shared_table(
+                conn, legacy_window_seconds=window_seconds,
+            )
+            # 旧 schema 回填可能开启隐式事务；先提交迁移，再进入预算判定的
+            # BEGIN IMMEDIATE，避免同一连接嵌套事务。
+            conn.commit()
             conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM agent_rate_limit_buckets WHERE expires_at<=?",
+                (now_epoch,),
+            )
             row = conn.execute(
                 "SELECT window_start,count FROM agent_rate_limit_buckets "
                 "WHERE limiter_key=?",
                 (digest,),
             ).fetchone()
+            if row is None:
+                total = conn.execute(
+                    "SELECT COUNT(*) AS total FROM agent_rate_limit_buckets"
+                ).fetchone()
+                if int(total["total"] or 0) >= self._max_keys:
+                    # 共享身份空间已满时同样保守拒绝新 key，避免轮换身份
+                    # 挤掉仍在生效的其他调用方预算。
+                    return False
             carried = 0
             if row is not None:
                 previous_start = int(row["window_start"])
@@ -356,11 +405,18 @@ class AgentRateLimiter:
                 return False
             conn.execute(
                 "INSERT INTO agent_rate_limit_buckets"
-                "(limiter_key,window_start,count,updated_at) VALUES(?,?,?,?) "
+                "(limiter_key,window_start,count,expires_at,updated_at) "
+                "VALUES(?,?,?,?,?) "
                 "ON CONFLICT(limiter_key) DO UPDATE SET "
                 "window_start=excluded.window_start,count=excluded.count,"
-                "updated_at=excluded.updated_at",
-                (digest, window_start, new_count, db.now()),
+                "expires_at=excluded.expires_at,updated_at=excluded.updated_at",
+                (
+                    digest,
+                    window_start,
+                    new_count,
+                    window_start + 2 * window_seconds,
+                    db.now(),
+                ),
             )
             return True
 

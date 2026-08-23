@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -12,6 +13,8 @@ from app import database as db
 from app.agent.action_history import list_action_history
 from app.agent.confirmation import ConfirmationStore, confirmation_context_fingerprint
 from app.agent.discovery_mapping_actions import (
+    _recent,
+    configure_discovery_mapping_context,
     confirm_discovery_mapping_confirmed,
     discovery_confirm_mapping_arguments,
     discovery_detail_arguments,
@@ -22,10 +25,12 @@ from app.agent.discovery_mapping_actions import (
 )
 from app.agent.guangya_directory_scrape_actions import (
     _flows,
+    configure_directory_scrape_context,
     directory_scrape_inspect_arguments,
     directory_scrape_preview_arguments,
     directory_scrape_run_arguments,
     directory_scrape_search_arguments,
+    execute_durable_directory_scrape_job,
     inspect_directory_scrape,
     prepare_run_directory_scrape,
     preview_directory_scrape,
@@ -70,12 +75,14 @@ from app.agent.rss_entry_actions import (
 )
 from app.agent.rss_retry_actions import _capture as capture_retryable_rss
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
+from app.agent.session_context import SQLiteAgentSessionContextRepository
 from app.agent.strm_history_actions import (
     get_strm_run_history,
     strm_run_history_arguments,
 )
 from app.discovery.models import MediaCard
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
+from app.modules.directory_scrape_errors import DirectoryScrapeGoneError
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -87,7 +94,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             for table in (
                 "rss_entry_media", "rss_entries", "rss_items", "media_external_ids",
                 "task_runs", "strm_change_queue", "strm_metadata_queue", "strm_failures",
-                "agent_library_patrol",
+                "agent_library_patrol", "organize_operation_jobs",
             ):
                 conn.execute(f"DELETE FROM {table}")
 
@@ -318,6 +325,54 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         self.assertIn(str(stored["tmdb_id"]), {"101", "202"})
         self.assertTrue(bool(stored["confirmed"]))
 
+    def test_discovery_mapping_confirmation_restores_persisted_snapshot(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "mapping-test-secret"
+        )
+        configure_discovery_mapping_context(repository)
+        card = MediaCard(
+            provider="douban", external_id="persisted-source", media_type="movie",
+            title="持久化映射", year="2026",
+        )
+        candidate = {
+            "tmdb_id": "909", "title": "持久化候选", "year": "2026",
+            "score": 0.97, "media_type": "movie",
+        }
+        service = Mock()
+        service.get_detail.return_value = card
+        service.lookup_tmdb_mapping.return_value = {
+            "tmdb_id": "", "confirmed": False, "candidates": [candidate]
+        }
+        service.verify_tmdb_mapping_candidate.return_value = dict(candidate)
+        service.confirm_tmdb_mapping_if_unchanged.return_value = {
+            "tmdb_id": "909", "confirmed": True,
+        }
+        context = ToolContext(owner="owner-persisted-mapping")
+        with patch(
+            "app.agent.discovery_mapping_actions.config.get_bool", return_value=True,
+        ), patch(
+            "app.agent.discovery_mapping_actions.get_discovery_service",
+            return_value=service,
+        ):
+            get_discovery_mapping_candidates(
+                {
+                    "provider": "douban", "external_id": "persisted-source",
+                    "media_type": "movie",
+                },
+                context,
+            )
+            _preview, fingerprint = prepare_confirm_discovery_mapping(
+                {"candidate_number": 1}, context
+            )
+            _recent.clear()  # 模拟确认请求命中另一个 Worker / 进程重启。
+            confirmed = confirm_discovery_mapping_confirmed(
+                {"candidate_number": 1}, fingerprint, context
+            )
+        self.assertTrue(confirmed.ok)
+        self.assertIsNone(repository.get_latest(
+            owner=context.owner, context_type="discovery_mapping", now=time.time(),
+        ))
+
     def test_discovery_mapping_cas_preserves_concurrently_confirmed_mapping(self) -> None:
         db.upsert_media_external_id(
             "douban", "race-existing", "movie", "100", "旧候选", "2025",
@@ -421,10 +476,13 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             self.assertEqual(stale.exception.code, "confirmation_stale")
             record.signature = original_signature
             with patch("app.modules.organize_tasks.get_organize_manager") as manager:
-                manager.return_value.start_operation.return_value = {"ok": True, "queued": True, "queue_position": 2}
+                manager.return_value.start_durable_operation.return_value = {"ok": True, "queued": True, "queue_position": 2}
                 accepted = run_directory_scrape_confirmed({}, fingerprint, context)
         self.assertTrue(inspected.ok and searched.ok and previewed.ok and prepared.ok)
         self.assertEqual(accepted.status, "accepted")
+        with self.assertRaises(AgentToolError) as consumed:
+            run_directory_scrape_confirmed({}, fingerprint, context)
+        self.assertEqual(consumed.exception.code, "confirmation_stale")
         rendered = json.dumps({
             "inspect": inspected.to_dict(), "search": searched.to_dict(),
             "preview": previewed.to_dict(), "prepare": prepared.to_dict(), "accepted": accepted.to_dict(),
@@ -434,6 +492,429 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             "/private/a", "/private/b", "/private/c", "/private/d", "PRIVATE-ACTION",
         ):
             self.assertNotIn(secret, rendered)
+
+    def test_guangya_scrape_filters_candidates_that_cannot_be_restored(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "scrape-candidate-validation-secret"
+        )
+        configure_directory_scrape_context(repository)
+        context = ToolContext(owner="owner-scrape-candidate-validation")
+        service = Mock()
+        service.inspect.return_value = {
+            "inspection_id": "inspection-candidates", "media_type": "tv",
+            "suggested_query": "合法候选", "requires_manual_match": False,
+            "manual_match_reason": "", "counts": {"videos": 1},
+        }
+        service.search.return_value = [
+            {
+                "provider": "tmdb", "external_id": "12/34",
+                "tmdb_id": "12/34", "title": "非法候选",
+                "year": "2026", "media_type": "tv", "score": 0.99,
+            },
+            {
+                "provider": "tmdb", "external_id": "567",
+                "tmdb_id": "567", "title": "合法候选",
+                "year": "2026", "media_type": "tv", "score": 0.95,
+            },
+        ]
+        service.store.get_inspection.return_value = SimpleNamespace()
+        service.preview.return_value = {
+            "preview_id": "preview-candidates",
+            "plans": [{
+                "action": "move", "conflict_decision": "none",
+                "file_id": "PRIVATE-FILE", "target_path": "/private/candidate",
+            }],
+            "companion_plans": [],
+        }
+        with patch(
+            "app.agent.guangya_directory_scrape_actions.get_directory_scrape_service",
+            return_value=service,
+        ):
+            inspect_directory_scrape({"directory_id": "dir-candidates"}, context)
+            searched = search_directory_scrape({"media_type": "auto"}, context)
+            self.assertEqual(searched.data["candidate_count"], 1)
+            self.assertEqual(
+                searched.data["candidates"][0]["candidate_number"], 1
+            )
+            self.assertEqual(
+                searched.data["candidates"][0]["title"], "合法候选"
+            )
+            _flows.clear()
+            previewed = preview_directory_scrape(
+                {"candidate_number": 1, "numbering_mode": "auto"}, context
+            )
+        self.assertTrue(previewed.ok)
+        self.assertEqual(service.preview.call_args.args[2], "567")
+        self.assertEqual(service.preview.call_args.args[3], "tv")
+
+    def test_guangya_scrape_queue_rejection_restores_preview_for_retry(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "scrape-retry-secret"
+        )
+        configure_directory_scrape_context(repository)
+        context = ToolContext(owner="owner-scrape-queue-retry")
+        record = SimpleNamespace(
+            inspection=SimpleNamespace(fingerprint="retry-inspection"),
+            rules=None, signature=(("move", "retry-plan"),),
+            target_snapshot=(("target", "retry"),), claimed=False,
+        )
+        service = Mock()
+        service.inspect.return_value = {
+            "inspection_id": "inspection-retry", "media_type": "tv",
+            "suggested_query": "重试预览", "requires_manual_match": False,
+            "manual_match_reason": "", "counts": {"videos": 1},
+        }
+        service.search.return_value = [{
+            "provider": "tmdb", "external_id": "321", "tmdb_id": "321",
+            "title": "重试预览", "year": "2026",
+            "media_type": "tv", "score": 0.95,
+        }]
+        service.preview.return_value = {
+            "preview_id": "preview-retry",
+            "plans": [{
+                "action": "move", "conflict_decision": "none",
+                "file_id": "PRIVATE-FILE", "target_path": "/private/retry",
+            }],
+            "companion_plans": [],
+        }
+        service.store.get_inspection.return_value = SimpleNamespace()
+        service.store.get_preview.return_value = record
+        service.preview_reference.return_value = "PRIVATE DIRECTORY"
+
+        with patch(
+            "app.agent.guangya_directory_scrape_actions.get_directory_scrape_service",
+            return_value=service,
+        ), patch("app.modules.organize_tasks.get_organize_manager") as manager:
+            inspect_directory_scrape({"directory_id": "dir-retry"}, context)
+            search_directory_scrape({"media_type": "auto"}, context)
+            preview_directory_scrape(
+                {"candidate_number": 1, "numbering_mode": "auto"}, context
+            )
+            _prepared, fingerprint = prepare_run_directory_scrape({}, context)
+            manager.return_value.start_durable_operation.return_value = {
+                "ok": False, "error": "queue unavailable"
+            }
+            with self.assertRaises(AgentToolError) as rejected:
+                run_directory_scrape_confirmed({}, fingerprint, context)
+            self.assertEqual(rejected.exception.code, "precondition_failed")
+            self.assertIn("预览已保留", str(rejected.exception))
+
+            _retry_preview, retry_fingerprint = prepare_run_directory_scrape({}, context)
+            manager.return_value.start_durable_operation.return_value = {
+                "ok": True, "queued": True, "queue_position": 1
+            }
+            accepted = run_directory_scrape_confirmed(
+                {}, retry_fingerprint, context
+            )
+
+        self.assertEqual(accepted.status, "accepted")
+        self.assertIsNone(repository.get_latest(
+            owner=context.owner, context_type="directory_scrape", now=time.time(),
+        ))
+
+    def test_guangya_scrape_confirmation_rebuilds_preview_in_another_worker(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "scrape-test-secret"
+        )
+        configure_directory_scrape_context(repository)
+        context = ToolContext(owner="owner-persisted-scrape")
+        inspection = SimpleNamespace(fingerprint="stable-inspection")
+        original_record = SimpleNamespace(
+            inspection=inspection,
+            rules=None,
+            signature=(("move", "same-plan"),),
+            target_snapshot=(("target", "same"),),
+            claimed=False,
+        )
+        rebuilt_record = SimpleNamespace(
+            inspection=inspection,
+            rules=None,
+            signature=original_record.signature,
+            target_snapshot=original_record.target_snapshot,
+            claimed=False,
+        )
+        plans = [{
+            "action": "move", "conflict_decision": "none",
+            "file_id": "PRIVATE-FILE", "target_path": "/private/target",
+        }]
+        first = Mock()
+        first.inspect.return_value = {
+            "inspection_id": "inspection-old", "media_type": "tv",
+            "suggested_query": "沧元图", "requires_manual_match": False,
+            "manual_match_reason": "", "counts": {"videos": 1},
+        }
+        first.search.return_value = [{
+            "provider": "tmdb", "external_id": "123", "tmdb_id": "123",
+            "title": "沧元图", "year": "2026", "media_type": "tv", "score": 0.95,
+        }]
+        first.preview.return_value = {
+            "preview_id": "preview-old", "plans": plans, "companion_plans": [],
+        }
+        first.store.get_inspection.return_value = SimpleNamespace()
+        first.store.get_preview.return_value = original_record
+
+        second = Mock()
+        second.store.get_inspection.side_effect = DirectoryScrapeGoneError("gone")
+
+        def get_preview(_owner: str, preview_id: str):
+            if preview_id == "preview-old":
+                raise DirectoryScrapeGoneError("gone")
+            self.assertEqual(preview_id, "preview-new")
+            return rebuilt_record
+
+        second.store.get_preview.side_effect = get_preview
+        second.inspect.return_value = {
+            "inspection_id": "inspection-new", "media_type": "tv",
+            "suggested_query": "沧元图", "requires_manual_match": False,
+            "manual_match_reason": "", "counts": {"videos": 1},
+        }
+        second.preview.return_value = {
+            "preview_id": "preview-new", "plans": plans, "companion_plans": [],
+        }
+        second.preview_reference.return_value = "PRIVATE DIRECTORY"
+
+        with patch(
+            "app.agent.guangya_directory_scrape_actions.get_directory_scrape_service",
+            return_value=first,
+        ):
+            inspect_directory_scrape({"directory_id": "dir-restore"}, context)
+            search_directory_scrape({"media_type": "auto"}, context)
+            preview_directory_scrape(
+                {"candidate_number": 1, "numbering_mode": "auto"}, context,
+            )
+            _prepared, fingerprint = prepare_run_directory_scrape({}, context)
+
+        _flows.clear()  # 模拟确认请求命中另一个 Worker / 进程重启。
+        with patch(
+            "app.agent.guangya_directory_scrape_actions.get_directory_scrape_service",
+            return_value=second,
+        ), patch("app.modules.organize_tasks.get_organize_manager") as manager:
+            manager.return_value.start_durable_operation.return_value = {
+                "ok": True, "queued": True, "queue_position": 1,
+            }
+            accepted = run_directory_scrape_confirmed({}, fingerprint, context)
+            durable_payload = manager.return_value.start_durable_operation.call_args.kwargs["payload"]
+
+        self.assertTrue(accepted.ok)
+        second.inspect.assert_called_once_with(context.owner, "dir-restore")
+        second.preview.assert_called_once()
+        second.execute_preview.return_value = {"stats": {"moved": 1}}
+        with patch(
+            "app.agent.guangya_directory_scrape_actions.get_directory_scrape_service",
+            return_value=second,
+        ):
+            durable_result = execute_durable_directory_scrape_job(durable_payload)
+        self.assertEqual(durable_result["stats"]["moved"], 1)
+        execution_owner = durable_payload["execution_owner"]
+        second.inspect.assert_any_call(execution_owner, "dir-restore")
+        second.execute_preview.assert_called_once_with(execution_owner, "preview-new")
+        self.assertIsNone(repository.get_latest(
+            owner=context.owner, context_type="directory_scrape", now=time.time(),
+        ))
+
+    def test_reset_session_clears_mapping_and_scrape_continuations(self) -> None:
+        agent = get_agent_service()
+        repository = agent.session_context_repository
+        self.assertIsNotNone(repository)
+        owner = "owner-reset-batch5"
+        context = ToolContext(owner=owner)
+
+        discovery = Mock()
+        discovery.get_detail.return_value = MediaCard(
+            provider="douban", external_id="reset-source", media_type="movie",
+            title="重置测试", year="2026",
+        )
+        discovery.lookup_tmdb_mapping.return_value = {
+            "tmdb_id": "", "confirmed": False,
+            "candidates": [{
+                "tmdb_id": "808", "title": "重置候选", "year": "2026",
+                "score": 0.9, "media_type": "movie",
+            }],
+        }
+        scrape = Mock()
+        scrape.inspect.return_value = {
+            "inspection_id": "inspection-reset", "media_type": "tv",
+            "suggested_query": "重置测试", "requires_manual_match": False,
+            "manual_match_reason": "", "counts": {"videos": 1},
+        }
+        with patch(
+            "app.agent.discovery_mapping_actions.config.get_bool", return_value=True,
+        ), patch(
+            "app.agent.discovery_mapping_actions.get_discovery_service",
+            return_value=discovery,
+        ), patch(
+            "app.agent.guangya_directory_scrape_actions.get_directory_scrape_service",
+            return_value=scrape,
+        ):
+            get_discovery_mapping_candidates(
+                {
+                    "provider": "douban", "external_id": "reset-source",
+                    "media_type": "movie",
+                },
+                context,
+            )
+            inspect_directory_scrape({"directory_id": "dir-reset"}, context)
+
+        self.assertIn(owner, _recent)
+        self.assertIn(owner, _flows)
+        reset = agent.reset_session(owner=owner)
+        self.assertTrue(reset["reset"])
+        self.assertNotIn(owner, _recent)
+        self.assertNotIn(owner, _flows)
+        self.assertIsNone(repository.get_latest(
+            owner=owner, context_type="discovery_mapping", now=time.time(),
+        ))
+        self.assertIsNone(repository.get_latest(
+            owner=owner, context_type="directory_scrape", now=time.time(),
+        ))
+
+    def test_reset_race_cannot_reinsert_discovery_mapping_context(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "mapping-reset-race-secret"
+        )
+        configure_discovery_mapping_context(repository)
+        agent = AgentOrchestrator(
+            ToolRegistry(), session_context_repository=repository,
+        )
+        owner = "owner-mapping-reset-race"
+        context = ToolContext(owner=owner)
+        entered = threading.Event()
+        release = threading.Event()
+        failures: list[Exception] = []
+        service = Mock()
+        service.get_detail.return_value = MediaCard(
+            provider="douban", external_id="race-reset", media_type="movie",
+            title="重置竞态", year="2026",
+        )
+
+        def lookup(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=3)
+            return {
+                "tmdb_id": "", "confirmed": False,
+                "candidates": [{
+                    "tmdb_id": "707", "title": "竞态候选", "year": "2026",
+                    "score": 0.9, "media_type": "movie",
+                }],
+            }
+
+        service.lookup_tmdb_mapping.side_effect = lookup
+
+        def run_lookup() -> None:
+            try:
+                get_discovery_mapping_candidates(
+                    {
+                        "provider": "douban", "external_id": "race-reset",
+                        "media_type": "movie",
+                    },
+                    context,
+                )
+            except Exception as exc:  # 断言发生在主线程。
+                failures.append(exc)
+
+        with patch(
+            "app.agent.discovery_mapping_actions.config.get_bool", return_value=True,
+        ), patch(
+            "app.agent.discovery_mapping_actions.get_discovery_service",
+            return_value=service,
+        ):
+            worker = threading.Thread(target=run_lookup)
+            worker.start()
+            self.assertTrue(entered.wait(timeout=2))
+            agent.reset_session(owner=owner)
+            release.set()
+            worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], AgentToolError)
+        self.assertEqual(getattr(failures[0], "code", ""), "precondition_failed")
+        self.assertIsNone(repository.get_latest(
+            owner=owner, context_type="discovery_mapping", now=time.time(),
+        ))
+        with self.assertRaises(AgentToolError):
+            prepare_confirm_discovery_mapping({"candidate_number": 1}, context)
+
+    def test_reset_race_cannot_reinsert_directory_scrape_context(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "scrape-reset-race-secret"
+        )
+        configure_directory_scrape_context(repository)
+        agent = AgentOrchestrator(
+            ToolRegistry(), session_context_repository=repository,
+        )
+        owner = "owner-scrape-reset-race"
+        context = ToolContext(owner=owner)
+        entered = threading.Event()
+        release = threading.Event()
+        failures: list[Exception] = []
+        service = Mock()
+
+        def inspect(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=3)
+            return {
+                "inspection_id": "inspection-race", "media_type": "tv",
+                "suggested_query": "重置竞态", "requires_manual_match": False,
+                "manual_match_reason": "", "counts": {"videos": 1},
+            }
+
+        service.inspect.side_effect = inspect
+
+        def run_inspect() -> None:
+            try:
+                inspect_directory_scrape({"directory_id": "dir-race"}, context)
+            except Exception as exc:  # 断言发生在主线程。
+                failures.append(exc)
+
+        with patch(
+            "app.agent.guangya_directory_scrape_actions.get_directory_scrape_service",
+            return_value=service,
+        ):
+            worker = threading.Thread(target=run_inspect)
+            worker.start()
+            self.assertTrue(entered.wait(timeout=2))
+            agent.reset_session(owner=owner)
+            release.set()
+            worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], AgentToolError)
+        self.assertEqual(getattr(failures[0], "code", ""), "precondition_failed")
+        self.assertIsNone(repository.get_latest(
+            owner=owner, context_type="directory_scrape", now=time.time(),
+        ))
+        with self.assertRaises(AgentToolError):
+            search_directory_scrape({"media_type": "auto"}, context)
+
+    def test_persisted_reset_invalidates_stale_worker_memory_cache(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "stale-worker-cache-secret"
+        )
+        configure_directory_scrape_context(repository)
+        owner = "owner-stale-worker-cache"
+        context = ToolContext(owner=owner)
+        service = Mock()
+        service.inspect.return_value = {
+            "inspection_id": "inspection-stale", "media_type": "tv",
+            "suggested_query": "旧目录", "requires_manual_match": False,
+            "manual_match_reason": "", "counts": {"videos": 1},
+        }
+        with patch(
+            "app.agent.guangya_directory_scrape_actions.get_directory_scrape_service",
+            return_value=service,
+        ):
+            inspect_directory_scrape({"directory_id": "dir-stale"}, context)
+            self.assertIn(owner, _flows)
+            repository.invalidate_owner(
+                owner=owner, context_types=("directory_scrape",),
+            )
+            with self.assertRaises(AgentToolError) as caught:
+                search_directory_scrape({"media_type": "auto"}, context)
+        self.assertEqual(caught.exception.code, "precondition_failed")
+        service.search.assert_not_called()
+        self.assertNotIn(owner, _flows)
 
     def test_batch5_llm_projection_keeps_safe_context_and_drops_private_fields(self) -> None:
         projected = project_agent_response_for_llm({

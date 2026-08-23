@@ -208,6 +208,161 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
         self.assertIsNotNone(remaining)
         self.assertEqual(remaining.payload, {"safe": "b"})
 
+    def test_guarded_context_is_latest_wins_single_use_and_reset_safe(self):
+        owner = "guarded-owner"
+        first = self.repository.begin_context(
+            owner=owner, context_type="discovery_mapping"
+        )
+        stored = self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="discovery_mapping",
+            payload={"safe": "first"},
+            expires_at=1_100.0,
+            guard=first,
+        )
+        self.assertIsNotNone(stored)
+        self.assertGreater(stored.revision, 0)
+        self.assertEqual(stored.generation, first.generation)
+
+        second = self.repository.begin_context(
+            owner=owner, context_type="discovery_mapping"
+        )
+        self.assertNotEqual(second.generation, first.generation)
+        self.assertIsNone(self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="discovery_mapping",
+            payload={"safe": "late-first"},
+            expires_at=1_100.0,
+            guard=stored,
+        ))
+        current = self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="discovery_mapping",
+            payload={"safe": "second"},
+            expires_at=1_100.0,
+            guard=second,
+        )
+        self.assertIsNotNone(current)
+        self.assertTrue(self.repository.consume_latest_guarded(
+            owner=owner,
+            context_type="discovery_mapping",
+            guard=current,
+        ))
+        self.assertFalse(self.repository.consume_latest_guarded(
+            owner=owner,
+            context_type="discovery_mapping",
+            guard=current,
+        ))
+
+        scrape = self.repository.begin_context(
+            owner=owner, context_type="directory_scrape"
+        )
+        scrape_stored = self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="directory_scrape",
+            payload={"safe": "scrape"},
+            expires_at=1_100.0,
+            guard=scrape,
+        )
+        self.assertIsNotNone(scrape_stored)
+        self.assertEqual(self.repository.invalidate_owner(
+            owner=owner,
+            context_types=("discovery_mapping", "directory_scrape"),
+        ), 1)
+        self.assertIsNone(self.repository.get_latest(
+            owner=owner, context_type="directory_scrape", now=1_000.0,
+        ))
+        self.assertIsNone(self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="directory_scrape",
+            payload={"safe": "late-scrape"},
+            expires_at=1_100.0,
+            guard=scrape_stored,
+        ))
+
+    def test_pruned_epoch_never_reuses_an_old_guard_after_reset(self):
+        owner = "guarded-aba-owner"
+        stale = self.repository.begin_context(
+            owner=owner, context_type="discovery_mapping"
+        )
+        self.repository.invalidate_owner(
+            owner=owner, context_types=("discovery_mapping",)
+        )
+        self.wall[0] += 3_601.0
+        current = self.repository.begin_context(
+            owner=owner, context_type="discovery_mapping"
+        )
+        self.assertGreater(current.generation, stale.generation)
+        self.assertIsNone(self.repository.replace_latest_guarded(
+            owner=owner, context_type="discovery_mapping",
+            payload={"safe": "stale"}, expires_at=self.wall[0] + 100.0,
+            guard=stale,
+        ))
+        self.assertIsNotNone(self.repository.replace_latest_guarded(
+            owner=owner, context_type="discovery_mapping",
+            payload={"safe": "current"}, expires_at=self.wall[0] + 100.0,
+            guard=current,
+        ))
+
+    def test_context_capacity_never_evicts_another_owner_active_flow(self):
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "capacity-test-secret",
+            clock=lambda: self.wall[0],
+            max_rows=128,
+        )
+        protected_owner = "protected-flow-owner"
+        guard = repository.begin_context(
+            owner=protected_owner, context_type="discovery_mapping"
+        )
+        protected = repository.replace_latest_guarded(
+            owner=protected_owner, context_type="discovery_mapping",
+            payload={"safe": "protected"}, expires_at=1_100.0, guard=guard,
+        )
+        self.assertIsNotNone(protected)
+        for index in range(127):
+            repository.replace_latest(
+                owner=f"capacity-owner-{index}", context_type="patrol",
+                payload={"index": index}, expires_at=1_100.0,
+            )
+        with self.assertRaisesRegex(RuntimeError, "容量已满"):
+            repository.replace_latest(
+                owner="overflow-owner", context_type="patrol",
+                payload={"overflow": True}, expires_at=1_100.0,
+            )
+        restored = repository.get_latest(
+            owner=protected_owner, context_type="discovery_mapping", now=self.wall[0],
+        )
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.payload, {"safe": "protected"})
+
+    def test_epoch_capacity_reclaims_only_inactive_rows(self):
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "epoch-capacity-test-secret",
+            clock=lambda: self.wall[0],
+            max_epochs=128,
+        )
+        active_owner = "epoch-active-owner"
+        active_guard = repository.begin_context(
+            owner=active_owner, context_type="directory_scrape"
+        )
+        self.assertIsNotNone(repository.replace_latest_guarded(
+            owner=active_owner, context_type="directory_scrape",
+            payload={"safe": "active"}, expires_at=1_100.0, guard=active_guard,
+        ))
+        for index in range(128):
+            repository.begin_context(
+                owner=f"epoch-inactive-owner-{index}",
+                context_type="discovery_mapping",
+            )
+        with db.get_conn() as conn:
+            epoch_count = int(conn.execute(
+                "SELECT COUNT(*) FROM agent_session_context_epochs"
+            ).fetchone()[0])
+        self.assertEqual(epoch_count, 128)
+        self.assertIsNotNone(repository.get_latest(
+            owner=active_owner, context_type="directory_scrape", now=self.wall[0],
+        ))
+
     def test_expired_malformed_and_oversized_contexts_fail_closed(self):
         owner = "session-a"
         digest = self.repository.owner_digest_for_tests(owner)

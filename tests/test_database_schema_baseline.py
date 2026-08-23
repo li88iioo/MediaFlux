@@ -11,7 +11,7 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
-    def test_fresh_database_contains_complete_v2_schema(self) -> None:
+    def test_fresh_database_contains_complete_v5_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             task_columns = {
@@ -42,7 +42,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             }
 
         self.assertEqual(version, db.SCHEMA_VERSION)
-        self.assertEqual(version, 2)
+        self.assertEqual(version, 5)
         self.assertIn("rules_snapshot", task_columns)
         self.assertIn("season_override", task_columns)
         self.assertIn("episode_override", task_columns)
@@ -58,6 +58,10 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             "idx_recognition_knowledge_lookup",
             "idx_recognition_knowledge_source",
             "idx_media_probe_cache_fingerprint_updated",
+            "agent_session_context_epochs",
+            "agent_session_context_generation_sequence",
+            "organize_operation_jobs",
+            "idx_organize_operation_jobs_active_dedupe",
             "media_proxy_playback_sessions",
             "idx_media_proxy_records_session_id",
         }.issubset(schema_objects))
@@ -107,8 +111,70 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                         "owner_digest,context_type,payload,expires_at,created_at"
                         ") VALUES('digest','resource_candidates','{}',9999999999,'2026-08-01')"
                     )
-                self.assertEqual(version, 2)
+                self.assertEqual(version, 5)
                 self.assertEqual(preserved["context_type"], "patrol")
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_v2_database_migrates_context_generation_and_epochs(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-agent-v3-") as root:
+            path = Path(root) / "v2.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL,"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "created_at TEXT NOT NULL"
+                    ");"
+                    "CREATE INDEX idx_agent_session_context_lookup "
+                    "ON agent_session_context(owner_digest,context_type,expires_at,id DESC);"
+                    "CREATE INDEX idx_agent_session_context_expiry "
+                    "ON agent_session_context(expires_at);"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES('digest','patrol','{}',9999999999,'2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=2")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {
+                        str(row["name"])
+                        for row in migrated.execute(
+                            "PRAGMA table_info(agent_session_context)"
+                        )
+                    }
+                    preserved = migrated.execute(
+                        "SELECT context_type,context_generation "
+                        "FROM agent_session_context WHERE owner_digest='digest'"
+                    ).fetchone()
+                    epoch_table = migrated.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='agent_session_context_epochs'"
+                    ).fetchone()
+                    generation_sequence = migrated.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='agent_session_context_generation_sequence'"
+                    ).fetchone()
+                self.assertEqual(version, 5)
+                self.assertIn("context_generation", columns)
+                self.assertEqual(preserved["context_type"], "patrol")
+                self.assertEqual(int(preserved["context_generation"]), 0)
+                self.assertIsNotNone(epoch_table)
+                self.assertIsNotNone(generation_sequence)
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
@@ -151,6 +217,109 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
                 knowledge.reset_runtime_state_for_tests()
+
+    def test_v3_database_migrates_hardened_durable_organize_operation_queue(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-organize-v4-") as root:
+            path = Path(root) / "v3.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("CREATE TABLE task_runs(id INTEGER PRIMARY KEY)")
+                conn.execute("PRAGMA user_version=3")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    table = migrated.execute(
+                        "SELECT sql FROM sqlite_master "
+                        "WHERE type='table' AND name='organize_operation_jobs'"
+                    ).fetchone()
+                    indexes = {
+                        str(row["name"])
+                        for row in migrated.execute(
+                            "PRAGMA index_list(organize_operation_jobs)"
+                        )
+                    }
+                    columns = {
+                        str(row["name"])
+                        for row in migrated.execute(
+                            "PRAGMA table_info(organize_operation_jobs)"
+                        )
+                    }
+                self.assertEqual(version, 5)
+                self.assertIsNotNone(table)
+                self.assertIn("idx_organize_operation_jobs_active_dedupe", indexes)
+                self.assertTrue({
+                    "payload_auth", "cancel_requested", "expires_at", "purged_at"
+                }.issubset(columns))
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_v4_queue_migrates_existing_rows_to_v5_safely(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-organize-v5-") as root:
+            path = Path(root) / "v4.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE organize_operation_jobs ("
+                    "job_id TEXT PRIMARY KEY,job_kind TEXT NOT NULL,owner_digest TEXT NOT NULL,"
+                    "operation TEXT NOT NULL,reference TEXT NOT NULL DEFAULT '',"
+                    "payload_json TEXT NOT NULL DEFAULT '{}',dedupe_digest TEXT NOT NULL,"
+                    "status TEXT NOT NULL,lease_generation INTEGER NOT NULL DEFAULT 0,"
+                    "result_json TEXT NOT NULL DEFAULT '{}',error_code TEXT NOT NULL DEFAULT '',"
+                    "error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+                    "started_at TEXT,finished_at TEXT);"
+                    "CREATE UNIQUE INDEX idx_organize_operation_jobs_active_dedupe "
+                    "ON organize_operation_jobs(dedupe_digest) "
+                    "WHERE status IN ('pending','running');"
+                )
+                rows = [
+                    ("a" * 32, "pending", "payload-pending", "1" * 64),
+                    ("b" * 32, "running", "payload-running", "2" * 64),
+                    ("c" * 32, "completed", "payload-completed", "3" * 64),
+                ]
+                for job_id, status, payload, digest in rows:
+                    conn.execute(
+                        "INSERT INTO organize_operation_jobs("
+                        "job_id,job_kind,owner_digest,operation,reference,payload_json,"
+                        "dedupe_digest,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (job_id, "agent_directory_scrape", "d" * 64, "目录刮削", "ref", payload,
+                         digest, status, "2026-08-01", "2026-08-01"),
+                    )
+                conn.execute("PRAGMA user_version=4")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    result = {
+                        str(row["job_id"]): dict(row)
+                        for row in migrated.execute(
+                            "SELECT * FROM organize_operation_jobs ORDER BY job_id"
+                        )
+                    }
+                    columns = {
+                        str(row["name"])
+                        for row in migrated.execute("PRAGMA table_info(organize_operation_jobs)")
+                    }
+                self.assertEqual(version, 5)
+                self.assertTrue({"payload_auth", "cancel_requested", "expires_at", "purged_at"}.issubset(columns))
+                self.assertEqual(result["a" * 32]["status"], "cancelled")
+                self.assertEqual(result["a" * 32]["payload_json"], "{}")
+                self.assertEqual(result["b" * 32]["status"], "running")
+                self.assertEqual(result["c" * 32]["status"], "completed")
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
 
     def test_precreated_empty_database_is_treated_as_fresh_install(self) -> None:
         previous_path = db.DB_PATH

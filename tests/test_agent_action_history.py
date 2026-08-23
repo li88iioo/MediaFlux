@@ -488,11 +488,11 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         with db.get_conn() as conn:
             conn.executemany(
                 "INSERT INTO agent_action_history("
-                "tool_name,risk,status,ok,mode,summary,safe_details,error_code,"
+                "owner_digest,tool_name,risk,status,ok,mode,summary,safe_details,error_code,"
                 "elapsed_ms,started_at,finished_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
-                    ("strm.run_once", "danger", "accepted", 1, "confirmed_action",
+                    (OWNER_DIGEST, "strm.run_once", "danger", "accepted", 1, "confirmed_action",
                      "STRM 手动同步：已提交", "{}", "", 1, timestamp, timestamp)
                     for _ in range(2000)
                 ],
@@ -511,6 +511,120 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             oldest = conn.execute("SELECT MIN(id) FROM agent_action_history").fetchone()[0]
         self.assertEqual(count, 2000)
         self.assertEqual(oldest, newest - 1999)
+
+    def test_history_retention_does_not_evict_another_owner(self):
+        other_owner = action_history_owner_digest("owner-b")
+        db.add_agent_action_history(
+            owner_digest=other_owner,
+            tool_name="strm.run_once",
+            risk="danger",
+            status="accepted",
+            ok=True,
+            summary="另一会话的历史",
+        )
+        for _ in range(2001):
+            db.add_agent_action_history(
+                owner_digest=OWNER_DIGEST,
+                tool_name="strm.run_once",
+                risk="danger",
+                status="accepted",
+                ok=True,
+                summary="当前会话的历史",
+            )
+        with db.get_conn() as conn:
+            current_count = conn.execute(
+                "SELECT COUNT(*) FROM agent_action_history WHERE owner_digest=?",
+                (OWNER_DIGEST,),
+            ).fetchone()[0]
+            other_count = conn.execute(
+                "SELECT COUNT(*) FROM agent_action_history WHERE owner_digest=?",
+                (other_owner,),
+            ).fetchone()[0]
+        self.assertEqual(current_count, 2000)
+        self.assertEqual(other_count, 1)
+
+    def test_history_global_cap_keeps_new_record_and_evicts_oldest_fairly(self):
+        owners = [action_history_owner_digest(f"owner-{index}") for index in range(4)]
+        with patch("app.database._AGENT_ACTION_HISTORY_GLOBAL_LIMIT", 3):
+            for index, owner in enumerate(owners):
+                db.add_agent_action_history(
+                    owner_digest=owner,
+                    tool_name="strm.run_once",
+                    risk="danger",
+                    status="accepted",
+                    ok=True,
+                    summary=f"审计 {index}",
+                )
+        with db.get_conn() as conn:
+            stored = conn.execute(
+                "SELECT owner_digest FROM agent_action_history ORDER BY id"
+            ).fetchall()
+        self.assertEqual([row["owner_digest"] for row in stored], owners[1:])
+
+    def test_history_global_cap_prefers_owner_with_largest_share(self):
+        owner_a = action_history_owner_digest("owner-large-share")
+        owner_b = action_history_owner_digest("owner-small-share")
+        owner_c = action_history_owner_digest("owner-new-share")
+        with patch("app.database._AGENT_ACTION_HISTORY_GLOBAL_LIMIT", 3):
+            for summary in ("A1", "A2"):
+                db.add_agent_action_history(
+                    owner_digest=owner_a, tool_name="strm.run_once",
+                    risk="danger", status="accepted", ok=True, summary=summary,
+                )
+            db.add_agent_action_history(
+                owner_digest=owner_b, tool_name="strm.run_once",
+                risk="danger", status="accepted", ok=True, summary="B1",
+            )
+            newest_id = db.add_agent_action_history(
+                owner_digest=owner_c, tool_name="strm.run_once",
+                risk="danger", status="accepted", ok=True, summary="C1",
+            )
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,owner_digest,summary FROM agent_action_history ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [(row["owner_digest"], row["summary"]) for row in rows],
+            [(owner_a, "A2"), (owner_b, "B1"), (owner_c, "C1")],
+        )
+        self.assertEqual(int(rows[-1]["id"]), newest_id)
+
+    def test_history_global_cap_converges_from_legacy_overflow(self):
+        owner_a = action_history_owner_digest("legacy-owner-a")
+        owner_b = action_history_owner_digest("legacy-owner-b")
+        owner_c = action_history_owner_digest("legacy-owner-c")
+        with db.get_conn() as conn:
+            for owner, summary in (
+                (owner_a, "A1"), (owner_a, "A2"), (owner_a, "A3"),
+                (owner_b, "B1"), (owner_b, "B2"),
+            ):
+                conn.execute(
+                    "INSERT INTO agent_action_history("
+                    "owner_digest,tool_name,risk,status,ok,mode,summary,"
+                    "safe_details,error_code,elapsed_ms,started_at,finished_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        owner, "strm.run_once", "danger", "accepted", 1,
+                        "confirmed_action", summary, "{}", "", 0,
+                        "2026-08-01", "2026-08-01",
+                    ),
+                )
+        with patch("app.database._AGENT_ACTION_HISTORY_GLOBAL_LIMIT", 3):
+            newest_id = db.add_agent_action_history(
+                owner_digest=owner_c, tool_name="strm.run_once",
+                risk="danger", status="accepted", ok=True, summary="C1",
+            )
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,owner_digest,summary FROM agent_action_history ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [(row["owner_digest"], row["summary"]) for row in rows],
+            [(owner_a, "A3"), (owner_b, "B2"), (owner_c, "C1")],
+        )
+        self.assertEqual(int(rows[-1]["id"]), newest_id)
 
 
 class AgentActionHistoryAPITests(IsolatedDatabaseTestCase):

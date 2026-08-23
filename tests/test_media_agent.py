@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app.agent.models import RiskLevel, ToolResult, ToolSpec
+from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentInputError,
     AgentOrchestrator,
@@ -343,6 +343,30 @@ class AgentToolTests(unittest.TestCase):
             "next_run": "2026-08-02 05:00:00",
         })
         self.assertNotIn(secret, str(result.to_dict()))
+
+    def test_guangya_organize_status_queries_durable_operation_by_public_reference(self):
+        operation_ref = "GY-ABCD-EF01-2345-6789-ABCD-EF01-2345-6789"
+        manager = Mock()
+        manager.status.return_value = {
+            "status": "idle",
+            "operation_queue": {"total": 0, "items": []},
+            "schedule": {},
+        }
+        manager.task_result.return_value = {
+            "status": "manual_review",
+            "started_at": "",
+            "finished_at": "",
+            "result": {},
+        }
+        with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager):
+            result = guangya_organize_status(
+                {"operation_ref": operation_ref}, ToolContext(owner="owner-status")
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "attention")
+        self.assertEqual(result.data["task"]["operation_ref"], operation_ref)
+        manager.task_result.assert_called_once_with(operation_ref, owner="owner-status")
 
     def test_guangya_organize_status_preserves_partial_state_and_safe_cleanup_counts(self):
         secret = "private-cleanup-detail"

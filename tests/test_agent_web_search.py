@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
+import hashlib
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -175,6 +176,53 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertTrue(second.allow("same-user", limit=3, window_seconds=60))
         self.assertTrue(first.allow("same-user", limit=3, window_seconds=60))
         self.assertFalse(second.allow("same-user", limit=3, window_seconds=60))
+
+    def test_shared_rate_bucket_reclaims_expired_rows_and_bounds_identities(self):
+        limiter = AgentRateLimiter(shared=True, max_keys=2)
+        limiter.reset()
+        with patch("app.agent.rate_limit.time.time", return_value=120.0):
+            self.assertTrue(limiter.allow("owner-a", limit=1, window_seconds=60))
+            self.assertTrue(limiter.allow("owner-b", limit=1, window_seconds=60))
+            self.assertFalse(limiter.allow("owner-c", limit=1, window_seconds=60))
+            self.assertEqual(limiter.tracked_keys(), 2)
+        with patch("app.agent.rate_limit.time.time", return_value=240.0):
+            self.assertEqual(limiter.tracked_keys(), 0)
+            self.assertTrue(limiter.allow("owner-c", limit=1, window_seconds=60))
+        with db.get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM agent_rate_limit_buckets"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_shared_rate_bucket_migration_preserves_active_legacy_budget(self):
+        key = "legacy-active-owner"
+        digest = hashlib.sha256(
+            b"mediaflux-agent-rate:v1\0" + key.encode("utf-8")
+        ).hexdigest()
+        with db.get_conn() as conn:
+            conn.execute("DROP TABLE agent_rate_limit_buckets")
+            conn.execute(
+                "CREATE TABLE agent_rate_limit_buckets("
+                "limiter_key TEXT PRIMARY KEY,window_start INTEGER NOT NULL,"
+                "count INTEGER NOT NULL DEFAULT 0 CHECK(count>=0),"
+                "updated_at TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO agent_rate_limit_buckets("
+                "limiter_key,window_start,count,updated_at) VALUES(?,?,?,?)",
+                (digest, 120, 3, db.now()),
+            )
+        limiter = AgentRateLimiter(shared=True)
+        with patch("app.agent.rate_limit.time.time", return_value=130.0):
+            self.assertFalse(limiter.allow(key, limit=3, window_seconds=60))
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT count,expires_at FROM agent_rate_limit_buckets "
+                "WHERE limiter_key=?",
+                (digest,),
+            ).fetchone()
+        self.assertEqual(int(row["count"]), 3)
+        self.assertGreater(int(row["expires_at"]), 130)
 
     def test_daily_budget_fails_closed_before_provider(self):
         self.values["TAVILY_DAILY_CREDIT_LIMIT"] = "1"
