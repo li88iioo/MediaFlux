@@ -1518,7 +1518,10 @@ def _mark_direct_source(
     source["SupportsDirectPlay"] = True
     source["SupportsDirectStream"] = True
     source["IsRemote"] = False
-    source["Protocol"] = "Http"
+    # Jellyfin Android 2.7 / Yamby 会把 Protocol=Http 的 Path 直接当作 HLS
+    # 清单加载；这里实际提供的是 Jellyfin 标准视频流端点，必须保留 File
+    # 语义，让原生客户端自行生成 /Videos/{id}/stream 请求。
+    source["Protocol"] = "File"
     source["RequiresOpening"] = False
     source["RequiresClosing"] = False
     source["RequiresLooping"] = False
