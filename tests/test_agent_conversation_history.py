@@ -95,6 +95,7 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
             "original_title": "Jiu Men",
             "year": "2026",
             "media_type": "tv",
+            "case_stage": "library_checked",
         })
         self.assertNotIn("arguments", assistant)
         self.assertNotIn("confirmation_id", assistant)
@@ -123,6 +124,63 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
             '"arguments"',
         ):
             self.assertNotIn(forbidden, raw)
+
+    def test_confirmed_resource_submit_persists_only_safe_case_progress(self):
+        response = {
+            "mode": "confirmed_action",
+            "tool_call": {
+                "name": "indexer.submit_resource",
+                "arguments": {
+                    "result_id": "private-result-id",
+                    "target": "qb",
+                },
+            },
+            "confirmation_id": "private-confirmation",
+            "result": {
+                "ok": True,
+                "status": "accepted",
+                "summary": "下载任务已提交",
+                "data": {
+                    "request_id": 99,
+                    "verification": {
+                        "title": "The Show",
+                        "tmdb_id": "12345",
+                        "season": 2,
+                        "episode": 3,
+                    },
+                    "magnet": "magnet:?xt=urn:btih:secret",
+                    "path": "/private/path",
+                },
+            },
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="确认下载第 1 个",
+            response=response,
+        )
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        assistant = history["messages"][1]["data"]
+        self.assertEqual(assistant["media_context"], {
+            "title": "The Show",
+            "media_type": "tv",
+            "tmdb_id": "12345",
+            "season": 2,
+            "episode": 3,
+            "case_stage": "download_submitted",
+        })
+        serialized = repr(assistant)
+        for forbidden in (
+            "private-result-id",
+            "private-confirmation",
+            "magnet:",
+            "/private/path",
+            "request_id",
+        ):
+            self.assertNotIn(forbidden, serialized)
 
     def test_multiline_narrative_is_persisted_and_restored_safely(self):
         response = _response(summary="底层工具摘要")
@@ -386,7 +444,10 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         context = self.repository.get_llm_context(
             principal="browser-principal-a", session_id=SESSION_A
         )
-        self.assertEqual(context[-1]["tentative_media_context"], {"title": "沙丘2"})
+        self.assertEqual(context[-1]["tentative_media_context"], {
+            "title": "沙丘2",
+            "case_stage": "library_checked",
+        })
         self.assertNotIn("media_context", context[-1])
 
         selection_response = {
@@ -493,6 +554,7 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
             "douban_id": "654321",
             "season": 2,
             "episode": 3,
+            "case_stage": "resource_candidates",
         }
         self.assertEqual(history["messages"][1]["data"]["media_context"], expected)
 

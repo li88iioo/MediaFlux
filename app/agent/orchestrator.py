@@ -23,6 +23,7 @@ from app.agent.confirmation_contract import (
     build_confirmation_contract,
     sanitize_confirmation_contract,
 )
+from app.agent.media_case import normalize_media_case_stage
 from app.agent.models import LLMToolDisposition, RiskLevel, ToolContext, ToolResult
 from app.agent.metrics import agent_metrics
 from app.agent.observability import (
@@ -183,6 +184,29 @@ def _is_casual_greeting(message: str) -> bool:
     return normalized in _CASUAL_GREETING_PHRASES
 
 
+_UNSUPPORTED_ENGINEERING_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"(?:修改|改写|修复|热修复|打补丁).{0,10}(?:代码|源码|程序)",
+    r"(?:代码|源码|程序).{0,10}(?:修改|改写|热修复|打补丁)",
+    r"(?:提交|合并|回滚).{0,10}(?:代码|commit|分支|git)",
+    r"(?:执行|运行).{0,10}(?:sql|vacuum|reindex|shell|命令行)",
+    r"(?:sql|vacuum|reindex|shell|命令行).{0,10}(?:执行|运行)",
+    r"(?:优化|迁移|清理|删除|创建索引).{0,10}(?:数据库|sqlite|表结构)",
+    r"(?:数据库|sqlite|表结构).{0,10}(?:优化|迁移|清理|删除|创建索引)",
+    r"(?:重启|部署|回滚).{0,10}(?:docker|systemctl|服务|系统)",
+    r"(?:docker|systemctl).{0,10}(?:重启|部署|回滚)",
+))
+
+
+def _is_unsupported_engineering_request(message: str) -> bool:
+    """只拦截明确的工程操作，不因媒体标题或运行环境描述误伤业务诊断。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    normalized = re.sub(r"《[^》]{1,160}》", "《媒体标题》", normalized)
+    compact = re.sub(r"[\s，。！？!?、；;：:]+", "", normalized)
+    return bool(compact) and any(
+        pattern.search(compact) for pattern in _UNSUPPORTED_ENGINEERING_PATTERNS
+    )
+
+
 def _is_vague_multi_site_request(message: str) -> bool:
     normalized = _normalize_indexer_command(message)
     site_scope = any(token in normalized for token in (
@@ -332,6 +356,9 @@ def _safe_media_context(value: Any) -> dict[str, Any]:
         coordinate = value.get(field)
         if isinstance(coordinate, int) and not isinstance(coordinate, bool) and 1 <= coordinate <= maximum:
             result[field] = coordinate
+    case_stage = normalize_media_case_stage(value.get("case_stage"))
+    if case_stage:
+        result["case_stage"] = case_stage
     return result
 
 
@@ -6299,14 +6326,23 @@ class AgentOrchestrator:
             if ticket.tool_name == "indexer.submit_resource"
             else result
         )
+        verification = (
+            parse_recent_download_verification_context(ticket.followup_context)
+            if ticket.tool_name == "indexer.submit_resource"
+            else None
+        )
         if (
             ticket.tool_name == "indexer.submit_resource"
             and public_result.ok
             and public_result.status == "accepted"
-            and parse_recent_download_verification_context(
-                ticket.followup_context
-            ) is not None
+            and verification is not None
         ):
+            public_result.data["verification"] = {
+                "title": verification.title,
+                "tmdb_id": verification.tmdb_id,
+                "season": verification.season,
+                "episode": verification.episode,
+            }
             public_result.suggestions.append(
                 "可询问：刚才下载的缺集入库完成了吗。"
             )
@@ -7794,6 +7830,16 @@ class AgentOrchestrator:
 
         if _is_negated_danger_action_message(message):
             return self._conversation_response("好，不会执行这项操作。")
+
+        if _is_unsupported_engineering_request(message):
+            return self._conversation_response(
+                "我现在是媒体业务助手，可以检查追更、媒体库、RSS、下载、整理和播放链路；"
+                "不能修改代码、执行任意 SQL、重启服务或部署。",
+                [
+                    "如果是媒体流程异常，可以直接描述哪部媒体或哪个环节出了问题",
+                    "例如：检查最近下载为什么还没有入库",
+                ],
+            )
 
         discovery_followup = self._handle_discovery_followup(
             message,

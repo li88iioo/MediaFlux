@@ -18,6 +18,7 @@ from app.agent.conversation_summary import (
     render_conversation_summary,
 )
 from app.modules.web_secret import get_web_secret
+from app.agent.media_case import media_case_stage_for_tool, normalize_media_case_stage
 from app.sensitive_data import contains_sensitive_credential
 
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -40,6 +41,7 @@ _MEDIA_CONTEXT_TOOL_TYPES: dict[str, str] = {
     "discovery.lookup_rating": "",
     "discovery.add_watchlist": "",
     "indexer.search_resources": "",
+    "indexer.submit_resource": "tv",
 }
 _MEDIA_CONTEXT_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 _HISTORY_CREDENTIAL_RE = re.compile(
@@ -588,6 +590,7 @@ class SQLiteAgentConversationHistoryRepository:
             {
                 "title", "original_title", "year", "media_type",
                 "tmdb_id", "bangumi_id", "douban_id", "season", "episode",
+                "case_stage",
             }
         ):
             return None
@@ -622,6 +625,11 @@ class SQLiteAgentConversationHistoryRepository:
                 if isinstance(coordinate, bool) or not isinstance(coordinate, int) or not 1 <= coordinate <= maximum:
                     return None
                 result[field] = coordinate
+        case_stage = normalize_media_case_stage(value.get("case_stage"))
+        if value.get("case_stage") not in (None, "") and not case_stage:
+            return None
+        if case_stage:
+            result["case_stage"] = case_stage
         return result
 
     def _media_context_projection(
@@ -733,6 +741,9 @@ class SQLiteAgentConversationHistoryRepository:
             )
             if coordinate is not None:
                 result[field] = coordinate
+        case_stage = media_case_stage_for_tool(normalized_tool)
+        if case_stage:
+            result["case_stage"] = case_stage
         return result
 
     def _tentative_media_context_projection(

@@ -50,7 +50,11 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertFalse(ranked["items"][-1]["quality"]["eligible"])
         self.assertTrue(any("冲突" in warning for warning in ranked["items"][-1]["quality"]["warnings"]))
         self.assertEqual(ranked["recommendation"]["status"], "recommended")
-        self.assertEqual(ranked["recommendation"]["selected"]["result_id"], "exact-result-id-0001")
+        selected = ranked["recommendation"]["selected"]
+        self.assertEqual(selected["result_id"], "exact-result-id-0001")
+        self.assertIn("精确匹配 S02E03", selected["reasons"])
+        self.assertEqual(selected["tags"]["resolution"], "1080p")
+        self.assertEqual(selected["warnings"], [])
 
     def test_missing_activity_is_unknown_instead_of_zero_quality(self):
         data = {"items": [

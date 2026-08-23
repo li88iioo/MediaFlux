@@ -26,6 +26,7 @@ from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.conversation_history import get_agent_conversation_history_repository
 from app.agent.confirmation_contract import sanitize_confirmation_contract
 from app.agent.feature_gate import is_agent_enabled
+from app.agent.media_case import media_case_stage_for_tool
 from app.agent.llm_router import (
     begin_llm_request_budget,
     normalize_streamed_answer,
@@ -305,7 +306,7 @@ def _normalize_resource_page_payload(
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("无法创建 Telegram 资源分页") from exc
 
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
     for candidate in candidates:
         if not isinstance(candidate, dict):
@@ -334,6 +335,9 @@ def _normalize_resource_page_payload(
                 ),
                 "size": _redact_text(
                     html.unescape(str(candidate.get("size") or "")), limit=32
+                ),
+                "explanation": _redact_text(
+                    html.unescape(str(candidate.get("explanation") or "")), limit=180
                 ),
             }
         )
@@ -442,7 +446,7 @@ class TelegramAgentActionStore:
         self,
         *,
         owner: str,
-        candidates: list[dict[str, str]],
+        candidates: list[dict[str, Any]],
         page: int,
         group_id: str,
     ) -> str:
@@ -2204,12 +2208,13 @@ _CALLBACK_MEDIA_CONTEXT_TOOLS = frozenset({
     "discovery.lookup_rating",
     "discovery.add_watchlist",
     "indexer.search_resources",
+    "indexer.submit_resource",
 })
 
 
 def _safe_callback_media_history(
     payload: dict[str, Any], result: dict[str, Any]
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict[str, Any]]:
     """只保留 callback 续问所需的媒体身份，不保留票据、内部 ID 或路径。"""
     tool_call = payload.get("tool_call") if isinstance(payload.get("tool_call"), dict) else {}
     tool_name = str(tool_call.get("name") or "").strip()[:120]
@@ -2221,8 +2226,14 @@ def _safe_callback_media_history(
         if isinstance(tool_call.get("arguments"), dict)
         else {}
     )
+    verification = (
+        data.get("verification")
+        if isinstance(data.get("verification"), dict)
+        else {}
+    )
     title = sanitize_public_text(
         data.get("title")
+        or verification.get("title")
         or data.get("query")
         or arguments.get("title")
         or arguments.get("query"),
@@ -2230,20 +2241,57 @@ def _safe_callback_media_history(
     )
     if not title:
         return tool_name, {}
-    media: dict[str, str] = {"title": title}
+    media: dict[str, Any] = {"title": title}
+    sources = (data, verification, arguments)
     original_title = sanitize_public_text(
-        data.get("original_title") or arguments.get("original_title"), limit=160
+        data.get("original_title")
+        or verification.get("original_title")
+        or arguments.get("original_title"),
+        limit=160,
     )
     if original_title:
         media["original_title"] = original_title
-    year = str(data.get("year") or arguments.get("year") or "").strip()
+    year = str(
+        data.get("year") or verification.get("year") or arguments.get("year") or ""
+    ).strip()
     if re.fullmatch(r"(?:19|20)\d{2}", year):
         media["year"] = year
-    media_type = str(
-        data.get("media_type") or arguments.get("media_type") or ""
-    ).strip().lower()
+    media_type = (
+        "tv"
+        if tool_name == "indexer.submit_resource"
+        else str(
+            data.get("media_type") or arguments.get("media_type") or ""
+        ).strip().lower()
+    )
     if media_type in {"movie", "tv"}:
         media["media_type"] = media_type
+    for field, maximum_digits in (
+        ("tmdb_id", 10),
+        ("bangumi_id", 10),
+        ("douban_id", 20),
+    ):
+        identifier = next((
+            candidate
+            for source in sources
+            if (candidate := str(source.get(field) or "").strip()).isascii()
+            and candidate.isdigit()
+            and 1 <= len(candidate) <= maximum_digits
+        ), "")
+        if identifier:
+            media[field] = identifier
+    for field, maximum in (("season", 100), ("episode", 1000)):
+        coordinate = next((
+            candidate
+            for source in sources
+            if isinstance((candidate := source.get(field)), int)
+            and not isinstance(candidate, bool)
+            and 1 <= candidate <= maximum
+        ), None)
+        if coordinate is not None:
+            media[field] = coordinate
+    case_stage = media_case_stage_for_tool(tool_name)
+    if case_stage:
+        media["case_stage"] = case_stage
     return tool_name, media
 
 
@@ -2642,9 +2690,9 @@ def _resource_item_groups(response: Any) -> list[tuple[str, list[Any]]]:
     return []
 
 
-def _resource_candidates(response: Any) -> list[dict[str, str]]:
+def _resource_candidates(response: Any) -> list[dict[str, Any]]:
     """只提取可下载资源的最小安全展示字段。"""
-    candidates: list[dict[str, str]] = []
+    candidates: list[dict[str, Any]] = []
     seen_result_ids: set[str] = set()
     for episode_label, items in _resource_item_groups(response):
         for item in items:
@@ -2669,6 +2717,14 @@ def _resource_candidates(response: Any) -> list[dict[str, str]]:
             if not title:
                 continue
             seen_result_ids.add(result_id)
+            quality = item.get("quality") if isinstance(item.get("quality"), dict) else {}
+            reasons = quality.get("reasons") if isinstance(quality.get("reasons"), list) else []
+            warnings = quality.get("warnings") if isinstance(quality.get("warnings"), list) else []
+            explanation_parts = [
+                _redact_text(value, limit=90)
+                for value in [*reasons[:2], *warnings[:1]]
+                if _redact_text(value, limit=90)
+            ]
             candidates.append(
                 {
                     "result_id": result_id,
@@ -2678,6 +2734,7 @@ def _resource_candidates(response: Any) -> list[dict[str, str]]:
                         item.get("site_name") or item.get("site_id"), limit=60
                     ),
                     "size": _redact_text(item.get("size_text"), limit=32),
+                    "explanation": "；".join(explanation_parts)[:180],
                 }
             )
             if len(candidates) >= _RESOURCE_RESULT_LIMIT:
@@ -2689,7 +2746,7 @@ def _resource_markup(
     telebot: Any,
     *,
     owner: str,
-    candidates: list[dict[str, str]],
+    candidates: list[dict[str, Any]],
     page: int = 0,
 ):
     if not candidates:
@@ -2759,7 +2816,7 @@ def _resource_markup(
 
 
 def _render_resource_candidates(
-    response: Any, candidates: list[dict[str, str]], *, page: int = 0
+    response: Any, candidates: list[dict[str, Any]], *, page: int = 0
 ) -> str:
     if not candidates:
         return render_agent_response(response)
@@ -2800,6 +2857,9 @@ def _render_resource_candidates(
         lines.append(f"<b>{position}.</b> {prefix}{candidate['title']}")
         if metadata:
             lines.append(f"   {metadata}")
+        explanation = candidate.get("explanation")
+        if explanation:
+            lines.append(f"   推荐依据：{explanation}")
     lines.extend([
         "",
         "选择下方按钮即可；真正提交前还会再次确认。",

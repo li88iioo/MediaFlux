@@ -355,6 +355,33 @@ def _safe_generic_candidate(value: Any) -> dict[str, Any] | None:
     }
 
 
+_ALLOWED_QUALITY_TAGS = frozenset({
+    "resolution", "media", "video_codec", "effect", "audio",
+})
+
+
+def _safe_quality_messages(value: Any, *, maximum: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for raw in value[:maximum]:
+        text = _safe_text(raw, 120)
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _safe_quality_tags(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key in sorted(_ALLOWED_QUALITY_TAGS):
+        text = _safe_text(value.get(key), 64)
+        if text:
+            result[key] = text
+    return result
+
+
 def _safe_candidate(
     value: Any,
     *,
@@ -395,6 +422,9 @@ def _safe_candidate(
         "confidence": confidence,
         "match": match,
         "download_state": download_state,
+        "reasons": _safe_quality_messages(value.get("reasons"), maximum=6),
+        "warnings": _safe_quality_messages(value.get("warnings"), maximum=4),
+        "tags": _safe_quality_tags(value.get("tags")),
         "_verification_context": verification_context,
     }
 
@@ -403,10 +433,13 @@ _GENERIC_PERSISTED_KEYS = frozenset({
     "position", "result_id", "title", "site_id", "site_name", "size_text",
     "download_state", "_verification_context",
 })
-_EPISODIC_PERSISTED_KEYS = frozenset({
+_EPISODIC_PERSISTED_KEYS_V1 = frozenset({
     "position", "season", "episode", "episode_label", "result_id", "title",
     "site_id", "site_name", "rank", "score", "confidence", "match",
     "download_state", "_verification_context",
+})
+_EPISODIC_PERSISTED_KEYS = _EPISODIC_PERSISTED_KEYS_V1 | frozenset({
+    "reasons", "warnings", "tags",
 })
 
 
@@ -453,7 +486,7 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
                 or projected["download_state"] not in _ALLOWED_DOWNLOAD_STATE
             ):
                 return None
-        elif keys == _EPISODIC_PERSISTED_KEYS:
+        elif keys in {_EPISODIC_PERSISTED_KEYS_V1, _EPISODIC_PERSISTED_KEYS}:
             season = _safe_positive_int(raw.get("season"), maximum=100)
             episode = _safe_positive_int(raw.get("episode"), maximum=1000)
             if season is None or episode is None:
@@ -483,7 +516,12 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
             if projected is None:
                 return None
             projected["position"] = expected_position
-            if raw != projected:
+            comparable = (
+                {key: projected[key] for key in _EPISODIC_PERSISTED_KEYS_V1}
+                if keys == _EPISODIC_PERSISTED_KEYS_V1
+                else projected
+            )
+            if raw != comparable:
                 return None
             result_id = projected["result_id"]
         else:

@@ -303,6 +303,9 @@ def _candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
         "confidence": str(quality["confidence"]),
         "match": str(quality["match"]),
         "download_state": _safe_text(item.get("download_state"), 24),
+        "reasons": list(quality.get("reasons") or [])[:6],
+        "warnings": list(quality.get("warnings") or [])[:4],
+        "tags": dict(quality.get("tags") or {}),
     }
 
 

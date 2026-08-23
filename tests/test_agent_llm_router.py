@@ -529,6 +529,61 @@ class AgentLLMSelectionTests(unittest.TestCase):
                 select_orchestration_tool("检查一下", registry, owner="")
             )
 
+    def test_unified_selector_uses_domain_filtered_bounded_capabilities(self):
+        registry = build_tool_registry()
+        values = {"AGENT_LLM_ENABLED": "1"}
+
+        async def fake_request(message, capabilities, **kwargs):
+            self.assertEqual(message, "检查下载队列有没有异常")
+            names = {item["name"] for item in capabilities}
+            self.assertTrue(names)
+            self.assertTrue(all(name.startswith("downloads.") for name in names))
+            self.assertLessEqual(len(capabilities), 14)
+            return None
+
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.agent.llm_router._allow_llm_request", return_value=True
+        ), patch(
+            "app.agent.llm_router._request_selection", side_effect=fake_request
+        ):
+            self.assertIsNone(
+                select_orchestration_tool(
+                    "检查下载队列有没有异常", registry, owner="session-a"
+                )
+            )
+
+    def test_dynamic_selector_keeps_relevant_confirmation_capability_reachable(self):
+        registry = build_tool_registry()
+        values = {"AGENT_LLM_ENABLED": "1"}
+
+        async def fake_request(message, capabilities, **kwargs):
+            names = {item["name"] for item in capabilities}
+            self.assertIn("rss.refresh_subscription", names)
+            self.assertLessEqual(len(capabilities), 14)
+            refresh = next(
+                item for item in capabilities
+                if item["name"] == "rss.refresh_subscription"
+            )
+            self.assertEqual(refresh["disposition"], "prepare_confirmation")
+            return None
+
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.agent.llm_router._allow_llm_request", return_value=True
+        ), patch(
+            "app.agent.llm_router._request_selection", side_effect=fake_request
+        ):
+            self.assertIsNone(
+                select_orchestration_tool(
+                    "刷新第 1 个 RSS 订阅", registry, owner="session-a"
+                )
+            )
+
     def test_native_capabilities_are_domain_filtered_and_bounded(self):
         registry = build_tool_registry()
 
@@ -2689,6 +2744,53 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertIn("哪部剧", response["result"]["summary"])
         conversation.assert_called_once()
         planner.assert_not_called()
+
+    def test_engineering_requests_are_rejected_as_out_of_scope(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        messages = (
+            "帮我修改代码修复这个问题",
+            "执行 SQL VACUUM 优化数据库",
+            "重启 Docker 服务并重新部署",
+        )
+
+        with patch(
+            "app.agent.orchestrator.answer_conversation"
+        ) as conversation, patch.object(
+            agent, "_query_with_model_tools"
+        ) as planner:
+            for message in messages:
+                with self.subTest(message=message):
+                    response = agent.query(message, owner="web-session", present=False)
+                    self.assertEqual(response["mode"], "conversation")
+                    self.assertIn("媒体业务助手", response["result"]["summary"])
+                    self.assertIn("不能修改代码", response["result"]["summary"])
+
+        conversation.assert_not_called()
+        planner.assert_not_called()
+
+    def test_media_diagnostics_are_not_rejected_as_engineering_requests(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        planned = {
+            "mode": "read_only",
+            "tool_call": {"name": "downloads.list", "arguments": {}},
+            "result": ToolResult(True, "success", "已进入媒体诊断").to_dict(),
+        }
+
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=planned
+        ) as planner:
+            for message in (
+                "Docker 下载服务里的队列卡住了，帮我修复",
+                "修复《代码》的下载",
+                "媒体库部署完成后，修复这部剧没入库的问题",
+            ):
+                with self.subTest(message=message):
+                    self.assertEqual(
+                        agent.query(message, owner="web-session", present=False),
+                        planned,
+                    )
+
+        self.assertEqual(planner.call_count, 3)
 
     def test_safe_media_control_gets_planner_before_deterministic_fallback(self):
         agent = AgentOrchestrator(ToolRegistry())

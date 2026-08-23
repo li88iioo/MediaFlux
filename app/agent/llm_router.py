@@ -30,6 +30,7 @@ from app.agent.token_budget import (
     request_fits_token_budget,
     resolve_context_window,
 )
+from app.agent.media_case import normalize_media_case_stage
 from app.agent.models import LLMToolDisposition, ToolResult
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.result_projection import (
@@ -1003,6 +1004,9 @@ def _safe_media_context_for_llm(value: Any) -> dict[str, Any]:
         coordinate = value.get(field)
         if isinstance(coordinate, int) and not isinstance(coordinate, bool) and 1 <= coordinate <= maximum:
             result[field] = coordinate
+    case_stage = normalize_media_case_stage(value.get("case_stage"))
+    if case_stage:
+        result["case_stage"] = case_stage
     if not result.get("title"):
         return {}
     return result
@@ -3011,8 +3015,12 @@ def select_orchestration_tool(
         return None
     route_owner = str(owner or "").strip()
     request_owner = str(rate_owner or route_owner).strip()
-    capabilities = orchestration_tool_capabilities(
-        registry, include_confirmations=bool(route_owner)
+    capabilities = _rank_read_capabilities(
+        orchestration_tool_capabilities(
+            registry, include_confirmations=bool(route_owner)
+        ),
+        _native_context_text(normalized, conversation_context, reply_context),
+        max_candidates=_NATIVE_MAX_CAPABILITIES,
     )
     if not capabilities or not _reserve_llm_provider_request(request_owner):
         return None

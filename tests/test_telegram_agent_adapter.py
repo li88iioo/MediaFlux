@@ -1318,6 +1318,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 "size": "1.2 GB",
                 "episode": "",
                 "title": "光阴之外 S01E01",
+                "explanation": "精确匹配 S01E01；含简体中文标记",
             },
             {
                 "result_id": "r2",
@@ -1334,6 +1335,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("已检查 3 个站点", text)
         self.assertIn("<b>候选资源</b>", text)
         self.assertEqual(text.count("光阴之外 S01E01"), 1)
+        self.assertIn("推荐依据：精确匹配 S01E01；含简体中文标记", text)
         self.assertIn("\n\n<b>2.</b>", text)
 
     def test_resource_candidate_summary_prefers_public_display_over_llm_narrative(self):
@@ -2365,6 +2367,11 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                         "title": "九门",
                         "year": "2026",
                         "media_type": "tv",
+                        "verification": {
+                            "tmdb_id": "12345",
+                            "season": 2,
+                            "episode": 3,
+                        },
                         "result_id": "private-result-id",
                         "magnet": "magnet:?xt=urn:btih:secret",
                     },
@@ -2378,10 +2385,58 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             "arguments": {},
         })
         self.assertEqual(projected["result"]["data"], {
-            "title": "九门", "year": "2026", "media_type": "tv",
+            "title": "九门",
+            "year": "2026",
+            "media_type": "tv",
+            "tmdb_id": "12345",
+            "season": 2,
+            "episode": 3,
+            "case_stage": "resource_candidates",
         })
         serialized = repr(projected)
         for forbidden in ("private-id", "/private/path", "private-result-id", "magnet:"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_confirmed_submit_callback_keeps_safe_case_progress(self):
+        projected = _safe_callback_history_response(
+            {
+                "mode": "confirmed_action",
+                "tool_call": {
+                    "name": "indexer.submit_resource",
+                    "arguments": {"result_id": "private-result-id"},
+                },
+                "confirmation": {"confirmation_id": "private-ticket"},
+                "result": {
+                    "ok": True,
+                    "status": "accepted",
+                    "summary": "下载任务已提交",
+                    "data": {
+                        "verification": {
+                            "title": "The Show",
+                            "tmdb_id": "12345",
+                            "season": 2,
+                            "episode": 3,
+                        },
+                        "request_id": 99,
+                        "path": "/private/path",
+                    },
+                },
+            },
+            fallback_summary="操作已完成",
+        )
+
+        self.assertEqual(projected["result"]["data"], {
+            "title": "The Show",
+            "media_type": "tv",
+            "tmdb_id": "12345",
+            "season": 2,
+            "episode": 3,
+            "case_stage": "download_submitted",
+        })
+        serialized = repr(projected)
+        for forbidden in (
+            "private-result-id", "private-ticket", "/private/path", "request_id"
+        ):
             self.assertNotIn(forbidden, serialized)
 
     def test_confirmation_callback_history_omits_internal_identifiers(self):

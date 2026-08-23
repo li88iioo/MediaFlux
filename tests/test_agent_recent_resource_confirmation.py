@@ -55,6 +55,9 @@ def _candidate(
         "confidence": "high",
         "match": "exact_episode",
         "download_state": "ready",
+        "reasons": ["精确匹配 S02E03", "可直接提交下载"],
+        "warnings": [],
+        "tags": {"resolution": "1080p", "media": "WEB-DL"},
         "magnet": "magnet:?xt=must-not-leak",
         "path": "/private/download",
     }
@@ -143,6 +146,14 @@ class RecentResourceCandidateStoreTests(unittest.TestCase):
         self.assertEqual([item["position"] for item in snapshot["candidates"]], [1, 2])
         self.assertEqual(snapshot["candidates"][0]["episode_label"], "S02E03")
         self.assertEqual(snapshot["candidates"][0]["result_id"], "resource-result-0001")
+        self.assertEqual(
+            snapshot["candidates"][0]["reasons"],
+            ["精确匹配 S02E03", "可直接提交下载"],
+        )
+        self.assertEqual(
+            snapshot["candidates"][0]["tags"],
+            {"media": "WEB-DL", "resolution": "1080p"},
+        )
         serialized = repr(snapshot)
         for secret in ("magnet:", "/private", "/secret", "secret.example"):
             self.assertNotIn(secret, serialized)
@@ -836,6 +847,12 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             "可询问：刚才下载的缺集入库完成了吗。",
             confirmed["result"]["suggestions"],
         )
+        self.assertEqual(confirmed["result"]["data"]["verification"], {
+            "title": "The Show",
+            "tmdb_id": "12345",
+            "season": 2,
+            "episode": 3,
+        })
         self.assertNotIn("_verification_context", repr(response))
         self.assertNotIn("_verification_context", repr(confirmed))
 
