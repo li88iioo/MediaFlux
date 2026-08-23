@@ -63,8 +63,9 @@ _PLAYBACK_SESSION_QUERY_KEY = "_mfps"
 _PLAYBACK_SOURCE_QUERY_KEY = "_mfss"
 _PLAYBACK_AUTHORIZATION_TTL_SECONDS = 15 * 60
 _PLAYBACK_AUTHORIZATION_MAX_TTL_SECONDS = 12 * 60 * 60
+_PLAYBACK_INFO_PREFERENCE_PARSE_MAX_BYTES = 1024 * 1024
 _SENSITIVE_QUERY_KEYS = {
-    "api_key", "x-emby-token", "x-mediabrowser-token",
+    "api_key", "apikey", "x-emby-token", "x-mediabrowser-token",
     _PLAYBACK_SESSION_QUERY_KEY, _PLAYBACK_SOURCE_QUERY_KEY,
 }
 _AUTH_SCOPE_SECRET = secrets.token_bytes(32)
@@ -81,7 +82,10 @@ _AUTH_DEVICE_ID_RE = re.compile(
     re.IGNORECASE,
 )
 _MEDIA_BROWSER_AUTH_RE = re.compile(r"^\s*MediaBrowser(?:\s+|$)", re.IGNORECASE)
-_HLS_PATH_RE = re.compile(r"(?:\.m3u8$|/(?:hls|master|main)/|\.ts$|\.m4s$)", re.IGNORECASE)
+_HLS_PATH_RE = re.compile(
+    r"(?:\.m3u8$|/(?:hls\d*|master|main)/|\.ts$|\.m4s$)",
+    re.IGNORECASE,
+)
 _signed_url_caches: dict[int, SignedUrlCache] = {}
 _signed_url_caches_lock = threading.RLock()
 
@@ -290,6 +294,39 @@ def _resolved_instance(instance_id: int) -> dict[str, Any] | None:
     return resolve_proxy_instance(row)
 
 
+_COMPACT_MEDIA_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_CANONICAL_MEDIA_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$"
+)
+
+
+def _normalized_media_identifier(value: Any) -> str:
+    """统一 Jellyfin UUID 的标准带连字符/无连字符表示，不改写普通标识。"""
+    raw = str(value or "").strip()
+    if _COMPACT_MEDIA_UUID_RE.fullmatch(raw):
+        return raw.casefold()
+    if _CANONICAL_MEDIA_UUID_RE.fullmatch(raw):
+        return raw.replace("-", "").casefold()
+    return raw
+
+
+def _media_identifier_variants(value: Any) -> tuple[str, ...]:
+    """返回数据库兼容查询需要的原始、compact、canonical UUID 形式。"""
+    raw = str(value or "").strip()
+    normalized = _normalized_media_identifier(raw)
+    if not _COMPACT_MEDIA_UUID_RE.fullmatch(normalized):
+        return (raw,)
+    canonical = (
+        f"{normalized[:8]}-{normalized[8:12]}-{normalized[12:16]}-"
+        f"{normalized[16:20]}-{normalized[20:]}"
+    )
+    return tuple(
+        dict.fromkeys(
+            (raw, normalized, canonical, normalized.upper(), canonical.upper())
+        )
+    )
+
+
 @dataclass
 class _DynamicGuangYaMapping:
     file_id: str
@@ -325,11 +362,15 @@ class DynamicGuangYaMappings:
         source_id: str,
         file_id: str,
     ) -> None:
-        normalized_item = str(item_id or "").strip()
+        normalized_item = _normalized_media_identifier(item_id)
         normalized_file = str(file_id or "").strip()
         if not normalized_item or not normalized_file:
             return
-        key = (int(instance_id), normalized_item, str(source_id or "").strip())
+        key = (
+            int(instance_id),
+            normalized_item,
+            _normalized_media_identifier(source_id),
+        )
         with self._lock:
             now = self._clock()
             self._prune_expired_locked(now)
@@ -365,8 +406,8 @@ class DynamicGuangYaMappings:
     def get(self, instance_id: int, item_id: str, source_id: str = "") -> str | None:
         now = self._clock()
         instance_key = int(instance_id)
-        item_key = str(item_id or "").strip()
-        source_key = str(source_id or "").strip()
+        item_key = _normalized_media_identifier(item_id)
+        source_key = _normalized_media_identifier(source_id)
         with self._lock:
             self._prune_expired_locked(now)
             if source_key:
@@ -707,7 +748,12 @@ class ItemLevelBindingScopes:
         binding_signature: str,
         auth_scope: str = "",
     ) -> None:
-        key = (str(auth_scope or ""), int(instance_id), str(item_id or ""), str(source_id or ""))
+        key = (
+            str(auth_scope or ""),
+            int(instance_id),
+            _normalized_media_identifier(item_id),
+            _normalized_media_identifier(source_id),
+        )
         with self._lock:
             now = self._clock()
             self._prune_expired_locked(now)
@@ -728,7 +774,12 @@ class ItemLevelBindingScopes:
         binding_signature: str,
         auth_scope: str = "",
     ) -> bool:
-        key = (str(auth_scope or ""), int(instance_id), str(item_id or ""), str(source_id or ""))
+        key = (
+            str(auth_scope or ""),
+            int(instance_id),
+            _normalized_media_identifier(item_id),
+            _normalized_media_identifier(source_id),
+        )
         with self._lock:
             now = self._clock()
             self._prune_expired_locked(now)
@@ -752,7 +803,7 @@ class ItemLevelBindingScopes:
                 key for key, entry in self._entries.items()
                 if key[0] == str(auth_scope or "")
                 and key[1] == int(instance_id)
-                and key[2] == str(item_id or "")
+                and key[2] == _normalized_media_identifier(item_id)
                 and entry.binding_signature == str(binding_signature)
             ]
             if len(matches) == 1:
@@ -818,7 +869,12 @@ class PlaybackGrantRegistry:
                  *, source_type: str, file_id: str = "", binding_signature: str = "") -> None:
         if not auth_scope:
             return
-        key = (auth_scope, int(instance_id), str(item_id or ""), str(source_id or ""))
+        key = (
+            auth_scope,
+            int(instance_id),
+            _normalized_media_identifier(item_id),
+            _normalized_media_identifier(source_id),
+        )
         with self._lock:
             now = self._clock(); self._prune_locked(now); self._entries.pop(key, None)
             self._entries[key] = _PlaybackGrant(
@@ -838,9 +894,14 @@ class PlaybackGrantRegistry:
         with self._lock:
             now = self._clock()
             self._prune_locked(now)
-            keys = [(auth_scope, int(instance_id), str(item_id or ""), str(source_id or ""))]
-            if not source_id:
-                keys = [key for key in self._entries if key[:3] == (auth_scope, int(instance_id), str(item_id or ""))]
+            normalized_item = _normalized_media_identifier(item_id)
+            normalized_source = _normalized_media_identifier(source_id)
+            keys = [(auth_scope, int(instance_id), normalized_item, normalized_source)]
+            if not normalized_source:
+                keys = [
+                    key for key in self._entries
+                    if key[:3] == (auth_scope, int(instance_id), normalized_item)
+                ]
             matches = []
             for key in keys:
                 grant = self._entries.get(key)
@@ -920,6 +981,7 @@ class _PlaybackSessionLink:
     capability_expires_at: float
     browser_relay: bool = False
     native_cross_protocol_relay: bool = False
+    native_signed_media_relay: bool = False
     native_client_fingerprint: str = ""
     native_verified_auth_scope: str = ""
 
@@ -947,6 +1009,9 @@ class PlaybackSessionRegistry:
         ] = OrderedDict()
         self._entry_capabilities: dict[
             tuple[str, int, str], set[tuple[int, str]]
+        ] = {}
+        self._capability_browser_direct_redirect_signatures: dict[
+            tuple[int, str], tuple[str, ...]
         ] = {}
         self._upstream_session_index: dict[
             tuple[str, int, str], tuple[str, int, str]
@@ -994,6 +1059,9 @@ class PlaybackSessionRegistry:
 
     def _remove_capability_locked(self, capability_key: tuple[int, str]) -> None:
         linked = self._capability_index.pop(capability_key, None)
+        self._capability_browser_direct_redirect_signatures.pop(
+            capability_key, None
+        )
         if linked is None:
             return
         key, _expires_at, _max_expires_at = linked
@@ -1011,6 +1079,7 @@ class PlaybackSessionRegistry:
         token: str,
         expires_at: float,
         max_expires_at: float,
+        browser_direct_redirect_signatures: tuple[str, ...] = (),
     ) -> None:
         capability_key = (entry.instance_id, token)
         if capability_key in self._capability_index:
@@ -1021,6 +1090,24 @@ class PlaybackSessionRegistry:
             max_expires_at,
         )
         self._entry_capabilities.setdefault(key, set()).add(capability_key)
+        normalized_signatures = tuple(
+            dict.fromkeys(
+                signature
+                for signature in (
+                    str(value or "").strip()
+                    for value in browser_direct_redirect_signatures
+                )
+                if signature
+            )
+        )
+        if normalized_signatures:
+            self._capability_browser_direct_redirect_signatures[
+                capability_key
+            ] = normalized_signatures
+        else:
+            self._capability_browser_direct_redirect_signatures.pop(
+                capability_key, None
+            )
         entry.capability_expires_at = max(entry.capability_expires_at, expires_at)
         while len(self._capability_index) > self._max_capabilities:
             oldest = next(iter(self._capability_index))
@@ -1040,6 +1127,9 @@ class PlaybackSessionRegistry:
         entry = self._entries.pop(key, None)
         for capability_key in list(self._entry_capabilities.pop(key, set())):
             self._capability_index.pop(capability_key, None)
+            self._capability_browser_direct_redirect_signatures.pop(
+                capability_key, None
+            )
         if entry and entry.upstream_session_token:
             upstream_key = (
                 entry.auth_scope, entry.instance_id, entry.upstream_session_token
@@ -1072,13 +1162,14 @@ class PlaybackSessionRegistry:
         upstream_session_token: str = "",
         browser_relay: bool | None = None,
         native_cross_protocol_relay: bool | None = None,
+        native_signed_media_relay: bool | None = None,
         native_client_fingerprint: str = "",
         native_verified_auth_scope: str = "",
     ) -> _PlaybackSessionLink:
         if item_id:
-            entry.item_id = str(item_id)
+            entry.item_id = _normalized_media_identifier(item_id)
         if source_id:
-            entry.source_id = str(source_id)
+            entry.source_id = _normalized_media_identifier(source_id)
         if file_id:
             entry.file_id = str(file_id)
         if media_name:
@@ -1091,6 +1182,8 @@ class PlaybackSessionRegistry:
             entry.native_cross_protocol_relay = bool(
                 native_cross_protocol_relay
             )
+        if native_signed_media_relay is not None:
+            entry.native_signed_media_relay = bool(native_signed_media_relay)
         if native_client_fingerprint:
             entry.native_client_fingerprint = str(native_client_fingerprint)
         if native_verified_auth_scope:
@@ -1113,6 +1206,7 @@ class PlaybackSessionRegistry:
         server_capability: bool = False,
         browser_relay: bool = False,
         native_cross_protocol_relay: bool = False,
+        native_signed_media_relay: bool = False,
         native_client_fingerprint: str = "",
         native_verified_auth_scope: str = "",
     ) -> _PlaybackSessionLink:
@@ -1128,8 +1222,8 @@ class PlaybackSessionRegistry:
                     token=normalized_token,
                     auth_scope=key[0],
                     instance_id=key[1],
-                    item_id=str(item_id or ""),
-                    source_id=str(source_id or ""),
+                    item_id=_normalized_media_identifier(item_id),
+                    source_id=_normalized_media_identifier(source_id),
                     file_id=str(file_id or ""),
                     media_name=str(media_name or ""),
                     upstream_session_token="",
@@ -1139,6 +1233,7 @@ class PlaybackSessionRegistry:
                     native_cross_protocol_relay=bool(
                         native_cross_protocol_relay
                     ),
+                    native_signed_media_relay=bool(native_signed_media_relay),
                     native_client_fingerprint=str(
                         native_client_fingerprint or ""
                     ),
@@ -1162,6 +1257,7 @@ class PlaybackSessionRegistry:
                     upstream_session_token=upstream_session_token,
                     browser_relay=browser_relay,
                     native_cross_protocol_relay=native_cross_protocol_relay,
+                    native_signed_media_relay=native_signed_media_relay,
                     native_client_fingerprint=native_client_fingerprint,
                     native_verified_auth_scope=native_verified_auth_scope,
                 )
@@ -1193,7 +1289,11 @@ class PlaybackSessionRegistry:
         if entry is None:
             self._upstream_session_index.pop(alias_key, None)
             return None
-        if item_id and entry.item_id and entry.item_id != item_id:
+        if (
+            item_id
+            and entry.item_id
+            and entry.item_id != _normalized_media_identifier(item_id)
+        ):
             return None
         return key, entry
 
@@ -1207,7 +1307,9 @@ class PlaybackSessionRegistry:
         media_name: str = "",
         upstream_session_token: str = "",
         browser_relay: bool = False,
+        browser_direct_redirect_signatures: tuple[str, ...] = (),
         native_cross_protocol_relay: bool = False,
+        native_signed_media_relay: bool = False,
         native_client_fingerprint: str = "",
         native_verified_auth_scope: str = "",
     ) -> _PlaybackSessionLink:
@@ -1216,7 +1318,7 @@ class PlaybackSessionRegistry:
         normalized_instance = int(instance_id)
         normalized_token = self._token(token) or secrets.token_urlsafe(24)
         normalized_upstream = self._token(upstream_session_token)
-        normalized_item = str(item_id or "")
+        normalized_item = _normalized_media_identifier(item_id)
         with self._lock:
             now = self._clock()
             self._prune_locked(now)
@@ -1239,6 +1341,7 @@ class PlaybackSessionRegistry:
                     upstream_session_token=normalized_upstream,
                     browser_relay=browser_relay,
                     native_cross_protocol_relay=native_cross_protocol_relay,
+                    native_signed_media_relay=native_signed_media_relay,
                     native_client_fingerprint=native_client_fingerprint,
                     native_verified_auth_scope=native_verified_auth_scope,
                 )
@@ -1271,6 +1374,9 @@ class PlaybackSessionRegistry:
                         native_cross_protocol_relay=bool(
                             native_cross_protocol_relay
                         ),
+                        native_signed_media_relay=bool(
+                            native_signed_media_relay
+                        ),
                         native_client_fingerprint=str(
                             native_client_fingerprint or ""
                         ),
@@ -1287,6 +1393,7 @@ class PlaybackSessionRegistry:
                         media_name=media_name,
                         browser_relay=browser_relay,
                         native_cross_protocol_relay=native_cross_protocol_relay,
+                        native_signed_media_relay=native_signed_media_relay,
                         native_client_fingerprint=native_client_fingerprint,
                         native_verified_auth_scope=native_verified_auth_scope,
                     )
@@ -1300,9 +1407,30 @@ class PlaybackSessionRegistry:
                 normalized_token,
                 now + self._capability_ttl_seconds,
                 now + self._capability_max_ttl_seconds,
+                browser_direct_redirect_signatures,
             )
             self._enforce_capacity_locked()
             return entry
+
+    def capability_allows_browser_direct_redirect(
+        self,
+        instance_id: int,
+        token: str,
+        source_signature: str,
+    ) -> bool:
+        normalized_token = self._token(token)
+        normalized_signature = str(source_signature or "").strip()
+        if not normalized_token or not normalized_signature:
+            return False
+        with self._lock:
+            self._prune_capabilities_locked(self._clock())
+            allowed = self._capability_browser_direct_redirect_signatures.get(
+                (int(instance_id), normalized_token), ()
+            )
+            return any(
+                hmac.compare_digest(normalized_signature, signature)
+                for signature in allowed
+            )
 
     def resolve_capability(
         self,
@@ -1339,12 +1467,16 @@ class PlaybackSessionRegistry:
             ):
                 self._remove_capability_locked(capability_key)
                 return None
-            if item_id and entry.item_id and entry.item_id != str(item_id):
+            if (
+                item_id
+                and entry.item_id
+                and entry.item_id != _normalized_media_identifier(item_id)
+            ):
                 return None
             expected_source_signature = _playback_source_signature(
                 normalized_instance,
-                str(item_id or entry.item_id),
-                str(source_id or ""),
+                _normalized_media_identifier(item_id or entry.item_id),
+                _normalized_media_identifier(source_id),
                 normalized_token,
             )
             if not source_signature or not hmac.compare_digest(
@@ -1390,7 +1522,7 @@ class PlaybackSessionRegistry:
                     entry is not None
                     and item_id
                     and entry.item_id
-                    and entry.item_id != str(item_id)
+                    and entry.item_id != _normalized_media_identifier(item_id)
                 ):
                     if create:
                         return self.begin(
@@ -1429,18 +1561,24 @@ class PlaybackSessionRegistry:
             elif item_id and source_id:
                 pending = [
                     (key, entry) for key, entry in candidates
-                    if entry.item_id == str(item_id) and not entry.source_id
+                    if entry.item_id == _normalized_media_identifier(item_id) and not entry.source_id
                 ]
                 exact = [
                     (key, entry) for key, entry in candidates
-                    if entry.item_id == str(item_id) and entry.source_id == str(source_id)
+                    if (
+                        entry.item_id == _normalized_media_identifier(item_id)
+                        and entry.source_id == _normalized_media_identifier(source_id)
+                    )
                 ]
                 if len(pending) == 1:
                     preferred = pending
                 elif len(exact) == 1:
                     preferred = exact
             elif item_id:
-                preferred = [(key, entry) for key, entry in candidates if entry.item_id == str(item_id)]
+                preferred = [
+                    (key, entry) for key, entry in candidates
+                    if entry.item_id == _normalized_media_identifier(item_id)
+                ]
             elif len(candidates) == 1:
                 preferred = candidates
 
@@ -1479,6 +1617,7 @@ class PlaybackSessionRegistry:
             self._entries.clear()
             self._capability_index.clear()
             self._entry_capabilities.clear()
+            self._capability_browser_direct_redirect_signatures.clear()
             self._upstream_session_index.clear()
 
 
@@ -1491,8 +1630,20 @@ def _apply_playback_session(request: Request, entry: _PlaybackSessionLink | None
     request.state.proxy_playback_session_token = entry.token
     request.state.proxy_playback_session_key = _playback_sessions.persistent_key(entry)
     request.state.proxy_browser_relay = bool(entry.browser_relay)
+    capability_token = _request_query_value(
+        request, _PLAYBACK_SESSION_QUERY_KEY
+    )
+    source_signature = _request_query_value(request, _PLAYBACK_SOURCE_QUERY_KEY)
+    request.state.proxy_browser_direct_redirect = (
+        _playback_sessions.capability_allows_browser_direct_redirect(
+            entry.instance_id, capability_token, source_signature
+        )
+    )
     request.state.proxy_native_cross_protocol_relay = bool(
         entry.native_cross_protocol_relay
+    )
+    request.state.proxy_native_signed_media_relay = bool(
+        entry.native_signed_media_relay
     )
     if entry.item_id:
         request.state.proxy_media_item_id = entry.item_id
@@ -1567,8 +1718,15 @@ def _direct_stream_path(
     prefix: str = "",
     playback_session_token: str = "",
     playback_source_signature: str = "",
+    container: str = "",
 ) -> str:
-    path = f"{prefix}/Videos/{quote(str(item_id), safe='')}/stream"
+    normalized_container = str(container or "").strip().casefold().split(",", 1)[0]
+    suffix = (
+        f".{normalized_container}"
+        if re.fullmatch(r"[a-z0-9]{1,12}", normalized_container)
+        else ""
+    )
+    path = f"{prefix}/Videos/{quote(str(item_id), safe='')}/stream{suffix}"
     query: list[str] = []
     if source_id:
         query.append(f"MediaSourceId={quote(str(source_id), safe='')}")
@@ -1588,30 +1746,78 @@ def _mark_direct_source(
     source: dict[str, Any],
     stream_path: str,
     direct_stream_url: str | None = None,
+    *,
+    native_client_mode: str = "",
 ) -> None:
-    source["SupportsDirectPlay"] = True
-    source["SupportsDirectStream"] = True
-    source["IsRemote"] = False
-    # Jellyfin Android 2.7 / Yamby 会把 Protocol=Http 的 Path 直接当作 HLS
-    # 清单加载；这里实际提供的是 Jellyfin 标准视频流端点，必须保留 File
-    # 语义，让原生客户端自行生成 /Videos/{id}/stream 请求。
-    source["Protocol"] = "File"
+    requested_mode = str(native_client_mode or "").strip().casefold()
+    mode = (
+        requested_mode
+        if requested_mode in {"web", "jellyfin_android", "findroid"}
+        else ""
+    )
+    # Findroid 对 Protocol=HTTP 会直接采用 PlaybackInfo 返回的 Path；这样可以
+    # 保留 MediaFlux 写入 URL 的短时 capability。Protocol=File 则会自行通过
+    # SDK 重建标准 /Videos/{id}/stream URL，丢掉 capability 与访问令牌。
+    findroid_http_source = mode == "findroid"
+    source["IsRemote"] = findroid_http_source
+    source["Protocol"] = "Http" if findroid_http_source else "File"
     source["RequiresOpening"] = False
     source["RequiresClosing"] = False
     source["RequiresLooping"] = False
     source["ReadAtNativeFramerate"] = False
     source["Path"] = stream_path
     source["DirectStreamUrl"] = direct_stream_url or stream_path
+
+    if mode == "web":
+        # Web 的设备能力由 Jellyfin 上游判定。不能强行宣告 MKV/HEVC 可直放，
+        # 否则浏览器会持续下载不支持的媒体却始终没有首帧；只替换直放地址，
+        # 保留上游的 DirectPlay/DirectStream/Transcoding 与 HLS 决策。
+        return
+
+    # Jellyfin Android 2.7 使用的 jellyfin-sdk-kotlin 1.7.1 把
+    # TranscodingSubProtocol 声明为非空必填字段。即便禁用了转码，缺少该键也会
+    # 让 PlaybackInfo 在客户端反序列化阶段直接失败，因而根本不会发出视频 GET。
+    transcoding_sub_protocol = str(
+        source.get("TranscodingSubProtocol") or ""
+    ).strip().casefold()
+    source["TranscodingSubProtocol"] = (
+        transcoding_sub_protocol
+        if transcoding_sub_protocol in {"http", "hls"}
+        else "http"
+    )
+
+    # Jellyfin for Android 2.7 对 File 媒体优先选择 DirectPlay，并自行重建
+    # 无扩展名 stream URL；现场实测该分支会在发出媒体 GET 前 0ms 结束。
+    # 仅对官方 Android 客户端关闭 DirectPlay，强制进入已验证可请求
+    # /Videos/{id}/stream.{container} 的 DirectStream 分支。
+    source["SupportsDirectPlay"] = mode != "jellyfin_android"
+    source["SupportsDirectStream"] = True
+    # Android 后续 DirectStream 请求通过上游 PlaySessionId 恢复精确
+    # item/source 授权；Findroid 则通过 HTTP Path 携带 capability。
     source["SupportsTranscoding"] = False
-    # Jellyfin Web 会依据这些残留字段选择 HLS.js；若只删除 URL，浏览器会把
-    # 普通视频 302 地址当作 m3u8 通过 XHR 加载，随后被无 CORS 头的 CDN 拦截。
+    # 原生直放必须删除 HLS 清单地址，否则客户端仍可能选择 TranscodingUrl。
+    # TranscodingSubProtocol 因旧 Android SDK 契约要求而保留。
     for key in (
         "TranscodingUrl",
         "TranscodingContainer",
-        "TranscodingSubProtocol",
         "TranscodingInfo",
     ):
         source.pop(key, None)
+
+
+def _client_stream_url(path: str, base_url: str, native_client_mode: str) -> str:
+    """Findroid 的 HTTP MediaSource 需要绝对 URL；其他客户端保持相对路径。"""
+    raw_path = str(path or "").strip()
+    if str(native_client_mode or "").strip().casefold() != "findroid":
+        return raw_path
+    raw_base = str(base_url or "").strip().rstrip("/")
+    try:
+        parsed = urlsplit(raw_base)
+    except ValueError:
+        return raw_path
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return raw_path
+    return f"{raw_base}/{raw_path.lstrip('/')}"
 
 
 def validate_listen_host(value: str) -> str:
@@ -1978,6 +2184,145 @@ def _request_is_jellyfin_android_client(request: Any) -> bool:
     return "jellyfin" in user_agent and "android" in user_agent
 
 
+def _request_uses_exoplayer(request: Any) -> bool:
+    """识别默认禁止 HTTP/HTTPS 跨协议重定向的 Media3/ExoPlayer 客户端。"""
+    client_name = _request_client_name(request).casefold()
+    if "findroid" in client_name or _request_is_jellyfin_android_client(request):
+        return True
+    user_agent = str(request.headers.get("User-Agent") or "").casefold()
+    return any(marker in user_agent for marker in (
+        "exoplayer", "media3", "findroid", "jellyfin android",
+        "jellyfin-android",
+    ))
+
+
+def _request_prefers_direct_signed_redirect(request: Any) -> bool:
+    """保留已验证可直接跟随 HTTPS signed URL 的第三方客户端路径。"""
+    client_name = _request_client_name(request).casefold()
+    user_agent = str(request.headers.get("User-Agent") or "").casefold()
+    return any(
+        marker in client_name or marker in user_agent
+        for marker in ("yamby", "moonfin")
+    )
+
+
+def _native_playback_rewrite_mode(
+    request: Any,
+    request_payload: Any = None,
+) -> str:
+    client_name = _request_client_name(request).casefold()
+    if "findroid" in client_name:
+        return "findroid"
+    if _request_is_jellyfin_android_client(request):
+        profile = _diagnostic_dict_value(request_payload, "DeviceProfile")
+        profile_name = str(
+            _diagnostic_dict_value(profile, "Name") or ""
+        ).casefold()
+        # Jellyfin Android 的界面本身运行在 WebView 中。使用网页播放器时，
+        # Client 仍是 Jellyfin for Android，但 DeviceProfile 不是原生播放器
+        # 档案；不能把浏览器错误地强制成 MKV DirectStream。
+        if "jellyfin" in profile_name and "android" in profile_name:
+            return "jellyfin_android"
+        user_agent = str(request.headers.get("User-Agent") or "").casefold()
+        if "mozilla/" in user_agent or "; wv)" in user_agent:
+            return "web"
+        return "jellyfin_android"
+    if _request_is_web_client(request):
+        return "web"
+    return ""
+
+
+def _diagnostic_dict_value(data: Any, *names: str) -> Any:
+    if not isinstance(data, dict):
+        return None
+    folded = {str(key).casefold(): value for key, value in data.items()}
+    for name in names:
+        if str(name).casefold() in folded:
+            return folded[str(name).casefold()]
+    return None
+
+
+def _native_playback_diagnostic_summary(
+    request_payload: Any,
+    response_payload: Any,
+    *,
+    item_id: str,
+    changed: bool,
+) -> dict[str, Any]:
+    """生成不含 token、播放 URL 和签名参数的原生客户端诊断摘要。"""
+    request_data = request_payload if isinstance(request_payload, dict) else {}
+    profile = _diagnostic_dict_value(request_data, "DeviceProfile")
+    profile = profile if isinstance(profile, dict) else {}
+    normalized_item = _normalized_media_identifier(item_id).replace("-", "").casefold()
+    response_data = response_payload if isinstance(response_payload, dict) else {}
+    source_summaries: list[dict[str, Any]] = []
+    media_sources = response_data.get("MediaSources")
+    if isinstance(media_sources, list):
+        for source in media_sources[:4]:
+            if not isinstance(source, dict):
+                continue
+            source_id = str(source.get("Id") or "")
+            source_path = str(source.get("Path") or "")
+            direct_url = str(source.get("DirectStreamUrl") or "")
+            try:
+                parsed_source_path = urlsplit(source_path)
+            except ValueError:
+                parsed_source_path = urlsplit("")
+            source_summaries.append({
+                "id_present": bool(source_id),
+                "id_matches_item": bool(
+                    source_id
+                    and source_id.replace("-", "").casefold() == normalized_item
+                ),
+                "protocol": str(source.get("Protocol") or ""),
+                "container": str(source.get("Container") or ""),
+                "direct_play": bool(source.get("SupportsDirectPlay")),
+                "direct_stream": bool(source.get("SupportsDirectStream")),
+                "transcoding": bool(source.get("SupportsTranscoding")),
+                "path_relative": source_path.startswith("/"),
+                "path_scheme": parsed_source_path.scheme,
+                "path_host": parsed_source_path.hostname or "",
+                "path_route": parsed_source_path.path,
+                "direct_url_relative": direct_url.startswith("/"),
+                "stream_count": len(source.get("MediaStreams") or []),
+                "default_audio": source.get("DefaultAudioStreamIndex"),
+                "default_subtitle": source.get("DefaultSubtitleStreamIndex"),
+            })
+    request_source_id = str(
+        _diagnostic_dict_value(request_data, "MediaSourceId") or ""
+    )
+    return {
+        "request_source_present": bool(request_source_id),
+        "request_source_matches_item": bool(
+            request_source_id
+            and request_source_id.replace("-", "").casefold() == normalized_item
+        ),
+        "enable_direct_play": _diagnostic_dict_value(
+            request_data, "EnableDirectPlay"
+        ),
+        "enable_direct_stream": _diagnostic_dict_value(
+            request_data, "EnableDirectStream"
+        ),
+        "enable_transcoding": _diagnostic_dict_value(
+            request_data, "EnableTranscoding"
+        ),
+        "profile_name": str(_diagnostic_dict_value(profile, "Name") or ""),
+        "profile_direct_count": len(
+            _diagnostic_dict_value(profile, "DirectPlayProfiles") or []
+        ),
+        "profile_transcode_count": len(
+            _diagnostic_dict_value(profile, "TranscodingProfiles") or []
+        ),
+        "profile_codec_count": len(
+            _diagnostic_dict_value(profile, "CodecProfiles") or []
+        ),
+        "play_session_present": bool(response_data.get("PlaySessionId")),
+        "source_count": len(media_sources) if isinstance(media_sources, list) else -1,
+        "rewritten": bool(changed),
+        "sources": source_summaries,
+    }
+
+
 def _authorization_device_ids(value: Any) -> list[str]:
     values: list[str] = []
     for match in _AUTH_DEVICE_ID_RE.finditer(str(value or "")):
@@ -2204,35 +2549,48 @@ def _header_values(headers: Any, name: str) -> list[str]:
 
 def _request_auth_credentials(request: Any) -> list[str]:
     headers = request.headers
-    query = request.query_params
     values: list[str] = []
 
     for header_name in ("X-Emby-Token", "X-MediaBrowser-Token"):
         values.extend(_header_values(headers, header_name))
 
+    values.extend(_request_query_auth_credentials(request))
+
+    for header_name in ("Authorization", "X-Emby-Authorization"):
+        for header_value in _header_values(headers, header_name):
+            values.extend(_authorization_tokens(header_value))
+    return values
+
+
+def _request_query_auth_credentials(request: Any) -> list[str]:
+    """只提取原始 query 中携带的媒体服务器用户凭据。"""
+    query = request.query_params
     if hasattr(query, "multi_items"):
         query_items = list(query.multi_items())
     elif hasattr(query, "items"):
         query_items = list(query.items())
     else:
         query_items = []
-    for query_name in (
+    credential_keys = {
         "api_key",
-        "X-Emby-Token",
-        "X-MediaBrowser-Token",
-    ):
-        normalized_name = query_name.casefold()
-        for key, raw_value in query_items:
-            if str(key).casefold() != normalized_name:
-                continue
-            value = str(raw_value or "").strip()
-            if value:
-                values.append(value)
-
-    for header_name in ("Authorization", "X-Emby-Authorization"):
-        for header_value in _header_values(headers, header_name):
-            values.extend(_authorization_tokens(header_value))
+        "apikey",
+        "x-emby-token",
+        "x-mediabrowser-token",
+    }
+    values: list[str] = []
+    for key, raw_value in query_items:
+        if str(key).casefold() not in credential_keys:
+            continue
+        value = str(raw_value or "").strip()
+        if value:
+            values.append(value)
     return values
+
+
+def _request_query_auth_credential(request: Any) -> str:
+    """返回 query 中唯一的用户凭据；冲突输入不做隐式选择。"""
+    values = tuple(dict.fromkeys(_request_query_auth_credentials(request)))
+    return values[0] if len(values) == 1 else ""
 
 
 def _request_auth_credential(request: Any) -> str:
@@ -2247,6 +2605,17 @@ def _request_auth_has_conflict(request: Any) -> bool:
 def _auth_scope_fingerprint(credential: str) -> str:
     value = str(credential or "").encode("utf-8")
     return hmac.new(_AUTH_SCOPE_SECRET, value, hashlib.sha256).hexdigest() if value else ""
+
+
+def _upstream_playback_token_scope(instance_id: int, token: str) -> str:
+    """把上游 PlaySessionId 绑定为仅进程内、同地址复核的短时授权域。"""
+    normalized = PlaybackSessionRegistry._token(token)
+    if not normalized:
+        return ""
+    return _auth_scope_fingerprint(
+        "mediaflux-upstream-playback-token:"
+        f"{int(instance_id)}:{normalized}"
+    )
 
 
 def _upstream_playback_session_scope(
@@ -2275,8 +2644,9 @@ def _playback_source_signature(
     if not token:
         return ""
     payload = (
-        f"mediaflux-playback-source\0{int(instance_id)}\0{item_id}\0"
-        f"{source_id}\0{token}"
+        f"mediaflux-playback-source\0{int(instance_id)}\0"
+        f"{_normalized_media_identifier(item_id)}\0"
+        f"{_normalized_media_identifier(source_id)}\0{token}"
     ).encode("utf-8")
     return hmac.new(_AUTH_SCOPE_SECRET, payload, hashlib.sha256).hexdigest()[:48]
 
@@ -2390,12 +2760,91 @@ def _sanitized_query_string(request: Any) -> str:
     return urlencode(_sanitized_query_pairs(request), doseq=True)
 
 
-def _playback_info_query_string(request: Any) -> str:
-    """保留客户端能力参数，同时确保上游返回可直放/直传媒体源。"""
+def _upstream_query_string(request: Any, server_type: str = "") -> str:
+    """构造上游 query；Jellyfin HLS 仅续传原请求 query 的用户凭据。"""
+    pairs = _sanitized_query_pairs(request)
+    is_jellyfin_hls = bool(
+        str(server_type or "").strip().casefold() == "jellyfin"
+        and _HLS_PATH_RE.search(str(request.url.path or ""))
+    )
+    if is_jellyfin_hls:
+        # Jellyfin master playlist 会把当前 query 复制到 main/segment URI。
+        # 仅把客户端原本放在 query 中且值唯一的用户 token 作为 canonical
+        # api_key 续传给上游；header-only token 不扩大到 URL，且绝不使用
+        # 实例管理员密钥为匿名 HLS 请求兜底。
+        credential = _request_query_auth_credential(request)
+        if credential:
+            pairs.append(("api_key", credential))
+    return urlencode(pairs, doseq=True)
+
+
+def _playback_info_request_payload(body: bytes) -> dict[str, Any]:
+    """尽力解析 PlaybackInfo JSON 请求体；无效或非对象内容按空对象处理。"""
+    if not body or len(body) > _PLAYBACK_INFO_PREFERENCE_PARSE_MAX_BYTES:
+        return {}
+    try:
+        payload = httpx.Response(
+            status_code=200,
+            content=body,
+            headers={"content-type": "application/json"},
+        ).json()
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _optional_request_boolean(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().casefold()
+    if normalized in {"true", "1"}:
+        return True
+    if normalized in {"false", "0"}:
+        return False
+    return None
+
+
+def _playback_info_direct_fallback_requested(
+    request: Any,
+    request_payload: dict[str, Any],
+) -> bool:
+    """识别客户端显式禁用 DirectPlay/DirectStream 的降级请求。"""
+    preferences: dict[str, bool | None] = {
+        "enabledirectplay": None,
+        "enabledirectstream": None,
+    }
+    for key, value in _sanitized_query_pairs(request):
+        normalized_key = key.casefold()
+        if normalized_key in preferences:
+            parsed = _optional_request_boolean(value)
+            if parsed is not None:
+                preferences[normalized_key] = parsed
+
+    # Jellyfin Android 2.7 的 retry 2/3 将开关放在 POST JSON 顶层；body
+    # 是实际 API 契约，存在明确布尔值时覆盖 query 中的同名值。
+    for key in tuple(preferences):
+        parsed = _optional_request_boolean(
+            _diagnostic_dict_value(request_payload, key)
+        )
+        if parsed is not None:
+            preferences[key] = parsed
+    return any(value is False for value in preferences.values())
+
+
+def _playback_info_query_string(
+    request: Any,
+    *,
+    force_direct: bool = True,
+) -> str:
+    """保留客户端能力参数；仅默认请求才向上游要求直放/直传。"""
+    pairs = _sanitized_query_pairs(request)
+    if not force_direct:
+        return urlencode(pairs, doseq=True)
+
     direct_keys = {"enabledirectplay", "enabledirectstream"}
     pairs = [
         (key, value)
-        for key, value in _sanitized_query_pairs(request)
+        for key, value in pairs
         if key.casefold() not in direct_keys
     ]
     pairs.extend((
@@ -2539,16 +2988,36 @@ def _media_proxy_binding(
     auth_scope: str = "",
 ) -> Any:
     """精确绑定直接返回；Item 级绑定必须先在单源 PlaybackInfo 中登记。"""
-    binding = database.get_media_proxy_binding(instance_id, item_id, source_id)
+    requested_source = str(source_id or "").strip()
+    normalized_requested_source = _normalized_media_identifier(requested_source)
+    binding = None
+    for item_variant in _media_identifier_variants(item_id):
+        for source_variant in _media_identifier_variants(requested_source):
+            candidate = database.get_media_proxy_binding(
+                instance_id, item_variant, source_variant
+            )
+            if not candidate:
+                continue
+            bound_source = str(
+                _binding_value(candidate, "media_source_id") or ""
+            ).strip()
+            if (
+                bound_source
+                and normalized_requested_source
+                and _normalized_media_identifier(bound_source)
+                != normalized_requested_source
+            ):
+                continue
+            binding = candidate
+            break
+        if binding:
+            break
     if not binding:
         return None
     if str(_binding_value(binding, "source_type") or "").strip().lower() != "guangya":
         return None
-    requested_source = str(source_id or "").strip()
     bound_source = str(_binding_value(binding, "media_source_id") or "").strip()
     if bound_source:
-        if requested_source and bound_source != requested_source:
-            return None
         return binding
     if allow_item_level:
         return binding
@@ -2562,6 +3031,17 @@ def _media_proxy_binding(
     ) else None
 
 
+def _native_stream_container(source: dict[str, Any]) -> str:
+    """优先使用上游 Container，缺失时从原始媒体 Path 安全推断扩展名。"""
+    declared = str(source.get("Container") or "").strip().casefold().split(",", 1)[0]
+    if re.fullmatch(r"[a-z0-9]{1,12}", declared):
+        return declared
+    path = urlsplit(str(source.get("Path") or "")).path
+    filename = path.rsplit("/", 1)[-1]
+    suffix = filename.rsplit(".", 1)[-1].casefold() if "." in filename else ""
+    return suffix if re.fullmatch(r"[a-z0-9]{1,12}", suffix) else ""
+
+
 def rewrite_playback_info(
     payload: Any,
     instance_id: int,
@@ -2572,6 +3052,9 @@ def rewrite_playback_info(
     auth_scope: str = "",
     additional_auth_scopes: tuple[str, ...] = (),
     playback_session_token: str = "",
+    native_client_mode: str = "",
+    client_base_url: str = "",
+    browser_direct_redirect_signatures: set[str] | None = None,
 ) -> tuple[Any, bool]:
     if not isinstance(payload, dict):
         return payload, False
@@ -2588,12 +3071,44 @@ def rewrite_playback_info(
     )
     changed = False
     allow_item_level = len(media_sources) == 1
+    source_id_counts: dict[str, int] = {}
+    for candidate in media_sources:
+        if not isinstance(candidate, dict):
+            continue
+        normalized_source_id = _normalized_media_identifier(
+            str(candidate.get("Id") or "")
+        )
+        source_id_counts[normalized_source_id] = (
+            source_id_counts.get(normalized_source_id, 0) + 1
+        )
     for source in media_sources:
         if not isinstance(source, dict):
             continue
         source_id = str(source.get("Id") or "")
+        normalized_source_id = _normalized_media_identifier(source_id)
+        browser_source_identity_unique = bool(
+            allow_item_level
+            or (
+                normalized_source_id
+                and source_id_counts.get(normalized_source_id, 0) == 1
+            )
+        )
+        native_stream_container = (
+            _native_stream_container(source)
+            if native_client_mode == "jellyfin_android"
+            else ""
+        )
+        if native_stream_container:
+            # Android 2.7 的 DirectStream 回退会 requireNotNull(Container)；即使
+            # 上游遗漏字段，也应把从原始 Path 安全推断的容器回填到响应。
+            source["Container"] = native_stream_container
         source_signature = _playback_source_signature(
             instance_id, item_id, source_id, playback_session_token
+        )
+        emitted_source_signature = source_signature
+        browser_direct_play_eligible = bool(
+            str(native_client_mode or "").strip().casefold() == "web"
+            and source.get("SupportsDirectPlay") is True
         )
         binding = _media_proxy_binding(
             instance_id,
@@ -2609,20 +3124,42 @@ def rewrite_playback_info(
                 route_prefix,
                 playback_session_token,
                 source_signature,
+                native_stream_container,
             )
             # 真实数据库绑定始终含 media_source_id；旧式无该字段的绑定对象保留旧 Path。
             if _binding_has_field(binding, "media_source_id"):
                 path = direct_url
             else:
+                emitted_source_signature = _playback_source_signature(
+                    instance_id, item_id, "", playback_session_token
+                )
                 path = _direct_stream_path(
                     item_id,
                     prefix=route_prefix,
                     playback_session_token=playback_session_token,
-                    playback_source_signature=_playback_source_signature(
-                        instance_id, item_id, "", playback_session_token
-                    ),
+                    playback_source_signature=emitted_source_signature,
+                    container=native_stream_container,
                 )
-            _mark_direct_source(source, path, direct_url)
+            client_path = _client_stream_url(
+                path, client_base_url, native_client_mode
+            )
+            client_direct_url = _client_stream_url(
+                direct_url, client_base_url, native_client_mode
+            )
+            _mark_direct_source(
+                source,
+                client_path,
+                client_direct_url,
+                native_client_mode=native_client_mode,
+            )
+            if (
+                browser_direct_play_eligible
+                and browser_source_identity_unique
+                and browser_direct_redirect_signatures is not None
+            ):
+                browser_direct_redirect_signatures.add(
+                    emitted_source_signature
+                )
             for grant_scope in grant_scopes:
                 if not str(_binding_value(binding, "media_source_id") or "").strip():
                     _item_level_binding_scopes.register(
@@ -2661,16 +3198,29 @@ def rewrite_playback_info(
                 source_type="dynamic",
                 file_id=file_id,
             )
+        direct_url = _direct_stream_path(
+            item_id,
+            source_id,
+            route_prefix,
+            playback_session_token,
+            source_signature,
+            native_stream_container,
+        )
+        client_direct_url = _client_stream_url(
+            direct_url, client_base_url, native_client_mode
+        )
         _mark_direct_source(
             source,
-            _direct_stream_path(
-                item_id,
-                source_id,
-                route_prefix,
-                playback_session_token,
-                source_signature,
-            ),
+            client_direct_url,
+            client_direct_url,
+            native_client_mode=native_client_mode,
         )
+        if (
+            browser_direct_play_eligible
+            and browser_source_identity_unique
+            and browser_direct_redirect_signatures is not None
+        ):
+            browser_direct_redirect_signatures.add(source_signature)
         changed = True
     return payload, changed
 
@@ -2803,7 +3353,7 @@ def create_proxy_app(
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        """在进程级共享有界线程池执行 HEAD 探测的同步 SDK/DNS 调用。
+        """在进程级共享有界线程池执行 signed media 的同步 SDK/DNS 调用。
 
         请求被绝对 deadline 取消后，系统级 DNS/SDK 调用未必能立刻停止；
         worker 槽位必须等底层 Future 真正结束后再释放，避免跨 runtime
@@ -2890,6 +3440,9 @@ def create_proxy_app(
         capability_authorized = False
         capability_rejected = False
         playback_session = None
+        native_stream_resolution = (
+            "credential" if stream_match and auth_scope else "anonymous"
+        )
         if credential_conflict:
             # 冲突凭据必须在触碰有限容量的播放会话注册表前拒绝。
             pass
@@ -2915,7 +3468,10 @@ def create_proxy_app(
                     candidate_allowed
                     and candidate is not None
                     and not auth_scope
-                    and candidate.native_cross_protocol_relay
+                    and (
+                        candidate.native_cross_protocol_relay
+                        or candidate.native_signed_media_relay
+                    )
                 ):
                     native_client_fingerprint = _request_client_fingerprint(
                         request
@@ -2970,15 +3526,56 @@ def create_proxy_app(
             ):
                 auth_scope = session_scope
                 capability_authorized = True
+                native_stream_resolution = "device_scope"
             else:
+                native_stream_resolution = (
+                    "device_scope_rejected"
+                    if playback_session is not None
+                    else "device_scope_missing"
+                )
+                # Android 2.7 的 PlaybackInfo 请求并不保证携带 DeviceId，而视频
+                # URL 又可能补上 DeviceId。设备标识只是客户端元数据，不能让它
+                # 阻断已经由上游返回、同客户端地址、精确 item/source 绑定的
+                # PlaySessionId bearer 会话，因此设备 scope 未命中时统一回退到
+                # token scope。
+                token_scope = _upstream_playback_token_scope(
+                    instance_id, upstream_session_token
+                )
                 playback_session = _playback_sessions.resolve(
-                    "",
+                    token_scope,
                     instance_id,
                     token=upstream_session_token,
                     item_id=item_id,
                     source_id=source_id,
-                    create=True,
+                    create=False,
                 )
+                if (
+                    playback_session is not None
+                    and playback_session.native_cross_protocol_relay
+                    and playback_session.native_verified_auth_scope
+                    and native_client_fingerprint
+                    and hmac.compare_digest(
+                        playback_session.native_client_fingerprint,
+                        native_client_fingerprint,
+                    )
+                ):
+                    auth_scope = token_scope
+                    capability_authorized = True
+                    native_stream_resolution = "token_scope"
+                else:
+                    native_stream_resolution = (
+                        "token_scope_rejected"
+                        if playback_session is not None
+                        else "token_scope_missing"
+                    )
+                    playback_session = _playback_sessions.resolve(
+                        "",
+                        instance_id,
+                        token=upstream_session_token,
+                        item_id=item_id,
+                        source_id=source_id,
+                        create=True,
+                    )
         elif route_class == "guangya_direct" and not upstream_session_token:
             playback_session = _playback_sessions.begin(
                 auth_scope, instance_id, file_id=file_id, media_name=media_name
@@ -2998,17 +3595,25 @@ def create_proxy_app(
                 ),
             )
         request.state.proxy_auth_scope = auth_scope
+        request.state.proxy_native_stream_resolution = native_stream_resolution
         request.state.proxy_capability_authorized = capability_authorized
         request.state.proxy_source_ambiguous = source_ambiguous
         request.state.proxy_playback_session_token = ""
         request.state.proxy_playback_session_key = ""
         request.state.proxy_browser_relay = False
+        request.state.proxy_browser_direct_redirect = False
         request.state.proxy_native_cross_protocol_relay = False
+        request.state.proxy_native_signed_media_relay = False
         request.state.proxy_media_item_id = item_id
         request.state.proxy_media_source_id = source_id
         request.state.proxy_guangya_file_id = file_id
         request.state.proxy_media_name = media_name
         _apply_playback_session(request, playback_session)
+        if stream_match and not source_id:
+            # 请求未指定 MediaSourceId 时不得继承同一 PlaySession 上一次触碰的
+            # source。保持为空，让后续 mapping/grant 只在该 item 恰有唯一来源时
+            # 自动消歧，避免多源条目误复用旧来源直链。
+            request.state.proxy_media_source_id = ""
         request.state.proxy_route_class = route_class
         request.state.proxy_source = {
             "guangya_direct": "guangya",
@@ -3137,16 +3742,10 @@ def create_proxy_app(
         try:
             while True:
                 try:
-                    if request.method == "HEAD":
-                        pinned = await run_signed_media_probe_blocking(
-                            _pin_signed_media_target,
-                            current_url,
-                        )
-                    else:
-                        pinned = await asyncio.to_thread(
-                            _pin_signed_media_target,
-                            current_url,
-                        )
+                    pinned = await run_signed_media_probe_blocking(
+                        _pin_signed_media_target,
+                        current_url,
+                    )
                 except _SignedMediaProbeCapacityError:
                     await close_relay_client()
                     request.state.proxy_failure_stage = "signed_url_probe_capacity"
@@ -3167,6 +3766,7 @@ def create_proxy_app(
                 if relay_client is None:
                     relay_client = httpx.AsyncClient(
                         follow_redirects=False,
+                        trust_env=False,
                         timeout=_signed_media_timeout(request.method),
                         limits=httpx.Limits(
                             max_connections=2,
@@ -3367,28 +3967,63 @@ def create_proxy_app(
                     {"error": "无法获取光鸭直链"},
                     status_code=502,
                 )
-            if (
-                is_head_probe
-                or getattr(request.state, "proxy_browser_relay", False)
-                or _request_uses_browser_media_element(request)
-                or (
-                    getattr(
+            client_url = str(result.url).strip()
+            browser_direct_redirect = bool(
+                not is_head_probe
+                and getattr(
+                    request.state, "proxy_browser_direct_redirect", False
+                )
+            )
+            prefers_direct_redirect = _request_prefers_direct_signed_redirect(
+                request
+            )
+            verified_native_chain_relay = bool(
+                not prefers_direct_redirect
+                and getattr(
+                    request.state,
+                    "proxy_native_signed_media_relay",
+                    False,
+                )
+            )
+            native_cross_protocol_relay = bool(
+                not prefers_direct_redirect
+                and not browser_direct_redirect
+                and _request_is_cross_protocol_media_target(request, client_url)
+                and (
+                    _request_uses_exoplayer(request)
+                    or getattr(
                         request.state,
                         "proxy_native_cross_protocol_relay",
                         False,
                     )
-                    and _request_is_cross_protocol_media_target(
-                        request, result.url
-                    )
                 )
+            )
+            browser_relay_required = bool(
+                not browser_direct_redirect
+                and (
+                    getattr(request.state, "proxy_browser_relay", False)
+                    or _request_uses_browser_media_element(request)
+                )
+            )
+            if (
+                is_head_probe
+                or browser_relay_required
+                or verified_native_chain_relay
+                or native_cross_protocol_relay
             ):
-                # 原生客户端常在真正 GET 前先发 HEAD 探测。若把 HEAD 也
-                # 302 到 CDN，部分 Jellyfin/Emby 播放器不会正确跟随或重放
-                # 探测请求，最终表现为一直加载。这里只由 MediaFlux 代做无
-                # 正文探测；随后的原生 GET 仍返回 CDN 302，不承载视频流量。
-                return await _relay_signed_media(request, result.url)
+                # HLS.js、转码与不具备直放能力的浏览器仍需同源响应规避 CDN
+                # CORS；只有 PlaybackInfo 已由 Jellyfin 判定 SupportsDirectPlay
+                # 的具体 source，才允许携带 capability 的媒体 GET 返回真 302。
+                # Media3/ExoPlayer 的跨协议链路继续按原有兼容策略 relay。
+                if verified_native_chain_relay:
+                    request.state.proxy_action = "guangya_relay_native_chain"
+                elif native_cross_protocol_relay:
+                    request.state.proxy_action = "guangya_relay_cross_protocol"
+                return await _relay_signed_media(request, client_url)
+            if browser_direct_redirect:
+                request.state.proxy_action = "guangya_302_web_direct"
             return RedirectResponse(
-                result.url,
+                client_url,
                 status_code=302,
                 headers={
                     "Cache-Control": "private, no-store, no-cache, max-age=0",
@@ -3586,6 +4221,20 @@ def create_proxy_app(
         if not instance or not int(instance["enabled"] or 0):
             return JSONResponse({"error": "媒体反代实例已停用"}, status_code=503)
 
+        if _request_uses_exoplayer(request):
+            logger.info(
+                "media_proxy_native_request_diag instance=%s client=%s method=%s "
+                "path=%s host=%s media_source=%s play_session=%s auth=%s",
+                instance_id,
+                _request_client_name(request) or "exoplayer",
+                request.method,
+                request.url.path,
+                str(request.headers.get("host") or ""),
+                int(bool(_request_query_value(request, "MediaSourceId"))),
+                int(bool(_request_query_value(request, "PlaySessionId"))),
+                int(bool(_request_auth_credential(request))),
+            )
+
         credential = _request_auth_credential(request)
         auth_scope = (
             getattr(request.state, "proxy_auth_scope", "")
@@ -3619,12 +4268,41 @@ def create_proxy_app(
                         request,
                         str(binding["guangya_file_id"] or ""),
                     )
+            dynamic_file_id = ""
+            dynamic_allowed = False
             if not binding_allowed:
-                dynamic_file_id = _dynamic_guangya_mappings.get(instance_id, item_id, source_id)
-                if dynamic_file_id and _playback_grants.matches(
-                    auth_scope, instance_id, item_id, source_id, file_id=dynamic_file_id
-                ):
+                dynamic_file_id = _dynamic_guangya_mappings.get(
+                    instance_id, item_id, source_id
+                ) or ""
+                dynamic_allowed = bool(
+                    dynamic_file_id
+                    and _playback_grants.matches(
+                        auth_scope,
+                        instance_id,
+                        item_id,
+                        source_id,
+                        file_id=dynamic_file_id,
+                    )
+                )
+                if dynamic_allowed:
                     return await guangya_redirect(instance, request, dynamic_file_id)
+            logger.info(
+                "media_proxy_stream_fallback_diag instance=%s item=%s "
+                "source=%s auth=%s play_session=%s device=%s capability=%s "
+                "resolution=%s binding=%s dynamic=%s grant=%s query_keys=%s",
+                instance_id,
+                _normalized_media_identifier(item_id),
+                int(bool(source_id)),
+                int(bool(auth_scope)),
+                int(bool(_request_query_value(request, "PlaySessionId"))),
+                int(bool(_request_device_id(request))),
+                int(bool(_request_query_value(request, _PLAYBACK_SESSION_QUERY_KEY))),
+                getattr(request.state, "proxy_native_stream_resolution", "unknown"),
+                int(bool(binding)),
+                int(bool(dynamic_file_id)),
+                int(bool(dynamic_allowed)),
+                ",".join(sorted({str(key).lower() for key in request.query_params.keys()})),
+            )
 
         try:
             pinned = await asyncio.to_thread(
@@ -3637,18 +4315,33 @@ def create_proxy_app(
             return JSONResponse({"error": str(exc)}, status_code=502)
         target = pinned.connect_url
         playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
-        sanitized_query = (
-            _playback_info_query_string(request)
-            if playback_match
-            else _sanitized_query_string(request)
-        )
-        if sanitized_query:
-            target = f"{target}?{sanitized_query}"
         try:
             body = await _read_proxy_request_body(request)
         except ProxyRequestBodyTooLarge:
             request.state.proxy_failure_stage = "request_body"
             return JSONResponse({"error": "请求体过大"}, status_code=413)
+        playback_request_payload = (
+            _playback_info_request_payload(body) if playback_match else {}
+        )
+        direct_fallback_requested = bool(
+            playback_match
+            and _playback_info_direct_fallback_requested(
+                request, playback_request_payload
+            )
+        )
+        sanitized_query = (
+            _playback_info_query_string(
+                request,
+                force_direct=not direct_fallback_requested,
+            )
+            if playback_match
+            else _upstream_query_string(
+                request,
+                str(instance.get("server_type") or ""),
+            )
+        )
+        if sanitized_query:
+            target = f"{target}?{sanitized_query}"
         client = upstream_clients.get(pinned)
         upstream_headers = _upstream_request_headers(
             request,
@@ -3710,47 +4403,83 @@ def create_proxy_app(
             media_name = _playback_media_name(payload)
             android_device_id = _request_device_id(request)
             native_client_fingerprint = _request_client_fingerprint(request)
-            native_android_candidate = bool(
-                auth_scope
+            native_mode = _native_playback_rewrite_mode(
+                request,
+                playback_request_payload,
+            )
+            native_capability_requires_verification = native_mode in {
+                "jellyfin_android",
+                "findroid",
+            }
+            verified_native_candidate = bool(
+                native_capability_requires_verification
+                and not direct_fallback_requested
+                and auth_scope
                 and payload_session_token
-                and android_device_id
                 and native_client_fingerprint
-                and _request_is_jellyfin_android_client(request)
             )
             # PlaybackInfo 能返回 200 不等于请求携带的 token 已通过用户鉴权。
-            # 只有显式向上游验证成功，才给 Android ExoPlayer 签发可在后续
-            # 无 token stream 请求中恢复的短时会话；额外鉴权使用进程级非阻塞
-            # 容量限制，避免异常 PlaybackInfo 请求无限放大上游连接压力。
-            native_android_session = False
-            if native_android_candidate:
+            # 只有显式向上游验证成功，才登记 Android 后续无 token stream 请求
+            # 可用的短时、会话级、精确 item/source 授权域。Findroid 直接使用
+            # PlaybackInfo Path 中不可预测的 capability，不需要按地址降级授权。
+            verified_native_client = False
+            if verified_native_candidate:
                 if not _native_android_auth_capacity.acquire(blocking=False):
                     request.state.proxy_failure_stage = "client_auth_capacity"
                     return JSONResponse(
-                        {"error": "Android 播放鉴权繁忙，请稍后重试"},
+                        {"error": "原生客户端播放鉴权繁忙，请稍后重试"},
                         status_code=503,
                     )
                 try:
-                    native_android_session = await _client_is_authorized(
+                    verified_native_client = await _client_is_authorized(
                         instance, request
                     )
                 finally:
                     _native_android_auth_capacity.release()
+            native_android_session = bool(
+                verified_native_client
+                and native_mode == "jellyfin_android"
+                and payload_session_token
+            )
+            # Findroid 的 HTTP Path 由独立 DataSource 请求消费，且协议升级可能
+            # 发生在 signed URL 的第二跳。验证成功后只对 Findroid 标记完整链 relay，
+            # 避免改变已验证可用的 Jellyfin Android 同协议 302 行为。
+            findroid_signed_media_relay = bool(
+                verified_native_client
+                and native_mode == "findroid"
+                and payload_session_token
+            )
             session_scope = (
                 _upstream_playback_session_scope(
                     instance_id,
                     payload_session_token,
                     android_device_id,
                 )
-                if native_android_session
+                if native_android_session and android_device_id
                 else ""
             )
-            rewrite_scope = auth_scope
-            additional_scopes = (
-                (session_scope,)
-                if session_scope and session_scope != rewrite_scope
-                else ()
+            token_scope = (
+                _upstream_playback_token_scope(
+                    instance_id, payload_session_token
+                )
+                if native_android_session and payload_session_token
+                else ""
             )
-            if rewrite_scope:
+            rewrite_scope = (
+                auth_scope
+                if not native_capability_requires_verification
+                or verified_native_client
+                else ""
+            )
+            additional_scopes = tuple(
+                dict.fromkeys(
+                    scope
+                    for scope in (session_scope, token_scope)
+                    if scope and scope != rewrite_scope
+                )
+            )
+            browser_direct_redirect_signatures: set[str] = set()
+            if rewrite_scope and not direct_fallback_requested:
                 capability_token = secrets.token_urlsafe(24)
                 payload, changed = rewrite_playback_info(
                     payload,
@@ -3760,10 +4489,28 @@ def create_proxy_app(
                     auth_scope=rewrite_scope,
                     additional_auth_scopes=additional_scopes,
                     playback_session_token=capability_token,
+                    native_client_mode=native_mode,
+                    client_base_url=str(request.base_url).rstrip("/"),
+                    browser_direct_redirect_signatures=(
+                        browser_direct_redirect_signatures
+                    ),
                 )
             else:
                 capability_token = ""
                 changed = False
+            if _request_uses_exoplayer(request):
+                logger.info(
+                    "media_proxy_native_playback_diag instance=%s client=%s "
+                    "summary=%s",
+                    instance_id,
+                    _request_client_name(request) or "unknown",
+                    _native_playback_diagnostic_summary(
+                        playback_request_payload,
+                        payload,
+                        item_id=playback_match.group(1),
+                        changed=changed,
+                    ),
+                )
             if changed:
                 playback_session = _playback_sessions.finalize_capability(
                     rewrite_scope,
@@ -3772,20 +4519,32 @@ def create_proxy_app(
                     item_id=playback_match.group(1),
                     media_name=media_name,
                     upstream_session_token=response_session_token,
-                    browser_relay=_request_is_web_client(request),
+                    browser_relay=(
+                        native_mode == "web" or _request_is_web_client(request)
+                    ),
+                    browser_direct_redirect_signatures=tuple(
+                        sorted(browser_direct_redirect_signatures)
+                    ),
                     native_cross_protocol_relay=native_android_session,
+                    native_signed_media_relay=findroid_signed_media_relay,
                     native_client_fingerprint=(
                         native_client_fingerprint
-                        if native_android_session
+                        if native_android_session or findroid_signed_media_relay
                         else ""
                     ),
                     native_verified_auth_scope=(
-                        auth_scope if native_android_session else ""
+                        auth_scope
+                        if native_android_session or findroid_signed_media_relay
+                        else ""
                     ),
                 )
-                if session_scope and session_scope != rewrite_scope:
+                for native_session_scope in dict.fromkeys(
+                    scope
+                    for scope in (session_scope, token_scope)
+                    if scope and scope != rewrite_scope
+                ):
                     _playback_sessions.begin(
-                        session_scope,
+                        native_session_scope,
                         instance_id,
                         token=response_session_token,
                         item_id=playback_match.group(1),
