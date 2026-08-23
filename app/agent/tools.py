@@ -89,20 +89,26 @@ from app.agent.media_subscription_actions import (
     create_media_subscription_confirmed,
     delete_media_subscription,
     delete_media_subscription_confirmed,
+    get_media_subscription_policy,
     get_media_subscription_summary,
     inspect_media_subscription_updates,
     list_media_subscription_summaries,
     media_subscription_create_arguments,
     media_subscription_delete_arguments,
     media_subscription_enabled_arguments,
+    media_subscription_policy_arguments,
+    media_subscription_policy_update_arguments,
     media_subscription_summaries_arguments,
     media_subscription_summary_arguments,
     media_subscription_updates_arguments,
     prepare_create_media_subscription,
     prepare_delete_media_subscription,
     prepare_set_media_subscription_enabled,
+    prepare_set_media_subscription_policy,
     set_media_subscription_enabled,
     set_media_subscription_enabled_confirmed,
+    set_media_subscription_policy,
+    set_media_subscription_policy_confirmed,
 )
 from app.agent.rss_retry_actions import (
     clear_confirmation_state as clear_rss_retry_confirmation_state,
@@ -257,11 +263,15 @@ from app.agent.indexer_readiness_actions import (
 )
 from app.agent.indexer_actions import (
     preview_submit_resource,
+    preview_submit_resource_batch,
     search_arguments as indexer_search_arguments,
     search_resources,
     submit_arguments as indexer_submit_arguments,
+    submit_batch_arguments as indexer_submit_batch_arguments,
+    submit_batch_confirmation_context,
     submit_confirmation_context,
     submit_resource,
+    submit_resource_batch,
 )
 from app.agent.local_media_actions import (
     diagnose_local_media,
@@ -1320,6 +1330,57 @@ def build_tool_registry() -> ToolRegistry:
         llm_read=True,
     ))
     registry.register(ToolSpec(
+        name="media.get_subscription_policy",
+        description="按精确订阅编号读取追更范围、动作模式、下载目标和检查周期；不返回站点明细或凭据。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["subscription_id"],
+            "properties": {"subscription_id": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        handler=get_media_subscription_policy,
+        validator=media_subscription_policy_arguments,
+        llm_read=True,
+        llm_examples=(
+            "查看媒体订阅 1 的追更策略",
+            "订阅 1 多久检查一次，下载到哪里",
+        ),
+    ))
+    registry.register(ToolSpec(
+        name="media.set_subscription_policy",
+        description="预检并在用户确认后修改一个媒体追更订阅的追更范围、动作模式、下载目标或检查周期；不会立即检查或下载。",
+        risk=RiskLevel.DANGER,
+        parameters={
+            "type": "object",
+            "required": ["subscription_id"],
+            "properties": {
+                "subscription_id": {"type": "integer", "minimum": 1},
+                "monitor_mode": {"type": "string", "enum": ["missing", "future", "selected"]},
+                "seasons": {
+                    "type": "array", "maxItems": 20,
+                    "items": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "include_specials": {"type": "boolean"},
+                "action": {"type": "string", "enum": ["notify", "confirm", "auto"]},
+                "download_target": {"type": "string", "enum": ["qb", "guangya", "both"]},
+                "check_interval_minutes": {"type": "integer", "minimum": 5, "maximum": 10080},
+            },
+            "additionalProperties": False,
+        },
+        handler=set_media_subscription_policy,
+        validator=media_subscription_policy_update_arguments,
+        requires_confirmation=True,
+        confirmed_handler=set_media_subscription_policy_confirmed,
+        confirmation_preparer=prepare_set_media_subscription_policy,
+        llm_confirmation=True,
+        llm_examples=(
+            "把媒体订阅 1 的下载目标改为两边",
+            "媒体订阅 1 每 2 小时检查一次",
+            "媒体订阅 1 改成只通知不要自动下载",
+        ),
+    ))
+    registry.register(ToolSpec(
         name="media.create_subscription",
         description="预检并在用户确认后，为一个精确影视条目创建媒体追更订阅；不会立即搜索或下载资源。",
         risk=RiskLevel.LOW_WRITE,
@@ -2212,6 +2273,30 @@ def build_tool_registry() -> ToolRegistry:
         requires_confirmation=True,
         preview_handler=preview_submit_resource,
         confirmation_context=submit_confirmation_context,
+    ))
+    registry.register(ToolSpec(
+        name="indexer.submit_resource_batch",
+        description="在用户一次确认后，把当前会话中 2 到 12 个已搜索资源逐项提交到同一下载目标；各项独立幂等并报告部分失败。",
+        risk=RiskLevel.DANGER,
+        parameters={
+            "type": "object",
+            "required": ["result_ids", "target"],
+            "properties": {
+                "result_ids": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 12,
+                    "items": {"type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$"},
+                },
+                "target": {"type": "string", "enum": ["qb", "guangya", "both"]},
+            },
+            "additionalProperties": False,
+        },
+        handler=submit_resource_batch,
+        validator=indexer_submit_batch_arguments,
+        requires_confirmation=True,
+        preview_handler=preview_submit_resource_batch,
+        confirmation_context=submit_batch_confirmation_context,
     ))
     registry.register(ToolSpec(
         name="workspace.briefing",

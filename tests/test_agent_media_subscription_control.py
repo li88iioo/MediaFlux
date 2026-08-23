@@ -13,6 +13,8 @@ from app.agent.media_subscription_actions import (
     media_subscription_create_arguments,
     media_subscription_delete_arguments,
     media_subscription_enabled_arguments,
+    media_subscription_policy_arguments,
+    media_subscription_policy_update_arguments,
     media_subscription_summaries_arguments,
     media_subscription_summary_arguments,
     media_subscription_updates_arguments,
@@ -26,6 +28,7 @@ from app.agent.orchestrator import (
     media_subscription_candidate_request,
     media_subscription_control_request,
     media_subscription_delete_request,
+    media_subscription_policy_request,
     media_subscription_summary_request,
     media_subscription_title_request,
 )
@@ -136,8 +139,244 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
                 (self.sid, "manual", revision, "running", stamp),
             )
 
+    def test_subscription_policy_read_and_confirmed_update(self) -> None:
+        service = get_agent_service()
+        read = service.invoke(
+            "media.get_subscription_policy",
+            {"subscription_id": self.sid},
+            owner="owner",
+        )
+        self.assertEqual(read["result"]["data"]["download_target"], "guangya")
+        self.assertEqual(read["result"]["data"]["action"], "confirm")
+        self.assertNotIn("private-site", repr(read))
+
+        with patch(
+            "app.agent.media_subscription_actions._reload_scheduler",
+            return_value=True,
+        ):
+            prepared = service.prepare(
+                "media.set_subscription_policy",
+                {
+                    "subscription_id": self.sid,
+                    "download_target": "both",
+                    "action": "notify",
+                    "check_interval_minutes": 120,
+                },
+                owner="owner",
+            )
+            self.assertEqual(
+                db.get_media_subscription(self.sid)["download_target"], "guangya"
+            )
+            confirmed = service.confirm(
+                prepared["confirmation"]["confirmation_id"], owner="owner"
+            )
+        self.assertEqual(confirmed["result"]["status"], "completed")
+        after = db.get_media_subscription(self.sid)
+        self.assertEqual(after["download_target"], "both")
+        self.assertEqual(after["action"], "notify")
+        self.assertEqual(after["check_interval_minutes"], 120)
+        with self.assertRaises(AgentToolError):
+            service.confirm(
+                prepared["confirmation"]["confirmation_id"], owner="owner"
+            )
+
+    def test_subscription_policy_enforces_effective_tv_season_invariant(self) -> None:
+        service = get_agent_service()
+        with self.assertRaises(AgentToolError):
+            service.prepare(
+                "media.set_subscription_policy",
+                {"subscription_id": self.sid, "monitor_mode": "selected"},
+                owner="owner",
+            )
+
+        db.update_media_subscription_config(
+            self.sid,
+            monitor_mode="selected",
+            seasons_json="[1]",
+        )
+        with self.assertRaises(AgentToolError):
+            service.prepare(
+                "media.set_subscription_policy",
+                {"subscription_id": self.sid, "seasons": []},
+                owner="owner",
+            )
+        unchanged = db.get_media_subscription(self.sid)
+        self.assertEqual(unchanged["monitor_mode"], "selected")
+        self.assertEqual(json.loads(unchanged["seasons_json"]), [1])
+
+        db.update_media_subscription_config(
+            self.sid,
+            monitor_mode="missing",
+            seasons_json="[2]",
+        )
+        prepared = service.prepare(
+            "media.set_subscription_policy",
+            {"subscription_id": self.sid, "monitor_mode": "selected"},
+            owner="owner",
+        )
+        self.assertEqual(
+            prepared["result"]["data"]["effective"]["seasons"], [2]
+        )
+        with patch(
+            "app.agent.media_subscription_actions._reload_scheduler",
+            return_value=True,
+        ):
+            confirmed = service.confirm(
+                prepared["confirmation"]["confirmation_id"], owner="owner"
+            )
+        self.assertEqual(confirmed["result"]["status"], "completed")
+        after = db.get_media_subscription(self.sid)
+        self.assertEqual(after["monitor_mode"], "selected")
+        self.assertEqual(json.loads(after["seasons_json"]), [2])
+
+    def test_subscription_policy_rejects_movie_season_fields_without_writes(self) -> None:
+        movie_id = db.add_media_subscription(
+            provider="tmdb",
+            external_id="99901",
+            tmdb_id="99901",
+            media_type="movie",
+            title="示例电影",
+            action="confirm",
+            download_target="guangya",
+            enabled=True,
+        )
+        service = get_agent_service()
+        before = int(db.get_media_subscription(movie_id)["revision"])
+        for delta in (
+            {"monitor_mode": "selected"},
+            {"seasons": [1]},
+            {"include_specials": True},
+        ):
+            with self.subTest(delta=delta), self.assertRaises(AgentToolError):
+                service.prepare(
+                    "media.set_subscription_policy",
+                    {"subscription_id": movie_id, **delta},
+                    owner="owner",
+                )
+        after = db.get_media_subscription(movie_id)
+        self.assertEqual(int(after["revision"]), before)
+        self.assertEqual(json.loads(after["seasons_json"]), [])
+        self.assertFalse(bool(after["include_specials"]))
+
+    def test_subscription_policy_reports_irreversible_inflight_auto_dispatch(self) -> None:
+        db.update_media_subscription_config(self.sid, action="auto")
+        self._seed_inflight_state()
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE media_download_admissions SET status='dispatching' "
+                "WHERE subscription_id=?",
+                (self.sid,),
+            )
+        service = get_agent_service()
+        prepared = service.prepare(
+            "media.set_subscription_policy",
+            {"subscription_id": self.sid, "action": "notify"},
+            owner="owner",
+        )
+        preview = prepared["result"]["data"]
+        self.assertEqual(preview["in_flight_dispatches_at_preflight"], 1)
+        self.assertTrue(any("无法" in item for item in preview["effects"]))
+        contract = prepared["confirmation"]["contract"]
+        self.assertIn("无需再次确认", contract["impact"])
+        self.assertIn("提交阶段", contract["reversibility"])
+        with patch(
+            "app.agent.media_subscription_actions._reload_scheduler",
+            return_value=True,
+        ):
+            confirmed = service.confirm(
+                prepared["confirmation"]["confirmation_id"], owner="owner"
+            )
+        self.assertEqual(confirmed["result"]["data"]["in_flight_dispatches"], 1)
+        self.assertEqual(db.get_media_subscription(self.sid)["action"], "notify")
+
+    def test_subscription_policy_stales_when_admission_enters_dispatching(self) -> None:
+        self._seed_inflight_state()
+        row = db.get_media_subscription(self.sid)
+        with db.get_conn() as conn:
+            admission = conn.execute(
+                "SELECT id FROM media_download_admissions "
+                "WHERE subscription_id=? AND status='claimed'",
+                (self.sid,),
+            ).fetchone()
+        self.assertIsNotNone(admission)
+
+        service = get_agent_service()
+        prepared = service.prepare(
+            "media.set_subscription_policy",
+            {"subscription_id": self.sid, "action": "notify"},
+            owner="owner",
+        )
+        self.assertEqual(
+            prepared["result"]["data"]["in_flight_dispatches_at_preflight"],
+            0,
+        )
+        self.assertEqual(
+            prepared["result"]["data"]["pending_admissions_at_preflight"],
+            1,
+        )
+        self.assertTrue(db.begin_media_download_dispatch(
+            int(admission["id"]),
+            subscription_id=self.sid,
+            subscription_revision=int(row["revision"]),
+        ))
+
+        confirmed = service.confirm(
+            prepared["confirmation"]["confirmation_id"], owner="owner"
+        )
+        self.assertEqual(confirmed["result"]["status"], "conflict")
+        unchanged = db.get_media_subscription(self.sid)
+        self.assertEqual(unchanged["action"], "confirm")
+        self.assertEqual(int(unchanged["revision"]), int(row["revision"]))
+
+    def test_subscription_policy_stale_snapshot_fails_closed(self) -> None:
+        service = get_agent_service()
+        prepared = service.prepare(
+            "media.set_subscription_policy",
+            {"subscription_id": self.sid, "download_target": "qb"},
+            owner="owner",
+        )
+        db.update_media_subscription_config(self.sid, action="notify")
+        confirmed = service.confirm(
+            prepared["confirmation"]["confirmation_id"], owner="owner"
+        )
+        self.assertEqual(confirmed["result"]["status"], "conflict")
+        self.assertEqual(
+            db.get_media_subscription(self.sid)["download_target"], "guangya"
+        )
+
     def test_validators_registry_and_natural_language_are_strict(self) -> None:
         self.assertEqual(media_subscription_summaries_arguments({}), {})
+        self.assertEqual(
+            media_subscription_policy_arguments({"subscription_id": self.sid}),
+            {"subscription_id": self.sid},
+        )
+        self.assertEqual(
+            media_subscription_policy_update_arguments({
+                "subscription_id": self.sid,
+                "download_target": "both",
+                "check_interval_minutes": 120,
+            }),
+            {
+                "subscription_id": self.sid,
+                "download_target": "both",
+                "check_interval_minutes": 120,
+            },
+        )
+        self.assertEqual(
+            media_subscription_policy_request(
+                f"查看媒体订阅 {self.sid} 的策略"
+            ),
+            ("media.get_subscription_policy", {"subscription_id": self.sid}),
+        )
+        self.assertEqual(
+            media_subscription_policy_request(
+                f"把媒体订阅 {self.sid} 的下载目标改为两边"
+            ),
+            (
+                "media.set_subscription_policy",
+                {"subscription_id": self.sid, "download_target": "both"},
+            ),
+        )
         self.assertEqual(media_subscription_updates_arguments({}), {})
         with self.assertRaises(AgentToolError):
             media_subscription_updates_arguments({"refresh": True})
@@ -202,6 +441,9 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(tools["media.delete_subscription"]["risk"], "danger")
         self.assertTrue(tools["media.delete_subscription"]["requires_confirmation"])
         self.assertEqual(tools["media.set_subscription_enabled"]["risk"], "low_write")
+        self.assertEqual(tools["media.get_subscription_policy"]["risk"], "read")
+        self.assertEqual(tools["media.set_subscription_policy"]["risk"], "danger")
+        self.assertTrue(tools["media.set_subscription_policy"]["requires_confirmation"])
         self.assertTrue(tools["media.set_subscription_enabled"]["requires_confirmation"])
 
         self.assertTrue(is_media_subscription_summaries_message("列出全部媒体追更订阅"))

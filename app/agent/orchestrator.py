@@ -72,6 +72,7 @@ from app.agent.recent_download_submissions import (
     build_recent_download_status,
     explain_recent_download_status,
     parse_recent_download_verification_context,
+    sanitize_batch_submission_confirmation_result,
     sanitize_submission_confirmation_result,
 )
 from app.agent.episode_audit import invalidate_episode_audit_cache
@@ -1567,6 +1568,68 @@ def _has_media_subscription_scope(message: str) -> bool:
     return bool(re.search(_MEDIA_SUBSCRIPTION_SCOPE_PATTERN, message, re.IGNORECASE))
 
 
+def media_subscription_policy_request(
+    message: str,
+) -> tuple[str, dict[str, Any]] | None:
+    """解析常见追更策略查询与单次修改，复杂表达仍交给受控模型。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if "rss" in normalized or not any(token in normalized for token in (
+        "媒体订阅", "追更订阅", "媒体追更", "追番订阅", "追剧订阅",
+    )):
+        return None
+    matched = re.search(r"(?:订阅|追更)(?:编号)?\s*[#:]?\s*(\d{1,9})", normalized)
+    if not matched:
+        return None
+    subscription_id = int(matched.group(1))
+    if subscription_id <= 0:
+        return None
+    policy_scope = any(token in normalized for token in (
+        "策略", "规则", "下载目标", "多久", "间隔", "频率", "特殊篇",
+        "特别篇", "自动下载", "只通知", "每次确认", "追第", "每",
+    ))
+    if not policy_scope:
+        return None
+    write_scope = any(token in normalized for token in (
+        "修改", "改成", "改为", "设置", "设为", "调整", "切换", "开启", "关闭",
+    ))
+    if not write_scope:
+        return "media.get_subscription_policy", {"subscription_id": subscription_id}
+    arguments: dict[str, Any] = {"subscription_id": subscription_id}
+    if any(token in normalized for token in ("两边", "两个后端", "q b 和光鸭", "qb和光鸭")):
+        arguments["download_target"] = "both"
+    elif "光鸭" in normalized:
+        arguments["download_target"] = "guangya"
+    elif any(token in normalized for token in ("qb", "qbittorrent", "q b")):
+        arguments["download_target"] = "qb"
+    if any(token in normalized for token in ("只通知", "仅通知", "只提醒")):
+        arguments["action"] = "notify"
+    elif any(token in normalized for token in ("每次确认", "先确认", "确认后下载")):
+        arguments["action"] = "confirm"
+    elif any(token in normalized for token in ("自动下载", "自动提交")):
+        arguments["action"] = "auto"
+    interval = re.search(r"(\d{1,4})\s*(分钟|小时|天)", normalized)
+    if interval:
+        value = int(interval.group(1))
+        multiplier = {"分钟": 1, "小时": 60, "天": 1440}[interval.group(2)]
+        minutes = value * multiplier
+        if 5 <= minutes <= 10080:
+            arguments["check_interval_minutes"] = minutes
+    seasons = [int(value) for value in re.findall(r"第\s*(\d{1,3})\s*季", normalized)]
+    seasons = sorted({value for value in seasons if 1 <= value <= 100})
+    if seasons:
+        arguments["monitor_mode"] = "selected"
+        arguments["seasons"] = seasons
+    elif any(token in normalized for token in ("只追缺失", "缺失模式", "已有缺集")):
+        arguments["monitor_mode"] = "missing"
+    elif any(token in normalized for token in ("未来更新", "以后更新", "未来模式")):
+        arguments["monitor_mode"] = "future"
+    if any(token in normalized for token in ("包含特殊篇", "包含特别篇", "开启特殊篇")):
+        arguments["include_specials"] = True
+    elif any(token in normalized for token in ("不含特殊篇", "排除特殊篇", "关闭特殊篇")):
+        arguments["include_specials"] = False
+    return ("media.set_subscription_policy", arguments) if len(arguments) > 1 else None
+
+
 def media_subscription_summary_request(message: str) -> dict[str, int] | None:
     """解析单条媒体追更订阅的只读摘要请求。"""
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
@@ -3058,6 +3121,36 @@ def discovery_watchlist_summary_request(message: str) -> dict[str, Any] | None:
     return None
 
 
+def discovery_watchlist_subscription_request(
+    message: str,
+) -> dict[str, Any] | None:
+    """解析把一个精确探索收藏转为追更订阅的请求。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not any(scope in normalized for scope in (
+        *_DISCOVERY_WATCHLIST_SCOPES, "收藏",
+    )):
+        return None
+    if not any(token in normalized for token in (
+        "转为订阅", "转成订阅", "变成订阅", "加入追更",
+        "添加追更", "创建追更", "转为追更", "转成追更",
+    )):
+        return None
+    matched = re.search(
+        r"(?:探索收藏|影视收藏|发现收藏|收藏)(?:编号)?\s*([0-9]{1,9})(?:\s*号)?",
+        normalized,
+    )
+    if not matched:
+        return None
+    request: dict[str, Any] = {"watchlist_number": int(matched.group(1))}
+    season_match = re.search(r"第\s*([0-9]{1,3})\s*季", normalized)
+    if season_match:
+        season = int(season_match.group(1))
+        if not 1 <= season <= 100:
+            return None
+        request["season"] = season
+    return request
+
+
 def discovery_watchlist_remove_request(message: str) -> dict[str, Any] | None:
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
     if not any(scope in normalized for scope in _DISCOVERY_WATCHLIST_SCOPES):
@@ -3359,6 +3452,51 @@ def _recent_resource_target_followup_request(
     return {"position": position, "target": target}
 
 
+def recent_resource_batch_submit_request(
+    message: str, *, allow_implicit: bool = False
+) -> dict[str, Any] | None:
+    """解析最近候选的多选提交；只返回序号和统一目标。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if (
+        not normalized
+        or _is_recent_resource_question(normalized)
+        or any(token in normalized for token in _RECENT_RESOURCE_REJECT_TOKENS)
+    ):
+        return None
+    has_reference = any(token in normalized for token in _RECENT_RESOURCE_REFERENCES)
+    target, has_target = _recent_resource_target(normalized)
+    if not has_target or target not in {"qb", "guangya", "both"}:
+        return None
+    has_action = any(token in normalized for token in _RECENT_RESOURCE_ACTIONS) or any(
+        token in normalized for token in ("下到", "下去", "推送", "提交")
+    ) or has_target
+    if not has_action or (not allow_implicit and not has_reference and "刚才" not in normalized):
+        return None
+    if any(token in normalized for token in ("全部", "所有", "这些", "都下", "都推送")):
+        return {"all": True, "target": target}
+    front = re.search(r"前\s*([0-9]{1,2})\s*(?:个|项|条)", normalized)
+    if front:
+        count = int(front.group(1))
+        if 2 <= count <= 12:
+            return {"positions": list(range(1, count + 1)), "target": target}
+        return None
+    range_match = re.search(
+        r"第?\s*([0-9]{1,2})\s*(?:到|至|[-~～])\s*第?\s*([0-9]{1,2})\s*(?:个|项|条)?",
+        normalized,
+    )
+    if range_match:
+        start, end = int(range_match.group(1)), int(range_match.group(2))
+        if 1 <= start <= end <= 12 and end - start + 1 >= 2:
+            return {"positions": list(range(start, end + 1)), "target": target}
+        return None
+    positions: list[int] = []
+    for raw in re.findall(r"第\s*([0-9]{1,2})\s*(?:个|项|条|号)", normalized):
+        value = int(raw)
+        if 1 <= value <= 12 and value not in positions:
+            positions.append(value)
+    return {"positions": positions, "target": target} if len(positions) >= 2 else None
+
+
 def recent_resource_submit_request(
     message: str, *, allow_implicit: bool = False
 ) -> dict[str, Any] | None:
@@ -3406,6 +3544,9 @@ def _recent_resource_pre_model_submit_request(
     conversation_context: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """只抢占明确的最近候选提交续句，避免集数/序号误伤其他业务意图。"""
+    batch = recent_resource_batch_submit_request(message)
+    if batch is not None:
+        return batch
     explicit = recent_resource_submit_request(message)
     if explicit is not None:
         return explicit
@@ -5613,6 +5754,75 @@ class AgentOrchestrator:
             "library.search_missing_season_resources", arguments, owner=owner
         )
 
+    def _continue_recent_resource_batch_submit(
+        self, request: dict[str, Any], *, owner: str
+    ) -> dict[str, Any]:
+        if not owner:
+            return self._unsupported(
+                "批量资源提交需要在已登录会话中确认",
+                ["请重新登录后搜索资源，再明确选择多个候选和下载目标。"],
+            )
+        snapshot = self.recent_resource_store.get(owner=owner)
+        candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
+        if not isinstance(candidates, list) or len(candidates) < 2:
+            return self._response(
+                "indexer.submit_resource_batch",
+                {},
+                ToolResult(False, "precondition_failed", "当前会话没有可批量提交的资源候选",
+                    error="最近资源候选不存在、已过期或不足两项。"),
+                0,
+            )
+        if request.get("all"):
+            positions = list(range(1, min(len(candidates), 12) + 1))
+        else:
+            positions = request.get("positions")
+        if not isinstance(positions, list) or not 2 <= len(positions) <= 12:
+            return self._clarification_response(
+                "请一次选择 2 到 12 个明确候选。",
+                ["例如：把第 1、2 个到 qB。", "例如：把前 3 个到光鸭。"],
+            )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            or value < 1 or value > len(candidates)
+            for value in positions
+        ):
+            return self._clarification_response(
+                "选择的候选序号超出最近资源列表范围。",
+                [f"当前可选序号是 1 到 {min(len(candidates), 12)}。"],
+            )
+        target = request.get("target")
+        if target not in {"qb", "guangya", "both"}:
+            return self._clarification_response(
+                "批量资源要提交到哪里？请选择 qB、光鸭或两边。",
+                ["把第 1、2 个到 qB。", "把前 3 个到两边。"],
+            )
+        selected = [candidates[position - 1] for position in positions]
+        result_ids = [str(item.get("result_id") or "") for item in selected]
+        followup_items: list[dict[str, Any]] = []
+        for item in selected:
+            context: dict[str, Any] = {"result_id": str(item.get("result_id") or "")}
+            verification = item.get("_verification_context")
+            if isinstance(verification, dict):
+                context["verification"] = verification
+            followup_items.append(context)
+        try:
+            return self.prepare(
+                "indexer.submit_resource_batch",
+                {"result_ids": result_ids, "target": target},
+                owner=owner,
+                followup_context={"kind": "resource_batch", "items": followup_items},
+            )
+        except AgentToolError as exc:
+            if exc.code != "confirmation_unavailable":
+                raise
+            return self._response(
+                "indexer.submit_resource_batch",
+                {},
+                ToolResult(False, "precondition_failed", "最近资源列表已恢复，但部分下载句柄已经过期",
+                    error="请重新搜索资源后再批量提交。"),
+                0,
+            )
+
     def _continue_recent_resource_submit(
         self, request: dict[str, Any], *, owner: str
     ) -> dict[str, Any]:
@@ -5994,6 +6204,29 @@ class AgentOrchestrator:
         rate_identity: str = "",
         trusted_resource_owner_binding: bool = False,
     ) -> dict[str, Any]:
+        if tool_name == "indexer.submit_resource_batch":
+            result_ids = (
+                arguments.get("result_ids")
+                if isinstance(arguments, dict)
+                and isinstance(arguments.get("result_ids"), list)
+                else []
+            )
+            if not result_ids or any(
+                not isinstance(result_id, str)
+                or not (
+                    self.recent_resource_store.contains_result(
+                        owner=owner, result_id=result_id
+                    )
+                    or active_agent_state_owns_resource(
+                        owner=owner, result_id=result_id
+                    )
+                )
+                for result_id in result_ids
+            ):
+                raise AgentToolError(
+                    "批量资源不属于当前会话或候选已经过期，请重新搜索后再选择。",
+                    code="precondition_failed",
+                )
         if tool_name == "indexer.submit_resource":
             result_id = (
                 str(arguments.get("result_id") or "").strip()
@@ -6293,6 +6526,55 @@ class AgentOrchestrator:
                     confirmation_contract=ticket.confirmation_contract,
                 )
             raise
+        if ticket.tool_name == "indexer.submit_resource_batch":
+            raw_items = result.data.get("items") if isinstance(result.data, dict) else None
+            context_items = (
+                ticket.followup_context.get("items")
+                if ticket.followup_context.get("kind") == "resource_batch"
+                and isinstance(ticket.followup_context.get("items"), list)
+                else []
+            )
+            verification_by_result = {
+                str(item.get("result_id") or ""): item.get("verification")
+                for item in context_items
+                if isinstance(item, dict)
+            }
+            for raw in reversed(raw_items[:12]) if isinstance(raw_items, list) else []:
+                if not isinstance(raw, dict):
+                    continue
+                dispatch_status = str(raw.get("status") or "").strip().lower()
+                item_result = ToolResult(
+                    dispatch_status in {"submitted", "partial"},
+                    "accepted" if dispatch_status in {"submitted", "partial"} else (
+                        "conflict" if dispatch_status == "duplicate" else "unavailable"
+                    ),
+                    "下载任务已提交" if dispatch_status in {"submitted", "partial"} else "下载任务未提交",
+                    data=dict(raw),
+                )
+                verification_context = verification_by_result.get(
+                    str(raw.get("result_id") or "")
+                )
+                self.recent_download_store.capture(
+                    owner=owner,
+                    result=item_result,
+                    verification_context=(
+                        verification_context
+                        if isinstance(verification_context, dict)
+                        else None
+                    ),
+                )
+                if self.automatic_verification_enqueuer is not None:
+                    try:
+                        self.automatic_verification_enqueuer(
+                            item_result,
+                            verification_context if isinstance(verification_context, dict) else None,
+                            owner,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Agent 批量下载后自动复核排队失败 type=%s",
+                            type(exc).__name__,
+                        )
         if ticket.tool_name == "indexer.submit_resource":
             self.recent_download_store.capture(
                 owner=owner,
@@ -6324,6 +6606,8 @@ class AgentOrchestrator:
         public_result = (
             sanitize_submission_confirmation_result(result)
             if ticket.tool_name == "indexer.submit_resource"
+            else sanitize_batch_submission_confirmation_result(result)
+            if ticket.tool_name == "indexer.submit_resource_batch"
             else result
         )
         verification = (
@@ -6637,8 +6921,15 @@ class AgentOrchestrator:
             # 最近资源候选属于已经建立的强上下文。像“第 2 个到光鸭”或
             # “下载 34 集到 qB”必须先进入确认流程，不能再次交给模型猜测。
             if recent_resource_request is not None:
-                response = self._continue_recent_resource_submit(
-                    recent_resource_request, owner=owner
+                response = (
+                    self._continue_recent_resource_batch_submit(
+                        recent_resource_request, owner=owner
+                    )
+                    if "positions" in recent_resource_request
+                    or recent_resource_request.get("all")
+                    else self._continue_recent_resource_submit(
+                        recent_resource_request, owner=owner
+                    )
                 )
                 if not present:
                     return response
@@ -7070,6 +7361,42 @@ class AgentOrchestrator:
         conversation_context: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         """处理最近探索结果与探索收藏的确定性续句。"""
+        watchlist_subscription_request = discovery_watchlist_subscription_request(message)
+        if watchlist_subscription_request is not None:
+            if not owner:
+                return self._unsupported(
+                    "把探索收藏转为追更需要在已登录会话中确认",
+                    ["请登录后重新指定一个收藏编号。"],
+                )
+            watchlist_number = int(
+                watchlist_subscription_request["watchlist_number"]
+            )
+            # MediaFlux 是单管理员共享媒体工作区；owner 只隔离短期会话、
+            # 确认票据与防重放状态，收藏和媒体订阅本身均为工作区级数据。
+            row = db.get_media_watchlist_by_id(watchlist_number)
+            if row is None:
+                return self._clarification_response(
+                    f"没有找到编号 {watchlist_number} 的探索收藏。",
+                    ["列出探索收藏"],
+                )
+            media_type = str(row["media_type"] or "").strip().lower()
+            season = watchlist_subscription_request.get("season")
+            if season is not None and media_type != "tv":
+                return self._clarification_response(
+                    "电影收藏不能按季度创建追更。",
+                    [f"把收藏 {watchlist_number} 转为订阅"],
+                )
+            arguments = {
+                "provider": str(row["provider"] or ""),
+                "external_id": str(row["external_id"] or ""),
+                "media_type": media_type,
+            }
+            if isinstance(season, int):
+                arguments["season"] = season
+            return self.prepare(
+                "media.create_subscription", arguments, owner=owner
+            )
+
         snapshot = self.recent_discovery_store.get(owner=owner) if owner else None
         subscription_request = media_subscription_candidate_request(message)
         if subscription_request is not None:
@@ -7208,6 +7535,11 @@ class AgentOrchestrator:
         owner: str,
     ) -> dict[str, Any] | None:
         """处理最近资源选择、下载状态、异常解释与入库核验续句。"""
+        batch_request = recent_resource_batch_submit_request(message)
+        if batch_request is not None:
+            return self._continue_recent_resource_batch_submit(
+                batch_request, owner=owner
+            )
         recent_resource_request = recent_resource_submit_request(message)
         if recent_resource_request is not None:
             return self._continue_recent_resource_submit(
@@ -7405,6 +7737,18 @@ class AgentOrchestrator:
                 "请用书名号或引号提供一个完整任务名称；同名任务不会由 Agent 猜测选择。",
                 ["例如：暂停下载任务《Example.Show.S01E01》。"],
             )
+
+        media_policy_request = media_subscription_policy_request(message)
+        if media_policy_request is not None:
+            tool_name, arguments = media_policy_request
+            if tool_name == "media.get_subscription_policy":
+                return self._invoke_query_read(tool_name, arguments, owner=owner)
+            if not owner:
+                return self._unsupported(
+                    "修改媒体追更策略需要在已登录会话中确认",
+                    ["请登录后重新提交，并在预检后确认修改。"],
+                )
+            return self.prepare(tool_name, arguments, owner=owner)
 
         media_delete_request = media_subscription_delete_request(message)
         if media_delete_request is not None:
@@ -8391,6 +8735,13 @@ class AgentOrchestrator:
         # 所有明确的领域意图优先；仅在它们都未命中且候选仍有效时，
         # 才把“第 2 个到光鸭”解释为最近资源搜索的自然续句。
         if owner and self.recent_resource_store.get(owner=owner) is not None:
+            batch_request = recent_resource_batch_submit_request(
+                message, allow_implicit=True
+            )
+            if batch_request is not None:
+                return self._continue_recent_resource_batch_submit(
+                    batch_request, owner=owner
+                )
             recent_resource_request = recent_resource_submit_request(
                 message, allow_implicit=True
             )

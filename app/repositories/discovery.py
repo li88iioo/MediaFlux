@@ -148,6 +148,7 @@ def get_media_watchlist(
 
 
 def get_media_watchlist_by_id(watchlist_id: int) -> sqlite3.Row | None:
+    """读取单管理员媒体工作区的共享收藏；会话 owner 不是权限主体。"""
     with _database().get_conn() as conn:
         return conn.execute(
             "SELECT * FROM media_watchlist WHERE id=?",
@@ -165,6 +166,7 @@ def delete_media_watchlist(provider: str, external_id: str, media_type: str) -> 
 
 
 def list_media_watchlist(limit: int = 500) -> list[sqlite3.Row]:
+    """列出单管理员媒体工作区的共享收藏。"""
     with _database().get_conn() as conn:
         return conn.execute(
             "SELECT * FROM media_watchlist ORDER BY id DESC LIMIT ?",

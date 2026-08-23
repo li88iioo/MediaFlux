@@ -514,6 +514,60 @@ def sanitize_submission_confirmation_result(result: ToolResult) -> ToolResult:
     )
 
 
+def sanitize_batch_submission_confirmation_result(result: ToolResult) -> ToolResult:
+    """批量提交结果只公开逐项位置与固定状态，不公开句柄或任务 ID。"""
+    data = result.data if isinstance(result.data, dict) else {}
+    raw_items = data.get("items")
+    items: list[dict[str, Any]] = []
+    if isinstance(raw_items, list):
+        for position, raw in enumerate(raw_items[:12], start=1):
+            if not isinstance(raw, dict):
+                continue
+            status = str(raw.get("status") or "failed").strip().lower()
+            if status not in _ALLOWED_DISPATCH_STATUSES:
+                status = "failed"
+            items.append({
+                "position": position,
+                "status": status,
+                "created": bool(raw.get("created")),
+                "duplicate": bool(raw.get("duplicate")),
+                "succeeded": list(_safe_backend_tuple(raw.get("succeeded"))),
+                "failed": list(_safe_backend_tuple(raw.get("failed"))),
+            })
+    succeeded = sum(item["status"] in {"submitted", "partial"} for item in items)
+    duplicate = sum(item["status"] == "duplicate" for item in items)
+    failed = len(items) - succeeded - duplicate
+    target = str(data.get("target") or "").strip().lower()
+    if succeeded == len(items) and items:
+        status, summary, ok = "accepted", f"{succeeded} 个下载任务已提交", True
+    elif succeeded:
+        status, summary, ok = (
+            "partial",
+            f"批量提交完成：{succeeded} 个已受理，{len(items) - succeeded} 个未受理",
+            True,
+        )
+    elif duplicate and not failed:
+        status, summary, ok = "conflict", "所选资源均已提交或正在处理中", False
+    else:
+        status, summary, ok = "unavailable", "批量资源提交未成功", False
+    return ToolResult(
+        ok,
+        status,
+        summary,
+        data={
+            "target": target if target in _ALLOWED_TARGETS else "unknown",
+            "total": len(items),
+            "succeeded": succeeded,
+            "failed": failed,
+            "duplicate": duplicate,
+            "items": items,
+        },
+        evidence=[_evidence("服务器已逐项处理批量资源；公开响应不含资源句柄、任务 ID 或路径。")],
+        suggestions=["可询问：刚才批量下载到哪了。"] if succeeded else [],
+        error="部分或全部资源未被下载后端接受。" if succeeded < len(items) else "",
+    )
+
+
 def build_recent_download_status(
     record: RecentDownloadSubmission,
     *,
@@ -571,6 +625,15 @@ def build_recent_download_status(
         },
         "backends": backends,
     }
+    if record.verification is not None:
+        data.update({
+            "title": record.verification.title,
+            "tmdb_id": record.verification.tmdb_id,
+            "media_type": "tv",
+            "season": record.verification.season,
+            "episode": record.verification.episode,
+        })
+
     for key in ("updated_at", "completed_at"):
         value = _safe_timestamp(row[key])
         if value:

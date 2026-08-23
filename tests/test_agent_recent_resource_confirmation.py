@@ -15,17 +15,19 @@ from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
     is_recent_resource_submit_message,
+    recent_resource_batch_submit_request,
     recent_resource_submit_request,
 )
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     public_candidate_projection,
+    validate_safe_resource_snapshot,
 )
 from app.agent.recent_download_submissions import (
     enqueue_recent_download_library_verification,
 )
-from app.agent.registry import ToolRegistry
+from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.service import reset_agent_service_for_tests
 from app.agent.state_commit import (
     AgentStateCommitBuffer,
@@ -212,6 +214,9 @@ class RecentResourceCandidateStoreTests(unittest.TestCase):
         candidate = _candidate("generic-resource-0001", title="The.Show.1080p")
         candidate.update({
             "size_text": "1.2 GiB",
+            "media_title": "The Show",
+            "episode_label": "S02E03",
+            "subscription_number": 7,
             "magnet": "magnet:?xt=must-not-leak",
             "private_url": "https://secret.example/item",
         })
@@ -221,11 +226,67 @@ class RecentResourceCandidateStoreTests(unittest.TestCase):
         self.assertEqual(snapshot["candidates"][0]["position"], 1)
         self.assertEqual(snapshot["candidates"][0]["title"], "The.Show.1080p")
         self.assertEqual(snapshot["candidates"][0]["size_text"], "1.2 GiB")
+        self.assertEqual(snapshot["candidates"][0]["media_title"], "The Show")
+        self.assertEqual(snapshot["candidates"][0]["episode_label"], "S02E03")
+        self.assertEqual(snapshot["candidates"][0]["subscription_number"], 7)
         self.assertNotIn("magnet:", repr(snapshot))
         self.assertNotIn("secret.example", repr(snapshot))
 
+    def test_generic_candidate_snapshot_supports_current_and_legacy_persistence(self):
+        store = RecentResourceCandidateStore()
+        store.capture(
+            owner="session-a",
+            result=_generic_result(
+                _candidate("generic-resource-0001", title="The.Show.1080p")
+            ),
+        )
+        snapshot = store.get(owner="session-a")
+        self.assertEqual(snapshot["candidates"][0]["download_kinds"], ["magnet"])
+        self.assertEqual(validate_safe_resource_snapshot(snapshot), snapshot)
+
+        legacy = {
+            "search_status": snapshot["search_status"],
+            "candidates": [{
+                key: value
+                for key, value in snapshot["candidates"][0].items()
+                if key not in {
+                    "download_kinds", "media_title", "episode_label",
+                    "subscription_number",
+                }
+            }],
+        }
+        validated_legacy = validate_safe_resource_snapshot(legacy)
+        self.assertIsNotNone(validated_legacy)
+        self.assertEqual(
+            validated_legacy["candidates"][0]["result_id"],
+            "generic-resource-0001",
+        )
+
+        missing_capability = {
+            **snapshot,
+            "candidates": [{
+                key: value
+                for key, value in snapshot["candidates"][0].items()
+                if key != "download_kinds"
+            }],
+        }
+        self.assertIsNone(validate_safe_resource_snapshot(missing_capability))
+
 
 class RecentResourceSubmitIntentTests(unittest.TestCase):
+    def test_batch_parser_requires_multiple_positions_and_target(self):
+        self.assertEqual(
+            recent_resource_batch_submit_request("把刚才第1个和第2个到 qB"),
+            {"positions": [1, 2], "target": "qb"},
+        )
+        self.assertEqual(
+            recent_resource_batch_submit_request("把刚才前3个到光鸭"),
+            {"positions": [1, 2, 3], "target": "guangya"},
+        )
+        self.assertIsNone(
+            recent_resource_batch_submit_request("把刚才第1个到 qB")
+        )
+
     def test_parser_requires_recent_reference_and_write_action(self):
         self.assertEqual(
             recent_resource_submit_request("下载刚才推荐的第 2 个到 qBittorrent"),
@@ -395,6 +456,52 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             requires_confirmation=True,
             confirmation_context=lambda arguments: f"{arguments['result_id']}:{arguments['target']}",
         ))
+        registry.register(ToolSpec(
+            name="indexer.submit_resource_batch",
+            description="batch submit",
+            risk=RiskLevel.DANGER,
+            parameters={},
+            validator=lambda arguments: {
+                "result_ids": list(arguments.get("result_ids") or []),
+                "target": str(arguments.get("target") or ""),
+            },
+            preview_handler=lambda arguments: ToolResult(
+                True, "confirmation_required", "batch preview",
+                data={"count": len(arguments["result_ids"]), "target": arguments["target"]},
+            ),
+            handler=lambda arguments: (
+                execute_calls.append(dict(arguments))
+                or ToolResult(True, "partial", "batch submitted", data={
+                    "target": arguments["target"],
+                    "items": [
+                        {
+                            "result_id": arguments["result_ids"][0],
+                            "request_id": 201,
+                            "target": arguments["target"],
+                            "status": "submitted",
+                            "created": True,
+                            "duplicate": False,
+                            "succeeded": ["qb"],
+                            "failed": [],
+                        },
+                        {
+                            "result_id": arguments["result_ids"][1],
+                            "request_id": 202,
+                            "target": arguments["target"],
+                            "status": "failed",
+                            "created": True,
+                            "duplicate": False,
+                            "succeeded": [],
+                            "failed": ["qb"],
+                        },
+                    ],
+                })
+            ),
+            requires_confirmation=True,
+            confirmation_context=lambda arguments: (
+                ",".join(arguments["result_ids"]) + ":" + arguments["target"]
+            ),
+        ))
         service = AgentOrchestrator(
             registry,
             ConfirmationStore(token_factory=lambda: "confirm-resource-0001"),
@@ -403,6 +510,48 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             record_actions=record_actions,
         )
         return service, preview_calls, execute_calls, search_results
+
+    def test_batch_submit_uses_one_confirmation_and_redacts_item_handles(self):
+        service, _preview_calls, execute_calls, _ = self._agent()
+        service.invoke(
+            "indexer.search_resources", {"title": "示例剧"}, owner="session-a"
+        )
+
+        prepared = service.query(
+            "把刚才第1个和第2个到 qB", owner="session-a", present=False
+        )
+        self.assertEqual(prepared["mode"], "confirmation_required")
+        self.assertEqual(
+            prepared["tool_call"]["name"], "indexer.submit_resource_batch"
+        )
+        self.assertEqual(execute_calls, [])
+
+        confirmed = service.confirm(
+            prepared["confirmation"]["confirmation_id"], owner="session-a"
+        )
+        self.assertEqual(len(execute_calls), 1)
+        self.assertEqual(confirmed["result"]["status"], "partial")
+        self.assertEqual(confirmed["result"]["data"]["succeeded"], 1)
+        self.assertEqual(confirmed["result"]["data"]["failed"], 1)
+        self.assertEqual(
+            [
+                record.dispatch_status
+                for record in service.recent_download_store.get(owner="session-a")
+            ],
+            ["submitted", "failed"],
+        )
+        serialized = repr(confirmed)
+        for secret in (
+            "generic-resource-0001",
+            "generic-resource-0002",
+            "'request_id': 201",
+            "'request_id': 202",
+        ):
+            self.assertNotIn(secret, serialized)
+        with self.assertRaises(AgentToolError):
+            service.confirm(
+                prepared["confirmation"]["confirmation_id"], owner="session-a"
+            )
 
     def test_same_query_can_prepare_a_staged_owner_bound_resource(self):
         service, preview_calls, execute_calls, _ = self._agent()

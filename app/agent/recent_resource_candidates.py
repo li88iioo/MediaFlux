@@ -325,25 +325,32 @@ def _safe_snapshot(result: ToolResult) -> dict[str, Any]:
     }
 
 
-def _safe_generic_candidate(value: Any) -> dict[str, Any] | None:
+def _safe_generic_candidate(
+    value: Any, *, require_download_kinds: bool = True
+) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     result_id = str(value.get("result_id") or "").strip()
     title = _safe_text(value.get("title"), 300)
     download_state = str(value.get("download_state") or "").strip().lower()
     raw_kinds = value.get("download_kinds")
-    download_kinds = (
-        {str(item or "").strip().lower() for item in raw_kinds}
-        if isinstance(raw_kinds, list)
-        else set()
-    )
+    download_kinds = sorted(
+        {
+            str(item or "").strip().lower()
+            for item in raw_kinds
+            if str(item or "").strip().lower() in _ALLOWED_DOWNLOAD_KINDS
+        }
+    ) if isinstance(raw_kinds, list) else []
     if (
         not _RESULT_ID_PATTERN.fullmatch(result_id)
         or not title
         or download_state not in _ALLOWED_DOWNLOAD_STATE
-        or not download_kinds.intersection(_ALLOWED_DOWNLOAD_KINDS)
+        or (require_download_kinds and not download_kinds)
     ):
         return None
+    subscription_number = _safe_positive_int(
+        value.get("subscription_number"), maximum=2_147_483_647
+    )
     return {
         "result_id": result_id,
         "title": title,
@@ -351,6 +358,10 @@ def _safe_generic_candidate(value: Any) -> dict[str, Any] | None:
         "site_name": _safe_text(value.get("site_name"), 80),
         "size_text": _safe_text(value.get("size_text"), 32),
         "download_state": download_state,
+        "download_kinds": download_kinds,
+        "media_title": _safe_text(value.get("media_title"), 160),
+        "episode_label": _safe_text(value.get("episode_label"), 24),
+        "subscription_number": subscription_number,
         "_verification_context": None,
     }
 
@@ -429,9 +440,12 @@ def _safe_candidate(
     }
 
 
-_GENERIC_PERSISTED_KEYS = frozenset({
+_GENERIC_PERSISTED_KEYS_V1 = frozenset({
     "position", "result_id", "title", "site_id", "site_name", "size_text",
     "download_state", "_verification_context",
+})
+_GENERIC_PERSISTED_KEYS = _GENERIC_PERSISTED_KEYS_V1 | frozenset({
+    "download_kinds", "media_title", "episode_label", "subscription_number",
 })
 _EPISODIC_PERSISTED_KEYS_V1 = frozenset({
     "position", "season", "episode", "episode_label", "result_id", "title",
@@ -467,24 +481,21 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
         if not isinstance(raw, dict):
             return None
         keys = frozenset(raw)
-        if keys == _GENERIC_PERSISTED_KEYS:
+        if keys in {_GENERIC_PERSISTED_KEYS_V1, _GENERIC_PERSISTED_KEYS}:
             result_id = str(raw.get("result_id") or "").strip()
-            projected = {
-                "position": expected_position,
-                "result_id": result_id,
-                "title": _safe_text(raw.get("title"), 300),
-                "site_id": _safe_text(raw.get("site_id"), 32),
-                "site_name": _safe_text(raw.get("site_name"), 80),
-                "size_text": _safe_text(raw.get("size_text"), 32),
-                "download_state": str(raw.get("download_state") or "").strip().lower(),
-                "_verification_context": None,
-            }
-            if (
-                raw != projected
-                or not _RESULT_ID_PATTERN.fullmatch(result_id)
-                or not projected["title"]
-                or projected["download_state"] not in _ALLOWED_DOWNLOAD_STATE
-            ):
+            projected = _safe_generic_candidate(
+                raw,
+                require_download_kinds=keys != _GENERIC_PERSISTED_KEYS_V1,
+            )
+            if projected is None:
+                return None
+            projected["position"] = expected_position
+            comparable = (
+                {key: projected[key] for key in _GENERIC_PERSISTED_KEYS_V1}
+                if keys == _GENERIC_PERSISTED_KEYS_V1
+                else projected
+            )
+            if raw != comparable:
                 return None
         elif keys in {_EPISODIC_PERSISTED_KEYS_V1, _EPISODIC_PERSISTED_KEYS}:
             season = _safe_positive_int(raw.get("season"), maximum=100)

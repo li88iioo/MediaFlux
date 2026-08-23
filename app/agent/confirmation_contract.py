@@ -47,6 +47,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "暂停会停止安排新检查并失效尚未提交的候选资源；恢复会让订阅重新进入检查队列。已提交下载任务和媒体文件不受影响。",
         "reversibility": "可再次确认暂停或恢复该订阅。",
     },
+    "media.set_subscription_policy": {
+        "action": "修改媒体追更策略",
+        "object": "你指定的一条媒体追更订阅",
+        "impact": "会更新后续追更范围、动作模式、下载目标或检查周期，并失效旧候选；若启用自动模式，后续匹配资源会无需再次确认自动提交。本操作不会主动发起检查。",
+        "reversibility": "可再次修改后续策略；已进入提交阶段或已经提交的下载任务无法由本次修改撤回。",
+    },
     "media.create_subscription": {
         "action": "创建媒体追更订阅",
         "object": "你刚才选定的影视条目和季度",
@@ -190,6 +196,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "object": "当前已配置来源中的空文件夹",
         "impact": "只删除确认为空的目录，不删除目录内文件。",
         "reversibility": "空目录删除后不会自动恢复，但不会影响已有文件内容。",
+    },
+    "indexer.submit_resource_batch": {
+        "action": "批量提交资源下载",
+        "object": "你刚才选择的 2 到 12 个资源候选",
+        "impact": "会逐项向同一下载目标创建任务；各项独立幂等，部分失败不会回滚已成功项目。",
+        "reversibility": "可在目标下载器或云盘任务中分别暂停或删除；已发出的提交请求无法撤回。",
     },
     "indexer.submit_resource": {
         "action": "提交资源下载",

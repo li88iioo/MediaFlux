@@ -1,6 +1,7 @@
 """Media Agent 的多站资源搜索与确认提交动作。"""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -20,6 +21,7 @@ from app.indexers.downloads import (
     DownloadRequestCreationError,
     InvalidDownloadData,
     download_result,
+    download_result_public,
 )
 from app.indexers.errors import IndexerError, IndexerValidationError
 from app.indexers.models import IndexerMediaSearchRequest
@@ -505,4 +507,162 @@ def submit_resource(arguments: dict[str, str]) -> ToolResult:
             )
         ],
         suggestions=["可前往下载任务页查看进度。"],
+    )
+
+def submit_batch_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    _reject_extra(arguments, {"result_ids", "target"})
+    raw_ids = arguments.get("result_ids")
+    if not isinstance(raw_ids, list) or not 2 <= len(raw_ids) <= 12:
+        raise AgentToolError("result_ids 必须包含 2 到 12 个资源")
+    result_ids: list[str] = []
+    for raw in raw_ids:
+        if not isinstance(raw, str) or not _RESULT_ID_RE.fullmatch(raw.strip()):
+            raise AgentToolError("result_id 无效")
+        value = raw.strip()
+        if value not in result_ids:
+            result_ids.append(value)
+    if len(result_ids) < 2:
+        raise AgentToolError("批量提交至少需要 2 个不同资源")
+    target = str(arguments.get("target") or "").strip().lower()
+    if target not in _TARGETS:
+        raise AgentToolError("target 仅支持 qb、guangya 或 both")
+    return {"result_ids": result_ids, "target": target}
+
+
+def preview_submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
+    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+        return ToolResult(False, "disabled", "资源检索功能已关闭", error="资源检索功能未启用。")
+    resources: list[dict[str, Any]] = []
+    try:
+        for result_id in arguments["result_ids"]:
+            _service, item = _stored_resource({
+                "result_id": result_id,
+                "target": arguments["target"],
+            })
+            resources.append({
+                "position": len(resources) + 1,
+                "site_name": _safe_text(item.site_name, 80),
+                "title": _safe_text(item.title, 300),
+                "download_state": item.download_state,
+            })
+    except IndexerError as exc:
+        return ToolResult(False, exc.code, exc.public_message, error=exc.public_message)
+    readiness = _target_readiness(arguments["target"])
+    unavailable = [name for name, ready in readiness.items() if not ready]
+    if unavailable:
+        labels = {"qb": "qBittorrent", "guangya": "光鸭"}
+        return ToolResult(
+            False,
+            "not_configured",
+            f"{'、'.join(labels[name] for name in unavailable)} 尚未配置或登录",
+            data={"target": arguments["target"], "backends": readiness},
+            error="所选下载目标尚未就绪。",
+        )
+    return ToolResult(
+        True,
+        "confirmation_required",
+        f"确认后将批量提交 {len(resources)} 个资源到所选下载目标",
+        data={
+            "count": len(resources),
+            "resources": resources,
+            "target": arguments["target"],
+            "backends": readiness,
+            "effects": [
+                "逐项解析当前会话的短期资源结果",
+                "每项独立创建下载请求并保持幂等",
+                "部分失败不会回滚已经成功的项目",
+            ],
+        },
+        evidence=[Evidence(
+            "indexer_result_store",
+            "已逐项校验短期资源标识和下载后端就绪状态；未返回磁力、路径或凭据。",
+            _now(),
+        )],
+        suggestions=["请核对批量资源标题和统一下载目标后再确认。"],
+    )
+
+
+def submit_batch_confirmation_context(arguments: dict[str, Any]) -> str:
+    payload: list[dict[str, Any]] = []
+    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+        raise IndexerValidationError("indexer disabled")
+    for result_id in arguments["result_ids"]:
+        _service, item = _stored_resource({
+            "result_id": result_id,
+            "target": arguments["target"],
+        })
+        payload.append({
+            "result_id": result_id,
+            "site_id": item.site_id,
+            "title": item.title,
+            "download_state": item.download_state,
+            "download_kinds": sorted(item.download_kinds),
+        })
+    context = {
+        "resources": payload,
+        "target": arguments["target"],
+        "backends": _target_readiness(arguments["target"]),
+        "enabled": True,
+    }
+    return hashlib.sha256(json.dumps(
+        context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
+    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+        return ToolResult(False, "conflict", "资源检索功能已关闭", error="相关配置已变化，请重新搜索。")
+    try:
+        ensure_sync_bridge_available()
+    except AsyncBridgeUnavailable:
+        return ToolResult(False, "unavailable", "批量资源提交当前调用上下文不可用", error="请从同步 Agent 查询入口提交资源。")
+    service = get_indexer_service()
+
+    async def submit_all() -> list[dict[str, Any]]:
+        return list(await asyncio.gather(*(
+            download_result_public(
+                service,
+                result_id,
+                arguments["target"],
+                origin_namespace="agent",
+            )
+            for result_id in arguments["result_ids"]
+        )))
+
+    try:
+        items = run_indexer_awaitable_sync(submit_all())
+    except Exception:
+        return ToolResult(False, "unavailable", "批量下载处理失败", error="下载处理失败，请稍后重试。")
+    counts = {
+        status: sum(item.get("status") == status for item in items)
+        for status in ("submitted", "partial", "failed", "duplicate")
+    }
+    accepted = counts["submitted"] + counts["partial"]
+    if accepted and not counts["failed"] and not counts["duplicate"]:
+        status, summary = "accepted", f"{accepted} 个下载任务已提交"
+    elif accepted:
+        status, summary = "partial", f"批量提交完成：{accepted} 个已受理，{len(items) - accepted} 个未受理"
+    elif counts["duplicate"] and not counts["failed"]:
+        status, summary = "conflict", "所选资源均已提交或正在处理中"
+    else:
+        status, summary = "unavailable", "批量资源提交未成功"
+    return ToolResult(
+        bool(accepted),
+        status,
+        summary,
+        data={
+            "target": arguments["target"],
+            "total": len(items),
+            "succeeded": accepted,
+            "failed": counts["failed"],
+            "duplicate": counts["duplicate"],
+            "items": items,
+        },
+        evidence=[Evidence(
+            "download_dispatcher",
+            "逐项通过服务器端资源解析和下载分发器提交；各项独立幂等且允许部分失败。",
+            _now(),
+        )],
+        suggestions=["可询问：刚才批量下载到哪了。"],
+        error="部分或全部资源未被下载后端接受。" if accepted < len(items) else "",
     )

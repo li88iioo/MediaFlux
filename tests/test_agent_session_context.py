@@ -79,6 +79,29 @@ def _resource_result() -> ToolResult:
     )
 
 
+def _generic_resource_result() -> ToolResult:
+    return ToolResult(
+        True,
+        "success",
+        "搜索完成",
+        data={
+            "items": [{
+                "result_id": "generic-resource-0001",
+                "title": "Example.S01E01.1080p",
+                "site_id": "nyaa",
+                "site_name": "Nyaa",
+                "size_text": "1.2 GiB",
+                "download_state": "ready",
+                "download_kinds": ["magnet"],
+                "media_title": "Example",
+                "episode_label": "S01E01",
+                "subscription_number": 7,
+                "magnet": "magnet:?xt=urn:btih:secret",
+            }],
+        },
+    )
+
+
 def _discovery_result() -> ToolResult:
     return ToolResult(
         True,
@@ -413,6 +436,53 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
         self.assertIsNone(RecentDiscoveryCandidateStore(
             repository=self.repository, wall_clock=lambda: self.wall[0]
         ).get(owner="session-b"))
+
+    def test_generic_resource_candidates_restore_current_and_legacy_snapshots(self):
+        monotonic = [20.0]
+        store = RecentResourceCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        )
+        store.capture(owner="session-generic", result=_generic_resource_result())
+
+        restored = RecentResourceCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        ).get(owner="session-generic")
+        self.assertEqual(restored["candidates"][0]["download_kinds"], ["magnet"])
+        self.assertEqual(restored["candidates"][0]["media_title"], "Example")
+        self.assertNotIn("magnet:?", repr(restored))
+
+        legacy = {
+            "search_status": "success",
+            "candidates": [{
+                "position": 1,
+                "result_id": "legacy-resource-0001",
+                "title": "Legacy.S01E01.1080p",
+                "site_id": "nyaa",
+                "site_name": "Nyaa",
+                "size_text": "800 MiB",
+                "download_state": "ready",
+                "_verification_context": None,
+            }],
+        }
+        self.repository.replace_latest(
+            owner="session-legacy",
+            context_type="resource_candidates",
+            payload=legacy,
+            expires_at=self.wall[0] + 600,
+        )
+        restored_legacy = RecentResourceCandidateStore(
+            repository=self.repository,
+            clock=lambda: monotonic[0],
+            wall_clock=lambda: self.wall[0],
+        ).get(owner="session-legacy")
+        self.assertEqual(
+            restored_legacy["candidates"][0]["result_id"],
+            "legacy-resource-0001",
+        )
 
     def test_candidate_snapshots_support_search_id_reselection_after_restart(self):
         monotonic = [20.0]

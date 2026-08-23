@@ -31,6 +31,7 @@ _TOOL_LABELS = {
     "media.create_subscription": "媒体追更创建",
     "media.delete_subscription": "媒体追更删除",
     "media.set_subscription_enabled": "媒体追更状态修改",
+    "media.set_subscription_policy": "媒体追更策略修改",
     "config.set_feature_state": "功能开关修改",
     "config.set_indexer_sites": "资源检索站点修改",
     "config.set_safe_policy": "安全策略修改",
@@ -48,6 +49,7 @@ _TOOL_LABELS = {
     "guangya.organize.clean_empty": "光鸭空目录清理",
     "guangya.organize.stop": "停止光鸭整理任务",
     "indexer.submit_resource": "资源下载提交",
+    "indexer.submit_resource_batch": "批量资源下载提交",
     "library.set_patrol_policy": "缺集巡检策略修改",
     "library.start_episode_audit": "后台全库剧集检查",
     "agent.cancel_job": "取消后台全库剧集检查",
@@ -81,6 +83,9 @@ _SAFE_FIELDS = {
         "operation", "subscription_number", "enabled", "affected",
         "expired_candidates", "cancelled_admissions", "cancelled_runs", "runtime_refreshed",
     },
+    "media.set_subscription_policy": {
+        "subscription_number", "updated_fields", "expired_candidates", "runtime_refreshed",
+    },
     "config.set_feature_state": {
         "feature", "enabled", "runtime_refreshed", "verification_state",
     },
@@ -107,6 +112,9 @@ _SAFE_FIELDS = {
     "guangya.organize.stop": {"accepted"},
     "indexer.submit_resource": {
         "target", "status", "created", "succeeded", "failed", "duplicate",
+    },
+    "indexer.submit_resource_batch": {
+        "target", "total", "succeeded", "failed", "duplicate",
     },
     "library.set_patrol_policy": {"runtime_refreshed"},
     "library.start_episode_audit": {

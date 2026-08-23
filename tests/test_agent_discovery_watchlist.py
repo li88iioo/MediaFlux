@@ -50,6 +50,10 @@ def _card(index: int = 1) -> MediaCard:
 class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         with db.get_conn() as conn:
+            conn.execute("DELETE FROM media_download_admissions")
+            conn.execute("DELETE FROM media_subscription_candidates")
+            conn.execute("DELETE FROM media_subscription_runs")
+            conn.execute("DELETE FROM media_subscriptions")
             conn.execute("DELETE FROM media_watchlist")
             conn.execute("DELETE FROM agent_action_history")
         reset_agent_service_for_tests()
@@ -354,6 +358,78 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
         quoted = agent.query("在网上搜《第二十条》电影", owner="owner", present=False)
         self.assertEqual(quoted["tool_call"]["name"], "discovery.search")
         self.assertEqual(quoted["tool_call"]["arguments"]["query"], "第二十条")
+
+    def test_watchlist_can_be_converted_to_subscription_with_confirmation(self) -> None:
+        db.add_media_watchlist(
+            "tmdb", "99901", "tv", "收藏剧集", "2026", "PRIVATE_POSTER"
+        )
+        row = db.get_media_watchlist("tmdb", "99901", "tv")
+        number = int(row["id"])
+        discovery = Mock()
+        discovery.get_detail.return_value = MediaCard(
+            provider="tmdb",
+            external_id="99901",
+            media_type="tv",
+            title="收藏剧集",
+            year="2026",
+        )
+        async def create_subscription(payload, *, identity_confirmed=False):
+            subscription_id = db.add_media_subscription(
+                provider=payload["provider"],
+                external_id=payload["external_id"],
+                tmdb_id=payload["tmdb_id"],
+                media_type=payload["media_type"],
+                title="收藏剧集",
+                year="2026",
+                monitor_mode=payload["monitor_mode"],
+                seasons=payload["seasons"],
+            )
+            return {
+                "created": True,
+                "subscription": {"id": subscription_id, "title": "收藏剧集"},
+            }
+
+        subscription_service = Mock()
+        subscription_service.create_subscription = create_subscription
+        agent = get_agent_service()
+        with patch(
+            "app.agent.media_subscription_actions.get_discovery_service",
+            return_value=discovery,
+        ), patch(
+            "app.agent.media_subscription_actions.get_media_subscription_service",
+            return_value=subscription_service,
+        ), patch(
+            "app.agent.media_subscription_actions._reload_scheduler",
+            return_value=True,
+        ):
+            prepared = agent.query(
+                f"把收藏 {number} 转为订阅第 2 季",
+                owner="owner",
+                present=False,
+            )
+            self.assertEqual(prepared["mode"], "confirmation_required")
+            self.assertEqual(
+                prepared["tool_call"]["name"], "media.create_subscription"
+            )
+            with db.get_conn() as conn:
+                self.assertIsNone(conn.execute(
+                    "SELECT id FROM media_subscriptions WHERE tmdb_id=? AND media_type=? "
+                    "AND deleted_at IS NULL",
+                    ("99901", "tv"),
+                ).fetchone())
+            confirmed = agent.confirm(
+                prepared["confirmation"]["confirmation_id"], owner="owner"
+            )
+        self.assertEqual(confirmed["result"]["status"], "completed")
+        with db.get_conn() as conn:
+            subscription = conn.execute(
+                "SELECT * FROM media_subscriptions WHERE tmdb_id=? AND media_type=? "
+                "AND deleted_at IS NULL",
+                ("99901", "tv"),
+            ).fetchone()
+        self.assertIsNotNone(subscription)
+        self.assertEqual(json.loads(subscription["seasons_json"]), [2])
+        self.assertNotIn("PRIVATE_POSTER", repr(prepared) + repr(confirmed))
 
     def test_watchlist_natural_language_routes_preserve_read_and_write_boundaries(self) -> None:
         calls: list[tuple[str, dict]] = []

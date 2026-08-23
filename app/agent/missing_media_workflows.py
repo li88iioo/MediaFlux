@@ -526,11 +526,22 @@ def list_missing_workflows(
             break
     if any(workflow["state"] in {"submitted", "verification_pending"} for workflow in workflows):
         suggestions.append("查看刚才下载到哪了")
+    data: dict[str, Any] = {
+        "total": len(workflows),
+        "attention": attention,
+        "workflows": workflows,
+    }
+    if len(workflows) == 1:
+        data.update({
+            "title": workflows[0]["title"],
+            "media_type": "tv",
+            "season": workflows[0]["season"],
+        })
     return ToolResult(
         True,
         "attention" if attention else "healthy",
         f"共有 {len(workflows)} 个补库流程，{attention} 个需要你处理",
-        data={"total": len(workflows), "attention": attention, "workflows": workflows},
+        data=data,
         suggestions=suggestions[:4],
     )
 

@@ -206,7 +206,10 @@ class AgentConversationCompactionRepositoryTests(
         )
         self.assertIsNotNone(snapshot)
         assert snapshot is not None
-        self.assertEqual(snapshot.latest_media_context, media_context)
+        self.assertEqual(
+            snapshot.latest_media_context,
+            {**media_context, "case_stage": "resource_candidates"},
+        )
         self.assertTrue(
             self.repository.store_compaction_summary(
                 principal="browser-a",
@@ -222,7 +225,7 @@ class AgentConversationCompactionRepositoryTests(
 
         self.assertEqual(
             context[0].get("media_context"),
-            media_context,
+            {**media_context, "case_stage": "resource_candidates"},
         )
         self.assertNotIn("已找到资源", context[0]["text"])
 
@@ -366,7 +369,11 @@ class AgentConversationCompactionRepositoryTests(
         )
         self.assertEqual(
             context[0].get("media_context"),
-            {"title": "媒体 A", "media_type": "tv"},
+            {
+                "title": "媒体 A",
+                "media_type": "tv",
+                "case_stage": "resource_candidates",
+            },
         )
 
         self.assertTrue(
@@ -384,7 +391,11 @@ class AgentConversationCompactionRepositoryTests(
         )
         self.assertEqual(
             context[0].get("media_context"),
-            {"title": "媒体 B", "media_type": "tv"},
+            {
+                "title": "媒体 B",
+                "media_type": "tv",
+                "case_stage": "resource_candidates",
+            },
         )
 
         self.assertTrue(
@@ -408,7 +419,11 @@ class AgentConversationCompactionRepositoryTests(
         )
         self.assertEqual(
             context[0].get("media_context"),
-            {"title": "媒体 B", "media_type": "tv"},
+            {
+                "title": "媒体 B",
+                "media_type": "tv",
+                "case_stage": "resource_candidates",
+            },
         )
 
     def test_summary_write_uses_generation_revision_and_conversation_cas(self):
