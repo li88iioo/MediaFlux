@@ -29,6 +29,7 @@ from app.modules.organize import (
     enforce_fixed_organize_rules,
 )
 from app.modules.media_probe import ProbeBudget, probe_local_media_profile
+from app.modules.media_server_path_mapping import configured_media_server_refresh_options
 from app.modules.recognition_policy import (
     automatic_match_confirmation_message,
     automatic_match_policy,
@@ -679,7 +680,11 @@ class LocalMediaService:
                 from app.clients.jellyfin import JellyfinClient
                 providers.append((
                     "Jellyfin",
-                    JellyfinClient(get("JELLYFIN_URL"), get("JELLYFIN_API_KEY")),
+                    JellyfinClient(
+                        get("JELLYFIN_URL"),
+                        get("JELLYFIN_API_KEY"),
+                        **configured_media_server_refresh_options("jellyfin"),
+                    ),
                 ))
             except Exception as exc:
                 warnings.append(f"Jellyfin 客户端初始化失败: {exc}")
@@ -688,42 +693,53 @@ class LocalMediaService:
                 from app.clients.emby import EmbyClient
                 providers.append((
                     "Emby",
-                    EmbyClient(get("EMBY_URL"), get("EMBY_TOKEN")),
+                    EmbyClient(
+                        get("EMBY_URL"),
+                        get("EMBY_TOKEN"),
+                        **configured_media_server_refresh_options("emby"),
+                    ),
                 ))
             except Exception as exc:
                 warnings.append(f"Emby 客户端初始化失败: {exc}")
 
         for label, client in providers:
-            for path in sorted(paths):
-                try:
-                    refresher = getattr(client, "refresh_for_path", None)
-                    ok = refresher(path) if callable(refresher) else client.refresh_all()
-                    if not ok:
-                        warnings.append(f"{label} 刷新失败: {path}")
-                except Exception as exc:
-                    warnings.append(f"{label} 刷新失败 {path}: {exc}")
+            try:
+                refresher = getattr(client, "refresh_for_paths", None)
+                if not callable(refresher):
+                    warnings.append(f"{label} 不支持安全的批量路径刷新，已跳过")
+                    continue
+                outcome = refresher(sorted(paths))
+                if not outcome.get("ok"):
+                    reason = str(outcome.get("fallback") or "刷新请求失败")
+                    warnings.append(f"{label} 刷新未完成: {reason}")
+            except Exception as exc:
+                warnings.append(f"{label} 刷新失败: {exc}")
         return warnings
 
     @staticmethod
     def _refresh_plans(plans: list[LocalMovePlan]) -> list[str]:
-        """优先按稳定媒体库 ID 精准刷新；旧绑定按唯一名称安全兼容。"""
+        """校验媒体库绑定后，按目标路径执行库内精准刷新。"""
         warnings: list[str] = []
-        bindings = {
-            (
-                item.provider.strip().lower(),
-                item.library_id.strip(),
-                item.library_name.strip(),
-            )
-            for item in plans
-            if item.provider.strip() and (item.library_id.strip() or item.library_name.strip())
-        }
-        unbound_paths = {
-            str(item.target.parent) for item in plans
-            if not item.provider.strip()
-        }
+        bound_paths: dict[tuple[str, str, str], set[str]] = {}
+        unbound_paths: set[str] = set()
+        for item in plans:
+            provider = item.provider.strip().lower()
+            library_id = item.library_id.strip()
+            library_name = item.library_name.strip()
+            target_parent = str(item.target.parent)
+            if not provider:
+                unbound_paths.add(target_parent)
+                continue
+            if not library_id and not library_name:
+                warnings.append(f"{provider} 目标缺少媒体库绑定，已跳过刷新")
+                continue
+            bound_paths.setdefault(
+                (provider, library_id, library_name), set(),
+            ).add(target_parent)
+
         if unbound_paths:
             warnings.extend(LocalMediaService._refresh_paths(unbound_paths))
-        if not bindings:
+        if not bound_paths:
             return warnings
 
         from app.modules.media_server_profiles import list_configured_profiles
@@ -733,7 +749,7 @@ class LocalMediaService:
         }
         clients: dict[str, Any] = {}
         folders_by_provider: dict[str, list[dict[str, Any]]] = {}
-        for provider, library_id, library_name in sorted(bindings):
+        for (provider, library_id, library_name), paths in sorted(bound_paths.items()):
             profile = profiles.get(provider)
             label = library_name or library_id
             if profile is None:
@@ -744,33 +760,75 @@ class LocalMediaService:
                 if client is None:
                     if provider == "jellyfin":
                         from app.clients.jellyfin import JellyfinClient
-                        client = JellyfinClient(profile.url, profile.credential)
+                        client = JellyfinClient(
+                            profile.url,
+                            profile.credential,
+                            **configured_media_server_refresh_options("jellyfin"),
+                        )
                     elif provider == "emby":
                         from app.clients.emby import EmbyClient
-                        client = EmbyClient(profile.url, profile.credential)
+                        client = EmbyClient(
+                            profile.url,
+                            profile.credential,
+                            **configured_media_server_refresh_options("emby"),
+                        )
                     else:
                         warnings.append(f"不支持的媒体服务器: {provider}")
                         continue
                     clients[provider] = client
 
-                resolved_id = library_id
-                if not resolved_id:
-                    folders = folders_by_provider.get(provider)
-                    if folders is None:
-                        folders = client.list_virtual_folders()
-                        folders_by_provider[provider] = folders
+                folders = folders_by_provider.get(provider)
+                if folders is None:
+                    folders = client.list_virtual_folders()
+                    folders_by_provider[provider] = folders
+
+                if library_id:
                     matches = [
                         item for item in folders
-                        if item["name"].casefold() == library_name.casefold()
+                        if str(item.get("id") or "").strip() == library_id
+                    ]
+                    if len(matches) != 1:
+                        warnings.append(
+                            f"{profile.label} 媒体库绑定已失效，请重新绑定: {label}"
+                        )
+                        continue
+                    selected = matches[0]
+                    actual_name = str(selected.get("name") or "").strip()
+                    if (
+                        library_name
+                        and actual_name.casefold() != library_name.casefold()
+                    ):
+                        warnings.append(
+                            f"{profile.label} 媒体库名称与绑定 ID 不一致，请重新绑定: "
+                            f"{library_name}"
+                        )
+                        continue
+                else:
+                    matches = [
+                        item for item in folders
+                        if str(item.get("name") or "").strip().casefold()
+                        == library_name.casefold()
                     ]
                     if len(matches) != 1:
                         reason = "不存在" if not matches else "存在同名媒体库"
                         warnings.append(f"{profile.label} {reason}，请重新绑定: {library_name}")
                         continue
-                    resolved_id = matches[0]["id"]
+                    selected = matches[0]
 
-                if not client.refresh_library(resolved_id):
-                    warnings.append(f"{profile.label} 刷新失败: {label}")
+                resolved_id = str(selected.get("id") or "").strip()
+                refresher = getattr(client, "refresh_for_paths", None)
+                if not callable(refresher):
+                    warnings.append(f"{profile.label} 不支持安全的路径刷新，已跳过: {label}")
+                    continue
+                outcome = refresher(
+                    sorted(paths), allowed_library_ids=(resolved_id,),
+                )
+                if not isinstance(outcome, dict) or not outcome.get("ok"):
+                    reason = (
+                        str(outcome.get("fallback") or "刷新请求失败")
+                        if isinstance(outcome, dict) else "刷新响应格式异常"
+                    )
+                    warnings.append(f"{profile.label} 刷新未完成 {label}: {reason}")
             except Exception as exc:
                 warnings.append(f"{profile.label} 刷新失败 {label}: {exc}")
         return warnings

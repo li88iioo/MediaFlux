@@ -24,6 +24,7 @@ from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, log_throttled
+from app.modules.media_server_path_mapping import configured_media_server_refresh_options
 from app.modules.strm import (
     DEFAULT_METADATA_EXTS, DEFAULT_VIDEO_EXTS, STRM_OPERATION_LOCK, STRM_SUBDIR,
     clean_empty_strm_dirs, clean_retired_strm_sources, configured_strm_source_plans,
@@ -361,6 +362,7 @@ class STRMScheduler:
                 notify_override: bool | None = None,
                 detail_notify_override: bool | None = None,
                 emby_refresh_override: bool | None = None,
+                media_server_refresh_override: bool | None = None,
                 on_progress=None,
                 download_request_ids: list[int] | None = None,
                 organize_changes: list[dict[str, object]] | None = None,
@@ -380,6 +382,7 @@ class STRMScheduler:
                 "notify_override": notify_override,
                 "detail_notify_override": detail_notify_override,
                 "emby_refresh_override": emby_refresh_override,
+                "media_server_refresh_override": media_server_refresh_override,
                 "on_progress": on_progress,
                 "download_request_ids": list(download_request_ids or []),
                 "organize_changes": _merge_organize_changes(organize_changes),
@@ -1310,6 +1313,9 @@ class STRMScheduler:
             refresh_started = monotonic()
             media_refresh = self._refresh_media_servers(
                 emby_enabled=options.get("emby_refresh_override"),
+                media_server_refresh_enabled=options.get(
+                    "media_server_refresh_override"
+                ),
                 has_changes=has_changes,
                 changed_paths=list(stats.get("changed_strm_paths") or []),
                 changed_dirs=list(stats.get("changed_dirs") or []),
@@ -1457,10 +1463,18 @@ class STRMScheduler:
     def _refresh_media_servers(emby_enabled: bool | None = None,
                                has_changes: bool = True,
                                changed_paths: list[str] | None = None,
-                               changed_dirs: list[str] | None = None) -> dict:
-        """有 STRM 增量时刷新媒体库；整理联动可单独关闭 Emby。"""
+                               changed_dirs: list[str] | None = None,
+                               media_server_refresh_enabled: bool | None = None) -> dict:
+        """有 STRM 增量时刷新媒体库；整理联动开关同时控制 Jellyfin/Emby。"""
         if not has_changes:
             logger.debug("STRM 本轮无增量变化，跳过媒体库刷新")
+            return {}
+        allow_media_server_refresh = (
+            True if media_server_refresh_enabled is None
+            else bool(media_server_refresh_enabled)
+        )
+        if not allow_media_server_refresh:
+            logger.info("整理联动已关闭媒体服务器刷新，跳过 Jellyfin/Emby")
             return {}
         strm_root = get("STRM_ROOT", "")
         plan = plan_refresh_targets(
@@ -1481,28 +1495,39 @@ class STRMScheduler:
             all_ok = True
             for index, batch in enumerate(plan.batches, start=1):
                 outcome = client.refresh_for_paths(list(batch))
-                if outcome.get("fallback"):
-                    logger.info(
-                        "%s 精准刷新部分降级 batch=%s/%s reason=%s items=%s libraries=%s",
-                        client.display_name,
-                        index,
-                        len(plan.batches),
-                        outcome.get("fallback"),
-                        len(outcome.get("items") or []),
-                        len(outcome.get("libraries") or []),
-                    )
+                scope = str(outcome.get("scope") or "unknown")
+                log = logger.warning if scope in {"global", "skipped"} else logger.info
+                log(
+                    "%s 刷新结果 batch=%s/%s scope=%s ok=%s requested=%s mapped=%s "
+                    "matched=%s unmatched=%s ambiguous=%s items=%s libraries=%s reason=%s",
+                    client.display_name,
+                    index,
+                    len(plan.batches),
+                    scope,
+                    bool(outcome.get("ok")),
+                    int(outcome.get("requested", 0) or 0),
+                    int(outcome.get("mapped", 0) or 0),
+                    int(outcome.get("matched", 0) or 0),
+                    int(outcome.get("unmatched", 0) or 0),
+                    int(outcome.get("ambiguous", 0) or 0),
+                    len(outcome.get("items") or []),
+                    len(outcome.get("libraries") or []),
+                    outcome.get("fallback") or "-",
+                )
                 all_ok = bool(outcome.get("ok")) and all_ok
             return all_ok
 
         results: dict[str, bool] = {}
         if get_bool("JELLYFIN_ENABLED") and get("JELLYFIN_URL") and get("JELLYFIN_API_KEY"):
             results["Jellyfin"] = refresh(JellyfinClient(
-                get("JELLYFIN_URL"), get("JELLYFIN_API_KEY")
+                get("JELLYFIN_URL"), get("JELLYFIN_API_KEY"),
+                **configured_media_server_refresh_options("jellyfin"),
             ))
-        allow_emby = True if emby_enabled is None else emby_enabled
+        allow_emby = True if emby_enabled is None else bool(emby_enabled)
         if allow_emby and get_bool("EMBY_ENABLED") and get("EMBY_URL") and get("EMBY_TOKEN"):
             results["Emby"] = refresh(EmbyClient(
-                get("EMBY_URL"), get("EMBY_TOKEN")
+                get("EMBY_URL"), get("EMBY_TOKEN"),
+                **configured_media_server_refresh_options("emby"),
             ))
         if any(results.values()):
             from app.services import clear_dashboard_cache

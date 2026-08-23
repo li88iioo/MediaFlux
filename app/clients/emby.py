@@ -15,6 +15,7 @@ from app.clients.base import (
     runtime_ticks_to_minutes,
 )
 from app.logger import get_logger
+from app.modules.media_server_path_mapping import MediaServerPathMapping
 
 logger = get_logger(__name__)
 
@@ -30,8 +31,22 @@ class EmbyClient(MediaServerClient):
         "homevideos": "Video",
     }
 
-    def __init__(self, url: str, token: str, timeout: int = 10):
-        super().__init__(url, token, timeout)
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        timeout: int = 10,
+        *,
+        path_mappings: tuple[MediaServerPathMapping, ...] = (),
+        allow_global_refresh_fallback: bool = False,
+    ):
+        super().__init__(
+            url,
+            token,
+            timeout,
+            path_mappings=path_mappings,
+            allow_global_refresh_fallback=allow_global_refresh_fallback,
+        )
         self._cached_user_id = ""
         self._cached_server_info: dict | None = None
         self.product_kind = "unknown"
@@ -309,29 +324,8 @@ class EmbyClient(MediaServerClient):
         return str(path or "").replace("\\", "/").rstrip("/").lower()
 
     def refresh_for_path(self, media_path: str) -> bool:
-        """优先刷新包含 STRM 根目录的 Emby 媒体库，无法匹配时安全回退全局刷新。"""
-        target = self._normalize_path(media_path)
-        try:
-            folders = self.list_virtual_folders()
-            matched = []
-            for folder in folders:
-                locations = [
-                    self._normalize_path(item) for item in folder.get("locations", [])
-                ]
-                if target and any(
-                    target == location or target.startswith(location + "/") or location.startswith(target + "/")
-                    for location in locations if location
-                ):
-                    library_id = str(folder.get("id") or "").strip()
-                    if library_id:
-                        matched.append(library_id)
-            if matched:
-                results = [self.refresh_library(library_id) for library_id in dict.fromkeys(matched)]
-                return bool(results) and all(results)
-            logger.info(f"[Emby] 未找到与 STRM 路径匹配的媒体库，回退全局刷新: {media_path}")
-        except Exception as e:
-            logger.warning("Emby 定位 STRM 媒体库失败，回退全局刷新 type=%s", type(e).__name__)
-        return self.refresh_all()
+        """兼容单路径调用；沿用安全的批量精准刷新策略。"""
+        return bool(self.refresh_for_paths([media_path]).get("ok"))
 
     def refresh_all(self) -> bool:
         """全局刷新媒体库（POST /Library/Refresh）。整理入库后触发。"""

@@ -14,11 +14,20 @@ from typing import Any, Optional
 import requests
 
 from app.logger import get_logger, log_throttled
+from app.modules.media_server_path_mapping import (
+    MediaServerPathMapping,
+    apply_media_server_path_mapping,
+    media_server_path_is_within,
+    media_server_path_key,
+    normalize_media_server_path,
+)
 
 logger = get_logger(__name__)
 
 _RUNTIME_TICKS_PER_MINUTE = 600_000_000
 _MAX_RUNTIME_MINUTES = 525_600
+_MEDIA_ITEM_PAGE_SIZE = 5_000
+_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH = 100_000
 
 
 def runtime_ticks_to_minutes(value: Any) -> int:
@@ -133,10 +142,20 @@ class MediaServerClient:
 
     display_name = "MediaServer"
 
-    def __init__(self, url: str, token: str, timeout: int = 10):
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        timeout: int = 10,
+        *,
+        path_mappings: tuple[MediaServerPathMapping, ...] = (),
+        allow_global_refresh_fallback: bool = False,
+    ):
         self.url = url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self.path_mappings = tuple(path_mappings or ())
+        self.allow_global_refresh_fallback = bool(allow_global_refresh_fallback)
         self._session = requests.Session()
 
     # ---- 子类实现 ----
@@ -564,22 +583,94 @@ class MediaServerClient:
 
     @staticmethod
     def _normalize_media_path(path: object) -> str:
-        return str(path or "").replace("\\", "/").rstrip("/").lower()
+        try:
+            return normalize_media_server_path(path)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _media_path_key(path: object) -> str:
+        try:
+            return media_server_path_key(path)
+        except Exception:
+            return ""
 
     def _library_items_with_paths(self, library_id: str) -> list[dict[str, Any]]:
-        """列出一个媒体库内可定位的容器 Item 及其路径。"""
-        data = self._request(
-            "/Items",
-            params={
-                "ParentId": str(library_id),
-                "Recursive": "true",
-                "IncludeItemTypes": "Series,Season,Movie,Folder,BoxSet",
-                "Fields": "Path",
-                "Limit": 20000,
-            },
+        """完整分页列出库内可定位 Item；无法证明完整时失败关闭。"""
+        collected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        start_index = 0
+        expected_total: int | None = None
+        while start_index < _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH:
+            data = self._request(
+                "/Items",
+                params={
+                    "ParentId": str(library_id),
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Series,Season,Movie,Folder,BoxSet",
+                    "Fields": "Path",
+                    "StartIndex": start_index,
+                    "Limit": _MEDIA_ITEM_PAGE_SIZE,
+                },
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("Items"), list):
+                raise RuntimeError("媒体库条目响应格式异常，已停止精准刷新")
+            total_raw = data.get("TotalRecordCount")
+            if isinstance(total_raw, bool):
+                raise RuntimeError("媒体库条目总数无效，已停止精准刷新")
+            try:
+                total = int(total_raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("媒体库条目总数无效，已停止精准刷新") from exc
+            if total < 0:
+                raise RuntimeError("媒体库条目总数无效，已停止精准刷新")
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise RuntimeError("媒体库条目分页总数发生变化，已停止精准刷新")
+            if total > _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH:
+                raise RuntimeError(
+                    f"媒体库条目超过精准刷新安全上限 "
+                    f"{_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
+                )
+
+            raw_items = data["Items"]
+            if len(raw_items) > _MEDIA_ITEM_PAGE_SIZE:
+                raise RuntimeError("媒体库条目分页超过请求上限，已停止精准刷新")
+            if any(not isinstance(item, dict) for item in raw_items):
+                raise RuntimeError("媒体库条目响应包含无效项目，已停止精准刷新")
+            page = list(raw_items)
+            new_items = 0
+            for item in page:
+                identity = str(item.get("Id") or "").strip()
+                if not identity:
+                    raise RuntimeError("媒体库条目缺少 ID，已停止精准刷新")
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                collected.append(item)
+                new_items += 1
+
+            next_index = start_index + len(page)
+            if next_index > total or len(collected) > total:
+                raise RuntimeError("媒体库条目分页总数不一致，已停止精准刷新")
+            if not page:
+                if start_index == total and len(collected) == total:
+                    return collected
+                raise RuntimeError("媒体库条目分页提前结束，已停止精准刷新")
+            if not new_items:
+                raise RuntimeError("媒体库条目分页未前进，已停止精准刷新")
+            start_index = next_index
+            if start_index == total:
+                if len(collected) != total:
+                    raise RuntimeError("媒体库条目分页存在重复或缺失，已停止精准刷新")
+                return collected
+            if len(page) < _MEDIA_ITEM_PAGE_SIZE:
+                raise RuntimeError("媒体库条目分页提前结束，已停止精准刷新")
+
+        raise RuntimeError(
+            f"媒体库条目超过精准刷新安全上限 {_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
         )
-        items = data.get("Items") if isinstance(data, dict) else data
-        return [item for item in items or [] if isinstance(item, dict)]
 
     def _deepest_item_for_path(
         self, items: list[dict[str, Any]], target: str,
@@ -591,28 +682,83 @@ class MediaServerClient:
             item_path = self._normalize_media_path(item.get("Path"))
             if not item_path:
                 continue
-            if target == item_path or target.startswith(f"{item_path}/"):
+            if media_server_path_is_within(target, item_path):
                 if len(item_path) > best_length:
                     best_length = len(item_path)
                     best_id = str(item.get("Id") or "").strip()
         return best_id
 
-    def refresh_for_paths(self, paths: list[str]) -> dict[str, Any]:
-        """按本轮真实变化路径刷新最深父 Item。
+    def _finish_unlocatable_refresh(
+        self, result: dict[str, Any], reason: str, *, allow_global: bool = True,
+    ) -> dict[str, Any]:
+        """定位失败时默认安全跳过；仅显式允许且未受库约束时才全局扫描。"""
+        result["fallback"] = reason
+        if allow_global and self.allow_global_refresh_fallback:
+            logger.warning(
+                "[%s] %s，配置允许回退全局刷新", self.display_name, reason
+            )
+            result["scope"] = "global"
+            result["endpoints"] = ["/Library/Refresh"]
+            result["ok"] = self.refresh_all()
+            return result
+        logger.warning(
+            "[%s] %s，已安全跳过；未触发全局媒体库扫描", self.display_name, reason
+        )
+        result["scope"] = "skipped"
+        result["skipped"] = True
+        result["ok"] = False
+        return result
 
-        只有完全无法定位时才允许全局刷新，且必须记录明确降级原因。
-        同一 Item 每轮只刷新一次，避免同一剧集的多集触发多次刷新。
-        """
-        targets = [
-            self._normalize_media_path(item) for item in (paths or []) if str(item or "")
-        ]
-        targets = [item for item in dict.fromkeys(targets) if item]
+    def refresh_for_paths(
+        self, paths: list[str], *, allowed_library_ids: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """按真实变化路径刷新最深父 Item，可约束到已绑定的媒体库。"""
+        allowed_ids = {
+            str(item or "").strip() for item in allowed_library_ids or ()
+            if str(item or "").strip()
+        }
+        mapping_rows: list[dict[str, Any]] = []
+        mapped_targets: list[str] = []
+        for raw_path in paths or []:
+            raw = str(raw_path or "").strip()
+            if not raw:
+                continue
+            try:
+                mapped, mapping = apply_media_server_path_mapping(raw, self.path_mappings)
+            except Exception:
+                mapped, mapping = self._normalize_media_path(raw), None
+            normalized_source = self._normalize_media_path(raw)
+            normalized_target = self._normalize_media_path(mapped)
+            if not normalized_target:
+                continue
+            mapping_rows.append({
+                "source": normalized_source,
+                "target": normalized_target,
+                "applied": mapping is not None,
+                "mode": "explicit" if mapping is not None else "none",
+            })
+            mapped_targets.append(normalized_target)
+
+        targets = list(dict.fromkeys(mapped_targets))
         result: dict[str, Any] = {
-            "ok": False, "items": [], "libraries": [],
-            "fallback": "", "requested": len(targets), "skipped": False,
+            "ok": False,
+            "items": [],
+            "libraries": [],
+            "fallback": "",
+            "requested": len(targets),
+            "matched": 0,
+            "unmatched": 0,
+            "ambiguous": 0,
+            "mapped": sum(1 for row in mapping_rows if row["applied"]),
+            "path_mappings": mapping_rows,
+            "scope": "none",
+            "endpoints": [],
+            "skipped": False,
+            "allowed_libraries": sorted(allowed_ids),
         }
         if not targets:
             result["fallback"] = "本轮没有可定位的变化路径"
+            result["scope"] = "skipped"
             result["skipped"] = True
             result["ok"] = True
             return result
@@ -620,17 +766,35 @@ class MediaServerClient:
         try:
             folders = self.list_virtual_folders()
         except Exception as exc:
-            logger.warning(
-                "[%s] 读取媒体库目录失败，回退全局刷新: %s", self.display_name, exc
+            logger.warning("[%s] 读取媒体库目录失败: %s", self.display_name, exc)
+            return self._finish_unlocatable_refresh(
+                result, "媒体库目录读取失败", allow_global=not allowed_ids,
             )
-            result["fallback"] = "媒体库目录读取失败"
-            result["ok"] = self.refresh_all()
-            return result
+        if allowed_ids:
+            folders = [
+                folder for folder in folders
+                if str(folder.get("id") or "").strip() in allowed_ids
+            ]
 
-        library_for_target: dict[str, str] = {}
+        normalized_locations: list[tuple[str, str]] = []
+        for folder in folders:
+            library_id = str(folder.get("id") or "").strip()
+            if not library_id:
+                continue
+            for raw_location in folder.get("locations", []):
+                location = self._normalize_media_path(raw_location)
+                if not location:
+                    continue
+                normalized_locations.append((library_id, location))
+
+        source_for_target = {
+            row["target"]: row["source"] for row in mapping_rows
+        }
+        library_for_target: dict[str, tuple[str, str]] = {}
+        unmatched_targets: list[str] = []
+        ambiguous_targets = 0
         for target in targets:
-            best_library_id = ""
-            best_location_length = -1
+            direct_matches: list[tuple[int, str, str]] = []
             for folder in folders:
                 library_id = str(folder.get("id") or "").strip()
                 if not library_id:
@@ -642,54 +806,138 @@ class MediaServerClient:
                 for location in locations:
                     if not location:
                         continue
-                    if target != location and not target.startswith(f"{location}/"):
+                    if not media_server_path_is_within(target, location):
                         continue
-                    if len(location) > best_location_length:
-                        best_library_id = library_id
-                        best_location_length = len(location)
-            if best_library_id:
-                library_for_target[target] = best_library_id
+                    direct_matches.append((len(location), library_id, location))
+            if direct_matches:
+                longest = max(length for length, _library_id, _location in direct_matches)
+                winners = {
+                    (library_id, location)
+                    for length, library_id, location in direct_matches
+                    if length == longest
+                }
+                if len(winners) == 1:
+                    library_for_target[target] = next(iter(winners))
+                    continue
+                unmatched_targets.append(source_for_target.get(target, target))
+                ambiguous_targets += 1
+                continue
 
+            unmatched_targets.append(source_for_target.get(target, target))
+
+        result["matched"] = len(library_for_target)
+        result["unmatched"] = len(unmatched_targets)
+        result["ambiguous"] = ambiguous_targets
+        result["mapped"] = sum(1 for row in mapping_rows if row["applied"])
         if not library_for_target:
-            logger.info(
-                "[%s] 变化路径未命中任何媒体库，回退全局刷新", self.display_name
+            if ambiguous_targets and ambiguous_targets == len(unmatched_targets):
+                reason = "变化路径匹配多个媒体库，无法唯一定位"
+            elif ambiguous_targets:
+                reason = "部分变化路径匹配多个媒体库，其余路径未匹配任何媒体库"
+            else:
+                reason = "变化路径未匹配任何媒体库"
+            if ambiguous_targets:
+                # 歧义不是普通的“未定位”：即使管理员允许未匹配路径回退
+                # 全局扫描，也不能用一次整库刷新掩盖错误路由。
+                result["fallback"] = reason
+                result["scope"] = "skipped"
+                result["skipped"] = True
+                result["ok"] = False
+                logger.warning(
+                    "[%s] %s，已安全跳过；歧义目标禁止回退全局刷新",
+                    self.display_name, reason,
+                )
+                return result
+            return self._finish_unlocatable_refresh(
+                result, reason, allow_global=not allowed_ids,
             )
-            result["fallback"] = "变化路径未匹配任何媒体库"
-            result["ok"] = self.refresh_all()
-            return result
 
         items_by_library: dict[str, list[dict[str, Any]]] = {}
         item_ids: list[str] = []
         library_fallbacks: list[str] = []
-        for target, library_id in library_for_target.items():
+        failed_item_listings: set[str] = set()
+        for target, (library_id, library_location) in library_for_target.items():
             if library_id not in items_by_library:
                 try:
                     items_by_library[library_id] = self._library_items_with_paths(library_id)
                 except Exception as exc:
                     logger.warning(
-                        "[%s] 读取媒体库 %s 条目失败，降级为媒体库级刷新: %s",
+                        "[%s] 读取媒体库 %s 条目失败，已安全跳过该库刷新: %s",
                         self.display_name, library_id, exc,
                     )
                     items_by_library[library_id] = []
-            item_id = self._deepest_item_for_path(items_by_library[library_id], target)
-            if item_id:
-                item_ids.append(item_id)
-            else:
+                    failed_item_listings.add(library_id)
+            if library_id in failed_item_listings:
+                continue
+            items = items_by_library[library_id]
+            item_id = self._deepest_item_for_path(items, target)
+            if not item_id:
                 library_fallbacks.append(library_id)
+                continue
+            matched_item = next(
+                (item for item in items if str(item.get("Id") or "").strip() == item_id),
+                None,
+            )
+            item_path = self._normalize_media_path(
+                matched_item.get("Path") if isinstance(matched_item, dict) else ""
+            )
+            if (
+                item_path
+                and self._media_path_key(item_path) == self._media_path_key(library_location)
+            ):
+                # Jellyfin 可能返回一个覆盖物理媒体库根目录的 Folder Item；
+                # 它的 ID 不等于 VirtualFolder ItemId，但刷新范围仍是库级。
+                library_fallbacks.append(item_id)
+            else:
+                item_ids.append(item_id)
 
         refreshed = list(dict.fromkeys(item_ids))
         libraries = [
             item for item in dict.fromkeys(library_fallbacks) if item not in refreshed
         ]
         if not refreshed and not libraries:
-            result["fallback"] = "无法定位任何刷新目标"
-            result["ok"] = self.refresh_all()
-            return result
+            if failed_item_listings:
+                result["fallback"] = (
+                    f"{len(failed_item_listings)} 个媒体库条目读取失败，已安全跳过刷新"
+                )
+                result["scope"] = "skipped"
+                result["skipped"] = True
+                result["ok"] = False
+                return result
+            return self._finish_unlocatable_refresh(
+                result, "无法定位任何刷新目标", allow_global=not allowed_ids,
+            )
 
         outcomes = [self.refresh_library(item) for item in (*refreshed, *libraries)]
         result["items"] = refreshed
         result["libraries"] = libraries
-        result["ok"] = bool(outcomes) and all(outcomes)
+        result["endpoints"] = [
+            f"/Items/{item}/Refresh" for item in (*refreshed, *libraries)
+        ]
+        if refreshed and libraries:
+            result["scope"] = "mixed"
+        elif refreshed:
+            result["scope"] = "item"
+        else:
+            result["scope"] = "library"
+
+        reasons: list[str] = []
         if libraries:
-            result["fallback"] = "部分变化路径无法定位到具体 Item，已按媒体库刷新"
+            reasons.append("部分目标仅能定位到媒体库，已按媒体库刷新")
+        if failed_item_listings:
+            reasons.append(
+                f"{len(failed_item_listings)} 个媒体库条目读取失败，已安全跳过"
+            )
+        if ambiguous_targets:
+            reasons.append(f"{ambiguous_targets} 个变化路径匹配多个媒体库，已安全跳过")
+        unmatched_without_ambiguity = len(unmatched_targets) - ambiguous_targets
+        if unmatched_without_ambiguity:
+            reasons.append(
+                f"{unmatched_without_ambiguity} 个变化路径未匹配媒体库，已安全跳过"
+            )
+        result["fallback"] = "；".join(reasons)
+        result["ok"] = (
+            bool(outcomes) and all(outcomes)
+            and not unmatched_targets and not failed_item_listings
+        )
         return result

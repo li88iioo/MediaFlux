@@ -3,20 +3,27 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import mimetypes
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from app.clients.guangya import GuangYaClient
 from app.logger import get_logger, log_throttled
 from app.modules.media_proxy import (
     PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
     SignedUrlCache,
+    _parse_range,
 )
 
 logger = get_logger(__name__)
 router = APIRouter()
 _playgy_signed_urls = SignedUrlCache(max_entries=512)
+
+
+def _playgy_response_etag(value: str) -> str:
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+    return f'"mf-{digest}"'
 
 
 @router.api_route(
@@ -44,6 +51,15 @@ def play_gy(
         return JSONResponse({"error": "播放地址缺少有效签名"}, status_code=403)
     if not verify_playgy(file_id, etag, size, v, sig):
         return JSONResponse({"error": "播放地址签名无效"}, status_code=403)
+    is_head = str(getattr(request, "method", "")).upper() == "HEAD"
+    content_length = 0
+    if is_head:
+        try:
+            content_length = int(size)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "播放文件大小无效"}, status_code=400)
+        if content_length < 0:
+            return JSONResponse({"error": "播放文件大小无效"}, status_code=400)
     try:
         client = GuangYaClient()
         if not client.logged_in:
@@ -78,6 +94,66 @@ def play_gy(
             ua_bound=ua_bound,
         )
         if result.url:
+            if is_head:
+                logger.debug(
+                    "[HEAD] 光鸭 file_id=%s cache_hit=%s",
+                    file_id,
+                    result.cache_hit,
+                )
+                response_etag = _playgy_response_etag(etag)
+                response_headers = {
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "no-store",
+                    "ETag": response_etag,
+                    "Content-Type": (
+                        mimetypes.guess_type(filename)[0]
+                        or "application/octet-stream"
+                    ),
+                    "Pragma": "no-cache",
+                    "Referrer-Policy": "no-referrer",
+                    "X-Content-Type-Options": "nosniff",
+                }
+                range_value = str(
+                    request.headers.get("range", "")
+                    if request is not None
+                    else ""
+                ).strip()
+                if_range = str(
+                    request.headers.get("if-range", "")
+                    if request is not None
+                    else ""
+                ).strip()
+                # If-Range 只接受本响应给出的强 entity-tag；weak tag、日期或
+                # 其他 validator 均视为失配，并按完整表示返回 200。
+                if range_value and if_range and if_range != response_etag:
+                    range_value = ""
+                try:
+                    selected_range = _parse_range(range_value, content_length)
+                except (TypeError, ValueError):
+                    response_headers["Content-Range"] = (
+                        f"bytes */{content_length}"
+                    )
+                    return Response(
+                        status_code=416,
+                        headers=response_headers,
+                    )
+                if selected_range is None:
+                    response_headers["Content-Length"] = str(content_length)
+                    return Response(
+                        status_code=200,
+                        headers=response_headers,
+                    )
+                start, end = selected_range
+                response_headers.update({
+                    "Content-Length": str(end - start + 1),
+                    "Content-Range": (
+                        f"bytes {start}-{end}/{content_length}"
+                    ),
+                })
+                return Response(
+                    status_code=206,
+                    headers=response_headers,
+                )
             logger.debug("[302] 光鸭 file_id=%s cache_hit=%s", file_id, result.cache_hit)
             return RedirectResponse(
                 result.url,
