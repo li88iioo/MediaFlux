@@ -1703,8 +1703,139 @@ def _test_mode_enabled() -> bool:
     return _configured_test_mode or os.getenv("MEDIAFLUX_TEST_MODE", "").strip() == "1"
 
 
+def _restore_interrupted_agent_session_context_v2(
+    conn: sqlite3.Connection,
+) -> None:
+    """恢复旧版非原子 v2 迁移留下的临时表，再由正式迁移重新执行。"""
+    current_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if current_version > 1:
+        return
+    legacy_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='agent_session_context_v1'"
+    ).fetchone()
+    if legacy_exists is None:
+        return
+    legacy_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='agent_session_context_v1'"
+    ).fetchone()
+    legacy_sql = str(legacy_sql_row[0] or "").casefold()
+    legacy_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(agent_session_context_v1)"
+        ).fetchall()
+    }
+    required_legacy_columns = {
+        "id",
+        "owner_digest",
+        "context_type",
+        "payload",
+        "expires_at",
+        "created_at",
+    }
+    allowed_legacy_column_sets = (
+        required_legacy_columns,
+        required_legacy_columns | {"context_generation"},
+    )
+    normalized_legacy_sql = re.sub(r"\s+", "", legacy_sql)
+    legacy_indexes = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA index_list(agent_session_context_v1)"
+        ).fetchall()
+    }
+    expected_legacy_indexes = {
+        "idx_agent_session_context_lookup",
+        "idx_agent_session_context_expiry",
+    }
+    legacy_trigger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+        "AND tbl_name='agent_session_context_v1' LIMIT 1"
+    ).fetchone()
+    if (
+        "check(context_typein('patrol','download_submission'))"
+        not in normalized_legacy_sql
+        or legacy_columns not in allowed_legacy_column_sets
+        or legacy_indexes != expected_legacy_indexes
+        or legacy_trigger is not None
+    ):
+        raise RuntimeError(
+            "检测到无法确认来源的 agent_session_context_v1，"
+            "已拒绝自动恢复；请使用迁移前备份恢复数据库"
+        )
+    current_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='agent_session_context'"
+    ).fetchone()
+    if current_exists is not None:
+        current_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='agent_session_context'"
+        ).fetchone()
+        current_sql = str(current_sql_row[0] or "").casefold()
+        current_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(agent_session_context)"
+            ).fetchall()
+        }
+        expected_current_columns = required_legacy_columns | {"context_generation"}
+        current_indexes = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA index_list(agent_session_context)"
+            ).fetchall()
+        }
+        current_trigger = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name='agent_session_context' LIMIT 1"
+        ).fetchone()
+        if (
+            "check" in current_sql
+            or current_columns != expected_current_columns
+            or current_indexes
+            or current_trigger is not None
+        ):
+            raise RuntimeError(
+                "检测到无法确认的 Agent 会话上下文双表状态，"
+                "已拒绝自动恢复；请使用迁移前备份恢复数据库"
+            )
+        generation_match = (
+            "legacy.context_generation=current.context_generation"
+            if "context_generation" in legacy_columns
+            else "current.context_generation=0"
+        )
+        unexpected_row = conn.execute(
+            "SELECT 1 FROM agent_session_context AS current "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM agent_session_context_v1 AS legacy "
+            "WHERE legacy.id=current.id "
+            "AND legacy.owner_digest=current.owner_digest "
+            "AND legacy.context_type=current.context_type "
+            "AND legacy.payload=current.payload "
+            "AND legacy.expires_at=current.expires_at "
+            "AND legacy.created_at=current.created_at "
+            f"AND {generation_match}"
+            ") LIMIT 1"
+        ).fetchone()
+        if unexpected_row is not None:
+            raise RuntimeError(
+                "检测到 Agent 会话上下文部分迁移表包含新增或冲突数据，"
+                "已拒绝自动覆盖；请使用迁移前备份恢复数据库"
+            )
+        # 已确认现表仅是旧表的空集或一致子集，可以丢弃并从完整旧表重做。
+        conn.execute("DROP TABLE agent_session_context")
+    conn.execute(
+        "ALTER TABLE agent_session_context_v1 RENAME TO agent_session_context"
+    )
+    logger.warning("检测到未完成的 Agent 会话上下文迁移，已安全恢复并重新执行")
+
+
 def _migrate_agent_session_context_v2(conn: sqlite3.Connection) -> None:
     """移除固定 context_type CHECK，允许仓储白名单安全扩展上下文类型。"""
+    _restore_interrupted_agent_session_context_v2(conn)
     row = conn.execute(
         "SELECT sql FROM sqlite_master "
         "WHERE type='table' AND name='agent_session_context'"
@@ -1876,6 +2007,84 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
 }
 
 
+def _run_schema_savepoint(
+    conn: sqlite3.Connection,
+    *,
+    operation: Callable[[sqlite3.Connection], None],
+    next_version: int | None = None,
+) -> None:
+    """在独立 SAVEPOINT 中原子执行一次 schema 操作。"""
+    savepoint = "mediaflux_schema_step"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        operation(conn)
+        if next_version is not None:
+            conn.execute(f"PRAGMA user_version={int(next_version)}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except BaseException:
+        rolled_back = False
+        try:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            rolled_back = True
+        except sqlite3.Error as rollback_exc:
+            logger.error(
+                "数据库 schema 操作回滚失败 type=%s",
+                type(rollback_exc).__name__,
+            )
+        if rolled_back:
+            try:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except sqlite3.Error as release_exc:
+                logger.error(
+                    "数据库 schema SAVEPOINT 释放失败 type=%s",
+                    type(release_exc).__name__,
+                )
+        raise
+
+
+def _database_has_user_schema(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type IN ('table','index','view','trigger') "
+        "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+    ).fetchone()
+    return row is not None
+
+
+def _create_pre_migration_backup(
+    conn: sqlite3.Connection,
+    *,
+    current_version: int,
+) -> None:
+    if _test_mode_enabled():
+        return
+    from app.modules.backup import BackupError, create_backup
+
+    try:
+        paths = get_runtime_paths()
+        database_path = resolve_db_path()
+        standard_runtime_database = database_path == paths.database_path.resolve()
+        output = None
+        if not standard_runtime_database:
+            output = (
+                database_path.parent
+                / "backups"
+                / (
+                    f"mediaflux-pre-migration-{current_version}-to-"
+                    f"{SCHEMA_VERSION}-{time.time_ns()}.zip"
+                )
+            )
+        create_backup(
+            paths,
+            output=output,
+            reason=f"pre-migration-{current_version}-to-{SCHEMA_VERSION}",
+            source_connection=conn,
+            include_settings=standard_runtime_database,
+        )
+    except BackupError as exc:
+        raise RuntimeError(f"数据库迁移前备份失败，已取消启动：{exc}") from exc
+
+
 def _prepare_schema_migration(
     conn: sqlite3.Connection,
     *,
@@ -1887,7 +2096,10 @@ def _prepare_schema_migration(
         return current_version
     if current_version == 0:
         # 已存在但尚未打版本的早期数据库允许平滑进入，由 _SCHEMA
-        # 幂等补齐表结构，再基线化为当前正式版本。
+        # 幂等补齐表结构，再基线化为当前正式版本。已有用户 schema 时仍须
+        # 在任何补列、凭据清理和数据修复前建立可恢复快照。
+        if _database_has_user_schema(conn):
+            _create_pre_migration_backup(conn, current_version=current_version)
         return current_version
     if current_version > SCHEMA_VERSION:
         raise RuntimeError(
@@ -1908,36 +2120,17 @@ def _prepare_schema_migration(
         migrations.append(migration)
         version += 1
 
-    if not _test_mode_enabled():
-        from app.modules.backup import BackupError, create_backup
+    _create_pre_migration_backup(conn, current_version=current_version)
 
-        try:
-            paths = get_runtime_paths()
-            database_path = resolve_db_path()
-            standard_runtime_database = database_path == paths.database_path.resolve()
-            output = None
-            if not standard_runtime_database:
-                output = (
-                    database_path.parent
-                    / "backups"
-                    / (
-                        f"mediaflux-pre-migration-{current_version}-to-"
-                        f"{SCHEMA_VERSION}-{time.time_ns()}.zip"
-                    )
-                )
-            create_backup(
-                paths,
-                output=output,
-                reason=f"pre-migration-{current_version}-to-{SCHEMA_VERSION}",
-                source_connection=conn,
-                include_settings=standard_runtime_database,
-            )
-        except BackupError as exc:
-            raise RuntimeError(f"数据库迁移前备份失败，已取消启动：{exc}") from exc
+    def migrate_schema_chain(connection: sqlite3.Connection) -> None:
+        for next_version, migration in enumerate(
+            migrations,
+            start=current_version + 1,
+        ):
+            migration(connection)
+            connection.execute(f"PRAGMA user_version={next_version}")
 
-    for next_version, migration in enumerate(migrations, start=current_version + 1):
-        migration(conn)
-        conn.execute(f"PRAGMA user_version={next_version}")
+    _run_schema_savepoint(conn, operation=migrate_schema_chain)
     return current_version
 
 
@@ -1988,9 +2181,13 @@ def init_db() -> None:
         conn = _connect()
         try:
             _prepare_schema_migration(conn, database_existed=database_existed)
-            _sync_missing_schema_columns(conn)
-            # 未打版本的早期数据库也可能已有 v1 约束表；幂等检查后补齐。
-            _migrate_agent_session_context_v2(conn)
+            # 未打版本的早期数据库也可能已有 v1 约束表；补列与重建必须作为
+            # 一个原子步骤完成，避免退出后留下半迁移 schema。
+            def prepare_legacy_schema(connection: sqlite3.Connection) -> None:
+                _sync_missing_schema_columns(connection)
+                _migrate_agent_session_context_v2(connection)
+
+            _run_schema_savepoint(conn, operation=prepare_legacy_schema)
             conn.executescript(_SCHEMA)
             conn.execute(
                 "UPDATE agent_rate_limit_buckets SET expires_at="
@@ -2283,8 +2480,16 @@ def init_db() -> None:
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             conn.commit()
             _protect_database_files()
-        except sqlite3.Error as exc:
-            _observe_sqlite_contention(exc, phase="init_schema")
+        except BaseException as exc:
+            if isinstance(exc, sqlite3.Error):
+                _observe_sqlite_contention(exc, phase="init_schema")
+            try:
+                conn.rollback()
+            except sqlite3.Error as rollback_exc:
+                logger.warning(
+                    "数据库初始化失败后的回滚异常 type=%s",
+                    type(rollback_exc).__name__,
+                )
             raise
         finally:
             conn.close()

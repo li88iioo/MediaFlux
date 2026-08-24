@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from app import database as db
+from app.modules.backup import BackupError
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -113,6 +114,358 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                     )
                 self.assertEqual(version, 5)
                 self.assertEqual(preserved["context_type"], "patrol")
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_pre_migration_backup_failure_leaves_v1_database_untouched(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-backup-failure-") as root:
+            path = Path(root) / "v1.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL "
+                    "CHECK(context_type IN ('patrol','download_submission')),"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "created_at TEXT NOT NULL"
+                    ");"
+                    "CREATE INDEX idx_agent_session_context_lookup "
+                    "ON agent_session_context(owner_digest,context_type,expires_at,id DESC);"
+                    "CREATE INDEX idx_agent_session_context_expiry "
+                    "ON agent_session_context(expires_at);"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES('preserved','patrol','{}',9999999999,'2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            backup = mock.Mock(side_effect=BackupError("injected backup failure"))
+            try:
+                with (
+                    mock.patch.object(db, "_test_mode_enabled", return_value=False),
+                    mock.patch("app.modules.backup.create_backup", backup),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "数据库迁移前备份失败",
+                    ):
+                        db.init_db()
+                conn = sqlite3.connect(path)
+                try:
+                    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    table_sql = str(
+                        conn.execute(
+                            "SELECT sql FROM sqlite_master WHERE type='table' "
+                            "AND name='agent_session_context'"
+                        ).fetchone()[0]
+                    ).casefold()
+                    preserved = conn.execute(
+                        "SELECT owner_digest FROM agent_session_context"
+                    ).fetchall()
+                    legacy_table = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='agent_session_context_v1'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+                self.assertEqual(version, 1)
+                self.assertIn("check", table_sql)
+                self.assertEqual(preserved, [("preserved",)])
+                self.assertIsNone(legacy_table)
+                backup.assert_called_once()
+                kwargs = backup.call_args.kwargs
+                self.assertEqual(kwargs["reason"], "pre-migration-1-to-5")
+                self.assertFalse(kwargs["include_settings"])
+                self.assertEqual(Path(kwargs["output"]).parent, path.parent / "backups")
+                self.assertIsInstance(kwargs["source_connection"], sqlite3.Connection)
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_v2_generation_conflict_is_rejected_without_resetting_fence(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-agent-v2-generation-") as root:
+            path = Path(root) / "v1-generation-conflict.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL "
+                    "CHECK(context_type IN ('patrol','download_submission')),"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "created_at TEXT NOT NULL"
+                    ");"
+                    "CREATE INDEX idx_agent_session_context_lookup "
+                    "ON agent_session_context(owner_digest,context_type,expires_at,id DESC);"
+                    "CREATE INDEX idx_agent_session_context_expiry "
+                    "ON agent_session_context(expires_at);"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES('same-row','patrol','{}',9999999999,'2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+                conn.execute(
+                    "ALTER TABLE agent_session_context "
+                    "RENAME TO agent_session_context_v1"
+                )
+                conn.execute(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL,"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "context_generation INTEGER NOT NULL DEFAULT 0,"
+                    "created_at TEXT NOT NULL"
+                    ")"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "id,owner_digest,context_type,payload,expires_at,"
+                    "context_generation,created_at"
+                    ") VALUES(1,'same-row','patrol','{}',9999999999,9,'2026-08-01')"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "拒绝自动覆盖"):
+                    db.init_db()
+                conn = sqlite3.connect(path)
+                try:
+                    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    generation = int(
+                        conn.execute(
+                            "SELECT context_generation FROM agent_session_context WHERE id=1"
+                        ).fetchone()[0]
+                    )
+                    legacy_owner = str(
+                        conn.execute(
+                            "SELECT owner_digest FROM agent_session_context_v1 WHERE id=1"
+                        ).fetchone()[0]
+                    )
+                finally:
+                    conn.close()
+                self.assertEqual(version, 1)
+                self.assertEqual(generation, 9)
+                self.assertEqual(legacy_owner, "same-row")
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_interrupted_v2_rename_is_recovered_without_losing_rows(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-agent-v2-recover-") as root:
+            path = Path(root) / "v1-interrupted.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL "
+                    "CHECK(context_type IN ('patrol','download_submission')),"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "created_at TEXT NOT NULL"
+                    ");"
+                    "CREATE INDEX idx_agent_session_context_lookup "
+                    "ON agent_session_context(owner_digest,context_type,expires_at,id DESC);"
+                    "CREATE INDEX idx_agent_session_context_expiry "
+                    "ON agent_session_context(expires_at);"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES('preserved','patrol','{}',9999999999,'2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+                # 模拟旧版迁移在首条非事务 DDL 后退出。
+                conn.execute(
+                    "ALTER TABLE agent_session_context "
+                    "RENAME TO agent_session_context_v1"
+                )
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    preserved = migrated.execute(
+                        "SELECT context_type,context_generation "
+                        "FROM agent_session_context WHERE owner_digest='preserved'"
+                    ).fetchone()
+                    legacy_table = migrated.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='agent_session_context_v1'"
+                    ).fetchone()
+                self.assertEqual(version, db.SCHEMA_VERSION)
+                self.assertEqual(preserved["context_type"], "patrol")
+                self.assertEqual(int(preserved["context_generation"]), 0)
+                self.assertIsNone(legacy_table)
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_interrupted_v2_copy_restarts_from_complete_legacy_table(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-agent-v2-partial-") as root:
+            path = Path(root) / "v1-partial-copy.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL "
+                    "CHECK(context_type IN ('patrol','download_submission')),"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "created_at TEXT NOT NULL"
+                    ");"
+                    "CREATE INDEX idx_agent_session_context_lookup "
+                    "ON agent_session_context(owner_digest,context_type,expires_at,id DESC);"
+                    "CREATE INDEX idx_agent_session_context_expiry "
+                    "ON agent_session_context(expires_at);"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES('authoritative','patrol','{}',9999999999,'2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+                conn.execute(
+                    "ALTER TABLE agent_session_context "
+                    "RENAME TO agent_session_context_v1"
+                )
+                conn.execute(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL,"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "context_generation INTEGER NOT NULL DEFAULT 0,"
+                    "created_at TEXT NOT NULL"
+                    ")"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "id,owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES(1,'authoritative','patrol','{}',9999999999,'2026-08-01')"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    owners = {
+                        str(row["owner_digest"])
+                        for row in migrated.execute(
+                            "SELECT owner_digest FROM agent_session_context"
+                        )
+                    }
+                    legacy_table = migrated.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='agent_session_context_v1'"
+                    ).fetchone()
+                self.assertEqual(owners, {"authoritative"})
+                self.assertIsNone(legacy_table)
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_ambiguous_v2_double_table_state_is_rejected_without_data_loss(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-agent-v2-ambiguous-") as root:
+            path = Path(root) / "v1-ambiguous.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL "
+                    "CHECK(context_type IN ('patrol','download_submission')),"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "created_at TEXT NOT NULL"
+                    ");"
+                    "CREATE INDEX idx_agent_session_context_lookup "
+                    "ON agent_session_context(owner_digest,context_type,expires_at,id DESC);"
+                    "CREATE INDEX idx_agent_session_context_expiry "
+                    "ON agent_session_context(expires_at);"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES('legacy-row','patrol','{}',9999999999,'2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+                conn.execute(
+                    "ALTER TABLE agent_session_context "
+                    "RENAME TO agent_session_context_v1"
+                )
+                conn.execute(
+                    "CREATE TABLE agent_session_context ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL,"
+                    "context_type TEXT NOT NULL,"
+                    "payload TEXT NOT NULL,"
+                    "expires_at REAL NOT NULL,"
+                    "context_generation INTEGER NOT NULL DEFAULT 0,"
+                    "created_at TEXT NOT NULL"
+                    ")"
+                )
+                conn.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES('new-row','patrol','{}',9999999999,'2026-08-02')"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "拒绝自动覆盖"):
+                    db.init_db()
+                conn = sqlite3.connect(path)
+                try:
+                    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    legacy_owners = conn.execute(
+                        "SELECT owner_digest FROM agent_session_context_v1"
+                    ).fetchall()
+                    current_owners = conn.execute(
+                        "SELECT owner_digest FROM agent_session_context"
+                    ).fetchall()
+                finally:
+                    conn.close()
+                self.assertEqual(version, 1)
+                self.assertEqual(legacy_owners, [("legacy-row",)])
+                self.assertEqual(current_owners, [("new-row",)])
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
@@ -329,10 +682,66 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             path.touch()
             db.configure_database(path, test_mode=True)
             try:
-                db.init_db()
+                with (
+                    mock.patch.object(db, "_test_mode_enabled", return_value=False),
+                    mock.patch("app.modules.backup.create_backup") as backup,
+                ):
+                    db.init_db()
                 with db.get_conn() as conn:
                     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 self.assertEqual(version, db.SCHEMA_VERSION)
+                backup.assert_not_called()
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_unversioned_legacy_backup_failure_stops_before_baseline_changes(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-v0-backup-failure-") as root:
+            path = Path(root) / "legacy.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    "CREATE TABLE legacy_data(id INTEGER PRIMARY KEY,value TEXT NOT NULL)"
+                )
+                conn.execute("INSERT INTO legacy_data(id,value) VALUES(1,'preserved')")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            backup = mock.Mock(side_effect=BackupError("injected backup failure"))
+            try:
+                with (
+                    mock.patch.object(db, "_test_mode_enabled", return_value=False),
+                    mock.patch("app.modules.backup.create_backup", backup),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "数据库迁移前备份失败",
+                    ):
+                        db.init_db()
+                conn = sqlite3.connect(path)
+                try:
+                    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    tables = {
+                        str(row[0])
+                        for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )
+                    }
+                    value = str(
+                        conn.execute("SELECT value FROM legacy_data WHERE id=1").fetchone()[0]
+                    )
+                finally:
+                    conn.close()
+                self.assertEqual(version, 0)
+                self.assertEqual(tables, {"legacy_data"})
+                self.assertEqual(value, "preserved")
+                backup.assert_called_once()
+                self.assertEqual(
+                    backup.call_args.kwargs["reason"],
+                    "pre-migration-0-to-5",
+                )
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
@@ -549,6 +958,156 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                     }
                 self.assertEqual(version, 2)
                 self.assertIn("label", columns)
+            finally:
+                db._SCHEMA_MIGRATIONS.clear()
+                db._SCHEMA_MIGRATIONS.update(previous_migrations)
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_failed_future_migration_rolls_back_schema_data_and_version(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        previous_migrations = dict(db._SCHEMA_MIGRATIONS)
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-upgrade-rollback-") as root:
+            path = Path(root) / "v1.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("CREATE TABLE v1_data(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+                conn.execute("INSERT INTO v1_data(id,value) VALUES(1,'before')")
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+
+            def fail_mid_migration(conn: sqlite3.Connection) -> None:
+                conn.execute(
+                    "ALTER TABLE v1_data ADD COLUMN label TEXT NOT NULL DEFAULT ''"
+                )
+                conn.execute("UPDATE v1_data SET value='after',label='partial'")
+                raise sqlite3.OperationalError("injected migration failure")
+
+            try:
+                db._SCHEMA_MIGRATIONS.clear()
+                db._SCHEMA_MIGRATIONS[1] = fail_mid_migration
+                with mock.patch.object(db, "SCHEMA_VERSION", 2):
+                    with self.assertRaisesRegex(
+                        sqlite3.OperationalError,
+                        "injected migration failure",
+                    ):
+                        db.init_db()
+                conn = sqlite3.connect(path)
+                try:
+                    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {
+                        str(row[1])
+                        for row in conn.execute("PRAGMA table_info(v1_data)")
+                    }
+                    value = str(
+                        conn.execute("SELECT value FROM v1_data WHERE id=1").fetchone()[0]
+                    )
+                finally:
+                    conn.close()
+                self.assertEqual(version, 1)
+                self.assertEqual(columns, {"id", "value"})
+                self.assertEqual(value, "before")
+            finally:
+                db._SCHEMA_MIGRATIONS.clear()
+                db._SCHEMA_MIGRATIONS.update(previous_migrations)
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_failed_later_migration_rolls_back_entire_upgrade_chain(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        previous_migrations = dict(db._SCHEMA_MIGRATIONS)
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-chain-rollback-") as root:
+            path = Path(root) / "v1.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("CREATE TABLE v1_data(id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+                conn.execute("INSERT INTO v1_data(id,value) VALUES(1,'before')")
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+
+            def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+                conn.execute(
+                    "ALTER TABLE v1_data ADD COLUMN v2_label TEXT NOT NULL DEFAULT ''"
+                )
+
+            def fail_v2_to_v3(conn: sqlite3.Connection) -> None:
+                conn.execute(
+                    "ALTER TABLE v1_data ADD COLUMN v3_label TEXT NOT NULL DEFAULT ''"
+                )
+                conn.execute("UPDATE v1_data SET value='partial-v3'")
+                raise sqlite3.OperationalError("injected second migration failure")
+
+            try:
+                db._SCHEMA_MIGRATIONS.clear()
+                db._SCHEMA_MIGRATIONS.update({1: migrate_v1_to_v2, 2: fail_v2_to_v3})
+                with mock.patch.object(db, "SCHEMA_VERSION", 3):
+                    with self.assertRaisesRegex(
+                        sqlite3.OperationalError,
+                        "injected second migration failure",
+                    ):
+                        db.init_db()
+                conn = sqlite3.connect(path)
+                try:
+                    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {
+                        str(row[1])
+                        for row in conn.execute("PRAGMA table_info(v1_data)")
+                    }
+                    value = str(
+                        conn.execute("SELECT value FROM v1_data WHERE id=1").fetchone()[0]
+                    )
+                finally:
+                    conn.close()
+                self.assertEqual(version, 1)
+                self.assertEqual(columns, {"id", "value"})
+                self.assertEqual(value, "before")
+            finally:
+                db._SCHEMA_MIGRATIONS.clear()
+                db._SCHEMA_MIGRATIONS.update(previous_migrations)
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_keyboard_interrupt_rolls_back_schema_step(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        previous_migrations = dict(db._SCHEMA_MIGRATIONS)
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-interrupt-") as root:
+            path = Path(root) / "v1.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("CREATE TABLE v1_data(id INTEGER PRIMARY KEY)")
+                conn.execute("PRAGMA user_version=1")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+
+            def interrupt_migration(conn: sqlite3.Connection) -> None:
+                conn.execute("ALTER TABLE v1_data ADD COLUMN partial TEXT")
+                raise KeyboardInterrupt()
+
+            try:
+                db._SCHEMA_MIGRATIONS.clear()
+                db._SCHEMA_MIGRATIONS[1] = interrupt_migration
+                with mock.patch.object(db, "SCHEMA_VERSION", 2):
+                    with self.assertRaises(KeyboardInterrupt):
+                        db.init_db()
+                conn = sqlite3.connect(path)
+                try:
+                    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {
+                        str(row[1])
+                        for row in conn.execute("PRAGMA table_info(v1_data)")
+                    }
+                finally:
+                    conn.close()
+                self.assertEqual(version, 1)
+                self.assertEqual(columns, {"id"})
             finally:
                 db._SCHEMA_MIGRATIONS.clear()
                 db._SCHEMA_MIGRATIONS.update(previous_migrations)
