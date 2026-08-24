@@ -82,7 +82,7 @@
                 <span class="dashboard-metric-icon"><i data-lucide="layers-3"></i></span>
             </div>
             <div class="dashboard-metric-value"><span data-metric="total_items" data-count-target="{{ b.total_items }}">{{ "{:,}".format(b.total_items) }}</span><small>项</small></div>
-            <div class="dashboard-metric-foot">已建立索引的全部媒体</div>
+            <div class="dashboard-metric-foot" data-media-composition>{% if b.movie_count or b.series_count or b.episode_count %}{{ b.movie_count }} 部电影 · {{ b.series_count }} 部剧集 · {{ b.episode_count }} 集{% else %}已建立索引的可播放媒体{% endif %}</div>
         </article>
         <article class="dashboard-metric">
             <div class="dashboard-metric-head">
@@ -167,7 +167,7 @@
             {% if not b.libraries %}
             <div class="dashboard-panel-empty"><i data-lucide="library"></i><span>暂无媒体库信息</span></div>
             {% endif %}
-            <footer class="dashboard-library-foot"><span data-library-footer-count>{{ b.libraries|length }} 个媒体库</span><span data-library-footer-total>{{ "{:,}".format(b.total_items) }} 项内容</span><span class="is-status" data-library-footer-health><i data-lucide="check"></i>{{ b.server_product or b.server_type|upper }} 正常</span></footer>
+            <footer class="dashboard-library-foot"><span data-library-footer-count>{{ b.libraries|length }} 个媒体库</span><span data-library-footer-total>{{ "{:,}".format(b.total_items) }} 个可播放项</span><span class="is-status" data-library-footer-health><i data-lucide="check"></i>{{ b.server_product or b.server_type|upper }} 正常</span></footer>
         </aside>
     </section>
 
@@ -375,6 +375,9 @@
         if(lowerGrid) lowerGrid.hidden=false;
 
         const totalItems=Number(board.total_items)||0;
+        const movieCount=Number(board.movie_count)||0;
+        const seriesCount=Number(board.series_count)||0;
+        const episodeCount=Number(board.episode_count)||0;
         const libraries=Array.isArray(board.libraries)?board.libraries:[];
         const recentAdded=Array.isArray(board.recent_added)?board.recent_added:[];
         const recentPlayed=Array.isArray(board.recent_played)?board.recent_played:[];
@@ -392,6 +395,12 @@
                 element.textContent=Number(value).toLocaleString('zh-CN');
             }
         });
+        const mediaComposition=panel.querySelector('[data-media-composition]');
+        if(mediaComposition){
+            mediaComposition.textContent=(movieCount||seriesCount||episodeCount)
+                ? `${movieCount} 部电影 · ${seriesCount} 部剧集 · ${episodeCount} 集`
+                : '已建立索引的可播放媒体';
+        }
 
         const playbackScroll=panel.querySelector('.dashboard-table-scroll');
         const playbackBody=panel.querySelector('.dashboard-playback-table tbody');
@@ -429,7 +438,7 @@
         const libraryFooterHealth=panel.querySelector('[data-library-footer-health]');
         if(libraryCountLabel) libraryCountLabel.textContent=`${libraries.length} 个分区`;
         if(libraryFooterCount) libraryFooterCount.textContent=`${libraries.length} 个媒体库`;
-        if(libraryFooterTotal) libraryFooterTotal.textContent=`${totalItems.toLocaleString('zh-CN')} 项内容`;
+        if(libraryFooterTotal) libraryFooterTotal.textContent=`${totalItems.toLocaleString('zh-CN')} 个可播放项`;
         if(libraryFooterHealth) libraryFooterHealth.innerHTML=`<i data-lucide="${board.online?'check':'circle-alert'}"></i>${esc(board.server_product||String(board.server_type||'').toUpperCase())} ${board.online?'正常':'异常'}`;
         if(libraries.length && libBody){
             libContainer?.querySelector(':scope > .dashboard-panel-empty')?.remove();

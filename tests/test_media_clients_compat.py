@@ -30,6 +30,49 @@ class MediaRuntimeTests(unittest.TestCase):
         self.assertEqual(EmbyClient("http://legacy.local", "token")._media_item(payload).runtime, 0)
 
 
+class DashboardMediaCountTests(unittest.TestCase):
+    def test_total_items_counts_only_user_visible_playable_media(self):
+        expected_params = {
+            "Recursive": "true",
+            "Limit": 0,
+            "EnableImages": "false",
+            "IncludeItemTypes": "Movie,Episode,Audio,MusicVideo,Book,Video",
+        }
+        for client in (
+            JellyfinClient("http://jellyfin.local", "key"),
+            EmbyClient("http://legacy.local", "token"),
+        ):
+            with self.subTest(client=type(client).__name__):
+                client._cached_user_id = "user-id"
+                client._request = Mock(return_value={"TotalRecordCount": 16})
+
+                self.assertEqual(client._total_items(), 16)
+                client._request.assert_called_once_with(
+                    "/Users/user-id/Items",
+                    params=expected_params,
+                )
+
+    def test_jellyfin_media_counts_are_scoped_to_dashboard_user(self):
+        client = JellyfinClient("http://jellyfin.local", "key")
+        client._cached_user_id = "user-id"
+        client._request = Mock(return_value={
+            "MovieCount": 3,
+            "SeriesCount": 8,
+            "EpisodeCount": 13,
+            "ItemCount": 36,
+        })
+
+        self.assertEqual(client._media_counts(), {
+            "movie_count": 3,
+            "series_count": 8,
+            "episode_count": 13,
+        })
+        client._request.assert_called_once_with(
+            "/Items/Counts",
+            params={"userId": "user-id"},
+        )
+
+
 class LegacyMediaClientTests(unittest.TestCase):
     def test_identifies_jellyfin_10_compatible_node(self):
         client = EmbyClient("http://legacy.local", "token")
@@ -285,7 +328,17 @@ class PartialDashboardTests(unittest.TestCase):
         def isolated(method_name, user_id):
             if method_name == "_libraries":
                 raise RuntimeError("library timeout")
-            return {"_recent_added": [], "_recent_played": [], "_total_items": 123, "_total_plays": 5}[method_name]
+            return {
+                "_recent_added": [],
+                "_recent_played": [],
+                "_total_items": 16,
+                "_media_counts": {
+                    "movie_count": 3,
+                    "series_count": 8,
+                    "episode_count": 13,
+                },
+                "_total_plays": 5,
+            }[method_name]
 
         client._isolated_part = isolated
         board = client.get_dashboard()
@@ -293,7 +346,11 @@ class PartialDashboardTests(unittest.TestCase):
         self.assertTrue(board.online)
         self.assertEqual(board.server_product, "Jellyfin")
         self.assertEqual(board.server_version, "12.0.0")
-        self.assertEqual(board.total_items, 123)
+        self.assertEqual(board.total_items, 16)
+        self.assertEqual(
+            (board.movie_count, board.series_count, board.episode_count),
+            (3, 8, 13),
+        )
         self.assertEqual(board.partial_errors, ["libraries"])
 
 

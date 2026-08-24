@@ -27,6 +27,7 @@ logger = get_logger(__name__)
 
 class JellyfinClient(MediaServerClient):
     display_name = "Jellyfin"
+    _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
     _LIBRARY_TYPES = {
         "tvshows": "Series",
         "movies": "Movie",
@@ -91,6 +92,7 @@ class JellyfinClient(MediaServerClient):
             "recent_added": ("_recent_added", []),
             "recent_played": ("_recent_played", []),
             "total_items": ("_total_items", 0),
+            "media_counts": ("_media_counts", {}),
             "total_plays": ("_total_plays", 0),
         }
         with ThreadPoolExecutor(max_workers=len(parts), thread_name_prefix="jellyfin-dashboard") as pool:
@@ -101,9 +103,20 @@ class JellyfinClient(MediaServerClient):
             failure_types: list[str] = []
             for name, (method_name, default) in parts.items():
                 try:
-                    setattr(data, name, futures[name].result())
+                    result = futures[name].result()
+                    if name == "media_counts":
+                        data.movie_count = int(result.get("movie_count", 0) or 0)
+                        data.series_count = int(result.get("series_count", 0) or 0)
+                        data.episode_count = int(result.get("episode_count", 0) or 0)
+                    else:
+                        setattr(data, name, result)
                 except Exception as exc:
-                    setattr(data, name, default)
+                    if name == "media_counts":
+                        data.movie_count = 0
+                        data.series_count = 0
+                        data.episode_count = 0
+                    else:
+                        setattr(data, name, default)
                     data.partial_errors.append(name)
                     failure_types.append(f"{name}:{type(exc).__name__}")
         if failure_types:
@@ -465,8 +478,25 @@ class JellyfinClient(MediaServerClient):
             return self._recent_played_from_user_data(user_id, normalized_limit)
 
     def _total_items(self) -> int:
-        data = self._request("/Items/Counts")
-        return int(data.get("ItemCount", 0) or 0)
+        user_id = self._user_id()
+        data = self._request(
+            f"/Users/{user_id}/Items",
+            params={
+                "Recursive": "true",
+                "Limit": 0,
+                "EnableImages": "false",
+                "IncludeItemTypes": self._PLAYABLE_ITEM_TYPES,
+            },
+        )
+        return int(data.get("TotalRecordCount", 0) or 0)
+
+    def _media_counts(self) -> dict[str, int]:
+        data = self._request("/Items/Counts", params={"userId": self._user_id()})
+        return {
+            "movie_count": int(data.get("MovieCount", 0) or 0),
+            "series_count": int(data.get("SeriesCount", 0) or 0),
+            "episode_count": int(data.get("EpisodeCount", 0) or 0),
+        }
 
     def continue_watching(self, user_id: str, *, limit: int = 12) -> list[MediaItem]:
         selected = normalize_explicit_media_user_id(user_id)

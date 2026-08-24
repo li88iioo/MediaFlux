@@ -814,6 +814,9 @@ def dashboard_data(request: Request, refresh: bool = False):
                 "server_version": b.server_version,
                 "partial_errors": b.partial_errors,
                 "total_items": b.total_items,
+                "movie_count": b.movie_count,
+                "series_count": b.series_count,
+                "episode_count": b.episode_count,
                 "total_plays": b.total_plays,
                 "libraries": [
                     {

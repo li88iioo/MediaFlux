@@ -138,6 +138,9 @@ class DashboardData:
     recent_added: list[MediaItem] = field(default_factory=list)
     recent_played: list[MediaItem] = field(default_factory=list)
     total_items: int = 0
+    movie_count: int = 0
+    series_count: int = 0
+    episode_count: int = 0
     total_plays: int = 0
     online: bool = False
     error: str = ""

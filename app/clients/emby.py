@@ -23,6 +23,7 @@ logger = get_logger(__name__)
 
 class EmbyClient(MediaServerClient):
     display_name = "Emby / Jellyfin 10.x"
+    _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
     _LIBRARY_TYPES = {
         "tvshows": "Series",
         "movies": "Movie",
@@ -279,7 +280,12 @@ class EmbyClient(MediaServerClient):
         uid = self._user_id()
         data = self._request(
             f"/Users/{uid}/Items",
-            params={"Recursive": "true", "Limit": 0},
+            params={
+                "Recursive": "true",
+                "Limit": 0,
+                "EnableImages": "false",
+                "IncludeItemTypes": self._PLAYABLE_ITEM_TYPES,
+            },
         )
         return int(data.get("TotalRecordCount", 0) or 0)
 

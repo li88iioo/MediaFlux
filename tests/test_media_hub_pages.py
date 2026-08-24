@@ -50,7 +50,10 @@ class MediaHubPageContractTests(InitializedWebTestCase):
             server_type="jellyfin",
             web_url="http://media.example:8096",
             online=True,
-            total_items=20,
+            total_items=16,
+            movie_count=3,
+            series_count=8,
+            episode_count=13,
             libraries=[
                 Library(
                     id="lib-1",
@@ -173,6 +176,8 @@ class MediaHubPageContractTests(InitializedWebTestCase):
         self.assertIn('href="/media/recent?server=jellyfin"', response.text)
         self.assertIn('href="http://media.example:8096"', response.text)
         self.assertIn("打开媒体库", response.text)
+        self.assertIn("data-media-composition", response.text)
+        self.assertIn("3 部电影 · 8 部剧集 · 13 集", response.text)
         self.assertNotIn("打开媒体服务", response.text)
         self.assertNotIn(">配置<", response.text)
         self.assertNotIn(">管理<", response.text)

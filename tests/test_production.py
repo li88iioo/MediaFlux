@@ -2886,6 +2886,27 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(response.json(), [])
         dashboards.assert_called_once_with(force=True)
 
+    def test_dashboard_api_exposes_playable_total_and_media_composition(self):
+        headers = self._authenticated()
+        board = DashboardData(
+            server_name="AIO",
+            server_type="jellyfin",
+            online=True,
+            total_items=16,
+            movie_count=3,
+            series_count=8,
+            episode_count=13,
+        )
+        with patch("app.routes.api.build_dashboards", return_value=[board]):
+            response = self.client.get("/api/dashboard", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()[0]
+        self.assertEqual(payload["total_items"], 16)
+        self.assertEqual(payload["movie_count"], 3)
+        self.assertEqual(payload["series_count"], 8)
+        self.assertEqual(payload["episode_count"], 13)
+
     def test_download_overview_reports_unconfigured_qb_without_creating_client(self):
         headers = self._authenticated()
         with patch(
