@@ -2059,6 +2059,11 @@ def _mark_direct_source(
         # <video> 设置 crossorigin=anonymous，原生媒体元素即可用 no-cors GET
         # 跟随 MediaFlux 的 302。
         if web_direct_http_source:
+            # Jellyfin Web 首次播放会在客户端侧探测并写入该私有字段；但切换
+            # 清晰度时 changeStream() 会直接消费新的 PlaybackInfo，不再重复探测。
+            # 明确标记后，它会继续采用下面携带 capability 的 Path，而不是重建
+            # 一个丢失 _mfps/_mfss 的标准 stream URL。
+            source["enableDirectPlay"] = True
             source["RequiredHttpHeaders"] = {}
             # Jellyfin Web 12 只要看到 TranscodingSubProtocol=HLS，就算当前
             # playMethod 是 DirectPlay 也会交给 hls.js/XHR，随后跨域 302 被 CDN

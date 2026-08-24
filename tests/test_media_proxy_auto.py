@@ -4767,6 +4767,115 @@ class HybridMediaProxyTests(unittest.TestCase):
             json.loads(_FakeAsyncClient.requests[0].content), request_body
         )
 
+    def test_web_quality_switch_reuses_rewritten_direct_play_path(self):
+        payload = {
+            "PlaySessionId": "web-quality-session",
+            "MediaSources": [{
+                "Id": "web-quality-source",
+                "Path": "/playgy/web-quality-file/e/1/video.mp4",
+                "Protocol": "File",
+                "Container": "mp4",
+                "SupportsDirectPlay": True,
+                "SupportsDirectStream": True,
+                "SupportsTranscoding": True,
+                "TranscodingUrl": "/Videos/web-quality-item/master.m3u8",
+                "TranscodingContainer": "ts",
+                "TranscodingSubProtocol": "hls",
+            }],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+        ]
+        initial_request_body = {
+            "MediaSourceId": "web-quality-source",
+            "MaxStreamingBitrate": 20_000_000,
+            "DeviceProfile": {
+                "Name": "Jellyfin Web",
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                }],
+            },
+        }
+        switched_request_body = copy.deepcopy(initial_request_body)
+        switched_request_body["MaxStreamingBitrate"] = 4_000_000
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            initial_response = client.post(
+                "/Items/web-quality-item/PlaybackInfo?api_key=client-token",
+                json=initial_request_body,
+                headers={
+                    "X-Emby-Client": "Jellyfin Web",
+                    "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                },
+            )
+            switched_response = client.post(
+                "/Items/web-quality-item/PlaybackInfo?api_key=client-token",
+                json=switched_request_body,
+                headers={
+                    "X-Emby-Client": "Jellyfin Web",
+                    "User-Agent": "Mozilla/5.0 Jellyfin Web",
+                },
+            )
+
+        self.assertEqual(initial_response.status_code, 200)
+        self.assertEqual(switched_response.status_code, 200)
+        for response in (initial_response, switched_response):
+            source = response.json()["MediaSources"][0]
+            self.assertTrue(source["enableDirectPlay"])
+            self.assertTrue(source["SupportsDirectPlay"])
+            self.assertTrue(source["SupportsTranscoding"])
+            self.assertTrue(source["IsRemote"])
+            self.assertEqual(source["Protocol"], "Http")
+            self.assertEqual(source["RequiredHttpHeaders"], {})
+            self.assertNotIn("TranscodingSubProtocol", source)
+            self.assertEqual(
+                source["TranscodingUrl"],
+                "/Videos/web-quality-item/master.m3u8",
+            )
+            self.assertEqual(source["DirectStreamUrl"], source["Path"])
+            stream_url = urlsplit(source["Path"])
+            self.assertEqual(stream_url.path, "/Videos/web-quality-item/stream")
+            stream_query = parse_qs(stream_url.query)
+            self.assertEqual(
+                stream_query["MediaSourceId"],
+                ["web-quality-source"],
+            )
+            self.assertEqual(len(stream_query["_mfps"]), 1)
+            self.assertEqual(len(stream_query["_mfss"]), 1)
+
+        self.assertEqual(len(_FakeAsyncClient.requests), 2)
+        for upstream_request, request_body in zip(
+            _FakeAsyncClient.requests,
+            (initial_request_body, switched_request_body),
+            strict=True,
+        ):
+            self.assertEqual(upstream_request.method, "POST")
+            upstream_query = parse_qs(upstream_request.url.query.decode())
+            self.assertEqual(upstream_query["EnableDirectPlay"], ["true"])
+            self.assertEqual(upstream_query["EnableDirectStream"], ["true"])
+            self.assertEqual(json.loads(upstream_request.content), request_body)
+
     def test_web_playback_retries_default_audio_and_grants_true_302(self):
         first_payload = {
             "PlaySessionId": "web-audio-session",
@@ -5198,8 +5307,14 @@ class HybridMediaProxyTests(unittest.TestCase):
             "MediaSources": [{
                 "Id": "web-fallback-source",
                 "Path": "/playgy/web-fallback/e/1/video.mkv",
+                "Protocol": "File",
                 "Container": "mkv",
-                "SupportsDirectPlay": False,
+                "SupportsDirectPlay": True,
+                "SupportsDirectStream": True,
+                "SupportsTranscoding": True,
+                "TranscodingUrl": "/Videos/web-fallback-item/master.m3u8",
+                "TranscodingContainer": "ts",
+                "TranscodingSubProtocol": "hls",
                 "DefaultAudioStreamIndex": 1,
                 "MediaStreams": [
                     {"Type": "Video", "Index": 0, "Codec": "h264"},
@@ -5249,6 +5364,21 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(_FakeAsyncClient.requests), 1)
+        source = response.json()["MediaSources"][0]
+        self.assertNotIn("enableDirectPlay", source)
+        self.assertTrue(source["SupportsDirectPlay"])
+        self.assertEqual(
+            source["Path"],
+            "/playgy/web-fallback/e/1/video.mkv",
+        )
+        self.assertNotIn("_mfps", source["Path"])
+        self.assertNotIn("_mfss", source["Path"])
+        self.assertEqual(source["Protocol"], "File")
+        self.assertEqual(source["TranscodingSubProtocol"], "hls")
+        self.assertEqual(
+            source["TranscodingUrl"],
+            "/Videos/web-fallback-item/master.m3u8",
+        )
 
     def test_android_retry_two_preserves_upstream_direct_stream_contract(self):
         payload = {
