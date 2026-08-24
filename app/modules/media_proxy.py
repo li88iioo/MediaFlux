@@ -49,8 +49,9 @@ _PLAYBACK_INFO_RE = re.compile(r"^(?:/emby)?/Items/([^/]+)/PlaybackInfo/?$", re.
 _PLAYGY_RE = re.compile(r"^(?:/emby)?/playgy/([^/]+)(?:/.*)?$", re.IGNORECASE)
 _HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "te", "trailers", "transfer-encoding", "upgrade",
 }
+_REQUEST_ONLY_HEADERS = {"host", "content-length"}
 _FORWARDED_CLIENT_HEADERS = {
     "forwarded",
     "x-forwarded-for",
@@ -720,6 +721,48 @@ class SignedUrlCache:
 class SignedUrlCacheResult:
     url: str | None
     cache_hit: bool
+
+
+class BrowserDirectTargetCache:
+    """记录已完成公网目标校验的 signed URL，避免缓存命中仍重复 DNS。"""
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = 60.0,
+        max_entries: int = 2048,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_entries = max(1, int(max_entries))
+        self._clock = clock
+        self._entries: OrderedDict[str, float] = OrderedDict()
+        self._lock = threading.RLock()
+
+    def contains(self, url: str) -> bool:
+        key = str(url or "")
+        now = self._clock()
+        with self._lock:
+            expiry = self._entries.get(key, 0.0)
+            if expiry > now:
+                self._entries.move_to_end(key)
+                return True
+            self._entries.pop(key, None)
+            return False
+
+    def remember(self, url: str) -> None:
+        key = str(url or "")
+        if not key:
+            return
+        with self._lock:
+            self._entries.pop(key, None)
+            self._entries[key] = self._clock() + self._ttl_seconds
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
 
 
 @dataclass
@@ -2432,7 +2475,7 @@ def _response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {
         key: value
         for key, value in headers.items()
-        if key.lower() not in _HOP_HEADERS | {"set-cookie"}
+        if key.lower() not in _HOP_HEADERS | {"host", "set-cookie"}
     }
 
 
@@ -2463,7 +2506,7 @@ def _request_headers(request: Request) -> dict[str, str]:
     headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in _HOP_HEADERS
+        if key.lower() not in _HOP_HEADERS | _REQUEST_ONLY_HEADERS
     }
     for key in tuple(headers):
         if key.casefold() != "cookie":
@@ -4115,6 +4158,7 @@ def create_proxy_app(
     app.state.playback_record_writer = recorder
     app.state.upstream_clients = upstream_clients
     signed_urls = signed_urls or SignedUrlCache()
+    browser_direct_targets = BrowserDirectTargetCache()
     _register_signed_url_cache(instance_id, signed_urls)
     signed_media_probe_slots = asyncio.Semaphore(
         _SIGNED_MEDIA_PROBE_MAX_CONCURRENCY
@@ -4688,6 +4732,7 @@ def create_proxy_app(
             if not client.logged_in:
                 request.state.proxy_failure_stage = "provider_auth"
                 signed_urls.clear()
+                browser_direct_targets.clear()
                 return JSONResponse({"error": "光鸭未登录"}, status_code=503)
             try:
                 raw_client = client.raw
@@ -4808,16 +4853,20 @@ def create_proxy_app(
                 # 健全性检查，并不等同于钉住浏览器随后采用的 DNS 结果。真正需要
                 # DNS pinning 的 HLS/XHR 与不安全协议降级仍统一走 relay。
                 try:
-                    pinned_redirect = await asyncio.wait_for(
-                        run_signed_media_probe_blocking(
-                            _pin_signed_media_target,
-                            client_url,
-                        ),
-                        timeout=max(
-                            0.001,
-                            _SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS,
-                        ),
-                    )
+                    if browser_direct_targets.contains(client_url):
+                        pinned_redirect = None
+                    else:
+                        pinned_redirect = await asyncio.wait_for(
+                            run_signed_media_probe_blocking(
+                                _pin_signed_media_target,
+                                client_url,
+                            ),
+                            timeout=max(
+                                0.001,
+                                _SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS,
+                            ),
+                        )
+                        browser_direct_targets.remember(client_url)
                 except _SignedMediaProbeCapacityError:
                     request.state.proxy_failure_stage = (
                         "signed_url_probe_capacity"
@@ -4843,7 +4892,8 @@ def create_proxy_app(
                         {"error": "媒体直链地址无效"},
                         status_code=502,
                     )
-                redirect_url = pinned_redirect.logical_url
+                if pinned_redirect is not None:
+                    redirect_url = pinned_redirect.logical_url
                 request.state.proxy_action = "guangya_302_web_direct"
             return RedirectResponse(
                 redirect_url,

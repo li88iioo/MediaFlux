@@ -39,6 +39,15 @@ class AgentSettingsUiTests(unittest.TestCase):
             return json.loads(response.body)
         return response
 
+    def test_shared_config_save_surfaces_runtime_warnings_without_false_success(self):
+        source = Path("app/static/js/app.js").read_text(encoding="utf-8")
+        stylesheet = Path("app/static/css/main.css").read_text(encoding="utf-8")
+
+        self.assertIn("Array.isArray(data.warnings)", source)
+        self.assertIn("warnings.join('；'), 'warning'", source)
+        self.assertIn("triangle-alert", source)
+        self.assertIn(".app-toast.is-warning", stylesheet)
+
     def test_agent_defaults_to_disabled_when_unconfigured(self):
         with patch(
             "app.agent.feature_gate.config.get_bool",

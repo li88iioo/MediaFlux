@@ -578,7 +578,9 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
                 events.append("lock-exit")
 
         with patch.object(bot_handlers, "_lifecycle_control_lock", TrackingLock()), patch.object(
-            bot_handlers, "_stop_bot_locked", side_effect=lambda: events.append("stop")
+            bot_handlers,
+            "_stop_bot_locked",
+            side_effect=lambda **_kwargs: events.append("stop") or True,
         ), patch(
             "app.notifier.reset", side_effect=lambda: events.append("reset")
         ), patch.object(
@@ -590,6 +592,69 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
             events,
             ["lock-enter", "stop", "reset", "start", "lock-exit"],
         )
+
+    def test_restart_does_not_start_new_generation_until_old_polling_exits(self):
+        with patch.object(bot_handlers, "_stop_bot_locked", return_value=False), patch(
+            "app.notifier.reset"
+        ) as reset, patch.object(bot_handlers, "_start_bot_locked") as start:
+            self.assertFalse(bot_handlers.restart_bot())
+
+        reset.assert_not_called()
+        start.assert_not_called()
+
+    def test_polling_supervisor_reconnects_after_unexpected_exception(self):
+        class StopEvent:
+            def __init__(self):
+                self.stopped = False
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, _timeout):
+                return self.stopped
+
+        stop_event = StopEvent()
+
+        class Bot:
+            def __init__(self):
+                self.calls = 0
+
+            def infinity_polling(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("network")
+                stop_event.stopped = True
+
+        bot = Bot()
+        with patch.object(bot_handlers, "init_bot", return_value=bot), patch.object(
+            bot_handlers, "_ensure_command_menu", return_value=True
+        ):
+            bot_handlers.start_bot_blocking(stop_event)
+
+        self.assertEqual(bot.calls, 2)
+
+    def test_polling_supervisor_waits_before_reconnect_after_normal_return(self):
+        class StopEvent:
+            def __init__(self):
+                self.stopped = False
+                self.waits = []
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, timeout):
+                self.waits.append(timeout)
+                self.stopped = True
+                return True
+
+        stop_event = StopEvent()
+        bot = type("Bot", (), {"infinity_polling": lambda self, **_kwargs: None})()
+        with patch.object(bot_handlers, "init_bot", return_value=bot), patch.object(
+            bot_handlers, "_ensure_command_menu", return_value=True
+        ):
+            bot_handlers.start_bot_blocking(stop_event)
+
+        self.assertEqual(stop_event.waits, [1.0])
 
     def test_startup_stop_event_prevents_late_initialization_and_polling(self):
         stop_event = __import__("threading").Event()

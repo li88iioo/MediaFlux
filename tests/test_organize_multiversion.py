@@ -560,6 +560,63 @@ class _TvVariantTreeClient(_VariantTreeClient):
 
 
 class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
+    def test_historical_identity_is_not_lost_behind_large_audit_history(self):
+        from app import database as db
+
+        db.add_organize_log(
+            "guangya",
+            "incoming/old.mkv",
+            "电影/目标影片 (2026) {tmdb-4242}/目标影片.mkv",
+            "old-file",
+            "success",
+            "4242",
+            provider="tmdb",
+            external_id="4242",
+            media_type="movie",
+            original_parent_id="incoming",
+            original_name="old.mkv",
+        )
+        stamp = db.now()
+        with db.get_conn() as conn:
+            conn.executemany(
+                "INSERT INTO organize_log("
+                "source,original_path,new_path,file_id,status,tmdb_id,provider,external_id,"
+                "media_type,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        "guangya", f"incoming/noise-{index}.mkv",
+                        f"其他/noise-{index}.mkv", f"noise-{index}", "success",
+                        str(100000 + index), "tmdb", str(100000 + index), "movie",
+                        stamp, stamp,
+                    )
+                    for index in range(5_100)
+                ],
+            )
+
+        organizer = Organizer(client=Mock(), scraper=Mock())
+        self.assertIn(
+            ("movie", "tmdb:4242"),
+            organizer._historical_root_identities("电影/目标影片 (2026) {tmdb-4242}"),
+        )
+
+    def test_organize_log_high_water_returns_all_rows_from_current_operation(self):
+        from app import database as db
+
+        before = db.latest_organize_log_id()
+        first = db.add_organize_log(
+            "guangya", "a.mkv", "电影/A/A.mkv", "a", "success",
+            original_parent_id="source", original_name="a.mkv",
+        )
+        second = db.add_organize_log(
+            "guangya", "b.mkv", "电影/B/B.mkv", "b", "manual",
+            original_parent_id="source", original_name="b.mkv",
+        )
+
+        self.assertEqual(
+            [int(row["id"]) for row in db.list_organize_logs_after(before)],
+            [first, second],
+        )
+
     def _rules(self, **overrides):
         values = {
             "target_dir_id": "target",

@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +38,31 @@ def make_paths(root: Path) -> RuntimePaths:
 
 
 class BackupTests(unittest.TestCase):
+    def test_create_app_recovers_pending_restore_before_reading_session_secret(self) -> None:
+        from app import main
+
+        events: list[str] = []
+
+        @contextmanager
+        def lifecycle_guard(_paths):
+            events.append("lock")
+            yield
+
+        with patch(
+            "app.modules.backup.runtime_lifecycle_guard",
+            side_effect=lifecycle_guard,
+        ), patch(
+            "app.modules.backup.recover_pending_restore",
+            side_effect=lambda *_args, **_kwargs: events.append("recover") or True,
+        ), patch.object(
+            main,
+            "_secret_key",
+            side_effect=lambda: events.append("secret") or "test-secret",
+        ):
+            main.create_app(start_background=False)
+
+        self.assertLess(events.index("recover"), events.index("secret"))
+
     def test_runtime_lifecycle_is_reentrant_within_process_but_keeps_file_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_paths(Path(directory))

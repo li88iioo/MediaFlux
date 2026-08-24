@@ -2558,6 +2558,12 @@ class TelegramBotTests(unittest.TestCase):
             restart.assert_called_once()
             reset.assert_not_called()
 
+            restart.reset_mock(return_value=True)
+            restart.return_value = False
+            result = api.save_config(background_request, payload)
+            self.assertTrue(result["success"])
+            self.assertIn("Telegram Bot 配置已保存", result["warnings"][0])
+
     def test_notifier_reuses_single_bot_and_escapes_event_content(self):
         from app import notifier
 

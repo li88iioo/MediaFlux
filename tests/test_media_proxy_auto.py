@@ -3224,7 +3224,6 @@ class HybridMediaProxyTests(unittest.TestCase):
             [item.args[0] for item in pin_signed_target.call_args_list],
             [
                 "https://signed.invalid/web-direct-file",
-                "https://signed.invalid/web-direct-file",
                 "https://signed.invalid/web-transcode-file",
             ],
         )
@@ -8299,7 +8298,16 @@ class HybridMediaProxyTests(unittest.TestCase):
 
     def test_unbound_emby_stream_is_forwarded_unchanged_to_upstream(self):
         _FakeAsyncClient.responses = [
-            _FakeUpstreamResponse(status_code=206, body=b"local-video")
+            _FakeUpstreamResponse(
+                status_code=206,
+                body=b"local-video",
+                headers={
+                    "content-length": "11",
+                    "content-range": "bytes 0-10/100",
+                    "accept-ranges": "bytes",
+                    "host": "upstream.invalid",
+                },
+            )
         ]
         app = media_proxy.create_proxy_app(7)
         with (
@@ -8309,16 +8317,23 @@ class HybridMediaProxyTests(unittest.TestCase):
             TestClient(app, raise_server_exceptions=False) as client,
         ):
             response = client.get(
-                "/emby/Videos/local-item/stream?MediaSourceId=local-source&api_key=client-token"
+                "/emby/Videos/local-item/stream?MediaSourceId=local-source&api_key=client-token",
+                headers={"Range": "bytes=0-10"},
             )
 
         self.assertEqual(response.status_code, 206)
         self.assertEqual(response.content, b"local-video")
+        self.assertEqual(response.headers["content-length"], "11")
+        self.assertEqual(response.headers["content-range"], "bytes 0-10/100")
+        self.assertEqual(response.headers["accept-ranges"], "bytes")
+        self.assertNotIn("host", response.headers)
         self.assertEqual(
             str(_FakeAsyncClient.requests[0].url),
             "http://127.0.0.1:8096/emby/Videos/local-item/stream?MediaSourceId=local-source",
         )
         self.assertEqual(_FakeAsyncClient.requests[0].headers["X-Emby-Token"], "client-token")
+        self.assertEqual(_FakeAsyncClient.requests[0].headers["Range"], "bytes=0-10")
+        self.assertNotIn("Content-Length", _FakeAsyncClient.requests[0].headers)
 
     def test_fallback_manual_binding_does_not_rewrite_a_different_local_source(self):
         payload = {

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -64,6 +66,45 @@ class FakeSearchProvider:
 
 
 class DiscoverySearchUnitTests(unittest.TestCase):
+    def test_shutdown_defers_provider_close_until_inflight_search_finishes(self):
+        from app.discovery.search import DiscoverySearchService
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingProvider(FakeSearchProvider):
+            def __init__(self):
+                super().__init__("tmdb")
+                self.closed = False
+
+            def search(self, query, page):
+                started.set()
+                release.wait(timeout=2)
+                return [], False
+
+            def close(self):
+                self.closed = True
+
+        provider = BlockingProvider()
+        service = DiscoverySearchService(providers={"tmdb": provider})
+        result_holder = []
+        thread = threading.Thread(
+            target=lambda: result_holder.append(
+                service.search("测试", 1, ["tmdb"], timeout_seconds=0.01)
+            )
+        )
+        thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        thread.join(timeout=1)
+        service.shutdown()
+        self.assertFalse(provider.closed)
+
+        release.set()
+        deadline = time.monotonic() + 1
+        while not provider.closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(provider.closed)
+
     def test_tmdb_search_maps_movie_and_tv_and_ignores_people(self):
         from app.discovery.search import TMDBSearchProvider
 

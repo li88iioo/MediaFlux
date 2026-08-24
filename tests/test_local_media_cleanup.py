@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from app.modules.local_media_cleanup import (
     classify_cleanup_items,
@@ -67,6 +69,84 @@ class LocalMediaCleanupTests(unittest.TestCase):
             self.assertTrue(group.exists())
             self.assertEqual(len(result.deleted), 1)
             self.assertEqual(len(result.warnings), 1)
+
+    def test_delete_quarantines_and_restores_file_replaced_after_snapshot_check(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); group = root / "Movie"; group.mkdir()
+            junk = group / "广告说明.txt"; junk.write_bytes(b"old")
+            adapter = LocalFilesystemAdapter(root)
+            cleanup, _ = classify_cleanup_items([adapter.snapshot(junk)])
+
+            original_verify = LocalFilesystemAdapter.verify_snapshot
+
+            def replace_after_verify(current_adapter, snapshot):
+                verified = original_verify(current_adapter, snapshot)
+                replacement = group / "replacement.tmp"
+                replacement.write_bytes(b"new payload")
+                os.replace(replacement, junk)
+                return verified
+
+            with patch.object(
+                LocalFilesystemAdapter,
+                "verify_snapshot",
+                autospec=True,
+                side_effect=replace_after_verify,
+            ):
+                result = delete_cleanup_items(cleanup, allowed_root=root, selected_path=group)
+
+            self.assertTrue(junk.exists())
+            self.assertEqual(junk.read_bytes(), b"new payload")
+            self.assertEqual(result.deleted, [])
+            self.assertEqual(len(result.warnings), 1)
+
+    def test_quarantine_directory_swap_cannot_redirect_deletion_outside_root(self):
+        with tempfile.TemporaryDirectory() as root_raw, tempfile.TemporaryDirectory() as outside_raw:
+            root = Path(root_raw); group = root / "Movie"; group.mkdir()
+            outside = Path(outside_raw)
+            junk = group / "广告说明.txt"; junk.write_bytes(b"ad")
+            cleanup, _ = classify_cleanup_items([
+                LocalFilesystemAdapter(root).snapshot(junk)
+            ])
+            original_replace = os.replace
+            swapped = False
+
+            def swap_quarantine_parent(src, dst, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and kwargs.get("dst_dir_fd") is not None:
+                    swapped = True
+                    trash = root / ".mediaflux-trash"
+                    trash.rename(root / ".mediaflux-trash-original")
+                    trash.symlink_to(outside, target_is_directory=True)
+                return original_replace(src, dst, *args, **kwargs)
+
+            with patch(
+                "app.modules.local_media_cleanup.os.replace",
+                side_effect=swap_quarantine_parent,
+            ):
+                result = delete_cleanup_items(
+                    cleanup, allowed_root=root, selected_path=group,
+                )
+
+            self.assertTrue(swapped)
+            self.assertFalse(junk.exists())
+            self.assertEqual(result.deleted, [str(junk)])
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_cleanup_discovery_prunes_ignored_tree_before_item_limit(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); group = root / "Movie"; group.mkdir()
+            ignored = group / ".mediaflux-trash"; ignored.mkdir()
+            for index in range(20):
+                (ignored / f"old-{index}.tmp").write_bytes(b"x")
+            junk = group / "广告说明.txt"; junk.write_bytes(b"ad")
+
+            cleanup = discover_cleanup_candidates(
+                root,
+                group,
+                item_limit=2,
+            )
+
+            self.assertEqual([item.snapshot.path for item in cleanup], [junk])
 
     def test_empty_source_directory_is_removed_but_root_is_never_removed(self):
         with tempfile.TemporaryDirectory() as root_raw:

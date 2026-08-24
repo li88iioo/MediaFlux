@@ -1356,13 +1356,20 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 "Telegram Indexer 配置热更新失败 type=%s", type(exc).__name__
             )
     bot_restart_ms = 0
+    warnings: list[str] = []
     if {"TG_BOT_TOKEN", "TG_CHAT_ID", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS", "AGENT_ENABLED"} & updates.keys():
         bot_restart_started = time.perf_counter()
         try:
             if getattr(request.app.state, "background_services_enabled", False):
                 from app.bot import restart_bot
 
-                restart_bot()
+                if not restart_bot():
+                    warning = (
+                        "Telegram Bot 配置已保存，但旧连接未及时退出；"
+                        "请稍后重试或重启 MediaFlux 服务"
+                    )
+                    warnings.append(warning)
+                    logger.warning("Telegram Bot 配置热更新未完成：旧 polling 仍在退出")
             else:
                 from app.notifier import reset
 
@@ -1465,7 +1472,10 @@ def save_config(request: Request, data: Any = Body(default=None)):
         "配置保存完成 changed=%s persist_ms=%s bot_restart_ms=%s patrol_reload_ms=%s total_ms=%s",
         len(updates), persist_ms, bot_restart_ms, patrol_reload_ms, total_ms,
     )
-    return {"success": True}
+    result: dict[str, object] = {"success": True}
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 @router.get("/update/check", name="api.update_check")

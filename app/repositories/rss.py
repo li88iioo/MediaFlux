@@ -5,7 +5,7 @@ import re
 import secrets
 import sqlite3
 import unicodedata
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from app.modules.media_identity import normalize_tmdb_id
 
@@ -931,6 +931,46 @@ def update_rss_entry_status(entry_id: int, status: str) -> None:
                 "failure_retryable=0, failed_at=NULL WHERE id=?",
                 (status, processed, processed_at, submitted_at, entry_id),
             )
+
+
+def skip_pending_rss_entries(entry_ids: Iterable[int], reason: str) -> int:
+    """按当前过滤规则原子收束历史 pending 条目，并保留可解释原因。"""
+    normalized = list(dict.fromkeys(
+        int(entry_id) for entry_id in entry_ids if int(entry_id) > 0
+    ))
+    if not normalized:
+        return 0
+    message = str(reason or "命中排除关键词").strip()[:160]
+    updated = 0
+    stamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for offset in range(0, len(normalized), 500):
+            batch = normalized[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT id FROM rss_entries WHERE id IN ({placeholders}) "
+                "AND status='pending' AND COALESCE(processed,0)=0",
+                batch,
+            ).fetchall()
+            eligible = [int(row["id"]) for row in rows]
+            if not eligible:
+                continue
+            eligible_placeholders = ",".join("?" for _ in eligible)
+            cur = conn.execute(
+                f"UPDATE rss_entries SET status='skipped',processed=1,processed_at=?,"
+                "failure_code='',failure_retryable=0,failed_at=NULL "
+                f"WHERE id IN ({eligible_placeholders}) AND status='pending' "
+                "AND COALESCE(processed,0)=0",
+                (stamp, *eligible),
+            )
+            updated += int(cur.rowcount or 0)
+            conn.execute(
+                f"UPDATE rss_entry_media SET skip_reason=?,updated_at=? "
+                f"WHERE rss_entry_id IN ({eligible_placeholders})",
+                (message, stamp, *eligible),
+            )
+    return updated
 
 
 def update_rss_entries_processed(entry_ids: list[int], processed: bool) -> int:

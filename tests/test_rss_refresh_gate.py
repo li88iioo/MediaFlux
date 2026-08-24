@@ -188,6 +188,19 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
         recover.assert_called_once_with(stale_minutes=15)
 
+    def test_scheduler_stop_waits_for_active_refresh_workers(self):
+        scheduler = RSSScheduler()
+        release = threading.Event()
+        worker = threading.Thread(target=release.wait, name="rss-refresh-test", daemon=True)
+        scheduler._workers[1] = worker
+        scheduler._running_ids.add(1)
+        worker.start()
+
+        self.assertFalse(scheduler.stop(timeout=0.01))
+        release.set()
+        worker.join(timeout=1)
+        self.assertTrue(scheduler.stop(timeout=0.1))
+
     def test_scheduler_cancels_queued_refresh_when_subscription_is_paused(self):
         sid = db.add_rss_subscription(
             "queued-pause",
@@ -265,7 +278,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         with patch.object(
             engine, "refresh", return_value={"total": 1, "new": 1, "skipped": 0}
         ), patch(
-            "app.modules.rss.db.list_rss_entries", return_value=[{"id": 17}]
+            "app.modules.rss.db.list_rss_entries", return_value=[{"id": 17, "title": "普通资源"}]
         ), patch.object(
             engine,
             "download_many",
@@ -283,6 +296,77 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["failed"], 1)
         self.assertEqual(result["outcome_unknown_count"], 1)
         self.assertTrue(result["review_required"])
+
+    def test_auto_download_applies_current_exclude_keywords_to_existing_pending_rows(self):
+        sid = self._subscription("historical-filter")
+        db.update_rss_subscription(sid, {"exclude_keywords": "合集"})
+        excluded_id = db.add_rss_entry_with_media(
+            sid,
+            "作品 合集 01-12",
+            "excluded-guid",
+            media_key="tmdb:1:tv:S01E001",
+        )["id"]
+        accepted_id = db.add_rss_entry(
+            sid,
+            "作品 S01E13",
+            "accepted-guid",
+        )
+        engine = RSSEngine()
+        with patch.object(
+            engine, "refresh", return_value={"total": 2, "new": 0, "skipped": 0}
+        ), patch.object(
+            engine,
+            "download_many",
+            return_value={
+                "success_count": 1,
+                "existing_count": 0,
+                "unverified_count": 0,
+                "failure_count": 0,
+                "outcome_unknown_count": 0,
+                "review_required": False,
+            },
+        ) as download_many:
+            result = engine.auto_download(sid)
+
+        self.assertEqual(result["filtered"], 1)
+        download_many.assert_called_once_with([accepted_id])
+        excluded = db.get_rss_entry(int(excluded_id))
+        self.assertEqual(excluded["status"], "skipped")
+        self.assertTrue(excluded["processed"])
+        with db.get_conn() as conn:
+            media = conn.execute(
+                "SELECT skip_reason FROM rss_entry_media WHERE rss_entry_id=?",
+                (int(excluded_id),),
+            ).fetchone()
+        self.assertEqual(media["skip_reason"], "命中当前订阅排除关键词")
+
+    def test_scheduler_deduplicates_identical_alerts_until_recovery(self):
+        sid = self._subscription("scheduler-alert")
+        scheduler = RSSScheduler()
+        issue = {
+            "refresh": {"total": 1, "new": 1, "skipped": 0},
+            "downloaded": 0,
+            "existing": 0,
+            "unverified": 0,
+            "failed": 1,
+            "outcome_unknown_count": 1,
+            "review_required": True,
+        }
+        healthy = {"total": 0, "new": 0, "skipped": 0}
+        with patch("app.modules.rss_scheduler.RSSEngine") as engine, patch(
+            "app.modules.rss_scheduler.send_event", side_effect=[False, True, True]
+        ) as send_event:
+            engine.return_value.auto_download.return_value = issue
+            scheduler._execute(sid, "download")
+            scheduler._execute(sid, "download")
+            scheduler._execute(sid, "download")
+            self.assertEqual(send_event.call_count, 2)
+            engine.return_value.refresh.return_value = healthy
+            scheduler._execute(sid, "subscribe")
+            engine.return_value.auto_download.return_value = issue
+            scheduler._execute(sid, "download")
+
+        self.assertEqual(send_event.call_count, 3)
 
     def test_scheduler_warns_when_auto_download_outcome_is_unknown(self):
         scheduler = RSSScheduler()

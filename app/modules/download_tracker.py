@@ -583,18 +583,24 @@ class DownloadTracker:
 
     @staticmethod
     def _notify_completion(row, qb_status: str, gy_status: str, updates: dict) -> None:
-        if updates.get("status") not in {"completed", "failed"}:
+        new_status = str(updates.get("status") or "")
+        if new_status not in {"completed", "failed", "manual_review"}:
             return
         old_status = str(row["status"] or "")
-        if old_status in {"completed", "failed"}:
+        if old_status in {"completed", "failed", "manual_review"}:
             return
         fields = [("任务", row["title"] or "未命名任务")]
         if qb_status:
             fields.append(("qBittorrent", DownloadTracker._label(qb_status)))
         if gy_status:
             fields.append(("光鸭云盘", DownloadTracker._label(gy_status)))
+        if new_status == "manual_review":
+            fields.append(("处理", "结果待人工核对，请勿重复提交"))
         send(
-            NotificationEvent("📥 下载任务状态更新", fields=tuple(fields)),
+            NotificationEvent(
+                "下载任务需要人工核对" if new_status == "manual_review" else "📥 下载任务状态更新",
+                fields=tuple(fields),
+            ),
             chat_id=str(row["chat_id"] or "") or None,
         )
 
@@ -603,6 +609,7 @@ class DownloadTracker:
         return {
             "submitted": "已提交", "downloading": "下载中",
             "completed": "已完成", "failed": "失败",
+            "manual_review": "待人工核对", "outcome_unknown": "结果未知",
         }.get(status, status)
 
     @staticmethod

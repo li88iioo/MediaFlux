@@ -307,6 +307,7 @@ def start_background_services() -> None:
 def stop_background_services() -> bool:
     """停止任务生产者，再等待写任务在安全边界结束。"""
     subscription_workers_stopped = True
+    rss_workers_stopped = True
     organize_drained = True
     # 先关闭整理准入，避免迟到的 TG 回调或调度器在关机窗口提交新任务。
     from app.modules.organize_tasks import get_organize_manager
@@ -352,8 +353,11 @@ def stop_background_services() -> bool:
     try:
         from app.modules.rss_scheduler import get_rss_scheduler
 
-        get_rss_scheduler().stop()
+        rss_workers_stopped = get_rss_scheduler().stop()
+        if not rss_workers_stopped:
+            logger.warning("停止 RSS 调度器超时，保留依赖运行时直到进程退出")
     except Exception as exc:
+        rss_workers_stopped = False
         logger.warning("停止 RSS 调度器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.media_subscription_scheduler import get_media_subscription_scheduler
@@ -397,22 +401,22 @@ def stop_background_services() -> bool:
         get_scheduler().stop()
     except Exception as exc:
         logger.warning("停止 STRM 调度器失败 type=%s", type(exc).__name__)
-    return subscription_workers_stopped and organize_drained
+    return rss_workers_stopped and subscription_workers_stopped and organize_drained
 
 
 def create_app(*, start_background: bool = False) -> FastAPI:
+    # 恢复事务可能回滚 user.env。必须在首次读取配置、首启状态和会话密钥前
+    # 完成恢复，否则本进程会拿着恢复前后的混合快照运行到下一次重启。
+    from app.modules.backup import recover_pending_restore, runtime_lifecycle_guard
+
+    with runtime_lifecycle_guard(config.PATHS):
+        recover_pending_restore(config.PATHS, lifecycle_lock_held=True)
     secret_key = _secret_key()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         _app.state.ready = False
-        from app.modules.backup import (
-            recover_pending_restore,
-            runtime_lifecycle_guard,
-        )
-
         with runtime_lifecycle_guard(config.PATHS):
-            recover_pending_restore(config.PATHS, lifecycle_lock_held=True)
             database.init_db()
             from app.modules.recognition_knowledge import ensure_seed_knowledge
 

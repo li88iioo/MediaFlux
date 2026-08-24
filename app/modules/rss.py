@@ -1060,7 +1060,25 @@ class RSSEngine:
         refreshed = self.refresh(sub_id, expected_revision=expected_revision)
         if refreshed.get("error"):
             return refreshed
-        ids = [int(row["id"]) for row in db.list_rss_entries(sub_id=sub_id, status="pending", order="received_desc")]
+        rows = db.list_rss_entries(
+            sub_id=sub_id, status="pending", order="received_desc"
+        )
+        subscription = db.get_rss_subscription(sub_id)
+        exclude = self._split_keywords(
+            str(subscription["exclude_keywords"] or "") if subscription else ""
+        )
+        excluded_ids = [
+            int(row["id"]) for row in rows
+            if exclude and self._excluded(
+                str(row["title"] or "") if "title" in row.keys() else "",
+                exclude,
+            )
+        ]
+        filtered = db.skip_pending_rss_entries(
+            excluded_ids, "命中当前订阅排除关键词"
+        )
+        excluded = set(excluded_ids)
+        ids = [int(row["id"]) for row in rows if int(row["id"]) not in excluded]
         result = self.download_many(ids) if ids else {
             "success_count": 0, "existing_count": 0,
             "unverified_count": 0, "failure_count": 0,
@@ -1078,6 +1096,7 @@ class RSSEngine:
             "outcome_unknown_count": outcome_unknown_count,
             "review_required": bool(result.get("review_required"))
             or outcome_unknown_count > 0,
+            "filtered": filtered,
         }
 
     # ===== 推送实现 =====

@@ -5193,10 +5193,7 @@ class Organizer:
         if not prefix:
             return set()
         result: set[tuple[str, str]] = set()
-        for row in db.list_organize_logs(status="success", keyword=prefix, limit=5000):
-            new_path = str(row["new_path"] or "").strip("/")
-            if new_path != prefix and not new_path.startswith(prefix + "/"):
-                continue
+        for row in db.list_organize_root_identities(prefix):
             media_type = str(row["media_type"] or "")
             provider = str(row["provider"] or "").strip().lower() if "provider" in row.keys() else ""
             external_id = str(row["external_id"] or "").strip() if "external_id" in row.keys() else ""

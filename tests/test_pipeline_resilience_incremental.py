@@ -55,6 +55,24 @@ class _LocalScraper:
 
 
 class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
+    def test_guangya_organize_claim_survives_qb_manual_review(self):
+        request_id, _ = db.create_download_request(
+            "mixed-terminal-organize", "magnet", title="混合终态资源"
+        )
+        db.update_download_request(
+            request_id,
+            targets="both",
+            status="manual_review",
+            qb_status="manual_review",
+            gy_status="completed",
+            organize_started=0,
+        )
+
+        self.assertTrue(db.claim_download_request_organize(request_id))
+        row = db.get_download_request(request_id)
+        self.assertEqual(int(row["organize_started"]), 1)
+        self.assertEqual(str(row["status"]), "manual_review")
+
     def _local_inspection(self, confidence: float = 0.75):
         root = tempfile.TemporaryDirectory()
         source_root = Path(root.name) / "downloads"

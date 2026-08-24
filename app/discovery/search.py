@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import threading
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -217,6 +217,31 @@ class DiscoverySearchService:
         self._executor = executor or ThreadPoolExecutor(max_workers=3, thread_name_prefix="discovery-search")
         self._owns_executor = executor is None
         self._closed = False
+        self._state_lock = threading.RLock()
+        self._inflight: set[Future] = set()
+        self._providers_closed = False
+
+    def _close_providers(self) -> None:
+        with self._state_lock:
+            if self._providers_closed:
+                return
+            self._providers_closed = True
+        seen: set[int] = set()
+        for provider in self.providers.values():
+            if id(provider) in seen:
+                continue
+            seen.add(id(provider))
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+
+    def _future_finished(self, future: Future) -> None:
+        close_providers = False
+        with self._state_lock:
+            self._inflight.discard(future)
+            close_providers = self._closed and not self._inflight
+        if close_providers:
+            self._close_providers()
 
     def _enabled_names(self) -> list[str]:
         names = [name for name in _PROVIDER_ORDER if name in self.providers]
@@ -263,13 +288,17 @@ class DiscoverySearchService:
         items_by_name: dict[str, list[MediaCard]] = {}
         more_by_name: dict[str, bool] = {}
 
-        if self._closed:
-            raise RuntimeError("Discovery search service is closed")
-        future_map = {
-            self._executor.submit(self.providers[name].search, query, page): name
-            for name in selected
-            if name in self.providers
-        }
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Discovery search service is closed")
+            future_map = {
+                self._executor.submit(self.providers[name].search, query, page): name
+                for name in selected
+                if name in self.providers
+            }
+            self._inflight.update(future_map)
+            for future in future_map:
+                future.add_done_callback(self._future_finished)
         missing = [name for name in selected if name not in self.providers]
         for name in missing:
             errors_by_name[name] = {
@@ -332,19 +361,15 @@ class DiscoverySearchService:
 
 
     def shutdown(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            close_providers = not self._inflight
         if self._owns_executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
-        seen: set[int] = set()
-        for provider in self.providers.values():
-            if id(provider) in seen:
-                continue
-            seen.add(id(provider))
-            close = getattr(provider, "close", None)
-            if callable(close):
-                close()
+        if close_providers:
+            self._close_providers()
 
 
 _search_service: DiscoverySearchService | None = None

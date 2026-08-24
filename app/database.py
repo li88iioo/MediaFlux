@@ -179,6 +179,7 @@ CREATE TABLE IF NOT EXISTS organize_log (
 );
 CREATE INDEX IF NOT EXISTS idx_organize_log_status_id ON organize_log(status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_organize_log_file_id ON organize_log(file_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_organize_log_status_path ON organize_log(status, new_path);
 
 CREATE TABLE IF NOT EXISTS organize_confirmations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3007,6 +3008,38 @@ def list_organize_logs(status: str | None = None, keyword: str = "",
         return conn.execute(sql, params).fetchall()
 
 
+def latest_organize_log_id() -> int:
+    with get_conn() as conn:
+        row = conn.execute("SELECT COALESCE(MAX(id),0) AS id FROM organize_log").fetchone()
+        return int(row["id"] or 0)
+
+
+def list_organize_logs_after(after_id: int) -> list[sqlite3.Row]:
+    """按高水位读取全部新增审计，供单次批处理精确收束。"""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM organize_log WHERE id>? ORDER BY id ASC",
+            (max(0, int(after_id or 0)),),
+        ).fetchall()
+
+
+def list_organize_root_identities(media_root_path: str) -> list[sqlite3.Row]:
+    """精确读取目标根目录历史媒体身份，不依赖通用日志分页窗口。"""
+    prefix = str(media_root_path or "").strip("/")
+    if not prefix:
+        return []
+    branch = prefix + "/"
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT DISTINCT media_type,provider,external_id,tmdb_id FROM ("
+            "SELECT media_type,provider,external_id,tmdb_id FROM organize_log "
+            "WHERE status='success' AND new_path=? UNION ALL "
+            "SELECT media_type,provider,external_id,tmdb_id FROM organize_log "
+            "WHERE status='success' AND new_path>=? AND new_path<?)",
+            (prefix, branch, branch + "\U0010ffff"),
+        ).fetchall()
+
+
 def count_organize_logs(status: str | None = None, keyword: str = "") -> int:
     filters, params = _organize_log_filters(status, keyword)
     with get_conn() as conn:
@@ -3811,6 +3844,7 @@ from app.repositories.rss import (  # noqa: E402
     purge_processed_rss_entries,
     recover_stale_submitting_rss_entries,
     record_rss_entry_failure,
+    skip_pending_rss_entries,
     update_rss_entries_processed,
     update_rss_entries_processed_snapshot,
     update_rss_entry_status,
@@ -3836,6 +3870,7 @@ from app.repositories.media_subscriptions import (  # noqa: E402
     finish_media_subscription_run,
     get_media_subscription,
     get_media_subscription_candidate,
+    get_media_subscription_stats,
     list_active_media_download_admissions,
     list_due_media_subscriptions,
     list_media_subscription_candidates,

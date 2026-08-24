@@ -34,6 +34,7 @@ _bot = None
 _bot_thread: threading.Thread | None = None
 _bot_thread_stop: threading.Event | None = None
 _registered_bot_id: int | None = None
+_command_menu_bot_id: int | None = None
 _progress_recovery_thread: threading.Thread | None = None
 _progress_recovery_stop: threading.Event | None = None
 _lifecycle_lock = threading.RLock()
@@ -893,6 +894,39 @@ def _start_organize_all(bot, telebot, source_message) -> bool:
         return False
 
 
+def _set_command_menu(bot, telebot) -> bool:
+    global _command_menu_bot_id
+    try:
+        bot.set_my_commands(
+            [
+                telebot.types.BotCommand("organize", "整理光鸭云盘或本地媒体"),
+                telebot.types.BotCommand("sync_gy", "同步光鸭云盘STRM"),
+                telebot.types.BotCommand("media_search", "搜索媒体资源"),
+                telebot.types.BotCommand("rss", "查看RSS订阅"),
+                telebot.types.BotCommand("rss_refresh", "刷新RSS订阅"),
+                telebot.types.BotCommand("rss_dl", "下载RSS条目"),
+                telebot.types.BotCommand("agent", "使用 Media Agent"),
+                telebot.types.BotCommand("agent_reset", "重置 Agent 会话"),
+                telebot.types.BotCommand("status", "查看运行状态"),
+                telebot.types.BotCommand("help", "查看使用帮助"),
+                telebot.types.BotCommand("start", "开始"),
+            ]
+        )
+    except Exception as exc:
+        logger.warning("设置命令菜单失败 type=%s", type(exc).__name__)
+        return False
+    _command_menu_bot_id = id(bot)
+    return True
+
+
+def _ensure_command_menu(bot) -> bool:
+    if _command_menu_bot_id == id(bot):
+        return True
+    import telebot
+
+    return _set_command_menu(bot, telebot)
+
+
 def _register_commands(bot, telebot):
     def require_auth(handler):
         def wrapped(msg, *args, **kwargs):
@@ -1496,24 +1530,7 @@ def _register_commands(bot, telebot):
             "新的单次确认按钮已发送，请使用最新消息继续操作。",
         )
 
-    try:
-        bot.set_my_commands(
-            [
-                telebot.types.BotCommand("organize", "整理光鸭云盘或本地媒体"),
-                telebot.types.BotCommand("sync_gy", "同步光鸭云盘STRM"),
-                telebot.types.BotCommand("media_search", "搜索媒体资源"),
-                telebot.types.BotCommand("rss", "查看RSS订阅"),
-                telebot.types.BotCommand("rss_refresh", "刷新RSS订阅"),
-                telebot.types.BotCommand("rss_dl", "下载RSS条目"),
-                telebot.types.BotCommand("agent", "使用 Media Agent"),
-                telebot.types.BotCommand("agent_reset", "重置 Agent 会话"),
-                telebot.types.BotCommand("status", "查看运行状态"),
-                telebot.types.BotCommand("help", "查看使用帮助"),
-                telebot.types.BotCommand("start", "开始"),
-            ]
-        )
-    except Exception as e:
-        logger.warning("设置命令菜单失败 type=%s", type(e).__name__)
+    _set_command_menu(bot, telebot)
 
 
 def _run_rss_refresh(
@@ -3002,14 +3019,23 @@ def start_bot_blocking(stop_event: threading.Event | None = None):
     bot = init_bot(stop_event=stop_event)
     if bot is None or (stop_event is not None and stop_event.is_set()):
         return
-    logger.debug("TG Bot 启动 polling")
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
-    except Exception as exc:
-        log_throttled(
-            logger, logging.ERROR, f"tg-bot-polling:{type(exc).__name__}",
-            "TG Bot polling 异常退出 type=%s", type(exc).__name__,
-        )
+    delay = 1.0
+    effective_stop = stop_event or threading.Event()
+    while not effective_stop.is_set():
+        _ensure_command_menu(bot)
+        logger.debug("TG Bot 启动 polling")
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+            if stop_event is None or not stop_event.is_set():
+                logger.warning("TG Bot polling 意外结束，准备自动重连")
+        except Exception as exc:
+            log_throttled(
+                logger, logging.ERROR, f"tg-bot-polling:{type(exc).__name__}",
+                "TG Bot polling 异常退出 type=%s，将自动重连", type(exc).__name__,
+            )
+        if effective_stop.wait(delay):
+            break
+        delay = min(30.0, delay * 2)
 
 
 def _start_bot_locked() -> bool:
@@ -3046,7 +3072,7 @@ def start_bot() -> bool:
         return _start_bot_locked()
 
 
-def _stop_bot_locked(timeout: float = 5.0) -> None:
+def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) -> bool:
     """在生命周期控制锁内停止 polling 与恢复线程。"""
     global _bot, _bot_thread, _bot_thread_stop
     global _progress_recovery_thread, _progress_recovery_stop
@@ -3068,9 +3094,10 @@ def _stop_bot_locked(timeout: float = 5.0) -> None:
         logger.warning("停止 Telegram 终态重投失败 type=%s", type(exc).__name__)
     if bot is not None:
         try:
-            from app.bot.progress import cancel_active_operations
+            if cancel_operations:
+                from app.bot.progress import cancel_active_operations
 
-            cancel_active_operations("服务正在停止，本次操作已结束；启动完成后可重新发起。")
+                cancel_active_operations("服务正在停止，本次操作已结束；启动完成后可重新发起。")
         except Exception as exc:
             logger.warning("收尾 Telegram 长任务失败 type=%s", type(exc).__name__)
         try:
@@ -3110,6 +3137,7 @@ def _stop_bot_locked(timeout: float = 5.0) -> None:
         shutdown_telegram_indexer_worker(timeout=timeout)
     except Exception as exc:
         logger.warning("停止 Telegram 资源站服务失败 type=%s", type(exc).__name__)
+    return thread_finished
 
 
 def stop_bot(timeout: float = 5.0) -> None:
@@ -3120,12 +3148,15 @@ def stop_bot(timeout: float = 5.0) -> None:
 
 def restart_bot() -> bool:
     """配置更新后原子地停止旧 polling、重置客户端并启动新代。"""
-    global _registered_bot_id
+    global _registered_bot_id, _command_menu_bot_id
     from app.notifier import reset
 
     with _lifecycle_control_lock:
-        _stop_bot_locked()
+        if not _stop_bot_locked(cancel_operations=False):
+            logger.error("Telegram Bot 旧 polling 未在超时内退出，已取消热重启")
+            return False
         reset()
         with _lifecycle_lock:
             _registered_bot_id = None
+            _command_menu_bot_id = None
         return _start_bot_locked()

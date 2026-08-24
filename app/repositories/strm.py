@@ -641,6 +641,8 @@ DEFAULT_STRM_PROVIDER = "guangya"
 DEFAULT_STRM_LEASE_SECONDS = 900
 _ACTIVE_STATES = ("queued", "running", "dirty")
 _MAX_QUEUED_CHANGES = 5000
+_FORCE_FULL_KIND = "force_full"
+_FORCE_FULL_FILE_ID = "__mediaflux_full_sync__"
 
 
 def _future_stamp(delay_seconds: float) -> str:
@@ -680,14 +682,35 @@ def _load_changes(raw: object) -> list[dict[str, Any]]:
 
 
 def merge_strm_changes(*groups: object) -> list[dict[str, Any]]:
-    """按变化键去重合并，保持首次出现顺序。"""
+    """按变化键去重合并；同一快照以后到值为准，溢出时强制全量。"""
     merged: dict[str, dict[str, Any]] = {}
     for group in groups:
         for item in group or []:
             if not isinstance(item, dict):
                 continue
-            merged.setdefault(_change_key(item), dict(item))
-    return list(merged.values())[:_MAX_QUEUED_CHANGES]
+            merged[_change_key(item)] = dict(item)
+    changes = list(merged.values())
+    if len(changes) <= _MAX_QUEUED_CHANGES:
+        return changes
+
+    # 不能静默裁掉变化。保留一个明确的无效增量标记，让消费端按既有
+    # fallback_required 契约执行全量同步；其余条目仅用于通知与诊断。
+    scope = next(
+        (
+            item for item in reversed(changes)
+            if str(item.get("source_id") or "").strip()
+        ),
+        {},
+    )
+    marker = {
+        "source_id": str(scope.get("source_id") or ""),
+        "rel_dir": _normalize_rel_dir(scope.get("rel_dir")),
+        "kind": _FORCE_FULL_KIND,
+        "action": "upsert",
+        "file_id": _FORCE_FULL_FILE_ID,
+        "name": "STRM 变化队列超过上限，转为全量同步",
+    }
+    return [*changes[-(_MAX_QUEUED_CHANGES - 1):], marker]
 
 
 def group_changes_by_target(changes: object) -> dict[tuple[str, str], list[dict[str, Any]]]:

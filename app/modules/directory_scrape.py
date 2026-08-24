@@ -1030,10 +1030,7 @@ class DirectoryScrapeService:
             if current.fingerprint != record.inspection.fingerprint:
                 raise DirectoryScrapeConflictError("目录内容已变化，请重新检查并生成预览")
             check_cancel()
-            existing_ids = {
-                int(row["id"])
-                for row in db.list_organize_logs(limit=5000)
-            }
+            organize_log_high_water = db.latest_organize_log_id()
             organizer = self._organizer(
                 record.scope_type,
                 current,
@@ -1108,8 +1105,8 @@ class DirectoryScrapeService:
             file_ids = {item.file_id for item in record.inspection.videos}
             new_rows = [
                 row
-                for row in db.list_organize_logs(limit=5000)
-                if int(row["id"]) not in existing_ids and str(row["file_id"]) in file_ids
+                for row in db.list_organize_logs_after(organize_log_high_water)
+                if str(row["file_id"]) in file_ids
             ]
             log_ids = [int(row["id"]) for row in new_rows]
             self._record_successful_manual_confirmations(record, new_rows)

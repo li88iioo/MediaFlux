@@ -715,7 +715,8 @@ def claim_download_request_organize(request_id: int) -> bool:
             "UPDATE download_requests SET organize_started=1,organize_status='starting',"
             "organize_error='',updated_at=? WHERE id=? "
             "AND targets IN ('guangya','both') AND gy_status='completed' "
-            "AND status IN ('submitted','downloading','completed') AND organize_started=0 "
+            "AND status IN ('submitted','downloading','completed','manual_review') "
+            "AND organize_started=0 "
             "AND COALESCE(organize_status,'') NOT IN ('resubmitted','cleared') "
             "AND COALESCE(attention_cleared_at,'')=''",
             (now(), int(request_id)),

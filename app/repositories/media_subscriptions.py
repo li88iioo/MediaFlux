@@ -302,6 +302,31 @@ def count_media_subscriptions(*, status: str = "", enabled: bool | None = None) 
         return int(row["total"] or 0)
 
 
+def get_media_subscription_stats() -> dict[str, int]:
+    """一次聚合订阅与当前可用候选统计，避免看板 N+1 明细查询。"""
+    expire_media_subscription_candidates()
+    with get_conn() as conn:
+        subscriptions = conn.execute(
+            "SELECT COUNT(*) AS media_total,"
+            "SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) AS media_active,"
+            "SUM(CASE WHEN status='missing' THEN 1 ELSE 0 END) AS media_missing,"
+            "SUM(CASE WHEN status IN ('inconclusive','error') THEN 1 ELSE 0 END) "
+            "AS media_inconclusive FROM media_subscriptions WHERE deleted_at IS NULL"
+        ).fetchone()
+        candidates = conn.execute(
+            "SELECT COUNT(*) AS candidate_total FROM media_subscription_candidates c "
+            "JOIN media_subscriptions s ON s.id=c.subscription_id "
+            "WHERE c.status='available' AND s.deleted_at IS NULL"
+        ).fetchone()
+    return {
+        "media_total": int(subscriptions["media_total"] or 0),
+        "media_active": int(subscriptions["media_active"] or 0),
+        "media_missing": int(subscriptions["media_missing"] or 0),
+        "media_inconclusive": int(subscriptions["media_inconclusive"] or 0),
+        "candidate_total": int(candidates["candidate_total"] or 0),
+    }
+
+
 def update_media_subscription(subscription_id: int, **fields: Any) -> bool:
     allowed = {
         "provider", "external_id", "title", "original_title", "year", "poster_key",

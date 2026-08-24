@@ -686,17 +686,24 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
             download_tracker.DownloadTracker._notify_completion(
                 row, "completed", "failed", {"status": "completed"}
             )
+            download_tracker.DownloadTracker._notify_completion(
+                row, "manual_review", "completed", {"status": "manual_review"}
+            )
         with patch.object(scheduler, "get_bool", return_value=True), patch.object(
             scheduler, "send", side_effect=lambda event, chat_id=None: sent.append((event, chat_id)) or True
         ):
             scheduler.STRMScheduler._notify_failure("错误<&>", "cron")
 
-        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent), 3)
         download_text = notifier.render_event(sent[0][0])
-        failure_text = notifier.render_event(sent[1][0])
+        review_text = notifier.render_event(sent[1][0])
+        failure_text = notifier.render_event(sent[2][0])
         self.assertIn("任务&lt;&amp;&gt;", download_text)
         self.assertNotIn("任务<&>", download_text)
         self.assertEqual(sent[0][1], "900")
+        self.assertIn("需要人工核对", review_text)
+        self.assertIn("请勿重复提交", review_text)
+        self.assertEqual(sent[1][1], "900")
         self.assertIn("错误&lt;&amp;&gt;", failure_text)
         self.assertNotIn("错误<&>", failure_text)
 

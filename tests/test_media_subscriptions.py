@@ -124,6 +124,69 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
         with self.assertRaisesRegex(MediaSubscriptionError, "不支持的订阅参数"):
             service.update_subscription(subscription_id, {"title": "越权修改"})
 
+    def test_stats_are_aggregated_without_loading_subscription_details(self) -> None:
+        active_id = self._seed_subscription(tmdb_id="100")
+        disabled_id = self._seed_subscription(tmdb_id="101")
+        inconclusive_id = self._seed_subscription(tmdb_id="102")
+        db.update_media_subscription_config(active_id, status="missing")
+        db.update_media_subscription_config(disabled_id, enabled=0, status="missing")
+        db.update_media_subscription_config(inconclusive_id, status="inconclusive")
+        db.replace_media_subscription_candidates(
+            active_id,
+            "tmdb:100:tv:S01E001",
+            season=1,
+            episode=1,
+            candidates=[{
+                "result_id": "available-result",
+                "site_id": "mikan",
+                "site_name": "Mikan",
+                "title": "可用资源",
+                "download_state": "available",
+            }],
+            expires_at="2099-01-01 00:00:00",
+        )
+
+        with patch(
+            "app.modules.media_subscriptions.db.list_media_subscriptions",
+            side_effect=AssertionError("stats must not load all rows"),
+        ):
+            stats = MediaSubscriptionService().stats()
+
+        self.assertEqual(stats, {
+            "media_total": 3,
+            "media_active": 2,
+            "media_missing": 2,
+            "media_inconclusive": 1,
+            "candidate_total": 1,
+        })
+
+    def test_stats_ignore_residual_candidates_from_soft_deleted_subscriptions(self) -> None:
+        subscription_id = self._seed_subscription(tmdb_id="deleted")
+        db.replace_media_subscription_candidates(
+            subscription_id,
+            "tmdb:deleted:tv:S01E001",
+            season=1,
+            episode=1,
+            candidates=[{
+                "result_id": "stale-result",
+                "site_id": "mikan",
+                "site_name": "Mikan",
+                "title": "历史残留资源",
+                "download_state": "available",
+            }],
+            expires_at="2099-01-01 00:00:00",
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE media_subscriptions SET deleted_at=? WHERE id=?",
+                (db.now(), subscription_id),
+            )
+
+        stats = MediaSubscriptionService().stats()
+
+        self.assertEqual(stats["media_total"], 0)
+        self.assertEqual(stats["candidate_total"], 0)
+
     def test_interval_writes_only_accept_three_or_seven_days_and_preserve_legacy_values(self) -> None:
         service = MediaSubscriptionService()
         subscription_id = self._seed_subscription()

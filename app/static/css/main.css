@@ -4328,6 +4328,13 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .app-toast.is-error .app-toast-icon {
     color: var(--danger, #ef4444);
 }
+.app-toast.is-warning {
+    border-color: color-mix(in srgb, var(--warning, #d97706) 42%, var(--border));
+    background: color-mix(in srgb, var(--bg-card) 92%, var(--warning, #d97706));
+}
+.app-toast.is-warning .app-toast-icon {
+    color: var(--warning, #d97706);
+}
 .app-toast.is-info .app-toast-icon {
     color: var(--accent, #3b82f6);
 }

@@ -75,6 +75,26 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
             sorted(item["file_id"] for item in claimed[0]["changes"]), ["f1", "f2"]
         )
 
+    def test_repeated_enqueue_keeps_latest_snapshot(self):
+        first = {**_change(file_id="f1"), "etag": "old", "size": 1}
+        latest = {**_change(file_id="f1"), "etag": "new", "size": 2}
+        db.enqueue_strm_change_targets([first])
+        db.enqueue_strm_change_targets([latest])
+
+        claimed = db.claim_strm_change_targets(owner="test")
+        self.assertEqual(claimed[0]["changes"][0]["etag"], "new")
+        self.assertEqual(claimed[0]["changes"][0]["size"], 2)
+
+    def test_queue_overflow_is_marked_for_full_sync_instead_of_silent_drop(self):
+        changes = [_change(file_id=f"f{index}") for index in range(5001)]
+        merged = db.merge_strm_changes(changes)
+
+        self.assertEqual(len(merged), 5000)
+        marker = merged[-1]
+        self.assertEqual(marker["kind"], "force_full")
+        self.assertEqual(marker["file_id"], "__mediaflux_full_sync__")
+        self.assertIn("全量同步", marker["name"])
+
     def test_debounce_deadline_is_persisted_and_can_be_reset(self):
         db.enqueue_strm_change_targets(
             [_change(file_id="f1")], not_before_seconds=30,

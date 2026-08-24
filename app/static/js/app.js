@@ -671,7 +671,7 @@
         }
         const toast = document.createElement('div');
         toast.className = `app-toast is-${type}`;
-        const iconName = type === 'success' ? 'circle-check-big' : (type === 'error' ? 'circle-x' : (type === 'loading' ? 'loader-2' : 'info'));
+        const iconName = type === 'success' ? 'circle-check-big' : (type === 'error' ? 'circle-x' : (type === 'warning' ? 'triangle-alert' : (type === 'loading' ? 'loader-2' : 'info')));
         toast.innerHTML = `<span class="app-toast-icon"><i data-lucide="${iconName}"></i></span><span class="app-toast-message">${String(message)}</span>`;
         container.appendChild(toast);
         renderIcons(toast);
@@ -734,7 +734,14 @@
                     : field.value;
             });
             if (options.toast !== false) {
-                window.showToast(options.toastMessage || '配置已成功保存', 'success');
+                const warnings = Array.isArray(data.warnings)
+                    ? data.warnings.filter(Boolean)
+                    : [];
+                if (warnings.length) {
+                    window.showToast(warnings.join('；'), 'warning', 5200);
+                } else {
+                    window.showToast(options.toastMessage || '配置已成功保存', 'success');
+                }
             }
             return data;
         } catch (error) {

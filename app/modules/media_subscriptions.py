@@ -1764,17 +1764,7 @@ class MediaSubscriptionService:
         return {**result, "candidate_id": int(candidate["id"]), "admission_id": admission_id}
 
     def stats(self) -> dict[str, int]:
-        rows = db.list_media_subscriptions(limit=500)
-        return {
-            "media_total": len(rows),
-            "media_active": sum(bool(row["enabled"]) for row in rows),
-            "media_missing": sum(str(row["status"]) == "missing" for row in rows),
-            "media_inconclusive": sum(str(row["status"]) in {"inconclusive", "error"} for row in rows),
-            "candidate_total": sum(
-                len(db.list_media_subscription_candidates(int(row["id"]), limit=500))
-                for row in rows
-            ),
-        }
+        return db.get_media_subscription_stats()
 
 
 _service = MediaSubscriptionService()

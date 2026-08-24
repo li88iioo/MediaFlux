@@ -5,7 +5,10 @@
 """
 from __future__ import annotations
 
+import os
 import re
+import stat as stat_module
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -14,8 +17,11 @@ from app.modules.local_path_mapping import assert_within
 from app.modules.local_storage import (
     LocalFileSnapshot,
     LocalFilesystemAdapter,
+    LocalScanLimitExceeded,
     is_ignored_local_media_directory,
 )
+
+_CLEANUP_QUARANTINE_DIR = ".mediaflux-trash"
 
 
 @dataclass(frozen=True)
@@ -86,21 +92,82 @@ def delete_cleanup_items(
     selected_path: Path | None = None,
     remove_empty_dirs: bool = True,
 ) -> CleanupResult:
-    """复核快照后直删确定垃圾；按统一规则决定是否清除空目录。"""
+    """复核快照后隔离并删除确定垃圾；目录句柄固定回收区，避免路径竞态。"""
     root = Path(allowed_root).expanduser().resolve(strict=False)
     adapter = LocalFilesystemAdapter(root)
     result = CleanupResult()
     parent_dirs: set[Path] = set()
-    for candidate in candidates:
-        path = assert_within(candidate.snapshot.path, root)
+    quarantine_root = root / _CLEANUP_QUARANTINE_DIR
+    quarantine_dir_fd: int | None = None
+    quarantine_run_fd: int | None = None
+    quarantine_run_name = f"cleanup-{uuid.uuid4().hex}"
+    quarantine_display_root = quarantine_root / quarantine_run_name
+
+    def ensure_quarantine() -> int:
+        nonlocal quarantine_dir_fd, quarantine_run_fd
+        if quarantine_run_fd is not None:
+            return quarantine_run_fd
         try:
-            adapter.verify_snapshot(candidate.snapshot)
-            path.unlink()
-            result.deleted.append(str(path))
-            parent_dirs.add(path.parent)
-        except Exception as exc:
-            result.retained.append(str(path))
-            result.warnings.append(f"垃圾文件未删除 {path.name}: {exc}")
+            quarantine_root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        quarantine_dir_fd = os.open(quarantine_root, directory_flags)
+        try:
+            os.mkdir(quarantine_run_name, mode=0o700, dir_fd=quarantine_dir_fd)
+            quarantine_run_fd = os.open(
+                quarantine_run_name,
+                directory_flags,
+                dir_fd=quarantine_dir_fd,
+            )
+        except Exception:
+            os.close(quarantine_dir_fd)
+            quarantine_dir_fd = None
+            raise
+        return quarantine_run_fd
+
+    try:
+        for candidate in candidates:
+            path = assert_within(candidate.snapshot.path, root)
+            quarantine_name = f"{uuid.uuid4().hex}-{path.name}"
+            moved = False
+            try:
+                adapter.verify_snapshot(candidate.snapshot)
+                run_fd = ensure_quarantine()
+                os.replace(path, quarantine_name, dst_dir_fd=run_fd)
+                moved = True
+                info = os.stat(quarantine_name, dir_fd=run_fd, follow_symlinks=False)
+                moved_identity = (
+                    int(info.st_size),
+                    int(info.st_mtime_ns),
+                    int(info.st_dev),
+                    int(info.st_ino),
+                ) if stat_module.S_ISREG(info.st_mode) else None
+                if moved_identity != candidate.snapshot.identity:
+                    if not path.exists():
+                        os.replace(quarantine_name, path, src_dir_fd=run_fd)
+                        moved = False
+                    raise RuntimeError("垃圾文件在删除前被替换，已保留并停止清理")
+                os.unlink(quarantine_name, dir_fd=run_fd)
+                moved = False
+                result.deleted.append(str(path))
+                parent_dirs.add(path.parent)
+            except Exception as exc:
+                if moved:
+                    result.retained.append(str(quarantine_display_root / quarantine_name))
+                else:
+                    result.retained.append(str(path))
+                result.warnings.append(f"垃圾文件未删除 {path.name}: {exc}")
+    finally:
+        if quarantine_run_fd is not None:
+            os.close(quarantine_run_fd)
+        if quarantine_dir_fd is not None:
+            try:
+                os.rmdir(quarantine_run_name, dir_fd=quarantine_dir_fd)
+            except OSError:
+                pass
+            os.close(quarantine_dir_fd)
 
     if not remove_empty_dirs:
         return result
@@ -147,17 +214,28 @@ def discover_cleanup_candidates(
     elif selected.is_dir():
         paths = []
         base_depth = len(selected.parts)
-        for path in selected.rglob("*"):
-            if path.is_symlink() or not path.is_file():
-                continue
-            relative_parts = path.relative_to(selected).parts[:-1]
-            if any(is_ignored_local_media_directory(part) for part in relative_parts):
-                continue
-            if len(path.parts) - base_depth > max(1, int(depth_limit)):
-                continue
-            paths.append(path)
-            if len(paths) > max(1, int(item_limit)):
-                break
+        visited = 0
+        max_depth = max(1, int(depth_limit))
+        max_items = max(1, int(item_limit))
+        for current_root, dirs, files in os.walk(selected, followlinks=False):
+            current = Path(current_root)
+            depth = len(current.parts) - base_depth
+            if depth >= max_depth:
+                dirs[:] = []
+            else:
+                dirs[:] = [
+                    name for name in dirs
+                    if not is_ignored_local_media_directory(name)
+                    and not (current / name).is_symlink()
+                ]
+            visited += len(dirs) + len(files)
+            if visited > max_items:
+                raise LocalScanLimitExceeded("垃圾清理扫描条目数量超过安全上限")
+            for name in files:
+                path = current / name
+                if path.is_symlink():
+                    continue
+                paths.append(path)
     else:
         return []
     adapter = LocalFilesystemAdapter(root)
