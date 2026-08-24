@@ -6968,6 +6968,172 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(captured[-1]["media_source_id"], "cloud")
         self.assertEqual(captured[-1]["guangya_file_id"], "file-session")
 
+    def test_quality_switch_sessions_keep_recent_media_name_without_merging(self):
+        class Raw:
+            token = "provider-secret"
+
+        class GuangYa:
+            logged_in = True
+            raw = Raw()
+
+            def get_download_url(self, _file_id, **_kwargs):
+                return "https://signed.invalid/file?Expires=4102444800"
+
+        payload = {
+            "Name": "Quality Switch Movie",
+            "PlaySessionId": "quality-original",
+            "MediaSources": [
+                {
+                    "Id": "cloud",
+                    "Path": "/playgy/file-quality/e/1/quality.mkv",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            ),
+            _FakeUpstreamResponse(
+                body=b"#EXTM3U\n#EXT-X-VERSION:3\n",
+                content_type="application/vnd.apple.mpegurl",
+            ),
+        ]
+        captured = []
+        recorder = media_proxy.PlaybackRecordWriter(
+            write_record=lambda record: captured.append(dict(record))
+        )
+        app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch(
+                "app.modules.media_proxy._client_is_authorized",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("app.modules.media_proxy.GuangYaClient", GuangYa),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            playback = client.get(
+                "/emby/Items/item-quality/PlaybackInfo?api_key=client-token"
+            )
+            direct = client.get(
+                "/emby/Videos/item-quality/stream"
+                "?MediaSourceId=cloud&PlaySessionId=quality-direct",
+                headers={"X-Emby-Token": "client-token"},
+                follow_redirects=False,
+            )
+            hls = client.get(
+                "/emby/Videos/item-quality/master.m3u8"
+                "?MediaSourceId=cloud&PlaySessionId=quality-hls",
+                headers={"X-Emby-Token": "client-token"},
+            )
+
+        self.assertEqual(playback.status_code, 200)
+        self.assertEqual(direct.status_code, 302)
+        self.assertEqual(hls.status_code, 200)
+        self.assertEqual(len(captured), 3)
+        self.assertEqual(
+            [record["media_name"] for record in captured],
+            ["Quality Switch Movie"] * 3,
+        )
+        self.assertEqual(
+            len({record["playback_session_key"] for record in captured}),
+            3,
+        )
+
+    def test_playback_info_does_not_cache_title_for_unconfirmed_source(self):
+        payload = {
+            "Name": "Confirmed Source Movie",
+            "PlaySessionId": "confirmed-source-session",
+            "MediaSources": [
+                {
+                    "Id": "source-confirmed",
+                    "Path": "/playgy/file-confirmed/e/1/confirmed.mkv",
+                }
+            ],
+        }
+        _FakeAsyncClient.responses = [
+            _FakeUpstreamResponse(
+                body=json.dumps(payload).encode("utf-8"),
+                content_type="application/json",
+            )
+        ]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_binding",
+                return_value=None,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/Items/item-confirmed/PlaybackInfo?api_key=client-token",
+                json={"MediaSourceId": "source-forged"},
+            )
+
+        scope = media_proxy._auth_scope_fingerprint("client-token")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            media_proxy._playback_sessions.resolve_media_name(
+                scope,
+                7,
+                "item-confirmed",
+                ("source-forged",),
+            ),
+            "",
+        )
+        self.assertEqual(
+            media_proxy._playback_sessions.resolve_media_name(
+                scope,
+                7,
+                "item-confirmed",
+                ("source-confirmed",),
+            ),
+            "Confirmed Source Movie",
+        )
+
+    def test_hls_conflicting_playback_parameters_are_rejected_before_upstream(self):
+        app = media_proxy.create_proxy_app(7)
+        queries = (
+            "MediaSourceId=source-a&MediaSourceId=source-b"
+            "&PlaySessionId=session-a",
+            "MediaSourceId=source-a&PlaySessionId=session-a"
+            "&PlaySessionId=session-b",
+        )
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=self._instance(),
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            for query in queries:
+                with self.subTest(query=query):
+                    response = client.get(
+                        f"/Videos/hls-item/master.m3u8?{query}"
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(
+                        response.json(),
+                        {"error": "播放参数重复或冲突"},
+                    )
+
+        self.assertEqual(_FakeAsyncClient.requests, [])
+
     def test_repeated_playback_info_with_same_upstream_session_stays_aggregated(self):
         payload = {
             "PlaySessionId": "emby-session-repeat",
