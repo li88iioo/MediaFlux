@@ -264,10 +264,16 @@ jobs:
           for platform_and_arch in "linux/amd64:x86_64" "linux/arm64:aarch64"; do
             platform=${platform_and_arch%%:*}
             expected_arch=${platform_and_arch#*:}
+            image_arch=${platform#linux/}
+            platform_digest=$(jq -r \
+              --arg os linux --arg arch "$image_arch" \
+              '.manifests[] | select(.platform.os == $os and .platform.architecture == $arch) | .digest' \
+              "$RUNNER_TEMP/manifest.json")
+            test -n "$platform_digest" && test "$platform_digest" != null
             safe_platform=${platform//\//-}
             output="$RUNNER_TEMP/docker-$safe_platform-version.json"
             docker run --rm --platform "$platform" --entrypoint python \
-              "$IMAGE_REPOSITORY@$IMAGE_DIGEST" mediaflux.py version --json > "$output"
+              "$IMAGE_REPOSITORY@$platform_digest" mediaflux.py version --json > "$output"
             jq -e --arg version "$EXPECTED_VERSION" --arg sha "$EXPECTED_SHA" \
               --arg arch "$expected_arch" \
               '.version == $version and .arch == $arch and .package == "docker" and .commit == $sha' \
@@ -313,8 +319,16 @@ jobs:
                 platform=${platform_arch%%:*}
                 expected_arch=${platform_arch##*:}
                 safe_arch=${platform#linux/}
+                platform_digest=$(jq -r \
+                  --arg os linux --arg arch "$safe_arch" \
+                  '.manifests[] | select(.platform.os == $os and .platform.architecture == $arch) | .digest' \
+                  "$RUNNER_TEMP/existing-exact-manifest.json")
+                if [[ -z "$platform_digest" || "$platform_digest" == null ]]; then
+                  reusable=false
+                  break
+                fi
                 docker run --rm --platform "$platform" --entrypoint python \
-                  "$exact" mediaflux.py version --json \
+                  "$IMAGE_REPOSITORY@$platform_digest" mediaflux.py version --json \
                   > "$RUNNER_TEMP/existing-exact-$safe_arch-version.json" 2>/dev/null || true
                 if ! jq -e \
                   --arg version "$VERSION" \

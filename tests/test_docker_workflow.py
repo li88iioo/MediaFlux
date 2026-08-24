@@ -79,6 +79,12 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn('docker run --rm --platform "$platform"', self.text)
         self.assertIn('output="$RUNNER_TEMP/docker-$safe_platform-version.json"', self.text)
         self.assertIn('.arch == $arch', self.text)
+        self.assertIn('platform_digest=$(jq -r', self.text)
+        self.assertIn('$IMAGE_REPOSITORY@$platform_digest', self.text)
+        candidate_smoke = self.text.split("      - name: Smoke test candidate images", 1)[1].split(
+            "      - name: Re-verify release tag before promotion", 1
+        )[0]
+        self.assertNotIn('$IMAGE_REPOSITORY@$IMAGE_DIGEST', candidate_smoke)
 
     def test_version_tag_is_immutable_and_mutable_tags_cannot_regress(self) -> None:
         promote = self.text.split("      - name: Promote verified image tags", 1)[1]
@@ -94,6 +100,9 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn('test "$promoted_digest" = "$promotion_digest"', promote)
         self.assertIn("Reuse previously verified immutable tag", promote)
         self.assertIn("existing-exact-manifest.json", promote)
+        self.assertIn('platform_digest=$(jq -r', promote)
+        self.assertIn('$IMAGE_REPOSITORY@$platform_digest', promote)
+        self.assertNotIn('"$exact" mediaflux.py version --json', promote)
         self.assertIn('"linux/amd64:x86_64"', promote)
         self.assertIn('"linux/arm64:aarch64"', promote)
         self.assertIn('--arg arch "$expected_arch"', promote)
