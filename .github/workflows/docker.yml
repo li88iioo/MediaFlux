@@ -15,6 +15,9 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
   SOURCE_SHA: ${{ github.sha }}
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -85,6 +88,12 @@ jobs:
                 '.version == "0.0.0-ci" and .package == "docker" and .commit == $sha' \
                 "$RUNNER_TEMP/docker-version.json"
               curl --fail --silent --show-error \
+                http://127.0.0.1:1258/healthz >/dev/null
+              docker exec mediaflux-smoke python mediaflux.py doctor --json \
+                > "$RUNNER_TEMP/docker-doctor.json"
+              jq -e 'all(.[]; .status != "error")' \
+                "$RUNNER_TEMP/docker-doctor.json"
+              curl --fail --silent --show-error \
                 http://127.0.0.1:1258/static/js/app.js >/dev/null
               source_app_js_bytes=$(wc -c < app/static/js/app.js)
               image_app_js_bytes=$(docker exec mediaflux-smoke sh -c \
@@ -102,6 +111,7 @@ jobs:
         run: docker rm --force mediaflux-smoke >/dev/null 2>&1 || true
 
   build:
+    if: github.event_name != 'pull_request'
     needs: [test, smoke]
     runs-on: ubuntu-latest
     permissions:
@@ -127,6 +137,40 @@ jobs:
           set -euo pipefail
           IMAGE_REPOSITORY=$(printf '%s' "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
           if [[ "$IS_TAG" == "true" ]]; then
+            git fetch --force --no-tags origin \
+              "+refs/heads/main:refs/remotes/origin/main"
+            if ! git merge-base --is-ancestor "$BUILD_SHA" origin/main; then
+              echo "Release tag target must be contained in origin/main" >&2
+              exit 1
+            fi
+            SOURCE_VERSION=$(python -c 'from app import __version__; print(__version__)')
+            if [[ "$TAG_NAME" != "v$SOURCE_VERSION" ]]; then
+              echo "Release tag $TAG_NAME does not match source version v$SOURCE_VERSION" >&2
+              exit 1
+            fi
+            export SOURCE_VERSION
+            if ! python - <<'PY'
+            import importlib.util
+            import os
+            from pathlib import Path
+
+            path = Path("packaging/scripts/generate_build_info.py")
+            spec = importlib.util.spec_from_file_location("release_build_info", path)
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            import sys
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            section = module._changelog_section(
+                Path("CHANGELOG.md").read_text(encoding="utf-8"),
+                os.environ["SOURCE_VERSION"],
+            )
+            raise SystemExit(0 if section.strip() else 1)
+            PY
+            then
+              echo "CHANGELOG.md is missing a dated, non-empty $SOURCE_VERSION section" >&2
+              exit 1
+            fi
             VERSION_REF="$TAG_NAME"
             RELEASE_BUILD=true
           else
@@ -191,6 +235,8 @@ jobs:
             SOURCE_DATE_EPOCH=${{ steps.context.outputs.source_date_epoch }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
 
       - name: Verify candidate multi-architecture manifest
         if: startsWith(github.ref, 'refs/tags/v')
@@ -206,7 +252,7 @@ jobs:
               and ($platforms | index("linux/arm64")) != null
           ' "$RUNNER_TEMP/manifest.json"
 
-      - name: Smoke test candidate arm64 image
+      - name: Smoke test candidate images
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           IMAGE_REPOSITORY: ${{ steps.context.outputs.image_repository }}
@@ -215,12 +261,18 @@ jobs:
           EXPECTED_SHA: ${{ steps.context.outputs.source_sha }}
         run: |
           set -euo pipefail
-          docker run --rm --platform linux/arm64 --entrypoint python \
-            "$IMAGE_REPOSITORY@$IMAGE_DIGEST" mediaflux.py version --json \
-            > "$RUNNER_TEMP/docker-arm64-version.json"
-          jq -e --arg version "$EXPECTED_VERSION" --arg sha "$EXPECTED_SHA" \
-            '.version == $version and .arch == "aarch64" and .package == "docker" and .commit == $sha' \
-            "$RUNNER_TEMP/docker-arm64-version.json"
+          for platform_and_arch in "linux/amd64:x86_64" "linux/arm64:aarch64"; do
+            platform=${platform_and_arch%%:*}
+            expected_arch=${platform_and_arch#*:}
+            safe_platform=${platform//\//-}
+            output="$RUNNER_TEMP/docker-$safe_platform-version.json"
+            docker run --rm --platform "$platform" --entrypoint python \
+              "$IMAGE_REPOSITORY@$IMAGE_DIGEST" mediaflux.py version --json > "$output"
+            jq -e --arg version "$EXPECTED_VERSION" --arg sha "$EXPECTED_SHA" \
+              --arg arch "$expected_arch" \
+              '.version == $version and .arch == $arch and .package == "docker" and .commit == $sha' \
+              "$output"
+          done
 
       - name: Re-verify release tag before promotion
         if: startsWith(github.ref, 'refs/tags/v')
@@ -324,7 +376,10 @@ jobs:
           VERSION_REF: ${{ steps.context.outputs.version_ref }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/release-notes
+          RELEASE_ASSETS="$RUNNER_TEMP/release-assets"
+          mkdir -p "$RELEASE_ASSETS"
+          cp "$RUNNER_TEMP/BUILD-INFO.json" "$RELEASE_ASSETS/BUILD-INFO.json"
+          export RELEASE_ASSETS
           python - <<'PY'
           import importlib.util, os
           from pathlib import Path
@@ -334,8 +389,25 @@ jobs:
           import sys
           sys.modules[s.name] = m
           s.loader.exec_module(m)
-          m.generate_release_notes(os.environ['VERSION_REF'], os.environ['GITHUB_REPOSITORY'], Path('CHANGELOG.md'), Path('/tmp/release-notes/RELEASE-NOTES.txt'))
+          m.generate_release_notes(
+              os.environ['VERSION_REF'],
+              os.environ['GITHUB_REPOSITORY'],
+              Path('CHANGELOG.md'),
+              Path(os.environ['RELEASE_ASSETS']) / 'RELEASE-NOTES.txt',
+          )
           PY
+          python packaging/scripts/generate_sbom.py requirements-release-runtime.lock \
+            --output "$RELEASE_ASSETS/PYTHON-DEPENDENCIES.spdx.json" \
+            --namespace "https://github.com/$GITHUB_REPOSITORY/releases/tag/$VERSION_REF"
+          python packaging/scripts/generate_checksums.py "$RELEASE_ASSETS"
+          git fetch --force --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          git fetch --force --no-tags origin \
+            "+refs/tags/$VERSION_REF:refs/tags/$VERSION_REF"
+          EXPECTED_SHA=$(jq -r '.commit' "$RUNNER_TEMP/BUILD-INFO.json")
+          test "$(git rev-list -n 1 "$VERSION_REF")" = "$EXPECTED_SHA"
+          git merge-base --is-ancestor "$EXPECTED_SHA" origin/main
+
           PRERELEASE=()
           if jq -e '.prerelease == true' "$RUNNER_TEMP/BUILD-INFO.json" >/dev/null; then
             PRERELEASE=(--prerelease)
@@ -343,6 +415,11 @@ jobs:
           if ! gh release view "$VERSION_REF" >/dev/null 2>&1; then
             gh release create "$VERSION_REF" \
               --title "MediaFlux $VERSION_REF" \
-              --notes-file /tmp/release-notes/RELEASE-NOTES.txt \
+              --notes-file "$RELEASE_ASSETS/RELEASE-NOTES.txt" \
               "${PRERELEASE[@]}"
           fi
+          gh release upload "$VERSION_REF" --clobber \
+            "$RELEASE_ASSETS/BUILD-INFO.json" \
+            "$RELEASE_ASSETS/RELEASE-NOTES.txt" \
+            "$RELEASE_ASSETS/PYTHON-DEPENDENCIES.spdx.json" \
+            "$RELEASE_ASSETS/SHA256SUMS"

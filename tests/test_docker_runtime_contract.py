@@ -22,6 +22,9 @@ class DockerRuntimeContractTests(unittest.TestCase):
         cls.compose = yaml.safe_load(cls.compose_text)
         cls.env_example = (cls.ROOT / ".env.example").read_text(encoding="utf-8")
         cls.dockerignore = (cls.ROOT / ".dockerignore").read_text(encoding="utf-8")
+        cls.workflow = (
+            cls.ROOT / ".github" / "workflows" / "docker.yml"
+        ).read_text(encoding="utf-8")
 
     def test_image_uses_unified_single_worker_runtime_entrypoint(self) -> None:
         self.assertIn("COPY mediaflux.py /app/", self.dockerfile)
@@ -264,6 +267,38 @@ class DockerRuntimeContractTests(unittest.TestCase):
         ):
             self.assertIn(value, self.dockerfile)
         self.assertNotIn("COPY --chown=mediaflux:mediaflux app /app/app", self.dockerfile)
+
+    def test_release_workflow_fails_closed_before_publishing(self) -> None:
+        for value in (
+            "if: github.event_name != 'pull_request'",
+            'git merge-base --is-ancestor "$BUILD_SHA" origin/main',
+            'module._changelog_section(',
+            'permissions:\n  contents: read',
+            "from app import __version__",
+            "does not match source version",
+            "CHANGELOG.md is missing a dated, non-empty",
+            "provenance: mode=max",
+            "sbom: true",
+        ):
+            with self.subTest(value=value):
+                self.assertIn(value, self.workflow)
+
+    def test_release_workflow_smoke_and_assets_cover_release_contract(self) -> None:
+        for value in (
+            "http://127.0.0.1:1258/readyz",
+            "http://127.0.0.1:1258/healthz",
+            "python mediaflux.py doctor --json",
+            "BUILD-INFO.json",
+            "RELEASE-NOTES.txt",
+            "PYTHON-DEPENDENCIES.spdx.json",
+            '"linux/amd64:x86_64"',
+            '"linux/arm64:aarch64"',
+            'git merge-base --is-ancestor "$EXPECTED_SHA" origin/main',
+            "SHA256SUMS",
+            'gh release upload "$VERSION_REF" --clobber',
+        ):
+            with self.subTest(value=value):
+                self.assertIn(value, self.workflow)
 
     def test_bare_container_cli_fails_closed_without_credentials(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mediaflux-docker-contract-") as root:

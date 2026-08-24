@@ -13,7 +13,12 @@ import unicodedata
 from typing import Any, Callable
 
 from app import database as db
-from app.agent.action_history import record_confirmation_error, record_confirmed_result
+from app.agent.action_history import (
+    record_confirmation_claimed,
+    record_confirmation_error,
+    record_confirmation_interrupted,
+    record_confirmed_result,
+)
 from app.agent.confirmation import (
     ConfirmationStore,
     SQLiteConfirmationStore,
@@ -6855,11 +6860,21 @@ class AgentOrchestrator:
                 self.confirmation_store, "claim_and_rotate_owner", None
             )
             if callable(claim_and_rotate):
-                ticket = claim_and_rotate(
-                    owner=owner, confirmation_id=confirmation_id
+                builtin_store = isinstance(
+                    self.confirmation_store,
+                    (ConfirmationStore, SQLiteConfirmationStore),
                 )
+                claim_kwargs = {
+                    "owner": owner,
+                    "confirmation_id": confirmation_id,
+                }
+                if builtin_store:
+                    claim_kwargs["record_execution"] = self.record_actions
+                    claim_kwargs["execution_risk_for"] = self.registry.risk_for
+                ticket = claim_and_rotate(**claim_kwargs)
                 self._reconcile_missing_confirmations(owner, ())
             else:
+                builtin_store = False
                 ticket = self.confirmation_store.claim(
                     owner=owner, confirmation_id=confirmation_id
                 )
@@ -6870,6 +6885,15 @@ class AgentOrchestrator:
             raise
         agent_metrics.record_confirmation("claimed")
         risk = self.registry.risk_for(ticket.tool_name)
+        if self.record_actions and not builtin_store:
+            record_confirmation_claimed(
+                owner=owner,
+                confirmation_id=ticket.confirmation_id,
+                owner_generation=ticket.owner_generation,
+                tool_name=ticket.tool_name,
+                risk=risk,
+                confirmation_contract=ticket.confirmation_contract,
+            )
         try:
             result, elapsed_ms = self.registry.execute_confirmed(
                 ticket.tool_name,
@@ -6884,6 +6908,19 @@ class AgentOrchestrator:
                     tool_name=ticket.tool_name,
                     risk=risk,
                     code=exc.code,
+                    confirmation_contract=ticket.confirmation_contract,
+                    confirmation_id=ticket.confirmation_id,
+                    owner_generation=ticket.owner_generation,
+                )
+            raise
+        except BaseException:
+            if self.record_actions:
+                record_confirmation_interrupted(
+                    owner=owner,
+                    confirmation_id=ticket.confirmation_id,
+                    owner_generation=ticket.owner_generation,
+                    tool_name=ticket.tool_name,
+                    risk=risk,
                     confirmation_contract=ticket.confirmation_contract,
                 )
             raise
@@ -6963,6 +7000,8 @@ class AgentOrchestrator:
                 result=result,
                 elapsed_ms=elapsed_ms,
                 confirmation_contract=ticket.confirmation_contract,
+                confirmation_id=ticket.confirmation_id,
+                owner_generation=ticket.owner_generation,
             )
         public_result = (
             sanitize_submission_confirmation_result(result)

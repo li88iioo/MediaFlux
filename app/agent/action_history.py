@@ -176,10 +176,17 @@ _STATUS_LABELS = {
     "confirmation_stale": "确认已失效",
     "busy": "正在执行",
     "review_required": "需人工核对",
+    "executing": "执行中",
+    "outcome_unknown": "结果待核对",
 }
 
 _OUTCOME_LABELS = {"all": "全部", "success": "成功", "failed": "失败"}
-_SAFE_ERROR_CODES = {"confirmation_stale", "confirmation_not_supported", "tool_not_found"}
+_SAFE_ERROR_CODES = {
+    "confirmation_stale",
+    "confirmation_not_supported",
+    "tool_not_found",
+    "execution_interrupted",
+}
 _COUNT_FIELDS = {
     "requested", "claimed", "submitted", "failed", "matched", "resolved", "missing",
     "stale", "source_count", "succeeded", "cleaned", "subscription_id",
@@ -378,9 +385,98 @@ def action_history_owner_digest(owner: str) -> str:
         b"mediaflux-agent-action-history:v1\0" + normalized.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
+
+
+def _confirmation_execution_id(
+    confirmation_id: str,
+    owner_generation: int,
+) -> str:
+    ticket_id = str(confirmation_id or "").strip()
+    generation = max(0, int(owner_generation or 0))
+    return f"{ticket_id}-{generation}"
+
+
+def record_confirmation_claimed(
+    *,
+    owner: str,
+    confirmation_id: str,
+    owner_generation: int,
+    tool_name: str,
+    risk: RiskLevel,
+    confirmation_contract: dict[str, Any] | None = None,
+    connection: Any = None,
+) -> None:
+    """在消费确认票据的同一事务中先持久化执行中状态。"""
+    started_at, _finished_at = _timestamps(0)
+    safe_tool = _safe_tool_name(tool_name)
+    db.add_agent_action_history(
+        owner_digest=action_history_owner_digest(owner),
+        tool_name=safe_tool,
+        risk=risk.value,
+        status="executing",
+        ok=False,
+        summary=_safe_summary(safe_tool, "executing"),
+        safe_details=_audit_details(
+            tool_name,
+            {},
+            confirmation_contract,
+        ),
+        started_at=started_at,
+        finished_at=started_at,
+        confirmation_id=_confirmation_execution_id(
+            confirmation_id,
+            owner_generation,
+        ),
+        connection=connection,
+    )
+
+
+def record_confirmation_interrupted(
+    *,
+    owner: str,
+    confirmation_id: str,
+    owner_generation: int,
+    tool_name: str,
+    risk: RiskLevel,
+    confirmation_contract: dict[str, Any] | None = None,
+) -> None:
+    """把已领取但未取得可信终态的动作标记为需人工核对。"""
+    safe_tool = _safe_tool_name(tool_name)
+    started_at, finished_at = _timestamps(0)
+    try:
+        db.add_agent_action_history(
+            owner_digest=action_history_owner_digest(owner),
+            tool_name=safe_tool,
+            risk=risk.value,
+            status="outcome_unknown",
+            ok=False,
+            summary=_safe_summary(safe_tool, "outcome_unknown"),
+            safe_details=_audit_details(
+                tool_name,
+                {},
+                confirmation_contract,
+            ),
+            error_code="execution_interrupted",
+            started_at=started_at,
+            finished_at=finished_at,
+            confirmation_id=_confirmation_execution_id(
+                confirmation_id,
+                owner_generation,
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Agent 中断动作审计写入失败 tool=%s type=%s",
+            tool_name,
+            type(exc).__name__,
+        )
+
+
 def record_confirmed_result(*, owner: str, tool_name: str, risk: RiskLevel,
                             result: ToolResult, elapsed_ms: int,
-                            confirmation_contract: dict[str, Any] | None = None) -> None:
+                            confirmation_contract: dict[str, Any] | None = None,
+                            confirmation_id: str = "",
+                            owner_generation: int = 0) -> None:
     """尽力记录已确认动作；审计失败不能改变副作用执行结果。"""
     started_at, finished_at = _timestamps(elapsed_ms)
     safe_tool = _safe_tool_name(tool_name)
@@ -397,6 +493,11 @@ def record_confirmed_result(*, owner: str, tool_name: str, risk: RiskLevel,
             elapsed_ms=elapsed_ms,
             started_at=started_at,
             finished_at=finished_at,
+            confirmation_id=(
+                _confirmation_execution_id(confirmation_id, owner_generation)
+                if confirmation_id
+                else ""
+            ),
         )
     except Exception as exc:
         logger.warning("Agent 动作审计写入失败 tool=%s type=%s", tool_name, type(exc).__name__)
@@ -404,7 +505,9 @@ def record_confirmed_result(*, owner: str, tool_name: str, risk: RiskLevel,
 
 def record_confirmation_error(*, owner: str, tool_name: str, risk: RiskLevel,
                               code: str, elapsed_ms: int = 0,
-                              confirmation_contract: dict[str, Any] | None = None) -> None:
+                              confirmation_contract: dict[str, Any] | None = None,
+                              confirmation_id: str = "",
+                              owner_generation: int = 0) -> None:
     """记录票据已消费、但在执行前因稳定确认错误码终止的动作。"""
     stable_code = _safe_error_code(code) or "confirmation_stale"
     safe_tool = _safe_tool_name(tool_name)
@@ -422,6 +525,11 @@ def record_confirmation_error(*, owner: str, tool_name: str, risk: RiskLevel,
             elapsed_ms=elapsed_ms,
             started_at=started_at,
             finished_at=finished_at,
+            confirmation_id=(
+                _confirmation_execution_id(confirmation_id, owner_generation)
+                if confirmation_id
+                else ""
+            ),
         )
     except Exception as exc:
         logger.warning("Agent 动作审计写入失败 tool=%s type=%s", tool_name, type(exc).__name__)
@@ -447,11 +555,20 @@ def list_action_history(arguments: dict[str, Any], context: ToolContext) -> Tool
         if risk not in {"low_write", "write", "danger"}:
             risk = "danger"
         confirmation_contract = _stored_confirmation_contract(details)
+        outcome = (
+            "success"
+            if bool(row["ok"])
+            else "pending"
+            if status == "executing"
+            else "unknown"
+            if status == "outcome_unknown"
+            else "failed"
+        )
         item = {
             "tool": tool_name,
             "label": _TOOL_LABELS.get(tool_name, "Agent 受确认动作"),
             "risk": risk,
-            "outcome": "success" if bool(row["ok"]) else "failed",
+            "outcome": outcome,
             "status": status,
             "summary": _safe_summary(tool_name, status),
             "details": _safe_details(tool_name, details),

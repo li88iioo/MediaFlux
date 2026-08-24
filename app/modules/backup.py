@@ -279,6 +279,15 @@ def _read_verified_backup(archive_path: Path) -> tuple[BackupManifest, dict[str,
                 raise BackupError("备份内容与 manifest 不一致")
             if database_payload is not None:
                 _verify_sqlite(database_payload)
+                actual_schema_version = _database_schema_version(database_payload)
+                try:
+                    manifest_schema_version = int(
+                        manifest.get("database_schema_version", -1)
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise BackupError("备份数据库版本字段无效") from exc
+                if manifest_schema_version != actual_schema_version:
+                    raise BackupError("备份数据库版本与 manifest 不一致")
     except FileNotFoundError as exc:
         raise BackupError(f"备份文件不存在：{path}") from exc
     except zipfile.BadZipFile as exc:
@@ -753,6 +762,20 @@ def restore_backup(paths: RuntimePaths, archive_path: Path) -> BackupManifest:
     with _offline_restore_guard(paths):
         _recover_pending_restore_unlocked(paths)
         manifest, verified_payloads = _read_verified_backup(archive_path)
+        database_payload = verified_payloads.get("database/mediaflux.db")
+        if database_payload is None:
+            raise BackupError("完整恢复要求备份包含数据库")
+        # 不能只信任 manifest；必须以已经完成哈希与完整性校验的数据库
+        # payload 为准，避免降级版本恢复成功后把服务留在无法启动的状态。
+        from app.database import SCHEMA_VERSION
+
+        backup_schema_version = _database_schema_version(database_payload)
+        if backup_schema_version > SCHEMA_VERSION:
+            raise BackupError(
+                "备份数据库版本 "
+                f"{backup_schema_version} 高于当前程序支持的 {SCHEMA_VERSION}，"
+                "已拒绝降级恢复"
+            )
         mapping = _restore_mapping(paths)
         files = {
             str(entry["name"]): (

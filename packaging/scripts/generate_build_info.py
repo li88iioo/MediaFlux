@@ -3,7 +3,7 @@
 from __future__ import annotations
 import argparse, json, os, re, tempfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -129,10 +129,20 @@ def generate_release_manifest(directory: Path, version: str, commit: str, output
     return output
 
 def _changelog_section(changelog_text: str, version: str) -> str:
-    """抽取 CHANGELOG.md 中指定版本段落（不含版本标题行），找不到返回空串。"""
-    pattern = re.compile(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)", re.MULTILINE | re.DOTALL)
+    """抽取带 ISO 日期的正式版本段落；标题或正文不合规时返回空串。"""
+    pattern = re.compile(
+        rf"^## \[{re.escape(version)}\] - (\d{{4}}-\d{{2}}-\d{{2}})[ \t]*\n"
+        r"(.*?)(?=^## \[|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
     match = pattern.search(changelog_text)
-    return match.group(1).strip() if match else ""
+    if match is None:
+        return ""
+    try:
+        date.fromisoformat(match.group(1))
+    except ValueError:
+        return ""
+    return match.group(2).strip()
 
 
 def generate_release_notes(ref: str, repo: str, changelog_path: Path, output: Path) -> Path:

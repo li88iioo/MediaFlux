@@ -15,7 +15,7 @@ from app.agent.action_history import (
     list_action_history,
     record_confirmed_result,
 )
-from app.agent.confirmation import ConfirmationStore
+from app.agent.confirmation import ConfirmationStore, SQLiteConfirmationStore
 from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
 from app.agent.orchestrator import AgentOrchestrator, agent_action_history_request
 from app.agent.owner_routes import web_agent_owner
@@ -88,6 +88,73 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
                 summary="invalid",
                 safe_details={"nested": {"path": "/private"}},
             )
+
+    def test_first_write_repairs_missing_history_table_in_legacy_database(self):
+        with db.get_conn() as conn:
+            conn.execute("DROP TABLE agent_action_history")
+
+        history_id = db.add_agent_action_history(
+            owner_digest=OWNER_DIGEST,
+            tool_name="telegram.send_test_notification",
+            risk="low_write",
+            status="executing",
+            ok=False,
+            summary="Telegram 测试通知：执行中",
+            confirmation_id="legacy-ticket-1",
+        )
+
+        self.assertGreater(history_id, 0)
+        row = db.list_agent_action_history(
+            owner_digest=OWNER_DIGEST,
+            limit=1,
+        )[0]
+        self.assertEqual(row["status"], "executing")
+        with db.get_conn() as conn:
+            confirmation = conn.execute(
+                "SELECT confirmation_id FROM agent_action_history WHERE id=?",
+                (history_id,),
+            ).fetchone()
+            indexes = {
+                str(index["name"])
+                for index in conn.execute("PRAGMA index_list(agent_action_history)")
+            }
+        self.assertEqual(confirmation["confirmation_id"], "legacy-ticket-1")
+        self.assertIn("idx_agent_action_history_confirmation", indexes)
+        self.assertIn("idx_agent_action_history_owner_id", indexes)
+
+    def test_failed_filter_excludes_in_progress_and_unknown_outcomes(self):
+        owner_digest = action_history_owner_digest(OWNER)
+        for status in ("executing", "outcome_unknown"):
+            db.add_agent_action_history(
+                owner_digest=owner_digest,
+                tool_name="strm.run_once",
+                risk="danger",
+                status=status,
+                ok=False,
+                summary=f"STRM 手动同步：{status}",
+            )
+        db.add_agent_action_history(
+            owner_digest=owner_digest,
+            tool_name="strm.run_once",
+            risk="danger",
+            status="failed",
+            ok=False,
+            summary="STRM 手动同步：执行失败",
+        )
+
+        failed = db.list_agent_action_history(
+            owner_digest=owner_digest,
+            limit=10,
+            outcome="failed",
+        )
+        self.assertEqual([row["status"] for row in failed], ["failed"])
+        all_items = list_action_history(
+            {"limit": 10, "outcome": "all"},
+            ToolContext(owner=OWNER),
+        ).data["items"]
+        outcomes = {item["status"]: item["outcome"] for item in all_items}
+        self.assertEqual(outcomes["executing"], "pending")
+        self.assertEqual(outcomes["outcome_unknown"], "unknown")
 
     def test_projection_keeps_only_strict_safe_fields(self):
         record_confirmed_result(
@@ -375,7 +442,8 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             2,
         )
 
-    def test_audit_storage_failure_does_not_change_confirmed_result(self):
+    def test_execution_ledger_failure_prevents_untracked_side_effect(self):
+        calls: list[str] = []
         registry = ToolRegistry()
         registry.register(ToolSpec(
             name="strm.run_once",
@@ -384,7 +452,10 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             parameters={},
             validator=lambda arguments: {},
             preview_handler=lambda arguments: ToolResult(True, "confirmation_required", "preview"),
-            handler=lambda arguments: ToolResult(True, "accepted", "done"),
+            handler=lambda arguments: (
+                calls.append("executed")
+                or ToolResult(True, "accepted", "done")
+            ),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -394,9 +465,81 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         )
         prepared = service.prepare("strm.run_once", {}, owner="owner")
         with patch("app.agent.action_history.db.add_agent_action_history", side_effect=OSError("disk")):
-            response = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
-        self.assertTrue(response["result"]["ok"])
-        self.assertEqual(response["result"]["status"], "accepted")
+            with self.assertRaises(OSError):
+                service.confirm(
+                    prepared["confirmation"]["confirmation_id"],
+                    owner="owner",
+                )
+        self.assertEqual(calls, [])
+
+    def test_interrupted_confirm_is_persisted_as_outcome_unknown(self):
+        registry = ToolRegistry()
+
+        def interrupt(_arguments):
+            raise KeyboardInterrupt("simulated process interruption")
+
+        registry.register(ToolSpec(
+            name="strm.run_once",
+            description="test",
+            risk=RiskLevel.DANGER,
+            parameters={},
+            validator=lambda arguments: {},
+            preview_handler=lambda arguments: ToolResult(
+                True, "confirmation_required", "preview"
+            ),
+            handler=interrupt,
+            requires_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry,
+            SQLiteConfirmationStore(),
+            record_actions=True,
+        )
+        prepared = service.prepare("strm.run_once", {}, owner="owner")
+        confirmation_id = prepared["confirmation"]["confirmation_id"]
+
+        with self.assertRaises(KeyboardInterrupt):
+            service.confirm(confirmation_id, owner="owner")
+
+        rows = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest("owner"),
+            limit=10,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "outcome_unknown")
+        self.assertEqual(rows[0]["error_code"], "execution_interrupted")
+        self.assertEqual(rows[0]["risk"], "danger")
+        with db.get_conn() as conn:
+            stored = conn.execute(
+                "SELECT confirmation_id FROM agent_action_history"
+            ).fetchone()
+        self.assertTrue(
+            str(stored["confirmation_id"]).startswith(f"{confirmation_id}-")
+        )
+        with self.assertRaises(AgentToolError) as replay:
+            service.confirm(confirmation_id, owner="owner")
+        self.assertEqual(replay.exception.code, "confirmation_invalid")
+
+    def test_startup_marks_orphaned_executing_action_as_unknown(self):
+        confirmation_id = "orphaned-confirmation-1234567890"
+        db.add_agent_action_history(
+            owner_digest=action_history_owner_digest("owner"),
+            tool_name="strm.run_once",
+            risk="danger",
+            status="executing",
+            ok=False,
+            summary="STRM 手动同步：执行中",
+            confirmation_id=confirmation_id,
+        )
+
+        db.init_db()
+
+        rows = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest("owner"),
+            limit=1,
+        )
+        self.assertEqual(rows[0]["status"], "outcome_unknown")
+        self.assertEqual(rows[0]["error_code"], "execution_interrupted")
 
     def test_read_tool_arguments_and_natural_language_request_are_strict(self):
         self.assertEqual(action_history_arguments({}), {"limit": 20, "outcome": "all"})

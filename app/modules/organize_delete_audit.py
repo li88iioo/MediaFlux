@@ -68,12 +68,23 @@ def execute_recycle_bin_delete(client, *, trigger: str, reason: str,
             str(safe_failure_message or "").strip()
             or redact_sensitive_text(exc)[:500]
         )[:500]
-        db.update_organize_delete_audit(
-            audit_id, status="failed", error=safe_error,
-            provider_result=redact_sensitive_text(
-                f"光鸭回收站调用失败：{safe_error}"
-            )[:500],
+        provider_not_called = bool(
+            getattr(exc, "provider_write_not_started", False)
         )
+        db.update_organize_delete_audit(
+            audit_id,
+            status="blocked" if provider_not_called else "failed",
+            error=safe_error,
+            provider_result=(
+                "未调用光鸭 provider；对象保留"
+                if provider_not_called
+                else redact_sensitive_text(
+                    f"光鸭回收站调用失败：{safe_error}"
+                )[:500]
+            ),
+        )
+        if provider_not_called:
+            raise
         raise RuntimeError(safe_error) from exc
     db.update_organize_delete_audit(
         audit_id, status="success", error="",

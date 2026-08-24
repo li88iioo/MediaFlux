@@ -104,7 +104,7 @@ class BackupTests(unittest.TestCase):
             paths.ensure_writable_dirs()
             connection = sqlite3.connect(paths.database_path)
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA user_version=7")
+            connection.execute(f"PRAGMA user_version={database.SCHEMA_VERSION}")
             connection.execute("CREATE TABLE sample(value TEXT)")
             connection.execute("INSERT INTO sample VALUES ('before')")
             connection.commit()
@@ -113,7 +113,10 @@ class BackupTests(unittest.TestCase):
 
             archive = create_backup(paths, reason="unit", source_connection=connection)
             manifest = verify_backup(archive)
-            self.assertEqual(manifest.payload["database_schema_version"], 7)
+            self.assertEqual(
+                manifest.payload["database_schema_version"],
+                database.SCHEMA_VERSION,
+            )
             self.assertEqual(len(manifest.entries), 3)
 
             connection.close()
@@ -130,6 +133,89 @@ class BackupTests(unittest.TestCase):
                 self.assertEqual(check.execute("SELECT value FROM sample").fetchone()[0], "before")
             finally:
                 check.close()
+
+    def test_restore_rejects_future_schema_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_paths(root / "source")
+            source.ensure_writable_dirs()
+            source_db = sqlite3.connect(source.database_path)
+            source_db.execute(
+                f"PRAGMA user_version={database.SCHEMA_VERSION + 1}"
+            )
+            source_db.execute("CREATE TABLE future_data(value TEXT)")
+            source_db.execute("INSERT INTO future_data VALUES ('future')")
+            source_db.commit()
+            source_db.close()
+            archive = create_backup(source)
+
+            target = make_paths(root / "target")
+            target.ensure_writable_dirs()
+            target_db = sqlite3.connect(target.database_path)
+            target_db.execute("CREATE TABLE current_data(value TEXT)")
+            target_db.execute("INSERT INTO current_data VALUES ('keep')")
+            target_db.commit()
+            target_db.close()
+            target.env_file.write_text("WEB_PORT=1258\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(BackupError, "已拒绝降级恢复"):
+                restore_backup(target, archive)
+
+            check = sqlite3.connect(target.database_path)
+            try:
+                self.assertEqual(
+                    check.execute("SELECT value FROM current_data").fetchone()[0],
+                    "keep",
+                )
+                self.assertIsNone(
+                    check.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='future_data'"
+                    ).fetchone()
+                )
+            finally:
+                check.close()
+            self.assertEqual(
+                target.env_file.read_text(encoding="utf-8"),
+                "WEB_PORT=1258\n",
+            )
+
+    def test_restore_rejects_partial_archive_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_paths(root / "source")
+            source.ensure_writable_dirs()
+            source.env_file.write_text("WEB_PORT=9999\n", encoding="utf-8")
+            archive = create_backup(source)
+            self.assertEqual(
+                [entry["name"] for entry in verify_backup(archive).entries],
+                ["config/user.env"],
+            )
+
+            target = make_paths(root / "target")
+            target.ensure_writable_dirs()
+            target_db = sqlite3.connect(target.database_path)
+            target_db.execute("CREATE TABLE current_data(value TEXT)")
+            target_db.execute("INSERT INTO current_data VALUES ('keep')")
+            target_db.commit()
+            target_db.close()
+            target.env_file.write_text("WEB_PORT=1258\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(BackupError, "完整恢复要求备份包含数据库"):
+                restore_backup(target, archive)
+
+            check = sqlite3.connect(target.database_path)
+            try:
+                self.assertEqual(
+                    check.execute("SELECT value FROM current_data").fetchone()[0],
+                    "keep",
+                )
+            finally:
+                check.close()
+            self.assertEqual(
+                target.env_file.read_text(encoding="utf-8"),
+                "WEB_PORT=1258\n",
+            )
 
     def test_verify_rejects_hash_tampering_and_extra_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

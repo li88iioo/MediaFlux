@@ -2521,6 +2521,35 @@ class DirectorySeasonOverrideTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(stats["source_dir_cleaned"], 1)
 
+    def test_cleanup_rechecks_cancel_immediately_before_recycle_delete(self):
+        service, _store, client = self._build(clean_empty=True)
+        client.tree["source"] = []
+        client.delete_empty_directory = Mock(wraps=client.delete_empty_directory)
+        record = SimpleNamespace(
+            scope_type="directory", scope_id="source", rules=service.rules_loader()
+        )
+        current = SimpleNamespace(directory_id="source", directory_name="下载目录")
+        stats = {}
+        checks = iter((False, True))
+
+        service._cleanup_selected_source(
+            record,
+            current,
+            stats,
+            cancel_check=lambda: next(checks),
+        )
+
+        client.delete_empty_directory.assert_not_called()
+        self.assertEqual(stats["stopped"], 1)
+        self.assertEqual(stats["source_dir_cleanup_skipped"], 1)
+        self.assertIn("source", client.infos)
+        audit = db.list_organize_delete_audits(limit=1)[0]
+        self.assertEqual(audit["status"], "blocked")
+        self.assertEqual(
+            audit["provider_result"],
+            "未调用光鸭 provider；对象保留",
+        )
+
     def test_cleanup_preserves_empty_source_when_execution_stats_are_unsafe(self):
         from types import SimpleNamespace
 

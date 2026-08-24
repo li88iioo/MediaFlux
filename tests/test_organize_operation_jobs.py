@@ -50,6 +50,33 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
             str(first["job_id"]),
         )
 
+    def test_targeted_claim_cannot_bypass_older_pending_job(self) -> None:
+        first, _ = self._enqueue(dedupe="owner:first")
+        second, _ = self._enqueue(dedupe="owner:second")
+
+        self.assertIsNone(claim_organize_operation_job(str(second["job_id"])))
+        claimed_first = claim_organize_operation_job(str(first["job_id"]))
+        self.assertEqual(claimed_first["job_id"], first["job_id"])
+
+    def test_stopped_durable_result_is_persisted_as_partial(self) -> None:
+        created, _ = self._enqueue(dedupe="owner:stopped")
+        claimed = claim_organize_operation_job(str(created["job_id"]))
+        manager = OrganizeTaskManager()
+        manager._lock = threading.Lock()
+        self.assertTrue(manager._lock.acquire(blocking=False))
+        manager._task = {"id": str(created["job_id"]), "status": "running"}
+
+        with patch.object(
+            manager,
+            "_execute_durable_operation",
+            return_value={"stats": {"moved": 1, "stopped": 1}},
+        ):
+            manager._run_durable_operation(dict(claimed))
+
+        terminal = get_organize_operation_job(str(created["job_id"]))
+        self.assertEqual(terminal["status"], "partial")
+        self.assertFalse(manager._lock.locked())
+
     def test_claim_and_finish_are_generation_fenced(self) -> None:
         created, _ = self._enqueue()
         claimed = claim_organize_operation_job(str(created["job_id"]))

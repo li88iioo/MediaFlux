@@ -1,18 +1,21 @@
 """首个正式 SQLite schema 基线契约。"""
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import tempfile
 from pathlib import Path
 from unittest import mock
 
 from app import database as db
-from app.modules.backup import BackupError
+from app import runtime_paths as runtime_paths_module
+from app.modules.backup import BackupError, restore_backup, verify_backup
+from app.runtime_paths import RuntimePaths
 from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
-    def test_fresh_database_contains_complete_v5_schema(self) -> None:
+    def test_fresh_database_contains_complete_v6_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             task_columns = {
@@ -31,6 +34,10 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 str(row["name"])
                 for row in conn.execute("PRAGMA index_list(agent_action_history)")
             }
+            action_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(agent_action_history)")
+            }
             rss_indexes = {
                 str(row["name"]): int(row["unique"])
                 for row in conn.execute("PRAGMA index_list(rss_entries)")
@@ -43,13 +50,15 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             }
 
         self.assertEqual(version, db.SCHEMA_VERSION)
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         self.assertIn("rules_snapshot", task_columns)
         self.assertIn("season_override", task_columns)
         self.assertIn("episode_override", task_columns)
         self.assertIn("session_id", playback_columns)
         self.assertIn("version", mapping_columns)
         self.assertIn("idx_agent_action_history_owner_id", action_indexes)
+        self.assertIn("idx_agent_action_history_confirmation", action_indexes)
+        self.assertIn("confirmation_id", action_columns)
         self.assertEqual(rss_indexes.get("idx_rss_entries_item_guid"), 1)
         self.assertEqual(rss_indexes.get("idx_rss_entries_failure_retry"), 0)
         self.assertTrue({
@@ -66,6 +75,154 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             "media_proxy_playback_sessions",
             "idx_media_proxy_records_session_id",
         }.issubset(schema_objects))
+
+    def test_v014_release_schema_prebackup_restore_and_upgrade(self) -> None:
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "database"
+            / "v0.1.4-schema.sql"
+        )
+        fixture_bytes = fixture.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(fixture_bytes).hexdigest(),
+            "025aaf682dc1ccb1cfe9733e928057727c76e54ce61898c89ed7b0c3577350e3",
+        )
+
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        previous_runtime_paths = runtime_paths_module._configured_paths
+
+        def make_paths(root: Path) -> RuntimePaths:
+            return RuntimePaths(
+                program_dir=root / "program",
+                data_dir=root / "data",
+                config_dir=root / "data",
+                cache_dir=root / "data" / "cache",
+                log_dir=root / "data" / "logs",
+                strm_dir=root / "strm",
+                trash_dir=root / "data" / "trash",
+            )
+
+        def assert_upgraded(path: Path) -> None:
+            connection = sqlite3.connect(path)
+            try:
+                connection.row_factory = sqlite3.Row
+                self.assertEqual(
+                    int(connection.execute("PRAGMA user_version").fetchone()[0]),
+                    db.SCHEMA_VERSION,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM settings_kv WHERE key='release_fixture_sentinel'"
+                    ).fetchone()[0],
+                    "preserved",
+                )
+                self.assertEqual(
+                    tuple(connection.execute(
+                        "SELECT context_type,context_generation "
+                        "FROM agent_session_context WHERE owner_digest='release-owner'"
+                    ).fetchone()),
+                    ("patrol", 0),
+                )
+                self.assertEqual(
+                    tuple(connection.execute(
+                        "SELECT summary,confirmation_id FROM agent_action_history "
+                        "WHERE owner_digest=?",
+                        ("a" * 64,),
+                    ).fetchone()),
+                    ("v0.1.4 sentinel", ""),
+                )
+                self.assertIsNotNone(connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' "
+                    "AND name='idx_agent_action_history_confirmation'"
+                ).fetchone())
+                self.assertEqual(
+                    connection.execute("PRAGMA integrity_check").fetchone()[0],
+                    "ok",
+                )
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            finally:
+                connection.close()
+
+        with tempfile.TemporaryDirectory(prefix="mediaflux-v014-upgrade-") as root:
+            root_path = Path(root)
+            source_paths = make_paths(root_path / "source")
+            source_paths.ensure_writable_dirs()
+            connection = sqlite3.connect(source_paths.database_path)
+            try:
+                connection.executescript(fixture_bytes.decode("utf-8"))
+                connection.execute(
+                    "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?)",
+                    ("release_fixture_sentinel", "preserved", "2026-08-24"),
+                )
+                connection.execute(
+                    "INSERT INTO agent_session_context("
+                    "owner_digest,context_type,payload,expires_at,created_at"
+                    ") VALUES(?,?,?,?,?)",
+                    ("release-owner", "patrol", "{}", 9_999_999_999, "2026-08-24"),
+                )
+                connection.execute(
+                    "INSERT INTO agent_action_history("
+                    "owner_digest,tool_name,risk,status,ok,summary,started_at,finished_at"
+                    ") VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        "a" * 64,
+                        "rss.refresh_subscription",
+                        "write",
+                        "completed",
+                        1,
+                        "v0.1.4 sentinel",
+                        "2026-08-24",
+                        "2026-08-24",
+                    ),
+                )
+                connection.execute("PRAGMA user_version=1")
+                connection.commit()
+            finally:
+                connection.close()
+
+            runtime_paths_module.configure_runtime_paths(source_paths)
+            db.configure_database(source_paths.database_path, test_mode=False)
+            try:
+                with mock.patch.object(db, "_test_mode_enabled", return_value=False):
+                    db.init_db()
+                assert_upgraded(source_paths.database_path)
+
+                backups = list(source_paths.backup_dir.glob(
+                    "mediaflux-*-pre-migration-1-to-6-*.zip"
+                ))
+                self.assertEqual(len(backups), 1)
+                manifest = verify_backup(backups[0])
+                self.assertEqual(manifest.payload["database_schema_version"], 1)
+
+                restored_paths = make_paths(root_path / "restored")
+                restored_paths.ensure_writable_dirs()
+                restore_backup(restored_paths, backups[0])
+                restored = sqlite3.connect(restored_paths.database_path)
+                try:
+                    self.assertEqual(
+                        int(restored.execute("PRAGMA user_version").fetchone()[0]),
+                        1,
+                    )
+                    self.assertEqual(
+                        restored.execute(
+                            "SELECT value FROM settings_kv "
+                            "WHERE key='release_fixture_sentinel'"
+                        ).fetchone()[0],
+                        "preserved",
+                    )
+                finally:
+                    restored.close()
+
+                runtime_paths_module.configure_runtime_paths(restored_paths)
+                db.configure_database(restored_paths.database_path, test_mode=False)
+                with mock.patch.object(db, "_test_mode_enabled", return_value=False):
+                    db.init_db()
+                assert_upgraded(restored_paths.database_path)
+            finally:
+                runtime_paths_module.configure_runtime_paths(previous_runtime_paths)
+                db.configure_database(previous_path, test_mode=previous_test_mode)
 
     def test_v1_agent_session_context_migrates_without_losing_rows(self) -> None:
         previous_path = db.DB_PATH
@@ -112,7 +269,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                         "owner_digest,context_type,payload,expires_at,created_at"
                         ") VALUES('digest','resource_candidates','{}',9999999999,'2026-08-01')"
                     )
-                self.assertEqual(version, 5)
+                self.assertEqual(version, 6)
                 self.assertEqual(preserved["context_type"], "patrol")
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
@@ -184,7 +341,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 self.assertIsNone(legacy_table)
                 backup.assert_called_once()
                 kwargs = backup.call_args.kwargs
-                self.assertEqual(kwargs["reason"], "pre-migration-1-to-5")
+                self.assertEqual(kwargs["reason"], "pre-migration-1-to-6")
                 self.assertFalse(kwargs["include_settings"])
                 self.assertEqual(Path(kwargs["output"]).parent, path.parent / "backups")
                 self.assertIsInstance(kwargs["source_connection"], sqlite3.Connection)
@@ -522,7 +679,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                         "SELECT 1 FROM sqlite_master WHERE type='table' "
                         "AND name='agent_session_context_generation_sequence'"
                     ).fetchone()
-                self.assertEqual(version, 5)
+                self.assertEqual(version, 6)
                 self.assertIn("context_generation", columns)
                 self.assertEqual(preserved["context_type"], "patrol")
                 self.assertEqual(int(preserved["context_generation"]), 0)
@@ -604,7 +761,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                             "PRAGMA table_info(organize_operation_jobs)"
                         )
                     }
-                self.assertEqual(version, 5)
+                self.assertEqual(version, 6)
                 self.assertIsNotNone(table)
                 self.assertIn("idx_organize_operation_jobs_active_dedupe", indexes)
                 self.assertTrue({
@@ -665,12 +822,76 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                         str(row["name"])
                         for row in migrated.execute("PRAGMA table_info(organize_operation_jobs)")
                     }
-                self.assertEqual(version, 5)
+                self.assertEqual(version, 6)
                 self.assertTrue({"payload_auth", "cancel_requested", "expires_at", "purged_at"}.issubset(columns))
                 self.assertEqual(result["a" * 32]["status"], "cancelled")
                 self.assertEqual(result["a" * 32]["payload_json"], "{}")
                 self.assertEqual(result["b" * 32]["status"], "running")
                 self.assertEqual(result["c" * 32]["status"], "completed")
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_v5_action_history_gains_confirmation_execution_identity(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-agent-history-v6-") as root:
+            path = Path(root) / "v5.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(
+                    "CREATE TABLE agent_action_history ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "owner_digest TEXT NOT NULL DEFAULT '',"
+                    "tool_name TEXT NOT NULL,risk TEXT NOT NULL,status TEXT NOT NULL,"
+                    "ok INTEGER NOT NULL DEFAULT 0,"
+                    "mode TEXT NOT NULL DEFAULT 'confirmed_action',"
+                    "summary TEXT NOT NULL,safe_details TEXT NOT NULL DEFAULT '{}',"
+                    "error_code TEXT NOT NULL DEFAULT '',elapsed_ms INTEGER NOT NULL DEFAULT 0,"
+                    "started_at TEXT NOT NULL,finished_at TEXT NOT NULL"
+                    ");"
+                )
+                conn.execute(
+                    "INSERT INTO agent_action_history("
+                    "owner_digest,tool_name,risk,status,summary,started_at,finished_at"
+                    ") VALUES(?,?,?,?,?,?,?)",
+                    (
+                        "a" * 64,
+                        "rss.refresh_subscription",
+                        "write",
+                        "completed",
+                        "历史记录",
+                        "2026-08-01",
+                        "2026-08-01",
+                    ),
+                )
+                conn.execute("PRAGMA user_version=5")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {
+                        str(row["name"])
+                        for row in migrated.execute(
+                            "PRAGMA table_info(agent_action_history)"
+                        )
+                    }
+                    indexes = {
+                        str(row["name"])
+                        for row in migrated.execute(
+                            "PRAGMA index_list(agent_action_history)"
+                        )
+                    }
+                    preserved = migrated.execute(
+                        "SELECT summary,confirmation_id FROM agent_action_history"
+                    ).fetchone()
+                self.assertEqual(version, 6)
+                self.assertIn("confirmation_id", columns)
+                self.assertIn("idx_agent_action_history_confirmation", indexes)
+                self.assertEqual(tuple(preserved), ("历史记录", ""))
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
@@ -740,7 +961,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 backup.assert_called_once()
                 self.assertEqual(
                     backup.call_args.kwargs["reason"],
-                    "pre-migration-0-to-5",
+                    "pre-migration-0-to-6",
                 )
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)

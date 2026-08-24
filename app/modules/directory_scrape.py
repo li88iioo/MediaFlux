@@ -24,6 +24,7 @@ from app.modules.organize import (
     enforce_fixed_organize_rules,
 )
 from app.modules.organize_sources import normalize_organize_sources
+from app.repositories.organize_operation_jobs import OrganizeOperationCancelled
 from app.modules.episode_mapping import (
     EpisodeMappingPlan,
     NUMBERING_MODES,
@@ -458,10 +459,16 @@ class _CallbackCancelEvent:
 
     def __init__(self, callback: Callable[[], None]):
         self._callback = callback
+        self._cancelled = False
 
     def is_set(self) -> bool:
-        self._callback()
-        return False
+        if self._cancelled:
+            return True
+        try:
+            self._callback()
+        except OrganizeOperationCancelled:
+            self._cancelled = True
+        return self._cancelled
 
 class DirectoryScrapeService:
     def __init__(
@@ -999,9 +1006,12 @@ class DirectoryScrapeService:
         record = self.store.claim_preview(owner, preview_id)
         cancel_event = _CallbackCancelEvent(cancel_check) if cancel_check else None
 
+        def cancellation_requested() -> bool:
+            return bool(cancel_event is not None and cancel_event.is_set())
+
         def check_cancel() -> None:
-            if cancel_check is not None:
-                cancel_check()
+            if cancellation_requested():
+                raise OrganizeOperationCancelled("光鸭操作已取消")
 
         try:
             check_cancel()
@@ -1069,21 +1079,32 @@ class DirectoryScrapeService:
                 media_probe_cache_only=True,
                 cancel_event=cancel_event,  # type: ignore[arg-type]
             )
-            check_cancel()
+            if cancellation_requested():
+                stats["stopped"] = 1
             self._apply_pending_stats(stats, current)
-            self._cleanup_selected_source(record, current, stats)
-            check_cancel()
-            Organizer.notify_directory_results(
-                stats,
-                record.rules,
-                source_name=record.inspection.directory_name,
-            )
-            check_cancel()
-            Organizer.trigger_post_actions(
-                stats,
-                record.rules,
-                source_name=record.inspection.directory_name,
-            )
+            if not stats.get("stopped"):
+                self._cleanup_selected_source(
+                    record,
+                    current,
+                    stats,
+                    cancel_check=cancellation_requested,
+                )
+            if cancellation_requested():
+                stats["stopped"] = 1
+            if not stats.get("stopped"):
+                Organizer.notify_directory_results(
+                    stats,
+                    record.rules,
+                    source_name=record.inspection.directory_name,
+                )
+            if cancellation_requested():
+                stats["stopped"] = 1
+            if not stats.get("stopped"):
+                Organizer.trigger_post_actions(
+                    stats,
+                    record.rules,
+                    source_name=record.inspection.directory_name,
+                )
             file_ids = {item.file_id for item in record.inspection.videos}
             new_rows = [
                 row
@@ -1163,6 +1184,8 @@ class DirectoryScrapeService:
         record: PreviewRecord,
         current: DirectoryInspection,
         stats: dict,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         """目录刮削完成后，复核并清理用户本次选择的空目录根。"""
         stats.setdefault("source_dir_cleaned", 0)
@@ -1218,6 +1241,16 @@ class DirectoryScrapeService:
                 limit=6,
             )
             return
+        if cancel_check is not None and cancel_check():
+            stats["stopped"] = 1
+            stats["source_dir_cleanup_skipped"] = 1
+            Organizer._append_reason(
+                stats,
+                "empty_dir_cleanup_reasons",
+                "任务已停止，已保留所选源目录",
+                limit=6,
+            )
+            return
         try:
             remaining = self.client.list_dir(source_id)
             if remaining:
@@ -1253,6 +1286,15 @@ class DirectoryScrapeService:
                 expected_updated_at = 0
             if not expected_etag and not expected_updated_at:
                 raise RuntimeError("所选源目录缺少可验证版本信息")
+            def delete_operation():
+                if cancel_check is not None and cancel_check():
+                    raise OrganizeOperationCancelled("光鸭操作已取消")
+                return delete_empty(
+                    source_id,
+                    expected_etag=expected_etag,
+                    expected_updated_at=expected_updated_at,
+                )
+
             execute_recycle_bin_delete(
                 self.client,
                 trigger="directory_scrape_source_cleanup",
@@ -1262,15 +1304,20 @@ class DirectoryScrapeService:
                     name=source.name or current.directory_name,
                     parent_id=str(source.parent_id or "0"),
                 ),
-                delete_operation=lambda: delete_empty(
-                    source_id,
-                    expected_etag=expected_etag,
-                    expected_updated_at=expected_updated_at,
-                ),
+                delete_operation=delete_operation,
             )
             stats["source_dir_cleaned"] = 1
             stats["empty_dirs_cleaned"] = int(stats.get("empty_dirs_cleaned", 0) or 0) + 1
             logger.info("目录刮削已清理空源目录: %s", source_id)
+        except OrganizeOperationCancelled:
+            stats["stopped"] = 1
+            stats["source_dir_cleanup_skipped"] = 1
+            Organizer._append_reason(
+                stats,
+                "empty_dir_cleanup_reasons",
+                "任务已停止，已保留所选源目录",
+                limit=6,
+            )
         except Exception as exc:
             stats["source_dir_cleanup_failed"] = 1
             reason = " ".join(str(exc or type(exc).__name__).split())[:160]

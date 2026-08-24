@@ -197,6 +197,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         self.assertNotIn("X-Emby-Token", request.headers)
         self.assertEqual(request.extensions["sni_hostname"], "media.example")
+        self.assertFalse(_FakeAsyncClient.init_kwargs[0]["trust_env"])
         self.assertTrue(upstream.closed)
 
     def test_saved_emby_instance_probe_keeps_legacy_token_header(self):
@@ -462,6 +463,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(timeout.connect, 10.0)
         self.assertEqual(timeout.write, 30.0)
         self.assertEqual(timeout.pool, 5.0)
+        self.assertFalse(_FakeAsyncClient.init_kwargs[0]["trust_env"])
 
     def test_upstream_client_is_reused_and_closed_with_proxy_lifespan(self):
         first_upstream = _FakeUpstreamResponse(body=b"first")
@@ -775,6 +777,36 @@ class HybridMediaProxyTests(unittest.TestCase):
             'MediaBrowser Token="same-token"',
         )
         self.assertEqual(headers["Authorization"].count("Token="), 1)
+
+    def test_upstream_headers_strip_mediaflux_session_cookie_only(self):
+        request = SimpleNamespace(
+            headers=httpx.Headers({
+                "Cookie": (
+                    "session=mediaflux-admin; connect.sid=jellyfin-session; "
+                    "theme=dark"
+                ),
+            }),
+            query_params=httpx.QueryParams(),
+            client=("203.0.113.8", 43123),
+            url=SimpleNamespace(scheme="https"),
+        )
+
+        headers = media_proxy._upstream_request_headers(request, "jellyfin")
+
+        self.assertNotIn("mediaflux-admin", headers.get("cookie", ""))
+        self.assertEqual(
+            headers["cookie"],
+            "connect.sid=jellyfin-session; theme=dark",
+        )
+
+    def test_generic_response_headers_drop_upstream_set_cookie(self):
+        headers = media_proxy._response_headers(httpx.Headers({
+            "Content-Type": "application/json",
+            "Set-Cookie": "session=upstream; Path=/",
+        }))
+
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertNotIn("set-cookie", headers)
 
     def test_jellyfin_forwarded_headers_replace_untrusted_client_chain(self):
         request = SimpleNamespace(
@@ -1701,6 +1733,186 @@ class HybridMediaProxyTests(unittest.TestCase):
             upstream_request.extensions["sni_hostname"],
             "media.internal.example",
         )
+
+    def test_generic_same_origin_redirect_is_rewritten_to_proxy_origin(self):
+        resolved = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.20", 8096)),
+        ]
+        instance = {
+            **self._instance(),
+            "upstream_url": "http://media.internal.example:8096/emby",
+        }
+        upstream = _FakeUpstreamResponse(
+            status_code=302,
+            headers={
+                "Location": "http://media.internal.example:8096/emby/web/index.html?x=1#dashboard",
+                "Set-Cookie": "session=upstream; Path=/",
+            },
+        )
+        _FakeAsyncClient.responses = [upstream]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.socket.getaddrinfo",
+                return_value=resolved,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get("/emby/redirect", follow_redirects=False)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response.headers["location"],
+            "/emby/web/index.html?x=1#dashboard",
+        )
+        self.assertNotIn("set-cookie", response.headers)
+        self.assertTrue(upstream.closed)
+
+    def test_generic_same_origin_redirect_rejects_encoded_path_traversal(self):
+        instance = {
+            **self._instance(),
+            "upstream_url": "http://media.internal.example:8096/emby",
+        }
+        for location in (
+            "http://media.internal.example:8096/emby/../System/Info",
+            "http://media.internal.example:8096/emby/%2e%2e/System/Info",
+            "http://media.internal.example:8096/emby/%252e%252e/System/Info",
+            "http://media.internal.example:8096/emby/%2f%2fattacker.invalid/path",
+        ):
+            with self.subTest(location=location):
+                upstream = _FakeUpstreamResponse(
+                    status_code=302,
+                    headers={"Location": location},
+                )
+                _FakeAsyncClient.responses = [upstream]
+                app = media_proxy.create_proxy_app(7)
+                with (
+                    patch(
+                        "app.modules.media_proxy.database.get_media_proxy_instance",
+                        return_value=instance,
+                    ),
+                    patch(
+                        "app.modules.media_proxy.socket.getaddrinfo",
+                        return_value=[
+                            (
+                                socket.AF_INET,
+                                socket.SOCK_STREAM,
+                                6,
+                                "",
+                                ("192.168.1.20", 8096),
+                            ),
+                        ],
+                    ),
+                    patch(
+                        "app.modules.media_proxy.httpx.AsyncClient",
+                        _FakeAsyncClient,
+                    ),
+                    TestClient(app, raise_server_exceptions=False) as client,
+                ):
+                    response = client.get(
+                        "/emby/redirect",
+                        follow_redirects=False,
+                    )
+
+                self.assertEqual(response.status_code, 502)
+                self.assertNotIn("location", response.headers)
+                self.assertTrue(upstream.closed)
+
+    def test_generic_same_origin_network_path_redirect_is_rejected(self):
+        instance = {
+            **self._instance(),
+            "upstream_url": "http://media.internal.example:8096/emby",
+        }
+        upstream = _FakeUpstreamResponse(
+            status_code=302,
+            headers={
+                "Location": (
+                    "http://media.internal.example:8096//attacker.example/path"
+                ),
+            },
+        )
+        _FakeAsyncClient.responses = [upstream]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.socket.getaddrinfo",
+                return_value=[
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.20", 8096)),
+                ],
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get("/emby/redirect", follow_redirects=False)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("location", response.headers)
+        self.assertTrue(upstream.closed)
+
+    def test_generic_redirect_cannot_escape_configured_upstream_base_path(self):
+        instance = {
+            **self._instance(),
+            "upstream_url": "http://media.internal.example:8096/emby",
+        }
+        upstream = _FakeUpstreamResponse(
+            status_code=302,
+            headers={
+                "Location": "http://media.internal.example:8096/System/Info",
+            },
+        )
+        _FakeAsyncClient.responses = [upstream]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy.socket.getaddrinfo",
+                return_value=[
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.20", 8096)),
+                ],
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get("/emby/redirect", follow_redirects=False)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("location", response.headers)
+        self.assertTrue(upstream.closed)
+
+    def test_generic_cross_origin_redirect_is_rejected(self):
+        instance = self._instance()
+        upstream = _FakeUpstreamResponse(
+            status_code=302,
+            headers={"Location": "https://cdn.example.invalid/media?api_key=secret"},
+        )
+        _FakeAsyncClient.responses = [upstream]
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get("/System/Redirect", follow_redirects=False)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("location", response.headers)
+        self.assertNotIn("secret", response.text)
+        self.assertTrue(upstream.closed)
 
     def test_validate_upstream_dns_failure_keeps_offline_hostname_configurable(self):
         url = "http://offline-media.invalid:8096/emby"

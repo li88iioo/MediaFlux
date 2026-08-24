@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""从项目声明的直接依赖生成最小 SPDX 2.3 JSON SBOM。"""
+"""从锁定的 Python 依赖清单生成范围明确的 SPDX 2.3 JSON SBOM。"""
 from __future__ import annotations
 import argparse, hashlib, json, re
 from datetime import datetime,timezone
@@ -18,7 +18,7 @@ def dependencies(files:list[Path])->list[dict[str,str]]:
 def generate_sbom(files:list[Path],output:Path,namespace:str)->Path:
  packages=[]
  for index,item in enumerate(dependencies(files),1): packages.append({'SPDXID':f'SPDXRef-Package-{index}','name':item['name'],'versionInfo':item['versionInfo'],'downloadLocation':'NOASSERTION','filesAnalyzed':False,'licenseConcluded':'NOASSERTION','licenseDeclared':'NOASSERTION'})
- payload={'spdxVersion':'SPDX-2.3','dataLicense':'CC0-1.0','SPDXID':'SPDXRef-DOCUMENT','name':'MediaFlux declared Python dependencies','documentNamespace':namespace,'creationInfo':{'created':datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z'),'creators':['Tool: MediaFlux-generate_sbom']},'packages':packages}
+ payload={'spdxVersion':'SPDX-2.3','dataLicense':'CC0-1.0','SPDXID':'SPDXRef-DOCUMENT','name':'MediaFlux locked Python dependencies','documentNamespace':namespace,'creationInfo':{'created':datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z'),'creators':['Tool: MediaFlux-generate_sbom']},'packages':packages}
  output.write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n',encoding='utf-8'); return output
 def main(argv:Sequence[str]|None=None)->int:
  p=argparse.ArgumentParser(description=__doc__); p.add_argument('requirements',nargs='+',type=Path); p.add_argument('--output',type=Path,required=True); p.add_argument('--namespace',default='https://mediaflux.invalid/sbom/development'); a=p.parse_args(argv); print(generate_sbom(a.requirements,a.output,a.namespace)); return 0

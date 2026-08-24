@@ -62,16 +62,20 @@ class DockerWorkflowTests(unittest.TestCase):
 
     def test_candidate_manifest_and_arm64_runtime_are_verified_before_promotion(self) -> None:
         manifest = self.text.index("Verify candidate multi-architecture manifest")
-        arm64 = self.text.index("Smoke test candidate arm64 image")
+        candidate_smoke = self.text.index("Smoke test candidate images")
         promote = self.text.index("Promote verified image tags")
-        self.assertLess(manifest, arm64)
-        self.assertLess(arm64, promote)
+        self.assertLess(manifest, candidate_smoke)
+        self.assertLess(candidate_smoke, promote)
         self.assertIn("steps.build.outputs.digest", self.text)
         self.assertIn('index("linux/amd64")', self.text)
         self.assertIn('index("linux/arm64")', self.text)
-        self.assertIn("--platform linux/arm64", self.text)
-        self.assertIn("docker-arm64-version.json", self.text)
-        self.assertIn('.arch == "aarch64"', self.text)
+        self.assertIn(
+            'for platform_and_arch in "linux/amd64:x86_64" "linux/arm64:aarch64"',
+            self.text,
+        )
+        self.assertIn('docker run --rm --platform "$platform"', self.text)
+        self.assertIn('output="$RUNNER_TEMP/docker-$safe_platform-version.json"', self.text)
+        self.assertIn('.arch == $arch', self.text)
 
     def test_version_tag_is_immutable_and_mutable_tags_cannot_regress(self) -> None:
         promote = self.text.split("      - name: Promote verified image tags", 1)[1]

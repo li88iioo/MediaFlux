@@ -136,6 +136,8 @@ _SIGNED_MEDIA_RESPONSE_HEADERS = {
     "etag",
     "last-modified",
 }
+_UPSTREAM_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+_MEDIAFLUX_SESSION_COOKIE_NAME = "session"
 
 
 class ProxyRequestBodyTooLarge(ValueError):
@@ -2252,6 +2254,7 @@ class _UpstreamClientPool:
             client = httpx.AsyncClient(
                 follow_redirects=False,
                 timeout=_upstream_timeout(),
+                trust_env=False,
             )
             self._clients[key] = client
         return client
@@ -2356,6 +2359,7 @@ async def probe_media_proxy_instance(
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout_value),
         follow_redirects=False,
+        trust_env=False,
     ) as client:
         request = client.build_request(
             "GET",
@@ -2428,7 +2432,7 @@ def _response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {
         key: value
         for key, value in headers.items()
-        if key.lower() not in _HOP_HEADERS
+        if key.lower() not in _HOP_HEADERS | {"set-cookie"}
     }
 
 
@@ -2441,8 +2445,89 @@ def _decoded_response_headers(headers: httpx.Headers) -> dict[str, str]:
     return result
 
 
+def _without_mediaflux_session_cookie(value: str) -> str:
+    """保留媒体服务器 Cookie，但绝不把 MediaFlux 登录会话转给上游。"""
+    retained: list[str] = []
+    for raw_part in str(value or "").split(";"):
+        part = raw_part.strip()
+        if not part:
+            continue
+        name, separator, _cookie_value = part.partition("=")
+        if separator and name.strip().casefold() == _MEDIAFLUX_SESSION_COOKIE_NAME:
+            continue
+        retained.append(part)
+    return "; ".join(retained)
+
+
 def _request_headers(request: Request) -> dict[str, str]:
-    return {key: value for key, value in request.headers.items() if key.lower() not in _HOP_HEADERS}
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in _HOP_HEADERS
+    }
+    for key in tuple(headers):
+        if key.casefold() != "cookie":
+            continue
+        safe_cookie = _without_mediaflux_session_cookie(headers[key])
+        if safe_cookie:
+            headers[key] = safe_cookie
+        else:
+            headers.pop(key, None)
+    return headers
+
+
+def _same_upstream_redirect_location(
+    pinned: _PinnedUpstreamTarget,
+    location: str,
+    *,
+    upstream_base_url: str = "",
+) -> str:
+    """只允许逻辑上游同源跳转，并改写为当前代理 origin 的相对地址。"""
+    raw_location = str(location or "").strip()
+    if not raw_location:
+        raise ValueError("上游重定向缺少目标地址")
+    joined = urljoin(pinned.logical_url, raw_location)
+    base = urlsplit(pinned.logical_url)
+    target = urlsplit(joined)
+    base_port = base.port or (443 if base.scheme == "https" else 80)
+    target_port = target.port or (443 if target.scheme == "https" else 80)
+    if (
+        target.scheme.casefold() != base.scheme.casefold()
+        or str(target.hostname or "").casefold()
+        != str(base.hostname or "").casefold()
+        or target_port != base_port
+        or target.username
+        or target.password
+    ):
+        raise ValueError("上游重定向越过媒体服务器边界")
+    target_path = target.path or "/"
+    decoded_path = target_path
+    for _ in range(3):
+        next_path = unquote(decoded_path)
+        if next_path == decoded_path:
+            break
+        decoded_path = next_path
+    decoded_segments = decoded_path.split("/")
+    if (
+        target_path.startswith("//")
+        or "//" in decoded_path
+        or "\\" in decoded_path
+        or any(segment in {".", ".."} for segment in decoded_segments)
+    ):
+        raise ValueError("上游重定向路径不安全")
+    configured_base = urlsplit(str(upstream_base_url or pinned.logical_url))
+    base_path = configured_base.path.rstrip("/")
+    if base_path and base_path != "/" and not (
+        target_path.casefold() == base_path.casefold()
+        or target_path.casefold().startswith(base_path.casefold() + "/")
+    ):
+        raise ValueError("上游重定向离开已配置的媒体服务器路径")
+    relative = target_path
+    if target.query:
+        relative = f"{relative}?{target.query}"
+    if target.fragment:
+        relative = f"{relative}#{target.fragment}"
+    return relative
 
 
 def _replace_header(
@@ -5513,6 +5598,33 @@ def create_proxy_app(
                 _apply_playback_session(request, playback_session)
             request.state.proxy_action = "playback_passthrough"
             return Response(content=raw, status_code=response.status_code, headers=headers)
+
+        if response.status_code in _UPSTREAM_REDIRECT_STATUS_CODES:
+            redirect_headers = _response_headers(response.headers)
+            location = str(response.headers.get("location") or "").strip()
+            await response.aclose()
+            try:
+                _replace_header(
+                    redirect_headers,
+                    "Location",
+                    _same_upstream_redirect_location(
+                        pinned,
+                        location,
+                        upstream_base_url=str(instance["upstream_url"]),
+                    ),
+                )
+            except ValueError:
+                request.state.proxy_failure_stage = "upstream_redirect"
+                return JSONResponse(
+                    {"error": "上游服务返回了不安全的重定向"},
+                    status_code=502,
+                )
+            redirect_headers.pop("content-length", None)
+            redirect_headers.pop("Content-Length", None)
+            return Response(
+                status_code=response.status_code,
+                headers=redirect_headers,
+            )
 
         return StreamingResponse(
             response.aiter_raw(),

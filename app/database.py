@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -1310,6 +1310,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_organize_operation_jobs_active_dedupe
 
 CREATE TABLE IF NOT EXISTS agent_action_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    confirmation_id TEXT NOT NULL DEFAULT '',
     owner_digest TEXT NOT NULL DEFAULT '',
     tool_name TEXT NOT NULL,
     risk TEXT NOT NULL,
@@ -1331,6 +1332,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_action_history_tool_id
     ON agent_action_history(tool_name, id DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_action_history_ok_id
     ON agent_action_history(ok, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_action_history_confirmation
+    ON agent_action_history(confirmation_id)
+    WHERE confirmation_id<>'';
 
 CREATE TABLE IF NOT EXISTS agent_session_context (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1998,12 +2002,63 @@ def _migrate_organize_operation_jobs_v5(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_agent_action_history_schema(conn: sqlite3.Connection) -> None:
+    """兼容最小/旧数据库，在首条确认审计写入前补齐表与索引。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_action_history ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "confirmation_id TEXT NOT NULL DEFAULT '',"
+        "owner_digest TEXT NOT NULL DEFAULT '',tool_name TEXT NOT NULL,"
+        "risk TEXT NOT NULL,status TEXT NOT NULL,ok INTEGER NOT NULL DEFAULT 0,"
+        "mode TEXT NOT NULL DEFAULT 'confirmed_action',summary TEXT NOT NULL,"
+        "safe_details TEXT NOT NULL DEFAULT '{}',error_code TEXT NOT NULL DEFAULT '',"
+        "elapsed_ms INTEGER NOT NULL DEFAULT 0,started_at TEXT NOT NULL,"
+        "finished_at TEXT NOT NULL"
+        ")"
+    )
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(agent_action_history)")
+    }
+    if "confirmation_id" not in columns:
+        conn.execute(
+            "ALTER TABLE agent_action_history ADD COLUMN "
+            "confirmation_id TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_action_history_id "
+        "ON agent_action_history(id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_action_history_owner_id "
+        "ON agent_action_history(owner_digest, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_action_history_tool_id "
+        "ON agent_action_history(tool_name, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_action_history_ok_id "
+        "ON agent_action_history(ok, id DESC)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_action_history_confirmation "
+        "ON agent_action_history(confirmation_id) WHERE confirmation_id<>''"
+    )
+
+
+def _migrate_agent_action_history_v6(conn: sqlite3.Connection) -> None:
+    """为确认写操作增加崩溃窗口内的持久执行标识。"""
+    _ensure_agent_action_history_schema(conn)
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
     2: _migrate_agent_session_context_v3,
     3: _migrate_organize_operation_jobs_v4,
     4: _migrate_organize_operation_jobs_v5,
+    5: _migrate_agent_action_history_v6,
 }
 
 
@@ -2475,6 +2530,13 @@ def init_db() -> None:
                 "WHERE status='submitting' "
                 "AND datetime(COALESCE(NULLIF(submitted_at,''),created_at)) "
                 "< datetime('now','localtime','-15 minutes')",
+                (timestamp,),
+            )
+            conn.execute(
+                "UPDATE agent_action_history SET status='outcome_unknown',ok=0,"
+                "summary='Agent 受确认动作：结果待核对',"
+                "error_code='execution_interrupted',finished_at=?,elapsed_ms=0 "
+                "WHERE status='executing'",
                 (timestamp,),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -5057,7 +5119,9 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
                              status: str, ok: bool, summary: str,
                              safe_details: dict | None = None,
                              error_code: str = "", elapsed_ms: int = 0,
-                             started_at: str = "", finished_at: str = "") -> int:
+                             started_at: str = "", finished_at: str = "",
+                             confirmation_id: str = "",
+                             connection: sqlite3.Connection | None = None) -> int:
     """写入一条脱敏 Agent 动作审计；调用方只能传入安全投影。"""
     normalized_owner = str(owner_digest or "").strip().lower()
     normalized_tool = str(tool_name or "").strip()
@@ -5065,6 +5129,7 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
     normalized_status = str(status or "").strip()
     normalized_summary = str(summary or "").strip()
     normalized_error = str(error_code or "").strip()
+    normalized_confirmation = str(confirmation_id or "").strip()
     if not re.fullmatch(r"[0-9a-f]{64}", normalized_owner):
         raise ValueError("Agent 审计身份摘要无效")
     if not normalized_tool or len(normalized_tool) > 128:
@@ -5077,6 +5142,11 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
         raise ValueError("Agent 审计摘要无效")
     if normalized_error and (len(normalized_error) > 64 or not re.fullmatch(r"[a-z0-9_]+", normalized_error)):
         raise ValueError("Agent 审计错误码无效")
+    if normalized_confirmation and (
+        len(normalized_confirmation) > 128
+        or not re.fullmatch(r"[A-Za-z0-9_-]+", normalized_confirmation)
+    ):
+        raise ValueError("Agent 审计确认标识无效")
     details = safe_details or {}
     if not isinstance(details, dict):
         raise ValueError("Agent 审计详情必须是对象")
@@ -5093,17 +5163,58 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
     elapsed = max(0, min(int(elapsed_ms or 0), 86_400_000))
     finished = str(finished_at or now()).strip()
     started = str(started_at or finished).strip()
-    with get_conn() as conn:
-        cursor = conn.execute(
-            "INSERT INTO agent_action_history("
-            "owner_digest,tool_name,risk,status,ok,mode,summary,safe_details,error_code,"
-            "elapsed_ms,started_at,finished_at"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (normalized_owner, normalized_tool, normalized_risk, normalized_status,
-             1 if ok else 0, "confirmed_action", normalized_summary, encoded,
-             normalized_error, elapsed, started, finished),
-        )
-        history_id = int(cursor.lastrowid)
+    def write(conn: sqlite3.Connection) -> int:
+        _ensure_agent_action_history_schema(conn)
+        history_id = 0
+        if normalized_confirmation:
+            existing = conn.execute(
+                "SELECT id FROM agent_action_history WHERE confirmation_id=?",
+                (normalized_confirmation,),
+            ).fetchone()
+            if existing is not None:
+                history_id = int(existing["id"])
+                conn.execute(
+                    "UPDATE agent_action_history SET owner_digest=?,tool_name=?,risk=?,"
+                    "status=?,ok=?,mode='confirmed_action',summary=?,safe_details=?,"
+                    "error_code=?,elapsed_ms=?,started_at=?,finished_at=? WHERE id=?",
+                    (
+                        normalized_owner,
+                        normalized_tool,
+                        normalized_risk,
+                        normalized_status,
+                        1 if ok else 0,
+                        normalized_summary,
+                        encoded,
+                        normalized_error,
+                        elapsed,
+                        started,
+                        finished,
+                        history_id,
+                    ),
+                )
+        if history_id <= 0:
+            cursor = conn.execute(
+                "INSERT INTO agent_action_history("
+                "confirmation_id,owner_digest,tool_name,risk,status,ok,mode,summary,"
+                "safe_details,error_code,elapsed_ms,started_at,finished_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    normalized_confirmation,
+                    normalized_owner,
+                    normalized_tool,
+                    normalized_risk,
+                    normalized_status,
+                    1 if ok else 0,
+                    "confirmed_action",
+                    normalized_summary,
+                    encoded,
+                    normalized_error,
+                    elapsed,
+                    started,
+                    finished,
+                ),
+            )
+            history_id = int(cursor.lastrowid)
         conn.execute(
             "DELETE FROM agent_action_history WHERE owner_digest=? AND id NOT IN ("
             "SELECT id FROM agent_action_history WHERE owner_digest=? "
@@ -5137,6 +5248,11 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
             )
         return history_id
 
+    if connection is not None:
+        return write(connection)
+    with get_conn() as conn:
+        return write(conn)
+
 
 def list_agent_action_history(*, owner_digest: str, limit: int = 20,
                               outcome: str = "all") -> list[sqlite3.Row]:
@@ -5156,9 +5272,10 @@ def list_agent_action_history(*, owner_digest: str, limit: int = 20,
         "WHERE owner_digest=?"
     )
     params: list = [normalized_owner]
-    if normalized_outcome != "all":
-        sql += " AND ok=?"
-        params.append(1 if normalized_outcome == "success" else 0)
+    if normalized_outcome == "success":
+        sql += " AND ok=1"
+    elif normalized_outcome == "failed":
+        sql += " AND ok=0 AND status NOT IN ('executing','outcome_unknown')"
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(bounded_limit)
     with get_conn() as conn:

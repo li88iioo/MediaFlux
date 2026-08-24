@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import time
+from datetime import datetime
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -37,7 +38,9 @@ class OrganizeOperationQueueFullError(RuntimeError):
 
 
 class OrganizeOperationCancelled(RuntimeError):
-    """持久任务在远端写入前被主体清理或显式取消。"""
+    """持久任务收到协作式取消；当前 provider 写入尚未开始。"""
+
+    provider_write_not_started = True
 
 
 def _database() -> "ModuleType":
@@ -230,7 +233,7 @@ def enqueue_organize_operation_job(
     lifetime = max(60, min(int(ttl_seconds), 86_400))
     current_epoch = time.time()
     expires_at = current_epoch + lifetime
-    timestamp = now()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         _expire_pending(conn, current_epoch)
@@ -321,21 +324,16 @@ def claim_organize_operation_job(job_id: str | None = None) -> sqlite3.Row | Non
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         _expire_pending(conn, current_epoch)
-        if safe_id:
-            row = conn.execute(
-                "SELECT job_id FROM organize_operation_jobs WHERE job_id=? "
-                "AND status='pending' AND expires_at>?",
-                (safe_id, current_epoch),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT job_id FROM organize_operation_jobs WHERE status='pending' "
-                "AND expires_at>? ORDER BY created_at,job_id LIMIT 1",
-                (current_epoch,),
-            ).fetchone()
+        row = conn.execute(
+            "SELECT job_id FROM organize_operation_jobs WHERE status='pending' "
+            "AND expires_at>? ORDER BY created_at,job_id LIMIT 1",
+            (current_epoch,),
+        ).fetchone()
         if row is None:
             return None
         selected = str(row["job_id"])
+        if safe_id and selected != safe_id:
+            return None
         cur = conn.execute(
             "UPDATE organize_operation_jobs SET status='running',"
             "lease_generation=lease_generation+1,started_at=COALESCE(started_at,?),"

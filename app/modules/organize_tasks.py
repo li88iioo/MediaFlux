@@ -62,6 +62,7 @@ def _operation_result_is_partial(result: object) -> bool:
         "empty_dir_cleanup_failed",
         "source_dir_cleanup_failed",
         "audit_failures",
+        "stopped",
     ):
         value = stats.get(key)
         if isinstance(value, (list, tuple, set, dict)):
@@ -699,8 +700,22 @@ class OrganizeTaskManager:
                         "replayed": True,
                     }
                 queue_has_items = bool(self._operation_queue)
+            try:
+                durable_has_items = (
+                    count_pending_organize_operation_jobs() > 0
+                    or count_running_organize_operation_jobs() > 0
+                )
+            except Exception as exc:
+                logger.warning(
+                    "检查光鸭持久化队列准入失败 type=%s", type(exc).__name__
+                )
+                durable_has_items = True
 
-            if not queue_has_items and self._lock.acquire(blocking=False):
+            if (
+                not queue_has_items
+                and not durable_has_items
+                and self._lock.acquire(blocking=False)
+            ):
                 return self._launch_operation_with_lock(
                     task_id,
                     operation,
@@ -720,7 +735,7 @@ class OrganizeTaskManager:
                 "reference": reference,
                 "callback": callback,
                 "dedupe_key": dedupe_key,
-                "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
             }
             with self._state_lock:
                 self._operation_queue.append(queued_item)
@@ -1273,21 +1288,56 @@ class OrganizeTaskManager:
                                 )
                                 self._lock.release()
                                 break
-                        item = None
+                        durable_row = None
+                        if durable_pending:
+                            try:
+                                pending_rows = list_pending_organize_operation_jobs(limit=1)
+                                durable_row = pending_rows[0] if pending_rows else None
+                            except Exception as exc:
+                                logger.warning(
+                                    "读取光鸭持久化队首失败 type=%s",
+                                    type(exc).__name__,
+                                )
                         with self._state_lock:
-                            if self._operation_queue:
-                                item = self._operation_queue.popleft()
-                        if item is not None:
-                            self._launch_operation_with_lock(
-                                str(item["id"]),
-                                str(item["operation"]),
-                                str(item["reference"]),
-                                item["callback"],
-                                dedupe_key=str(item.get("dedupe_key") or ""),
+                            memory_item = (
+                                self._operation_queue[0]
+                                if self._operation_queue
+                                else None
                             )
-                            break
+                        memory_key = (
+                            str(memory_item.get("queued_at") or ""),
+                            str(memory_item.get("id") or ""),
+                        ) if memory_item is not None else None
+                        durable_key = (
+                            str(durable_row["created_at"] or ""),
+                            str(durable_row["job_id"] or ""),
+                        ) if durable_row is not None else None
+                        launch_memory = bool(
+                            memory_item is not None
+                            and (durable_key is None or memory_key <= durable_key)
+                        )
+                        if launch_memory:
+                            with self._state_lock:
+                                item = (
+                                    self._operation_queue.popleft()
+                                    if self._operation_queue
+                                    else None
+                                )
+                            if item is not None:
+                                self._launch_operation_with_lock(
+                                    str(item["id"]),
+                                    str(item["operation"]),
+                                    str(item["reference"]),
+                                    item["callback"],
+                                    dedupe_key=str(item.get("dedupe_key") or ""),
+                                )
+                                break
                         try:
-                            row = claim_organize_operation_job()
+                            row = claim_organize_operation_job(
+                                str(durable_row["job_id"])
+                                if durable_row is not None
+                                else None
+                            )
                         except Exception as exc:
                             logger.warning(
                                 "领取光鸭持久化操作失败 type=%s", type(exc).__name__

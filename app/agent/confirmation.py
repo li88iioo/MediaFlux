@@ -166,7 +166,8 @@ class ConfirmationStore:
             )
 
     def claim_and_rotate_owner(
-        self, *, owner: str, confirmation_id: str
+        self, *, owner: str, confirmation_id: str, record_execution: bool = False,
+        execution_risk_for: Callable[[str], Any] | None = None,
     ) -> ConfirmationTicket:
         """原子领取一张票据并推进 owner epoch，撤销同会话其余票据。"""
         owner_key = str(owner or "").strip()
@@ -184,6 +185,22 @@ class ConfirmationStore:
                 )
             ):
                 raise AgentToolError("确认请求无效或已过期", code="confirmation_invalid")
+            if record_execution:
+                from app.agent.action_history import record_confirmation_claimed
+                from app.agent.models import RiskLevel
+
+                record_confirmation_claimed(
+                    owner=owner_key,
+                    confirmation_id=ticket.confirmation_id,
+                    owner_generation=ticket.owner_generation,
+                    tool_name=ticket.tool_name,
+                    risk=(
+                        execution_risk_for(ticket.tool_name)
+                        if execution_risk_for is not None
+                        else RiskLevel.WRITE
+                    ),
+                    confirmation_contract=ticket.confirmation_contract,
+                )
             generation = self._new_owner_generation_locked()
             self._owner_generations[owner_key] = (generation, now)
             for key, active in list(self._tickets.items()):
@@ -578,7 +595,8 @@ class SQLiteConfirmationStore(ConfirmationStore):
         )
 
     def claim_and_rotate_owner(
-        self, *, owner: str, confirmation_id: str
+        self, *, owner: str, confirmation_id: str, record_execution: bool = False,
+        execution_risk_for: Callable[[str], Any] | None = None,
     ) -> ConfirmationTicket:
         """在同一 SQLite 事务中领取票据、推进 epoch 并撤销同 owner 票据。"""
         from app import database as db
@@ -612,6 +630,26 @@ class SQLiteConfirmationStore(ConfirmationStore):
             ):
                 raise AgentToolError(
                     "确认请求无效或已过期", code="confirmation_invalid"
+                )
+            if record_execution:
+                from app.agent.action_history import record_confirmation_claimed
+                from app.agent.models import RiskLevel
+
+                tool_name = str(row["tool_name"])
+                record_confirmation_claimed(
+                    owner=owner_key,
+                    confirmation_id=str(row["confirmation_id"]),
+                    owner_generation=int(row["owner_generation"]),
+                    tool_name=tool_name,
+                    risk=(
+                        execution_risk_for(tool_name)
+                        if execution_risk_for is not None
+                        else RiskLevel.WRITE
+                    ),
+                    confirmation_contract=self._load_json_object(
+                        row["confirmation_contract_json"]
+                    ),
+                    connection=conn,
                 )
             generation = self._new_owner_generation(conn)
             conn.execute(
