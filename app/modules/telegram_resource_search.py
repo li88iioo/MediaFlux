@@ -213,6 +213,8 @@ class TelegramIndexerWorker:
         self._startup_error: BaseException | None = None
 
     def search(self, query: str) -> dict[str, Any]:
+        if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+            raise TelegramResourceSearchError("资源站搜索当前已关闭")
         request = IndexerMediaSearchRequest.create(title=query)
 
         async def run(service):

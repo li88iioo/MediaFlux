@@ -12,6 +12,7 @@ from app.bot.handlers import (
     _resource_target_view,
 )
 from app.modules.telegram_resource_search import (
+    TelegramIndexerWorker,
     TelegramResourceSearchError,
     TelegramResourceSearchStore,
 )
@@ -63,6 +64,24 @@ def _sites():
         {"site_id": "mikan", "site_name": "Mikan", "status": "success", "count": 1, "message": ""},
         {"site_id": "1lou", "site_name": "1Lou", "status": "error", "count": 0, "message": "响应超时"},
     ]
+
+
+class TelegramIndexerWorkerTests(unittest.TestCase):
+    def test_search_rejects_disabled_indexer_before_starting_worker(self):
+        worker = TelegramIndexerWorker()
+
+        with (
+            patch(
+                "app.modules.telegram_resource_search.config.get_bool",
+                return_value=False,
+            ),
+            patch.object(worker, "_call") as call,
+        ):
+            with self.assertRaisesRegex(TelegramResourceSearchError, "资源站搜索当前已关闭"):
+                worker.search("Frieren")
+
+        call.assert_not_called()
+        self.assertIsNone(worker._thread)
 
 
 class TelegramResourceSearchStoreTests(unittest.TestCase):
