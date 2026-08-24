@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-24
+
+### Added
+- 媒体 Agent 扩展为可持续的影视工作台：支持从已核验候选创建、暂停、恢复和删除媒体追更订阅，并覆盖 RSS、资源候选、本地媒体恢复、媒体库巡检、STRM 与媒体反代诊断等连续工作流；高风险写操作仍需明确确认（[`8213751`](https://github.com/li88iioo/MediaFlux/commit/8213751)、[`a4d2a69`](https://github.com/li88iioo/MediaFlux/commit/a4d2a69)、[`3037a9e`](https://github.com/li88iioo/MediaFlux/commit/3037a9e)、[`c676b04`](https://github.com/li88iioo/MediaFlux/commit/c676b04)、[`bb32494`](https://github.com/li88iioo/MediaFlux/commit/bb32494)）。
+- Agent 新增结构化核验、持久会话上下文、跨重启候选恢复、流式步骤跟踪和离线评测门禁；自然语言“确认/取消”可直接驱动当前待确认动作（[`4527f68`](https://github.com/li88iioo/MediaFlux/commit/4527f68)、[`9154c02`](https://github.com/li88iioo/MediaFlux/commit/9154c02)、[`8477595`](https://github.com/li88iioo/MediaFlux/commit/8477595)、[`c8cc360`](https://github.com/li88iioo/MediaFlux/commit/c8cc360)、[`def6f6c`](https://github.com/li88iioo/MediaFlux/commit/def6f6c)）。
+
+### Changed
+- Agent 路由改为优先结合 LLM 规划、已验证上下文和安全证据执行，并统一 Web/Telegram 的结果呈现、后续提问与恢复语义；兼容型 LLM Provider 遇到可恢复协议错误或瞬时限流时会在预算内降级或重试（[`e5eea7a`](https://github.com/li88iioo/MediaFlux/commit/e5eea7a)、[`f5a8472`](https://github.com/li88iioo/MediaFlux/commit/f5a8472)、[`9ea3903`](https://github.com/li88iioo/MediaFlux/commit/9ea3903)、[`a5b2438`](https://github.com/li88iioo/MediaFlux/commit/a5b2438)、[`a3a5a17`](https://github.com/li88iioo/MediaFlux/commit/a3a5a17)）。
+- 本地媒体整理后的 Jellyfin/Emby 刷新改为按变化路径和已绑定媒体库精确触发；无法安全定位目标库时默认跳过全库扫描，避免无关媒体库被重复刷新（[`d486f4f`](https://github.com/li88iioo/MediaFlux/commit/d486f4f)）。
+- Docker 发布链路新增源码版本、标签祖先、带日期非空 CHANGELOG、非 root 运行、健康检查、Doctor、数据库升级、多架构元数据、provenance 与 SBOM 门禁，并生成可校验的发布资产（[`6175a50`](https://github.com/li88iioo/MediaFlux/commit/6175a50)）。
+
+### Fixed
+- 修复 Agent 在自然跟进、多轮短指令、话题切换、较慢旧操作覆盖新结果、订阅单项超时和中断恢复等场景中的上下文误继承或状态丢失；存在 RSS 与媒体追更歧义时会先要求明确类别（[`4602ebf`](https://github.com/li88iioo/MediaFlux/commit/4602ebf)、[`ae3c1a5`](https://github.com/li88iioo/MediaFlux/commit/ae3c1a5)、[`3eff0c9`](https://github.com/li88iioo/MediaFlux/commit/3eff0c9)、[`7655df2`](https://github.com/li88iioo/MediaFlux/commit/7655df2)、[`826ef0a`](https://github.com/li88iioo/MediaFlux/commit/826ef0a)）。
+- 修复 Jellyfin、Findroid、Yamby 与 Android ExoPlayer 等原生客户端的 302 直连、认证恢复和 `HEAD` 播放前探测兼容性，并完善 Jellyfin HLS Token 的大小写兼容（[`7f161b3`](https://github.com/li88iioo/MediaFlux/commit/7f161b3)、[`97b8ad7`](https://github.com/li88iioo/MediaFlux/commit/97b8ad7)、[`3439110`](https://github.com/li88iioo/MediaFlux/commit/3439110)、[`9e60d06`](https://github.com/li88iioo/MediaFlux/commit/9e60d06)、[`a5059f5`](https://github.com/li88iioo/MediaFlux/commit/a5059f5)）。
+- 修复 Jellyfin Web 切换清晰度后黑屏或标题丢失的问题；直放来源会保持安全播放能力并避免重新落入会被浏览器跨域策略阻断的 HLS 路径（[`160587f`](https://github.com/li88iioo/MediaFlux/commit/160587f)、[`9fe7e12`](https://github.com/li88iioo/MediaFlux/commit/9fe7e12)）。
+- 加强整理识别、人工确认、纠错回退与清理保护：歧义标题和高季数剧集必须获得充分证据，否则进入人工确认；任务取消后不会继续调用云盘写入或删除接口（[`2c9295e`](https://github.com/li88iioo/MediaFlux/commit/2c9295e)、[`6175a50`](https://github.com/li88iioo/MediaFlux/commit/6175a50)）。
+- 修复 STRM 整理联动在连续任务、静默窗口、进程重启或初始化失败时可能遗漏变化或遗留运行锁的问题；变更会先持久化、合并，再按顺序恢复执行（[`2c9295e`](https://github.com/li88iioo/MediaFlux/commit/2c9295e)、[`dd1b534`](https://github.com/li88iioo/MediaFlux/commit/dd1b534)）。
+- 数据库 schema 升级改为升级前备份和保存点内原子迁移，失败会完整回滚；恢复备份会核验真实数据库 schema，拒绝未来版本或缺少数据库载荷的完整恢复（[`924e2f8`](https://github.com/li88iioo/MediaFlux/commit/924e2f8)、[`6175a50`](https://github.com/li88iioo/MediaFlux/commit/6175a50)）。
+- 确认动作与持久化整理队列增加崩溃恢复语义：中断中的动作会标记为“结果待核对”，避免重启后误报成功或重复执行；队列严格按创建顺序领取（[`6175a50`](https://github.com/li88iioo/MediaFlux/commit/6175a50)）。
+
+### Security
+- 加固媒体反代边界：规范化转发头、阻止 WebSocket 上游重定向、过滤内部直放地址与上游 Cookie，不向媒体服务器泄露 MediaFlux 登录会话，并拒绝跨服务器、目录穿越、重复编码和不安全相对跳转（[`183e249`](https://github.com/li88iioo/MediaFlux/commit/183e249)、[`b47e4b3`](https://github.com/li88iioo/MediaFlux/commit/b47e4b3)、[`6175a50`](https://github.com/li88iioo/MediaFlux/commit/6175a50)）。
+
 ## [0.1.4] - 2026-08-22
 
 ### Changed
@@ -94,7 +117,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/li88iioo/MediaFlux/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/li88iioo/MediaFlux/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/li88iioo/MediaFlux/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/li88iioo/MediaFlux/compare/v0.1.1...v0.1.2
