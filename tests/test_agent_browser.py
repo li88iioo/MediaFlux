@@ -92,6 +92,7 @@ class AgentBrowserTests(unittest.TestCase):
             window.__agentQueryGate = null;
             window.__agentQuerySignal = null;
             window.__agentLateStreamDelayMs = 0;
+            window.__agentStreamEvents = null;
             window.__agentCancelGate = null;
             window.__agentCancelSignal = null;
             window.__agentPrepareResponse = {};
@@ -139,6 +140,20 @@ class AgentBrowserTests(unittest.TestCase):
                     payload = {cancelled: true};
                 } else if (requestUrl === '/api/agent/query') {
                     window.__agentQuerySignal = options.signal || null;
+                    if (Array.isArray(window.__agentStreamEvents)) {
+                        const request = JSON.parse(String(options.body || '{}'));
+                        const events = window.__agentStreamEvents.map((event) => ({
+                            ...event,
+                            request_id: request.request_id,
+                        }));
+                        return new Response(
+                            `${events.map(event => JSON.stringify(event)).join('\\n')}\\n`,
+                            {
+                                status: 200,
+                                headers: {'Content-Type': 'application/x-ndjson'},
+                            },
+                        );
+                    }
                     if (window.__agentLateStreamDelayMs > 0) {
                         const request = JSON.parse(String(options.body || '{}'));
                         const encoder = new TextEncoder();
@@ -276,6 +291,48 @@ class AgentBrowserTests(unittest.TestCase):
             "window.__agentCalls.filter(call => call.url === '/api/agent/sessions').length"
         )
         self.assertEqual(sessions_before, sessions_after)
+
+    def test_final_fallback_replaces_streamed_draft_in_place(self):
+        self.page.evaluate("""() => {
+            window.__agentStreamEvents = [
+                {type: 'status', phase: 'answering'},
+                {type: 'delta', delta: '已完成基础检查。'},
+                {
+                    type: 'final',
+                    payload: {
+                        request_id: 'deterministic-fallback',
+                        mode: 'read_only',
+                        tool_call: {name: 'downloads.diagnose_queue', elapsed_ms: 3},
+                        result: {
+                            ok: true,
+                            status: 'healthy',
+                            summary: '下载队列状态正常',
+                            error: '',
+                            suggestions: [],
+                            data: {'总数': 16},
+                            evidence: [],
+                        },
+                        display: {
+                            version: 1,
+                            status: {key: 'success', label: '正常', tone: 'good'},
+                            summary: '下载队列状态正常',
+                            error: '',
+                            details: {'总数': 16},
+                            guidance: [],
+                        },
+                    },
+                },
+            ];
+        }""")
+        self.page.locator("#agentPrompt").fill("检查下载队列状态")
+        self.page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+
+        self.page.get_by_text("下载队列状态正常", exact=True).wait_for()
+        self.assertEqual(self.page.locator(".agent-result-card").count(), 1)
+        self.assertEqual(self.page.locator(".agent-streaming").count(), 0)
+        transcript = self.page.locator("#agentTranscript").inner_text()
+        self.assertNotIn("已完成基础检查。", transcript)
+        self.assertIn("下载队列状态正常", transcript)
 
     def test_late_stream_events_do_not_overwrite_stopped_message(self):
         self.page.evaluate("window.__agentLateStreamDelayMs = 250")

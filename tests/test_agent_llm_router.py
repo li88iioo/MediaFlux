@@ -2745,6 +2745,35 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         conversation.assert_called_once()
         planner.assert_not_called()
 
+    def test_identity_question_is_answered_locally_without_tools_or_provider(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        with patch(
+            "app.agent.orchestrator.answer_conversation",
+            return_value=LLMConversationReply("我是错误的上游身份。"),
+        ) as conversation, patch.object(
+            agent, "_query_with_model_tools"
+        ) as planner:
+            response = agent.query("你是谁？", present=False)
+
+        self.assertEqual(response["mode"], "conversation")
+        self.assertEqual(response["result"]["status"], "answered")
+        self.assertIn("MediaFlux Media Agent", response["result"]["summary"])
+        self.assertIn("家庭媒体自动化助手", response["result"]["summary"])
+        self.assertNotIn("还没理解", response["result"]["summary"])
+        self.assertIsNone(response["tool_call"])
+        conversation.assert_not_called()
+        planner.assert_not_called()
+
+    def test_identity_classifier_does_not_swallow_media_requests(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        for message in (
+            "你是谁，顺便检查下载队列",
+            "你是做什么的，帮我搜索资源",
+            "你叫什么名字的电视剧",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(agent._local_conversation(message))
+
     def test_engineering_requests_are_rejected_as_out_of_scope(self):
         agent = AgentOrchestrator(ToolRegistry())
         messages = (

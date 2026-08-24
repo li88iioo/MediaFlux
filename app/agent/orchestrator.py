@@ -155,6 +155,10 @@ _CASUAL_GREETING_PHRASES = frozenset({
     "在干嘛呢", "在干什么呢", "在干啥", "在干啥呢",
     "干吗", "干嘛", "干什么", "干啥",
 })
+_IDENTITY_QUESTION_PHRASES = frozenset({
+    "你是谁", "你叫什么", "你叫什么名字", "你叫啥", "你是干什么的",
+    "你是做什么的", "你是什么助手", "你是什么机器人", "你是机器人吗",
+})
 _AMBIGUOUS_FOLLOWUP_MARKERS = (
     "啥情况", "什么情况", "怎么回事", "咋回事", "继续看看", "看看这个",
     "说具体", "说清楚", "详细一点", "具体是什么", "然后呢", "这个呢",
@@ -183,9 +187,16 @@ def _is_ambiguous_followup(message: str) -> bool:
     )
 
 
+def _normalize_short_conversation_phrase(message: str) -> str:
+    return re.sub(r"[\s，。！？!?、；;：:~～]+", "", message.casefold())
+
+
 def _is_casual_greeting(message: str) -> bool:
-    normalized = re.sub(r"[\s，。！？!?、；;：:~～]+", "", message.casefold())
-    return normalized in _CASUAL_GREETING_PHRASES
+    return _normalize_short_conversation_phrase(message) in _CASUAL_GREETING_PHRASES
+
+
+def _is_identity_question(message: str) -> bool:
+    return _normalize_short_conversation_phrase(message) in _IDENTITY_QUESTION_PHRASES
 
 
 _UNSUPPORTED_ENGINEERING_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
@@ -7167,8 +7178,12 @@ class AgentOrchestrator:
                 )
             local_conversation = self._local_conversation(message)
             if local_conversation is not None:
-                # 纯闲聊不暴露任何工具，但优先让对话模型自然回应；Provider
-                # 不可用时再使用稳定的本地短句，避免伪造系统状态。
+                # 产品身份属于稳定事实：本地直接回答，不消耗 Provider 配额，
+                # 也不让上游模型把身份问题重新解释成媒体工具请求。
+                if _is_identity_question(message):
+                    return local_conversation
+                # 其他纯闲聊不暴露任何工具，但优先让对话模型自然回应；
+                # Provider 不可用时再使用稳定的本地短句，避免伪造系统状态。
                 conversation = answer_conversation(
                     message,
                     owner=llm_rate_owner or owner,
@@ -9412,7 +9427,14 @@ class AgentOrchestrator:
 
     @staticmethod
     def _local_conversation(message: str) -> dict[str, Any] | None:
-        if not _is_casual_greeting(message):
+        if _is_identity_question(message):
+            summary = (
+                "我是 MediaFlux Media Agent，一名家庭媒体自动化助手。"
+                "我可以帮你查看订阅更新、检查缺集、搜索资源，以及处理下载、RSS、云盘整理和媒体库状态。"
+            )
+        elif _is_casual_greeting(message):
+            summary = "我在，正等你安排。想找资源、看追更，还是处理下载和媒体库？"
+        else:
             return None
         response = {
             "request_id": current_request_id(),
@@ -9421,7 +9443,7 @@ class AgentOrchestrator:
             "result": ToolResult(
                 ok=True,
                 status="answered",
-                summary="我在，正等你安排。想找资源、看追更，还是处理下载和媒体库？",
+                summary=summary,
             ).to_dict(),
         }
         return result_projection.attach_public_display(response)

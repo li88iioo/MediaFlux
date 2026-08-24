@@ -346,9 +346,27 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(saved["presentation"]["status"], "interrupted")
         self.assertEqual(service.state_commits, ["检查下载队列状态"])
 
-    def test_split_unsafe_stream_token_is_never_publicly_emitted(self):
+    def test_split_unsafe_stream_token_falls_back_to_deterministic_result(self):
         csrf = self._login()
-        service = _FakeService(_tool_response())
+        unsafe_response = _tool_response()
+        unsafe_response["request_id"] = "https://internal.invalid/trace?token=secret"
+        unsafe_response["tool_call"]["arguments"] = {
+            "endpoint": "https://private.invalid/api",
+            "path": "/srv/media/private",
+        }
+        unsafe_response["result"]["data"].update({
+            "private_url": "https://private.invalid/result",
+            "private_path": "/srv/media/private",
+            "access_token": "secret-token-value",
+        })
+        unsafe_response["result"]["evidence"] = [{
+            "description": "内部证据 https://private.invalid/evidence",
+        }]
+        unsafe_response["display"] = {
+            "summary": "伪造展示 https://private.invalid/display",
+            "details": {"token": "forged-display-secret"},
+        }
+        service = _StatefulFakeService(unsafe_response)
         history = Mock()
 
         async def unsafe_stream(*_args, **_kwargs):
@@ -374,13 +392,65 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         events = self._events(response)
         self.assertEqual(
             [item["type"] for item in events],
-            ["status", "status", "status", "delta", "error"],
+            ["status", "status", "status", "delta", "final"],
         )
-        self.assertEqual(events[-1]["code"], "stream_invalid")
         self.assertEqual(events[3]["delta"], "已完成基础检查。")
-        self.assertNotIn("https://", response.text)
-        self.assertNotIn("private.invalid", response.text)
-        history.assert_not_called()
+        final_payload = events[-1]["payload"]
+        self.assertEqual(final_payload["request_id"], events[-1]["request_id"])
+        self.assertEqual(final_payload["result"]["summary"], "下载队列状态正常")
+        self.assertEqual(final_payload["result"]["data"], {"总数": 16})
+        self.assertEqual(
+            final_payload["tool_call"],
+            {"name": "downloads.diagnose_queue", "elapsed_ms": 3},
+        )
+        self.assertNotIn("arguments", final_payload["tool_call"])
+        for private_value in (
+            "https://", "private.invalid", "/srv/media/private",
+            "secret-token-value", "内部证据", "伪造展示", "forged-display-secret",
+            "internal.invalid", "trace?token=secret",
+        ):
+            self.assertNotIn(private_value, response.text)
+        history.assert_called_once()
+        saved = history.call_args.kwargs["response"]
+        self.assertEqual(saved["result"]["summary"], "下载队列状态正常")
+        self.assertEqual(saved["result"]["data"], {"总数": 16})
+        self.assertEqual(service.state_commits, ["检查下载队列状态"])
+
+    def test_invalid_final_stream_falls_back_to_deterministic_result(self):
+        csrf = self._login()
+        service = _FakeService(_tool_response())
+        history = Mock()
+
+        async def invalid_final_stream(*_args, **_kwargs):
+            yield "内部检查已经完成"
+
+        with (
+            patch("app.routes.agent_api.get_agent_service", return_value=service),
+            patch("app.routes.agent_api.stream_tool_answer", invalid_final_stream),
+            patch("app.routes.agent_api._record_query_history", history),
+        ):
+            response = self.client.post(
+                "/api/agent/query",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "message": "检查下载队列状态",
+                    "session_id": SESSION_ID,
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        events = self._events(response)
+        self.assertEqual(
+            [item["type"] for item in events],
+            ["status", "status", "status", "final"],
+        )
+        self.assertEqual(
+            events[-1]["payload"]["result"]["summary"],
+            "下载队列状态正常",
+        )
+        self.assertNotIn("内部检查", response.text)
+        history.assert_called_once()
 
     def test_windows_path_stream_token_is_smoothly_redacted(self):
         csrf = self._login()

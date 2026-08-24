@@ -507,6 +507,59 @@ def _apply_streamed_answer(
     )
 
 
+def _public_deterministic_fallback_response(
+    response: dict[str, Any],
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    """流叙述越界时，只保留已经过公开投影的确定性结果。"""
+    result = response.get("result")
+    result = result if isinstance(result, dict) else {}
+    # 不信任调用方附带的 display；在安全边界内从原结果重新投影。
+    display = project_agent_result_for_user(result)
+
+    status = sanitize_public_text(result.get("status"), limit=64) or "unknown"
+    summary = sanitize_public_multiline_text(display.get("summary"), limit=1200)
+    error = sanitize_public_multiline_text(display.get("error"), limit=420)
+    details = display.get("details")
+    if not isinstance(details, (dict, list)):
+        details = {}
+
+    safe_tool_call: dict[str, Any] | None = None
+    tool_call = response.get("tool_call")
+    if isinstance(tool_call, dict):
+        tool_name = str(tool_call.get("name") or "").strip()
+        if re.fullmatch(r"[a-z][a-z0-9_.]{0,95}", tool_name):
+            safe_tool_call = {"name": tool_name}
+            elapsed_ms = tool_call.get("elapsed_ms")
+            if isinstance(elapsed_ms, int) and not isinstance(elapsed_ms, bool):
+                safe_tool_call["elapsed_ms"] = min(max(0, elapsed_ms), 86_400_000)
+
+    raw_mode = str(response.get("mode") or "read_only").strip().casefold()
+    mode = raw_mode if raw_mode in {
+        "read_only", "read_plan", "conversation", "clarification",
+        "tool_result", "confirmed_action",
+    } else "read_only"
+    safe_request_id = (
+        request_id if _REQUEST_ID_PATTERN.fullmatch(str(request_id or "")) else ""
+    )
+    return {
+        "request_id": safe_request_id,
+        "mode": mode,
+        "tool_call": safe_tool_call,
+        "result": {
+            "ok": bool(result.get("ok")),
+            "status": status,
+            "summary": summary or "检查已完成。",
+            "error": error if not result.get("ok") else "",
+            "suggestions": [],
+            "data": details,
+            "evidence": [],
+        },
+        "display": display,
+    }
+
+
 async def _stream_query_events(
     request: Request,
     *,
@@ -668,6 +721,7 @@ async def _stream_query_events(
 
         projector = PublicNarrativeProjector()
         emitted = False
+        deterministic_public_fallback = False
 
         if stream is None and isinstance(trace, list):
             presentation = response.get("presentation")
@@ -748,16 +802,13 @@ async def _stream_query_events(
                 if not coordinator.is_current(operation):
                     yield cancelled_event()
                     return
-                event = current_event(
-                    "error",
-                    code="stream_invalid",
-                    message="回答未通过安全校验，请重试本次问题。",
+                # Provider narrative 只负责润色。流内容越过安全边界时丢弃
+                # 整段 narrative，并用公开投影后的确定性结果正常收口。
+                deterministic_public_fallback = True
+                projector = PublicNarrativeProjector()
+                logger.warning(
+                    "Agent LLM 流式回答未通过公开校验，回退公开确定性结果"
                 )
-                if event is None:
-                    yield cancelled_event()
-                else:
-                    yield event
-                return
             except ProviderStreamError:
                 if not coordinator.is_current(operation):
                     yield cancelled_event()
@@ -793,19 +844,22 @@ async def _stream_query_events(
 
         final_response = response
         if projector.accumulated:
-            answer = projector.finalize()
-            if not answer:
-                event = current_event(
-                    "error",
-                    code="stream_invalid",
-                    message="回答未通过安全校验，请重试本次问题。",
+            try:
+                answer = projector.finalize()
+            except ProviderStreamError:
+                answer = ""
+            if answer:
+                final_response = _apply_streamed_answer(response, answer)
+            else:
+                deterministic_public_fallback = True
+                logger.warning(
+                    "Agent LLM 流式回答未通过最终公开校验，回退公开确定性结果"
                 )
-                if event is None:
-                    yield cancelled_event()
-                else:
-                    yield event
-                return
-            final_response = _apply_streamed_answer(response, answer)
+        if deterministic_public_fallback:
+            final_response = _public_deterministic_fallback_response(
+                response,
+                request_id=operation.operation_id,
+            )
 
         if await request.is_disconnected():
             coordinator.cancel(
@@ -832,6 +886,7 @@ async def _stream_query_events(
         def finalize_response() -> bytes:
             state_buffer.commit()
             persist_final()
+            # final 始终是权威完整快照；客户端应原位替换此前的流式草稿。
             return _ndjson_event(
                 "final",
                 request_id=operation.operation_id,
