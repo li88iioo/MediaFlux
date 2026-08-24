@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import subprocess
 import unittest
 from pathlib import Path
+
+import yaml
 
 
 class DockerWorkflowTests(unittest.TestCase):
@@ -95,6 +98,22 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn('"linux/arm64:aarch64"', promote)
         self.assertIn('--arg arch "$expected_arch"', promote)
         self.assertIn(".arch == $arch", promote)
+
+    def test_prepare_build_context_shell_is_syntactically_valid(self) -> None:
+        workflow = yaml.safe_load(self.text)
+        prepare_script = next(
+            step["run"]
+            for step in workflow["jobs"]["build"]["steps"]
+            if step.get("name") == "Prepare build context"
+        )
+        result = subprocess.run(
+            ["bash", "-n"],
+            input=prepare_script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_release_build_uses_shared_build_info_contract(self) -> None:
         self.assertIn("packaging/scripts/generate_build_info.py", self.text)
