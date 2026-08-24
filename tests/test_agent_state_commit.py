@@ -42,6 +42,13 @@ class AgentStateCommitBufferTests(unittest.TestCase):
         self.assertEqual(buffer.commit(), 0)
         self.assertEqual(committed, [])
 
+    def test_commit_does_not_count_rejected_guarded_action(self):
+        buffer = AgentStateCommitBuffer(owner="owner-a")
+        with defer_agent_state_commits(buffer):
+            self.assertTrue(commit_or_defer_agent_state(lambda: False))
+
+        self.assertEqual(buffer.commit(), 0)
+
     def test_to_thread_inherits_deferred_commit_context(self):
         committed: list[str] = []
         buffer = AgentStateCommitBuffer(owner="owner-a")

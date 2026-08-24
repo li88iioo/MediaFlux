@@ -3393,6 +3393,7 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
         conn.execute("BEGIN IMMEDIATE")
         for key, table, column in (
             ("action_history", "agent_action_history", "owner_digest"),
+            ("media_preferences", "agent_media_preferences", "owner_digest"),
             ("session_context", "agent_session_context", "owner_digest"),
             ("session_context_epochs", "agent_session_context_epochs", "owner_digest"),
             ("confirmations", "agent_confirmations", "owner_digest"),
@@ -3405,6 +3406,7 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
             ("conversation_epochs", "agent_conversation_epochs", "principal_digest"),
         ):
             digest_key = {
+                "media_preferences": "action_history",
                 "confirmation_epochs": "confirmations",
                 "session_context_epochs": "session_context",
                 "organize_operation_jobs": "jobs",

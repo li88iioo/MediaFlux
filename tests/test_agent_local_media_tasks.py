@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+import time
 from unittest.mock import Mock, patch
 
 from app import database as db
@@ -15,6 +16,7 @@ from app.agent.local_media_task_actions import (
 from app.agent.registry import AgentToolError
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from app.agent.session_context import SQLiteAgentSessionContextRepository
+from app.agent.state_commit import AgentStateCommitBuffer, defer_agent_state_commits
 from app.modules.local_media_service import LocalMediaServiceError
 from app.modules.media_server_path_mapping import MediaServerPathMapping
 from tests.support import IsolatedDatabaseTestCase
@@ -522,6 +524,133 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         self.assertNotIn("owner-a", store._next_inspection)
         self.assertLessEqual(len(store._next_inspection), 1)
+
+    def test_context_store_buffers_same_request_chain_until_commit(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "test-secret"
+        )
+        store = LocalMediaAgentContextStore(repository=repository)
+        task = SimpleNamespace(
+            id=9, version=3, status="requires_manual", source_id=4
+        )
+        buffer = AgentStateCommitBuffer(owner="owner-a")
+
+        with defer_agent_state_commits(buffer):
+            refs = store.capture_tasks(owner="owner-a", tasks=[task])
+            self.assertEqual(store.task(owner="owner-a", number=1), refs[0])
+            inspection_number = store.capture_inspection(
+                owner="owner-a",
+                task=refs[0],
+                inspection_id="inspection-private",
+                digest="digest-private",
+            )
+            self.assertEqual(inspection_number, 1)
+            self.assertIsNotNone(
+                store.inspection(owner="owner-a", number=inspection_number)
+            )
+
+        self.assertIsNone(store.task(owner="owner-a", number=1))
+        self.assertEqual(buffer.commit(), 1)
+        restored = LocalMediaAgentContextStore(repository=repository)
+        self.assertEqual(
+            restored.task(owner="owner-a", number=1),
+            _TaskRef(9, 3, "requires_manual", 4),
+        )
+        self.assertIsNotNone(restored.inspection(owner="owner-a", number=1))
+
+    def test_context_store_discard_blocks_late_context_resurrection(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "test-secret"
+        )
+        store = LocalMediaAgentContextStore(repository=repository)
+        task = SimpleNamespace(
+            id=9, version=3, status="requires_manual", source_id=4
+        )
+        buffer = AgentStateCommitBuffer(owner="owner-a")
+
+        with defer_agent_state_commits(buffer):
+            refs = store.capture_tasks(owner="owner-a", tasks=[task])
+            self.assertEqual(len(refs), 1)
+            store.clear_owner(owner="owner-a")
+            self.assertEqual(buffer.discard(), 1)
+            self.assertEqual(store.capture_tasks(owner="owner-a", tasks=[task]), ())
+            self.assertEqual(
+                store.capture_inspection(
+                    owner="owner-a",
+                    task=refs[0],
+                    inspection_id="late-inspection",
+                    digest="late-digest",
+                ),
+                0,
+            )
+
+        self.assertIsNone(
+            repository.get_latest(
+                owner="owner-a",
+                context_type="local_media_tasks",
+                now=time.time(),
+            )
+        )
+        self.assertIsNone(store.task(owner="owner-a", number=1))
+
+    def test_context_store_stale_cross_worker_commit_cannot_undo_reset(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "test-secret"
+        )
+        old_store = LocalMediaAgentContextStore(repository=repository)
+        reset_store = LocalMediaAgentContextStore(repository=repository)
+        task = SimpleNamespace(
+            id=9, version=3, status="requires_manual", source_id=4
+        )
+        buffer = AgentStateCommitBuffer(owner="owner-a")
+
+        with defer_agent_state_commits(buffer):
+            refs = old_store.capture_tasks(owner="owner-a", tasks=[task])
+            old_store.capture_inspection(
+                owner="owner-a",
+                task=refs[0],
+                inspection_id="inspection-private",
+                digest="digest-private",
+            )
+            reset_store.clear_owner(owner="owner-a")
+
+        self.assertEqual(buffer.commit(), 0)
+        self.assertIsNone(
+            repository.get_latest(
+                owner="owner-a",
+                context_type="local_media_tasks",
+                now=time.time(),
+            )
+        )
+        self.assertIsNone(old_store.task(owner="owner-a", number=1))
+
+    def test_context_store_newer_cross_worker_buffer_wins(self) -> None:
+        repository = SQLiteAgentSessionContextRepository(
+            secret_provider=lambda: "test-secret"
+        )
+        old_store = LocalMediaAgentContextStore(repository=repository)
+        new_store = LocalMediaAgentContextStore(repository=repository)
+        first = SimpleNamespace(
+            id=9, version=3, status="requires_manual", source_id=4
+        )
+        second = SimpleNamespace(
+            id=10, version=2, status="requires_manual", source_id=5
+        )
+        old_buffer = AgentStateCommitBuffer(owner="owner-a")
+        new_buffer = AgentStateCommitBuffer(owner="owner-a")
+
+        with defer_agent_state_commits(old_buffer):
+            old_store.capture_tasks(owner="owner-a", tasks=[first])
+        with defer_agent_state_commits(new_buffer):
+            new_store.capture_tasks(owner="owner-a", tasks=[second])
+
+        self.assertEqual(new_buffer.commit(), 1)
+        self.assertEqual(old_buffer.commit(), 0)
+        restored = LocalMediaAgentContextStore(repository=repository)
+        self.assertEqual(
+            restored.task(owner="owner-a", number=1),
+            _TaskRef(10, 2, "requires_manual", 5),
+        )
 
     def test_precise_refresh_stales_when_server_endpoint_changes(self) -> None:
         self._task(status="completed", bound=True)

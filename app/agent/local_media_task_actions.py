@@ -18,7 +18,14 @@ from app import database as db
 from app.agent.models import Evidence, ToolContext, ToolResult
 from app.agent.registry import AgentToolError
 from app.agent.result_projection import sanitize_public_text
-from app.agent.session_context import AgentSessionContextRepository
+from app.agent.session_context import (
+    AgentContextWriteGuard,
+    AgentSessionContextRepository,
+)
+from app.agent.state_commit import (
+    AgentStateCommitBuffer,
+    active_agent_state_commit_buffer,
+)
 from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES, LOCAL_TASK_STATUSES
 from app.modules.local_media_scheduler import get_local_media_scheduler
 from app.modules.local_media_service import LocalMediaServiceError, get_local_media_service
@@ -49,6 +56,16 @@ class _InspectionRef:
     task: _TaskRef
     inspection_id: str
     digest: str
+
+
+@dataclass
+class _BufferedContext:
+    """单次 Agent 请求私有的本地媒体续接视图。"""
+
+    tasks: tuple[_TaskRef, ...]
+    inspections: tuple[_InspectionRef, ...]
+    next_inspection: int
+    guard: AgentContextWriteGuard | None = None
 
 
 class LocalMediaAgentContextStore:
@@ -97,6 +114,16 @@ class LocalMediaAgentContextStore:
             )
             for task in tasks[:_MAX_TASK_NUMBER]
         )
+        buffered = self._buffered_context(owner_key)
+        if buffered is not None:
+            buffer, state = buffered
+            if not self._stage_buffered_commit(buffer, owner_key, state):
+                return ()
+            with self._lock:
+                state.tasks = refs
+            return refs
+        if active_agent_state_commit_buffer() is not None:
+            return ()
         with self._lock:
             self._prune_locked()
             updated = self._mutate_persisted_locked(
@@ -120,6 +147,15 @@ class LocalMediaAgentContextStore:
 
     def task(self, *, owner: str, number: int) -> _TaskRef | None:
         owner_key = str(owner or "").strip()
+        buffered = self._buffered_context(owner_key)
+        if buffered is not None:
+            _, state = buffered
+            with self._lock:
+                if not 1 <= int(number) <= len(state.tasks):
+                    return None
+                return state.tasks[int(number) - 1]
+        if active_agent_state_commit_buffer() is not None:
+            return None
         with self._lock:
             self._prune_locked()
             self._restore_locked(owner_key, required="tasks")
@@ -139,6 +175,30 @@ class LocalMediaAgentContextStore:
     ) -> int:
         owner_key = str(owner or "").strip()
         if not owner_key or not inspection_id or not digest:
+            return 0
+        buffered = self._buffered_context(owner_key)
+        if buffered is not None:
+            buffer, state = buffered
+            if not self._stage_buffered_commit(buffer, owner_key, state):
+                return 0
+            with self._lock:
+                used = {item.number for item in state.inspections}
+                number = (
+                    1
+                    if state.next_inspection >= _MAX_INSPECTION_NUMBER
+                    else state.next_inspection + 1
+                )
+                while number in used:
+                    number = 1 if number >= _MAX_INSPECTION_NUMBER else number + 1
+                state.next_inspection = number
+                ref = _InspectionRef(
+                    number, task, str(inspection_id), str(digest)
+                )
+                state.inspections = (
+                    ref, *state.inspections
+                )[: self.max_inspections_per_owner]
+                return number
+        if active_agent_state_commit_buffer() is not None:
             return 0
         with self._lock:
             self._prune_locked()
@@ -195,6 +255,16 @@ class LocalMediaAgentContextStore:
 
     def inspection(self, *, owner: str, number: int) -> _InspectionRef | None:
         owner_key = str(owner or "").strip()
+        buffered = self._buffered_context(owner_key)
+        if buffered is not None:
+            _, state = buffered
+            with self._lock:
+                return next(
+                    (item for item in state.inspections if item.number == int(number)),
+                    None,
+                )
+        if active_agent_state_commit_buffer() is not None:
+            return None
         with self._lock:
             self._prune_locked()
             self._restore_locked(owner_key, required="inspections")
@@ -216,6 +286,27 @@ class LocalMediaAgentContextStore:
     ) -> bool:
         owner_key = str(owner or "").strip()
         if not owner_key or not inspection_id or not digest:
+            return False
+        buffered = self._buffered_context(owner_key)
+        if buffered is not None:
+            buffer, state = buffered
+            if not self._stage_buffered_commit(buffer, owner_key, state):
+                return False
+            with self._lock:
+                refs: list[_InspectionRef] = []
+                replaced = False
+                for item in state.inspections:
+                    if item.number == int(number):
+                        refs.append(_InspectionRef(
+                            item.number, item.task, str(inspection_id), str(digest)
+                        ))
+                        replaced = True
+                    else:
+                        refs.append(item)
+                if replaced:
+                    state.inspections = tuple(refs)
+                return replaced
+        if active_agent_state_commit_buffer() is not None:
             return False
         with self._lock:
             self._prune_locked()
@@ -264,7 +355,7 @@ class LocalMediaAgentContextStore:
             self._persist_locked(owner_key)
             return True
 
-    def clear_owner(self, *, owner: str) -> None:
+    def clear_owner(self, *, owner: str, invalidate_persisted: bool = True) -> None:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return
@@ -273,11 +364,18 @@ class LocalMediaAgentContextStore:
             self._inspections.pop(owner_key, None)
             self._next_inspection.pop(owner_key, None)
             repository = self._repository
-        if repository is not None:
+        if repository is not None and invalidate_persisted:
             try:
-                repository.delete_latest(
-                    owner=owner_key, context_type=self._CONTEXT_TYPE
-                )
+                invalidate = getattr(repository, "invalidate_context", None)
+                if callable(invalidate):
+                    invalidate(
+                        owner=owner_key,
+                        context_type=self._CONTEXT_TYPE,
+                    )
+                else:
+                    repository.delete_latest(
+                        owner=owner_key, context_type=self._CONTEXT_TYPE
+                    )
             except Exception as exc:
                 logger.warning(
                     "本地媒体 Agent 上下文清理失败 type=%s", type(exc).__name__
@@ -289,6 +387,104 @@ class LocalMediaAgentContextStore:
             self._tasks.clear()
             self._inspections.clear()
             self._next_inspection.clear()
+
+    def _buffered_context(
+        self, owner: str
+    ) -> tuple[AgentStateCommitBuffer, _BufferedContext] | None:
+        buffer = active_agent_state_commit_buffer()
+        if buffer is None or not owner:
+            return None
+        key = self._buffered_state_key(owner)
+        state = buffer.get_or_create_request_state(
+            owner=owner,
+            key=key,
+            factory=lambda: self._snapshot_context(owner),
+        )
+        if not isinstance(state, _BufferedContext):
+            return None
+        return buffer, state
+
+    def _snapshot_context(self, owner: str) -> _BufferedContext:
+        with self._lock:
+            self._prune_locked()
+            repository = self._repository
+            begin_update = (
+                getattr(repository, "begin_context_update", None)
+                if repository is not None else None
+            )
+            if callable(begin_update):
+                persisted, guard = begin_update(
+                    owner=owner, context_type=self._CONTEXT_TYPE
+                )
+                decoded = (
+                    self._decode_payload(persisted.payload)
+                    if persisted is not None else None
+                )
+                if decoded is None:
+                    self._tasks.pop(owner, None)
+                    self._inspections.pop(owner, None)
+                    self._next_inspection.pop(owner, None)
+                    return _BufferedContext((), (), 0, guard)
+                self._install_decoded_locked(
+                    owner, decoded, persisted_expires_at=persisted.expires_at
+                )
+                return _BufferedContext(*decoded, guard)
+            self._restore_locked(owner, required="tasks")
+            self._restore_locked(owner, required="inspections")
+            return _BufferedContext(
+                tasks=self._tasks.get(owner, (0.0, ()))[1],
+                inspections=self._inspections.get(owner, (0.0, ()))[1],
+                next_inspection=self._next_inspection.get(owner, 0),
+            )
+
+    def _stage_buffered_commit(
+        self,
+        buffer: AgentStateCommitBuffer,
+        owner: str,
+        state: _BufferedContext,
+    ) -> bool:
+        return buffer.add_once(
+            key=f"{self._buffered_state_key(owner)}:commit",
+            action=lambda: self._commit_buffered_context(owner, state),
+        )
+
+    def _commit_buffered_context(
+        self, owner: str, state: _BufferedContext
+    ) -> bool:
+        with self._lock:
+            decoded = (state.tasks, state.inspections, state.next_inspection)
+            expires_at = self._wall_clock() + self.ttl_seconds
+            repository = self._repository
+            if repository is not None:
+                guarded = getattr(repository, "replace_latest_guarded", None)
+                if state.guard is not None and callable(guarded):
+                    persisted = guarded(
+                        owner=owner,
+                        context_type=self._CONTEXT_TYPE,
+                        payload=self._encode_payload(*decoded),
+                        expires_at=expires_at,
+                        guard=state.guard,
+                    )
+                    if persisted is None:
+                        self._tasks.pop(owner, None)
+                        self._inspections.pop(owner, None)
+                        self._next_inspection.pop(owner, None)
+                        return False
+                    expires_at = persisted.expires_at
+                else:
+                    repository.replace_latest(
+                        owner=owner,
+                        context_type=self._CONTEXT_TYPE,
+                        payload=self._encode_payload(*decoded),
+                        expires_at=expires_at,
+                    )
+            self._install_decoded_locked(
+                owner, decoded, persisted_expires_at=expires_at
+            )
+            return True
+
+    def _buffered_state_key(self, owner: str) -> str:
+        return f"local-media:{id(self)}:{owner}"
 
     def _restore_locked(self, owner: str, *, required: str) -> None:
         if not owner:
@@ -540,8 +736,12 @@ def configure_local_media_agent_context(
     _context_store.set_repository(repository)
 
 
-def clear_local_media_agent_context(*, owner: str) -> None:
-    _context_store.clear_owner(owner=owner)
+def clear_local_media_agent_context(
+    *, owner: str, invalidate_persisted: bool = True
+) -> None:
+    _context_store.clear_owner(
+        owner=owner, invalidate_persisted=invalidate_persisted
+    )
 
 
 def reset_local_media_agent_context_for_tests() -> None:

@@ -5584,7 +5584,11 @@ class AgentOrchestrator:
                 if callable(invalidate_owner):
                     persisted = invalidate_owner(
                         owner=owner_key,
-                        context_types=("discovery_mapping", "directory_scrape"),
+                        context_types=(
+                            "discovery_mapping",
+                            "directory_scrape",
+                            "local_media_tasks",
+                        ),
                     )
                 else:
                     persisted = self.session_context_repository.delete_owner(
@@ -5598,7 +5602,9 @@ class AgentOrchestrator:
         self.recent_discovery_store.clear_owner(owner=owner_key)
         self.recent_download_store.clear_owner(owner=owner_key)
         self.recent_read_store.clear_owner(owner=owner_key)
-        clear_local_media_agent_context(owner=owner_key)
+        clear_local_media_agent_context(
+            owner=owner_key, invalidate_persisted=False
+        )
         clear_discovery_mapping_context(owner=owner_key, delete_persisted=False)
         clear_directory_scrape_context(owner=owner_key, delete_persisted=False)
         return {

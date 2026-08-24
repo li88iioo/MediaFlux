@@ -38,6 +38,12 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
                 (digests["action"], "demo", "read", "ok", 1, "done", now, now),
             )
             conn.execute(
+                "INSERT INTO agent_media_preferences("
+                "owner_digest,preferred_server,preferred_download_target,revision,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,?)",
+                (digests["action"], "emby", "qb", 1, now, now),
+            )
+            conn.execute(
                 "INSERT INTO agent_session_context(owner_digest,context_type,payload,expires_at,created_at) VALUES(?,?,?,?,?)",
                 (digests["session"], "latest_tool", "{}", time.time() + 60, now),
             )

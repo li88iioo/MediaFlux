@@ -280,6 +280,74 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
             guard=scrape_stored,
         ))
 
+    def test_guarded_update_preserves_snapshot_and_rejects_stale_writer(self):
+        owner = "guarded-update-owner"
+        self.repository.replace_latest(
+            owner=owner,
+            context_type="local_media_tasks",
+            payload={"safe": "seed"},
+            expires_at=1_100.0,
+        )
+
+        first_snapshot, first_guard = self.repository.begin_context_update(
+            owner=owner, context_type="local_media_tasks"
+        )
+        self.assertIsNotNone(first_snapshot)
+        self.assertEqual(first_snapshot.payload, {"safe": "seed"})
+        self.assertEqual(first_snapshot.generation, first_guard.generation)
+        self.assertEqual(first_snapshot.revision, first_guard.revision)
+
+        second_snapshot, second_guard = self.repository.begin_context_update(
+            owner=owner, context_type="local_media_tasks"
+        )
+        self.assertIsNotNone(second_snapshot)
+        self.assertEqual(second_snapshot.payload, {"safe": "seed"})
+        self.assertNotEqual(second_guard.generation, first_guard.generation)
+        self.assertIsNone(self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="local_media_tasks",
+            payload={"safe": "late-first"},
+            expires_at=1_100.0,
+            guard=first_guard,
+        ))
+        stored = self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="local_media_tasks",
+            payload={"safe": "second"},
+            expires_at=1_100.0,
+            guard=second_guard,
+        )
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.payload, {"safe": "second"})
+
+    def test_single_context_invalidation_blocks_guard_without_deleting_others(self):
+        owner = "single-context-reset-owner"
+        self.repository.replace_latest(
+            owner=owner,
+            context_type="patrol",
+            payload={"safe": "patrol"},
+            expires_at=1_100.0,
+        )
+        _snapshot, guard = self.repository.begin_context_update(
+            owner=owner, context_type="local_media_tasks"
+        )
+
+        self.assertEqual(self.repository.invalidate_context(
+            owner=owner, context_type="local_media_tasks"
+        ), 0)
+        self.assertIsNone(self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="local_media_tasks",
+            payload={"safe": "late"},
+            expires_at=1_100.0,
+            guard=guard,
+        ))
+        remaining = self.repository.get_latest(
+            owner=owner, context_type="patrol", now=1_000.0
+        )
+        self.assertIsNotNone(remaining)
+        self.assertEqual(remaining.payload, {"safe": "patrol"})
+
     def test_pruned_epoch_never_reuses_an_old_guard_after_reset(self):
         owner = "guarded-aba-owner"
         stale = self.repository.begin_context(

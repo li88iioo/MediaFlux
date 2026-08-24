@@ -123,6 +123,10 @@ class AgentSessionContextRepository(Protocol):
 
     def begin_context(self, *, owner: str, context_type: str) -> AgentContextWriteGuard: ...
 
+    def begin_context_update(
+        self, *, owner: str, context_type: str
+    ) -> tuple[PersistedAgentContext | None, AgentContextWriteGuard]: ...
+
     def replace_latest_guarded(
         self,
         *,
@@ -144,6 +148,8 @@ class AgentSessionContextRepository(Protocol):
     def invalidate_owner(
         self, *, owner: str, context_types: tuple[str, ...]
     ) -> int: ...
+
+    def invalidate_context(self, *, owner: str, context_type: str) -> int: ...
 
 
 class SQLiteAgentSessionContextRepository:
@@ -223,6 +229,55 @@ class SQLiteAgentSessionContextRepository:
                 (owner_digest, normalized_type),
             )
         return AgentContextWriteGuard(generation=generation, revision=0)
+
+    def begin_context_update(
+        self, *, owner: str, context_type: str,
+    ) -> tuple[PersistedAgentContext | None, AgentContextWriteGuard]:
+        """开启 latest-wins 更新世代，同时保留并返回当前安全快照。"""
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        now = float(self._clock())
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._prune(conn, now=now)
+            self._require_epoch_capacity(
+                conn, owner_digest=owner_digest, context_type=normalized_type,
+            )
+            row = conn.execute(
+                "SELECT id,payload,expires_at,context_generation "
+                "FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=? AND expires_at>? "
+                "ORDER BY id DESC LIMIT 1",
+                (owner_digest, normalized_type, now),
+            ).fetchone()
+            current = self._decode_row(
+                row, owner_digest=owner_digest, context_type=normalized_type
+            )
+            if row is not None and current is None:
+                conn.execute(
+                    "DELETE FROM agent_session_context "
+                    "WHERE owner_digest=? AND context_type=?",
+                    (owner_digest, normalized_type),
+                )
+            generation = self._advance_generation(
+                conn, owner_digest=owner_digest, context_type=normalized_type, now=now,
+            )
+            revision = current.revision if current is not None else 0
+            if current is not None:
+                conn.execute(
+                    "UPDATE agent_session_context SET context_generation=? "
+                    "WHERE id=? AND owner_digest=? AND context_type=?",
+                    (generation, revision, owner_digest, normalized_type),
+                )
+                current = PersistedAgentContext(
+                    payload=deepcopy(current.payload),
+                    expires_at=current.expires_at,
+                    revision=revision,
+                    generation=generation,
+                )
+        return current, AgentContextWriteGuard(
+            generation=generation, revision=revision,
+        )
 
     def replace_latest_guarded(
         self,
@@ -368,6 +423,27 @@ class SQLiteAgentSessionContextRepository:
             deleted = conn.execute(
                 "DELETE FROM agent_session_context WHERE owner_digest=?",
                 (owner_digest,),
+            )
+        return max(0, int(deleted.rowcount or 0))
+
+    def invalidate_context(self, *, owner: str, context_type: str) -> int:
+        """推进单个上下文世代并仅删除该类型，阻止迟到写入复活。"""
+        normalized_type = self._context_type(context_type, allow_download=False)
+        owner_digest = self._owner_digest(owner)
+        now = float(self._clock())
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._prune(conn, now=now)
+            self._require_epoch_capacity(
+                conn, owner_digest=owner_digest, context_type=normalized_type,
+            )
+            self._advance_generation(
+                conn, owner_digest=owner_digest, context_type=normalized_type, now=now,
+            )
+            deleted = conn.execute(
+                "DELETE FROM agent_session_context "
+                "WHERE owner_digest=? AND context_type=?",
+                (owner_digest, normalized_type),
             )
         return max(0, int(deleted.rowcount or 0))
 

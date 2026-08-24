@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import Any
 import logging
 import threading
 
@@ -15,17 +16,56 @@ class AgentStateCommitBuffer:
 
     def __init__(self, *, owner: str = "") -> None:
         self._lock = threading.RLock()
-        self._actions: list[Callable[[], None]] = []
+        self._actions: list[Callable[[], Any]] = []
         self._closed = False
         self._owner = str(owner or "").strip()
         self._resource_result_ids: set[str] = set()
+        self._request_states: dict[str, Any] = {}
+        self._action_keys: set[str] = set()
 
-    def add(self, action: Callable[[], None]) -> bool:
+    def add(self, action: Callable[[], Any]) -> bool:
         if not callable(action):
             raise TypeError("state commit action must be callable")
         with self._lock:
             if self._closed:
                 return False
+            self._actions.append(action)
+            return True
+
+    def get_or_create_request_state(
+        self,
+        *,
+        owner: str,
+        key: str,
+        factory: Callable[[], Any],
+    ) -> Any | None:
+        """返回当前请求私有状态；它不会在提交前泄漏到跨轮上下文。"""
+        owner_key = str(owner or "").strip()
+        state_key = str(key or "").strip()
+        if not callable(factory):
+            raise TypeError("request state factory must be callable")
+        if not owner_key or owner_key != self._owner or not state_key:
+            return None
+        with self._lock:
+            if self._closed:
+                return None
+            if state_key not in self._request_states:
+                self._request_states[state_key] = factory()
+            return self._request_states[state_key]
+
+    def add_once(self, *, key: str, action: Callable[[], Any]) -> bool:
+        """同一请求内按键至多登记一次提交动作。"""
+        action_key = str(key or "").strip()
+        if not action_key:
+            return False
+        if not callable(action):
+            raise TypeError("state commit action must be callable")
+        with self._lock:
+            if self._closed:
+                return False
+            if action_key in self._action_keys:
+                return True
+            self._action_keys.add(action_key)
             self._actions.append(action)
             return True
 
@@ -59,11 +99,13 @@ class AgentStateCommitBuffer:
             actions = tuple(self._actions)
             self._actions.clear()
             self._resource_result_ids.clear()
+            self._request_states.clear()
+            self._action_keys.clear()
         committed = 0
         for action in actions:
             try:
-                action()
-                committed += 1
+                if action() is not False:
+                    committed += 1
             except Exception as exc:
                 logger.warning(
                     "Agent 续接状态提交失败 type=%s", type(exc).__name__
@@ -79,6 +121,8 @@ class AgentStateCommitBuffer:
             discarded = len(self._actions)
             self._actions.clear()
             self._resource_result_ids.clear()
+            self._request_states.clear()
+            self._action_keys.clear()
             return discarded
 
 
@@ -97,6 +141,11 @@ def defer_agent_state_commits(buffer: AgentStateCommitBuffer) -> Iterator[None]:
         yield
     finally:
         _ACTIVE_STATE_COMMIT_BUFFER.reset(token)
+
+
+def active_agent_state_commit_buffer() -> AgentStateCommitBuffer | None:
+    """返回当前请求缓冲区，仅供需要请求内隔离视图的状态仓储使用。"""
+    return _ACTIVE_STATE_COMMIT_BUFFER.get()
 
 
 def commit_or_defer_agent_state(action: Callable[[], None]) -> bool:
