@@ -1990,6 +1990,128 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(throttled.call_args.args[5], 403)
         self.assertEqual(len(throttled.call_args.args), 6)
 
+    def test_anonymous_websocket_403_is_debug_only(self):
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "upstream_url": "http://media.example:8096",
+        }
+        pinned = media_proxy._PinnedUpstreamTarget(
+            logical_url="http://media.example:8096/socket",
+            connect_url="http://203.0.113.10:8096/socket",
+            host_header="media.example:8096",
+            sni_hostname="media.example",
+            addresses=("203.0.113.10",),
+        )
+
+        class RejectingWebSocketSession:
+            def __init__(self, *, connector, trace_configs=None) -> None:
+                self.closed = False
+
+            async def ws_connect(self, target: str, **kwargs):
+                raise media_proxy.WSServerHandshakeError(
+                    None,
+                    (),
+                    status=403,
+                    message="Invalid response status",
+                )
+
+            async def close(self) -> None:
+                self.closed = True
+
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch(
+                "app.modules.media_proxy.database.get_media_proxy_instance",
+                return_value=instance,
+            ),
+            patch(
+                "app.modules.media_proxy._pin_upstream_target",
+                return_value=pinned,
+            ),
+            patch("app.modules.media_proxy.TCPConnector", return_value=object()),
+            patch(
+                "app.modules.media_proxy.ClientSession",
+                RejectingWebSocketSession,
+            ),
+            patch("app.modules.media_proxy.log_throttled") as throttled,
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                with client.websocket_connect(
+                    "/socket",
+                    headers={"Origin": "http://mediaflux.test"},
+                ):
+                    pass
+
+        self.assertEqual(closed.exception.code, 1011)
+        throttled.assert_called_once()
+        self.assertEqual(throttled.call_args.args[1], logging.DEBUG)
+        self.assertEqual(
+            throttled.call_args.args[2],
+            "media-proxy-ws-anonymous:7:403",
+        )
+        self.assertEqual(throttled.call_args.args[5], 403)
+
+    def test_websocket_cookie_counts_as_auth_signal(self):
+        request = SimpleNamespace(
+            headers=Headers({"Cookie": "connect.sid=session-cookie"}),
+            query_params={},
+        )
+
+        self.assertTrue(media_proxy._request_has_websocket_auth_signal(request))
+
+        request.headers = Headers({})
+        self.assertFalse(media_proxy._request_has_websocket_auth_signal(request))
+
+    def test_websocket_anonymous_rejection_log_matrix(self):
+        anonymous = SimpleNamespace(headers=Headers({}), query_params={})
+        self.assertTrue(
+            media_proxy._websocket_handshake_is_anonymous_rejection(
+                anonymous,
+                401,
+            )
+        )
+        self.assertTrue(
+            media_proxy._websocket_handshake_is_anonymous_rejection(
+                anonymous,
+                403,
+            )
+        )
+        self.assertFalse(
+            media_proxy._websocket_handshake_is_anonymous_rejection(
+                anonymous,
+                500,
+            )
+        )
+
+        authenticated_requests = (
+            SimpleNamespace(
+                headers=Headers({"Authorization": "Bearer expired-token"}),
+                query_params={},
+            ),
+            SimpleNamespace(
+                headers=Headers({"X-Emby-Authorization": "malformed"}),
+                query_params={},
+            ),
+            SimpleNamespace(
+                headers=Headers({"Cookie": "connect.sid=session-cookie"}),
+                query_params={},
+            ),
+            SimpleNamespace(
+                headers=Headers({}),
+                query_params={"api_key": "expired-token"},
+            ),
+        )
+        for request in authenticated_requests:
+            with self.subTest(headers=dict(request.headers), query=request.query_params):
+                self.assertFalse(
+                    media_proxy._websocket_handshake_is_anonymous_rejection(
+                        request,
+                        403,
+                    )
+                )
+
     def test_websocket_upstream_redirect_is_rejected_before_second_hop(self):
         instance = {
             **self._instance(),

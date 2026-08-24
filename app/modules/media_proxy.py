@@ -3003,6 +3003,40 @@ def _request_auth_has_conflict(request: Any) -> bool:
     return len(set(_request_auth_credentials(request))) > 1
 
 
+def _request_has_websocket_auth_signal(request: Any) -> bool:
+    """判断 WebSocket 握手是否携带任何可用的认证信号。
+
+    Jellyfin Web 登录前会先建立一次匿名 ``/socket``，上游按预期返回
+    401/403；登录后浏览器可能只通过 Cookie 维持会话，因此 Cookie 也必须
+    视为认证信号，不能仅凭 query/header 中没有显式 Token 就降级真实故障。
+    """
+    if _request_auth_credentials(request):
+        return True
+    # 日志分级应比凭据解析更保守：即使 Authorization 格式不是当前支持的
+    # MediaBrowser Token=...，它仍代表一次真实认证尝试，失败必须保留 WARNING。
+    return any(
+        str(value or "").strip()
+        for header_name in (
+            "Authorization",
+            "X-Emby-Authorization",
+            "X-Emby-Token",
+            "X-MediaBrowser-Token",
+            "Cookie",
+        )
+        for value in _header_values(request.headers, header_name)
+    )
+
+
+def _websocket_handshake_is_anonymous_rejection(
+    request: Any,
+    status: int,
+) -> bool:
+    return bool(
+        int(status or 0) in {401, 403}
+        and not _request_has_websocket_auth_signal(request)
+    )
+
+
 def _auth_scope_fingerprint(credential: str) -> str:
     value = str(credential or "").encode("utf-8")
     return hmac.new(_AUTH_SCOPE_SECRET, value, hashlib.sha256).hexdigest() if value else ""
@@ -4581,14 +4615,28 @@ def create_proxy_app(
             return
         except WSServerHandshakeError as exc:
             status = int(getattr(exc, "status", 0) or 0)
-            log_throttled(
-                logger,
-                logging.WARNING,
-                f"media-proxy-ws-handshake:{instance_id}:{status}",
-                "媒体反代 WebSocket 上游握手失败 instance=%s status=%s",
-                instance_id,
+            anonymous_rejection = _websocket_handshake_is_anonymous_rejection(
+                websocket,
                 status,
             )
+            if anonymous_rejection:
+                log_throttled(
+                    logger,
+                    logging.DEBUG,
+                    f"media-proxy-ws-anonymous:{instance_id}:{status}",
+                    "媒体反代匿名 WebSocket 被上游拒绝 instance=%s status=%s",
+                    instance_id,
+                    status,
+                )
+            else:
+                log_throttled(
+                    logger,
+                    logging.WARNING,
+                    f"media-proxy-ws-handshake:{instance_id}:{status}",
+                    "媒体反代 WebSocket 上游握手失败 instance=%s status=%s",
+                    instance_id,
+                    status,
+                )
             if session is not None:
                 await session.close()
             await websocket.close(code=1011, reason="Upstream WebSocket unavailable")
