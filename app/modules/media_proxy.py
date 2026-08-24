@@ -1793,8 +1793,12 @@ def _mark_direct_source(
     # 保留 MediaFlux 写入 URL 的短时 capability。Protocol=File 则会自行通过
     # SDK 重建标准 /Videos/{id}/stream URL，丢掉 capability 与访问令牌。
     findroid_http_source = mode == "findroid"
-    source["IsRemote"] = findroid_http_source
-    source["Protocol"] = "Http" if findroid_http_source else "File"
+    web_direct_http_source = bool(
+        mode == "web" and source.get("SupportsDirectPlay") is True
+    )
+    http_source = findroid_http_source or web_direct_http_source
+    source["IsRemote"] = http_source
+    source["Protocol"] = "Http" if http_source else "File"
     source["RequiresOpening"] = False
     source["RequiresClosing"] = False
     source["RequiresLooping"] = False
@@ -1803,9 +1807,18 @@ def _mark_direct_source(
     source["DirectStreamUrl"] = direct_stream_url or stream_path
 
     if mode == "web":
-        # Web 的设备能力由 Jellyfin 上游判定。不能强行宣告 MKV/HEVC 可直放，
-        # 否则浏览器会持续下载不支持的媒体却始终没有首帧；只替换直放地址，
-        # 保留上游的 DirectPlay/DirectStream/Transcoding 与 HLS 决策。
+        # Web 的设备能力仍由 Jellyfin 上游判定，不能把原本不可直放的
+        # MKV/HEVC 强制宣告为 Direct Play。对于上游已经确认可直放的 source，
+        # 改成 Remote HTTP contract：Jellyfin Web 因 IsRemote=True 不会给
+        # <video> 设置 crossorigin=anonymous，原生媒体元素即可用 no-cors GET
+        # 跟随 MediaFlux 的 302。
+        if web_direct_http_source:
+            source["RequiredHttpHeaders"] = {}
+            # Jellyfin Web 12 只要看到 TranscodingSubProtocol=HLS，就算当前
+            # playMethod 是 DirectPlay 也会交给 hls.js/XHR，随后跨域 302 被 CDN
+            # CORS 拦截。直放合同移除该 HLS 标记；若客户端重新请求转码合同，
+            # 上游会在 SupportsDirectPlay=False 的响应中原样返回 HLS 字段。
+            source.pop("TranscodingSubProtocol", None)
         return
 
     # Jellyfin Android 2.7 使用的 jellyfin-sdk-kotlin 1.7.1 把
@@ -2179,6 +2192,19 @@ def _decoded_response_headers(headers: httpx.Headers) -> dict[str, str]:
 
 def _request_headers(request: Request) -> dict[str, str]:
     return {key: value for key, value in request.headers.items() if key.lower() not in _HOP_HEADERS}
+
+
+def _replace_header(
+    headers: dict[str, str],
+    name: str,
+    value: str,
+) -> None:
+    """大小写无关地替换单值请求头，避免 httpx 合并重复字段。"""
+    normalized_name = str(name or "").casefold()
+    for key in tuple(headers):
+        if key.casefold() == normalized_name:
+            headers.pop(key, None)
+    headers[name] = value
 
 
 def _canonical_client_ip(request: Any) -> str:
@@ -2732,8 +2758,15 @@ def _request_is_cross_protocol_media_target(
         and source_scheme != target_scheme
     )
 
+
+def _browser_direct_target_is_secure(signed_url: str) -> bool:
+    """浏览器真 302 只下发 HTTPS bearer URL，HTTP 目标统一走 relay。"""
+    target_scheme = str(urlsplit(str(signed_url or "")).scheme or "").casefold()
+    return target_scheme == "https"
+
+
 def _request_uses_browser_media_element(request: Any) -> bool:
-    """浏览器 video/audio 的跨域 302 会受 CDN CORS 约束，需要同源回源。"""
+    """识别浏览器媒体元素或 hls.js/fetch 发起的媒体请求。"""
     headers = request.headers
     destination = str(headers.get("Sec-Fetch-Dest") or "").strip().casefold()
     if destination in {"audio", "video"}:
@@ -2748,6 +2781,22 @@ def _request_uses_browser_media_element(request: Any) -> bool:
     )
 
 
+def _request_allows_browser_direct_redirect(request: Any) -> bool:
+    """只允许原生 HTMLMediaElement 的 no-cors GET 跟随跨域 signed URL。
+
+    Jellyfin Web 的 hls.js 使用 XHR/fetch（cors）读取媒体；即使 source 已由
+    PlaybackInfo 判定为可 Direct Play，302 到未开放 CORS 的 CDN 仍会被浏览器
+    拦截。原生 video/audio 且 no-cors 的请求则可以安全保持真正的 302 数据链。
+    """
+    headers = request.headers
+    destination = str(headers.get("Sec-Fetch-Dest") or "").strip().casefold()
+    fetch_mode = str(headers.get("Sec-Fetch-Mode") or "").strip().casefold()
+    return bool(
+        destination in {"audio", "video"}
+        and fetch_mode in {"", "no-cors"}
+    )
+
+
 def _signed_media_request_headers(
     request: Any,
     *,
@@ -2758,7 +2807,7 @@ def _signed_media_request_headers(
         for key, value in request.headers.items()
         if key.lower() in _SIGNED_MEDIA_REQUEST_HEADERS
     }
-    headers["Accept-Encoding"] = "identity"
+    _replace_header(headers, "Accept-Encoding", "identity")
     if head_probe:
         # 光鸭部分 CDN 节点会对 HEAD + video/* 或 application/json 返回 406；
         # bytes=0-0 又会异常返回 200 / Content-Length: 1。探测统一请求 1 KiB，
@@ -2952,6 +3001,40 @@ def _request_auth_credential(request: Any) -> str:
 
 def _request_auth_has_conflict(request: Any) -> bool:
     return len(set(_request_auth_credentials(request))) > 1
+
+
+def _request_has_websocket_auth_signal(request: Any) -> bool:
+    """判断 WebSocket 握手是否携带任何可用的认证信号。
+
+    Jellyfin Web 登录前会先建立一次匿名 ``/socket``，上游按预期返回
+    401/403；登录后浏览器可能只通过 Cookie 维持会话，因此 Cookie 也必须
+    视为认证信号，不能仅凭 query/header 中没有显式 Token 就降级真实故障。
+    """
+    if _request_auth_credentials(request):
+        return True
+    # 日志分级应比凭据解析更保守：即使 Authorization 格式不是当前支持的
+    # MediaBrowser Token=...，它仍代表一次真实认证尝试，失败必须保留 WARNING。
+    return any(
+        str(value or "").strip()
+        for header_name in (
+            "Authorization",
+            "X-Emby-Authorization",
+            "X-Emby-Token",
+            "X-MediaBrowser-Token",
+            "Cookie",
+        )
+        for value in _header_values(request.headers, header_name)
+    )
+
+
+def _websocket_handshake_is_anonymous_rejection(
+    request: Any,
+    status: int,
+) -> bool:
+    return bool(
+        int(status or 0) in {401, 403}
+        and not _request_has_websocket_auth_signal(request)
+    )
 
 
 def _auth_scope_fingerprint(credential: str) -> str:
@@ -4327,6 +4410,8 @@ def create_proxy_app(
                 and getattr(
                     request.state, "proxy_browser_direct_redirect", False
                 )
+                and _request_allows_browser_direct_redirect(request)
+                and _browser_direct_target_is_secure(client_url)
             )
             prefers_direct_redirect = _request_prefers_direct_signed_redirect(
                 request
@@ -4374,10 +4459,52 @@ def create_proxy_app(
                 elif native_cross_protocol_relay:
                     request.state.proxy_action = "guangya_relay_cross_protocol"
                 return await _relay_signed_media(request, client_url)
+            redirect_url = client_url
             if browser_direct_redirect:
+                # 浏览器会自行解析 Location，无法复用 relay 的物理 IP pinning；
+                # 此处的解析结果只是对受信 provider 返回值做下发前的公网目标
+                # 健全性检查，并不等同于钉住浏览器随后采用的 DNS 结果。真正需要
+                # DNS pinning 的 HLS/XHR 与不安全协议降级仍统一走 relay。
+                try:
+                    pinned_redirect = await asyncio.wait_for(
+                        run_signed_media_probe_blocking(
+                            _pin_signed_media_target,
+                            client_url,
+                        ),
+                        timeout=max(
+                            0.001,
+                            _SIGNED_MEDIA_PROBE_TOTAL_TIMEOUT_SECONDS,
+                        ),
+                    )
+                except _SignedMediaProbeCapacityError:
+                    request.state.proxy_failure_stage = (
+                        "signed_url_probe_capacity"
+                    )
+                    return JSONResponse(
+                        {"error": "媒体直链探测繁忙，请稍后重试"},
+                        status_code=503,
+                    )
+                except TimeoutError:
+                    request.state.proxy_failure_stage = "signed_url_probe_timeout"
+                    return JSONResponse(
+                        {"error": "媒体直链探测超时"},
+                        status_code=504,
+                    )
+                except ValueError as exc:
+                    request.state.proxy_failure_stage = "signed_url_target"
+                    logger.warning(
+                        "媒体反代浏览器直链地址无效 instance=%s reason=%s",
+                        instance_id,
+                        str(exc),
+                    )
+                    return JSONResponse(
+                        {"error": "媒体直链地址无效"},
+                        status_code=502,
+                    )
+                redirect_url = pinned_redirect.logical_url
                 request.state.proxy_action = "guangya_302_web_direct"
             return RedirectResponse(
-                client_url,
+                redirect_url,
                 status_code=302,
                 headers={
                     "Cache-Control": "private, no-store, no-cache, max-age=0",
@@ -4488,14 +4615,28 @@ def create_proxy_app(
             return
         except WSServerHandshakeError as exc:
             status = int(getattr(exc, "status", 0) or 0)
-            log_throttled(
-                logger,
-                logging.WARNING,
-                f"media-proxy-ws-handshake:{instance_id}:{status}",
-                "媒体反代 WebSocket 上游握手失败 instance=%s status=%s",
-                instance_id,
+            anonymous_rejection = _websocket_handshake_is_anonymous_rejection(
+                websocket,
                 status,
             )
+            if anonymous_rejection:
+                log_throttled(
+                    logger,
+                    logging.DEBUG,
+                    f"media-proxy-ws-anonymous:{instance_id}:{status}",
+                    "媒体反代匿名 WebSocket 被上游拒绝 instance=%s status=%s",
+                    instance_id,
+                    status,
+                )
+            else:
+                log_throttled(
+                    logger,
+                    logging.WARNING,
+                    f"media-proxy-ws-handshake:{instance_id}:{status}",
+                    "媒体反代 WebSocket 上游握手失败 instance=%s status=%s",
+                    instance_id,
+                    status,
+                )
             if session is not None:
                 await session.close()
             await websocket.close(code=1011, reason="Upstream WebSocket unavailable")
@@ -4723,6 +4864,13 @@ def create_proxy_app(
             request,
             str(instance.get("server_type") or ""),
         )
+        if playback_match:
+            # PlaybackInfo 必须读取并改写 JSON。浏览器通常声明 br，但 MediaFlux
+            # 的最小运行依赖不保证安装 Brotli 解码器；若把 br 原样转给 Jellyfin，
+            # httpx 会在缺少可选解码器时把压缩字节当作正文，最终产生
+            # application/json + 二进制 body。控制面统一请求 identity，既避免
+            # 解码依赖，也确保首次请求和 Web 音轨协商重试使用同一合同。
+            _replace_header(upstream_headers, "Accept-Encoding", "identity")
         upstream_headers["Host"] = pinned.host_header
         upstream_request = client.build_request(
             request.method,
@@ -4759,6 +4907,17 @@ def create_proxy_app(
                     instance_id,
                 )
                 return JSONResponse({"error": "上游响应过大"}, status_code=502)
+            except httpx.DecodingError as exc:
+                request.state.proxy_failure_stage = "upstream_playback_info"
+                logger.warning(
+                    "媒体反代 PlaybackInfo 解码失败 instance=%s type=%s",
+                    instance_id,
+                    type(exc).__name__,
+                )
+                return JSONResponse(
+                    {"error": "上游播放信息无效"},
+                    status_code=502,
+                )
             finally:
                 await response.aclose()
             try:
@@ -4767,8 +4926,17 @@ def create_proxy_app(
                     content=raw,
                     headers={"content-type": headers.get("content-type", "application/json")},
                 ).json()
-            except ValueError:
-                return Response(content=raw, status_code=response.status_code, headers=headers)
+            except ValueError as exc:
+                request.state.proxy_failure_stage = "upstream_playback_info"
+                logger.warning(
+                    "媒体反代 PlaybackInfo JSON 无效 instance=%s type=%s",
+                    instance_id,
+                    type(exc).__name__,
+                )
+                return JSONResponse(
+                    {"error": "上游播放信息无效"},
+                    status_code=502,
+                )
             if (
                 request.method == "POST"
                 and playback_rewrite_mode == "web"
