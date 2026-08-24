@@ -53,6 +53,8 @@ class _TreeClient:
 
 
 class _MutableTreeClient(_TreeClient):
+    supports_guarded_empty_directory_delete = True
+
     def __init__(self, tree: dict[str, list[GuangYaFile]], infos: dict[str, GuangYaFile]):
         super().__init__(tree, infos)
         self._sequence = 0

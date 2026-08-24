@@ -72,6 +72,7 @@ def _atomic_clean_client(*, credential_generation: int = 0):
     return SimpleNamespace(
         logged_in=True,
         credential_generation=credential_generation,
+        supports_guarded_empty_directory_delete=True,
         supports_atomic_empty_directory_delete=True,
         delete_empty_directory=Mock(return_value=True),
     )
@@ -286,6 +287,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
 
     def test_clean_empty_protects_nested_configured_source_roots(self):
         client = Mock()
+        client.supports_guarded_empty_directory_delete = True
 
         def list_dir(dir_id):
             if dir_id == "parent":
@@ -337,6 +339,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             updated_at=700,
         )
         client = Mock()
+        client.supports_guarded_empty_directory_delete = True
         client.supports_atomic_empty_directory_delete = True
         client.file_info.return_value = SimpleNamespace(
             is_dir=True, etag="empty-v8", updated_at=701,
@@ -378,6 +381,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             updated_at=200,
         )
         client = Mock()
+        client.supports_guarded_empty_directory_delete = True
         client.supports_atomic_empty_directory_delete = True
         client.file_info.return_value = SimpleNamespace(
             is_dir=True, etag="empty-v2", updated_at=201,
@@ -416,6 +420,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
 
     def test_clean_empty_missing_version_is_reported_and_not_deleted(self):
         client = Mock()
+        client.supports_guarded_empty_directory_delete = True
         client.list_dir.side_effect = [
             [SimpleNamespace(is_dir=True, file_id="empty", etag="", updated_at=0)],
             [],
