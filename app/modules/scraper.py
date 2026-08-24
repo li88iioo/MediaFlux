@@ -166,6 +166,15 @@ _BRACKET_SHORT_LANGUAGE_NOISE = re.compile(r"(?i)jpn")
 _BRACKET_LONG_LANGUAGE_NOISE = re.compile(r"(?i)japanese")
 
 
+@dataclass(frozen=True)
+class _SearchOutcome:
+    results: tuple[dict, ...] = ()
+    status: str = "no_result"
+    error: str = ""
+    cache_hit: bool = False
+    empty_cache_hit: bool = False
+
+
 @dataclass
 class RecognitionContext:
     """从文件名和父目录提取出的、可序列化的确定性识别上下文。"""
@@ -244,6 +253,7 @@ class CandidateScoreBreakdown:
     quarter_bonus: float = 0.0
     final_score: float = 0.0
     matched_title: str = ""
+    matched_query: str = ""
     rejected_constraints: list[str] = field(default_factory=list)
 
 
@@ -362,6 +372,17 @@ _IMPLICIT_SEASON_BRACKET_EPISODE_TOKEN = re.compile(
     r"(?![A-Za-z0-9])"
     r"(?=\s*[\[【(（]\s*\d{1,4}(?:v\d+)?\s*[\]】)）]"
     r"\s*[\[【(（])"
+)
+# ``[Yami Shibai 17][06][1080p]`` 同时存在两种合理解释：作品名
+# 可能就叫 ``Yami Shibai 17``，也可能是基础标题的第 17 季。该模式不能在
+# 纯文件名解析阶段直接定性；它只生成一个严格 TMDB 回退候选，且必须由目标
+# 季/集确实存在来证明后，才通过 ``season_override`` 影响最终整理位置。
+_AMBIGUOUS_ENCLOSED_HIGH_SEASON_EPISODE_TOKEN = re.compile(
+    r"(?ix)[\[【]"
+    r"(?P<title>[^\]】\r\n]{2,120}?)"
+    r"[ ._-]+(?P<season>20|1[0-9])\s*[\]】]\s*"
+    r"[\[【]\s*(?P<episode>\d{1,4})(?:v\d+)?\s*[\]】]"
+    r"(?=\s*[\[【])"
 )
 _IMPLICIT_SEASON_VOLUME_TOKEN = re.compile(
     r"(?ix)(?<![A-Za-z0-9])"
@@ -1912,13 +1933,131 @@ def extract_recognition_context(filename: str, parent_path: str = "") -> Recogni
     )
 
 
+def _enclosed_high_season_fallback_context(
+    context: RecognitionContext,
+) -> RecognitionContext | None:
+    """为相邻方括号高季号生成须经 TMDB 位置验证的第二解释。"""
+    if (
+        context.media_type != "tv"
+        or context.season is not None
+        or context.episode is None
+        or context.episode < 1
+    ):
+        return None
+    raw = _strip_explicit_tmdb_markers(str(context.filename or ""))
+    stem = raw.rsplit(".", 1)[0] if "." in raw else raw
+    for match in reversed(list(
+        _AMBIGUOUS_ENCLOSED_HIGH_SEASON_EPISODE_TOKEN.finditer(stem)
+    )):
+        season = int(match.group("season"))
+        episode = int(match.group("episode"))
+        if episode != context.episode:
+            continue
+        tail = stem[match.end():]
+        # 单独的语言/版本标签不足以证明这是发布方的季号语法；至少要求
+        # 一个可识别发布组前缀和编码/分辨率/来源等技术证据。
+        prefix = stem[:match.start()].strip()
+        release_prefix = _RELEASE_PREFIX.fullmatch(prefix)
+        if not release_prefix:
+            continue
+        prefix_content = _bracket_content(release_prefix.group(1))
+        title_remainder = stem[match.start():]
+        if not (
+            _is_release_prefix(prefix_content, title_remainder)
+            or _probable_unknown_release_prefix(prefix_content, title_remainder)
+        ):
+            continue
+        if not _IMPLICIT_SEASON_TECHNICAL_EVIDENCE.search(tail):
+            continue
+        title, title_cleaned = _clean_release_stem(match.group("title"))
+        title = re.sub(r"\s+", " ", title).strip(" ._-—–:：")
+        if not title or _low_information_query(title):
+            continue
+        cleaned = {
+            key: list(values) for key, values in context.cleaned_components.items()
+        }
+        cleaned["ambiguous_enclosed_season"] = [
+            f"title={title};season={season};episode={episode}"
+        ]
+        for key, values in title_cleaned.items():
+            cleaned[key] = _unique_text((*cleaned.get(key, []), *values))
+        return replace(
+            context,
+            normalized_title=title,
+            filename_title=title,
+            media_type="tv",
+            season=season,
+            episode=episode,
+            title_variants=_unique_text((title, *_split_title_variants(title))),
+            cleaned_components=cleaned,
+        )
+    return None
+
+
+_SOURCE_LOW_INFORMATION_FOLDERS_KEY = "source_low_information_folder_titles"
+
+
+def _source_low_information_folder_titles(
+    context: RecognitionContext,
+) -> list[str]:
+    filename_queries = _split_title_variants(context.filename_title)
+    if not any(not _low_information_query(query) for query in filename_queries):
+        return []
+    return [
+        query for query in _split_title_variants(context.folder_title)
+        if _low_information_query(query)
+    ]
+
+
+def _inherit_source_query_provenance(
+    context: RecognitionContext, source_context: RecognitionContext | None,
+) -> None:
+    """保留预处理前的低信息目录来源，但不把它重新加入普通查询。"""
+    if source_context is None:
+        return
+    cleaned = {
+        key: list(values) for key, values in context.cleaned_components.items()
+    }
+    weak_folders = list(
+        cleaned.get(_SOURCE_LOW_INFORMATION_FOLDERS_KEY, [])
+    )
+    weak_folders.extend(_source_low_information_folder_titles(source_context))
+    if weak_folders:
+        cleaned[_SOURCE_LOW_INFORMATION_FOLDERS_KEY] = _unique_text(weak_folders)
+    context.cleaned_components = cleaned
+
+
+def _weak_folder_title_keys(context: RecognitionContext) -> set[str]:
+    """返回不能覆盖可靠文件标题的低信息目录标题键。"""
+    folder_titles = list(
+        context.cleaned_components.get(_SOURCE_LOW_INFORMATION_FOLDERS_KEY, [])
+    )
+    folder_titles.extend(_source_low_information_folder_titles(context))
+    return {
+        _comparison_key(query) for query in folder_titles if query
+    }
+
+
 def generate_query_variants(context: RecognitionContext) -> list[str]:
-    """阶段 3：按文件标题、双标题拆分和父目录标题生成有序查询。"""
+    """阶段 3：按文件标题、双标题拆分和父目录标题生成有序查询。
+
+    ``1`` / ``Q`` 这类目录名可以在文件名本身也缺少有效标题时用于候选召回，
+    但不能在文件名已有完整标题时重新进入搜索并以精确命中覆盖文件证据。
+    """
+    weak_folder_keys = _weak_folder_title_keys(context)
+    folder_queries = [
+        query for query in _split_title_variants(context.folder_title)
+        if _comparison_key(query) not in weak_folder_keys
+    ]
+    extra_variants = [
+        query for query in context.title_variants
+        if _comparison_key(query) not in weak_folder_keys
+    ]
     return _unique_text(
         _split_title_variants(context.normalized_title)
         + _split_title_variants(context.filename_title)
-        + _split_title_variants(context.folder_title)
-        + list(context.title_variants)
+        + folder_queries
+        + extra_variants
     )[:8]
 
 
@@ -2663,6 +2802,25 @@ def score_candidate(context: RecognitionContext, candidate: dict) -> CandidateSc
         media_type_score = 0.0
         constraint_penalty = -1.0
 
+    high_information_anchors = [
+        query for query in anchor_queries if not _low_information_query(query)
+    ]
+    weak_folder_keys = _weak_folder_title_keys(context)
+    candidate_title_keys = {
+        _comparison_key(value) for value in (title, original, *aliases) if value
+    }
+    if (
+        not rejected
+        and high_information_anchors
+        and (
+            _low_information_query(matched_query)
+            or bool(weak_folder_keys.intersection(candidate_title_keys))
+        )
+        and primary_title_score < 0.9
+    ):
+        rejected.append("low_information_variant_match")
+        constraint_penalty = -0.35
+
     matched_query_key = _comparison_key(matched_query)
     if (
         not rejected
@@ -2731,6 +2889,7 @@ def score_candidate(context: RecognitionContext, candidate: dict) -> CandidateSc
         quarter_bonus=float(round(quarter_bonus, 3)),
         final_score=float(final_score),
         matched_title=matched_title,
+        matched_query=matched_query,
         rejected_constraints=rejected,
     )
 
@@ -3104,6 +3263,9 @@ class TMDBScraper:
         self.match_mode = get("TMDB_MATCH_MODE", "strict")  # strict / loose
         self._last_search_error = ""
         self._last_search_status = ""
+        self._last_search_cache_hit = False
+        self._last_search_empty_cache_hit = False
+        self._search_outcome_local = threading.local()
         self._recognition_detail_cache: dict[tuple[str, str], dict] = {}
         self._recognition_detail_failures: set[tuple[str, str]] = set()
         self._detail_cache: dict[tuple[str, str], dict] = {}
@@ -3206,70 +3368,115 @@ class TMDBScraper:
                 cache.pop(next(iter(cache)))
             cache[key] = (now, str(message or "")[:500])
 
-    def search(self, title: str, year: str, media_type: str) -> list[dict]:
+    def _publish_search_outcome(self, outcome: _SearchOutcome) -> None:
+        """发布兼容诊断字段；识别管线使用线程内 outcome，避免并发串扰。"""
+        with self._tmdb_state_lock:
+            self._last_search_status = outcome.status
+            self._last_search_error = outcome.error
+            self._last_search_cache_hit = outcome.cache_hit
+            self._last_search_empty_cache_hit = outcome.empty_cache_hit
+        self._search_outcome_local.value = outcome
+
+    def _clear_thread_search_outcome(self) -> None:
+        if hasattr(self._search_outcome_local, "value"):
+            del self._search_outcome_local.value
+
+    def _take_thread_search_outcome(self, results: list[dict]) -> _SearchOutcome:
+        outcome = getattr(self._search_outcome_local, "value", None)
+        self._clear_thread_search_outcome()
+        if isinstance(outcome, _SearchOutcome):
+            return outcome
+        # 测试或扩展代码可能替换 public search 方法；此时只能基于返回值
+        # 生成保守的调用局部结果，但绝不借用其它调用遗留的实例状态。
+        cloned = tuple(self._clone_search_results(results))
+        return _SearchOutcome(
+            results=cloned,
+            status="matched" if cloned else "no_result",
+        )
+
+    def _search_with_outcome(
+        self, title: str, year: str, media_type: str,
+    ) -> _SearchOutcome:
         normalized_type = "tv" if media_type == "tv" else "movie"
         normalized_title = " ".join(str(title or "").split()).casefold()
         normalized_year = str(year or "").strip()
         cache_key = (normalized_type, normalized_title, normalized_year)
-        cached = self._search_cache.get(cache_key)
-        if cached:
-            cached_at, cached_results = cached
-            ttl = _SEARCH_CACHE_TTL_SECONDS if cached_results else _EMPTY_SEARCH_CACHE_TTL_SECONDS
-            if time.monotonic() - cached_at <= ttl:
-                self._performance_counters["tmdb_search_cache_hits"] += 1
-                self._last_search_status = "matched" if cached_results else "no_result"
-                self._last_search_error = ""
-                return self._clone_search_results(cached_results)
-            self._search_cache.pop(cache_key, None)
+        with self._tmdb_state_lock:
+            cached = self._search_cache.get(cache_key)
+            if cached:
+                cached_at, cached_results = cached
+                ttl = (
+                    _SEARCH_CACHE_TTL_SECONDS
+                    if cached_results else _EMPTY_SEARCH_CACHE_TTL_SECONDS
+                )
+                if time.monotonic() - cached_at <= ttl:
+                    self._performance_counters["tmdb_search_cache_hits"] += 1
+                    cloned = tuple(self._clone_search_results(cached_results))
+                    return _SearchOutcome(
+                        results=cloned,
+                        status="matched" if cloned else "no_result",
+                        cache_hit=True,
+                        empty_cache_hit=not bool(cloned),
+                    )
+                self._search_cache.pop(cache_key, None)
         failed_message = self._active_tmdb_failure(
             self._search_failure_cache, cache_key
         )
         if failed_message:
-            self._last_search_status = "request_error"
-            self._last_search_error = failed_message
-            return []
+            return _SearchOutcome(status="request_error", error=failed_message)
         if self._tmdb_circuit_blocked():
-            self._last_search_status = "request_error"
-            self._last_search_error = "TMDB 服务暂时不可用，已进入短时保护"
-            return []
+            return _SearchOutcome(
+                status="request_error",
+                error="TMDB 服务暂时不可用，已进入短时保护",
+            )
 
         raw_config_error = getattr(self.client, "config_error", "")
         config_error = raw_config_error.strip() if isinstance(raw_config_error, str) else ""
         if config_error:
-            self._last_search_status = "config_error"
-            self._last_search_error = config_error
             logger.error(config_error)
-            return []
+            return _SearchOutcome(status="config_error", error=config_error)
         if not self.api_key:
-            self._last_search_status = "config_error"
-            self._last_search_error = "未配置 TMDB_API_KEY"
-            logger.error(self._last_search_error)
-            return []
+            error = "未配置 TMDB_API_KEY"
+            logger.error(error)
+            return _SearchOutcome(status="config_error", error=error)
         try:
-            self._performance_counters["tmdb_search_requests"] += 1
+            with self._tmdb_state_lock:
+                self._performance_counters["tmdb_search_requests"] += 1
             results = self._clone_search_results(
                 self.client.search(title, year, normalized_type)
             )
-            self._last_search_status = "matched" if results else "no_result"
-            self._last_search_error = ""
             self._record_tmdb_success()
-            if cache_key not in self._search_cache and len(self._search_cache) >= _SEARCH_CACHE_LIMIT:
-                self._search_cache.pop(next(iter(self._search_cache)))
-            self._search_cache[cache_key] = (time.monotonic(), self._clone_search_results(results))
-            return results
+            with self._tmdb_state_lock:
+                if (
+                    cache_key not in self._search_cache
+                    and len(self._search_cache) >= _SEARCH_CACHE_LIMIT
+                ):
+                    self._search_cache.pop(next(iter(self._search_cache)))
+                self._search_cache[cache_key] = (
+                    time.monotonic(), self._clone_search_results(results),
+                )
+            cloned = tuple(self._clone_search_results(results))
+            return _SearchOutcome(
+                results=cloned,
+                status="matched" if cloned else "no_result",
+            )
         except Exception as e:
-            self._last_search_status = "request_error"
-            self._last_search_error = redact_sensitive_text(f"TMDB 请求失败：{e}")[:500]
+            error = redact_sensitive_text(f"TMDB 请求失败：{e}")[:500]
             if self._transient_tmdb_error(e):
                 self._remember_tmdb_failure(
-                    self._search_failure_cache, cache_key, self._last_search_error
+                    self._search_failure_cache, cache_key, error
                 )
                 self._record_tmdb_failure(e)
             logger.error(
                 "TMDB 搜索失败 [%s] [%s] [%s]: %s",
                 redact_sensitive_text(title), year, media_type, redact_sensitive_text(e),
             )
-            return []
+            return _SearchOutcome(status="request_error", error=error)
+
+    def search(self, title: str, year: str, media_type: str) -> list[dict]:
+        outcome = self._search_with_outcome(title, year, media_type)
+        self._publish_search_outcome(outcome)
+        return self._clone_search_results(list(outcome.results))
 
     @staticmethod
     def _remember_detail(
@@ -4427,6 +4634,7 @@ class TMDBScraper:
         search_only_queries: list[str] = []
         search_only_variant_used = False
         type_mismatch_seen = False
+        search_attempts: list[dict[str, object]] = []
 
         def collect(
             year: str,
@@ -4437,7 +4645,20 @@ class TMDBScraper:
             nonlocal type_mismatch_seen
             requested_type = str(context.media_type or "").strip().lower()
             for query in list(query_pool or queries):
-                for candidate in self.search(query, year, context.media_type):
+                self._clear_thread_search_outcome()
+                results = self.search(query, year, context.media_type)
+                outcome = self._take_thread_search_outcome(results)
+                search_attempts.append({
+                    "query": str(query or ""),
+                    "year": str(year or ""),
+                    "status": outcome.status,
+                    "error": outcome.error,
+                    "cache_hit": outcome.cache_hit,
+                    "empty_cache_hit": outcome.empty_cache_hit,
+                    "search_only": bool(search_only),
+                    "result_count": len(outcome.results),
+                })
+                for candidate in results:
                     tmdb_id = str(candidate.get("id") or "").strip()
                     reported_type = str(candidate.get("media_type") or "").strip().lower()
                     # 类型专用搜索端点可能省略 media_type；此时应继承请求上下文，
@@ -4470,17 +4691,27 @@ class TMDBScraper:
                 search_only_variant_used = bool(raw_candidates)
 
         if not raw_candidates:
-            if type_mismatch_seen and self._last_search_status == "matched":
+            failed_attempt = next((
+                item for item in search_attempts
+                if item.get("status") in {"config_error", "request_error"}
+            ), None)
+            if failed_attempt is not None:
+                status = str(failed_attempt.get("status") or "request_error")
+                error = str(failed_attempt.get("error") or "TMDB 搜索失败")
+            elif type_mismatch_seen and any(
+                item.get("status") == "matched" for item in search_attempts
+            ):
                 error = "TMDB 搜索结果媒体类型与请求不一致"
                 status = "no_result"
             else:
-                error = self._last_search_error or "TMDB 无搜索结果"
-                status = self._last_search_status or "no_result"
+                error = "TMDB 无搜索结果"
+                status = "no_result"
             return RecognitionResult(
                 media_type=context.media_type, need_confirm=True, error=error,
                 status=status, matched_by=matched_by, threshold=threshold,
                 context=context, query_variants=queries,
                 threshold_decision=decide_threshold(0.0, threshold),
+                metadata={"search_attempts": [dict(item) for item in search_attempts]},
             )
 
         initial_scores = [
@@ -4712,6 +4943,18 @@ class TMDBScraper:
                     {"target_season_year_evidence": selected_season_year_evidence}
                     if selected_season_year_evidence is not None else {}
                 ),
+                "recognition_evidence": {
+                    "matched_query": str(
+                        best.score_breakdown.matched_query
+                        if best.score_breakdown else ""
+                    ),
+                    "matched_title": str(
+                        best.score_breakdown.matched_title
+                        if best.score_breakdown else ""
+                    ),
+                    "filename_title": str(context.filename_title or ""),
+                    "folder_title": str(context.folder_title or ""),
+                },
             },
         )
         proof_precheck = _verified_automatic_identity_precheck(
@@ -4846,9 +5089,13 @@ class TMDBScraper:
                     result.year or expected_year, result.media_type,
                     parent_path=context.parent_path,
                 )
+            matched_query = (
+                best.score_breakdown.matched_query if best.score_breakdown else ""
+            )
             logger.info(
                 f"  ✓ {matched_by} 匹配: {result.title} ({result.year}) "
-                f"tmdb={result.tmdb_id} conf={result.confidence:.2f}"
+                f"tmdb={result.tmdb_id} conf={result.confidence:.2f} "
+                f"query={matched_query!r}"
             )
         else:
             result.status = "low_confidence"
@@ -4856,6 +5103,8 @@ class TMDBScraper:
             result.need_confirm = True
             if decision.get("reason") == "low_information_title":
                 result.error = "标题信息量不足，候选结果需要人工确认"
+            elif decision.get("reason") == "low_information_variant_match":
+                result.error = "候选仅命中低信息目录或标题变体，无法证明与文件主标题一致，需要人工确认"
             elif decision.get("reason") == "ambiguous_romaji_alias":
                 result.error = "同一罗马字/拉丁别名命中多个 TMDB 条目，需要人工确认"
             elif decision.get("reason") == "ambiguous_near_tie":
@@ -4873,23 +5122,100 @@ class TMDBScraper:
                     f"匹配置信度 {result.confidence:.0%} 低于"
                     f"{'严格' if effective_match_mode == 'strict' else '宽松'}模式阈值 {threshold:.0%}"
                 )
+            matched_query = (
+                best.score_breakdown.matched_query if best.score_breakdown else ""
+            )
             logger.info(
                 f"  ⚠ 确定性需确认 score={result.confidence:.2f} "
-                f"reason={decision.get('reason')} title={result.title}"
+                f"reason={decision.get('reason')} title={result.title} "
+                f"query={matched_query!r}"
             )
         return result
 
     def deterministic_recognize(
-        self, filename: str, parent_path: str = "", *, media_type_hint: str = ""
+        self,
+        filename: str,
+        parent_path: str = "",
+        *,
+        media_type_hint: str = "",
+        source_context: RecognitionContext | None = None,
     ) -> RecognitionResult:
-        """执行不含 AI 的确定性 TMDB 搜索、评分与阈值决策。"""
+        """执行不含 AI 的确定性 TMDB 搜索、评分与阈值决策。
+
+        ``source_context`` 只保留管理员预处理前的目录来源；标题替换可以
+        改善搜索召回，但不能重新让低信息根目录覆盖完整文件标题。
+        """
         context = extract_recognition_context(filename, parent_path)
+        _inherit_source_query_provenance(context, source_context)
         hint = str(media_type_hint or "").strip().lower()
         if hint in {"movie", "tv"}:
             context.media_type = hint
-        return self._recognize_context(
+        primary = self._recognize_context(
             context, filename, allow_lock=False, matched_by="search"
         )
+        if primary.status != "no_result" or context.media_type != "tv":
+            return primary
+        primary_attempts = list((primary.metadata or {}).get("search_attempts") or [])
+        exact_title_key = _comparison_key(context.normalized_title)
+        exact_title_fresh_empty = any(
+            _comparison_key(str(item.get("query") or "")) == exact_title_key
+            and str(item.get("year") or "") == ""
+            and item.get("status") == "no_result"
+            and not bool(item.get("cache_hit"))
+            and not bool(item.get("empty_cache_hit"))
+            for item in primary_attempts
+            if isinstance(item, dict)
+        )
+        primary_query_failed = any(
+            item.get("status") in {"config_error", "request_error"}
+            for item in primary_attempts
+            if isinstance(item, dict)
+        )
+        if not exact_title_fresh_empty or primary_query_failed:
+            primary.metadata = {
+                **dict(primary.metadata or {}),
+                "implicit_season_fallback_skipped": "primary_title_unverified",
+            }
+            return primary
+
+        fallback_context = _enclosed_high_season_fallback_context(context)
+        if fallback_context is None:
+            return primary
+        fallback = self._recognize_context(
+            fallback_context,
+            filename,
+            allow_lock=False,
+            matched_by="implicit_season_fallback",
+            match_mode="strict",
+        )
+        # 完整数字标题是第一解释；基础标题不仅要严格匹配和通过季集校验，
+        # 还必须在多个同别名 TMDB 候选中由目标位置唯一消歧。单一基础标题
+        # 即使恰好存在 S17E06，也不足以证明 ``Room 17`` 不是正式数字片名。
+        position_resolution = dict(
+            (fallback.metadata or {}).get("alias_position_resolution") or {}
+        )
+        if (
+            fallback.status != "matched"
+            or fallback.need_confirm
+            or not fallback.tmdb_id
+            or str(position_resolution.get("selected_tmdb_id") or "")
+            != str(fallback.tmdb_id)
+            or int(position_resolution.get("candidate_count") or 0) < 2
+            or not list(position_resolution.get("excluded") or [])
+        ):
+            return primary
+        fallback.season_override = fallback_context.season
+        fallback.metadata = {
+            **dict(fallback.metadata or {}),
+            "implicit_season_fallback": {
+                "source_title": context.normalized_title,
+                "fallback_title": fallback_context.normalized_title,
+                "season": fallback_context.season,
+                "episode": fallback_context.episode,
+                "primary_status": primary.status,
+            },
+        }
+        return fallback
 
     def _external_hint_fallback(
         self,
@@ -4937,7 +5263,10 @@ class TMDBScraper:
             titles = _unique_text((card.title, card.original_title))
             if not titles:
                 continue
-            source_verified, _, _, _, _ = _verify_source_title_anchor(
+            (
+                source_verified, source_score, matched_source,
+                matched_hint_title, _,
+            ) = _verify_source_title_anchor(
                 approval_anchors,
                 titles,
                 season=context.season,
@@ -4991,17 +5320,38 @@ class TMDBScraper:
                 and second.confidence >= 0.9
                 and source_related
             ):
+                existing_metadata = dict(second.metadata or {})
+                tmdb_evidence = dict(
+                    existing_metadata.get("recognition_evidence") or {}
+                )
                 second.metadata = {
-                    **dict(second.metadata or {}),
+                    **existing_metadata,
                     "recognition_evidence": {
+                        **tmdb_evidence,
                         "kind": "external_title_hint",
                         "provider": str(card.provider or ""),
                         "external_id": str(card.external_id or ""),
                         "hint_title": str(card.title or ""),
                         "hint_year": str(card.year or ""),
                         "source_anchor_verified": True,
+                        "source": {
+                            "filename_title": str(context.filename_title or ""),
+                            "folder_title": str(context.folder_title or ""),
+                            "approved_anchor": str(matched_source or ""),
+                            "matched_hint_title": str(matched_hint_title or ""),
+                            "anchor_score": float(round(source_score, 3)),
+                        },
                         "tmdb_revalidated": True,
                         "tmdb_id": str(second.tmdb_id or ""),
+                        "tmdb": {
+                            "id": str(second.tmdb_id or ""),
+                            "matched_query": str(
+                                tmdb_evidence.get("matched_query") or ""
+                            ),
+                            "matched_title": str(
+                                tmdb_evidence.get("matched_title") or ""
+                            ),
+                        },
                     },
                 }
                 logger.info(
@@ -6423,15 +6773,29 @@ class TMDBScraper:
 
         deterministic = (
             self.deterministic_recognize(
-                processed.filename, processed.parent_path, media_type_hint=hint
+                processed.filename, processed.parent_path,
+                media_type_hint=hint, source_context=raw_context,
             )
             if hint
-            else self.deterministic_recognize(processed.filename, processed.parent_path)
+            else self.deterministic_recognize(
+                processed.filename, processed.parent_path,
+                source_context=raw_context,
+            )
         )
         if deterministic.context is not None:
-            deterministic.context.season = processed.season
-            deterministic.context.episode = processed.episode
-            if processed.season is not None or processed.episode is not None:
+            verified_implicit_season = bool(
+                deterministic.matched_by == "implicit_season_fallback"
+                and deterministic.season_override is not None
+                and (deterministic.metadata or {}).get("implicit_season_fallback")
+            )
+            if not verified_implicit_season:
+                deterministic.context.season = processed.season
+                deterministic.context.episode = processed.episode
+            if (
+                verified_implicit_season
+                or processed.season is not None
+                or processed.episode is not None
+            ):
                 deterministic.context.media_type = "tv"
         if (
             deterministic.status == "matched"

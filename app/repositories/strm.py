@@ -643,9 +643,13 @@ _ACTIVE_STATES = ("queued", "running", "dirty")
 _MAX_QUEUED_CHANGES = 5000
 
 
-def _future_stamp(delay_seconds: int) -> str:
+def _future_stamp(delay_seconds: float) -> str:
+    try:
+        delay = max(0.0, float(delay_seconds or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        delay = 0.0
     return (
-        datetime.now() + timedelta(seconds=max(0, int(delay_seconds or 0)))
+        datetime.now() + timedelta(seconds=delay)
     ).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -702,18 +706,33 @@ def group_changes_by_target(changes: object) -> dict[tuple[str, str], list[dict[
 
 def enqueue_strm_change_targets(
     changes: object, *, provider: str = DEFAULT_STRM_PROVIDER,
+    not_before_seconds: float | None = 0.0,
 ) -> int:
-    """登记变化目标目录；同步进行中的目标转入 dirty，不丢事件。"""
+    """登记变化目标目录；同步进行中的目标转入 dirty，不丢事件。
+
+    ``not_before_seconds`` 用于把整理静默窗口持久化到队列：
+    - 数值：从现在起重新设置最早领取时间；
+    - ``None``：合并变化但保留已有最早领取时间。
+    """
     grouped = group_changes_by_target(changes)
     if not grouped:
         return 0
     database = _database()
     stamp = database.now()
+    if not_before_seconds is None:
+        next_attempt_at = None
+    else:
+        try:
+            delay = max(0.0, float(not_before_seconds or 0.0))
+        except (TypeError, ValueError, OverflowError):
+            delay = 0.0
+        next_attempt_at = _future_stamp(delay)
     written = 0
     with database.get_conn() as conn:
         for (source_id, rel_dir), items in grouped.items():
             row = conn.execute(
-                "SELECT id,state,pending_changes_json FROM strm_change_queue "
+                "SELECT id,state,pending_changes_json,next_attempt_at "
+                "FROM strm_change_queue "
                 "WHERE provider=? AND source_id=? AND rel_dir=?",
                 (provider, source_id, rel_dir),
             ).fetchone()
@@ -728,23 +747,61 @@ def enqueue_strm_change_targets(
                     "INSERT INTO strm_change_queue(provider,source_id,rel_dir,state,"
                     "pending_changes_json,created_at,updated_at,next_attempt_at) "
                     "VALUES(?,?,?,'queued',?,?,?,?)",
-                    (provider, source_id, rel_dir, payload, stamp, stamp, stamp),
+                    (
+                        provider, source_id, rel_dir, payload, stamp, stamp,
+                        next_attempt_at or stamp,
+                    ),
                 )
             elif str(row["state"]) in {"running", "dirty"}:
-                conn.execute(
-                    "UPDATE strm_change_queue SET state='dirty',dirty=1,"
-                    "pending_changes_json=?,updated_at=? WHERE id=?",
-                    (payload, stamp, int(row["id"])),
-                )
+                if next_attempt_at is None:
+                    conn.execute(
+                        "UPDATE strm_change_queue SET state='dirty',dirty=1,"
+                        "pending_changes_json=?,updated_at=? WHERE id=?",
+                        (payload, stamp, int(row["id"])),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE strm_change_queue SET state='dirty',dirty=1,"
+                        "pending_changes_json=?,updated_at=?,next_attempt_at=? WHERE id=?",
+                        (payload, stamp, next_attempt_at, int(row["id"])),
+                    )
             else:
+                resolved_next_attempt = (
+                    str(row["next_attempt_at"] or stamp)
+                    if next_attempt_at is None else next_attempt_at
+                )
                 conn.execute(
                     "UPDATE strm_change_queue SET state='queued',dirty=0,attempts=0,"
                     "last_error='',pending_changes_json=?,updated_at=?,next_attempt_at=? "
                     "WHERE id=?",
-                    (payload, stamp, stamp, int(row["id"])),
+                    (payload, stamp, resolved_next_attempt, int(row["id"])),
                 )
             written += 1
     return written
+
+
+def reschedule_strm_change_targets(
+    changes: object, *, not_before_seconds: float,
+    provider: str = DEFAULT_STRM_PROVIDER,
+) -> int:
+    """把同一内存合并批次的全部目标统一到新的最早领取时间。"""
+    grouped = group_changes_by_target(changes)
+    if not grouped:
+        return 0
+    database = _database()
+    stamp = database.now()
+    next_attempt_at = _future_stamp(not_before_seconds)
+    updated = 0
+    with database.get_conn() as conn:
+        for source_id, rel_dir in grouped:
+            cur = conn.execute(
+                "UPDATE strm_change_queue SET next_attempt_at=?,updated_at=? "
+                "WHERE provider=? AND source_id=? AND rel_dir=? "
+                "AND state IN ('queued','dirty')",
+                (next_attempt_at, stamp, provider, source_id, rel_dir),
+            )
+            updated += int(cur.rowcount or 0)
+    return updated
 
 
 def claim_strm_change_targets(
@@ -845,7 +902,7 @@ def complete_strm_change_target(
     with database.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT state,pending_changes_json FROM strm_change_queue "
+            "SELECT state,pending_changes_json,next_attempt_at FROM strm_change_queue "
             "WHERE id=? AND state IN ('running','dirty') AND lease_owner=? "
             "AND lease_generation=?",
             (int(target_id), str(expected_owner or ""), int(expected_lease_generation)),
@@ -856,13 +913,16 @@ def complete_strm_change_target(
             _load_changes(row["pending_changes_json"])
         )
         state = "queued" if requeue else "completed"
+        next_attempt_at = (
+            max(stamp, str(row["next_attempt_at"] or stamp)) if requeue else stamp
+        )
         cur = conn.execute(
             "UPDATE strm_change_queue SET state=?,dirty=0,attempts=0,last_error='',"
             "version=version+1,inflight_changes_json='[]',lease_owner='',lease_until=0,"
             "updated_at=?,next_attempt_at=? WHERE id=? AND state IN ('running','dirty') "
             "AND lease_owner=? AND lease_generation=?",
             (
-                state, stamp, stamp, int(target_id), str(expected_owner or ""),
+                state, stamp, next_attempt_at, int(target_id), str(expected_owner or ""),
                 int(expected_lease_generation),
             ),
         )
@@ -1007,6 +1067,38 @@ def count_due_strm_change_targets(*, provider: str = DEFAULT_STRM_PROVIDER) -> i
             (provider, stamp),
         ).fetchone()
         return int(row["total"] or 0) if row else 0
+
+
+def seconds_until_next_strm_change_target(
+    *, provider: str = DEFAULT_STRM_PROVIDER,
+) -> float | None:
+    """返回下一条变化目标距可领取/可恢复的秒数；无活动目标返回 ``None``。"""
+    with _database().get_conn() as conn:
+        queued_row = conn.execute(
+            "SELECT MIN(next_attempt_at) AS next_attempt_at FROM strm_change_queue "
+            "WHERE provider=? AND state='queued'",
+            (provider,),
+        ).fetchone()
+        leased_row = conn.execute(
+            "SELECT MIN(lease_until) AS lease_until FROM strm_change_queue "
+            "WHERE provider=? AND state IN ('running','dirty')",
+            (provider,),
+        ).fetchone()
+    delays: list[float] = []
+    raw = (
+        str(queued_row["next_attempt_at"] or "").strip()
+        if queued_row else ""
+    )
+    if raw:
+        try:
+            due_at = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+            delays.append(max(0.0, (due_at - datetime.now()).total_seconds()))
+        except ValueError:
+            delays.append(0.0)
+    lease_until = float(leased_row["lease_until"] or 0.0) if leased_row else 0.0
+    if lease_until > 0:
+        delays.append(max(0.0, lease_until - time.time()))
+    return min(delays) if delays else None
 
 
 def list_strm_change_queue(

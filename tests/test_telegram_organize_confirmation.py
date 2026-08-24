@@ -703,6 +703,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             )
         )
         calls = []
+        post_action_kwargs = []
 
         class FakeOrganizer:
             def __init__(self, **_kwargs):
@@ -721,8 +722,9 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 calls.append("notified")
 
             @staticmethod
-            def trigger_post_actions(*_args, **_kwargs):
+            def trigger_post_actions(*_args, **kwargs):
                 calls.append("post_actions")
+                post_action_kwargs.append(dict(kwargs))
 
         current_file = GuangYaFile(
             "file-4", "Nagatoro - 04.mp4", False, size=104,
@@ -762,6 +764,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         ), patch(
             "app.modules.organize_confirmations.Organizer", FakeOrganizer
         ), patch(
+            "app.modules.organize_confirmations.get", return_value="8"
+        ), patch(
             "app.modules.organize_confirmations.edit_event", return_value=True
         ) as edit_mock:
             result = callbacks[0]()
@@ -772,6 +776,9 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         )
         self.assertIn("notified", calls)
         self.assertIn("post_actions", calls)
+        self.assertEqual(len(post_action_kwargs), 1)
+        self.assertFalse(post_action_kwargs[0]["notify_result"])
+        self.assertEqual(post_action_kwargs[0]["strm_debounce_seconds"], 8)
         self.assertEqual(len(confirmation_calls), 1)
         args, kwargs = confirmation_calls[0]
         self.assertEqual(args[:5], (

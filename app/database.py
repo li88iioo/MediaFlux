@@ -3088,6 +3088,8 @@ from app.repositories.strm import (  # noqa: E402
     merge_strm_changes,
     recover_stale_strm_metadata_jobs,
     recover_stale_strm_change_targets,
+    reschedule_strm_change_targets,
+    seconds_until_next_strm_change_target,
     renew_strm_change_target_leases,
     renew_strm_metadata_job_lease,
     requeue_strm_metadata_jobs,

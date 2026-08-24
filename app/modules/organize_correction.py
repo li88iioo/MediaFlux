@@ -6,10 +6,11 @@ OrganizeTaskManager 的统一写锁异步执行。历史或损坏快照只读展
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import asdict, dataclass
 
-from app import database as db
+from app import config, database as db
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.logger import get_logger
 from app.modules.organize import OrganizeRules, Organizer, enforce_fixed_organize_rules
@@ -17,6 +18,7 @@ from app.modules.organize_delete_audit import (
     DeleteCandidate, execute_recycle_bin_delete, record_blocked_delete,
 )
 from app.modules.organize_postprocess import companion_target_name, normalize_media_number
+from app.modules.organize_sources import normalize_organize_sources
 from app.modules.scraper import Candidate, MatchResult, TMDBScraper
 
 logger = get_logger(__name__)
@@ -377,6 +379,8 @@ class OrganizeCorrectionService:
             "match": {
                 "tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
                 "media_type": match.media_type,
+                "provider": Organizer._match_provider(match),
+                "external_id": Organizer._match_external_id(match),
             },
             "target_root_id": rules.target_dir_id,
             "target_path": target_path,
@@ -599,6 +603,373 @@ class OrganizeCorrectionService:
             for row in db.list_organize_log_items(log_id)
         ) else default
 
+    @staticmethod
+    def _return_cleanup_protected_ids(
+        items: list[CorrectionItem], rules: OrganizeRules,
+    ) -> tuple[set[str], str]:
+        """返回送回源目录时绝不能删除的永久根目录。"""
+        protected = {
+            "0",
+            str(rules.target_dir_id or "").strip(),
+            *(str(item.original_parent_id or "").strip() for item in items),
+        }
+        sources, error = normalize_organize_sources(
+            config.get("GY_ORGANIZE_SOURCE_DIRS", "")
+        )
+        protected.update(str(item.get("id") or "").strip() for item in sources)
+        protected.discard("")
+        return protected, error
+
+    @staticmethod
+    def _directory_belongs_to_target_root(
+        directory: GuangYaFile,
+        *,
+        target_root_id: str,
+        forbidden_ancestor_ids: set[str],
+        read_directory,
+    ) -> bool:
+        """只接受祖先链仍明确到达目标根且未进入来源/保护子树的目录。"""
+        normalized_target = str(target_root_id or "").strip()
+        if not normalized_target:
+            return False
+        current_id = str(directory.file_id or "").strip()
+        ancestor_id = str(directory.parent_id or "").strip()
+        visited = {current_id}
+        for _ in range(32):
+            if ancestor_id in forbidden_ancestor_ids:
+                return False
+            if ancestor_id == normalized_target:
+                return True
+            if not ancestor_id or ancestor_id in visited:
+                return False
+            visited.add(ancestor_id)
+            ancestor = read_directory(ancestor_id)
+            if (
+                ancestor is None
+                or not bool(getattr(ancestor, "is_dir", False))
+                or str(getattr(ancestor, "file_id", "") or "") != ancestor_id
+            ):
+                return False
+            next_parent = str(getattr(ancestor, "parent_id", "") or "").strip()
+            if not next_parent or next_parent == ancestor_id:
+                return False
+            ancestor_id = next_parent
+        return False
+
+    def _capture_return_cleanup_directories(
+        self,
+        *,
+        detail: dict,
+        items: list[CorrectionItem],
+        rules: OrganizeRules,
+    ) -> tuple[list[GuangYaFile], set[str], list[str]]:
+        """在移动前记录本日志精确命中的目标叶目录及媒体根。
+
+        只沿日志 ``new_path`` 能证明的媒体层级向上读取，最多清理
+        ``Season N`` 和它的媒体根；分类、地区、年份和归档根永不进入候选。
+        """
+        protected, config_error = self._return_cleanup_protected_ids(items, rules)
+        if config_error:
+            return [], protected, [
+                "整理源目录配置异常，已跳过目标空目录清理以保证安全"
+            ]
+
+        raw_path = str(detail.get("new_path") or "").replace("\\", "/")
+        path_parts = [part.strip() for part in raw_path.split("/") if part.strip()]
+        directory_parts = path_parts[:-1]
+        if not directory_parts:
+            return [], protected, []
+
+        leaf_name = directory_parts[-1]
+        has_season_layer = bool(
+            str(detail.get("media_type") or "") == "tv"
+            and (
+                detail.get("season") is not None
+                or leaf_name.casefold() == "specials"
+                or re.fullmatch(r"(?i)season\s+\d+", leaf_name)
+            )
+        )
+        media_root_index = -2 if has_season_layer else -1
+        if len(directory_parts) < abs(media_root_index):
+            return [], protected, [
+                "整理目标路径缺少可验证的媒体目录层级，空目录已安全保留"
+            ]
+        media_root_name = directory_parts[media_root_index]
+        identity_marker = Organizer._identity_marker(media_root_name)
+        tmdb_id = str(detail.get("tmdb_id") or "").strip()
+        provider = str(detail.get("provider") or "").strip().lower()
+        external_id = str(detail.get("external_id") or "").strip()
+        if not provider and tmdb_id:
+            provider = "tmdb"
+        if not external_id:
+            external_id = tmdb_id
+        expected_marker = Organizer._match_identity_tag(MatchResult(
+            tmdb_id=tmdb_id,
+            provider=provider,
+            external_id=external_id,
+        )).casefold()
+        if (
+            not expected_marker
+            or not identity_marker
+            or identity_marker != expected_marker
+        ):
+            return [], protected, [
+                "整理目标路径缺少匹配的媒体身份标识，空目录已安全保留"
+            ]
+        cleanup_levels = min(len(directory_parts), 2 if has_season_layer else 1)
+        file_info = getattr(self.client, "file_info", None)
+        if not callable(file_info):
+            return [], protected, [
+                "云盘接口无法核验整理目标目录，已安全保留空目录"
+            ]
+        target_root_id = str(rules.target_dir_id or "").strip()
+        if not target_root_id:
+            return [], protected, [
+                "整理目标根目录配置为空，已安全保留空目录"
+            ]
+
+        snapshot_cache: dict[str, GuangYaFile] = {}
+
+        def read_directory(directory_id: str) -> GuangYaFile | None:
+            cached = snapshot_cache.get(directory_id)
+            if cached is not None:
+                return cached
+            current = file_info(directory_id)
+            if (
+                current is None
+                or not bool(getattr(current, "is_dir", False))
+                or str(getattr(current, "file_id", "") or "") != directory_id
+            ):
+                return None
+            snapshot_cache[directory_id] = current
+            return current
+
+        ancestry_cache: dict[str, bool] = {}
+        forbidden_ancestor_ids = protected - {target_root_id}
+
+        def belongs_to_target_root(media_root: GuangYaFile) -> bool:
+            media_root_id = str(media_root.file_id or "").strip()
+            if media_root_id not in ancestry_cache:
+                ancestry_cache[media_root_id] = self._directory_belongs_to_target_root(
+                    media_root,
+                    target_root_id=target_root_id,
+                    forbidden_ancestor_ids=forbidden_ancestor_ids,
+                    read_directory=read_directory,
+                )
+            return ancestry_cache[media_root_id]
+
+        captured: list[GuangYaFile] = []
+        seen: set[str] = set()
+        warnings: list[str] = []
+        target_parent_ids = list(dict.fromkeys(
+            str(item.current_parent_id or "").strip() for item in items
+            if str(item.current_parent_id or "").strip()
+        ))
+        for leaf_id in target_parent_ids:
+            current_id = leaf_id
+            branch: list[GuangYaFile] = []
+            for level in range(cleanup_levels):
+                if not current_id or current_id in protected:
+                    break
+                expected_name = directory_parts[-1 - level]
+                try:
+                    current = read_directory(current_id)
+                except Exception as exc:
+                    logger.warning(
+                        "送回源目录前读取目标目录失败 level=%s type=%s",
+                        level, type(exc).__name__,
+                    )
+                    warnings.append("无法核验部分整理目标目录，已安全保留")
+                    break
+                if current is None or str(current.name or "") != expected_name:
+                    warnings.append("整理目标目录与日志快照不一致，已安全保留")
+                    break
+                branch.append(current)
+                next_parent = str(current.parent_id or "").strip()
+                if not next_parent or next_parent == current_id:
+                    break
+                current_id = next_parent
+            if len(branch) != cleanup_levels:
+                continue
+            if not belongs_to_target_root(branch[-1]):
+                warnings.append("整理目标目录不属于当前整理目标根，已安全保留")
+                continue
+            for current in branch:
+                directory_id = str(current.file_id or "").strip()
+                if directory_id in seen:
+                    continue
+                captured.append(current)
+                seen.add(directory_id)
+        return captured, protected, list(dict.fromkeys(warnings))
+
+    def _cleanup_return_target_directories(
+        self,
+        *,
+        log_id: int,
+        directories: list[GuangYaFile],
+        protected: set[str],
+        target_root_id: str,
+    ) -> tuple[int, list[str]]:
+        """文件全部送回后，自底向上安全回收本日志留下的目标空目录。"""
+        if not directories:
+            return 0, []
+        delete_empty = getattr(self.client, "delete_empty_directory", None)
+        guarded_capability = getattr(
+            self.client, "supports_guarded_empty_directory_delete", None
+        )
+        if guarded_capability is None:
+            guarded_capability = getattr(
+                self.client, "supports_atomic_empty_directory_delete", None
+            )
+        if not callable(delete_empty) or guarded_capability is not True:
+            audit_failed = False
+            for snapshot in directories:
+                directory_id = str(snapshot.file_id or "").strip()
+                if not directory_id or directory_id in protected:
+                    continue
+                try:
+                    record_blocked_delete(
+                        trigger="return_to_source_empty_dir_cleanup",
+                        reason="当前 Provider 不支持带版本与空目录复核的回收站删除",
+                        candidate=DeleteCandidate(
+                            file_id=directory_id,
+                            name=str(snapshot.name or "整理目标空目录"),
+                            parent_id=str(snapshot.parent_id or ""),
+                            gcid=str(snapshot.etag or ""),
+                        ),
+                        organize_log_id=log_id,
+                    )
+                except Exception as exc:
+                    audit_failed = True
+                    logger.warning(
+                        "记录送回空目录保留审计失败 type=%s",
+                        type(exc).__name__,
+                    )
+            warnings = [
+                "当前云盘接口不支持安全的空目录回收站清理，整理目标目录已保留"
+            ]
+            if audit_failed:
+                warnings.append("目标空目录保留审计写入失败，请查看服务日志")
+            return 0, warnings
+
+        # 同一媒体目录可能同时包含本日志留下的多个季目录。先按候选链深度
+        # 删除所有叶目录，再重新检查媒体根，避免根目录因过早检查而残留。
+        unique_directories: list[GuangYaFile] = []
+        directory_by_id: dict[str, GuangYaFile] = {}
+        for snapshot in directories:
+            directory_id = str(snapshot.file_id or "").strip()
+            if not directory_id or directory_id in directory_by_id:
+                continue
+            directory_by_id[directory_id] = snapshot
+            unique_directories.append(snapshot)
+
+        def candidate_depth(snapshot: GuangYaFile) -> int:
+            depth = 0
+            seen_ids = {str(snapshot.file_id or "").strip()}
+            parent_id = str(snapshot.parent_id or "").strip()
+            while parent_id in directory_by_id and parent_id not in seen_ids:
+                depth += 1
+                seen_ids.add(parent_id)
+                parent_id = str(
+                    directory_by_id[parent_id].parent_id or ""
+                ).strip()
+            return depth
+
+        ordered_directories = [
+            snapshot for _, snapshot in sorted(
+                enumerate(unique_directories),
+                key=lambda pair: (-candidate_depth(pair[1]), pair[0]),
+            )
+        ]
+        atomic_capability = getattr(
+            self.client, "supports_atomic_empty_directory_delete", None
+        )
+        cleanup_strategy = (
+            "Provider 原子校验后移入回收站"
+            if atomic_capability is True
+            else "双重版本与空目录复核后移入回收站"
+        )
+
+        cleaned = 0
+        warnings: list[str] = []
+        for snapshot in ordered_directories:
+            directory_id = str(snapshot.file_id or "").strip()
+            if not directory_id or directory_id in protected:
+                continue
+            try:
+                if self.client.list_dir(directory_id):
+                    record_blocked_delete(
+                        trigger="return_to_source_empty_dir_cleanup",
+                        reason="目录仍含其他内容，已保留",
+                        candidate=DeleteCandidate(
+                            file_id=directory_id,
+                            name=str(snapshot.name or "整理目标目录"),
+                            parent_id=str(snapshot.parent_id or ""),
+                            gcid=str(snapshot.etag or ""),
+                        ),
+                        organize_log_id=log_id,
+                    )
+                    warnings.append("部分整理目标目录仍含其他内容，已保留")
+                    continue
+                current = self.client.file_info(directory_id)
+                if (
+                    current is None
+                    or not bool(getattr(current, "is_dir", False))
+                    or str(getattr(current, "file_id", "") or "") != directory_id
+                    or str(getattr(current, "name", "") or "") != str(snapshot.name or "")
+                    or str(getattr(current, "parent_id", "") or "")
+                    != str(snapshot.parent_id or "")
+                ):
+                    raise RuntimeError("目录身份或位置已变化")
+                expected_etag = str(getattr(current, "etag", "") or "")
+                try:
+                    expected_updated_at = max(
+                        0, int(getattr(current, "updated_at", 0) or 0)
+                    )
+                except (TypeError, ValueError):
+                    expected_updated_at = 0
+                if not expected_etag and expected_updated_at <= 0:
+                    raise RuntimeError("目录缺少可验证版本")
+                normalized_target_root = str(target_root_id or "").strip()
+                if not self._directory_belongs_to_target_root(
+                    current,
+                    target_root_id=normalized_target_root,
+                    forbidden_ancestor_ids=protected - {normalized_target_root},
+                    read_directory=self.client.file_info,
+                ):
+                    raise RuntimeError("目录已不属于当前整理目标根")
+                execute_recycle_bin_delete(
+                    self.client,
+                    trigger="return_to_source_empty_dir_cleanup",
+                    reason=(
+                        "送回源目录成功后清理本日志留下的整理目标空目录；"
+                        f"{cleanup_strategy}"
+                    ),
+                    candidate=DeleteCandidate(
+                        file_id=directory_id,
+                        name=str(current.name or "整理目标空目录"),
+                        parent_id=str(current.parent_id or ""),
+                        gcid=expected_etag,
+                    ),
+                    organize_log_id=log_id,
+                    safe_failure_message="目标目录状态已变化，已安全保留",
+                    delete_operation=lambda current_id=directory_id,
+                    current_etag=expected_etag,
+                    current_updated_at=expected_updated_at: delete_empty(
+                        current_id,
+                        expected_etag=current_etag,
+                        expected_updated_at=current_updated_at,
+                    ),
+                )
+                cleaned += 1
+            except Exception as exc:
+                logger.warning(
+                    "送回源目录后清理目标空目录失败 type=%s",
+                    type(exc).__name__,
+                )
+                warnings.append("部分整理目标空目录未能清理，目录已安全保留")
+        return cleaned, list(dict.fromkeys(warnings))
+
     def _run_post_actions(
         self,
         *,
@@ -719,7 +1090,10 @@ class OrganizeCorrectionService:
             current_parent_id=target_id, current_name=preview["file_name"],
             target_parent_id=target_id,
             new_path=preview["target_path"] + "/" + preview["file_name"],
-            tmdb_id=match["tmdb_id"], media_type=match["media_type"],
+            tmdb_id=match["tmdb_id"],
+            provider=str(match.get("provider") or ""),
+            external_id=str(match.get("external_id") or ""),
+            media_type=match["media_type"],
             title=match["title"], year=match["year"], error="",
         )
         warnings = self._notify_reorganize_result(preview, items)
@@ -743,6 +1117,12 @@ class OrganizeCorrectionService:
             raise ValueError(detail.get("safety_notice") or "当前状态不能送回源目录")
         items = self._load_items(log_id)
         self._verify_items(items)
+        rules = OrganizeRules.from_config()
+        cleanup_directories, cleanup_protected, cleanup_warnings = (
+            self._capture_return_cleanup_directories(
+                detail=detail, items=items, rules=rules,
+            )
+        )
         self._verify_targets_available(
             [(item, item.original_parent_id, item.original_name) for item in items],
             allow_group_file_ids={item.file_id for item in items},
@@ -786,11 +1166,31 @@ class OrganizeCorrectionService:
             current_parent_id=video.original_parent_id,
             current_name=video.original_name, error="",
         )
-        rules = OrganizeRules.from_config()
-        warnings = self._run_post_actions(items=items, rules=rules, moved=len(items))
+        empty_dirs_cleaned, directory_warnings = (
+            self._cleanup_return_target_directories(
+                log_id=log_id,
+                directories=cleanup_directories,
+                protected=cleanup_protected,
+                target_root_id=rules.target_dir_id,
+            )
+        )
+        warnings = [*cleanup_warnings, *directory_warnings]
+        warnings.extend(
+            self._run_post_actions(items=items, rules=rules, moved=len(items))
+        )
+        if not cleanup_directories:
+            cleanup_status = "retained" if cleanup_warnings else "not_applicable"
+        elif empty_dirs_cleaned >= len(cleanup_directories):
+            cleanup_status = "cleaned"
+        elif empty_dirs_cleaned > 0:
+            cleanup_status = "partial"
+        else:
+            cleanup_status = "retained"
         return {
             "success": True, "log_id": log_id, "item_count": len(items),
-            "warnings": warnings,
+            "empty_dirs_cleaned": empty_dirs_cleaned,
+            "empty_dir_cleanup_status": cleanup_status,
+            "warnings": list(dict.fromkeys(warnings)),
         }
 
     def revert_latest(self, log_id: int, operation_token: str,

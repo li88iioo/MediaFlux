@@ -1208,6 +1208,519 @@ class OrganizeCorrectionTests(unittest.TestCase):
             db.add_organize_log_items(log_id, items)
             return log_id
 
+    def test_return_to_source_cleans_exact_empty_season_and_media_directories(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "organize.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                log_id = db.add_organize_log(
+                    "guangya",
+                    "1/Original.Show.S01E01.mkv",
+                    (
+                        "剧集/1 (2006) {tmdb-294418}/Season 1/"
+                        "1.2006.S01E01.mkv"
+                    ),
+                    "video",
+                    "success",
+                    "294418",
+                    original_parent_id="source-id",
+                    original_name="Original.Show.S01E01.mkv",
+                    current_parent_id="season-id",
+                    current_name="1.2006.S01E01.mkv",
+                    target_parent_id="season-id",
+                    media_type="tv",
+                    title="1",
+                    year="2006",
+                    season=1,
+                    episode=1,
+                    legacy_incomplete=False,
+                )
+                db.add_organize_log_items(log_id, [{
+                    "file_id": "video",
+                    "role": "video",
+                    "original_parent_id": "source-id",
+                    "original_name": "Original.Show.S01E01.mkv",
+                    "current_parent_id": "season-id",
+                    "current_name": "1.2006.S01E01.mkv",
+                    "target_parent_id": "season-id",
+                    "target_name": "1.2006.S01E01.mkv",
+                    "size": 100,
+                    "etag": "video-etag",
+                }])
+
+            remote = {
+                "category-id": GuangYaFile(
+                    "category-id", "剧集", True, etag="category-etag",
+                    parent_id="target-root", updated_at=10,
+                ),
+                "show-id": GuangYaFile(
+                    "show-id", "1 (2006) {tmdb-294418}", True,
+                    etag="show-etag", parent_id="category-id", updated_at=20,
+                ),
+                "season-id": GuangYaFile(
+                    "season-id", "Season 1", True, etag="season-etag",
+                    parent_id="show-id", updated_at=30,
+                ),
+                "video": GuangYaFile(
+                    "video", "1.2006.S01E01.mkv", False, 100,
+                    "video-etag", "season-id",
+                ),
+            }
+            deleted: list[str] = []
+
+            class FakeClient:
+                supports_atomic_empty_directory_delete = False
+                supports_guarded_empty_directory_delete = True
+
+                def file_info(self, file_id):
+                    return remote.get(file_id)
+
+                def list_dir(self, parent_id):
+                    return [
+                        item for item in remote.values()
+                        if item.parent_id == parent_id
+                    ]
+
+                def rename(self, file_id, name):
+                    remote[file_id].name = name
+
+                def move(self, file_ids, parent_id):
+                    remote[file_ids[0]].parent_id = parent_id
+
+                def delete_empty_directory(
+                    self, file_id, *, expected_etag="", expected_updated_at=0,
+                ):
+                    directory = remote[file_id]
+                    self_outer.assertTrue(directory.is_dir)
+                    self_outer.assertEqual(directory.etag, expected_etag)
+                    self_outer.assertEqual(directory.updated_at, expected_updated_at)
+                    self_outer.assertEqual(self.list_dir(file_id), [])
+                    deleted.append(file_id)
+                    del remote[file_id]
+                    return True
+
+            self_outer = self
+            rules = OrganizeRules(target_dir_id="target-root", link_strm=False)
+            with patch("app.database.DB_PATH", test_db), patch(
+                "app.modules.organize_correction.OrganizeRules.from_config",
+                return_value=rules,
+            ), patch(
+                "app.modules.organize_correction.config.get", return_value="",
+            ):
+                service = OrganizeCorrectionService(
+                    client=FakeClient(), scraper=object()
+                )
+                version = service.detail(log_id)["version"]
+                result = service.return_to_source(
+                    log_id, "return-clean-dirs", version
+                )
+
+                self.assertTrue(result["success"])
+                self.assertEqual(result["empty_dirs_cleaned"], 2)
+                self.assertEqual(result["empty_dir_cleanup_status"], "cleaned")
+                self.assertEqual(result["warnings"], [])
+                self.assertEqual(deleted, ["season-id", "show-id"])
+                self.assertIn("category-id", remote)
+                self.assertEqual(remote["video"].parent_id, "source-id")
+                self.assertEqual(
+                    remote["video"].name, "Original.Show.S01E01.mkv"
+                )
+                audits = db.list_organize_delete_audits(log_id, limit=10)
+                ordered_audits = list(reversed(audits))
+                self.assertEqual(
+                    [row["trigger"] for row in ordered_audits],
+                    [
+                        "return_to_source_empty_dir_cleanup",
+                        "return_to_source_empty_dir_cleanup",
+                    ],
+                )
+                self.assertEqual(
+                    [row["gcid"] for row in ordered_audits],
+                    ["season-etag", "show-etag"],
+                )
+
+    def test_return_cleanup_accepts_guarded_recycle_bin_fallback(self):
+        directory = GuangYaFile(
+            "season-id", "Season 1", True, etag="season-etag",
+            parent_id="show-id", updated_at=30,
+        )
+        client = SimpleNamespace(
+            supports_atomic_empty_directory_delete=False,
+            supports_guarded_empty_directory_delete=True,
+            list_dir=Mock(return_value=[]),
+            file_info=Mock(return_value=directory),
+            delete_empty_directory=Mock(return_value=True),
+        )
+        service = OrganizeCorrectionService(client=client, scraper=object())
+
+        def run_delete(*_args, **kwargs):
+            return kwargs["delete_operation"]()
+
+        with patch(
+            "app.modules.organize_correction.execute_recycle_bin_delete",
+            side_effect=run_delete,
+        ) as audited_delete:
+            cleaned, warnings = service._cleanup_return_target_directories(
+                log_id=1, directories=[directory], protected=set(),
+                target_root_id="show-id",
+            )
+
+        self.assertEqual(cleaned, 1)
+        self.assertEqual(warnings, [])
+        client.delete_empty_directory.assert_called_once_with(
+            "season-id", expected_etag="season-etag", expected_updated_at=30,
+        )
+        self.assertIn(
+            "双重版本与空目录复核后移入回收站",
+            audited_delete.call_args.kwargs["reason"],
+        )
+
+    def test_return_cleanup_orders_all_seasons_before_media_root(self):
+        remote = {
+            "show-id": GuangYaFile(
+                "show-id", "Show (2026) {tmdb-1}", True, etag="show-etag",
+                parent_id="category-id", updated_at=20,
+            ),
+            "season-1": GuangYaFile(
+                "season-1", "Season 1", True, etag="s1-etag",
+                parent_id="show-id", updated_at=30,
+            ),
+            "season-2": GuangYaFile(
+                "season-2", "Season 2", True, etag="s2-etag",
+                parent_id="show-id", updated_at=40,
+            ),
+        }
+        deleted: list[str] = []
+
+        class FakeClient:
+            supports_atomic_empty_directory_delete = False
+            supports_guarded_empty_directory_delete = True
+
+            def list_dir(self, parent_id):
+                return [item for item in remote.values() if item.parent_id == parent_id]
+
+            def file_info(self, file_id):
+                return remote.get(file_id)
+
+            def delete_empty_directory(
+                self, file_id, *, expected_etag="", expected_updated_at=0,
+            ):
+                self_outer.assertEqual(self.list_dir(file_id), [])
+                deleted.append(file_id)
+                del remote[file_id]
+                return True
+
+        def run_delete(*_args, **kwargs):
+            return kwargs["delete_operation"]()
+
+        self_outer = self
+        service = OrganizeCorrectionService(client=FakeClient(), scraper=object())
+        directories = [remote["season-1"], remote["show-id"], remote["season-2"]]
+        with patch(
+            "app.modules.organize_correction.execute_recycle_bin_delete",
+            side_effect=run_delete,
+        ):
+            cleaned, warnings = service._cleanup_return_target_directories(
+                log_id=1, directories=directories, protected=set(),
+                target_root_id="category-id",
+            )
+
+        self.assertEqual(cleaned, 3)
+        self.assertEqual(warnings, [])
+        self.assertEqual(deleted, ["season-1", "season-2", "show-id"])
+
+    def test_return_cleanup_keeps_nonempty_directory(self):
+        directory = GuangYaFile(
+            "season-id", "Season 1", True, etag="season-etag",
+            parent_id="show-id", updated_at=30,
+        )
+        child = GuangYaFile("other", "keep.mkv", False, parent_id="season-id")
+        client = SimpleNamespace(
+            supports_atomic_empty_directory_delete=False,
+            supports_guarded_empty_directory_delete=True,
+            list_dir=Mock(return_value=[child]),
+            file_info=Mock(return_value=directory),
+            delete_empty_directory=Mock(),
+        )
+        service = OrganizeCorrectionService(client=client, scraper=object())
+        with patch(
+            "app.modules.organize_correction.record_blocked_delete"
+        ) as blocked:
+            cleaned, warnings = service._cleanup_return_target_directories(
+                log_id=1, directories=[directory], protected=set(),
+                target_root_id="show-id",
+            )
+
+        self.assertEqual(cleaned, 0)
+        self.assertIn("仍含其他内容", warnings[0])
+        client.file_info.assert_not_called()
+        client.delete_empty_directory.assert_not_called()
+        self.assertEqual(blocked.call_count, 1)
+        self.assertEqual(blocked.call_args.kwargs["reason"], "目录仍含其他内容，已保留")
+
+    def test_return_cleanup_audit_failure_is_nonfatal_after_file_return(self):
+        client = SimpleNamespace(
+            supports_atomic_empty_directory_delete=False,
+            supports_guarded_empty_directory_delete=False,
+            delete_empty_directory=Mock(),
+        )
+        service = OrganizeCorrectionService(client=client, scraper=object())
+        directory = GuangYaFile(
+            "show-id", "Show (2026) {tmdb-1}", True, etag="show-etag",
+            parent_id="category-id", updated_at=20,
+        )
+        with patch(
+            "app.modules.organize_correction.record_blocked_delete",
+            side_effect=RuntimeError("audit unavailable"),
+        ):
+            cleaned, warnings = service._cleanup_return_target_directories(
+                log_id=1, directories=[directory], protected=set(),
+                target_root_id="target-root",
+            )
+
+        self.assertEqual(cleaned, 0)
+        self.assertTrue(any("不支持安全的空目录回收站清理" in item for item in warnings))
+        self.assertTrue(any("审计写入失败" in item for item in warnings))
+        client.delete_empty_directory.assert_not_called()
+
+    def test_return_cleanup_requires_explicit_safe_capability(self):
+        directory = GuangYaFile(
+            "season-id", "Season 1", True, etag="season-etag",
+            parent_id="show-id", updated_at=30,
+        )
+        client = SimpleNamespace(delete_empty_directory=Mock())
+        service = OrganizeCorrectionService(client=client, scraper=object())
+        with patch(
+            "app.modules.organize_correction.record_blocked_delete"
+        ) as blocked:
+            cleaned, warnings = service._cleanup_return_target_directories(
+                log_id=1, directories=[directory], protected=set(),
+                target_root_id="target-root",
+            )
+
+        self.assertEqual(cleaned, 0)
+        self.assertIn("不支持安全的空目录回收站清理", warnings[0])
+        client.delete_empty_directory.assert_not_called()
+        blocked.assert_called_once()
+
+    def test_return_cleanup_rejects_source_subtree_when_target_is_cloud_root(self):
+        remote = {
+            "season-id": GuangYaFile(
+                "season-id", "Season 1", True, etag="season-etag",
+                parent_id="show-id", updated_at=30,
+            ),
+            "show-id": GuangYaFile(
+                "show-id", "Show (2026) {tmdb-1}", True, etag="show-etag",
+                parent_id="source-root", updated_at=20,
+            ),
+            "source-root": GuangYaFile(
+                "source-root", "整理来源", True, etag="source-etag",
+                parent_id="0", updated_at=10,
+            ),
+        }
+        service = OrganizeCorrectionService(
+            client=SimpleNamespace(file_info=lambda file_id: remote.get(file_id)),
+            scraper=object(),
+        )
+        item = SimpleNamespace(
+            original_parent_id="different-source", current_parent_id="season-id",
+        )
+        rules = OrganizeRules(target_dir_id="0", link_strm=False)
+        with patch(
+            "app.modules.organize_correction.config.get",
+            return_value='[{"id":"source-root","name":"整理来源"}]',
+        ):
+            directories, _protected, warnings = (
+                service._capture_return_cleanup_directories(
+                    detail={
+                        "new_path": (
+                            "Show (2026) {tmdb-1}/Season 1/Show.S01E01.mkv"
+                        ),
+                        "media_type": "tv",
+                        "tmdb_id": "1",
+                        "season": 1,
+                    },
+                    items=[item],
+                    rules=rules,
+                )
+            )
+
+        self.assertEqual(directories, [])
+        self.assertIn("不属于当前整理目标根", warnings[0])
+
+    def test_return_cleanup_rechecks_target_ancestry_before_delete(self):
+        snapshot = GuangYaFile(
+            "season-id", "Season 1", True, etag="season-etag",
+            parent_id="show-id", updated_at=30,
+        )
+        remote = {
+            "season-id": GuangYaFile(
+                "season-id", "Season 1", True, etag="season-etag",
+                parent_id="show-id", updated_at=30,
+            ),
+            "show-id": GuangYaFile(
+                "show-id", "Show (2026) {tmdb-1}", True, etag="show-etag",
+                parent_id="foreign-category", updated_at=20,
+            ),
+            "foreign-category": GuangYaFile(
+                "foreign-category", "剧集", True, etag="category-etag",
+                parent_id="0", updated_at=10,
+            ),
+        }
+        client = SimpleNamespace(
+            supports_atomic_empty_directory_delete=False,
+            supports_guarded_empty_directory_delete=True,
+            list_dir=Mock(return_value=[]),
+            file_info=Mock(side_effect=lambda file_id: remote.get(file_id)),
+            delete_empty_directory=Mock(),
+        )
+        service = OrganizeCorrectionService(client=client, scraper=object())
+        with patch(
+            "app.modules.organize_correction.execute_recycle_bin_delete"
+        ) as audited_delete:
+            cleaned, warnings = service._cleanup_return_target_directories(
+                log_id=1,
+                directories=[snapshot],
+                protected=set(),
+                target_root_id="target-root",
+            )
+
+        self.assertEqual(cleaned, 0)
+        self.assertIn("未能清理", warnings[0])
+        client.delete_empty_directory.assert_not_called()
+        audited_delete.assert_not_called()
+
+    def test_return_cleanup_rejects_matching_identity_outside_target_root(self):
+        remote = {
+            "season-id": GuangYaFile(
+                "season-id", "Season 1", True, etag="season-etag",
+                parent_id="show-id", updated_at=30,
+            ),
+            "show-id": GuangYaFile(
+                "show-id", "Show (2026) {tmdb-1}", True, etag="show-etag",
+                parent_id="foreign-category", updated_at=20,
+            ),
+            "foreign-category": GuangYaFile(
+                "foreign-category", "剧集", True, etag="category-etag",
+                parent_id="foreign-root", updated_at=10,
+            ),
+            "foreign-root": GuangYaFile(
+                "foreign-root", "Other", True, etag="root-etag",
+                parent_id="0", updated_at=5,
+            ),
+        }
+        service = OrganizeCorrectionService(
+            client=SimpleNamespace(file_info=lambda file_id: remote.get(file_id)),
+            scraper=object(),
+        )
+        item = SimpleNamespace(
+            original_parent_id="source-id", current_parent_id="season-id",
+        )
+        rules = OrganizeRules(target_dir_id="target-root", link_strm=False)
+        with patch(
+            "app.modules.organize_correction.config.get", return_value="",
+        ):
+            directories, _protected, warnings = (
+                service._capture_return_cleanup_directories(
+                    detail={
+                        "new_path": (
+                            "剧集/Show (2026) {tmdb-1}/Season 1/"
+                            "Show.S01E01.mkv"
+                        ),
+                        "media_type": "tv",
+                        "tmdb_id": "1",
+                        "season": 1,
+                    },
+                    items=[item],
+                    rules=rules,
+                )
+            )
+
+        self.assertEqual(directories, [])
+        self.assertIn("不属于当前整理目标根", warnings[0])
+
+    def test_return_cleanup_accepts_metatube_identity_under_target_root(self):
+        remote = {
+            "season-id": GuangYaFile(
+                "season-id", "Season 1", True, etag="season-etag",
+                parent_id="show-id", updated_at=30,
+            ),
+            "show-id": GuangYaFile(
+                "show-id", "Show (2026) {metatube-series_1}", True,
+                etag="show-etag", parent_id="category-id", updated_at=20,
+            ),
+            "category-id": GuangYaFile(
+                "category-id", "剧集", True, etag="category-etag",
+                parent_id="target-root", updated_at=10,
+            ),
+        }
+        service = OrganizeCorrectionService(
+            client=SimpleNamespace(file_info=lambda file_id: remote.get(file_id)),
+            scraper=object(),
+        )
+        item = SimpleNamespace(
+            original_parent_id="source-id", current_parent_id="season-id",
+        )
+        rules = OrganizeRules(target_dir_id="target-root", link_strm=False)
+        with patch(
+            "app.modules.organize_correction.config.get", return_value="",
+        ):
+            directories, _protected, warnings = (
+                service._capture_return_cleanup_directories(
+                    detail={
+                        "new_path": (
+                            "剧集/Show (2026) {metatube-series_1}/Season 1/"
+                            "Show.S01E01.mkv"
+                        ),
+                        "media_type": "tv",
+                        "provider": "metatube",
+                        "external_id": "series_1",
+                        "season": 1,
+                    },
+                    items=[item],
+                    rules=rules,
+                )
+            )
+
+        self.assertEqual(
+            [directory.file_id for directory in directories],
+            ["season-id", "show-id"],
+        )
+        self.assertEqual(warnings, [])
+
+    def test_return_cleanup_rejects_unproven_historical_directory_shape(self):
+        class FakeClient:
+            def file_info(self, file_id):
+                return GuangYaFile(
+                    file_id, "剧集", True, etag="category-etag",
+                    parent_id="target-root", updated_at=10,
+                )
+
+        service = OrganizeCorrectionService(
+            client=FakeClient(), scraper=object()
+        )
+        item = SimpleNamespace(
+            original_parent_id="source-id", current_parent_id="category-id"
+        )
+        rules = OrganizeRules(target_dir_id="target-root", link_strm=False)
+        with patch(
+            "app.modules.organize_correction.config.get", return_value="",
+        ):
+            directories, _protected, warnings = (
+                service._capture_return_cleanup_directories(
+                    detail={
+                        "new_path": "剧集/file.mkv",
+                        "media_type": "movie",
+                        "tmdb_id": "1",
+                    },
+                    items=[item],
+                    rules=rules,
+                )
+            )
+
+        self.assertEqual(directories, [])
+        self.assertIn("缺少匹配的媒体身份标识", warnings[0])
+
     def test_return_to_source_rolls_back_current_file_when_move_fails(self):
         with tempfile.TemporaryDirectory() as root:
             test_db = Path(root) / "organize.db"
@@ -1344,8 +1857,13 @@ class OrganizeCorrectionTests(unittest.TestCase):
                 result = service.reorganize(
                     log_id, "reorganize-success", version, "99", "movie"
                 )
+                updated_log = dict(db.get_organize_log(log_id))
 
             self.assertTrue(result["success"])
+            self.assertEqual(
+                (updated_log["provider"], updated_log["external_id"]),
+                ("tmdb", "99"),
+            )
             self.assertEqual(len(confirm_calls), 1)
             args, kwargs = confirm_calls[0]
             self.assertEqual(args[:5], (

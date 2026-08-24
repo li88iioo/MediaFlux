@@ -1107,8 +1107,19 @@ def _execute_guangya_confirmation(
         Organizer.notify_directory_results(
             stats, current_rules, source_name=scope_name, chat_id=chat_id
         )
+        try:
+            confirm_debounce = max(0, min(int(float(
+                get("GY_ORGANIZE_CONFIRM_STRM_DEBOUNCE_SECONDS", "8") or 8
+            )), 30))
+        except (TypeError, ValueError, OverflowError):
+            confirm_debounce = 8
         Organizer.trigger_post_actions(
-            stats, current_rules, source_name=scope_name, chat_id=chat_id
+            stats,
+            current_rules,
+            source_name=scope_name,
+            chat_id=chat_id,
+            notify_result=False,
+            strm_debounce_seconds=confirm_debounce,
         )
         terminal_event = _confirmation_result_event(payload, candidate, stats)
         db.complete_organize_confirmation_with_delivery(

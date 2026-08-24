@@ -89,6 +89,7 @@ def _serialize_score_breakdown(breakdown) -> dict | None:
         "constraint_penalty": float(breakdown.constraint_penalty),
         "final_score": float(breakdown.final_score),
         "matched_title": str(breakdown.matched_title or ""),
+        "matched_query": str(breakdown.matched_query or ""),
         "rejected_constraints": list(breakdown.rejected_constraints or []),
     }
 

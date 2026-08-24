@@ -75,6 +75,57 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
             sorted(item["file_id"] for item in claimed[0]["changes"]), ["f1", "f2"]
         )
 
+    def test_debounce_deadline_is_persisted_and_can_be_reset(self):
+        db.enqueue_strm_change_targets(
+            [_change(file_id="f1")], not_before_seconds=30,
+        )
+        first_delay = db.seconds_until_next_strm_change_target()
+        self.assertIsNotNone(first_delay)
+        self.assertGreater(first_delay, 20)
+        self.assertEqual(db.claim_strm_change_targets(owner="early"), [])
+
+        db.enqueue_strm_change_targets(
+            [_change(file_id="f2")], not_before_seconds=8,
+        )
+        reset_delay = db.seconds_until_next_strm_change_target()
+        self.assertIsNotNone(reset_delay)
+        self.assertGreater(reset_delay, 3)
+        self.assertLess(reset_delay, first_delay)
+
+    def test_non_debounced_merge_can_preserve_existing_deadline(self):
+        db.enqueue_strm_change_targets(
+            [_change(file_id="f1")], not_before_seconds=30,
+        )
+        before = db.seconds_until_next_strm_change_target()
+        db.enqueue_strm_change_targets(
+            [_change(file_id="f2")], not_before_seconds=None,
+        )
+        after = db.seconds_until_next_strm_change_target()
+
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        self.assertGreater(after, 20)
+        self.assertLessEqual(abs(after - before), 1.0)
+
+    def test_reschedule_moves_every_target_in_the_merged_batch(self):
+        changes = [
+            _change(rel_dir="剧集/A/Season 1", file_id="f1"),
+            _change(rel_dir="剧集/B/Season 1", file_id="f2"),
+        ]
+        db.enqueue_strm_change_targets(changes, not_before_seconds=30)
+
+        updated = db.reschedule_strm_change_targets(
+            changes, not_before_seconds=8,
+        )
+
+        self.assertEqual(updated, 2)
+        rows = [dict(row) for row in db.list_strm_change_queue()]
+        self.assertEqual(len({row["next_attempt_at"] for row in rows}), 1)
+        delay = db.seconds_until_next_strm_change_target()
+        self.assertIsNotNone(delay)
+        self.assertGreater(delay, 3)
+        self.assertLess(delay, 12)
+
     def test_change_during_running_becomes_dirty_without_losing_events(self):
         db.enqueue_strm_change_targets([_change(file_id="f1")])
         db.claim_strm_change_targets(owner="test")
@@ -102,6 +153,25 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
         self.assertEqual(state, "queued")
         replay = db.claim_strm_change_targets(owner="test")
         self.assertEqual([item["file_id"] for item in replay[0]["changes"]], ["f2"])
+
+    def test_dirty_requeue_preserves_a_later_debounce_deadline(self):
+        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        claimed = db.claim_strm_change_targets(owner="test")
+        db.enqueue_strm_change_targets(
+            [_change(file_id="f2")], not_before_seconds=8,
+        )
+
+        state = db.complete_strm_change_target(
+            claimed[0]["id"],
+            expected_owner=claimed[0]["lease_owner"],
+            expected_lease_generation=claimed[0]["lease_generation"],
+        )
+
+        self.assertEqual(state, "queued")
+        self.assertEqual(db.claim_strm_change_targets(owner="too-early"), [])
+        delay = db.seconds_until_next_strm_change_target()
+        self.assertIsNotNone(delay)
+        self.assertGreater(delay, 3)
 
     def test_completing_a_clean_target_marks_completed(self):
         db.enqueue_strm_change_targets([_change(file_id="f1")])
@@ -182,6 +252,16 @@ class StrmChangeQueueWorkerTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(len(reclaimed), 1)
         self.assertEqual([item["file_id"] for item in reclaimed[0]["changes"]], ["f1"])
+
+    def test_next_target_delay_includes_an_unexpired_lease(self):
+        db.enqueue_strm_change_targets([_change(file_id="f1")])
+        db.claim_strm_change_targets(owner="worker-a", lease_seconds=30)
+
+        delay = db.seconds_until_next_strm_change_target()
+
+        self.assertIsNotNone(delay)
+        self.assertGreater(delay, 20)
+        self.assertLessEqual(delay, 30)
 
     def test_stale_worker_cannot_settle_a_reclaimed_target(self):
         db.enqueue_strm_change_targets([_change(file_id="f1")])
@@ -383,14 +463,19 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
         db.enqueue_strm_change_targets([_change(file_id="f1")])
         claimed = self.scheduler._claim_change_targets("organize")
 
-        self.scheduler._settle_change_targets(
-            claimed, "failed", error="STRM 同步部分完成，等待重试",
-        )
+        with patch.object(
+            self.scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
+            self.scheduler._settle_change_targets(
+                claimed, "failed", error="STRM 同步部分完成，等待重试",
+            )
 
         row = dict(db.list_strm_change_queue()[0])
         self.assertEqual(row["state"], "queued")
         self.assertEqual(row["attempts"], 1)
         self.assertIn("f1", str(row["pending_changes_json"]))
+        schedule.assert_called_once()
+        self.assertGreater(schedule.call_args.args[0], 50)
 
     def test_stopped_run_releases_targets(self):
         db.enqueue_strm_change_targets([_change(file_id="f1")])
@@ -407,20 +492,34 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
         claimed = self.scheduler._claim_change_targets("organize")
         db.enqueue_strm_change_targets([_change(file_id="f2")])
 
-        with patch.object(STRMScheduler, "trigger") as trigger:
+        with patch.object(
+            self.scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
             self.scheduler._settle_change_targets(claimed, "completed")
 
-        trigger.assert_called_once_with("organize")
+        schedule.assert_called_once()
         self.assertEqual(db.count_pending_strm_change_targets(), 1)
 
     def test_clean_completion_does_not_retrigger(self):
         db.enqueue_strm_change_targets([_change(file_id="f1")])
         claimed = self.scheduler._claim_change_targets("organize")
 
-        with patch.object(STRMScheduler, "trigger") as trigger:
+        with patch.object(
+            self.scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
             self.scheduler._settle_change_targets(claimed, "completed")
 
-        trigger.assert_not_called()
+        schedule.assert_not_called()
+
+    def test_empty_claim_still_rearms_a_future_queue_target(self):
+        with patch.object(
+            db, "seconds_until_next_strm_change_target", return_value=240.0,
+        ), patch.object(
+            self.scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
+            self.scheduler._settle_change_targets([], "completed")
+
+        schedule.assert_called_once_with(240.0)
 
     def test_claim_limit_is_automatically_drained_by_a_followup_run(self):
         db.enqueue_strm_change_targets([
@@ -431,10 +530,12 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(len(claimed), 200)
         self.assertEqual(db.count_pending_strm_change_targets(), 201)
-        with patch.object(STRMScheduler, "trigger") as trigger:
+        with patch.object(
+            self.scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
             self.scheduler._settle_change_targets(claimed, "completed")
 
-        trigger.assert_called_once_with("organize")
+        schedule.assert_called_once()
         self.assertEqual(db.count_pending_strm_change_targets(), 1)
         remainder = self.scheduler._claim_change_targets("organize")
         self.assertEqual(len(remainder), 1)

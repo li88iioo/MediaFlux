@@ -102,6 +102,164 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertTrue(result)
         self.assertEqual(delivered, [{"chat_id": "100"}])
 
+    def test_no_candidate_pending_items_do_not_promise_missing_cards(self) -> None:
+        stats = {
+            "task_id": "task-no-candidates",
+            "total": 2,
+            "moved": 0,
+            "metadata_moved": 0,
+            "need_confirm": 2,
+            "skipped": 0,
+            "failed": 0,
+            "media_items": [],
+            "confirmations": ["TMDB 无搜索结果"],
+            "confirmation_groups": [],
+        }
+        delivered: list[str] = []
+        with patch(
+            "app.modules.organize_notification_outbox.deliver_organize_notification",
+            side_effect=lambda _key, body, **_kwargs: delivered.append(body) or True,
+        ), patch("app.notifier.send_event") as send_event:
+            result = Organizer.notify_task_results(
+                stats, OrganizeRules(), source_name="1 个源目录", chat_id="100",
+            )
+
+        self.assertTrue(result)
+        send_event.assert_not_called()
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("待确认 2 个", delivered[0])
+        self.assertIn("本轮暂无可用 TMDB 候选", delivered[0])
+        self.assertIn("Web 待确认队列", delivered[0])
+        self.assertNotIn("请在下方候选卡中选择匹配结果", delivered[0])
+
+    def test_incomplete_confirmation_groups_are_not_reported_as_actionable(self) -> None:
+        cases = (
+            (
+                "missing-candidates",
+                {
+                    "files": [{"file_id": "file-1", "name": "Show.mkv"}],
+                    "candidates": [],
+                },
+            ),
+            (
+                "missing-files",
+                {
+                    "files": [],
+                    "candidates": [{
+                        "tmdb_id": "1", "media_type": "tv", "title": "Show",
+                    }],
+                },
+            ),
+            (
+                "invalid-candidate",
+                {
+                    "files": [{"file_id": "file-1", "name": "Show.mkv"}],
+                    "candidates": [{
+                        "tmdb_id": "", "media_type": "tv", "title": "Show",
+                    }],
+                },
+            ),
+            (
+                "malformed-file",
+                {
+                    "files": [{}],
+                    "candidates": [{
+                        "tmdb_id": "1", "media_type": "tv", "title": "Show",
+                    }],
+                },
+            ),
+            (
+                "mixed-invalid-file",
+                {
+                    "files": [
+                        {"file_id": "file-1", "name": "Show.mkv"},
+                        "invalid",
+                    ],
+                    "candidates": [{
+                        "tmdb_id": "1", "media_type": "tv", "title": "Show",
+                    }],
+                },
+            ),
+        )
+        for task_id, group in cases:
+            with self.subTest(task_id=task_id):
+                delivered: list[str] = []
+                stats = {
+                    "task_id": f"task-{task_id}",
+                    "total": 1,
+                    "moved": 0,
+                    "metadata_moved": 0,
+                    "need_confirm": 1,
+                    "skipped": 0,
+                    "failed": 0,
+                    "media_items": [],
+                    "confirmation_groups": [group],
+                }
+                with patch(
+                    "app.modules.organize_notification_outbox.deliver_organize_notification",
+                    side_effect=lambda _key, body, **_kwargs: delivered.append(body) or True,
+                ), patch("app.notifier.send_event") as send_event:
+                    result = Organizer.notify_task_results(
+                        stats, OrganizeRules(), source_name="来源目录", chat_id="100",
+                    )
+
+                self.assertTrue(result)
+                send_event.assert_not_called()
+                self.assertEqual(len(delivered), 1)
+                self.assertIn("本轮暂无可用 TMDB 候选", delivered[0])
+                self.assertNotIn("请在下方候选卡中选择匹配结果", delivered[0])
+
+    def test_mixed_pending_items_only_promise_actionable_candidate_cards(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "task_id": "task-mixed-candidates",
+            "total": 2,
+            "need_confirm": 2,
+            "confirmations": ["TMDB 无搜索结果"],
+        })
+        delivered: list[str] = []
+        with patch(
+            "app.modules.organize_notification_outbox.deliver_organize_notification",
+            side_effect=lambda _key, body, **_kwargs: delivered.append(body) or True,
+        ), patch("app.notifier.send_event", return_value=True) as send_event:
+            result = Organizer.notify_task_results(
+                stats, OrganizeRules(), source_name="来源目录", chat_id="100",
+            )
+
+        self.assertTrue(result)
+        send_event.assert_called_once()
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("待确认 2 个", delivered[0])
+        self.assertIn("1 个可在下方候选卡中选择", delivered[0])
+        self.assertIn("1 个暂无可用 TMDB 候选", delivered[0])
+
+    def test_multiple_files_in_one_confirmation_group_explains_single_card(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "task_id": "task-grouped-candidates",
+            "total": 2,
+            "need_confirm": 2,
+        })
+        stats["confirmation_groups"][0]["files"] = [
+            {"file_id": "file-1", "name": "Show - 01.mkv"},
+            {"file_id": "file-2", "name": "Show - 02.mkv"},
+        ]
+        delivered: list[str] = []
+        with patch(
+            "app.modules.organize_notification_outbox.deliver_organize_notification",
+            side_effect=lambda _key, body, **_kwargs: delivered.append(body) or True,
+        ), patch("app.notifier.send_event", return_value=True) as send_event:
+            result = Organizer.notify_task_results(
+                stats, OrganizeRules(), source_name="来源目录", chat_id="100",
+            )
+
+        self.assertTrue(result)
+        send_event.assert_called_once()
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("待确认 2 个文件", delivered[0])
+        self.assertIn("已按媒体合并为 1 组", delivered[0])
+        self.assertIn("仅发送 1 张候选卡", delivered[0])
+
     def test_confirmation_card_delivery_failure_keeps_terminal_fallback_visible(self) -> None:
         with patch(
             "app.notifier.send_result", return_value=TelegramSendResult(ok=True)
