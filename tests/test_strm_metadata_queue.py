@@ -366,3 +366,37 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
             self.assertEqual(target.read_bytes(), b"metadata")
             index = db.list_strm_index(f"guangya-meta:{source_id}")
             self.assertEqual([item["file_id"] for item in index], ["meta"])
+
+    def test_media_refresh_failure_keeps_changed_paths_until_retry_succeeds(self):
+        from unittest.mock import patch
+
+        from app.modules.strm_metadata_worker import STRMMetadataWorker
+
+        worker = STRMMetadataWorker()
+        worker._changed_paths = ["/strm/Movie/Movie.nfo", "/strm/Movie/Movie.nfo"]
+        with patch(
+            "app.modules.strm_metadata_worker.get_int",
+            side_effect=lambda key, default=0: {
+                "STRM_METADATA_REFRESH_BATCH_SIZE": 50,
+                "STRM_METADATA_REFRESH_INTERVAL_SECONDS": 300,
+            }.get(key, default),
+        ), patch(
+            "app.modules.scheduler.STRMScheduler._refresh_media_servers",
+            side_effect=[{"Jellyfin": False}, {"Jellyfin": True}],
+        ) as refresh:
+            worker._flush_media_refresh(force=True)
+            self.assertEqual(worker._changed_paths, [
+                "/strm/Movie/Movie.nfo", "/strm/Movie/Movie.nfo",
+            ])
+            self.assertTrue(worker._refresh_retry_pending)
+
+            # 进程停止或显式 flush 必须立即重试，不能因普通批处理节流丢失刷新。
+            worker._flush_media_refresh(force=True)
+
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(
+            refresh.call_args_list[0].kwargs["changed_paths"],
+            ["/strm/Movie/Movie.nfo"],
+        )
+        self.assertEqual(worker._changed_paths, [])
+        self.assertFalse(worker._refresh_retry_pending)

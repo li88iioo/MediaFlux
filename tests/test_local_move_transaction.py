@@ -70,6 +70,33 @@ class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
             self.assertEqual(target.read_bytes(), b"new-version")
             self.assertEqual(list(target_root.glob(".*.mediaflux-replaced-*")), [])
 
+    def test_replace_backup_cleanup_failure_requires_manual_attention(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root, target_root = root / "source", root / "library"
+            source_root.mkdir(); target_root.mkdir()
+            source = source_root / "Movie.mkv"
+            source.write_bytes(b"new-version")
+            target = target_root / "Movie.mkv"
+            target.write_bytes(b"old-version")
+            snapshot = LocalFilesystemAdapter(source_root).snapshot(source)
+            transaction = LocalMoveTransaction(
+                [source_root], [target_root], operation_token="replace-warning"
+            )
+
+            with patch.object(
+                transaction,
+                "_unlink_owned_anchored",
+                side_effect=OSError("backup cleanup blocked"),
+            ):
+                result = transaction.execute([Plan(snapshot, target, action="replace")])
+
+            self.assertEqual(result.status, "requires_manual")
+            self.assertEqual(target.read_bytes(), b"new-version")
+            self.assertEqual(len(result.warnings), 1)
+            self.assertIn("旧版本备份清理失败", result.warnings[0])
+            self.assertEqual(len(list(target_root.glob(".*.mediaflux-replaced-*"))), 1)
+
     def test_later_failure_restores_replaced_target_and_all_sources(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)
@@ -262,6 +289,39 @@ class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
             self.assertEqual(source.read_bytes(), b"external")
             self.assertEqual(displaced.read_bytes(), b"inspected")
             self.assertFalse((target_root / source.name).exists())
+
+    def test_transient_target_parent_swap_cannot_publish_outside_library(self):
+        with tempfile.TemporaryDirectory() as root_raw, tempfile.TemporaryDirectory() as outside_raw:
+            root = Path(root_raw)
+            source_root, target_root = root / "source", root / "library"
+            target_parent = target_root / "Movies"
+            source_root.mkdir(); target_parent.mkdir(parents=True)
+            outside = Path(outside_raw)
+            source = source_root / "Movie.mkv"
+            source.write_bytes(b"mediaflux")
+            target = target_parent / source.name
+            displaced_parent = target_root / "Movies-pinned"
+            snapshot = LocalFilesystemAdapter(source_root).snapshot(source)
+            transaction = LocalMoveTransaction([source_root], [target_root])
+            real_publish = transaction._publish_no_replace
+
+            def swap_parent_then_publish(src, dst):
+                target_parent.rename(displaced_parent)
+                target_parent.symlink_to(outside, target_is_directory=True)
+                try:
+                    return real_publish(src, dst)
+                finally:
+                    target_parent.unlink()
+                    displaced_parent.rename(target_parent)
+
+            with patch.object(
+                transaction, "_publish_no_replace", side_effect=swap_parent_then_publish,
+            ):
+                result = transaction.execute([Plan(snapshot, target)])
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(target.read_bytes(), b"mediaflux")
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_external_target_replacement_is_not_deleted_or_rolled_back(self):
         with tempfile.TemporaryDirectory() as root_raw:

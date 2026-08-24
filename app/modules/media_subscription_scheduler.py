@@ -23,25 +23,30 @@ class MediaSubscriptionScheduler:
         self._thread: threading.Thread | None = None
         self._workers: dict[int, threading.Thread] = {}
         self._lock = threading.Lock()
+        self._accepting = True
         self._last_recovery_at = 0.0
 
     def start(self) -> None:
-        thread = self._thread
-        if thread and thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._wake_event.clear()
-        self._last_recovery_at = 0.0
-        self._thread = threading.Thread(
-            target=self._loop,
-            name="media-subscription-scheduler",
-            daemon=True,
-        )
-        self._thread.start()
+        with self._lock:
+            thread = self._thread
+            if thread and thread.is_alive():
+                return
+            self._accepting = True
+            self._stop_event.clear()
+            self._wake_event.clear()
+            self._last_recovery_at = 0.0
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="media-subscription-scheduler",
+                daemon=True,
+            )
+            self._thread.start()
         logger.info("媒体订阅调度器已启动")
 
     def stop(self, timeout: float = 30.0) -> bool:
         """停止生产新检查，并等待已启动的检查在有界时间内收敛。"""
+        with self._lock:
+            self._accepting = False
         self._stop_event.set()
         self._wake_event.set()
         deadline = time.monotonic() + max(0.0, float(timeout))
@@ -107,6 +112,8 @@ class MediaSubscriptionScheduler:
                 break
             subscription_id = int(row["id"])
             with self._lock:
+                if not self._accepting or self._stop_event.is_set():
+                    break
                 self._workers = {
                     sid: worker for sid, worker in self._workers.items() if worker.is_alive()
                 }
@@ -121,12 +128,11 @@ class MediaSubscriptionScheduler:
                     daemon=True,
                 )
                 self._workers[subscription_id] = worker
-            try:
-                worker.start()
-            except Exception:
-                with self._lock:
+                try:
+                    worker.start()
+                except Exception:
                     self._workers.pop(subscription_id, None)
-                raise
+                    raise
             count += 1
         return count
 

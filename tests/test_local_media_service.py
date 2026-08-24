@@ -123,6 +123,41 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         self.assertIs(budgets[0], budgets[1])
         self.assertIsNotNone(budgets[0].remaining_seconds())
 
+    def test_sample_video_is_retained_without_being_deleted_or_archived(self):
+        from app.modules.organize import OrganizeRules
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "sample-downloads"
+            target_root = root / "movies"
+            source_root.mkdir(); target_root.mkdir()
+            (source_root / "Movie.2026.mkv").write_bytes(b"main-video")
+            (source_root / "Movie.2026.sample.mkv").write_bytes(b"sample-video")
+            source_id = self._source(source_root, target_root, "movie")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="1", title="Movie", year="2026",
+                media_type="movie", confidence=1.0,
+            )))
+            inspection = service.inspect_source("admin", source_id, source_root)
+            with patch(
+                "app.modules.local_media_service.OrganizeRules.from_config",
+                return_value=OrganizeRules(region_split=False, year_split=False),
+            ):
+                preview = service.preview("admin", inspection["inspection_id"])
+
+            self.assertEqual(preview["status"], "planned")
+            self.assertEqual(len(preview["plans"]), 1)
+            self.assertEqual(preview["plans"][0]["source_path"], "Movie.2026.mkv")
+            self.assertEqual(preview["cleanup"], [])
+            self.assertEqual(
+                preview["retained"],
+                [{
+                    "name": "Movie.2026.sample.mkv",
+                    "reason": "疑似 sample/proof 视频，已保留且不自动归档",
+                    "reason_code": "sample-review",
+                }],
+            )
+
     def test_rules_snapshot_keeps_manual_execution_consistent_with_preview(self):
         from app.modules.organize import OrganizeRules
 

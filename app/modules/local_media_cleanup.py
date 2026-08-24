@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import stat as stat_module
@@ -13,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from app.modules.local_path_mapping import assert_within
+from app.modules.local_path_mapping import PathMappingError, assert_within
 from app.modules.local_storage import (
     LocalFileSnapshot,
     LocalFilesystemAdapter,
@@ -71,13 +72,6 @@ def classify_cleanup_items(
             candidate = CleanupCandidate(item, "shortcut", "下载站网址快捷方式")
         elif suffix in {".txt", ".html", ".htm"} and _AD_TEXT_RE.search(item.path.stem):
             candidate = CleanupCandidate(item, "site-note", "下载站说明或广告文件")
-        elif (
-            item.role == "video"
-            and primary_video_count > 0
-            and item.size <= max(1, int(sample_max_bytes))
-            and _SAMPLE_RE.search(item.path.stem)
-        ):
-            candidate = CleanupCandidate(item, "sample", "明确标记的 sample/proof 样片")
         if candidate is None:
             retained.append(item)
         else:
@@ -92,7 +86,7 @@ def delete_cleanup_items(
     selected_path: Path | None = None,
     remove_empty_dirs: bool = True,
 ) -> CleanupResult:
-    """复核快照后隔离并删除确定垃圾；目录句柄固定回收区，避免路径竞态。"""
+    """复核快照后隔离并删除确定垃圾；源与回收区都固定到目录句柄。"""
     root = Path(allowed_root).expanduser().resolve(strict=False)
     adapter = LocalFilesystemAdapter(root)
     result = CleanupResult()
@@ -102,18 +96,42 @@ def delete_cleanup_items(
     quarantine_run_fd: int | None = None
     quarantine_run_name = f"cleanup-{uuid.uuid4().hex}"
     quarantine_display_root = quarantine_root / quarantine_run_name
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    root_fd: int | None = None
+
+    def open_source_parent(relative_parent: Path) -> int:
+        """从已固定根目录逐段打开父目录，拒绝中途符号链接替换。"""
+        if root_fd is None:
+            raise RuntimeError("本地安全清理目录句柄不可用")
+        current_fd = os.dup(root_fd)
+        try:
+            for part in relative_parent.parts:
+                if part in {"", "."}:
+                    continue
+                next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+        except Exception:
+            os.close(current_fd)
+            raise
 
     def ensure_quarantine() -> int:
         nonlocal quarantine_dir_fd, quarantine_run_fd
         if quarantine_run_fd is not None:
             return quarantine_run_fd
+        if root_fd is None:
+            raise RuntimeError("本地安全清理目录句柄不可用")
         try:
-            quarantine_root.mkdir(mode=0o700)
+            os.mkdir(_CLEANUP_QUARANTINE_DIR, mode=0o700, dir_fd=root_fd)
         except FileExistsError:
             pass
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
-        quarantine_dir_fd = os.open(quarantine_root, directory_flags)
+        quarantine_dir_fd = os.open(
+            _CLEANUP_QUARANTINE_DIR,
+            directory_flags,
+            dir_fd=root_fd,
+        )
         try:
             os.mkdir(quarantine_run_name, mode=0o700, dir_fd=quarantine_dir_fd)
             quarantine_run_fd = os.open(
@@ -128,14 +146,39 @@ def delete_cleanup_items(
         return quarantine_run_fd
 
     try:
+        root_fd = os.open(root, directory_flags)
+    except (NotImplementedError, OSError) as exc:
+        result.retained.extend(str(candidate.snapshot.path) for candidate in candidates)
+        result.warnings.append(f"当前运行环境不支持安全垃圾清理: {exc}")
+        return result
+
+    try:
         for candidate in candidates:
             path = assert_within(candidate.snapshot.path, root)
+            relative_path = path.relative_to(root)
             quarantine_name = f"{uuid.uuid4().hex}-{path.name}"
             moved = False
+            source_parent_fd: int | None = None
             try:
+                # 保留适配器的业务快照校验，再在固定目录句柄上做最终身份复核。
                 adapter.verify_snapshot(candidate.snapshot)
+                source_parent_fd = open_source_parent(relative_path.parent)
+                info = os.stat(path.name, dir_fd=source_parent_fd, follow_symlinks=False)
+                source_identity = (
+                    int(info.st_size),
+                    int(info.st_mtime_ns),
+                    int(info.st_dev),
+                    int(info.st_ino),
+                ) if stat_module.S_ISREG(info.st_mode) else None
+                if source_identity != candidate.snapshot.identity:
+                    raise RuntimeError("垃圾文件在删除前被替换，已保留并停止清理")
                 run_fd = ensure_quarantine()
-                os.replace(path, quarantine_name, dst_dir_fd=run_fd)
+                os.replace(
+                    path.name,
+                    quarantine_name,
+                    src_dir_fd=source_parent_fd,
+                    dst_dir_fd=run_fd,
+                )
                 moved = True
                 info = os.stat(quarantine_name, dir_fd=run_fd, follow_symlinks=False)
                 moved_identity = (
@@ -145,9 +188,13 @@ def delete_cleanup_items(
                     int(info.st_ino),
                 ) if stat_module.S_ISREG(info.st_mode) else None
                 if moved_identity != candidate.snapshot.identity:
-                    if not path.exists():
-                        os.replace(quarantine_name, path, src_dir_fd=run_fd)
-                        moved = False
+                    os.replace(
+                        quarantine_name,
+                        path.name,
+                        src_dir_fd=run_fd,
+                        dst_dir_fd=source_parent_fd,
+                    )
+                    moved = False
                     raise RuntimeError("垃圾文件在删除前被替换，已保留并停止清理")
                 os.unlink(quarantine_name, dir_fd=run_fd)
                 moved = False
@@ -159,6 +206,9 @@ def delete_cleanup_items(
                 else:
                     result.retained.append(str(path))
                 result.warnings.append(f"垃圾文件未删除 {path.name}: {exc}")
+            finally:
+                if source_parent_fd is not None:
+                    os.close(source_parent_fd)
     finally:
         if quarantine_run_fd is not None:
             os.close(quarantine_run_fd)
@@ -169,28 +219,87 @@ def delete_cleanup_items(
                 pass
             os.close(quarantine_dir_fd)
 
-    if not remove_empty_dirs:
-        return result
+    try:
+        if not remove_empty_dirs:
+            return result
 
-    selected = Path(selected_path).expanduser().resolve(strict=False) if selected_path else None
-    if selected:
-        selected = assert_within(selected, root)
-        parent_dirs.add(selected if selected.is_dir() else selected.parent)
-    for directory in sorted(parent_dirs, key=lambda item: len(item.parts), reverse=True):
-        current = directory
-        while current != root and root in current.parents:
+        selected = Path(selected_path).expanduser().resolve(strict=False) if selected_path else None
+        if selected:
             try:
-                assert_within(current, root)
-                if not current.exists() or not current.is_dir():
+                selected = assert_within(selected, root)
+                relative_selected = selected.relative_to(root)
+                selected_fd = open_source_parent(relative_selected)
+            except (OSError, PathMappingError):
+                parent_dirs.add(selected.parent)
+            else:
+                os.close(selected_fd)
+                parent_dirs.add(selected)
+
+        warned_path_change = False
+        for directory in sorted(parent_dirs, key=lambda item: len(item.parts), reverse=True):
+            try:
+                relative = assert_within(directory, root).relative_to(root)
+            except PathMappingError as exc:
+                if not warned_path_change:
+                    result.warnings.append(f"来源目录已变化，跳过空目录清理: {exc}")
+                    warned_path_change = True
+                continue
+            while relative.parts:
+                parent_fd: int | None = None
+                try:
+                    parent_fd = open_source_parent(Path(*relative.parts[:-1]))
+                    os.rmdir(relative.parts[-1], dir_fd=parent_fd)
+                    removed = root.joinpath(*relative.parts)
+                    result.removed_dirs.append(str(removed))
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    if getattr(exc, "errno", None) not in {errno.ENOTEMPTY, errno.EEXIST}:
+                        if not warned_path_change:
+                            result.warnings.append(
+                                f"来源目录已变化，跳过空目录清理: {type(exc).__name__}"
+                            )
+                            warned_path_change = True
                     break
-                if any(current.iterdir()):
-                    break
-                current.rmdir()
-                result.removed_dirs.append(str(current))
-            except OSError:
-                break
-            current = current.parent
-    return result
+                finally:
+                    if parent_fd is not None:
+                        os.close(parent_fd)
+                relative = Path(*relative.parts[:-1])
+        return result
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def cleanup_candidates_from_snapshots(
+    snapshots: Iterable[LocalFileSnapshot],
+) -> list[CleanupCandidate]:
+    """复用既有扫描快照，只选择可确定删除的非媒体垃圾。"""
+    items = list(snapshots)
+    cleanup, _ = classify_cleanup_items(items)
+    return cleanup
+
+
+def probable_sample_video_paths(
+    snapshots: Iterable[LocalFileSnapshot],
+    *,
+    sample_max_bytes: int = 300 * 1024 * 1024,
+) -> set[Path]:
+    """返回需保留但不自动归档的 sample/proof 视频路径。"""
+    items = list(snapshots)
+    primary_count = sum(
+        1 for item in items
+        if item.role == "video" and not _SAMPLE_RE.search(item.path.stem)
+    )
+    if primary_count <= 0:
+        return set()
+    return {
+        item.path
+        for item in items
+        if item.role == "video"
+        and item.size <= max(1, int(sample_max_bytes))
+        and _SAMPLE_RE.search(item.path.stem)
+    }
 
 
 def discover_cleanup_candidates(
@@ -245,8 +354,4 @@ def discover_cleanup_candidates(
             snapshots.append(adapter.snapshot(path))
         except Exception:
             continue
-    non_sample_videos = sum(
-        1 for item in snapshots if item.role == "video" and not _SAMPLE_RE.search(item.path.stem)
-    )
-    cleanup, _ = classify_cleanup_items(snapshots, primary_video_count=non_sample_videos)
-    return cleanup
+    return cleanup_candidates_from_snapshots(snapshots)

@@ -2564,6 +2564,12 @@ class TelegramBotTests(unittest.TestCase):
             self.assertTrue(result["success"])
             self.assertIn("Telegram Bot 配置已保存", result["warnings"][0])
 
+            restart.reset_mock(side_effect=True)
+            restart.side_effect = RuntimeError("restart failed")
+            result = api.save_config(background_request, payload)
+            self.assertTrue(result["success"])
+            self.assertIn("运行中实例热更新失败", result["warnings"][0])
+
     def test_notifier_reuses_single_bot_and_escapes_event_content(self):
         from app import notifier
 
@@ -4618,9 +4624,17 @@ class SecurityTests(InitializedWebTestCase):
             "organize_started": 0, "chat_id": "chat",
         }
         task = SimpleNamespace(hash="hash-1", name="Broken", progress=0.2, state="error")
-        with patch("app.database.update_download_request_and_sync_media_admission") as update, patch.object(
+        with patch("app.database.update_download_request_and_sync_media_admission") as update, patch(
+            "app.database.update_download_request"
+        ), patch.object(
             tracker, "_update_backend_log"
-        ) as update_log, patch("app.modules.download_tracker.send") as notify:
+        ) as update_log, patch(
+            "app.database.claim_download_request_notification",
+            return_value={"token": "notice-41", "attempts": 0},
+        ), patch(
+            "app.database.finalize_download_request_notification",
+            return_value=True,
+        ), patch("app.modules.download_tracker.send") as notify:
             tracker._update_request(row, [task], [])
         self.assertEqual(update.call_args.kwargs["qb_status"], "failed")
         self.assertEqual(update.call_args.kwargs["status"], "failed")
@@ -4640,7 +4654,9 @@ class SecurityTests(InitializedWebTestCase):
         rules = OrganizeRules(target_dir_id="target")
         manager = Mock()
         manager.start.return_value = {"ok": True, "task_id": "organize-1", "run_id": 17}
-        with patch("app.database.update_download_request_and_sync_media_admission") as update, patch.object(
+        with patch("app.database.update_download_request_and_sync_media_admission") as update, patch(
+            "app.database.update_download_request"
+        ), patch.object(
             tracker, "_update_backend_log"
         ), patch(
             "app.database.claim_download_request_organize", return_value=True
@@ -4649,6 +4665,12 @@ class SecurityTests(InitializedWebTestCase):
         }.get(key, default)), patch(
             "app.modules.download_tracker.OrganizeRules.from_config", return_value=rules
         ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch(
+            "app.database.claim_download_request_notification",
+            return_value={"token": "notice-42", "attempts": 0},
+        ), patch(
+            "app.database.finalize_download_request_notification",
+            return_value=True,
+        ), patch(
             "app.modules.download_tracker.send"
         ):
             tracker._update_request(row, [], [task])

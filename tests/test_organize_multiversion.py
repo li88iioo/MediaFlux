@@ -617,6 +617,25 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
             [first, second],
         )
 
+    def test_organize_logs_can_be_read_by_exact_operation_token(self):
+        from app import database as db
+
+        expected = db.add_organize_log(
+            "guangya", "same.mkv", "电影/A.mkv", "same-file", "success",
+            operation_token="manual-current",
+            original_parent_id="source", original_name="same.mkv",
+        )
+        db.add_organize_log(
+            "guangya", "same.mkv", "电影/B.mkv", "same-file", "success",
+            operation_token="manual-other",
+            original_parent_id="source", original_name="same.mkv",
+        )
+
+        self.assertEqual(
+            [int(row["id"]) for row in db.list_organize_logs_by_operation_token("manual-current")],
+            [expected],
+        )
+
     def _rules(self, **overrides):
         values = {
             "target_dir_id": "target",

@@ -34,6 +34,9 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:1258/readyz", self.text)
         self.assertIn("needs: [test, smoke]", self.text)
         self.assertIn("docker logs mediaflux-smoke", self.text)
+        self.assertIn("docker stop --time 60 mediaflux-smoke", self.text)
+        self.assertIn(".State.ExitCode", self.text)
+        self.assertIn("docker rm --force mediaflux-smoke", self.text)
 
     def test_smoke_verifies_embedded_docker_build_metadata(self) -> None:
         self.assertIn("mediaflux.py version --json", self.text)

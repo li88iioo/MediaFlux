@@ -51,9 +51,12 @@ class LocalMediaCleanupTests(unittest.TestCase):
             cleanup, retained = classify_cleanup_items(snapshots, primary_video_count=1)
             self.assertEqual(
                 {item.snapshot.path.name for item in cleanup},
-                {"下载必看.txt", "site.url", "Movie.sample.mkv", "download.mkv.!qB", "Thumbs.db", "empty.dat"},
+                {"下载必看.txt", "site.url", "download.mkv.!qB", "Thumbs.db", "empty.dat"},
             )
-            self.assertEqual({item.path.name for item in retained}, {"fonts.zip", "chapters.xml", "extra.bin"})
+            self.assertEqual(
+                {item.path.name for item in retained},
+                {"Movie.sample.mkv", "fonts.zip", "chapters.xml", "extra.bin"},
+            )
 
     def test_delete_rechecks_snapshot_and_removes_only_empty_subdirectories(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -98,6 +101,38 @@ class LocalMediaCleanupTests(unittest.TestCase):
             self.assertEqual(junk.read_bytes(), b"new payload")
             self.assertEqual(result.deleted, [])
             self.assertEqual(len(result.warnings), 1)
+
+    def test_source_parent_swap_cannot_delete_file_outside_root(self):
+        with tempfile.TemporaryDirectory() as root_raw, tempfile.TemporaryDirectory() as outside_raw:
+            root = Path(root_raw); group = root / "Movie"; group.mkdir()
+            outside = Path(outside_raw)
+            junk = group / "广告说明.txt"; junk.write_bytes(b"ad")
+            cleanup, _ = classify_cleanup_items([
+                LocalFilesystemAdapter(root).snapshot(junk)
+            ])
+            original_verify = LocalFilesystemAdapter.verify_snapshot
+            relocated = outside / "Movie"
+
+            def swap_source_parent(current_adapter, snapshot):
+                verified = original_verify(current_adapter, snapshot)
+                group.rename(relocated)
+                group.symlink_to(relocated, target_is_directory=True)
+                return verified
+
+            with patch.object(
+                LocalFilesystemAdapter,
+                "verify_snapshot",
+                autospec=True,
+                side_effect=swap_source_parent,
+            ):
+                result = delete_cleanup_items(
+                    cleanup, allowed_root=root, selected_path=group,
+                )
+
+            self.assertTrue((relocated / junk.name).exists())
+            self.assertEqual(result.deleted, [])
+            self.assertTrue(result.warnings)
+            self.assertTrue(any("跳过空目录清理" in item for item in result.warnings))
 
     def test_quarantine_directory_swap_cannot_redirect_deletion_outside_root(self):
         with tempfile.TemporaryDirectory() as root_raw, tempfile.TemporaryDirectory() as outside_raw:
@@ -182,6 +217,45 @@ class LocalMediaCleanupTests(unittest.TestCase):
             self.assertFalse(group.exists())
             self.assertTrue(root.exists())
             self.assertIn(str(group), result.removed_dirs)
+
+    def test_empty_directory_parent_swap_cannot_remove_outside_directory(self):
+        with tempfile.TemporaryDirectory() as root_raw, tempfile.TemporaryDirectory() as outside_raw:
+            root = Path(root_raw)
+            container = root / "Container"
+            selected = container / "Empty"
+            selected.mkdir(parents=True)
+            outside = Path(outside_raw)
+            outside_empty = outside / "Empty"
+            outside_empty.mkdir()
+            displaced = root / "Container-pinned"
+            original_rmdir = os.rmdir
+            swapped = False
+
+            def swap_parent_then_remove(path, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and str(path) == "Empty" and kwargs.get("dir_fd") is not None:
+                    swapped = True
+                    container.rename(displaced)
+                    container.symlink_to(outside, target_is_directory=True)
+                    try:
+                        return original_rmdir(path, *args, **kwargs)
+                    finally:
+                        container.unlink()
+                        displaced.rename(container)
+                return original_rmdir(path, *args, **kwargs)
+
+            with patch(
+                "app.modules.local_media_cleanup.os.rmdir",
+                side_effect=swap_parent_then_remove,
+            ):
+                result = delete_cleanup_items(
+                    [], allowed_root=root, selected_path=selected, remove_empty_dirs=True,
+                )
+
+            self.assertTrue(swapped)
+            self.assertFalse(selected.exists())
+            self.assertTrue(outside_empty.exists())
+            self.assertIn(str(selected), result.removed_dirs)
 
     def test_parent_of_moved_single_file_is_removed_when_empty(self):
         with tempfile.TemporaryDirectory() as root_raw:

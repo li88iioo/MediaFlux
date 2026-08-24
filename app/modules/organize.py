@@ -580,6 +580,8 @@ class OrganizeContext:
     group_progress: Callable[[dict], None] | None = None
     # 回退开关：为 False 时继续使用整源扫描/规划/执行的旧路径。
     group_pipeline: bool = True
+    # 单次调用的审计归属键；用于精确回读本轮日志，避免并发任务污染。
+    operation_token: str = ""
 
     @property
     def probe_cache_only(self) -> bool:
@@ -1764,6 +1766,7 @@ class Organizer:
             plans, rules, stats, companion_files, subtitle_plans_by_video,
             cancel_event, source_dir_id=source_dir_id,
             on_progress=on_progress,
+            operation_token=context.operation_token,
         )
         stats["execute_elapsed_seconds"] = round(
             time.monotonic() - execute_started, 3
@@ -1858,7 +1861,8 @@ class Organizer:
                  protected_source_ids: set[str] | None = None,
                  automatic: bool = False,
                  group_progress: Callable[[dict], None] | None = None,
-                 group_pipeline: bool = True) -> tuple[list, dict]:
+                 group_pipeline: bool = True,
+                 operation_token: str = "") -> tuple[list, dict]:
         """兼容入口；内部阶段统一通过 :class:`OrganizeContext` 传参。"""
         context = OrganizeContext(
             source_dir_id=str(source_dir_id),
@@ -1878,6 +1882,7 @@ class Organizer:
             automatic=bool(automatic),
             group_progress=group_progress,
             group_pipeline=bool(group_pipeline),
+            operation_token=str(operation_token or "").strip(),
         )
         return self._organize(context, rules)
 

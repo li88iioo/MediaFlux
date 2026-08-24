@@ -257,11 +257,72 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
         raise PathMappingError("条目在读取后发生变化，请刷新后重试")
 
     trash_root = root / LOCAL_MEDIA_TRASH_DIR
-    if trash_root.exists() and (trash_root.is_symlink() or not trash_root.is_dir()):
-        raise PathMappingError("MediaFlux 回收区路径不安全")
-    trash_root.mkdir(mode=0o700, exist_ok=True)
-    assert_within(trash_root, root)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    destination = trash_root / f"{timestamp}-{uuid.uuid4().hex[:10]}-{selected.name}"
-    os.replace(selected, destination)
-    return destination
+    destination_name = f"{timestamp}-{uuid.uuid4().hex[:10]}-{selected.name}"
+    destination = trash_root / destination_name
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    root_fd: int | None = None
+    trash_fd: int | None = None
+    moved = False
+    try:
+        root_fd = os.open(root, directory_flags)
+        fresh = os.stat(selected.name, dir_fd=root_fd, follow_symlinks=False)
+        if stat_module.S_ISLNK(fresh.st_mode):
+            raise PathMappingError("禁止删除符号链接")
+        fresh_identity = {
+            "size": int(fresh.st_size),
+            "mtime_ns": int(fresh.st_mtime_ns),
+            "device": int(fresh.st_dev),
+            "inode": int(fresh.st_ino),
+        }
+        if fresh_identity != normalized_expected:
+            raise PathMappingError("条目在删除前发生变化，请刷新后重试")
+        try:
+            os.mkdir(LOCAL_MEDIA_TRASH_DIR, mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        trash_fd = os.open(LOCAL_MEDIA_TRASH_DIR, directory_flags, dir_fd=root_fd)
+        os.replace(
+            selected.name,
+            destination_name,
+            src_dir_fd=root_fd,
+            dst_dir_fd=trash_fd,
+        )
+        moved = True
+        published = os.stat(destination_name, dir_fd=trash_fd, follow_symlinks=False)
+        published_identity = {
+            "size": int(published.st_size),
+            "mtime_ns": int(published.st_mtime_ns),
+            "device": int(published.st_dev),
+            "inode": int(published.st_ino),
+        }
+        if published_identity != normalized_expected:
+            os.replace(
+                destination_name,
+                selected.name,
+                src_dir_fd=trash_fd,
+                dst_dir_fd=root_fd,
+            )
+            moved = False
+            raise PathMappingError("条目移动到回收区时发生变化，已恢复原位置")
+        return destination
+    except (NotImplementedError, TypeError) as exc:
+        raise PathMappingError("当前运行环境不支持安全回收操作") from exc
+    except Exception:
+        if moved and root_fd is not None and trash_fd is not None:
+            try:
+                os.replace(
+                    destination_name,
+                    selected.name,
+                    src_dir_fd=trash_fd,
+                    dst_dir_fd=root_fd,
+                )
+            except Exception:
+                pass
+        raise
+    finally:
+        if trash_fd is not None:
+            os.close(trash_fd)
+        if root_fd is not None:
+            os.close(root_fd)

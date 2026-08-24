@@ -201,6 +201,37 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         worker.join(timeout=1)
         self.assertTrue(scheduler.stop(timeout=0.1))
 
+    def test_scheduler_stop_closes_worker_admission_during_due_query(self):
+        scheduler = RSSScheduler()
+        entered = threading.Event()
+        release = threading.Event()
+        results = []
+
+        def delayed_due_rows():
+            entered.set()
+            release.wait(timeout=2)
+            return [{"id": 9, "action": "download"}]
+
+        with patch.object(scheduler, "_run_cleanup_if_due", return_value=0), patch(
+            "app.modules.rss_scheduler.db.recover_stale_submitting_rss_entries",
+            return_value=0,
+        ), patch(
+            "app.modules.rss_scheduler.db.list_due_rss_subscriptions",
+            side_effect=delayed_due_rows,
+        ), patch.object(scheduler, "_execute") as execute:
+            runner = threading.Thread(target=lambda: results.append(scheduler.run_due()))
+            runner.start()
+            self.assertTrue(entered.wait(timeout=1))
+            self.assertTrue(scheduler.stop(timeout=0.01))
+            release.set()
+            runner.join(timeout=1)
+
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(results, [0])
+        execute.assert_not_called()
+        self.assertEqual(scheduler._running_ids, set())
+        self.assertEqual(scheduler._workers, {})
+
     def test_scheduler_cancels_queued_refresh_when_subscription_is_paused(self):
         sid = db.add_rss_subscription(
             "queued-pause",
@@ -300,12 +331,12 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
     def test_auto_download_applies_current_exclude_keywords_to_existing_pending_rows(self):
         sid = self._subscription("historical-filter")
         db.update_rss_subscription(sid, {"exclude_keywords": "合集"})
-        excluded_id = db.add_rss_entry_with_media(
+        # 历史普通条目可能没有 rss_entry_media；过滤时也必须补写可解释原因。
+        excluded_id = db.add_rss_entry(
             sid,
             "作品 合集 01-12",
             "excluded-guid",
-            media_key="tmdb:1:tv:S01E001",
-        )["id"]
+        )
         accepted_id = db.add_rss_entry(
             sid,
             "作品 S01E13",
@@ -367,6 +398,48 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             scheduler._execute(sid, "download")
 
         self.assertEqual(send_event.call_count, 3)
+
+    def test_scheduler_retries_unresolved_alert_and_persists_delivery_signature(self):
+        sid = self._subscription("scheduler-durable-alert")
+        entry_id = db.add_rss_entry(sid, "待核对资源", "durable-alert-guid")
+        self.assertIsNotNone(entry_id)
+        db.record_rss_entry_failure(int(entry_id), "qb_outcome_unknown", False)
+        issue = {
+            "refresh": {"total": 1, "new": 1, "skipped": 0},
+            "downloaded": 0,
+            "existing": 0,
+            "unverified": 0,
+            "failed": 1,
+            "outcome_unknown_count": 1,
+            "review_required": True,
+        }
+        healthy = {"total": 0, "new": 0, "skipped": 0}
+        scheduler = RSSScheduler()
+        with patch("app.modules.rss_scheduler.RSSEngine") as engine, patch(
+            "app.modules.rss_scheduler.send_event", side_effect=[False, True]
+        ) as send_event:
+            engine.return_value.auto_download.return_value = issue
+            scheduler._execute(sid, "download")
+            engine.return_value.refresh.return_value = healthy
+            scheduler._execute(sid, "subscribe")
+
+        self.assertEqual(send_event.call_count, 2)
+        persisted = db.kv_get(scheduler._alert_key(sid), "")
+        self.assertIn("outcome_unknown", persisted)
+
+        restarted = RSSScheduler()
+        with patch("app.modules.rss_scheduler.RSSEngine") as engine, patch(
+            "app.modules.rss_scheduler.send_event"
+        ) as send_event:
+            engine.return_value.refresh.return_value = healthy
+            restarted._execute(sid, "subscribe")
+        send_event.assert_not_called()
+
+        db.update_rss_entries_processed([int(entry_id)], True)
+        with patch("app.modules.rss_scheduler.RSSEngine") as engine:
+            engine.return_value.refresh.return_value = healthy
+            restarted._execute(sid, "subscribe")
+        self.assertEqual(db.kv_get(restarted._alert_key(sid), "missing"), "")
 
     def test_scheduler_warns_when_auto_download_outcome_is_unknown(self):
         scheduler = RSSScheduler()

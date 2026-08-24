@@ -3115,6 +3115,7 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
         recovery_thread.join(timeout=timeout)
     with _lifecycle_lock:
         thread_finished = not thread or not thread.is_alive()
+        recovery_finished = not recovery_thread or not recovery_thread.is_alive()
         if thread is None:
             if _bot is bot:
                 _bot = None
@@ -3124,12 +3125,9 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
                 _bot_thread_stop = None
             # 只有当前代 polling 已退出时，才清理它可能在 stop 快照后设置的 bot。
             _bot = None
-        if (
-            _progress_recovery_thread is recovery_thread
-            and (not recovery_thread or not recovery_thread.is_alive())
-        ):
+        if _progress_recovery_thread is recovery_thread and recovery_finished:
             _progress_recovery_thread = None
-        if _progress_recovery_stop is recovery_stop:
+        if _progress_recovery_stop is recovery_stop and recovery_finished:
             _progress_recovery_stop = None
     try:
         from app.modules.telegram_resource_search import shutdown_telegram_indexer_worker
@@ -3137,13 +3135,13 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
         shutdown_telegram_indexer_worker(timeout=timeout)
     except Exception as exc:
         logger.warning("停止 Telegram 资源站服务失败 type=%s", type(exc).__name__)
-    return thread_finished
+    return thread_finished and recovery_finished
 
 
-def stop_bot(timeout: float = 5.0) -> None:
-    """停止 Telegram 长轮询，并等待 polling 与恢复线程退出。"""
+def stop_bot(timeout: float = 5.0) -> bool:
+    """停止 Telegram 长轮询，并返回 polling 与恢复线程是否均已退出。"""
     with _lifecycle_control_lock:
-        _stop_bot_locked(timeout=timeout)
+        return _stop_bot_locked(timeout=timeout)
 
 
 def restart_bot() -> bool:

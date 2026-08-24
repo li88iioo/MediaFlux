@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,6 +57,40 @@ class _LocalScraper:
 
 
 class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
+    def test_download_notification_is_claimed_by_exactly_one_tracker(self):
+        request_id, _ = db.create_download_request(
+            "notification-claim", "magnet", title="并发通知"
+        )
+        db.update_download_request(
+            request_id,
+            status="completed",
+            notification_event_status="completed",
+            notification_delivery_status="pending",
+        )
+        barrier = threading.Barrier(3)
+
+        def claim():
+            barrier.wait()
+            return db.claim_download_request_notification(request_id)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(claim) for _ in range(2)]
+            barrier.wait()
+            claims = [future.result(timeout=5) for future in futures]
+
+        winners = [item for item in claims if item is not None]
+        self.assertEqual(len(winners), 1)
+        token = str(winners[0]["token"])
+        self.assertFalse(db.finalize_download_request_notification(
+            request_id, "stale-token", delivered=True,
+        ))
+        self.assertTrue(db.finalize_download_request_notification(
+            request_id, token, delivered=True,
+        ))
+        row = db.get_download_request(request_id)
+        self.assertEqual(row["notification_delivery_status"], "sent")
+        self.assertEqual(row["notification_lease_token"], "")
+
     def test_guangya_organize_claim_survives_qb_manual_review(self):
         request_id, _ = db.create_download_request(
             "mixed-terminal-organize", "magnet", title="混合终态资源"
@@ -210,6 +246,44 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             tracker._update_request(row, [], [], qb_available=True)
         self.assertEqual(update.call_args.kwargs["qb_status"], "manual_review")
         self.assertEqual(update.call_args.kwargs["status"], "manual_review")
+
+    def test_manual_review_notification_retries_until_delivery_succeeds(self):
+        request_id, _ = db.create_download_request(
+            f"notify-{uuid.uuid4().hex}", "magnet", title="Notify",
+            source_value="magnet:?xt=urn:btih:notify", chat_id="100",
+        )
+        db.update_download_request(
+            request_id,
+            status="submitted",
+            qb_status="outcome_unknown",
+            qb_task_id="",
+            gy_status="",
+        )
+        tracker = DownloadTracker()
+        row = db.get_download_request(request_id)
+        with patch("app.modules.download_tracker.send", return_value=False):
+            tracker._update_request(row, [], [], qb_available=True)
+
+        pending = db.get_download_request(request_id)
+        self.assertEqual(pending["status"], "manual_review")
+        self.assertEqual(pending["notification_delivery_status"], "retry_wait")
+        self.assertEqual(int(pending["notification_attempts"]), 1)
+
+        db.update_download_request(
+            request_id,
+            title="Changed after terminal state",
+            notification_next_retry_at="2000-01-01 00:00:00",
+        )
+        retry_row = db.get_download_request(request_id)
+        with patch("app.modules.download_tracker.send", return_value=True) as send:
+            tracker._update_request(retry_row, [], [], qb_available=True)
+
+        delivered = db.get_download_request(request_id)
+        self.assertEqual(delivered["notification_delivery_status"], "sent")
+        self.assertTrue(delivered["notification_sent_at"])
+        send.assert_called_once()
+        event = send.call_args.args[0]
+        self.assertEqual(dict(event.fields)["任务"], "Notify")
 
     def test_manual_review_targets_require_explicit_successor_resubmit(self):
         request_id, _ = db.create_download_request(

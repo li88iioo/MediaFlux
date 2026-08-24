@@ -567,6 +567,53 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
                 bot_handlers._progress_recovery_stop,
             ) = saved
 
+    def test_stop_reports_incomplete_while_old_recovery_generation_is_alive(self):
+        class RecoveryThread:
+            def __init__(self):
+                self.joined = False
+
+            def is_alive(self):
+                return True
+
+            def join(self, timeout):
+                self.joined = True
+
+        recovery = RecoveryThread()
+        recovery_stop = __import__("threading").Event()
+        saved = (
+            bot_handlers._bot,
+            bot_handlers._bot_thread,
+            bot_handlers._bot_thread_stop,
+            bot_handlers._progress_recovery_thread,
+            bot_handlers._progress_recovery_stop,
+        )
+        bot_handlers._bot = None
+        bot_handlers._bot_thread = None
+        bot_handlers._bot_thread_stop = None
+        bot_handlers._progress_recovery_thread = recovery
+        bot_handlers._progress_recovery_stop = recovery_stop
+        try:
+            with patch(
+                "app.modules.telegram_resource_search.shutdown_telegram_indexer_worker"
+            ):
+                stopped = bot_handlers._stop_bot_locked(
+                    timeout=0.01, cancel_operations=False,
+                )
+
+            self.assertFalse(stopped)
+            self.assertTrue(recovery.joined)
+            self.assertTrue(recovery_stop.is_set())
+            self.assertIs(bot_handlers._progress_recovery_thread, recovery)
+            self.assertIs(bot_handlers._progress_recovery_stop, recovery_stop)
+        finally:
+            (
+                bot_handlers._bot,
+                bot_handlers._bot_thread,
+                bot_handlers._bot_thread_stop,
+                bot_handlers._progress_recovery_thread,
+                bot_handlers._progress_recovery_stop,
+            ) = saved
+
     def test_restart_holds_control_lock_across_stop_reset_and_start(self):
         events: list[str] = []
 

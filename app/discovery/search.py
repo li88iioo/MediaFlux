@@ -225,15 +225,24 @@ class DiscoverySearchService:
         with self._state_lock:
             if self._providers_closed:
                 return
+            # 关闭尝试由当前调用独占；单个 provider 失败不能阻断其余资源释放。
             self._providers_closed = True
         seen: set[int] = set()
-        for provider in self.providers.values():
+        for name, provider in self.providers.items():
             if id(provider) in seen:
                 continue
             seen.add(id(provider))
             close = getattr(provider, "close", None)
-            if callable(close):
+            if not callable(close):
+                continue
+            try:
                 close()
+            except Exception as exc:
+                logger.warning(
+                    "Discovery provider close failed provider=%s type=%s",
+                    name,
+                    type(exc).__name__,
+                )
 
     def _future_finished(self, future: Future) -> None:
         close_providers = False
@@ -288,15 +297,24 @@ class DiscoverySearchService:
         items_by_name: dict[str, list[MediaCard]] = {}
         more_by_name: dict[str, bool] = {}
 
-        with self._state_lock:
-            if self._closed:
-                raise RuntimeError("Discovery search service is closed")
-            future_map = {
-                self._executor.submit(self.providers[name].search, query, page): name
-                for name in selected
-                if name in self.providers
-            }
-            self._inflight.update(future_map)
+        future_map: dict[Future, str] = {}
+        try:
+            with self._state_lock:
+                if self._closed:
+                    raise RuntimeError("Discovery search service is closed")
+                # 每次 submit 成功后立即登记，避免后续 submit 异常让已运行 Future
+                # 脱离生命周期账本并在 shutdown 时被提前关闭 provider。
+                for name in selected:
+                    if name not in self.providers:
+                        continue
+                    future = self._executor.submit(
+                        self.providers[name].search, query, page,
+                    )
+                    future_map[future] = name
+                    self._inflight.add(future)
+        finally:
+            # 已完成 Future 的 callback 可能同步执行；必须在 state lock 外注册，
+            # 否则极快 provider 会在同一线程回调并自锁。
             for future in future_map:
                 future.add_done_callback(self._future_finished)
         missing = [name for name in selected if name not in self.providers]

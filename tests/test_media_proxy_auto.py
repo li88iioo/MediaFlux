@@ -2024,7 +2024,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class RejectingWebSocketSession:
-            def __init__(self, *, connector, trace_configs=None) -> None:
+            def __init__(self, *, connector, trace_configs=None, timeout=None) -> None:
                 self.closed = False
 
             async def ws_connect(self, target: str, **kwargs):
@@ -2109,7 +2109,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class RejectingWebSocketSession:
-            def __init__(self, *, connector, trace_configs=None) -> None:
+            def __init__(self, *, connector, trace_configs=None, timeout=None) -> None:
                 captured["connector"] = connector
                 captured["trace_configs"] = trace_configs
                 self.closed = False
@@ -2217,7 +2217,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
 
         class RejectingWebSocketSession:
-            def __init__(self, *, connector, trace_configs=None) -> None:
+            def __init__(self, *, connector, trace_configs=None, timeout=None) -> None:
                 self.closed = False
 
             async def ws_connect(self, target: str, **kwargs):
@@ -2340,7 +2340,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         class RedirectingWebSocketSession:
-            def __init__(self, *, connector, trace_configs=None) -> None:
+            def __init__(self, *, connector, trace_configs=None, timeout=None) -> None:
                 captured["trace_configs"] = trace_configs
                 self.closed = False
                 captured["session"] = self
@@ -2410,7 +2410,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         captured_session: dict[str, object] = {}
 
         class ConnectedSession:
-            def __init__(self, *, connector, trace_configs=None) -> None:
+            def __init__(self, *, connector, trace_configs=None, timeout=None) -> None:
                 self.connector = connector
                 self.closed = False
                 captured_session["value"] = self
@@ -2469,6 +2469,196 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertTrue(upstream.closed)
         self.assertTrue(captured_session["value"].closed)
         self.assertTrue(downstream.closed)
+
+    def test_websocket_forwards_downstream_close_code_and_reason_upstream(self):
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "upstream_url": "http://media.example:8096",
+        }
+        pinned = media_proxy._PinnedUpstreamTarget(
+            logical_url="http://media.example:8096/socket",
+            connect_url="http://203.0.113.10:8096/socket",
+            host_header="media.example:8096",
+            sni_hostname="media.example",
+            addresses=("203.0.113.10",),
+        )
+
+        class Upstream:
+            protocol = None
+
+            def __init__(self) -> None:
+                self.close_calls: list[dict[str, object]] = []
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Event().wait()
+
+            async def close(self, **kwargs) -> None:
+                self.close_calls.append(kwargs)
+
+        upstream = Upstream()
+
+        class Session:
+            def __init__(self, *, connector, trace_configs=None, timeout=None) -> None:
+                self.closed = False
+
+            async def ws_connect(self, _target: str, **_kwargs):
+                return upstream
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class Downstream:
+            def __init__(self) -> None:
+                self.headers = httpx.Headers({
+                    "Authorization": 'MediaBrowser Token="client-token"',
+                })
+                self.query_params = httpx.QueryParams()
+                self.url = SimpleNamespace(query="")
+                self.scope = {"subprotocols": []}
+                self.close_calls: list[dict[str, object]] = []
+
+            async def accept(self, **_kwargs) -> None:
+                return None
+
+            async def receive(self):
+                return {
+                    "type": "websocket.disconnect",
+                    "code": 1001,
+                    "reason": "client leaving",
+                }
+
+            async def close(self, **kwargs) -> None:
+                self.close_calls.append(kwargs)
+
+        downstream = Downstream()
+        app = media_proxy.create_proxy_app(7)
+        websocket_route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == "/{path:path}"
+            and getattr(route, "methods", None) is None
+        )
+        with patch(
+            "app.modules.media_proxy.database.get_media_proxy_instance",
+            return_value=instance,
+        ), patch(
+            "app.modules.media_proxy._pin_upstream_target",
+            return_value=pinned,
+        ), patch(
+            "app.modules.media_proxy.TCPConnector", return_value=object(),
+        ), patch(
+            "app.modules.media_proxy.ClientSession", Session,
+        ):
+            asyncio.run(websocket_route.endpoint(downstream, "socket"))
+
+        self.assertEqual(upstream.close_calls, [{
+            "code": 1001,
+            "message": b"client leaving",
+        }])
+        self.assertEqual(downstream.close_calls[-1]["code"], 1000)
+
+    def test_websocket_close_reason_is_bounded_to_protocol_limit(self):
+        bounded = media_proxy._bounded_websocket_reason("离" * 100)
+        self.assertLessEqual(len(bounded.encode("utf-8")), 123)
+        self.assertEqual(media_proxy._valid_websocket_close_code(1001), 1001)
+        self.assertEqual(media_proxy._valid_websocket_close_code(999), 1000)
+
+    def test_websocket_forwards_upstream_close_code_and_reason_downstream(self):
+        instance = {
+            **self._instance(),
+            "server_type": "jellyfin",
+            "upstream_url": "http://media.example:8096",
+        }
+        pinned = media_proxy._PinnedUpstreamTarget(
+            logical_url="http://media.example:8096/socket",
+            connect_url="http://203.0.113.10:8096/socket",
+            host_header="media.example:8096",
+            sni_hostname="media.example",
+            addresses=("203.0.113.10",),
+        )
+
+        class Upstream:
+            protocol = None
+
+            def __init__(self) -> None:
+                self.sent_close = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.sent_close:
+                    raise StopAsyncIteration
+                self.sent_close = True
+                return SimpleNamespace(
+                    type=media_proxy.WSMsgType.CLOSE,
+                    data=1008,
+                    extra="policy rejected",
+                )
+
+            async def close(self, **_kwargs) -> None:
+                return None
+
+        upstream = Upstream()
+
+        class Session:
+            def __init__(self, *, connector, trace_configs=None, timeout=None) -> None:
+                return None
+
+            async def ws_connect(self, _target: str, **_kwargs):
+                return upstream
+
+            async def close(self) -> None:
+                return None
+
+        class Downstream:
+            def __init__(self) -> None:
+                self.headers = httpx.Headers({
+                    "Authorization": 'MediaBrowser Token="client-token"',
+                })
+                self.query_params = httpx.QueryParams()
+                self.url = SimpleNamespace(query="")
+                self.scope = {"subprotocols": []}
+                self.close_calls: list[dict[str, object]] = []
+
+            async def accept(self, **_kwargs) -> None:
+                return None
+
+            async def receive(self):
+                await asyncio.Event().wait()
+
+            async def close(self, **kwargs) -> None:
+                self.close_calls.append(kwargs)
+
+        downstream = Downstream()
+        app = media_proxy.create_proxy_app(7)
+        websocket_route = next(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) == "/{path:path}"
+            and getattr(route, "methods", None) is None
+        )
+        with patch(
+            "app.modules.media_proxy.database.get_media_proxy_instance",
+            return_value=instance,
+        ), patch(
+            "app.modules.media_proxy._pin_upstream_target",
+            return_value=pinned,
+        ), patch(
+            "app.modules.media_proxy.TCPConnector", return_value=object(),
+        ), patch(
+            "app.modules.media_proxy.ClientSession", Session,
+        ):
+            asyncio.run(websocket_route.endpoint(downstream, "socket"))
+
+        self.assertEqual(downstream.close_calls[-1], {
+            "code": 1008,
+            "reason": "policy rejected",
+        })
 
     def test_replace_header_removes_all_case_insensitive_duplicates(self):
         headers = {
@@ -8306,6 +8496,8 @@ class HybridMediaProxyTests(unittest.TestCase):
                     "content-range": "bytes 0-10/100",
                     "accept-ranges": "bytes",
                     "host": "upstream.invalid",
+                    "connection": "Foo, keep-alive",
+                    "foo": "upstream-secret",
                 },
             )
         ]
@@ -8318,7 +8510,11 @@ class HybridMediaProxyTests(unittest.TestCase):
         ):
             response = client.get(
                 "/emby/Videos/local-item/stream?MediaSourceId=local-source&api_key=client-token",
-                headers={"Range": "bytes=0-10"},
+                headers={
+                    "Range": "bytes=0-10",
+                    "Connection": "Foo, keep-alive",
+                    "Foo": "client-secret",
+                },
             )
 
         self.assertEqual(response.status_code, 206)
@@ -8327,6 +8523,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(response.headers["content-range"], "bytes 0-10/100")
         self.assertEqual(response.headers["accept-ranges"], "bytes")
         self.assertNotIn("host", response.headers)
+        self.assertNotIn("foo", response.headers)
+        self.assertNotIn("connection", response.headers)
         self.assertEqual(
             str(_FakeAsyncClient.requests[0].url),
             "http://127.0.0.1:8096/emby/Videos/local-item/stream?MediaSourceId=local-source",
@@ -8334,6 +8532,8 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeAsyncClient.requests[0].headers["X-Emby-Token"], "client-token")
         self.assertEqual(_FakeAsyncClient.requests[0].headers["Range"], "bytes=0-10")
         self.assertNotIn("Content-Length", _FakeAsyncClient.requests[0].headers)
+        self.assertNotIn("Foo", _FakeAsyncClient.requests[0].headers)
+        self.assertNotIn("Connection", _FakeAsyncClient.requests[0].headers)
 
     def test_fallback_manual_binding_does_not_rewrite_a_different_local_source(self):
         payload = {
@@ -8508,6 +8708,43 @@ class HybridMediaProxyTests(unittest.TestCase):
             "https://signed.invalid/sync-file",
         ])
         self.assertEqual(cache.metrics()["entries"], 1)
+
+    def test_browser_direct_target_cache_expires_entries(self):
+        clock = [10.0]
+        cache = media_proxy.BrowserDirectTargetCache(
+            ttl_seconds=5.0,
+            clock=lambda: clock[0],
+        )
+        url = "https://cdn.example.invalid/signed"
+
+        self.assertFalse(cache.contains(url))
+        cache.remember(url)
+        self.assertTrue(cache.contains(url))
+        clock[0] = 15.0
+        self.assertFalse(cache.contains(url))
+
+    def test_browser_direct_target_cache_evicts_least_recently_used_entry(self):
+        cache = media_proxy.BrowserDirectTargetCache(max_entries=2)
+        first = "https://cdn.example.invalid/first"
+        second = "https://cdn.example.invalid/second"
+        third = "https://cdn.example.invalid/third"
+        cache.remember(first)
+        cache.remember(second)
+        self.assertTrue(cache.contains(first))
+        cache.remember(third)
+
+        self.assertTrue(cache.contains(first))
+        self.assertTrue(cache.contains(third))
+        self.assertFalse(cache.contains(second))
+
+    def test_browser_direct_target_cache_only_trusts_explicitly_validated_urls(self):
+        cache = media_proxy.BrowserDirectTargetCache()
+        rejected = "https://127.0.0.1/private"
+
+        self.assertFalse(cache.contains(rejected))
+        self.assertFalse(cache.contains(rejected))
+        cache.remember("https://cdn.example.invalid/validated")
+        self.assertFalse(cache.contains(rejected))
 
     def test_range_diagnostic_only_exposes_shape(self):
         self.assertEqual(media_proxy._range_diagnostic(""), "none")

@@ -1030,7 +1030,7 @@ class DirectoryScrapeService:
             if current.fingerprint != record.inspection.fingerprint:
                 raise DirectoryScrapeConflictError("目录内容已变化，请重新检查并生成预览")
             check_cancel()
-            organize_log_high_water = db.latest_organize_log_id()
+            operation_token = f"manual-{uuid.uuid4().hex}"
             organizer = self._organizer(
                 record.scope_type,
                 current,
@@ -1075,6 +1075,7 @@ class DirectoryScrapeService:
                 # 完全一致；缓存由预览阶段的在线探测负责预热。
                 media_probe_cache_only=True,
                 cancel_event=cancel_event,  # type: ignore[arg-type]
+                operation_token=operation_token,
             )
             if cancellation_requested():
                 stats["stopped"] = 1
@@ -1102,12 +1103,7 @@ class DirectoryScrapeService:
                     record.rules,
                     source_name=record.inspection.directory_name,
                 )
-            file_ids = {item.file_id for item in record.inspection.videos}
-            new_rows = [
-                row
-                for row in db.list_organize_logs_after(organize_log_high_water)
-                if str(row["file_id"]) in file_ids
-            ]
+            new_rows = db.list_organize_logs_by_operation_token(operation_token)
             log_ids = [int(row["id"]) for row in new_rows]
             self._record_successful_manual_confirmations(record, new_rows)
             self.store.consume_preview(owner, preview_id)

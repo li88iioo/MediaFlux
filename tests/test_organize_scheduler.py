@@ -395,6 +395,49 @@ class OrganizeSchedulerTests(unittest.TestCase):
         manager.shutdown.assert_called_once_with(timeout=30.0)
         self.assertIn("停止网盘整理任务超时", "\n".join(captured.output))
 
+    def test_application_shutdown_propagates_bot_and_download_tracker_timeouts(self):
+        from app import main
+
+        manager = MagicMock()
+        manager.shutdown.return_value = True
+        downloads = MagicMock()
+        downloads.stop.return_value = False
+        rss = MagicMock()
+        rss.stop.return_value = True
+        subscriptions = MagicMock()
+        subscriptions.stop.return_value = True
+        with patch(
+            "app.modules.organize_tasks.get_organize_manager", return_value=manager,
+        ), patch(
+            "app.bot.stop_bot", return_value=False,
+        ), patch(
+            "app.modules.download_tracker.get_download_tracker", return_value=downloads,
+        ), patch(
+            "app.modules.rss_scheduler.get_rss_scheduler", return_value=rss,
+        ), patch(
+            "app.modules.media_subscription_scheduler.get_media_subscription_scheduler",
+            return_value=subscriptions,
+        ), patch(
+            "app.modules.agent_jobs_scheduler.get_agent_jobs_scheduler",
+        ), patch(
+            "app.modules.agent_library_patrol_scheduler.get_agent_library_patrol_scheduler",
+        ), patch(
+            "app.modules.agent_download_verification_scheduler.get_download_library_verification_scheduler",
+        ), patch(
+            "app.modules.organize_scheduler.get_organize_scheduler",
+        ), patch(
+            "app.modules.local_media_scheduler.get_local_media_scheduler",
+        ), patch(
+            "app.modules.organize_confirmations.stop_confirmation_dispatcher",
+        ), patch(
+            "app.modules.scheduler.get_scheduler",
+        ), self.assertLogs("app.main", level="WARNING") as captured:
+            self.assertFalse(main.stop_background_services())
+
+        output = "\n".join(captured.output)
+        self.assertIn("停止 TG Bot 超时", output)
+        self.assertIn("停止下载跟踪器超时", output)
+
     def test_verification_scheduler_stop_error_logs_only_exception_type(self):
         from app import main
 

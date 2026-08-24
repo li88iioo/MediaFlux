@@ -43,6 +43,7 @@ class STRMMetadataWorker:
         self._failed_session = 0
         self._changed_paths: list[str] = []
         self._last_refresh_at = time.monotonic()
+        self._refresh_retry_pending = False
 
     def start(self) -> None:
         with self._state_lock:
@@ -323,23 +324,31 @@ class STRMMetadataWorker:
         interval = max(
             30, min(get_int("STRM_METADATA_REFRESH_INTERVAL_SECONDS", 300), 3600)
         )
-        if not force and len(self._changed_paths) < batch_size and (
-            time.monotonic() - self._last_refresh_at < interval
-        ):
+        elapsed = time.monotonic() - self._last_refresh_at
+        if self._refresh_retry_pending and not force and elapsed < interval:
+            return
+        if not force and len(self._changed_paths) < batch_size and elapsed < interval:
             return
         paths = list(dict.fromkeys(self._changed_paths))
-        self._changed_paths.clear()
         self._last_refresh_at = time.monotonic()
         try:
             from app.modules.scheduler import STRMScheduler
 
-            STRMScheduler._refresh_media_servers(
+            results = STRMScheduler._refresh_media_servers(
                 has_changes=True,
                 changed_paths=paths,
                 changed_dirs=[],
             )
         except Exception:
-            logger.exception("STRM 元数据落盘后的媒体库刷新失败")
+            self._refresh_retry_pending = True
+            logger.exception("STRM 元数据落盘后的媒体库刷新失败，将保留变更稍后重试")
+            return
+        if results and not all(bool(value) for value in results.values()):
+            self._refresh_retry_pending = True
+            logger.warning("STRM 元数据已落盘，但媒体库刷新未全部成功，将稍后重试")
+            return
+        self._changed_paths.clear()
+        self._refresh_retry_pending = False
 
 
 _worker = STRMMetadataWorker()

@@ -220,7 +220,12 @@ class LocalFilesystemAdapter:
             raise LocalStorageError(f"目录暂时不可完整读取: {start.name}") from walk_errors[0]
         return False
 
-    def scan(self, path: Path | None = None) -> list[LocalFileSnapshot]:
+    def scan(
+        self,
+        path: Path | None = None,
+        *,
+        include_non_media: bool = False,
+    ) -> list[LocalFileSnapshot]:
         start = assert_within(Path(path) if path is not None else self.allowed_root, self.allowed_root)
         relative_parts = start.relative_to(self.allowed_root).parts
         if any(is_ignored_local_media_directory(part) for part in relative_parts):
@@ -253,12 +258,14 @@ class LocalFilesystemAdapter:
 
         snapshots: list[LocalFileSnapshot] = []
         for candidate in sorted(candidates, key=lambda item: item.as_posix().casefold()):
-            if self.is_temporary(candidate) or candidate.is_symlink():
+            if candidate.is_symlink():
+                continue
+            if not include_non_media and self.is_temporary(candidate):
                 continue
             snapshot = self.snapshot(candidate)
-            if snapshot.size <= 0:
+            if not include_non_media and snapshot.size <= 0:
                 continue
-            if snapshot.role == "other":
+            if not include_non_media and snapshot.role == "other":
                 continue
             if snapshot.role == "video" and snapshot.size < self.min_video_size:
                 continue

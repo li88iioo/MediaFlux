@@ -34,10 +34,16 @@ class DownloadTracker:
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.RLock()
+        self._run_lock = threading.Lock()
+        self._stopping = False
+        self._lifecycle_generation = 0
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
+        with self._lifecycle_lock:
+            if self._stopping or (self._thread and self._thread.is_alive()):
+                return
+            generation = self._lifecycle_generation
         try:
             projected, released = db.reconcile_startup_media_download_admissions(
                 stale_seconds=self._missing_grace_seconds()
@@ -51,24 +57,47 @@ class DownloadTracker:
         except Exception:
             # 恢复失败不阻断主服务；后续订阅巡检仍会继续按请求状态对账。
             logger.exception("启动恢复下载准入失败")
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, name="download-tracker", daemon=True)
-        self._thread.start()
+        with self._lifecycle_lock:
+            if (
+                self._stopping
+                or generation != self._lifecycle_generation
+                or (self._thread and self._thread.is_alive())
+            ):
+                return
+            self._stop_event.clear()
+            thread = threading.Thread(
+                target=self._loop, name="download-tracker", daemon=True
+            )
+            self._thread = thread
+            thread.start()
         logger.info("下载任务跟踪器已启动")
 
-    def stop(self, timeout: float = 5.0) -> None:
-        self._stop_event.set()
-        self._wake_event.set()
-        thread = self._thread
+    def stop(self, timeout: float = 5.0) -> bool:
+        with self._lifecycle_lock:
+            self._stopping = True
+            self._lifecycle_generation += 1
+            self._stop_event.set()
+            self._wake_event.set()
+            thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
-        if not thread or not thread.is_alive():
-            self._thread = None
+            thread.join(timeout=max(0.0, float(timeout)))
+        stopped = not thread or not thread.is_alive()
+        with self._lifecycle_lock:
+            if self._thread is thread and stopped:
+                self._thread = None
+            self._stopping = False
+        if not stopped:
+            logger.warning("下载任务跟踪器未能在关闭超时内结束")
+        return stopped
 
     def reload(self) -> None:
         self._wake_event.set()
 
     def run_once(self) -> int:
+        with self._run_lock:
+            return self._run_once_locked()
+
+    def _run_once_locked(self) -> int:
         local_media_enabled = bool(db.list_local_media_sources(owner="admin", enabled_only=True))
         try:
             cursor = max(0, int(db.kv_get(_TRACKER_CURSOR_KEY, "0") or 0))
@@ -255,6 +284,30 @@ class DownloadTracker:
                 updates["completed_at"] = db.now()
             elif any(status in {"downloading", "completed", "outcome_unknown"} for status in statuses):
                 updates["status"] = "downloading"
+        next_root_status = str(updates.get("status") or "")
+        if (
+            next_root_status in {"completed", "failed", "manual_review"}
+            and root_status not in {"completed", "failed", "manual_review"}
+        ):
+            notification_payload = {
+                "title": str(self._row_value(row, "title", "") or "未命名任务"),
+                "event_status": next_root_status,
+                "qb_status": str(effective_qb or ""),
+                "gy_status": str(effective_gy or ""),
+                "chat_id": str(self._row_value(row, "chat_id", "") or ""),
+            }
+            updates.update({
+                "notification_event_status": next_root_status,
+                "notification_delivery_status": "pending",
+                "notification_attempts": 0,
+                "notification_next_retry_at": db.now(),
+                "notification_sent_at": None,
+                "notification_payload_json": json.dumps(
+                    notification_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            })
         if updates:
             db.update_download_request_and_sync_media_admission(request_id, **updates)
 
@@ -583,26 +636,102 @@ class DownloadTracker:
 
     @staticmethod
     def _notify_completion(row, qb_status: str, gy_status: str, updates: dict) -> None:
-        new_status = str(updates.get("status") or "")
-        if new_status not in {"completed", "failed", "manual_review"}:
+        payload: dict[str, object] = {}
+        payload_raw = str(
+            updates.get("notification_payload_json")
+            or DownloadTracker._row_value(row, "notification_payload_json", "")
+            or ""
+        )
+        if payload_raw:
+            try:
+                decoded = json.loads(payload_raw)
+                if isinstance(decoded, dict):
+                    payload = decoded
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+        delivery_status = str(
+            updates.get("notification_delivery_status")
+            or DownloadTracker._row_value(row, "notification_delivery_status", "")
+            or ""
+        )
+        event_status = str(
+            updates.get("notification_event_status")
+            or DownloadTracker._row_value(row, "notification_event_status", "")
+            or updates.get("status")
+            or ""
+        )
+        # 兼容直接调用该格式化入口的旧测试/插件；真实 tracker 行必须走持久化状态。
+        request_id = int(DownloadTracker._row_value(row, "id", 0) or 0)
+        if not delivery_status and not request_id:
+            delivery_status = "pending"
+            event_status = str(updates.get("status") or "")
+        if (
+            delivery_status not in {"pending", "retry_wait", "sending"}
+            or event_status not in {"completed", "failed", "manual_review"}
+        ):
             return
-        old_status = str(row["status"] or "")
-        if old_status in {"completed", "failed", "manual_review"}:
-            return
-        fields = [("任务", row["title"] or "未命名任务")]
+        event_status = str(payload.get("event_status") or event_status)
+        qb_status = str(payload.get("qb_status") or qb_status)
+        gy_status = str(payload.get("gy_status") or gy_status)
+        claim: dict[str, object] | None = None
+        if request_id:
+            claim = db.claim_download_request_notification(request_id)
+            if claim is None:
+                return
+        fields = [(
+            "任务",
+            str(payload.get("title") or DownloadTracker._row_value(row, "title", "") or "未命名任务"),
+        )]
         if qb_status:
             fields.append(("qBittorrent", DownloadTracker._label(qb_status)))
         if gy_status:
             fields.append(("光鸭云盘", DownloadTracker._label(gy_status)))
-        if new_status == "manual_review":
+        if event_status == "manual_review":
             fields.append(("处理", "结果待人工核对，请勿重复提交"))
-        send(
-            NotificationEvent(
-                "下载任务需要人工核对" if new_status == "manual_review" else "📥 下载任务状态更新",
-                fields=tuple(fields),
-            ),
-            chat_id=str(row["chat_id"] or "") or None,
+        try:
+            delivered = bool(send(
+                NotificationEvent(
+                    "下载任务需要人工核对" if event_status == "manual_review" else "📥 下载任务状态更新",
+                    fields=tuple(fields),
+                ),
+                chat_id=str(
+                    payload.get("chat_id")
+                    or DownloadTracker._row_value(row, "chat_id", "")
+                    or ""
+                ) or None,
+            ))
+        except Exception as exc:
+            delivered = False
+            logger.warning(
+                "下载任务通知发送异常 request#%s type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+        if not request_id or claim is None:
+            return
+        token = str(claim.get("token") or "")
+        attempts = int(claim.get("attempts") or 0) + 1
+        delay = min(3600, 30 * (2 ** min(attempts - 1, 6)))
+        retry_at = (datetime.now() + timedelta(seconds=delay)).strftime(
+            "%Y-%m-%d %H:%M:%S"
         )
+        try:
+            if not db.finalize_download_request_notification(
+                request_id,
+                token,
+                delivered=delivered,
+                retry_at=None if delivered else retry_at,
+            ):
+                logger.warning(
+                    "下载任务通知 lease 已失效 request#%s",
+                    request_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "下载任务通知状态提交异常 request#%s type=%s",
+                request_id,
+                type(exc).__name__,
+            )
 
     @staticmethod
     def _label(status: str) -> str:

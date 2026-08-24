@@ -180,6 +180,8 @@ CREATE TABLE IF NOT EXISTS organize_log (
 CREATE INDEX IF NOT EXISTS idx_organize_log_status_id ON organize_log(status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_organize_log_file_id ON organize_log(file_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_organize_log_status_path ON organize_log(status, new_path);
+CREATE INDEX IF NOT EXISTS idx_organize_log_operation_token
+    ON organize_log(operation_token, id) WHERE operation_token!='';
 
 CREATE TABLE IF NOT EXISTS organize_confirmations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -411,6 +413,14 @@ CREATE TABLE IF NOT EXISTS download_requests (
     local_import_completed_at TEXT,
     attention_cleared_at TEXT,
     attention_clear_note TEXT DEFAULT '',
+    notification_event_status TEXT DEFAULT '',
+    notification_delivery_status TEXT DEFAULT '',
+    notification_attempts INTEGER NOT NULL DEFAULT 0,
+    notification_next_retry_at TEXT,
+    notification_sent_at TEXT,
+    notification_payload_json TEXT DEFAULT '',
+    notification_lease_token TEXT DEFAULT '',
+    notification_lease_expires_at TEXT,
     error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -2473,6 +2483,13 @@ def init_db() -> None:
                 (timestamp, timestamp),
             )
             conn.execute(
+                "UPDATE download_requests SET notification_delivery_status='retry_wait',"
+                "notification_lease_token='',notification_lease_expires_at=NULL,"
+                "notification_next_retry_at=?,updated_at=? "
+                "WHERE notification_delivery_status='sending'",
+                (timestamp, timestamp),
+            )
+            conn.execute(
                 "UPDATE download_requests SET status='manual_review',"
                 "qb_status=CASE WHEN qb_status='submitting' THEN 'manual_review' ELSE qb_status END,"
                 "gy_status=CASE WHEN gy_status='submitting' THEN 'manual_review' ELSE gy_status END,"
@@ -2810,6 +2827,7 @@ def add_organize_log(
     error: str = "",
     release_parse: dict | None = None,
     parent_log_id: int | None = None,
+    operation_token: str = "",
     legacy_incomplete: bool | None = None,
     _conn: sqlite3.Connection | None = None,
 ) -> int:
@@ -2828,13 +2846,14 @@ def add_organize_log(
             "INSERT INTO organize_log(source,original_path,new_path,file_id,status,tmdb_id,provider,external_id,"
             "operation_type,source_dir_id,original_parent_id,original_name,current_parent_id,"
             "current_name,target_parent_id,media_type,title,year,season,episode,error,release_parse_json,parent_log_id,"
-            "version,legacy_incomplete,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "operation_token,version,legacy_incomplete,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 source, original_path, new_path, file_id, status, tmdb_id, provider, external_id,
                 operation_type, source_dir_id, original_parent_id, original_name,
                 current_parent_id, current_name, target_parent_id, media_type, title,
-                year, season, episode, error, release_parse_json, parent_log_id, 1, 1 if incomplete else 0,
+                year, season, episode, error, release_parse_json, parent_log_id,
+                str(operation_token or "").strip(), 1, 1 if incomplete else 0,
                 timestamp, timestamp,
             ),
         )
@@ -3020,6 +3039,18 @@ def list_organize_logs_after(after_id: int) -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM organize_log WHERE id>? ORDER BY id ASC",
             (max(0, int(after_id or 0)),),
+        ).fetchall()
+
+
+def list_organize_logs_by_operation_token(operation_token: str) -> list[sqlite3.Row]:
+    """精确读取单次整理调用写入的全部审计记录。"""
+    token = str(operation_token or "").strip()
+    if not token:
+        return []
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM organize_log WHERE operation_token=? ORDER BY id ASC",
+            (token,),
         ).fetchall()
 
 
@@ -3798,6 +3829,7 @@ from app.repositories.agent_jobs import (  # noqa: E402
 # ===== 下载请求认领与本地入库状态 =====
 from app.repositories.download_requests import (  # noqa: E402
     claim_download_request,
+    claim_download_request_notification,
     claim_download_request_organize,
     claim_download_request_targets,
     get_download_request_by_request_key,
@@ -3806,6 +3838,7 @@ from app.repositories.download_requests import (  # noqa: E402
     list_active_download_requests,
     mark_download_request_local_media_failed,
     mark_download_request_local_media_skipped,
+    finalize_download_request_notification,
     update_download_request,
     update_download_request_and_sync_media_admission,
     update_download_request_for_local_media_task,
@@ -3831,6 +3864,7 @@ from app.repositories.rss import (  # noqa: E402
     get_pending_rss_qb_snapshot,
     get_retryable_failed_rss_qb_snapshot,
     get_rss_diagnostic_summary,
+    get_rss_manual_review_summary,
     get_rss_subscription_safe_summary,
     get_rss_entry,
     get_rss_stats,

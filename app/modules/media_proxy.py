@@ -27,7 +27,8 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 import httpx
 import uvicorn
 from aiohttp import (
-    ClientSession, TCPConnector, TraceConfig, WSServerHandshakeError, WSMsgType,
+    ClientSession, ClientTimeout, TCPConnector, TraceConfig, WSServerHandshakeError,
+    WSMsgType,
 )
 from aiohttp.abc import AbstractResolver
 from fastapi import FastAPI, Request, WebSocket
@@ -49,7 +50,7 @@ _PLAYBACK_INFO_RE = re.compile(r"^(?:/emby)?/Items/([^/]+)/PlaybackInfo/?$", re.
 _PLAYGY_RE = re.compile(r"^(?:/emby)?/playgy/([^/]+)(?:/.*)?$", re.IGNORECASE)
 _HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade",
+    "te", "trailers", "transfer-encoding", "upgrade", "proxy-connection",
 }
 _REQUEST_ONLY_HEADERS = {"host", "content-length"}
 _FORWARDED_CLIENT_HEADERS = {
@@ -102,6 +103,7 @@ _signed_url_caches: dict[int, SignedUrlCache] = {}
 _signed_url_caches_lock = threading.RLock()
 
 _PROXY_CONNECT_TIMEOUT_SECONDS = 10.0
+_PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT_SECONDS = 20.0
 PLAYGY_SIGNED_URL_TIMEOUT_SECONDS = 8.0
 _PROXY_WRITE_TIMEOUT_SECONDS = 30.0
 _PROXY_POOL_TIMEOUT_SECONDS = 5.0
@@ -187,6 +189,27 @@ def _playback_info_response_limit() -> int:
 
 def _proxy_websocket_message_limit() -> int:
     return _bounded_megabytes_setting("MEDIA_PROXY_MAX_WEBSOCKET_MESSAGE_MB", 4, 64)
+
+
+def _valid_websocket_close_code(value: object, default: int = 1000) -> int:
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        return default
+    if code < 1000 or code > 4999 or code in {1004, 1005, 1006, 1015}:
+        return default
+    return code
+
+
+def _bounded_websocket_reason(value: object) -> str:
+    raw = str(value or "")
+    encoded = raw.encode("utf-8")[:123]
+    while encoded:
+        try:
+            return encoded.decode("utf-8")
+        except UnicodeDecodeError:
+            encoded = encoded[:-1]
+    return ""
 
 
 def _upstream_timeout() -> httpx.Timeout:
@@ -2471,11 +2494,31 @@ def resolve_local_binding(local_root: str, relative_path: str) -> Path:
     return candidate
 
 
+def _connection_header_tokens(headers: Any) -> set[str]:
+    """返回 Connection 声明的动态 hop-by-hop 字段名。"""
+    values: list[str] = []
+    get_list = getattr(headers, "get_list", None)
+    if callable(get_list):
+        values = [str(value) for value in get_list("connection")]
+    else:
+        value = getattr(headers, "get", lambda *_args: None)("connection")
+        if value is not None:
+            values = [str(value)]
+    return {
+        token.strip().casefold()
+        for value in values
+        for token in value.split(",")
+        if token.strip()
+    }
+
+
 def _response_headers(headers: httpx.Headers) -> dict[str, str]:
+    blocked = _HOP_HEADERS | {"host", "set-cookie"}
+    blocked |= _connection_header_tokens(headers)
     return {
         key: value
         for key, value in headers.items()
-        if key.lower() not in _HOP_HEADERS | {"host", "set-cookie"}
+        if key.lower() not in blocked
     }
 
 
@@ -2503,10 +2546,12 @@ def _without_mediaflux_session_cookie(value: str) -> str:
 
 
 def _request_headers(request: Request) -> dict[str, str]:
+    blocked = _HOP_HEADERS | _REQUEST_ONLY_HEADERS
+    blocked |= _connection_header_tokens(request.headers)
     headers = {
         key: value
         for key, value in request.headers.items()
-        if key.lower() not in _HOP_HEADERS | _REQUEST_ONLY_HEADERS
+        if key.lower() not in blocked
     }
     for key in tuple(headers):
         if key.casefold() != "cookie":
@@ -4982,6 +5027,13 @@ def create_proxy_app(
             session = ClientSession(
                 connector=connector,
                 trace_configs=[_websocket_trace_config()],
+                timeout=ClientTimeout(
+                    # 只约束 HTTP Upgrade；升级成功后 aiohttp 会按
+                    # ClientWSTimeout 将 WebSocket receive timeout 恢复为无限。
+                    total=_PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT_SECONDS,
+                    connect=_PROXY_CONNECT_TIMEOUT_SECONDS,
+                    sock_connect=_PROXY_CONNECT_TIMEOUT_SECONDS,
+                ),
             )
             upstream_ws = await session.ws_connect(
                 target,
@@ -5047,21 +5099,38 @@ def create_proxy_app(
                 await session.close()
             await websocket.close(code=1011, reason="Upstream WebSocket unavailable")
             return
+        close_state = {
+            "downstream_code": 1000,
+            "downstream_reason": "",
+            "upstream_code": 1000,
+            "upstream_reason": "",
+        }
+
         async def client_to_upstream():
             while True:
                 message = await websocket.receive()
                 kind = message.get("type")
                 if kind == "websocket.disconnect":
+                    close_state["downstream_code"] = _valid_websocket_close_code(
+                        message.get("code"),
+                    )
+                    close_state["downstream_reason"] = _bounded_websocket_reason(
+                        message.get("reason"),
+                    )
                     break
                 if message.get("text") is not None:
                     text = message["text"]
                     if len(text.encode("utf-8")) > message_limit:
+                        close_state["upstream_code"] = 1009
+                        close_state["upstream_reason"] = "WebSocket message too large"
                         await websocket.close(code=1009, reason="WebSocket message too large")
                         break
                     await upstream_ws.send_str(text)
                 elif message.get("bytes") is not None:
                     payload = message["bytes"]
                     if len(payload) > message_limit:
+                        close_state["upstream_code"] = 1009
+                        close_state["upstream_reason"] = "WebSocket message too large"
                         await websocket.close(code=1009, reason="WebSocket message too large")
                         break
                     await upstream_ws.send_bytes(payload)
@@ -5070,15 +5139,26 @@ def create_proxy_app(
             async for message in upstream_ws:
                 if message.type == WSMsgType.TEXT:
                     if len(message.data.encode("utf-8")) > message_limit:
+                        close_state["upstream_code"] = 1009
+                        close_state["upstream_reason"] = "Upstream message too large"
                         await websocket.close(code=1009, reason="Upstream message too large")
                         break
                     await websocket.send_text(message.data)
                 elif message.type == WSMsgType.BINARY:
                     if len(message.data) > message_limit:
+                        close_state["upstream_code"] = 1009
+                        close_state["upstream_reason"] = "Upstream message too large"
                         await websocket.close(code=1009, reason="Upstream message too large")
                         break
                     await websocket.send_bytes(message.data)
-                elif message.type in {WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR}:
+                elif message.type == WSMsgType.CLOSE:
+                    close_state["upstream_code"] = _valid_websocket_close_code(message.data)
+                    close_state["upstream_reason"] = _bounded_websocket_reason(message.extra)
+                    break
+                elif message.type in {WSMsgType.CLOSED, WSMsgType.ERROR}:
+                    close_state["upstream_code"] = _valid_websocket_close_code(
+                        getattr(upstream_ws, "close_code", None),
+                    )
                     break
 
         tasks: set[asyncio.Task] = set()
@@ -5105,11 +5185,29 @@ def create_proxy_app(
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             try:
-                await upstream_ws.close()
+                downstream_code = _valid_websocket_close_code(
+                    close_state.get("downstream_code"),
+                )
+                downstream_reason = _bounded_websocket_reason(
+                    close_state.get("downstream_reason"),
+                )
+                if downstream_code != 1000 or downstream_reason:
+                    await upstream_ws.close(
+                        code=downstream_code,
+                        message=downstream_reason.encode("utf-8"),
+                    )
+                else:
+                    await upstream_ws.close()
             finally:
                 await session.close()
             try:
-                await websocket.close()
+                upstream_code = _valid_websocket_close_code(
+                    close_state.get("upstream_code"),
+                )
+                upstream_reason = _bounded_websocket_reason(
+                    close_state.get("upstream_reason"),
+                )
+                await websocket.close(code=upstream_code, reason=upstream_reason)
             except Exception:
                 pass
 

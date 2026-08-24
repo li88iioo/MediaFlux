@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
@@ -739,6 +740,10 @@ _DOWNLOAD_REQUEST_UPDATE_FIELDS = {
     "qb_content_path", "local_import_status", "local_import_attempts",
     "local_import_error", "local_import_target", "local_import_started_at",
     "local_import_completed_at", "error", "completed_at",
+    "notification_event_status", "notification_delivery_status",
+    "notification_attempts", "notification_next_retry_at", "notification_sent_at",
+    "notification_payload_json",
+    "notification_lease_token", "notification_lease_expires_at",
     "title", "source_value", "torrent_data",
 }
 
@@ -760,6 +765,85 @@ def _update_download_request_conn(
     values.extend([timestamp, int(request_id)])
     conn.execute(f"UPDATE download_requests SET {', '.join(sets)} WHERE id=?", values)
     return True
+
+
+def claim_download_request_notification(
+    request_id: int,
+    *,
+    lease_seconds: int = 300,
+) -> dict[str, object] | None:
+    """原子领取一条到期通知，避免并发 tracker 重复发送。"""
+    timestamp = now()
+    lease_until = (
+        datetime.now() + timedelta(seconds=max(30, int(lease_seconds or 300)))
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    token = uuid.uuid4().hex
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT notification_attempts FROM download_requests WHERE id=? AND ("
+            "(notification_delivery_status IN ('pending','retry_wait') AND "
+            "(notification_next_retry_at IS NULL OR notification_next_retry_at='' "
+            "OR notification_next_retry_at<=datetime('now','localtime'))) OR "
+            "(notification_delivery_status='sending' AND "
+            "(notification_lease_expires_at IS NULL OR notification_lease_expires_at='' "
+            "OR notification_lease_expires_at<=datetime('now','localtime'))))",
+            (int(request_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        cur = conn.execute(
+            "UPDATE download_requests SET notification_delivery_status='sending',"
+            "notification_lease_token=?,notification_lease_expires_at=?,updated_at=? "
+            "WHERE id=? AND ("
+            "(notification_delivery_status IN ('pending','retry_wait') AND "
+            "(notification_next_retry_at IS NULL OR notification_next_retry_at='' "
+            "OR notification_next_retry_at<=datetime('now','localtime'))) OR "
+            "(notification_delivery_status='sending' AND "
+            "(notification_lease_expires_at IS NULL OR notification_lease_expires_at='' "
+            "OR notification_lease_expires_at<=datetime('now','localtime'))))",
+            (token, lease_until, timestamp, int(request_id)),
+        )
+        if cur.rowcount != 1:
+            return None
+        return {
+            "token": token,
+            "attempts": int(row["notification_attempts"] or 0),
+        }
+
+
+def finalize_download_request_notification(
+    request_id: int,
+    token: str,
+    *,
+    delivered: bool,
+    retry_at: str | None = None,
+) -> bool:
+    """仅由当前 lease 持有者提交通知结果。"""
+    normalized_token = str(token or "").strip()
+    if not normalized_token:
+        return False
+    timestamp = now()
+    with get_conn() as conn:
+        if delivered:
+            cur = conn.execute(
+                "UPDATE download_requests SET notification_delivery_status='sent',"
+                "notification_next_retry_at=NULL,notification_sent_at=?,"
+                "notification_lease_token='',notification_lease_expires_at=NULL,updated_at=? "
+                "WHERE id=? AND notification_delivery_status='sending' "
+                "AND notification_lease_token=?",
+                (timestamp, timestamp, int(request_id), normalized_token),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE download_requests SET notification_delivery_status='retry_wait',"
+                "notification_attempts=notification_attempts+1,notification_next_retry_at=?,"
+                "notification_lease_token='',notification_lease_expires_at=NULL,updated_at=? "
+                "WHERE id=? AND notification_delivery_status='sending' "
+                "AND notification_lease_token=?",
+                (retry_at or timestamp, timestamp, int(request_id), normalized_token),
+            )
+        return cur.rowcount == 1
 
 
 def update_download_request(request_id: int, **fields) -> None:
@@ -861,6 +945,12 @@ def list_active_download_requests(
         "gy_status IN ('submitted','downloading','outcome_unknown'))) ",
         "(status='completed' AND gy_status='completed' AND organize_started=0 "
         "AND (organize_next_retry_at IS NULL OR organize_next_retry_at='' OR organize_next_retry_at<=datetime('now','localtime')))",
+        "((notification_delivery_status IN ('pending','retry_wait') "
+        "AND (notification_next_retry_at IS NULL OR notification_next_retry_at='' "
+        "OR notification_next_retry_at<=datetime('now','localtime'))) OR "
+        "(notification_delivery_status='sending' AND "
+        "(notification_lease_expires_at IS NULL OR notification_lease_expires_at='' "
+        "OR notification_lease_expires_at<=datetime('now','localtime'))))",
     ]
     if include_local_import:
         clauses.append(

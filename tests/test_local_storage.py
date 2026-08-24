@@ -57,6 +57,28 @@ class LocalStorageTests(unittest.TestCase):
             )
             self.assertEqual(snapshot_digest(snapshots), snapshot_digest(list(reversed(snapshots))))
 
+    def test_scan_can_include_non_media_for_single_pass_cleanup_planning(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            (root / "Movie.mkv").write_bytes(b"video")
+            (root / "下载必看.txt").write_bytes(b"ad")
+            (root / "fonts.zip").write_bytes(b"font")
+            (root / "empty.tmp").touch()
+
+            snapshots = LocalFilesystemAdapter(root).scan(
+                include_non_media=True,
+            )
+
+            self.assertEqual(
+                [(item.path.name, item.role, item.size) for item in snapshots],
+                [
+                    ("empty.tmp", "other", 0),
+                    ("fonts.zip", "other", 4),
+                    ("Movie.mkv", "video", 5),
+                    ("下载必看.txt", "other", 2),
+                ],
+            )
+
     def test_contains_video_filters_non_media_only_directories(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)

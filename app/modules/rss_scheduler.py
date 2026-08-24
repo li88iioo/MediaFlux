@@ -1,6 +1,7 @@
 """RSS 订阅周期调度器。"""
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -12,6 +13,7 @@ from app.notifier import NotificationEvent, send_event
 
 logger = get_logger(__name__)
 _MAX_CONCURRENT_REFRESHES = 4
+_ALERT_KEY_PREFIX = "rss.scheduler.alert_signature."
 
 
 class RSSScheduler:
@@ -22,16 +24,51 @@ class RSSScheduler:
         self._running_ids: set[int] = set()
         self._workers: dict[int, threading.Thread] = {}
         self._lock = threading.Lock()
+        self._accepting = True
         self._cleanup_interval_seconds = 3600
         self._last_cleanup_at = 0.0
         self._alert_signatures: dict[int, tuple[object, ...]] = {}
+        self._loaded_alert_ids: set[int] = set()
+
+    @staticmethod
+    def _alert_key(sub_id: int) -> str:
+        return f"{_ALERT_KEY_PREFIX}{int(sub_id)}"
+
+    @staticmethod
+    def _serialize_signature(signature: tuple[object, ...]) -> str:
+        return json.dumps(signature, ensure_ascii=False, separators=(",", ":"))
+
+    def _persisted_signature(self, sub_id: int) -> tuple[object, ...] | None:
+        raw = db.kv_get(self._alert_key(sub_id), "")
+        with self._lock:
+            self._loaded_alert_ids.add(sub_id)
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        return tuple(value) if isinstance(value, list) else None
 
     def _notify_issue(self, sub_id: int, code: str, fields: list[tuple[str, object]]) -> None:
         signature = (code, *(str(value) for _label, value in fields))
         with self._lock:
             if self._alert_signatures.get(sub_id) == signature:
                 return
-        subscription = db.get_rss_subscription(sub_id)
+        try:
+            persisted = self._persisted_signature(sub_id)
+            if persisted == signature:
+                with self._lock:
+                    self._alert_signatures[sub_id] = signature
+                return
+            subscription = db.get_rss_subscription(sub_id)
+        except Exception as exc:
+            logger.warning(
+                "RSS 周期告警状态读取异常 sub#%s type=%s",
+                sub_id,
+                type(exc).__name__,
+            )
+            return
         name = str(subscription["name"] or f"订阅 #{sub_id}") if subscription else f"订阅 #{sub_id}"
         try:
             delivered = send_event(
@@ -47,24 +84,53 @@ class RSSScheduler:
                 type(exc).__name__,
             )
             return
-        if delivered:
-            with self._lock:
-                self._alert_signatures[sub_id] = signature
+        if not delivered:
+            return
+        with self._lock:
+            self._alert_signatures[sub_id] = signature
+        try:
+            db.kv_set(self._alert_key(sub_id), self._serialize_signature(signature))
+        except Exception as exc:
+            logger.warning(
+                "RSS 周期告警状态保存异常 sub#%s type=%s",
+                sub_id,
+                type(exc).__name__,
+            )
 
     def _clear_issue(self, sub_id: int) -> None:
         with self._lock:
-            self._alert_signatures.pop(sub_id, None)
+            had_issue = self._alert_signatures.pop(sub_id, None) is not None
+            loaded = sub_id in self._loaded_alert_ids
+        try:
+            if not loaded:
+                had_issue = self._persisted_signature(sub_id) is not None or had_issue
+            if not had_issue:
+                return
+            db.kv_set(self._alert_key(sub_id), "")
+        except Exception as exc:
+            logger.warning(
+                "RSS 周期告警状态清理异常 sub#%s type=%s",
+                sub_id,
+                type(exc).__name__,
+            )
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, name="rss-scheduler", daemon=True)
-        self._thread.start()
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._accepting = True
+            self._stop_event.clear()
+            self._wake_event.clear()
+            self._thread = threading.Thread(
+                target=self._loop, name="rss-scheduler", daemon=True,
+            )
+            self._thread.start()
         logger.info("RSS 调度器已启动")
 
     def stop(self, timeout: float = 5.0) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._lock:
+            self._accepting = False
         self._stop_event.set()
         self._wake_event.set()
         thread = self._thread
@@ -83,7 +149,8 @@ class RSSScheduler:
         return not alive and (self._thread is None or not self._thread.is_alive())
 
     def reload(self) -> None:
-        self._wake_event.set()
+        if not self._stop_event.is_set():
+            self._wake_event.set()
 
     def run_due(self) -> int:
         if self._stop_event.is_set():
@@ -97,31 +164,32 @@ class RSSScheduler:
         count = 0
         for row in db.list_due_rss_subscriptions():
             sub_id = int(row["id"])
+            worker = threading.Thread(
+                target=self._execute,
+                args=(
+                    sub_id,
+                    str(row["action"] or "subscribe"),
+                    rss_subscription_refresh_revision(row),
+                ),
+                name=f"rss-refresh-{sub_id}",
+                daemon=True,
+            )
             with self._lock:
+                # stop() 与任务准入共用一把锁，禁止关机窗口再启动新 worker。
+                if not self._accepting or self._stop_event.is_set():
+                    break
                 if len(self._running_ids) >= _MAX_CONCURRENT_REFRESHES:
                     break
                 if sub_id in self._running_ids:
                     continue
                 self._running_ids.add(sub_id)
-            try:
-                worker = threading.Thread(
-                    target=self._execute,
-                    args=(
-                        sub_id,
-                        str(row["action"] or "subscribe"),
-                        rss_subscription_refresh_revision(row),
-                    ),
-                    name=f"rss-refresh-{sub_id}",
-                    daemon=True,
-                )
-                with self._lock:
-                    self._workers[sub_id] = worker
-                worker.start()
-            except Exception:
-                with self._lock:
+                self._workers[sub_id] = worker
+                try:
+                    worker.start()
+                except Exception:
                     self._running_ids.discard(sub_id)
                     self._workers.pop(sub_id, None)
-                raise
+                    raise
             count += 1
         return count
 
@@ -191,7 +259,27 @@ class RSSScheduler:
                     [("状态", "部分订阅源刷新失败")],
                 )
             else:
-                self._clear_issue(sub_id)
+                unresolved = db.get_rss_manual_review_summary(sub_id)
+                outcome_unknown = int(unresolved.get("outcome_unknown_count") or 0)
+                failed = int(unresolved.get("failed_count") or 0)
+                if outcome_unknown:
+                    self._notify_issue(
+                        sub_id,
+                        "outcome_unknown",
+                        [
+                            ("状态", "提交结果待人工核对，请勿重复提交"),
+                            ("待核对", outcome_unknown),
+                            ("失败", failed),
+                        ],
+                    )
+                elif failed:
+                    self._notify_issue(
+                        sub_id,
+                        "partial_failure",
+                        [("状态", "周期下载部分失败"), ("失败", failed)],
+                    )
+                else:
+                    self._clear_issue(sub_id)
         except Exception as exc:
             logger.warning("RSS 周期任务异常 sub#%s type=%s", sub_id, type(exc).__name__)
             self._notify_issue(

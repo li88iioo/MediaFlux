@@ -965,10 +965,11 @@ def skip_pending_rss_entries(entry_ids: Iterable[int], reason: str) -> int:
                 (stamp, *eligible),
             )
             updated += int(cur.rowcount or 0)
-            conn.execute(
-                f"UPDATE rss_entry_media SET skip_reason=?,updated_at=? "
-                f"WHERE rss_entry_id IN ({eligible_placeholders})",
-                (message, stamp, *eligible),
+            conn.executemany(
+                "INSERT INTO rss_entry_media(rss_entry_id,skip_reason,created_at,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(rss_entry_id) DO UPDATE SET "
+                "skip_reason=excluded.skip_reason,updated_at=excluded.updated_at",
+                [(entry_id, message, stamp, stamp) for entry_id in eligible],
             )
     return updated
 
@@ -1090,6 +1091,25 @@ def update_rss_entries_processed_snapshot(
                 [now(), *ids],
             )
         return int(cur.rowcount or 0)
+
+
+def get_rss_manual_review_summary(sub_id: int) -> dict[str, int]:
+    """汇总订阅仍未处理的终态失败，供调度告警跨轮次重试与恢复。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN failure_code IN "
+            "('qb_outcome_unknown','guangya_outcome_unknown','submission_outcome_unknown') "
+            "THEN 1 ELSE 0 END) AS outcome_unknown_count, "
+            "COUNT(*) AS failed_count "
+            "FROM rss_entries WHERE rss_item_id=? AND status='failed' "
+            "AND COALESCE(processed,0)=0 AND COALESCE(failure_retryable,0)=0",
+            (int(sub_id),),
+        ).fetchone()
+    return {
+        "outcome_unknown_count": int(row["outcome_unknown_count"] or 0) if row else 0,
+        "failed_count": int(row["failed_count"] or 0) if row else 0,
+    }
 
 
 def get_rss_diagnostic_summary(

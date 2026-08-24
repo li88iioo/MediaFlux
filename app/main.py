@@ -308,6 +308,8 @@ def stop_background_services() -> bool:
     """停止任务生产者，再等待写任务在安全边界结束。"""
     subscription_workers_stopped = True
     rss_workers_stopped = True
+    bot_workers_stopped = True
+    download_tracker_stopped = True
     organize_drained = True
     # 先关闭整理准入，避免迟到的 TG 回调或调度器在关机窗口提交新任务。
     from app.modules.organize_tasks import get_organize_manager
@@ -319,8 +321,11 @@ def stop_background_services() -> bool:
     try:
         from app.bot import stop_bot
 
-        stop_bot()
+        bot_workers_stopped = bool(stop_bot())
+        if not bot_workers_stopped:
+            logger.warning("停止 TG Bot 超时，保留依赖运行时直到进程退出")
     except Exception as exc:
+        bot_workers_stopped = False
         logger.warning("停止 TG Bot 失败 type=%s", type(exc).__name__)
     try:
         from app.modules.agent_jobs_scheduler import get_agent_jobs_scheduler
@@ -347,8 +352,11 @@ def stop_background_services() -> bool:
     try:
         from app.modules.download_tracker import get_download_tracker
 
-        get_download_tracker().stop()
+        download_tracker_stopped = bool(get_download_tracker().stop())
+        if not download_tracker_stopped:
+            logger.warning("停止下载跟踪器超时，保留依赖运行时直到进程退出")
     except Exception as exc:
+        download_tracker_stopped = False
         logger.warning("停止下载跟踪器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.rss_scheduler import get_rss_scheduler
@@ -401,7 +409,13 @@ def stop_background_services() -> bool:
         get_scheduler().stop()
     except Exception as exc:
         logger.warning("停止 STRM 调度器失败 type=%s", type(exc).__name__)
-    return rss_workers_stopped and subscription_workers_stopped and organize_drained
+    return all((
+        bot_workers_stopped,
+        download_tracker_stopped,
+        rss_workers_stopped,
+        subscription_workers_stopped,
+        organize_drained,
+    ))
 
 
 def create_app(*, start_background: bool = False) -> FastAPI:
@@ -487,15 +501,37 @@ def create_app(*, start_background: bool = False) -> FastAPI:
 
                 try:
                     if runtime_safe_to_close:
-                        shutdown_discovery_service()
-                        shutdown_discovery_search_service()
-                        await shutdown_indexer_service()
+                        for label, closer in (
+                            ("discovery", shutdown_discovery_service),
+                            ("discovery-search", shutdown_discovery_search_service),
+                        ):
+                            try:
+                                closer()
+                            except Exception as exc:
+                                logger.warning(
+                                    "关闭 %s 运行时失败 type=%s",
+                                    label,
+                                    type(exc).__name__,
+                                )
+                        try:
+                            await shutdown_indexer_service()
+                        except Exception as exc:
+                            logger.warning(
+                                "关闭 indexer 运行时失败 type=%s",
+                                type(exc).__name__,
+                            )
                     else:
                         logger.warning(
                             "媒体订阅检查尚未收敛，本次关机跳过 discovery/indexer runtime 销毁"
                         )
                     if start_background:
-                        await proxy_manager.stop()
+                        try:
+                            await proxy_manager.stop()
+                        except Exception as exc:
+                            logger.warning(
+                                "关闭媒体反代运行时失败 type=%s",
+                                type(exc).__name__,
+                            )
                 finally:
                     if runtime_safe_to_close:
                         unbind_indexer_event_loop(indexer_event_loop)

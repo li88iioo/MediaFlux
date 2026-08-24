@@ -9,7 +9,7 @@
     <title>{% block title %}MediaFlux{% endblock %}</title>
     {% include "_theme_bootstrap.html" %}
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='favicon.svg') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='css/main.css') }}?v=20260821p">
+    <link rel="stylesheet" href="{{ url_for('static', path='css/main.css') }}?v=20260824a">
     {% block page_styles %}{% endblock %}
 </head>
 <body class="{% block body_class %}{% endblock %}{% if active in ['logs', 'local_media', 'organize', 'organize_rules', 'downloads', 'rss', 'guangya', 'guangya_offline', 'guangya_more', 'share_transfer', 'guangya_strm', 'media_proxy', 'gcid'] %} compact-workspace-page{% endif %}">
@@ -117,7 +117,7 @@
     <script src="{{ url_for('static', path='js/vendor/gsap.min.js') }}?v=20260818a"></script>
     <script src="{{ url_for('static', path='js/motion.js') }}?v=20260820a"></script>
     {% endif %}
-    <script src="{{ url_for('static', path='js/app.js') }}?v=20260820b"></script>
+    <script src="{{ url_for('static', path='js/app.js') }}?v=20260824a"></script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

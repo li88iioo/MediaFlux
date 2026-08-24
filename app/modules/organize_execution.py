@@ -37,6 +37,7 @@ def execute_organize_plans(
     *,
     source_dir_id: str = "",
     on_progress: Callable[[int, int], None] | None = None,
+    operation_token: str = "",
 ) -> None:
     # 延迟读取 organize 模块的兼容绑定：既避免循环导入，也保留现有
     # 测试/插件对 app.modules.organize 下审计、删除和日志符号的 patch 契约。
@@ -50,6 +51,14 @@ def execute_organize_plans(
     logger = organize_module.logger
     record_blocked_delete = organize_module.record_blocked_delete
     _safe_organize_failure = organize_module._safe_organize_failure
+
+    operation_token = str(operation_token or "").strip()
+
+    def write_organize_audit(log_args, log_kwargs, items):
+        payload = dict(log_kwargs)
+        if operation_token:
+            payload["operation_token"] = operation_token
+        return organizer._write_organize_audit(log_args, payload, items)
 
     subtitle_plans_by_video = subtitle_plans_by_video or {}
     moved_companions: set[str] = set()
@@ -105,7 +114,7 @@ def execute_organize_plans(
         companions = organizer._companions_for_plan(
             plan, companion_files.get(plan.original_path, [])
         )
-        organizer._write_organize_audit(
+        write_organize_audit(
             (
                 "guangya", plan.original_path,
                 plan.target_path + "/" + target_name,
@@ -196,7 +205,7 @@ def execute_organize_plans(
             match = p.match or MatchResult()
             parsed = organizer._parse_media_fields(p.original_name)
             position_season, position_episode = resolved_plan_position(p, parsed)
-            organizer._write_organize_audit(
+            write_organize_audit(
                 ("guangya", p.original_path, p.target_path, p.file_id, "skipped", match.tmdb_id),
                 {
                     "source_dir_id": source_dir_id,
@@ -236,7 +245,7 @@ def execute_organize_plans(
                 p, companion_files.get(p.original_path, [])
             )
             try:
-                organizer._write_organize_audit(
+                write_organize_audit(
                     (
                         "guangya", p.original_path, "", p.file_id,
                         audit_status, match.tmdb_id,
@@ -587,7 +596,7 @@ def execute_organize_plans(
             )
             log_id = None
             try:
-                log_id = organizer._write_organize_audit(
+                log_id = write_organize_audit(
                     (
                         "guangya", p.original_path,
                         p.target_path + "/" + actual_name,
@@ -744,7 +753,7 @@ def execute_organize_plans(
                 current_group["error"] = failure_message
             parsed = organizer._parse_media_fields(p.original_name)
             position_season, position_episode = resolved_plan_position(p, parsed)
-            failed_log_id = organizer._write_organize_audit(
+            failed_log_id = write_organize_audit(
                 (
                     "guangya", p.original_path, p.target_path,
                     p.file_id, "failed", p.match.tmdb_id,

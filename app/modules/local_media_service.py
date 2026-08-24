@@ -21,7 +21,11 @@ from app.modules.local_path_mapping import (
 from app.modules.local_storage import (
     LocalContentChanged, LocalFileSnapshot, LocalFilesystemAdapter, snapshot_digest,
 )
-from app.modules.local_media_cleanup import delete_cleanup_items, discover_cleanup_candidates
+from app.modules.local_media_cleanup import (
+    cleanup_candidates_from_snapshots,
+    delete_cleanup_items,
+    probable_sample_video_paths,
+)
 from app.modules.organize import (
     OrganizeRules,
     Organizer,
@@ -142,8 +146,15 @@ class LocalMediaService:
         selected = assert_within(
             require_container_absolute_path(path, label="目录路径"), root,
         )
-        snapshots = LocalFilesystemAdapter(root).scan(selected)
-        videos = [item for item in snapshots if item.role == "video"]
+        adapter = LocalFilesystemAdapter(root)
+        snapshots = adapter.scan(selected, include_non_media=True)
+        visible_snapshots = [
+            item for item in snapshots
+            if item.size > 0
+            and item.role != "other"
+            and not adapter.is_temporary(item.path)
+        ]
+        videos = [item for item in visible_snapshots if item.role == "video"]
         if not videos:
             raise LocalMediaServiceError("选择路径中没有可整理的视频")
         primary_video = videos[0] if len(videos) == 1 else None
@@ -179,7 +190,7 @@ class LocalMediaService:
             "source_id": int(source_id),
             "selected_name": selected.name,
             "selected_kind": "file" if selected.is_file() else "directory",
-            "file_count": len(snapshots),
+            "file_count": len(visible_snapshots),
             "video_count": len(videos),
             "single_video": primary_video is not None,
             "primary_video_name": primary_video.path.name if primary_video else "",
@@ -190,7 +201,7 @@ class LocalMediaService:
             "cloud_write": False,
             "files": [
                 {"name": item.path.name, "relative_path": item.relative_path, "role": item.role, "size": item.size}
-                for item in snapshots
+                for item in visible_snapshots
             ],
         }
 
@@ -397,7 +408,9 @@ class LocalMediaService:
         source = db.get_local_media_source(inspection.source_id, owner=owner)
         if source is None:
             raise LocalMediaServiceError("本地媒体来源已被删除")
-        current = LocalFilesystemAdapter(inspection.root).scan(inspection.selected_path)
+        current = LocalFilesystemAdapter(inspection.root).scan(
+            inspection.selected_path, include_non_media=True,
+        )
         if snapshot_digest(current) != inspection.digest:
             raise LocalMediaServiceError("源文件在检查后发生变化，请重新检查")
         targets = db.list_local_library_targets(inspection.source_id, owner=owner)
@@ -420,9 +433,15 @@ class LocalMediaService:
         rules = enforce_fixed_organize_rules(rules)
         effective_rules_snapshot = self._serialize_rules_snapshot(rules)
 
-        cleanup_candidates = discover_cleanup_candidates(inspection.root, inspection.selected_path)
+        cleanup_candidates = cleanup_candidates_from_snapshots(current)
         cleanup_paths = {item.snapshot.path for item in cleanup_candidates}
-        videos = [item for item in current if item.role == "video" and item.path not in cleanup_paths]
+        retained_sample_paths = probable_sample_video_paths(current)
+        videos = [
+            item for item in current
+            if item.role == "video"
+            and item.path not in cleanup_paths
+            and item.path not in retained_sample_paths
+        ]
         subtitles = [_LocalFile(item.relative_path, item.path.name, item) for item in current if item.role == "subtitle"]
         video_files = [_LocalFile(item.relative_path, item.path.name, item) for item in videos]
         # 本地预览共享一个有界预算：缓存命中免费，慢文件不会把整次预览拖成 N×30 秒。
@@ -665,8 +684,17 @@ class LocalMediaService:
                 {"name": item.snapshot.path.name, "reason": item.reason, "reason_code": item.reason_code}
                 for item in cleanup_candidates
             ],
+            "retained": [
+                {
+                    "name": path.name,
+                    "reason": "疑似 sample/proof 视频，已保留且不自动归档",
+                    "reason_code": "sample-review",
+                }
+                for path in sorted(retained_sample_paths)
+            ],
             "_move_plans": plans,
             "_cleanup_candidates": cleanup_candidates,
+            "_retained_paths": [str(path) for path in sorted(retained_sample_paths)],
         }
 
 
@@ -924,15 +952,21 @@ class LocalMediaService:
                 refresh_warnings = self._refresh_plans(executable_plans)
                 warnings.extend(refresh_warnings)
                 media_refresh_status = "failed" if refresh_warnings else "completed"
+            final_status = (
+                "requires_manual" if result.status == "requires_manual" else "completed"
+            )
             db.update_local_media_task(
-                task_id, owner=owner, status="completed", warning="；".join(warnings),
+                task_id, owner=owner, status=final_status, warning="；".join(warnings),
                 completed_at=db.now(), error="",
             )
             return {
-                "status": "completed", "task_id": task_id,
+                "status": final_status, "task_id": task_id,
                 "moved": [str(item.target) for item in result.moved],
                 "deleted_junk": list(cleanup_result.deleted) if cleanup_result else [],
-                "retained_junk": list(cleanup_result.retained) if cleanup_result else [],
+                "retained_junk": [
+                    *list(preview.get("_retained_paths") or []),
+                    *(list(cleanup_result.retained) if cleanup_result else []),
+                ],
                 "qb_cleanup_pending": qb_cleanup_pending,
                 "warnings": warnings,
                 "media_refresh_status": media_refresh_status,

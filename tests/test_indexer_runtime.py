@@ -19,8 +19,33 @@ class FakeRegistry:
 
 class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
-        runtime._service = None
         runtime.unbind_indexer_event_loop()
+        runtime._service = None
+
+    def test_build_service_adds_sukebei_only_once_when_enabled(self):
+        registry = FakeRegistry()
+
+        def get_value(key, default=""):
+            if key == "INDEXER_ENABLED_SITES":
+                return "nyaa"
+            return default
+
+        def get_bool(key, default=False):
+            if key == "INDEXER_SUKEBEI_ENABLED":
+                return True
+            return default
+
+        with patch("app.indexers.runtime.config.get", side_effect=get_value), patch(
+            "app.indexers.runtime.config.get_int",
+            side_effect=lambda _key, default: default,
+        ), patch(
+            "app.indexers.runtime.config.get_bool", side_effect=get_bool,
+        ), patch(
+            "app.indexers.runtime.build_default_registry", return_value=registry,
+        ):
+            service = runtime._build_service()
+
+        self.assertEqual(service.enabled_site_ids, frozenset({"nyaa", "sukebei"}))
 
     def test_build_service_passes_configured_user_agent_to_registry(self):
         registry = FakeRegistry()
@@ -69,6 +94,50 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             service.enabled_site_ids,
             frozenset({"nyaa", "mikan", "btbtla", "1lou", "animetosho", "tpb"}),
         )
+
+    async def test_sync_bridge_without_binding_reuses_and_closes_standalone_loop(self):
+        observed: list[asyncio.AbstractEventLoop] = []
+        closed_on: list[asyncio.AbstractEventLoop] = []
+
+        async def capture_loop():
+            observed.append(asyncio.get_running_loop())
+            return "ok"
+
+        first = await asyncio.to_thread(
+            runtime.run_indexer_awaitable_sync, capture_loop(), timeout_seconds=1.0,
+        )
+        second = await asyncio.to_thread(
+            runtime.run_indexer_awaitable_sync, capture_loop(), timeout_seconds=1.0,
+        )
+        service = Mock()
+
+        async def close():
+            closed_on.append(asyncio.get_running_loop())
+
+        service.aclose = close
+        runtime._service = service
+        stopped = await asyncio.to_thread(runtime._stop_standalone_runtime, 1.0)
+
+        self.assertEqual((first, second), ("ok", "ok"))
+        self.assertEqual(len(observed), 2)
+        self.assertIs(observed[0], observed[1])
+        self.assertEqual(closed_on, [observed[0]])
+        self.assertTrue(stopped)
+        self.assertIsNone(runtime._runtime_loop)
+
+    async def test_async_bridge_without_binding_uses_standalone_loop(self):
+        caller_loop = asyncio.get_running_loop()
+
+        async def capture_loop():
+            return asyncio.get_running_loop()
+
+        observed = await runtime.run_indexer_awaitable(
+            capture_loop(), timeout_seconds=1.0,
+        )
+
+        self.assertIsNot(observed, caller_loop)
+        self.assertIs(observed, runtime._standalone_loop)
+        self.assertTrue(await asyncio.to_thread(runtime._stop_standalone_runtime, 1.0))
 
     async def test_sync_bridge_runs_on_bound_lifespan_loop(self):
         owner_loop = asyncio.get_running_loop()

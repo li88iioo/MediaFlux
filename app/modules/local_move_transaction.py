@@ -68,10 +68,14 @@ class LocalMoveTransaction:
     ) -> None:
         if not source_roots or not target_roots:
             raise ValueError("移动事务必须配置来源和目标白名单")
-        self.source_roots = tuple(Path(root).expanduser().absolute() for root in source_roots)
-        self.target_roots = tuple(Path(root).expanduser().absolute() for root in target_roots)
-        for root in (*self.source_roots, *self.target_roots):
-            assert_within(root, root)
+        self.source_roots = tuple(
+            assert_within(Path(root).expanduser().absolute(), Path(root).expanduser().absolute())
+            for root in source_roots
+        )
+        self.target_roots = tuple(
+            assert_within(Path(root).expanduser().absolute(), Path(root).expanduser().absolute())
+            for root in target_roots
+        )
         self.task_id = task_id
         self.owner = str(owner or "admin")
         self.operation_token = operation_token or uuid.uuid4().hex
@@ -94,6 +98,70 @@ class LocalMoveTransaction:
         raise LocalMoveError("路径不在允许的来源或目标根目录内") from (
             errors[-1] if errors else None
         )
+
+    @contextmanager
+    def _pinned_entry(
+        self,
+        path: Path,
+        roots: Sequence[Path],
+        *,
+        create_parent: bool = False,
+    ) -> Iterator[tuple[Path, Path]]:
+        """将最终目录项固定到逐段打开的目录句柄，避免父目录被并发替换。"""
+        display = self._within_any(path, roots)
+        root = next(
+            (
+                candidate
+                for candidate in sorted(roots, key=lambda item: len(item.parts), reverse=True)
+                if display == candidate or candidate in display.parents
+            ),
+            None,
+        )
+        if root is None:
+            raise LocalMoveError("路径不在允许的来源或目标根目录内")
+        relative = display.relative_to(root)
+        if not relative.parts:
+            raise LocalMoveError("移动事务不能直接操作根目录")
+        proc_fd_root = Path("/proc/self/fd")
+        if os.name != "posix" or not proc_fd_root.is_dir():
+            raise LocalMoveError("当前运行环境不支持目录句柄固定，拒绝执行本地移动")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        opened: list[int] = []
+        current_fd = os.open(root, flags)
+        opened.append(current_fd)
+        try:
+            for part in relative.parts[:-1]:
+                try:
+                    next_fd = os.open(part, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if not create_parent:
+                        raise
+                    try:
+                        os.mkdir(part, mode=0o755, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    next_fd = os.open(part, flags, dir_fd=current_fd)
+                current_fd = next_fd
+                opened.append(current_fd)
+            yield display, proc_fd_root / str(current_fd) / relative.name
+        finally:
+            for fd in reversed(opened):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _unlink_owned_anchored(
+        self,
+        path: Path,
+        expected: tuple[int, int, int, int],
+        *,
+        roots: Sequence[Path],
+        label: str,
+    ) -> None:
+        with self._pinned_entry(path, roots) as (_display, pinned):
+            self._unlink_owned(pinned, expected, label=label)
 
     @staticmethod
     def _identity(path: Path) -> tuple[int, int, int, int]:
@@ -147,8 +215,11 @@ class LocalMoveTransaction:
     def _open_verified_source(
         self,
         snapshot: LocalFileSnapshot,
+        source_path: Path | None = None,
     ) -> Iterator[tuple[BinaryIO, os.stat_result]]:
-        source = self._within_any(snapshot.path, self.source_roots)
+        source = Path(source_path) if source_path is not None else self._within_any(
+            snapshot.path, self.source_roots
+        )
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(source, flags)
@@ -299,8 +370,8 @@ class LocalMoveTransaction:
 
     def _copy_to_partial(
         self,
-        adapter: LocalFilesystemAdapter,
         snapshot: LocalFileSnapshot,
+        source: Path,
         target: Path,
     ) -> tuple[Path, str]:
         if LocalFilesystemAdapter.available_space(target.parent) < snapshot.size:
@@ -309,7 +380,7 @@ class LocalMoveTransaction:
         if partial.exists():
             raise FileExistsError(f"发现未清理的移动临时文件: {partial}")
         try:
-            with self._open_verified_source(snapshot) as (src, source_info):
+            with self._open_verified_source(snapshot, source) as (src, source_info):
                 source_fingerprint = self._quick_fingerprint_stream(src, snapshot.size)
                 src.seek(0)
                 with partial.open("xb") as dst:
@@ -333,7 +404,7 @@ class LocalMoveTransaction:
                     # 部分 SMB/NAS/Windows 不支持完整 POSIX 元数据；内容与身份校验仍必须继续。
                     pass
             self._verify_target(source_fingerprint, partial, snapshot.size)
-            adapter.verify_snapshot(snapshot)
+            self._require_identity(source, snapshot.identity, label="源文件")
             return partial, source_fingerprint
         except Exception:
             partial.unlink(missing_ok=True)
@@ -341,11 +412,15 @@ class LocalMoveTransaction:
 
     def _retire_copied_source(
         self,
-        adapter: LocalFilesystemAdapter,
         snapshot: LocalFileSnapshot,
+        source: Path,
     ) -> None:
-        source = self._within_any(snapshot.path, self.source_roots)
-        adapter.verify_snapshot(snapshot)
+        try:
+            self._require_identity(source, snapshot.identity, label="源文件")
+        except LocalMoveError as exc:
+            raise LocalMoveError(
+                f"源文件在处理期间发生变化: {snapshot.relative_path}"
+            ) from exc
         retired = source.with_name(
             f".{source.name}.mediaflux-retire-{self.operation_token[:12]}"
         )
@@ -361,178 +436,194 @@ class LocalMoveTransaction:
         self._unlink_owned(retired, snapshot.identity, label="来源退役文件")
 
     def _move_one(self, plan: MovePlanLike, index: int) -> MovedItem:
-        source = self._within_any(plan.source.path, self.source_roots)
-        target = self._within_any(Path(plan.target), self.target_roots)
-        adapter = LocalFilesystemAdapter(
-            next(root for root in self.source_roots if source == root or root in source.parents)
-        )
-        adapter.verify_snapshot(plan.source)
+        source_display = self._within_any(plan.source.path, self.source_roots)
+        target_display = self._within_any(Path(plan.target), self.target_roots)
         plan_action = str(getattr(plan, "action", "move") or "move")
         if plan_action not in {"move", "replace"}:
             raise LocalMoveError(f"不支持的本地移动动作: {plan_action}")
-        current_target_identity = self._identity_or_none(target)
-        if current_target_identity is not None and plan_action != "replace":
-            raise FileExistsError(f"本地媒体库已存在目标文件: {target}")
-        if plan_action == "replace":
-            if current_target_identity is None:
-                raise LocalMoveError(f"待替换目标已不存在，请重新生成预览: {target.name}")
-            expected_target = getattr(plan, "expected_target_identity", None)
-            if expected_target is not None and current_target_identity != expected_target:
-                raise LocalMoveError(f"待替换目标在预览后发生变化，请重新生成预览: {target.name}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        source = self._within_any(source, self.source_roots)
-        target = self._within_any(target, self.target_roots)
-        adapter.verify_snapshot(plan.source)
-        same_fs = LocalFilesystemAdapter.same_filesystem(source, target)
-        action = "replace" if plan_action == "replace" else (
-            "rename" if same_fs else "copy_verify_delete"
-        )
-        self._record_step(index, action, source, target)
-        with self._open_verified_source(plan.source) as (stream, _):
-            source_fingerprint = self._quick_fingerprint_stream(stream, plan.source.size)
-        adapter.verify_snapshot(plan.source)
-        partial: Path | None = None
-        target_created = False
-        published_identity: tuple[int, int, int, int] | None = None
-        moved: MovedItem | None = None
-        backup: Path | None = None
-        backup_identity: tuple[int, int, int, int] | None = None
-        try:
+        with self._pinned_entry(
+            source_display, self.source_roots
+        ) as (_source_display, source), self._pinned_entry(
+            target_display, self.target_roots, create_parent=True
+        ) as (_target_display, target):
+            self._require_identity(source, plan.source.identity, label="源文件")
+            current_target_identity = self._identity_or_none(target)
+            if current_target_identity is not None and plan_action != "replace":
+                raise FileExistsError(f"本地媒体库已存在目标文件: {target_display}")
             if plan_action == "replace":
-                self._require_identity(
-                    target,
-                    current_target_identity,
-                    label="待替换目标",
-                )
-                backup = target.with_name(
+                if current_target_identity is None:
+                    raise LocalMoveError(
+                        f"待替换目标已不存在，请重新生成预览: {target_display.name}"
+                    )
+                expected_target = getattr(plan, "expected_target_identity", None)
+                if expected_target is not None and current_target_identity != expected_target:
+                    raise LocalMoveError(
+                        f"待替换目标在预览后发生变化，请重新生成预览: {target_display.name}"
+                    )
+            same_fs = LocalFilesystemAdapter.same_filesystem(source, target)
+            action = "replace" if plan_action == "replace" else (
+                "rename" if same_fs else "copy_verify_delete"
+            )
+            self._record_step(index, action, source_display, target_display)
+            with self._open_verified_source(plan.source, source) as (stream, _):
+                source_fingerprint = self._quick_fingerprint_stream(stream, plan.source.size)
+            self._require_identity(source, plan.source.identity, label="源文件")
+            partial: Path | None = None
+            target_created = False
+            published_identity: tuple[int, int, int, int] | None = None
+            moved: MovedItem | None = None
+            backup: Path | None = None
+            backup_display: Path | None = None
+            backup_identity: tuple[int, int, int, int] | None = None
+            try:
+                if plan_action == "replace":
+                    self._require_identity(
+                        target,
+                        current_target_identity,
+                        label="待替换目标",
+                    )
+                    backup_display = target_display.with_name(
+                        f".{target_display.name}.mediaflux-replaced-{self.operation_token[:12]}"
+                    )
+                    backup = target.with_name(
                     f".{target.name}.mediaflux-replaced-{self.operation_token[:12]}"
-                )
-                if backup.exists():
-                    raise FileExistsError(f"发现未清理的替换备份: {backup}")
-                os.replace(target, backup)
-                backup_identity = self._identity(backup)
-                if backup_identity != current_target_identity:
-                    raise LocalMoveError(f"待替换目标在备份时发生变化: {target.name}")
-                self._replaced_backups[target] = (backup, backup_identity)
-            else:
-                # 再次缩短“目标不存在”检查与发布之间的窗口。外部不协作写者仍可能
-                # 在 syscall 间抢占路径，因此发布后还会记录并校验事务所有权。
-                if self._identity_or_none(target) is not None:
-                    raise FileExistsError(f"本地媒体库已存在目标文件: {target}")
-            if same_fs:
-                if plan_action == "replace":
-                    os.replace(source, target)
-                    published_identity = plan.source.identity
+                    )
+                    if backup.exists():
+                        raise FileExistsError(f"发现未清理的替换备份: {backup_display}")
+                    os.replace(target, backup)
+                    backup_identity = self._identity(backup)
+                    if backup_identity != current_target_identity:
+                        raise LocalMoveError(f"待替换目标在备份时发生变化: {target_display.name}")
+                    self._replaced_backups[target_display] = (
+                        backup_display, backup_identity
+                    )
                 else:
-                    published_identity = self._publish_no_replace(source, target)
-                target_created = True
-                self._require_identity(target, published_identity, label="事务目标")
-                moved = MovedItem(
-                    source=source,
-                    target=target,
-                    role=str(plan.role),
-                    cross_filesystem=False,
-                    published_identity=published_identity,
-                )
-                self._moved.append(moved)
-                self._moved_steps[target] = index
-                if published_identity != plan.source.identity:
-                    raise LocalMoveError(f"源文件在最终移动前发生变化: {plan.source.relative_path}")
-                self._verify_target(source_fingerprint, target, plan.source.size)
-            else:
-                partial, copied_fingerprint = self._copy_to_partial(adapter, plan.source, target)
-                if copied_fingerprint != source_fingerprint:
-                    raise LocalMoveError(f"源文件在复制准备期间发生变化: {plan.source.relative_path}")
-                if plan_action != "replace" and self._identity_or_none(target) is not None:
-                    raise FileExistsError(f"本地媒体库已存在目标文件: {target}")
-                if plan_action == "replace":
-                    published_identity = self._identity(partial)
-                    os.replace(partial, target)
+                    if self._identity_or_none(target) is not None:
+                        raise FileExistsError(f"本地媒体库已存在目标文件: {target_display}")
+                if same_fs:
+                    if plan_action == "replace":
+                        os.replace(source, target)
+                        published_identity = plan.source.identity
+                    else:
+                        published_identity = self._publish_no_replace(source, target)
+                    target_created = True
+                    self._require_identity(target, published_identity, label="事务目标")
+                    moved = MovedItem(
+                        source=source_display,
+                        target=target_display,
+                        role=str(plan.role),
+                        cross_filesystem=False,
+                        published_identity=published_identity,
+                    )
+                    self._moved.append(moved)
+                    self._moved_steps[target_display] = index
+                    if published_identity != plan.source.identity:
+                        raise LocalMoveError(
+                            f"源文件在最终移动前发生变化: {plan.source.relative_path}"
+                        )
+                    self._verify_target(source_fingerprint, target, plan.source.size)
                 else:
-                    published_identity = self._publish_no_replace(partial, target)
-                partial = None
-                target_created = True
-                self._require_identity(target, published_identity, label="事务目标")
-                self._verify_target(source_fingerprint, target, plan.source.size)
-                self._retire_copied_source(adapter, plan.source)
-                moved = MovedItem(
-                    source=source,
-                    target=target,
-                    role=str(plan.role),
-                    cross_filesystem=True,
-                    published_identity=published_identity,
-                )
-                self._moved.append(moved)
-                self._moved_steps[target] = index
-            self._finish_step(index, "completed")
-            return moved
-        except Exception as exc:
-            cleanup_errors: list[str] = []
-            if partial is not None:
-                try:
-                    partial.unlink(missing_ok=True)
-                except Exception as cleanup_exc:
-                    cleanup_errors.append(str(cleanup_exc))
-            if target_created and moved is None and published_identity is not None:
-                try:
-                    self._unlink_owned(target, published_identity, label="事务目标")
-                except Exception as cleanup_exc:
-                    cleanup_errors.append(str(cleanup_exc))
-            if moved is None and backup is not None and backup_identity is not None:
-                try:
-                    self._require_identity(backup, backup_identity, label="替换备份")
-                    if self._identity_or_none(target) is None:
-                        os.replace(backup, target)
-                        self._replaced_backups.pop(target, None)
-                except Exception as cleanup_exc:
-                    cleanup_errors.append(str(cleanup_exc))
-            error_text = str(exc)
-            if cleanup_errors:
-                error_text += "；失败清理需要人工核验: " + " | ".join(cleanup_errors)
-                exc = LocalMoveError(error_text)
-            self._finish_step(index, "failed", error_text)
-            raise exc
+                    partial, copied_fingerprint = self._copy_to_partial(
+                        plan.source, source, target
+                    )
+                    if copied_fingerprint != source_fingerprint:
+                        raise LocalMoveError(
+                            f"源文件在复制准备期间发生变化: {plan.source.relative_path}"
+                        )
+                    if plan_action != "replace" and self._identity_or_none(target) is not None:
+                        raise FileExistsError(f"本地媒体库已存在目标文件: {target_display}")
+                    if plan_action == "replace":
+                        published_identity = self._identity(partial)
+                        os.replace(partial, target)
+                    else:
+                        published_identity = self._publish_no_replace(partial, target)
+                    partial = None
+                    target_created = True
+                    self._require_identity(target, published_identity, label="事务目标")
+                    self._verify_target(source_fingerprint, target, plan.source.size)
+                    self._retire_copied_source(plan.source, source)
+                    moved = MovedItem(
+                        source=source_display,
+                        target=target_display,
+                        role=str(plan.role),
+                        cross_filesystem=True,
+                        published_identity=published_identity,
+                    )
+                    self._moved.append(moved)
+                    self._moved_steps[target_display] = index
+                self._finish_step(index, "completed")
+                return moved
+            except Exception as exc:
+                cleanup_errors: list[str] = []
+                if partial is not None:
+                    try:
+                        partial.unlink(missing_ok=True)
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(str(cleanup_exc))
+                if target_created and moved is None and published_identity is not None:
+                    try:
+                        self._unlink_owned(target, published_identity, label="事务目标")
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(str(cleanup_exc))
+                if moved is None and backup is not None and backup_identity is not None:
+                    try:
+                        self._require_identity(backup, backup_identity, label="替换备份")
+                        if self._identity_or_none(target) is None:
+                            os.replace(backup, target)
+                            self._replaced_backups.pop(target_display, None)
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(str(cleanup_exc))
+                error_text = str(exc)
+                if cleanup_errors:
+                    error_text += "；失败清理需要人工核验: " + " | ".join(cleanup_errors)
+                    exc = LocalMoveError(error_text)
+                self._finish_step(index, "failed", error_text)
+                raise exc
 
     def _restore_one(self, moved: MovedItem) -> None:
-        if self._identity_or_none(moved.target) is None:
-            if self._identity_or_none(moved.source) is not None:
-                return
-            raise LocalMoveError(f"回滚时源和目标均不存在: {moved.source.name}")
-        self._require_identity(
-            moved.target,
-            moved.published_identity,
-            label="回滚目标",
-        )
-        moved.source.parent.mkdir(parents=True, exist_ok=True)
-        if self._identity_or_none(moved.source) is not None:
-            raise FileExistsError(f"回滚源路径已被占用: {moved.source}")
-        if LocalFilesystemAdapter.same_filesystem(moved.target, moved.source):
-            os.replace(moved.target, moved.source)
+        with self._pinned_entry(
+            moved.target, self.target_roots
+        ) as (_target_display, target), self._pinned_entry(
+            moved.source, self.source_roots, create_parent=True
+        ) as (_source_display, source):
+            if self._identity_or_none(target) is None:
+                if self._identity_or_none(source) is not None:
+                    return
+                raise LocalMoveError(f"回滚时源和目标均不存在: {moved.source.name}")
             self._require_identity(
-                moved.source,
-                moved.published_identity,
-                label="回滚后的源文件",
-            )
-            return
-        size = moved.published_identity[0]
-        fingerprint = self._quick_fingerprint(moved.target, size)
-        partial = moved.source.with_name(
-            f".{moved.source.name}.mediaflux-rollback-{self.operation_token[:12]}"
-        )
-        try:
-            with moved.target.open("rb") as src, partial.open("xb") as dst:
-                shutil.copyfileobj(src, dst, length=self.chunk_size)
-                dst.flush()
-                os.fsync(dst.fileno())
-            self._verify_target(fingerprint, partial, size)
-            os.replace(partial, moved.source)
-            self._unlink_owned(
-                moved.target,
+                target,
                 moved.published_identity,
                 label="回滚目标",
             )
-        finally:
-            partial.unlink(missing_ok=True)
+            if self._identity_or_none(source) is not None:
+                raise FileExistsError(f"回滚源路径已被占用: {moved.source}")
+            if LocalFilesystemAdapter.same_filesystem(target, source):
+                os.replace(target, source)
+                self._require_identity(
+                    source,
+                    moved.published_identity,
+                    label="回滚后的源文件",
+                )
+                return
+            size = moved.published_identity[0]
+            fingerprint = self._quick_fingerprint(target, size)
+            partial = source.with_name(
+                f".{source.name}.mediaflux-rollback-{self.operation_token[:12]}"
+            )
+            try:
+                with target.open("rb") as src, partial.open("xb") as dst:
+                    shutil.copyfileobj(src, dst, length=self.chunk_size)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                self._verify_target(fingerprint, partial, size)
+                os.replace(partial, source)
+                self._unlink_owned(
+                    target,
+                    moved.published_identity,
+                    label="回滚目标",
+                )
+            finally:
+                partial.unlink(missing_ok=True)
 
     def rollback(self) -> list[str]:
         errors: list[str] = []
@@ -543,15 +634,22 @@ class LocalMoveTransaction:
                 backup_record = self._replaced_backups.pop(moved.target, None)
                 if backup_record is not None:
                     backup, backup_identity = backup_record
-                    self._require_identity(backup, backup_identity, label="替换备份")
-                    if self._identity_or_none(moved.target) is not None:
-                        raise LocalMoveError(f"回滚目标路径已被占用: {moved.target}")
-                    os.replace(backup, moved.target)
-                    self._require_identity(
-                        moved.target,
-                        backup_identity,
-                        label="恢复后的替换目标",
-                    )
+                    with self._pinned_entry(
+                        backup, self.target_roots
+                    ) as (_backup_display, pinned_backup), self._pinned_entry(
+                        moved.target, self.target_roots
+                    ) as (_target_display, pinned_target):
+                        self._require_identity(
+                            pinned_backup, backup_identity, label="替换备份"
+                        )
+                        if self._identity_or_none(pinned_target) is not None:
+                            raise LocalMoveError(f"回滚目标路径已被占用: {moved.target}")
+                        os.replace(pinned_backup, pinned_target)
+                        self._require_identity(
+                            pinned_target,
+                            backup_identity,
+                            label="恢复后的替换目标",
+                        )
                 if index is not None:
                     self._finish_step(index, "rolled_back")
             except Exception as exc:
@@ -577,12 +675,19 @@ class LocalMoveTransaction:
             for target, backup_record in list(self._replaced_backups.items()):
                 backup, backup_identity = backup_record
                 try:
-                    self._unlink_owned(backup, backup_identity, label="替换备份")
+                    self._unlink_owned_anchored(
+                        backup,
+                        backup_identity,
+                        roots=self.target_roots,
+                        label="替换备份",
+                    )
                     self._replaced_backups.pop(target, None)
                 except Exception as exc:
                     warnings.append(f"旧版本备份清理失败: {backup.name}: {exc}")
             return MoveTransactionResult(
-                status="completed", moved=list(self._moved), warnings=warnings
+                status="requires_manual" if warnings else "completed",
+                moved=list(self._moved),
+                warnings=warnings,
             )
         except Exception as exc:
             rollback_errors = self.rollback()

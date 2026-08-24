@@ -106,7 +106,13 @@ jobs:
           done
           docker logs mediaflux-smoke
           exit 1
-      - name: Stop smoke container
+      - name: Verify graceful container shutdown
+        if: success()
+        run: |
+          docker stop --time 60 mediaflux-smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' mediaflux-smoke)" = "0"
+          docker logs mediaflux-smoke
+      - name: Cleanup smoke container
         if: always()
         run: docker rm --force mediaflux-smoke >/dev/null 2>&1 || true
 

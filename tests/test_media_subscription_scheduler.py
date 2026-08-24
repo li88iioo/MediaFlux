@@ -1,6 +1,7 @@
 """媒体订阅调度器停止边界与有界并发测试。"""
 from __future__ import annotations
 
+import threading
 from unittest import TestCase
 from unittest.mock import AsyncMock, patch
 
@@ -50,6 +51,36 @@ class MediaSubscriptionSchedulerTests(TestCase):
             self.assertEqual(scheduler.run_due(), 0)
         recover.assert_not_called()
         due.assert_not_called()
+        self.assertEqual(_FakeThread.instances, [])
+
+    def test_stop_during_due_query_prevents_late_worker_admission(self) -> None:
+        scheduler = MediaSubscriptionScheduler()
+        query_started = threading.Event()
+        release_query = threading.Event()
+
+        def due_rows(*_args, **_kwargs):
+            query_started.set()
+            release_query.wait(2)
+            return [{"id": 7}]
+
+        runner = threading.Thread(target=scheduler.run_due)
+        with patch(
+            "app.modules.media_subscription_scheduler.db.recover_stale_media_subscription_checks",
+            return_value=0,
+        ), patch(
+            "app.modules.media_subscription_scheduler.db.list_due_media_subscriptions",
+            side_effect=due_rows,
+        ), patch(
+            "app.modules.media_subscription_scheduler.threading.Thread", _FakeThread,
+        ):
+            runner.start()
+            self.assertTrue(query_started.wait(1))
+            self.assertTrue(scheduler.stop(timeout=0.1))
+            release_query.set()
+            runner.join(timeout=2)
+
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(scheduler._workers, {})
         self.assertEqual(_FakeThread.instances, [])
 
     def test_run_due_caps_workers_and_deduplicates_subscription_ids(self) -> None:

@@ -1857,6 +1857,12 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             {db.get_organize_log(log_id)["tmdb_id"] for log_id in result["log_ids"]},
             {"1726"},
         )
+        operation_tokens = {
+            str(db.get_organize_log(log_id)["operation_token"] or "")
+            for log_id in result["log_ids"]
+        }
+        self.assertEqual(len(operation_tokens), 1)
+        self.assertTrue(next(iter(operation_tokens)).startswith("manual-"))
         self.assertNotEqual(self.client.infos["v1"].parent_id, "movie-dir")
         self.assertEqual(self.client.infos["v2"].parent_id, "movie-dir")
         self.assertIn("钢铁侠.2008", self.client.infos["v1"].name)

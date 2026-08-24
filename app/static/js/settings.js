@@ -460,6 +460,7 @@
                     }, 3000);
                 }
             }catch(err){
+                window.showToast?.(err?.message || '检查更新失败', 'error', 5200);
                 statusBadge.className = 'telemetry-status-badge is-error';
                 statusBadge.dataset.tone = 'error';
                 statusBadge.textContent = '检查失败';

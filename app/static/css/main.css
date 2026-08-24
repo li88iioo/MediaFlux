@@ -4270,8 +4270,8 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     align-items: center;
     gap: 8px;
     pointer-events: none;
-    max-width: min(460px, calc(100vw - 32px));
-    width: max-content;
+    width: min(460px, calc(100vw - 32px));
+    max-width: calc(100vw - 32px);
 }
 .app-toast {
     pointer-events: auto;
@@ -4289,19 +4289,22 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     line-height: 1.4;
     backdrop-filter: blur(12px) saturate(1.2);
     -webkit-backdrop-filter: blur(12px) saturate(1.2);
-    animation: app-toast-in 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
     transition: opacity 0.2s ease, transform 0.2s ease;
     user-select: none;
     cursor: pointer;
+    width: max-content;
+    max-width: 100%;
+    min-width: 0;
+}
+.app-toast-message {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 .app-toast.is-leaving {
     opacity: 0;
     transform: translateY(-8px) scale(0.95);
     pointer-events: none;
-}
-@keyframes app-toast-in {
-    from { opacity: 0; transform: translateY(-16px) scale(0.92); }
-    to { opacity: 1; transform: translateY(0) scale(1); }
 }
 .app-toast-icon {
     width: 20px;

@@ -1375,6 +1375,10 @@ def save_config(request: Request, data: Any = Body(default=None)):
 
                 reset()
         except Exception as exc:
+            warnings.append(
+                "Telegram Bot 配置已保存，但运行中实例热更新失败；"
+                "请稍后重试或重启 MediaFlux 服务"
+            )
             logger.warning("Telegram Bot 配置热更新失败 type=%s", type(exc).__name__)
         finally:
             bot_restart_ms = max(1, round((time.perf_counter() - bot_restart_started) * 1000))

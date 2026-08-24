@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -96,6 +97,8 @@ class DiscoverySearchUnitTests(unittest.TestCase):
         thread.start()
         self.assertTrue(started.wait(timeout=1))
         thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result_holder[0].errors[0]["code"], "timeout")
         service.shutdown()
         self.assertFalse(provider.closed)
 
@@ -104,6 +107,80 @@ class DiscoverySearchUnitTests(unittest.TestCase):
         while not provider.closed and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertTrue(provider.closed)
+
+    def test_partial_submit_failure_keeps_started_future_in_lifecycle_ledger(self):
+        from app.discovery.search import DiscoverySearchService
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingProvider(FakeSearchProvider):
+            def __init__(self, name):
+                super().__init__(name)
+                self.closed = False
+
+            def search(self, query, page):
+                started.set()
+                release.wait(timeout=2)
+                return [], False
+
+            def close(self):
+                self.closed = True
+
+        class PartialExecutor:
+            def __init__(self):
+                self.delegate = ThreadPoolExecutor(max_workers=1)
+                self.calls = 0
+
+            def submit(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("submit failed")
+                return self.delegate.submit(*args, **kwargs)
+
+        first = BlockingProvider("tmdb")
+        second = BlockingProvider("douban")
+        executor = PartialExecutor()
+        service = DiscoverySearchService(
+            providers={"tmdb": first, "douban": second}, executor=executor,
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "submit failed"):
+                service.search("测试", 1, ["tmdb", "douban"])
+            self.assertTrue(started.wait(timeout=1))
+            service.shutdown()
+            self.assertFalse(first.closed)
+            self.assertFalse(second.closed)
+            release.set()
+            deadline = time.monotonic() + 1
+            while not first.closed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(first.closed)
+            self.assertTrue(second.closed)
+        finally:
+            release.set()
+            executor.delegate.shutdown(wait=True)
+
+    def test_provider_close_failure_does_not_block_remaining_providers(self):
+        from app.discovery.search import DiscoverySearchService
+
+        class Provider(FakeSearchProvider):
+            def __init__(self, name, fail=False):
+                super().__init__(name)
+                self.fail = fail
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                if self.fail:
+                    raise RuntimeError("close failed")
+
+        first = Provider("tmdb", fail=True)
+        second = Provider("douban")
+        service = DiscoverySearchService(providers={"tmdb": first, "douban": second})
+        service.shutdown()
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
 
     def test_tmdb_search_maps_movie_and_tv_and_ignores_people(self):
         from app.discovery.search import TMDBSearchProvider

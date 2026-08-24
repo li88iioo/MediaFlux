@@ -672,7 +672,15 @@
         const toast = document.createElement('div');
         toast.className = `app-toast is-${type}`;
         const iconName = type === 'success' ? 'circle-check-big' : (type === 'error' ? 'circle-x' : (type === 'warning' ? 'triangle-alert' : (type === 'loading' ? 'loader-2' : 'info')));
-        toast.innerHTML = `<span class="app-toast-icon"><i data-lucide="${iconName}"></i></span><span class="app-toast-message">${String(message)}</span>`;
+        const icon = document.createElement('span');
+        icon.className = 'app-toast-icon';
+        const iconNode = document.createElement('i');
+        iconNode.dataset.lucide = iconName;
+        icon.appendChild(iconNode);
+        const messageNode = document.createElement('span');
+        messageNode.className = 'app-toast-message';
+        messageNode.textContent = String(message);
+        toast.append(icon, messageNode);
         container.appendChild(toast);
         renderIcons(toast);
         if (window.MFAnim) {
