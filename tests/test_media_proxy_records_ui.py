@@ -74,7 +74,13 @@ class MediaProxyRecordsUiTests(unittest.TestCase):
         self.assertIn(
             "if(session.media_name)return session.media_name", self.template
         )
-        self.assertIn("`媒体 ${session.media_item_id}`", self.template)
+        self.assertIn("function compactProxyIdentifier", self.template)
+        self.assertIn(
+            "`媒体 ${compactProxyIdentifier(session.media_item_id)}`",
+            self.template,
+        )
+        self.assertNotIn('title="${esc(rawSourceId)}"', self.template)
+        self.assertNotIn('title="${esc(session.media_item_id)}"', self.template)
 
     def test_clear_requires_confirmation_and_rows_use_safe_badges(self):
         self.assertIn("CLEAR PLAYBACK RECORDS", self.template)

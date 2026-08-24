@@ -75,6 +75,12 @@ class RecognitionHintTests(unittest.TestCase):
         matched = RecognitionResult(
             tmdb_id="1726", title="钢铁侠", year="2008", media_type="movie",
             confidence=0.96, status="matched", need_confirm=False,
+            metadata={
+                "recognition_evidence": {
+                    "matched_query": "Iron Man",
+                    "matched_title": "钢铁侠",
+                },
+            },
         )
         hints = SimpleNamespace(items=(MediaCard(
             provider="douban", external_id="1", media_type="movie",
@@ -100,6 +106,14 @@ class RecognitionHintTests(unittest.TestCase):
         self.assertTrue(evidence["source_anchor_verified"])
         self.assertTrue(evidence["tmdb_revalidated"])
         self.assertEqual(evidence["tmdb_id"], "1726")
+        self.assertEqual(evidence["matched_query"], "Iron Man")
+        self.assertEqual(evidence["matched_title"], "钢铁侠")
+        self.assertEqual(evidence["source"]["filename_title"], "Iron Man")
+        self.assertEqual(evidence["source"]["approved_anchor"], "Iron Man")
+        self.assertEqual(evidence["source"]["matched_hint_title"], "Iron Man")
+        self.assertEqual(evidence["source"]["anchor_score"], 1.0)
+        self.assertEqual(evidence["tmdb"]["id"], "1726")
+        self.assertEqual(evidence["tmdb"]["matched_query"], "Iron Man")
 
     def test_unrelated_external_hint_cannot_redirect_source_title(self):
         from app.modules.scraper import RecognitionContext, RecognitionResult, TMDBScraper

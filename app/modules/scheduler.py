@@ -79,6 +79,39 @@ def _merge_organize_changes(*groups) -> list[dict[str, object]]:
     return list(merged.values())
 
 
+def _organize_change_scope_key(
+    change: object,
+) -> tuple[str, str, str, str, str, str] | None:
+    """返回用于判断通知归属的稳定变化键。"""
+    if not isinstance(change, dict):
+        return None
+    source_id = str(change.get("source_id") or "").strip()
+    kind = str(change.get("kind") or "video").strip().lower()
+    file_id = str(change.get("file_id") or "").strip()
+    if not source_id or not file_id:
+        return None
+    action = str(change.get("action") or "upsert").strip().lower()
+    rel_dir = str(change.get("rel_dir") or "").strip().strip("/")
+    name = str(change.get("name") or "").strip()
+    return source_id, kind, file_id, action, rel_dir, name
+
+
+def _claimed_changes_extend_notification_scope(
+    requested_changes: object, claimed_changes: object,
+) -> bool:
+    """判断持久队列是否补入了不属于本次实时请求的变化。"""
+    requested_keys = {
+        key
+        for item in (requested_changes or [])
+        if (key := _organize_change_scope_key(item)) is not None
+    }
+    return any(
+        (key := _organize_change_scope_key(item)) is not None
+        and key not in requested_keys
+        for item in (claimed_changes or [])
+    )
+
+
 class _ChangeTargetLeaseHeartbeat:
     """后台续租本轮领取的 STRM 变化目标，避免长任务租约过期后被重复消费。"""
 
@@ -138,6 +171,7 @@ class STRMScheduler:
         self._loaded_cron = ""
         self._run_options: dict[str, object] = {}
         self._pending_organize_options: dict[str, object] | None = None
+        self._pending_organize_deadline: float | None = None
         self._pending_thread: Optional[threading.Thread] = None
         self._progress = {
             "stage": "idle", "completed": 0, "total": 1, "percent": 0, "detail": "",
@@ -148,6 +182,14 @@ class STRMScheduler:
         """启动调度检查线程。重复调用安全。"""
         with self._admission_lock:
             if self._thread and self._thread.is_alive():
+                return
+            pending_thread = self._pending_thread
+            if pending_thread and pending_thread.is_alive():
+                logger.warning("STRM 排队线程仍在停止中，暂缓重新启动调度器")
+                return
+            worker = self._worker
+            if worker and worker.is_alive():
+                logger.warning("STRM 工作线程仍在停止中，暂缓重新启动调度器")
                 return
             self._stop_event.clear()
             self._thread = threading.Thread(
@@ -197,9 +239,71 @@ class STRMScheduler:
             return
         logger.info("检测到待同步 STRM 变化目标 count=%s，已排队恢复执行", pending)
         try:
-            self.trigger("organize")
+            delay = db.seconds_until_next_strm_change_target()
+            self._schedule_persisted_change_queue(delay)
         except Exception:
             logger.exception("恢复 STRM 变化目标触发失败")
+
+    def _schedule_persisted_change_queue(
+        self, delay_seconds: float | None = None,
+    ) -> dict:
+        """静默排队持久变化目标；内部等待不受实时 debounce 的 120 秒上限约束。"""
+        if delay_seconds is None:
+            delay_seconds = db.seconds_until_next_strm_change_target()
+        if delay_seconds is None:
+            return {"ok": True, "queued": False, "message": "没有待同步 STRM 变化目标"}
+        try:
+            delay = max(0.0, float(delay_seconds or 0.0))
+        except (TypeError, ValueError, OverflowError):
+            delay = 0.0
+        with self._admission_lock:
+            if self._stop_event.is_set():
+                return {"ok": False, "error": "STRM 调度器正在停止"}
+            with self._state_lock:
+                if self._pending_organize_options:
+                    return {
+                        "ok": True, "queued": True,
+                        "message": "已有整理联动批次将排空持久变化目标",
+                    }
+            return self._queue_organize_trigger(
+                {
+                    "notify_override": False,
+                    "detail_notify_override": False,
+                    "emby_refresh_override": None,
+                    "media_server_refresh_override": None,
+                    "download_request_ids": [],
+                    "organize_changes": [],
+                    "force_full": False,
+                    # 即使因时钟粒度提前醒来且尚无可领取目标，也只能 no-op，
+                    # 绝不能把队列恢复降级成一次无关的全量扫描。
+                    "sync_mode": "fast",
+                    "chat_ids": [],
+                    "uses_default_notification_scope": False,
+                    "has_silent_notification_scope": True,
+                    "persisted_queue_only": True,
+                },
+                debounce_seconds=delay,
+            )
+
+    def _drain_persisted_change_queue(self) -> None:
+        """调度循环兜底接管持久队列，覆盖瞬时线程创建失败等内存调度中断。"""
+        if self._stop_event.is_set():
+            return
+        with self._state_lock:
+            if self._running or self._pending_organize_options:
+                return
+            worker = self._worker
+            if worker and worker.is_alive():
+                return
+        delay = db.seconds_until_next_strm_change_target()
+        if delay is None:
+            return
+        result = self._schedule_persisted_change_queue(delay)
+        if not result.get("ok"):
+            logger.warning(
+                "STRM 持久变化队列兜底排队失败 error=%s",
+                result.get("error") or "unknown",
+            )
 
     def stop(self, timeout: float = 30.0) -> None:
         """请求调度线程退出并等待收尾；重复调用安全。"""
@@ -279,6 +383,14 @@ class STRMScheduler:
 
     def _wait_and_run_pending_organize(self) -> None:
         while not self._stop_event.is_set():
+            with self._state_lock:
+                deadline = self._pending_organize_deadline
+            if deadline is not None:
+                remaining = deadline - monotonic()
+                if remaining > 0:
+                    # 短轮询允许后续整理触发重置 quiet window，同时保持 stop 响应。
+                    self._stop_event.wait(timeout=min(remaining, 0.25))
+                    continue
             if not self._run_lock.acquire(blocking=False):
                 # 通常由本调度器释放锁时直接唤醒；保留低频兜底，兼容测试、
                 # 运维工具或其他进程内调用方直接操作共享锁的场景。
@@ -290,8 +402,14 @@ class STRMScheduler:
                     self._run_lock.release()
                     break
                 with self._state_lock:
+                    # 获取执行锁期间可能又来了人工确认；重新检查延后截止时间。
+                    deadline = self._pending_organize_deadline
+                    if deadline is not None and deadline > monotonic():
+                        self._run_lock.release()
+                        continue
                     options = self._pending_organize_options
                     self._pending_organize_options = None
+                    self._pending_organize_deadline = None
                     self._pending_thread = None
                 if options is None:
                     self._run_lock.release()
@@ -303,6 +421,7 @@ class STRMScheduler:
             cancelled_options = dict(self._pending_organize_options or {})
             cancelled = bool(cancelled_options)
             self._pending_organize_options = None
+            self._pending_organize_deadline = None
             self._pending_thread = None
         if cancelled:
             _update_strm_requests(
@@ -312,16 +431,42 @@ class STRMScheduler:
             )
             logger.warning("应用停止，已取消尚未执行的整理联动 STRM")
 
-    def _queue_organize_trigger(self, options: dict[str, object]) -> dict:
+    def _queue_organize_trigger(
+        self, options: dict[str, object], *, debounce_seconds: float = 0.0,
+        reset_deadline: bool = False,
+    ) -> dict:
         with self._state_lock:
-            pending = dict(self._pending_organize_options or {})
+            existing = dict(self._pending_organize_options or {})
+            # 内部持久队列 waiter 只是一个无通知、无变化清单的定时占位符。
+            # 新的实时整理到达时应替换它，而不是把 silent 范围并入用户通知。
+            pending = (
+                {}
+                if existing.get("persisted_queue_only")
+                and not options.get("persisted_queue_only")
+                else existing
+            )
             for key, value in options.items():
+                if key in {"notify_override", "detail_notify_override"}:
+                    if key not in pending:
+                        pending[key] = value
+                    else:
+                        current = pending.get(key)
+                        pending[key] = (
+                            True if True in {current, value}
+                            else None if current is None or value is None
+                            else False
+                        )
+                    continue
                 if value is None:
                     continue
                 if key in {"download_request_ids", "chat_ids"}:
                     pending[key] = list(dict.fromkeys([
                         *list(pending.get(key) or []), *list(value or []),
                     ]))
+                elif key in {
+                    "uses_default_notification_scope", "has_silent_notification_scope",
+                }:
+                    pending[key] = bool(pending.get(key)) or bool(value)
                 elif key == "organize_changes":
                     pending[key] = _merge_organize_changes(
                         pending.get(key), value
@@ -337,6 +482,36 @@ class STRMScheduler:
                     )
                 else:
                     pending[key] = bool(value)
+            try:
+                quiet_seconds = max(0.0, float(debounce_seconds or 0.0))
+            except (TypeError, ValueError, OverflowError):
+                quiet_seconds = 0.0
+            if quiet_seconds > 0:
+                changes = list(pending.get("organize_changes") or [])
+                if changes:
+                    expected = len(db.group_changes_by_target(changes))
+                    try:
+                        updated = db.reschedule_strm_change_targets(
+                            changes, not_before_seconds=quiet_seconds,
+                        )
+                    except Exception:
+                        logger.exception("重置 STRM 合并批次持久截止时间失败")
+                        return {
+                            "ok": False,
+                            "error": "STRM 合并批次截止时间持久化失败",
+                        }
+                    if updated < expected:
+                        logger.error(
+                            "重置 STRM 合并批次截止时间不完整 updated=%s expected=%s",
+                            updated, expected,
+                        )
+                        return {
+                            "ok": False,
+                            "error": "STRM 合并批次截止时间持久化不完整",
+                        }
+                self._pending_organize_deadline = monotonic() + quiet_seconds
+            elif reset_deadline:
+                self._pending_organize_deadline = monotonic()
             self._pending_organize_options = pending
             _update_strm_requests(
                 pending, strm_status="queued", strm_error="", strm_finished_at=None
@@ -354,17 +529,19 @@ class STRMScheduler:
                 except Exception:
                     self._pending_thread = None
                     self._pending_organize_options = None
+                    self._pending_organize_deadline = None
                     _update_strm_requests(
                         pending, strm_status="failed", strm_error="STRM 整理联动排队失败",
                         strm_finished_at=db.now(),
                     )
                     logger.exception("启动整理联动 STRM 等待线程失败")
                     return {"ok": False, "error": "STRM 整理联动排队失败"}
-        return {
-            "ok": True,
-            "queued": True,
-            "message": "STRM 整理联动已排队，将在当前操作结束后执行",
-        }
+        message = "STRM 整理联动已排队，将在当前操作结束后执行"
+        if quiet_seconds > 0:
+            message = (
+                f"STRM 整理联动已合并排队，将在 {quiet_seconds:g} 秒无新增整理后执行"
+            )
+        return {"ok": True, "queued": True, "message": message}
 
     def trigger(self, trigger_type: str = "manual", *,
                 notify_override: bool | None = None,
@@ -376,7 +553,8 @@ class STRMScheduler:
                 organize_changes: list[dict[str, object]] | None = None,
                 force_full: bool = False,
                 sync_mode: str = "auto",
-                chat_id: str = "") -> dict:
+                chat_id: str = "",
+                debounce_seconds: float = 0.0) -> dict:
         """异步触发一次任务；整理联动在忙时合并排队，其余触发保持拒绝。"""
         with self._admission_lock:
             if self._stop_event.is_set():
@@ -386,6 +564,24 @@ class STRMScheduler:
                 return {"ok": False, "error": "STRM 同步模式无效"}
             if force_full:
                 normalized_mode = "full"
+            try:
+                quiet_seconds = max(0.0, min(float(debounce_seconds or 0.0), 120.0))
+            except (TypeError, ValueError, OverflowError):
+                quiet_seconds = 0.0
+            with self._state_lock:
+                pending_snapshot = dict(self._pending_organize_options or {})
+                has_pending_organize = bool(pending_snapshot)
+                pending_is_persisted_queue = bool(
+                    pending_snapshot.get("persisted_queue_only")
+                )
+            resolved_chat_id = str(chat_id or "").strip()
+            notification_scope_enabled = bool(
+                notify_override is not False
+                or (
+                    trigger_type == "organize"
+                    and detail_notify_override is not False
+                )
+            )
             options = {
                 "notify_override": notify_override,
                 "detail_notify_override": detail_notify_override,
@@ -396,11 +592,42 @@ class STRMScheduler:
                 "organize_changes": _merge_organize_changes(organize_changes),
                 "force_full": bool(force_full),
                 "sync_mode": normalized_mode,
-                "chat_ids": [str(chat_id).strip()] if str(chat_id or "").strip() else [],
+                "chat_ids": (
+                    [resolved_chat_id]
+                    if resolved_chat_id and notification_scope_enabled else []
+                ),
+                "uses_default_notification_scope": bool(
+                    notification_scope_enabled and not resolved_chat_id
+                ),
+                "has_silent_notification_scope": not notification_scope_enabled,
+                "persisted_queue_only": False,
             }
             # 先持久化再触发：进程在排队或执行中崩溃时，变化目标仍可恢复。
-            if not self._persist_change_targets(options.get("organize_changes")):
+            persist_not_before: float | None = 0.0
+            if trigger_type == "organize":
+                if quiet_seconds > 0:
+                    persist_not_before = quiet_seconds
+                elif has_pending_organize and not pending_is_persisted_queue:
+                    # 无 debounce 的后续触发加入现有静默批次时，不得把持久截止时间提前。
+                    persist_not_before = None
+            if not self._persist_change_targets(
+                options.get("organize_changes"),
+                not_before_seconds=persist_not_before,
+            ):
                 return {"ok": False, "error": "STRM 变化目标持久化失败，已取消同步"}
+            if trigger_type == "organize" and (
+                quiet_seconds > 0 or has_pending_organize
+            ):
+                options.pop("on_progress", None)
+                return self._queue_organize_trigger(
+                    options,
+                    debounce_seconds=quiet_seconds,
+                    reset_deadline=bool(
+                        has_pending_organize
+                        and pending_is_persisted_queue
+                        and quiet_seconds <= 0
+                    ),
+                )
             if not self._run_lock.acquire(blocking=False):
                 if trigger_type == "organize":
                     options.pop("on_progress", None)
@@ -446,12 +673,16 @@ class STRMScheduler:
                 self._worker = threading.current_thread()
         return self._execute_locked(trigger_type)
 
-    def _persist_change_targets(self, organize_changes: object) -> bool:
+    def _persist_change_targets(
+        self, organize_changes: object, *, not_before_seconds: float | None = 0.0,
+    ) -> bool:
         """把整理变化写入唯一权威队列；失败时必须阻断同步，避免事件只存在内存。"""
         if not organize_changes:
             return True
         try:
-            db.enqueue_strm_change_targets(organize_changes)
+            db.enqueue_strm_change_targets(
+                organize_changes, not_before_seconds=not_before_seconds,
+            )
             return True
         except Exception:
             logger.exception("登记 STRM 变化目标队列失败")
@@ -469,18 +700,19 @@ class STRMScheduler:
 
     def _settle_change_targets(
         self, claimed: list[dict], outcome: str, *, error: str = "",
+        empty_retry_delay: float = 0.0,
     ) -> None:
         """按运行结果收敛变化目标；owner/代次栅栏阻止迟到 worker 覆盖新状态。"""
         rows = [dict(item) for item in claimed if item.get("id")]
-        if not rows:
-            return
+        requeued = 0
         try:
             if outcome == "stopped":
-                db.release_strm_change_targets(
-                    rows, reason="服务停止，STRM 变化目标已退回队列"
-                )
+                if rows:
+                    db.release_strm_change_targets(
+                        rows, reason="服务停止，STRM 变化目标已退回队列"
+                    )
                 return
-            if outcome == "failed":
+            if outcome == "failed" and rows:
                 for item in rows:
                     state = db.fail_strm_change_target(
                         int(item["id"]),
@@ -490,33 +722,34 @@ class STRMScheduler:
                     )
                     if state == "stale":
                         logger.warning("忽略迟到的 STRM 失败结算 target=%s", item["id"])
-                return
-            requeued = 0
-            for item in rows:
-                state = db.complete_strm_change_target(
-                    int(item["id"]),
-                    expected_owner=str(item.get("lease_owner") or ""),
-                    expected_lease_generation=int(item.get("lease_generation") or 0),
-                )
-                if state == "queued":
-                    requeued += 1
-                elif state == "stale":
-                    logger.warning("忽略迟到的 STRM 完成结算 target=%s", item["id"])
+            elif rows:
+                for item in rows:
+                    state = db.complete_strm_change_target(
+                        int(item["id"]),
+                        expected_owner=str(item.get("lease_owner") or ""),
+                        expected_lease_generation=int(item.get("lease_generation") or 0),
+                    )
+                    if state == "queued":
+                        requeued += 1
+                    elif state == "stale":
+                        logger.warning("忽略迟到的 STRM 完成结算 target=%s", item["id"])
         except Exception:
             logger.exception("更新 STRM 变化目标状态失败")
             return
-        due_count = 0
-        try:
-            due_count = db.count_due_strm_change_targets()
-        except Exception:
-            logger.exception("读取待续跑 STRM 变化目标失败")
-        if due_count and not self._stop_event.is_set():
-            logger.info(
-                "仍有可领取的 STRM 变化目标，已安排下一轮 count=%s dirty_requeued=%s",
-                due_count, requeued,
-            )
+        if not self._stop_event.is_set():
             try:
-                self.trigger("organize")
+                delay = db.seconds_until_next_strm_change_target()
+                if delay is not None:
+                    if not rows and delay <= 0:
+                        try:
+                            delay = max(0.0, float(empty_retry_delay or 0.0))
+                        except (TypeError, ValueError, OverflowError):
+                            delay = 0.0
+                    logger.info(
+                        "仍有 STRM 变化目标，已安排下一轮 delay=%.1fs dirty_requeued=%s",
+                        delay, requeued,
+                    )
+                    self._schedule_persisted_change_queue(delay)
             except Exception:
                 logger.exception("重新排队 STRM 变化目标触发失败")
 
@@ -726,6 +959,14 @@ class STRMScheduler:
                 log_throttled(
                     logger, logging.WARNING, f"organize-outbox:{type(exc).__name__}",
                     "整理通知补发检查失败 type=%s", type(exc).__name__,
+                )
+            try:
+                self._drain_persisted_change_queue()
+            except Exception as exc:
+                log_throttled(
+                    logger, logging.WARNING,
+                    f"strm-change-queue-drain:{type(exc).__name__}",
+                    "STRM 持久变化队列兜底检查失败 type=%s", type(exc).__name__,
                 )
             self._wake_event.wait(timeout=10)
             self._wake_event.clear()
@@ -1177,13 +1418,19 @@ class STRMScheduler:
                     claimed_targets, max(30, get_int("STRM_CHANGE_LEASE_SECONDS", 900))
                 )
                 lease_heartbeat.start()
+                claimed_changes = [
+                    change
+                    for target in claimed_targets
+                    for change in (target.get("changes") or [])
+                ]
+                if _claimed_changes_extend_notification_scope(
+                    organize_changes, claimed_changes,
+                ):
+                    # 持久队列中额外领取的目标可能来自重启恢复或旧失败重试，
+                    # 已无法证明属于本次通知会话；合并后只能发送脱敏汇总。
+                    options["has_silent_notification_scope"] = True
                 organize_changes = _merge_organize_changes(
-                    organize_changes,
-                    [
-                        change
-                        for target in claimed_targets
-                        for change in (target.get("changes") or [])
-                    ],
+                    organize_changes, claimed_changes,
                 )
             use_incremental = bool(
                 (trigger_type == "organize" or requested_mode == "fast")
@@ -1383,11 +1630,23 @@ class STRMScheduler:
                 stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
                 notify_override=options.get("notify_override"),
                 chat_ids=list(options.get("chat_ids") or []),
+                uses_default_notification_scope=options.get(
+                    "uses_default_notification_scope"
+                ),
+                has_silent_notification_scope=bool(
+                    options.get("has_silent_notification_scope")
+                ),
             )
             self._notify_details(
                 stats, trigger_type,
                 enabled_override=options.get("detail_notify_override"),
                 chat_ids=list(options.get("chat_ids") or []),
+                uses_default_notification_scope=options.get(
+                    "uses_default_notification_scope"
+                ),
+                has_silent_notification_scope=bool(
+                    options.get("has_silent_notification_scope")
+                ),
             )
             logger.info(
                 "STRM 任务%s trigger=%s mode=%s fallback=%s elapsed=%ss",
@@ -1402,6 +1661,7 @@ class STRMScheduler:
                 claimed_targets,
                 "failed" if partial else "completed",
                 error="STRM 同步部分完成，等待重试" if partial else "",
+                empty_retry_delay=1.0,
             )
             return {"ok": True, "partial": partial, **result}
         except Exception as exc:
@@ -1421,12 +1681,21 @@ class STRMScheduler:
             if lease_heartbeat:
                 lease_heartbeat.stop()
                 lease_heartbeat = None
-            self._settle_change_targets(claimed_targets, "failed", error=error_text)
+            self._settle_change_targets(
+                claimed_targets, "failed", error=error_text,
+                empty_retry_delay=60.0,
+            )
             self._notify_failure(
                 error_text,
                 trigger_type,
                 notify_override=options.get("notify_override"),
                 chat_ids=list(options.get("chat_ids") or []),
+                uses_default_notification_scope=options.get(
+                    "uses_default_notification_scope"
+                ),
+                has_silent_notification_scope=bool(
+                    options.get("has_silent_notification_scope")
+                ),
             )
             return {"ok": False, "error": error_text}
         finally:
@@ -1642,27 +1911,82 @@ class STRMScheduler:
         )
 
     @staticmethod
+    def _resolve_notification_scopes(
+        chat_ids: list[str] | None,
+        uses_default_notification_scope: bool | None,
+        has_silent_notification_scope: bool,
+    ) -> tuple[list[str], bool, bool]:
+        """解析合并任务的通知范围，并判断是否必须隐藏跨来源详情。"""
+        recipients = list(dict.fromkeys(
+            str(item) for item in (chat_ids or []) if str(item)
+        ))
+        uses_default = (
+            not recipients
+            if uses_default_notification_scope is None
+            else bool(uses_default_notification_scope)
+        )
+        configured_default = str(get("TG_CHAT_ID", "") or "").strip()
+        send_default = bool(
+            uses_default
+            and (not configured_default or configured_default not in recipients)
+        )
+        scope_count = (
+            len(recipients)
+            + int(send_default)
+            + int(bool(has_silent_notification_scope))
+        )
+        return recipients, send_default, scope_count > 1
+
+    @staticmethod
     def _notify_success(stats: dict, refresh: dict, elapsed: float,
                         trigger_type: str, sources: list[dict], strm_root: str,
                         notify_override: bool | None = None,
-                        chat_ids: list[str] | None = None) -> None:
+                        chat_ids: list[str] | None = None,
+                        uses_default_notification_scope: bool | None = None,
+                        has_silent_notification_scope: bool = False) -> None:
         enabled = get_bool("STRM_NOTIFY_ENABLED", True) if notify_override is None else notify_override
         if trigger_type == "telegram" or not enabled:
             return
-        event = STRMScheduler._build_success_event(
-            stats, refresh, elapsed, trigger_type, sources, strm_root
+        recipients, send_default, restricted = STRMScheduler._resolve_notification_scopes(
+            chat_ids,
+            uses_default_notification_scope,
+            has_silent_notification_scope,
         )
-        recipients = list(dict.fromkeys(str(item) for item in (chat_ids or []) if str(item)))
+        if restricted:
+            partial = bool(
+                int(stats.get("failed", 0) or 0)
+                or int(stats.get("metadata_failed", 0) or 0)
+                or stats.get("clean_skipped")
+                or any(value is False for value in refresh.values())
+            )
+            event = NotificationEvent(
+                "⚠️ STRM 同步部分完成" if partial else "✅ STRM 同步完成",
+                fields=((
+                    "说明",
+                    "本轮合并了多个整理请求；为避免跨来源暴露目录或文件信息，"
+                    "详细结果请在 Web 运行记录中查看。",
+                ),),
+            )
+            logger.warning(
+                "STRM 合并任务包含多个通知范围，已隐藏跨来源汇总详情 chats=%s default=%s silent=%s",
+                len(recipients), send_default, bool(has_silent_notification_scope),
+            )
+        else:
+            event = STRMScheduler._build_success_event(
+                stats, refresh, elapsed, trigger_type, sources, strm_root
+            )
         if recipients:
             for recipient in recipients:
                 send(event, chat_id=recipient)
-        else:
+        if send_default:
             send(event)
 
     @staticmethod
     def _notify_details(stats: dict, trigger_type: str,
                         enabled_override: bool | None = None,
-                        chat_ids: list[str] | None = None) -> None:
+                        chat_ids: list[str] | None = None,
+                        uses_default_notification_scope: bool | None = None,
+                        has_silent_notification_scope: bool = False) -> None:
         """仅为整理联动发送有界文件明细，汇总通知开关与其相互独立。"""
         if trigger_type != "organize":
             return
@@ -1672,34 +1996,59 @@ class STRMScheduler:
         )
         if not enabled:
             return
+        recipients, send_default, restricted = STRMScheduler._resolve_notification_scopes(
+            chat_ids,
+            uses_default_notification_scope,
+            has_silent_notification_scope,
+        )
+        if restricted:
+            logger.warning(
+                "STRM 合并任务包含多个通知范围，已跳过文件明细 chats=%s default=%s silent=%s",
+                len(recipients), send_default, bool(has_silent_notification_scope),
+            )
+            return
         for message in build_strm_detail_messages(
             stats.get("changes") or [],
             omitted_count=int(stats.get("omitted_count", 0) or 0),
             max_messages=max(0, get_int("STRM_DETAIL_MAX_MESSAGES", 200)),
         ):
             # notifier.send 接收 HTML 文本；完整转义动态目录和文件名。
-            recipients = list(dict.fromkeys(str(item) for item in (chat_ids or []) if str(item)))
             if recipients:
                 for recipient in recipients:
                     send_text(html.escape(message), chat_id=recipient)
-            else:
+            if send_default:
                 send_text(html.escape(message))
 
     @staticmethod
     def _notify_failure(error: str, trigger_type: str,
                         notify_override: bool | None = None,
-                        chat_ids: list[str] | None = None) -> None:
+                        chat_ids: list[str] | None = None,
+                        uses_default_notification_scope: bool | None = None,
+                        has_silent_notification_scope: bool = False) -> None:
         enabled = get_bool("STRM_NOTIFY_ENABLED", True) if notify_override is None else notify_override
         if trigger_type != "telegram" and enabled:
             event = NotificationEvent(
                 "❌ STRM 同步失败",
                 fields=(("触发", trigger_type), ("错误", error[:500])),
             )
-            recipients = list(dict.fromkeys(str(item) for item in (chat_ids or []) if str(item)))
+            recipients, send_default, restricted = STRMScheduler._resolve_notification_scopes(
+                chat_ids,
+                uses_default_notification_scope,
+                has_silent_notification_scope,
+            )
+            if restricted:
+                event = NotificationEvent(
+                    "❌ STRM 同步失败",
+                    fields=((
+                        "说明",
+                        "本轮合并了多个整理请求；为避免跨来源暴露错误详情，"
+                        "请在 Web 运行记录中查看。",
+                    ),),
+                )
             if recipients:
                 for recipient in recipients:
                     send(event, chat_id=recipient)
-            else:
+            if send_default:
                 send(event)
 
     @staticmethod

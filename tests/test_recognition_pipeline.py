@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import threading
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -1344,6 +1345,23 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
             (2, 5),
         )
 
+    def test_enclosed_high_number_remains_ambiguous_without_tmdb_proof(self):
+        scraper = self.recognition_module()
+        parser = scraper.TMDBScraper()
+        filename = "[Yami Shibai 17][06][x264 1080p][CHS].mp4"
+
+        context = scraper.extract_recognition_context(filename, "")
+        parsed = _parse_fields(parser, filename)
+
+        self.assertEqual(context.normalized_title, "Yami Shibai 17")
+        self.assertEqual((context.season, context.episode), (None, 6))
+        self.assertEqual(parsed["title"], "Yami Shibai 17")
+        self.assertEqual((parsed["season"], parsed["episode"]), (None, 6))
+        self.assertEqual(
+            scraper.parse_release_position(filename),
+            {"season": None, "episode": 6, "episode_end": None},
+        )
+
     def test_implicit_sequel_season_keeps_numeric_and_part_titles_safe(self):
         scraper = self.recognition_module()
         parser = scraper.TMDBScraper()
@@ -1919,6 +1937,16 @@ class _DeterministicClient:
 
 
 
+class _QueryDeterministicClient(_DeterministicClient):
+    def __init__(self, candidates_by_query, details=None):
+        super().__init__([], details)
+        self.candidates_by_query = candidates_by_query
+
+    def search(self, title, year, media_type):
+        self.search_calls.append((title, year, media_type))
+        return list(self.candidates_by_query.get(str(title), []))
+
+
 class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
     def test_virgin_punk_matches_tmdb_translation_alias(self):
         scraper_module = self.recognition_module()
@@ -2018,6 +2046,133 @@ class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
         self.assertTrue(result.need_confirm)
         self.assertEqual(result.threshold_decision["reason"], "low_information_title")
         self.assertIn("信息量不足", result.error)
+
+    def test_low_information_parent_cannot_override_informative_filename(self):
+        scraper_module = self.recognition_module()
+        wrong_candidate = {
+            "id": 294418,
+            "name": "1",
+            "first_air_date": "2006-01-01",
+            "media_type": "tv",
+        }
+        filenames = (
+            (
+                "[ANi] Animatica「北斗之拳 拳王軍雜兵們的輓歌」 - 19 "
+                "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+            ),
+            (
+                "[ANi] 麵包超人電影版：小水滴的英雄！ [電影] [中文配音] - 01 "
+                "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+            ),
+        )
+
+        for filename in filenames:
+            with self.subTest(filename=filename):
+                context = scraper_module.extract_recognition_context(filename, "1")
+                self.assertEqual(context.folder_title, "1")
+                self.assertNotIn(
+                    "1", scraper_module.generate_query_variants(context)
+                )
+
+                breakdown = scraper_module.score_candidate(
+                    context, wrong_candidate
+                )
+                self.assertEqual(
+                    breakdown.rejected_constraints,
+                    ["low_information_variant_match"],
+                )
+                self.assertNotEqual(breakdown.matched_query, "1")
+
+                result = scraper_module.TMDBScraper(
+                    client=_DeterministicClient([wrong_candidate])
+                ).deterministic_recognize(filename, "1")
+
+                self.assertEqual(result.status, "low_confidence")
+                self.assertTrue(result.need_confirm)
+                self.assertEqual(
+                    result.threshold_decision["reason"],
+                    "low_information_variant_match",
+                )
+                self.assertIn("低信息目录", result.error)
+                self.assertEqual(
+                    result.metadata["recognition_evidence"]["folder_title"],
+                    "1",
+                )
+
+    def test_low_information_parent_keeps_correct_filename_matches(self):
+        scraper_module = self.recognition_module()
+        samples = (
+            (
+                "9001",
+                (
+                    "[ANi] Animatica「北斗之拳 拳王軍雜兵們的輓歌」 - 19 "
+                    "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+                ),
+                "Animatica「北斗之拳 拳王軍雜兵們的輓歌」",
+                19,
+            ),
+            (
+                "9002",
+                (
+                    "[ANi] 麵包超人電影版：小水滴的英雄！ [電影] [中文配音] - 01 "
+                    "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+                ),
+                "麵包超人電影版：小水滴的英雄！ 中文配音",
+                1,
+            ),
+        )
+
+        for tmdb_id, filename, title, episode in samples:
+            with self.subTest(filename=filename):
+                candidate = {
+                    "id": int(tmdb_id),
+                    "name": title,
+                    "first_air_date": "2026-01-01",
+                    "media_type": "tv",
+                }
+                client = _DeterministicClient([candidate], {
+                    tmdb_id: {
+                        "seasons": [
+                            {"season_number": 1, "episode_count": 24}
+                        ],
+                    },
+                })
+                result = scraper_module.TMDBScraper(
+                    client=client
+                ).deterministic_recognize(filename, "1")
+
+                self.assertEqual(result.status, "matched")
+                self.assertFalse(result.need_confirm)
+                self.assertEqual(result.tmdb_id, tmdb_id)
+                self.assertEqual(result.context.episode, episode)
+                self.assertNotIn("1", result.query_variants)
+                self.assertNotIn(
+                    "low_information_variant_match",
+                    result.rejected_constraints,
+                )
+
+    def test_meaningful_folder_still_identifies_generic_episode_filename(self):
+        scraper_module = self.recognition_module()
+        candidate = {
+            "id": 9003,
+            "name": "Example Show",
+            "first_air_date": "2024-01-01",
+            "media_type": "tv",
+        }
+        client = _DeterministicClient([candidate], {
+            "9003": {"seasons": [{"season_number": 1, "episode_count": 12}]},
+        })
+
+        result = scraper_module.TMDBScraper(client=client).deterministic_recognize(
+            "01.mkv", "/剧集/Example Show"
+        )
+
+        self.assertEqual(result.status, "matched")
+        self.assertFalse(result.need_confirm)
+        self.assertIn("Example Show", result.query_variants)
+        self.assertNotIn(
+            "low_information_variant_match", result.rejected_constraints
+        )
 
     def test_four_digit_movie_title_can_still_auto_match(self):
         scraper_module = self.recognition_module()
@@ -2227,6 +2382,417 @@ class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
         resolution = result.metadata["alias_position_resolution"]
         self.assertEqual(resolution["selected_tmdb_id"], "56559")
         self.assertEqual(resolution["excluded"][0]["reason"], "season_not_found")
+
+    def test_enclosed_yami_shibai_high_season_uses_verified_fallback(self):
+        scraper_module = self.recognition_module()
+        filename = (
+            "[UHA-WINGS&YUI-7][Yami Shibai 17][06]"
+            "[x264 1080p][CHS].mp4"
+        )
+        candidates = [
+            {
+                "id": 56559,
+                "name": "暗芝居",
+                "original_name": "闇芝居",
+                "first_air_date": "2013-07-15",
+                "media_type": "tv",
+            },
+            {
+                "id": 136895,
+                "name": "暗芝居（生）",
+                "original_name": "闇芝居（生）",
+                "first_air_date": "2020-09-10",
+                "media_type": "tv",
+            },
+        ]
+        client = _QueryDeterministicClient({"Yami Shibai": candidates}, {
+            "56559": {
+                "alternative_titles": {"results": [{"title": "Yami Shibai"}]},
+                "seasons": [{"season_number": 17, "episode_count": 13}],
+            },
+            "136895": {
+                "alternative_titles": {"results": [{"title": "Yami Shibai"}]},
+                "seasons": [{"season_number": 1, "episode_count": 13}],
+            },
+        })
+        tmdb = scraper_module.TMDBScraper(client=client)
+
+        result = tmdb.deterministic_recognize(filename, "1")
+        parsed = tmdb.parse_media(filename, "1", result)
+
+        self.assertEqual(result.status, "matched")
+        self.assertFalse(result.need_confirm)
+        self.assertEqual(result.tmdb_id, "56559")
+        self.assertEqual(result.matched_by, "implicit_season_fallback")
+        self.assertEqual(result.season_override, 17)
+        self.assertEqual(
+            (result.context.normalized_title, result.context.season, result.context.episode),
+            ("Yami Shibai", 17, 6),
+        )
+        self.assertEqual((parsed.source_season, parsed.source_episode), (None, 6))
+        self.assertEqual((parsed.effective_season, parsed.effective_episode), (17, 6))
+        self.assertIn(("Yami Shibai 17", "", "tv"), client.search_calls)
+        self.assertIn(("Yami Shibai", "", "tv"), client.search_calls)
+        self.assertEqual(
+            result.metadata["implicit_season_fallback"]["source_title"],
+            "Yami Shibai 17",
+        )
+
+    def test_enclosed_numeric_title_prefers_primary_tmdb_identity(self):
+        scraper_module = self.recognition_module()
+        filename = "[Room 17][06][1080p].mkv"
+        candidate = {
+            "id": 1701,
+            "name": "Room 17",
+            "original_name": "Room 17",
+            "first_air_date": "2024-01-01",
+            "media_type": "tv",
+        }
+        client = _QueryDeterministicClient({"Room 17": [candidate]}, {
+            "1701": {"seasons": [{"season_number": 1, "episode_count": 10}]},
+        })
+
+        result = scraper_module.TMDBScraper(client=client).deterministic_recognize(
+            filename
+        )
+
+        self.assertEqual(result.status, "matched")
+        self.assertEqual(result.tmdb_id, "1701")
+        self.assertEqual(result.context.normalized_title, "Room 17")
+        self.assertIsNone(result.context.season)
+        self.assertIsNone(result.season_override)
+        self.assertNotIn(("Room", "", "tv"), client.search_calls)
+        self.assertNotIn("implicit_season_fallback", result.metadata)
+
+    def test_enclosed_season_fallback_requires_tmdb_position_proof(self):
+        scraper_module = self.recognition_module()
+        filename = "[UHA-WINGS&YUI-7][Yami Shibai 17][06][1080p].mp4"
+        candidate = {
+            "id": 56559,
+            "name": "暗芝居",
+            "original_name": "闇芝居",
+            "first_air_date": "2013-07-15",
+            "media_type": "tv",
+        }
+        client = _QueryDeterministicClient({"Yami Shibai": [candidate]}, {
+            "56559": {
+                "alternative_titles": {"results": [{"title": "Yami Shibai"}]},
+                "seasons": [{"season_number": 16, "episode_count": 13}],
+            },
+        })
+
+        result = scraper_module.TMDBScraper(client=client).deterministic_recognize(
+            filename
+        )
+
+        self.assertEqual(result.status, "no_result")
+        self.assertTrue(result.need_confirm)
+        self.assertIsNone(result.season_override)
+        self.assertEqual(result.context.normalized_title, "Yami Shibai 17")
+        self.assertNotIn("implicit_season_fallback", result.metadata)
+
+    def test_enclosed_numeric_title_is_not_overridden_by_single_base_series(self):
+        scraper_module = self.recognition_module()
+        filename = (
+            "[UHA-WINGS&YUI-7][The Fantastic Four 17][06]"
+            "[x264 1080p].mkv"
+        )
+        candidate = {
+            "id": 99,
+            "name": "The Fantastic Four",
+            "original_name": "The Fantastic Four",
+            "first_air_date": "2000-01-01",
+            "media_type": "tv",
+        }
+        client = _QueryDeterministicClient({"The Fantastic Four": [candidate]}, {
+            "99": {"seasons": [{"season_number": 17, "episode_count": 12}]},
+        })
+
+        result = scraper_module.TMDBScraper(client=client).deterministic_recognize(
+            filename
+        )
+
+        self.assertEqual(result.status, "no_result")
+        self.assertTrue(result.need_confirm)
+        self.assertIsNone(result.season_override)
+        self.assertEqual(result.context.normalized_title, "The Fantastic Four 17")
+        self.assertIn(("The Fantastic Four", "", "tv"), client.search_calls)
+        self.assertNotIn("implicit_season_fallback", result.metadata)
+
+    def test_enclosed_season_fallback_rejects_language_only_release_evidence(self):
+        scraper_module = self.recognition_module()
+        filename = "[UHA-WINGS&YUI-7][Yami Shibai 17][06][CHS].mp4"
+        candidates = [{
+            "id": 56559,
+            "name": "暗芝居",
+            "original_name": "闇芝居",
+            "first_air_date": "2013-07-15",
+            "media_type": "tv",
+        }]
+        client = _QueryDeterministicClient({"Yami Shibai": candidates}, {
+            "56559": {
+                "alternative_titles": {"results": [{"title": "Yami Shibai"}]},
+                "seasons": [{"season_number": 17, "episode_count": 13}],
+            },
+        })
+
+        result = scraper_module.TMDBScraper(client=client).deterministic_recognize(
+            filename
+        )
+
+        self.assertEqual(result.status, "no_result")
+        self.assertNotIn(("Yami Shibai", "", "tv"), client.search_calls)
+        self.assertIsNone(result.season_override)
+
+    def test_enclosed_season_fallback_stops_when_exact_title_query_fails(self):
+        scraper_module = self.recognition_module()
+        filename = (
+            "[UHA-WINGS&YUI-7][Yami Shibai 17][06]"
+            "[x264 1080p][CHS].mp4"
+        )
+        candidates = [
+            {
+                "id": 56559,
+                "name": "暗芝居",
+                "original_name": "闇芝居",
+                "first_air_date": "2013-07-15",
+                "media_type": "tv",
+            },
+            {
+                "id": 136895,
+                "name": "暗芝居（生）",
+                "original_name": "闇芝居（生）",
+                "first_air_date": "2020-09-10",
+                "media_type": "tv",
+            },
+        ]
+
+        class _FailingExactClient(_QueryDeterministicClient):
+            def search(self, title, year, media_type):
+                self.search_calls.append((title, year, media_type))
+                if title == "Yami Shibai 17":
+                    raise scraper_module.ProviderUnavailable("temporary outage")
+                return list(self.candidates_by_query.get(str(title), []))
+
+        client = _FailingExactClient({"Yami Shibai": candidates}, {})
+
+        result = scraper_module.TMDBScraper(client=client).deterministic_recognize(
+            filename, "1"
+        )
+
+        self.assertEqual(result.status, "request_error")
+        self.assertTrue(result.need_confirm)
+        self.assertIsNone(result.season_override)
+        self.assertNotIn(("Yami Shibai", "", "tv"), client.search_calls)
+        attempts = result.metadata["search_attempts"]
+        self.assertTrue(any(
+            item["query"] == "Yami Shibai 17"
+            and item["status"] == "request_error"
+            for item in attempts
+        ))
+
+    def test_enclosed_season_fallback_rejects_cached_empty_exact_title(self):
+        scraper_module = self.recognition_module()
+        filename = (
+            "[UHA-WINGS&YUI-7][Yami Shibai 17][06]"
+            "[x264 1080p][CHS].mp4"
+        )
+        candidates = [
+            {
+                "id": 56559,
+                "name": "暗芝居",
+                "original_name": "闇芝居",
+                "first_air_date": "2013-07-15",
+                "media_type": "tv",
+            },
+            {
+                "id": 136895,
+                "name": "暗芝居（生）",
+                "original_name": "闇芝居（生）",
+                "first_air_date": "2020-09-10",
+                "media_type": "tv",
+            },
+        ]
+        client = _QueryDeterministicClient({"Yami Shibai": candidates}, {})
+        tmdb = scraper_module.TMDBScraper(client=client)
+        self.assertEqual(tmdb.search("Yami Shibai 17", "", "tv"), [])
+        client.candidates_by_query["Yami Shibai 17"] = [{
+            "id": 777,
+            "name": "Yami Shibai 17",
+            "original_name": "Yami Shibai 17",
+            "first_air_date": "2026-01-01",
+            "media_type": "tv",
+        }]
+
+        result = tmdb.deterministic_recognize(filename, "1")
+
+        self.assertEqual(result.status, "no_result")
+        self.assertTrue(result.need_confirm)
+        self.assertIsNone(result.season_override)
+        self.assertNotIn(("Yami Shibai", "", "tv"), client.search_calls)
+        self.assertEqual(
+            result.metadata["implicit_season_fallback_skipped"],
+            "primary_title_unverified",
+        )
+        exact_attempt = next(
+            item for item in result.metadata["search_attempts"]
+            if item["query"] == "Yami Shibai 17" and item["year"] == ""
+        )
+        self.assertTrue(exact_attempt["cache_hit"])
+        self.assertTrue(exact_attempt["empty_cache_hit"])
+
+    def test_enclosed_season_fallback_cache_provenance_is_thread_local(self):
+        scraper_module = self.recognition_module()
+        filename = (
+            "[UHA-WINGS&YUI-7][Yami Shibai 17][06]"
+            "[x264 1080p][CHS].mp4"
+        )
+        candidates = [
+            {
+                "id": 56559,
+                "name": "暗芝居",
+                "original_name": "闇芝居",
+                "first_air_date": "2013-07-15",
+                "media_type": "tv",
+            },
+            {
+                "id": 136895,
+                "name": "暗芝居（生）",
+                "original_name": "闇芝居（生）",
+                "first_air_date": "2020-09-10",
+                "media_type": "tv",
+            },
+        ]
+        client = _QueryDeterministicClient({"Yami Shibai": candidates}, {})
+        tmdb = scraper_module.TMDBScraper(client=client)
+        self.assertEqual(tmdb.search("Yami Shibai 17", "", "tv"), [])
+        reached = threading.Event()
+        release = threading.Event()
+        worker_result = []
+        original_take = tmdb._take_thread_search_outcome
+        blocked = False
+
+        def gated_take(results):
+            nonlocal blocked
+            if threading.current_thread().name == "recognition-a" and not blocked:
+                blocked = True
+                reached.set()
+                self.assertTrue(release.wait(3))
+            return original_take(results)
+
+        def recognize():
+            worker_result.append(tmdb.deterministic_recognize(filename, "1"))
+
+        with patch.object(tmdb, "_take_thread_search_outcome", side_effect=gated_take):
+            worker = threading.Thread(target=recognize, name="recognition-a")
+            worker.start()
+            self.assertTrue(reached.wait(3))
+            self.assertEqual(tmdb.search("Unrelated Fresh Empty", "", "tv"), [])
+            release.set()
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+
+        self.assertEqual(len(worker_result), 1)
+        result = worker_result[0]
+        self.assertEqual(result.status, "no_result")
+        self.assertIsNone(result.season_override)
+        self.assertNotIn(("Yami Shibai", "", "tv"), client.search_calls)
+        exact_attempt = next(
+            item for item in result.metadata["search_attempts"]
+            if item["query"] == "Yami Shibai 17" and item["year"] == ""
+        )
+        self.assertTrue(exact_attempt["cache_hit"])
+        self.assertTrue(exact_attempt["empty_cache_hit"])
+
+    def test_enclosed_season_fallback_rejects_multiple_candidates_at_same_position(self):
+        scraper_module = self.recognition_module()
+        filename = (
+            "[UHA-WINGS&YUI-7][Yami Shibai 17][06]"
+            "[x264 1080p][CHS].mp4"
+        )
+        candidates = [
+            {
+                "id": 56559,
+                "name": "暗芝居",
+                "original_name": "闇芝居",
+                "first_air_date": "2013-07-15",
+                "media_type": "tv",
+            },
+            {
+                "id": 136895,
+                "name": "暗芝居（生）",
+                "original_name": "闇芝居（生）",
+                "first_air_date": "2020-09-10",
+                "media_type": "tv",
+            },
+        ]
+        shared_detail = {
+            "alternative_titles": {"results": [{"title": "Yami Shibai"}]},
+            "seasons": [{"season_number": 17, "episode_count": 13}],
+        }
+        client = _QueryDeterministicClient({"Yami Shibai": candidates}, {
+            "56559": shared_detail,
+            "136895": shared_detail,
+        })
+
+        result = scraper_module.TMDBScraper(client=client).deterministic_recognize(
+            filename, "1"
+        )
+
+        self.assertEqual(result.status, "no_result")
+        self.assertTrue(result.need_confirm)
+        self.assertIsNone(result.season_override)
+        self.assertNotIn("implicit_season_fallback", result.metadata)
+
+    def test_match_preserves_verified_implicit_season_context_and_effective_position(self):
+        scraper_module = self.recognition_module()
+        filename = (
+            "[UHA-WINGS&YUI-7][Yami Shibai 17][06]"
+            "[x264 1080p][CHS].mp4"
+        )
+        candidates = [
+            {
+                "id": 56559,
+                "name": "暗芝居",
+                "original_name": "闇芝居",
+                "first_air_date": "2013-07-15",
+                "media_type": "tv",
+            },
+            {
+                "id": 136895,
+                "name": "暗芝居（生）",
+                "original_name": "闇芝居（生）",
+                "first_air_date": "2020-09-10",
+                "media_type": "tv",
+            },
+        ]
+        client = _QueryDeterministicClient({"Yami Shibai": candidates}, {
+            "56559": {
+                "alternative_titles": {"results": [{"title": "Yami Shibai"}]},
+                "seasons": [{"season_number": 17, "episode_count": 13}],
+            },
+            "136895": {
+                "alternative_titles": {"results": [{"title": "Yami Shibai"}]},
+                "seasons": [{"season_number": 1, "episode_count": 13}],
+            },
+        })
+        tmdb = scraper_module.TMDBScraper(client=client)
+
+        with patch.object(tmdb, "_get_lock", return_value=None), patch(
+            "app.modules.tmdb_regex_rules.find_tmdb_regex_match", return_value=None,
+        ), patch(
+            "app.modules.media_aliases.lookup_manual_alias", return_value=None,
+        ):
+            result = tmdb.match(filename, "1")
+        parsed = tmdb.parse_media(filename, "1", result)
+
+        self.assertEqual(result.status, "matched")
+        self.assertEqual(result.matched_by, "implicit_season_fallback")
+        self.assertEqual(result.season_override, 17)
+        self.assertEqual((result.effective_season, result.effective_episode), (17, 6))
+        self.assertEqual((result.context.season, result.context.episode), (17, 6))
+        self.assertEqual((parsed.source_season, parsed.source_episode), (None, 6))
+        self.assertEqual((parsed.effective_season, parsed.effective_episode), (17, 6))
 
     def test_exact_alias_ambiguity_can_use_source_year_and_tmdb_position(self):
         scraper_module = self.recognition_module()
@@ -3673,7 +4239,13 @@ class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
             result = tmdb.match("Fallback.Movie.2024.mkv", "/电影/Fallback Movie (2024)")
 
         self.assertIs(result, expected)
-        recognize.assert_called_once_with("Fallback.Movie.2024.mkv", "/电影/Fallback Movie (2024)")
+        recognize.assert_called_once()
+        self.assertEqual(
+            recognize.call_args.args,
+            ("Fallback.Movie.2024.mkv", "/电影/Fallback Movie (2024)"),
+        )
+        source_context = recognize.call_args.kwargs["source_context"]
+        self.assertEqual(source_context.filename_title, "Fallback Movie")
 
 
 class RecognitionPreviewContractTests(RecognitionContractMixin, unittest.TestCase):
@@ -3703,6 +4275,7 @@ class RecognitionPreviewContractTests(RecognitionContractMixin, unittest.TestCas
             constraint_penalty=0.0,
             final_score=0.96,
             matched_title="Show",
+            matched_query="Show",
             rejected_constraints=[],
         )
         result = scraper_module.RecognitionResult(
@@ -3754,6 +4327,9 @@ class RecognitionPreviewContractTests(RecognitionContractMixin, unittest.TestCas
         self.assertEqual(payload["recognition"]["folder_context"]["year"], "2024")
         self.assertEqual(payload["recognition"]["query_variants"], ["Show"])
         self.assertEqual(payload["candidates"][0]["score_breakdown"]["final_score"], 0.96)
+        self.assertEqual(
+            payload["candidates"][0]["score_breakdown"]["matched_query"], "Show"
+        )
         self.assertEqual(payload["recognition"]["threshold_decision"]["reason"], "score_met")
         serialized = json.dumps(payload, ensure_ascii=False).lower()
         self.assertNotIn("test-key", serialized)

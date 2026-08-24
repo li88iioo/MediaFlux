@@ -146,13 +146,27 @@ class _NoAtomicEmptyDeleteRawClient(_RotatingRawClient):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fs_delete_calls: list[list[str]] = []
+        self.detail_calls = 0
+        self.list_calls = 0
+        self.children_by_call: list[list[dict]] = []
         self.detail = {
             "fileId": "empty-dir", "fileName": "Empty", "resType": 2,
             "etag": "version-1", "utime": 123,
         }
 
     def fs_detail(self, _file_id):
+        self.detail_calls += 1
         return {"data": {"fileInfo": dict(self.detail)}}
+
+    def fs_files(self, **_kwargs):
+        self.list_calls += 1
+        index = self.list_calls - 1
+        children = (
+            self.children_by_call[index]
+            if index < len(self.children_by_call)
+            else []
+        )
+        return {"data": {"list": list(children)}}
 
     def fs_delete(self, file_ids):
         self.fs_delete_calls.append([str(item) for item in file_ids])
@@ -412,7 +426,35 @@ class GuangYaTokenClientTests(unittest.TestCase):
                     expected_updated_at=123,
                 ))
 
+            self.assertEqual(raw.detail_calls, 2)
+            self.assertEqual(raw.list_calls, 2)
             self.assertEqual(raw.fs_delete_calls, [["empty-dir"]])
+
+    def test_guarded_empty_directory_recheck_rejects_new_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory, expires_at=time() + 7200)
+            with patch(
+                "app.clients.guangya._load_raw",
+                return_value=_NoAtomicEmptyDeleteRawClient,
+            ):
+                client = GuangYaClient(token_file=token_file)
+                raw = client._raw
+                raw.children_by_call = [[], [{
+                    "fileId": "late-child",
+                    "fileName": "late.mkv",
+                    "resType": 1,
+                }]]
+
+                with self.assertRaisesRegex(RuntimeError, "已包含内容"):
+                    client.delete_empty_directory(
+                        "empty-dir",
+                        expected_etag="version-1",
+                        expected_updated_at=123,
+                    )
+
+            self.assertEqual(raw.detail_calls, 2)
+            self.assertEqual(raw.list_calls, 2)
+            self.assertEqual(raw.fs_delete_calls, [])
 
     def test_delete_empty_directory_rejects_provider_failure_response(self):
         with tempfile.TemporaryDirectory() as directory:

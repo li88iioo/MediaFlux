@@ -261,6 +261,149 @@ class PlaybackSessionRegistryTests(unittest.TestCase):
             registry.persistent_key(resolved), registry.persistent_key(entry)
         )
 
+    def test_new_play_session_inherits_recent_media_name_for_exact_source(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        registry.remember_media_names(
+            "scope-a",
+            7,
+            "item-1",
+            {"source-a": "Movie.mkv"},
+        )
+
+        first = registry.begin(
+            "scope-a",
+            7,
+            token="play-session-a",
+            item_id="item-1",
+            source_id="source-a",
+        )
+        second = registry.begin(
+            "scope-a",
+            7,
+            token="play-session-b",
+            item_id="item-1",
+            source_id="source-a",
+        )
+
+        self.assertEqual(first.media_name, "Movie.mkv")
+        self.assertEqual(second.media_name, "Movie.mkv")
+        self.assertNotEqual(
+            registry.persistent_key(first), registry.persistent_key(second)
+        )
+
+    def test_same_session_switching_source_does_not_pollute_new_source_title(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        registry.remember_media_names(
+            "scope-a",
+            7,
+            "item-1",
+            {
+                "source-a": "Source A.mkv",
+                "source-b": "Source B.mkv",
+            },
+        )
+        entry = registry.begin(
+            "scope-a",
+            7,
+            token="shared-session",
+            item_id="item-1",
+            source_id="source-a",
+        )
+
+        switched = registry.resolve(
+            "scope-a",
+            7,
+            token="shared-session",
+            item_id="item-1",
+            source_id="source-b",
+        )
+        fresh = registry.begin(
+            "scope-a",
+            7,
+            token="fresh-session",
+            item_id="item-1",
+            source_id="source-b",
+        )
+
+        self.assertIs(switched, entry)
+        self.assertEqual(switched.media_name, "Source B.mkv")
+        self.assertEqual(fresh.media_name, "Source B.mkv")
+
+    def test_media_name_context_isolated_by_scope_instance_item_and_source(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        registry.remember_media_names(
+            "scope-a",
+            7,
+            "item-1",
+            {"source-a": "Movie.mkv"},
+        )
+
+        cases = (
+            ("scope-b", 7, "item-1", "source-a"),
+            ("scope-a", 8, "item-1", "source-a"),
+            ("scope-a", 7, "item-2", "source-a"),
+            ("scope-a", 7, "item-1", "source-b"),
+            ("", 7, "item-1", "source-a"),
+        )
+        for index, (scope, instance_id, item_id, source_id) in enumerate(cases):
+            with self.subTest(
+                scope=scope,
+                instance_id=instance_id,
+                item_id=item_id,
+                source_id=source_id,
+            ):
+                entry = registry.begin(
+                    scope,
+                    instance_id,
+                    token=f"isolated-{index}",
+                    item_id=item_id,
+                    source_id=source_id,
+                )
+                self.assertEqual(entry.media_name, "")
+
+    def test_media_name_context_expires_with_playback_session_ttl(self):
+        now = [100.0]
+        registry = media_proxy.PlaybackSessionRegistry(
+            ttl_seconds=10,
+            clock=lambda: now[0],
+        )
+        registry.remember_media_names(
+            "scope-a",
+            7,
+            "item-1",
+            {"source-a": "Movie.mkv"},
+        )
+
+        now[0] = 111.0
+        entry = registry.begin(
+            "scope-a",
+            7,
+            token="expired-session",
+            item_id="item-1",
+            source_id="source-a",
+        )
+
+        self.assertEqual(entry.media_name, "")
+
+    def test_unsafe_media_name_is_not_added_to_inheritance_context(self):
+        registry = media_proxy.PlaybackSessionRegistry()
+        registry.remember_media_names(
+            "scope-a",
+            7,
+            "item-1",
+            {"source-a": "web+foo:user:password@example.invalid"},
+        )
+
+        entry = registry.begin(
+            "scope-a",
+            7,
+            token="safe-session",
+            item_id="item-1",
+            source_id="source-a",
+        )
+
+        self.assertEqual(entry.media_name, "")
+
     def test_repeated_capabilities_share_upstream_session_and_expire_independently(self):
         now = [100.0]
         registry = media_proxy.PlaybackSessionRegistry(

@@ -44,6 +44,7 @@ from app.modules.media_server_profiles import resolve_proxy_instance
 
 logger = get_logger(__name__)
 _STREAM_RE = re.compile(r"^(?:/emby)?/Videos/([^/]+)/stream(?:\.[^/]+)?/?$", re.IGNORECASE)
+_VIDEO_ITEM_RE = re.compile(r"^(?:/emby)?/Videos/([^/]+)/", re.IGNORECASE)
 _PLAYBACK_INFO_RE = re.compile(r"^(?:/emby)?/Items/([^/]+)/PlaybackInfo/?$", re.IGNORECASE)
 _PLAYGY_RE = re.compile(r"^(?:/emby)?/playgy/([^/]+)(?:/.*)?$", re.IGNORECASE)
 _HOP_HEADERS = {
@@ -993,6 +994,60 @@ def _playback_media_name(payload: Any) -> str:
     return ""
 
 
+def _playback_media_source_names(payload: Any) -> dict[str, str]:
+    """提取 PlaybackInfo 中可安全展示、且与 MediaSource 精确绑定的名称。"""
+    if not isinstance(payload, dict):
+        return {}
+    shared_name = ""
+    for key in ("Name", "ItemName", "Title"):
+        shared_name = _safe_media_name(payload.get(key))
+        if shared_name:
+            break
+    media_sources = payload.get("MediaSources")
+    if not isinstance(media_sources, list):
+        return {}
+    result: dict[str, str] = {}
+    conflicted: set[str] = set()
+    for source in media_sources:
+        if not isinstance(source, dict):
+            continue
+        source_id = _normalized_media_identifier(source.get("Id"))
+        if not source_id or source_id in conflicted:
+            continue
+        source_name = shared_name
+        if not source_name:
+            source_name = _safe_media_name(source.get("Path"), path_value=True)
+        if not source_name:
+            source_name = _safe_media_name(source.get("Name"))
+        if not source_name:
+            continue
+        previous = result.get(source_id)
+        if previous and previous != source_name:
+            # 重复 SourceId 却给出不同名称时不建立继承上下文，避免串标题。
+            result.pop(source_id, None)
+            conflicted.add(source_id)
+            continue
+        result[source_id] = source_name
+    return result
+
+
+def _playback_media_source_ids(payload: Any) -> tuple[str, ...]:
+    if not isinstance(payload, dict):
+        return ()
+    media_sources = payload.get("MediaSources")
+    if not isinstance(media_sources, list):
+        return ()
+    return tuple(dict.fromkeys(
+        source_id
+        for source_id in (
+            _normalized_media_identifier(source.get("Id"))
+            for source in media_sources
+            if isinstance(source, dict)
+        )
+        if source_id
+    ))
+
+
 @dataclass
 class _PlaybackSessionLink:
     token: str
@@ -1042,6 +1097,9 @@ class PlaybackSessionRegistry:
         self._upstream_session_index: dict[
             tuple[str, int, str], tuple[str, int, str]
         ] = {}
+        self._media_name_index: OrderedDict[
+            tuple[str, int, str, str], tuple[str, float]
+        ] = OrderedDict()
         self._lock = threading.RLock()
 
     @staticmethod
@@ -1170,6 +1228,132 @@ class PlaybackSessionRegistry:
             if value.expires_at <= now
         ]:
             self._remove_locked(key)
+        self._prune_media_names_locked(now)
+
+    def _prune_media_names_locked(self, now: float) -> None:
+        for key in [
+            key for key, (_media_name, expires_at) in self._media_name_index.items()
+            if expires_at <= now
+        ]:
+            self._media_name_index.pop(key, None)
+
+    @staticmethod
+    def _media_name_key(
+        auth_scope: str,
+        instance_id: int,
+        item_id: str,
+        source_id: str,
+    ) -> tuple[str, int, str, str] | None:
+        normalized_scope = str(auth_scope or "")
+        normalized_item = _normalized_media_identifier(item_id)
+        normalized_source = _normalized_media_identifier(source_id)
+        if not normalized_scope or not normalized_item or not normalized_source:
+            return None
+        return (
+            normalized_scope,
+            int(instance_id),
+            normalized_item,
+            normalized_source,
+        )
+
+    def _remember_media_name_locked(
+        self,
+        auth_scope: str,
+        instance_id: int,
+        item_id: str,
+        source_id: str,
+        media_name: str,
+        now: float,
+    ) -> None:
+        key = self._media_name_key(auth_scope, instance_id, item_id, source_id)
+        safe_name = _safe_media_name(media_name)
+        if key is None or not safe_name:
+            return
+        self._media_name_index[key] = (safe_name, now + self._ttl_seconds)
+        self._media_name_index.move_to_end(key)
+        while len(self._media_name_index) > self._max_entries:
+            self._media_name_index.popitem(last=False)
+
+    def _resolve_media_name_locked(
+        self,
+        auth_scope: str,
+        instance_id: int,
+        item_id: str,
+        source_ids: tuple[str, ...],
+        now: float,
+    ) -> str:
+        self._prune_media_names_locked(now)
+        normalized_sources = tuple(dict.fromkeys(
+            source_id
+            for source_id in (
+                _normalized_media_identifier(value) for value in source_ids
+            )
+            if source_id
+        ))
+        if not normalized_sources:
+            return ""
+        resolved: list[tuple[tuple[str, int, str, str], str]] = []
+        for source_id in normalized_sources:
+            key = self._media_name_key(
+                auth_scope, instance_id, item_id, source_id
+            )
+            if key is None:
+                return ""
+            cached = self._media_name_index.get(key)
+            if cached is None:
+                return ""
+            resolved.append((key, cached[0]))
+        names = {media_name for _key, media_name in resolved}
+        if len(names) != 1:
+            return ""
+        for key, media_name in resolved:
+            self._media_name_index[key] = (
+                media_name, now + self._ttl_seconds
+            )
+            self._media_name_index.move_to_end(key)
+        return resolved[0][1]
+
+    def remember_media_names(
+        self,
+        auth_scope: str,
+        instance_id: int,
+        item_id: str,
+        media_names: dict[str, str],
+    ) -> None:
+        """保存短时标题上下文；只接受认证域内的精确 item/source。"""
+        if not auth_scope or not item_id or not media_names:
+            return
+        with self._lock:
+            now = self._clock()
+            self._prune_media_names_locked(now)
+            for source_id, media_name in media_names.items():
+                self._remember_media_name_locked(
+                    auth_scope,
+                    instance_id,
+                    item_id,
+                    source_id,
+                    media_name,
+                    now,
+                )
+
+    def resolve_media_name(
+        self,
+        auth_scope: str,
+        instance_id: int,
+        item_id: str,
+        source_ids: tuple[str, ...],
+    ) -> str:
+        """按认证域、实例、媒体和来源精确恢复近期安全标题。"""
+        if not auth_scope or not item_id or not source_ids:
+            return ""
+        with self._lock:
+            return self._resolve_media_name_locked(
+                auth_scope,
+                instance_id,
+                item_id,
+                source_ids,
+                self._clock(),
+            )
 
     def _enforce_capacity_locked(self) -> None:
         while len(self._entries) > self._max_entries:
@@ -1192,14 +1376,55 @@ class PlaybackSessionRegistry:
         native_client_fingerprint: str = "",
         native_verified_auth_scope: str = "",
     ) -> _PlaybackSessionLink:
+        now = self._clock()
+        normalized_item = (
+            _normalized_media_identifier(item_id) if item_id else entry.item_id
+        )
+        normalized_source = (
+            _normalized_media_identifier(source_id)
+            if source_id else entry.source_id
+        )
+        identity_changed = bool(
+            (
+                item_id
+                and entry.item_id
+                and entry.item_id != normalized_item
+            )
+            or (
+                source_id
+                and entry.source_id
+                and entry.source_id != normalized_source
+            )
+        )
         if item_id:
-            entry.item_id = _normalized_media_identifier(item_id)
+            entry.item_id = normalized_item
         if source_id:
-            entry.source_id = _normalized_media_identifier(source_id)
+            entry.source_id = normalized_source
         if file_id:
             entry.file_id = str(file_id)
         if media_name:
             entry.media_name = str(media_name)
+        elif identity_changed:
+            # 同 token 切换 item/source 时，旧标题不能污染新的精确来源键。
+            entry.media_name = ""
+        if entry.item_id and entry.source_id:
+            if not entry.media_name:
+                entry.media_name = self._resolve_media_name_locked(
+                    entry.auth_scope,
+                    entry.instance_id,
+                    entry.item_id,
+                    (entry.source_id,),
+                    now,
+                )
+            if entry.media_name:
+                self._remember_media_name_locked(
+                    entry.auth_scope,
+                    entry.instance_id,
+                    entry.item_id,
+                    entry.source_id,
+                    entry.media_name,
+                    now,
+                )
         if upstream_session_token:
             self._set_upstream_session_locked(key, entry, upstream_session_token)
         if browser_relay is not None:
@@ -1214,7 +1439,7 @@ class PlaybackSessionRegistry:
             entry.native_client_fingerprint = str(native_client_fingerprint)
         if native_verified_auth_scope:
             entry.native_verified_auth_scope = str(native_verified_auth_scope)
-        entry.expires_at = self._clock() + self._ttl_seconds
+        entry.expires_at = now + self._ttl_seconds
         self._entries.move_to_end(key)
         return entry
 
@@ -1244,14 +1469,25 @@ class PlaybackSessionRegistry:
             self._prune_capabilities_locked(now)
             entry = self._entries.get(key)
             if entry is None:
+                normalized_item = _normalized_media_identifier(item_id)
+                normalized_source = _normalized_media_identifier(source_id)
+                resolved_media_name = str(media_name or "")
+                if not resolved_media_name and normalized_item and normalized_source:
+                    resolved_media_name = self._resolve_media_name_locked(
+                        key[0],
+                        key[1],
+                        normalized_item,
+                        (normalized_source,),
+                        now,
+                    )
                 entry = _PlaybackSessionLink(
                     token=normalized_token,
                     auth_scope=key[0],
                     instance_id=key[1],
-                    item_id=_normalized_media_identifier(item_id),
-                    source_id=_normalized_media_identifier(source_id),
+                    item_id=normalized_item,
+                    source_id=normalized_source,
                     file_id=str(file_id or ""),
-                    media_name=str(media_name or ""),
+                    media_name=resolved_media_name,
                     upstream_session_token="",
                     expires_at=now + self._ttl_seconds,
                     capability_expires_at=0.0,
@@ -1268,6 +1504,15 @@ class PlaybackSessionRegistry:
                     ),
                 )
                 self._entries[key] = entry
+                if normalized_item and normalized_source and resolved_media_name:
+                    self._remember_media_name_locked(
+                        key[0],
+                        key[1],
+                        normalized_item,
+                        normalized_source,
+                        resolved_media_name,
+                        now,
+                    )
                 if upstream_session_token:
                     self._set_upstream_session_locked(
                         key, entry, upstream_session_token
@@ -1645,6 +1890,7 @@ class PlaybackSessionRegistry:
             self._entry_capabilities.clear()
             self._capability_browser_direct_redirect_signatures.clear()
             self._upstream_session_index.clear()
+            self._media_name_index.clear()
 
 
 _playback_sessions = PlaybackSessionRegistry()
@@ -1813,6 +2059,11 @@ def _mark_direct_source(
         # <video> 设置 crossorigin=anonymous，原生媒体元素即可用 no-cors GET
         # 跟随 MediaFlux 的 302。
         if web_direct_http_source:
+            # Jellyfin Web 首次播放会在客户端侧探测并写入该私有字段；但切换
+            # 清晰度时 changeStream() 会直接消费新的 PlaybackInfo，不再重复探测。
+            # 明确标记后，它会继续采用下面携带 capability 的 Path，而不是重建
+            # 一个丢失 _mfps/_mfss 的标准 stream URL。
+            source["enableDirectPlay"] = True
             source["RequiredHttpHeaders"] = {}
             # Jellyfin Web 12 只要看到 TranscodingSubProtocol=HLS，就算当前
             # playMethod 是 DirectPlay 也会交给 hls.js/XHR，随后跨域 302 被 CDN
@@ -3848,7 +4099,13 @@ def create_proxy_app(
         auth_scope = _auth_scope_fingerprint(credential)
         playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
         stream_match = _STREAM_RE.match(request.url.path)
-        item_id = (playback_match or stream_match).group(1) if (playback_match or stream_match) else ""
+        video_match = (
+            _VIDEO_ITEM_RE.match(request.url.path)
+            if route_class == "upstream_hls"
+            else None
+        )
+        media_match = playback_match or stream_match or video_match
+        item_id = media_match.group(1) if media_match else ""
         source_values = _request_query_values(request, "MediaSourceId")
         source_id = source_values[0] if source_values else ""
         source_ambiguous = _request_query_has_conflicting_values(
@@ -3868,9 +4125,9 @@ def create_proxy_app(
         device_id = _request_device_id(request)
         device_id_ambiguous = _request_device_id_has_conflict(request)
         playback_parameters_ambiguous = bool(
-            (stream_match and source_ambiguous)
+            ((stream_match or video_match) and source_ambiguous)
             or (
-                (stream_match or playback_match)
+                (stream_match or playback_match or video_match)
                 and (upstream_session_ambiguous or device_id_ambiguous)
             )
         )
@@ -5025,6 +5282,8 @@ def create_proxy_app(
                 request, "PlaySessionId"
             )
             media_name = _playback_media_name(payload)
+            media_source_names = _playback_media_source_names(payload)
+            media_source_ids = _playback_media_source_ids(payload)
             android_device_id = _request_device_id(request)
             native_client_fingerprint = _request_client_fingerprint(request)
             native_mode = playback_rewrite_mode
@@ -5099,6 +5358,53 @@ def create_proxy_app(
                     if scope and scope != rewrite_scope
                 )
             )
+            body_source_id = _normalized_media_identifier(
+                _diagnostic_dict_value(
+                    playback_request_payload, "MediaSourceId"
+                )
+            )
+            query_source_id = _normalized_media_identifier(
+                _request_query_value(request, "MediaSourceId")
+            )
+            requested_source_conflict = bool(
+                body_source_id
+                and query_source_id
+                and body_source_id != query_source_id
+            )
+            requested_source_id = body_source_id or query_source_id
+            if requested_source_conflict:
+                title_source_ids = ()
+            elif requested_source_id and requested_source_id in media_source_ids:
+                title_source_ids = (requested_source_id,)
+            else:
+                # 只接受上游 PlaybackInfo 实际确认过的 MediaSourceId。
+                title_source_ids = media_source_ids
+            title_scopes = tuple(dict.fromkeys(
+                scope
+                for scope in (auth_scope, rewrite_scope, *additional_scopes)
+                if scope
+            ))
+            if not media_name and title_source_ids:
+                for title_scope in title_scopes:
+                    media_name = _playback_sessions.resolve_media_name(
+                        title_scope,
+                        instance_id,
+                        playback_match.group(1),
+                        title_source_ids,
+                    )
+                    if media_name:
+                        break
+            names_to_remember = dict(media_source_names)
+            if media_name:
+                for source_id in title_source_ids:
+                    names_to_remember.setdefault(source_id, media_name)
+            for title_scope in title_scopes:
+                _playback_sessions.remember_media_names(
+                    title_scope,
+                    instance_id,
+                    playback_match.group(1),
+                    names_to_remember,
+                )
             browser_direct_redirect_signatures: set[str] = set()
             if rewrite_scope and not direct_fallback_requested:
                 capability_token = secrets.token_urlsafe(24)

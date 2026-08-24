@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -234,6 +235,29 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
             organize_changes=stats["strm_changes"], force_full=False,
         )
         self.assertTrue(stats["strm"]["ok"])
+
+    def test_pending_confirmations_debounce_strm_link(self) -> None:
+        stats = {
+            "moved": 1,
+            "need_confirm": 2,
+            "strm_changes": [{
+                "source_id": "archive", "kind": "video",
+                "file_id": "video", "action": "upsert",
+            }],
+        }
+        rules = OrganizeRules(link_strm=True)
+        with patch(
+            "app.modules.organize.get",
+            side_effect=lambda key, default="": (
+                "30" if key == "GY_ORGANIZE_PENDING_STRM_DEBOUNCE_SECONDS" else default
+            ),
+        ), patch.object(Organizer, "_post_organize_link") as post_link:
+            Organizer.trigger_post_actions(
+                stats, rules, notify_result=False,
+            )
+
+        post_link.assert_called_once()
+        self.assertEqual(post_link.call_args.kwargs["debounce_seconds"], 30.0)
 
     def test_partial_organize_does_not_trigger_strm_link(self) -> None:
         stats = {"moved": 1, "failed": 1, "scan_errors": []}
@@ -798,8 +822,10 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
                 scheduler._pending_thread.join(timeout=2)
 
         self.assertEqual(started[0][0], "organize")
-        self.assertFalse(started[0][1]["notify_override"])
-        self.assertFalse(started[0][1]["detail_notify_override"])
+        self.assertTrue(started[0][1]["notify_override"])
+        self.assertTrue(started[0][1]["detail_notify_override"])
+        self.assertTrue(started[0][1]["uses_default_notification_scope"])
+        self.assertTrue(started[0][1]["has_silent_notification_scope"])
         self.assertFalse(started[0][1]["emby_refresh_override"])
         self.assertEqual(started[0][1]["download_request_ids"], [1, 2])
         self.assertEqual(started[0][1]["organize_changes"], [{
@@ -811,6 +837,502 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
         self.assertEqual(final_status["pending_organize_changes"], 0)
         self.assertEqual(final_status["pending_organize_requests"], 0)
         self.assertEqual(final_status["pending_organize_chats"], 0)
+
+    def test_organize_debounce_coalesces_rapid_triggers_before_worker_start(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        started = threading.Event()
+        captured: list[tuple[str, dict]] = []
+
+        def fake_start(trigger_type: str, options: dict) -> dict:
+            captured.append((trigger_type, dict(options)))
+            scheduler._run_lock.release()
+            started.set()
+            return {"ok": True, "message": "started"}
+
+        with patch.object(
+            scheduler, "_persist_change_targets", return_value=True,
+        ), patch.object(
+            db, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+        ), patch.object(
+            scheduler, "_start_locked_worker", side_effect=fake_start,
+        ):
+            first = scheduler.trigger(
+                "organize",
+                chat_id="100",
+                debounce_seconds=0.12,
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "first", "action": "upsert",
+                }],
+            )
+            self.assertTrue(first["queued"])
+            waiter = scheduler._pending_thread
+            self.assertFalse(started.wait(timeout=0.04))
+
+            second = scheduler.trigger(
+                "organize",
+                chat_id="200",
+                debounce_seconds=0.12,
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "second", "action": "upsert",
+                }],
+            )
+            self.assertTrue(second["queued"])
+            self.assertFalse(started.wait(timeout=0.04))
+            self.assertTrue(started.wait(timeout=1.0))
+            if waiter:
+                waiter.join(timeout=1)
+
+        self.assertEqual(len(captured), 1)
+        trigger_type, options = captured[0]
+        self.assertEqual(trigger_type, "organize")
+        self.assertEqual(options["chat_ids"], ["100", "200"])
+        self.assertEqual(
+            {item["file_id"] for item in options["organize_changes"]},
+            {"first", "second"},
+        )
+
+    def test_existing_quiet_window_absorbs_non_debounced_organize_trigger(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        started = threading.Event()
+        captured: list[dict] = []
+
+        def fake_start(_trigger_type: str, options: dict) -> dict:
+            captured.append(dict(options))
+            scheduler._run_lock.release()
+            started.set()
+            return {"ok": True, "message": "started"}
+
+        with patch.object(
+            scheduler, "_persist_change_targets", return_value=True,
+        ), patch.object(
+            db, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+        ), patch.object(
+            scheduler, "_start_locked_worker", side_effect=fake_start,
+        ):
+            first = scheduler.trigger(
+                "organize", debounce_seconds=0.12,
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "first", "action": "upsert",
+                }],
+            )
+            self.assertTrue(first["queued"])
+            waiter = scheduler._pending_thread
+            second = scheduler.trigger(
+                "organize",
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "second", "action": "upsert",
+                }],
+            )
+            self.assertTrue(second["queued"])
+            self.assertFalse(started.wait(timeout=0.04))
+            self.assertTrue(started.wait(timeout=1.0))
+            if waiter:
+                waiter.join(timeout=1)
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            {item["file_id"] for item in captured[0]["organize_changes"]},
+            {"first", "second"},
+        )
+
+    def test_start_does_not_clear_stop_while_pending_waiter_is_alive(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        scheduler._stop_event.set()
+        scheduler._pending_thread = SimpleNamespace(is_alive=lambda: True)
+
+        scheduler.start()
+
+        self.assertTrue(scheduler._stop_event.is_set())
+        self.assertIsNone(scheduler._thread)
+
+    def test_start_does_not_clear_stop_while_worker_is_alive(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        scheduler._stop_event.set()
+        scheduler._worker = SimpleNamespace(is_alive=lambda: True)
+
+        scheduler.start()
+
+        self.assertTrue(scheduler._stop_event.is_set())
+        self.assertIsNone(scheduler._thread)
+
+    def test_recovered_change_queue_suppresses_unscoped_notifications(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        with patch.object(
+            db, "recover_stale_strm_change_targets", return_value=0,
+        ), patch.object(
+            db, "count_pending_strm_change_targets", return_value=1,
+        ), patch.object(
+            db, "seconds_until_next_strm_change_target", return_value=12.5,
+        ), patch.object(
+            scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
+            scheduler._recover_change_queue()
+
+        schedule.assert_called_once_with(12.5)
+
+    def test_persisted_queue_internal_wait_is_not_clamped_and_uses_fast_mode(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        with patch.object(
+            scheduler, "_queue_organize_trigger", return_value={"ok": True},
+        ) as queue:
+            scheduler._schedule_persisted_change_queue(240.0)
+
+        options = queue.call_args.args[0]
+        self.assertEqual(queue.call_args.kwargs["debounce_seconds"], 240.0)
+        self.assertEqual(options["sync_mode"], "fast")
+        self.assertFalse(options["notify_override"])
+        self.assertFalse(options["detail_notify_override"])
+        self.assertTrue(options["has_silent_notification_scope"])
+
+    def test_scheduler_loop_fallback_requeues_persisted_changes(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        with patch.object(
+            db, "seconds_until_next_strm_change_target", return_value=42.0,
+        ), patch.object(
+            scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
+            scheduler._drain_persisted_change_queue()
+
+        schedule.assert_called_once_with(42.0)
+
+    def test_waiter_start_failure_is_recoverable_by_scheduler_loop(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        change = {
+            "source_id": "archive", "kind": "video",
+            "file_id": "waiter-failure", "action": "upsert",
+        }
+        with patch("app.modules.scheduler.threading.Thread.start", side_effect=RuntimeError("no thread")):
+            result = scheduler.trigger(
+                "organize", debounce_seconds=8, organize_changes=[change],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        with patch.object(
+            scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
+            scheduler._drain_persisted_change_queue()
+
+        schedule.assert_called_once()
+
+    def test_worker_start_failure_is_recoverable_by_scheduler_loop(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        change = {
+            "source_id": "archive", "kind": "video",
+            "file_id": "worker-failure", "action": "upsert",
+        }
+        with patch("app.modules.scheduler.threading.Thread.start", side_effect=RuntimeError("no thread")):
+            result = scheduler.trigger("organize", organize_changes=[change])
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(db.count_pending_strm_change_targets(), 1)
+        with patch.object(
+            scheduler, "_schedule_persisted_change_queue", return_value={"ok": True},
+        ) as schedule:
+            scheduler._drain_persisted_change_queue()
+
+        schedule.assert_called_once()
+
+    def test_realtime_organize_preempts_a_long_internal_queue_wait(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        scheduler._pending_organize_options = {
+            "notify_override": False,
+            "detail_notify_override": False,
+            "download_request_ids": [],
+            "organize_changes": [],
+            "force_full": False,
+            "sync_mode": "fast",
+            "chat_ids": [],
+            "uses_default_notification_scope": False,
+            "has_silent_notification_scope": True,
+            "persisted_queue_only": True,
+        }
+        scheduler._pending_organize_deadline = time.monotonic() + 240
+        started = threading.Event()
+        captured: list[dict] = []
+
+        def fake_start(_trigger_type: str, options: dict) -> dict:
+            captured.append(dict(options))
+            scheduler._run_lock.release()
+            started.set()
+            return {"ok": True, "message": "started"}
+
+        with patch.object(
+            scheduler, "_persist_change_targets", return_value=True,
+        ) as persist, patch.object(
+            db, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+        ), patch.object(
+            scheduler, "_start_locked_worker", side_effect=fake_start,
+        ):
+            result = scheduler.trigger(
+                "organize",
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "fresh", "action": "upsert",
+                }],
+            )
+            self.assertTrue(result["queued"])
+            self.assertTrue(started.wait(timeout=1.0))
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["sync_mode"], "auto")
+        self.assertFalse(captured[0]["persisted_queue_only"])
+        self.assertFalse(captured[0]["has_silent_notification_scope"])
+        persist.assert_called_once_with(
+            [{
+                "source_id": "archive", "kind": "video",
+                "file_id": "fresh", "action": "upsert",
+            }],
+            not_before_seconds=0.0,
+        )
+
+    def test_default_and_explicit_chat_batch_preserves_both_scopes(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        started = threading.Event()
+        captured: list[dict] = []
+
+        def fake_start(_trigger_type: str, options: dict) -> dict:
+            captured.append(dict(options))
+            scheduler._run_lock.release()
+            started.set()
+            return {"ok": True, "message": "started"}
+
+        with patch.object(
+            scheduler, "_persist_change_targets", return_value=True,
+        ), patch.object(
+            db, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+        ), patch.object(
+            scheduler, "_start_locked_worker", side_effect=fake_start,
+        ):
+            scheduler.trigger(
+                "organize", debounce_seconds=0.12,
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "default", "action": "upsert",
+                }],
+            )
+            scheduler.trigger(
+                "organize", chat_id="100", debounce_seconds=0.12,
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "explicit", "action": "upsert",
+                }],
+            )
+            self.assertTrue(started.wait(timeout=1.0))
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["chat_ids"], ["100"])
+        self.assertTrue(captured[0]["uses_default_notification_scope"])
+        self.assertFalse(captured[0]["has_silent_notification_scope"])
+
+    def test_cross_chat_strm_notifications_hide_shared_details(self) -> None:
+        from app.modules import scheduler as scheduler_module
+
+        stats = {
+            "generated": 1,
+            "failed": 0,
+            "metadata_failed": 0,
+            "cleaned": 0,
+            "metadata_cleaned": 0,
+            "changes": [{"path": "动漫/Private.Show/Private.S01E01.strm"}],
+        }
+        with patch.object(scheduler_module, "send") as send, patch.object(
+            scheduler_module, "send_text"
+        ) as send_text:
+            scheduler_module.STRMScheduler._notify_success(
+                stats,
+                {"jellyfin": True},
+                1.0,
+                "organize",
+                [{"id": "source"}],
+                "/private/strm-root",
+                notify_override=True,
+                chat_ids=["100", "200"],
+            )
+            scheduler_module.STRMScheduler._notify_details(
+                stats,
+                "organize",
+                enabled_override=True,
+                chat_ids=["100", "200"],
+            )
+
+        self.assertEqual(send.call_count, 2)
+        for call in send.call_args_list:
+            event = call.args[0]
+            rendered = str(event)
+            self.assertIn("多个整理请求", rendered)
+            self.assertNotIn("Private.Show", rendered)
+            self.assertNotIn("/private/strm-root", rendered)
+        send_text.assert_not_called()
+
+    def test_default_and_explicit_chat_notifications_hide_shared_details(self) -> None:
+        from app.modules import scheduler as scheduler_module
+
+        stats = {
+            "generated": 1,
+            "failed": 0,
+            "metadata_failed": 0,
+            "cleaned": 0,
+            "metadata_cleaned": 0,
+            "changes": [{"path": "动漫/Private.Show/Private.S01E01.strm"}],
+        }
+        with patch.object(scheduler_module, "send") as send, patch.object(
+            scheduler_module, "send_text"
+        ) as send_text, patch.object(
+            scheduler_module, "get", return_value="default-chat",
+        ):
+            scheduler_module.STRMScheduler._notify_success(
+                stats,
+                {"jellyfin": True},
+                1.0,
+                "organize",
+                [{"id": "source"}],
+                "/private/strm-root",
+                notify_override=True,
+                chat_ids=["100"],
+                uses_default_notification_scope=True,
+            )
+            scheduler_module.STRMScheduler._notify_details(
+                stats,
+                "organize",
+                enabled_override=True,
+                chat_ids=["100"],
+                uses_default_notification_scope=True,
+            )
+
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(
+            {call.kwargs.get("chat_id", "default") for call in send.call_args_list},
+            {"100", "default"},
+        )
+        for call in send.call_args_list:
+            rendered = str(call.args[0])
+            self.assertIn("多个整理请求", rendered)
+            self.assertNotIn("Private.Show", rendered)
+            self.assertNotIn("/private/strm-root", rendered)
+        send_text.assert_not_called()
+
+    def test_silent_and_explicit_chat_notifications_hide_shared_details(self) -> None:
+        from app.modules import scheduler as scheduler_module
+
+        stats = {
+            "generated": 1,
+            "failed": 0,
+            "metadata_failed": 0,
+            "cleaned": 0,
+            "metadata_cleaned": 0,
+            "changes": [{"path": "动漫/Recovered.Private/Recovered.S01E01.strm"}],
+        }
+        with patch.object(scheduler_module, "send") as send, patch.object(
+            scheduler_module, "send_text"
+        ) as send_text:
+            scheduler_module.STRMScheduler._notify_success(
+                stats,
+                {},
+                1.0,
+                "organize",
+                [{"id": "source"}],
+                "/private/strm-root",
+                notify_override=True,
+                chat_ids=["100"],
+                uses_default_notification_scope=False,
+                has_silent_notification_scope=True,
+            )
+            scheduler_module.STRMScheduler._notify_details(
+                stats,
+                "organize",
+                enabled_override=True,
+                chat_ids=["100"],
+                uses_default_notification_scope=False,
+                has_silent_notification_scope=True,
+            )
+            scheduler_module.STRMScheduler._notify_failure(
+                "secret backend path /private/recovered",
+                "organize",
+                notify_override=True,
+                chat_ids=["100"],
+                uses_default_notification_scope=False,
+                has_silent_notification_scope=True,
+            )
+
+        self.assertEqual(send.call_count, 2)
+        for call in send.call_args_list:
+            rendered = str(call.args[0])
+            self.assertIn("多个整理请求", rendered)
+            self.assertNotIn("Recovered.Private", rendered)
+            self.assertNotIn("secret backend path", rendered)
+        send_text.assert_not_called()
+
+    def test_persisted_extra_changes_are_treated_as_unscoped(self) -> None:
+        from app.modules.scheduler import _claimed_changes_extend_notification_scope
+
+        requested = [{
+            "source_id": "archive", "kind": "video",
+            "file_id": "current", "action": "upsert",
+        }]
+        same_scope = [dict(requested[0])]
+        recovered = [
+            *same_scope,
+            {
+                "source_id": "archive", "kind": "video",
+                "file_id": "recovered", "action": "upsert",
+            },
+        ]
+
+        self.assertFalse(
+            _claimed_changes_extend_notification_scope(requested, same_scope)
+        )
+        self.assertTrue(
+            _claimed_changes_extend_notification_scope(requested, recovered)
+        )
+
+        moved_elsewhere = [{
+            "source_id": "archive", "kind": "video",
+            "file_id": "current", "action": "upsert",
+            "rel_dir": "动漫/Private Old/Season 1",
+            "name": "Old.S01E01.mkv",
+        }]
+        current_location = [{
+            "source_id": "archive", "kind": "video",
+            "file_id": "current", "action": "upsert",
+            "rel_dir": "动漫/Public New/Season 1",
+            "name": "New.S01E01.mkv",
+        }]
+        self.assertTrue(
+            _claimed_changes_extend_notification_scope(
+                current_location, moved_elsewhere,
+            )
+        )
 
     def test_per_file_failures_persist_partial_task_state(self) -> None:
         from app.modules import scheduler as scheduler_module

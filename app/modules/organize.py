@@ -2180,6 +2180,7 @@ class Organizer:
         stats: dict, rules: OrganizeRules, source_name: str = "", chat_id: str = "",
         download_request_ids: list[int] | None = None,
         *, notify_result: bool = True,
+        strm_debounce_seconds: float | None = None,
     ) -> None:
         """多源任务聚合完成后只执行一次 STRM 联动和总结通知。"""
         unsafe_partial = bool(
@@ -2194,9 +2195,27 @@ class Organizer:
             rules.link_strm and not stats.get("stopped") and stats.get("moved", 0)
             and (not unsafe_partial or stats.get("strm_changes"))
         ):
+            resolved_debounce = strm_debounce_seconds
+            try:
+                has_pending_confirmation = int(
+                    stats.get("need_confirm", 0) or 0
+                ) > 0
+            except (TypeError, ValueError, OverflowError):
+                has_pending_confirmation = False
+            if resolved_debounce is None and has_pending_confirmation:
+                resolved_debounce = get(
+                    "GY_ORGANIZE_PENDING_STRM_DEBOUNCE_SECONDS", "30"
+                ) or 30
+            try:
+                normalized_debounce = max(
+                    0.0, min(float(resolved_debounce or 0.0), 120.0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                normalized_debounce = 30.0 if has_pending_confirmation else 0.0
             Organizer._post_organize_link(
                 stats, rules, download_request_ids=download_request_ids,
                 chat_id=chat_id, force_incremental=unsafe_partial,
+                debounce_seconds=normalized_debounce,
             )
         elif rules.link_strm and unsafe_partial:
             stats["strm"] = {
@@ -2215,6 +2234,7 @@ class Organizer:
         download_request_ids: list[int] | None = None,
         chat_id: str = "",
         force_incremental: bool = False,
+        debounce_seconds: float = 0.0,
     ) -> None:
         """整理后联动：触发 STRM；媒体库刷新由 STRM 完成后统一处理。"""
         base_url = get("GY_STRM_BASE_URL", "")
@@ -2234,6 +2254,8 @@ class Organizer:
                 }
                 if chat_id:
                     trigger_options["chat_id"] = chat_id
+                if debounce_seconds > 0:
+                    trigger_options["debounce_seconds"] = debounce_seconds
                 result = get_scheduler().trigger("organize", **trigger_options)
                 logger.info(f"整理联动 STRM: {result}")
                 stats["strm"] = result
@@ -2506,10 +2528,69 @@ class Organizer:
                 "⏹️ 光鸭整理已停止"
                 if stopped else ("⚠️ 光鸭整理部分完成" if attention else "✅ 光鸭整理完成")
             )
-            groups = [
+            raw_groups = [
                 item for item in (stats.get("confirmation_groups") or [])
                 if isinstance(item, dict)
             ]
+            groups: list[dict] = []
+            actionable_file_keys: set[str] = set()
+            for group_index, group in enumerate(raw_groups):
+                valid_candidates = [
+                    dict(item) for item in (group.get("candidates") or [])
+                    if isinstance(item, dict)
+                    and str(item.get("tmdb_id") or "").strip()
+                    and str(item.get("media_type") or "") in {"movie", "tv"}
+                ]
+                raw_files = list(group.get("files") or [])
+                raw_companions = list(group.get("companions") or [])
+                source_parent_id = str(
+                    group.get("source_parent_id") or "0"
+                )
+
+                def valid_snapshot(item: object, *, require_scope: bool) -> bool:
+                    if not isinstance(item, dict):
+                        return False
+                    if not str(item.get("file_id") or "").strip():
+                        return False
+                    if not str(item.get("name") or "").strip():
+                        return False
+                    parent_id = str(item.get("parent_id") or "0")
+                    if require_scope and parent_id != source_parent_id:
+                        return False
+                    try:
+                        return int(item.get("size") or 0) >= 0
+                    except (TypeError, ValueError):
+                        return False
+
+                valid_files = [
+                    dict(item) for item in raw_files
+                    if valid_snapshot(item, require_scope=True)
+                ]
+                valid_companions = [
+                    dict(item) for item in raw_companions
+                    if valid_snapshot(item, require_scope=False)
+                ]
+                if (
+                    not valid_candidates
+                    or not valid_files
+                    or len(valid_files) != len(raw_files)
+                    or len(valid_companions) != len(raw_companions)
+                ):
+                    continue
+                sanitized_group = {
+                    **group,
+                    "files": valid_files,
+                    "companions": valid_companions,
+                    "candidates": valid_candidates,
+                }
+                groups.append(sanitized_group)
+                for file_index, file in enumerate(valid_files):
+                    file_id = str(file.get("file_id") or "").strip()
+                    actionable_file_keys.add(
+                        f"id:{file_id}"
+                        if file_id else f"row:{group_index}:{file_index}"
+                    )
+            actionable_confirmation_count = len(actionable_file_keys)
             summary = NotificationEvent(
                 title,
                 fields=(
@@ -2519,6 +2600,7 @@ class Organizer:
                 footer=Organizer._task_notification_footer(
                     stats,
                     confirmation_group_count=len(groups),
+                    actionable_confirmation_count=actionable_confirmation_count,
                 ),
                 layout="relaxed",
             )
@@ -2695,18 +2777,59 @@ class Organizer:
             reasons.append(text)
 
     @staticmethod
-    def _task_notification_footer(stats: dict, *, confirmation_group_count: int = 0) -> str:
-        """生成任务级简洁提示，候选详情交给下方按钮卡承载。"""
+    def _task_notification_footer(
+        stats: dict,
+        *,
+        confirmation_group_count: int = 0,
+        actionable_confirmation_count: int | None = None,
+    ) -> str:
+        """生成任务级提示，并区分可点击候选与无候选待确认项。"""
         from app.notifier import safe_int
 
         sections: list[str] = []
         need_confirm = safe_int(stats.get("need_confirm", 0), 0, minimum=0)
+        actionable = min(
+            need_confirm,
+            (
+                need_confirm
+                if actionable_confirmation_count is None and confirmation_group_count > 0
+                else safe_int(actionable_confirmation_count, 0, minimum=0)
+            ),
+        )
         if need_confirm:
-            group_label = f"{confirmation_group_count} 组" if confirmation_group_count else f"{need_confirm} 个"
-            sections.append(
-                f"⚠️ 待确认 {group_label}\n"
-                "请在下方候选卡中选择匹配结果。"
-            )
+            if confirmation_group_count > 0:
+                without_candidates = max(0, need_confirm - actionable)
+                grouped_candidate_line = (
+                    f"• {actionable} 个有可用候选，已合并为 "
+                    f"{confirmation_group_count} 组，将发送 "
+                    f"{confirmation_group_count} 张候选卡"
+                    if actionable != confirmation_group_count
+                    else f"• {actionable} 个可在下方候选卡中选择"
+                )
+                if without_candidates:
+                    sections.append(
+                        f"⚠️ 待确认 {need_confirm} 个\n"
+                        f"{grouped_candidate_line}\n"
+                        f"• {without_candidates} 个暂无可用 TMDB 候选，"
+                        "请前往 Web 待确认队列搜索或手动匹配。"
+                    )
+                elif need_confirm != confirmation_group_count:
+                    sections.append(
+                        f"⚠️ 待确认 {need_confirm} 个文件\n"
+                        f"已按媒体合并为 {confirmation_group_count} 组，"
+                        f"因此下方仅发送 {confirmation_group_count} 张候选卡。"
+                    )
+                else:
+                    sections.append(
+                        f"⚠️ 待确认 {confirmation_group_count} 组\n"
+                        "请在下方候选卡中选择匹配结果。"
+                    )
+            else:
+                sections.append(
+                    f"⚠️ 待确认 {need_confirm} 个\n"
+                    "本轮暂无可用 TMDB 候选，无法生成候选卡；"
+                    "请前往 Web 待确认队列搜索或手动匹配。"
+                )
 
         skipped = safe_int(stats.get("skipped", 0), 0, minimum=0)
         reasons = []
@@ -5459,7 +5582,7 @@ class Organizer:
             explicit_capability = getattr(
                 self.client, "supports_atomic_empty_directory_delete", None
             )
-        capability_available = callable(delete_empty) and explicit_capability is not False
+        capability_available = callable(delete_empty) and explicit_capability is True
         unique_dirs: dict[str, tuple[str, int, str, int]] = {}
         for item in scanned_dirs:
             if len(item) < 2:

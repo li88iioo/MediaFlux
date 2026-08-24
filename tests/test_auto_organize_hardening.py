@@ -65,6 +65,22 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(rules.automatic_match_preset, "conservative")
 
+    def test_empty_directory_cleanup_requires_explicit_safe_capability(self):
+        delete_empty = Mock()
+        organizer = Organizer(
+            client=SimpleNamespace(delete_empty_directory=delete_empty),
+            scraper=object(),
+        )
+
+        report = organizer._clean_empty_dirs_report([
+            ("empty-dir", 2, "dir-etag", 123),
+        ])
+
+        self.assertEqual(report["cleaned"], 0)
+        self.assertEqual(report["unsupported"], 1)
+        self.assertIn("不支持安全空目录清理", report["reasons"][0])
+        delete_empty.assert_not_called()
+
     def test_multibatch_selection_without_all_task_ids_is_not_auto_trackable(self):
         raw = Mock()
         raw.request.side_effect = [
