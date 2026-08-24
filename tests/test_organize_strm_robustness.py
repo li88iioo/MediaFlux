@@ -1334,10 +1334,28 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             )
         )
 
+    def test_task_run_initialization_failure_releases_operation_lock(self) -> None:
+        from app.modules import scheduler as scheduler_module
+
+        scheduler = scheduler_module.STRMScheduler()
+        self.addCleanup(scheduler.stop, 2.0)
+        with patch.object(
+            scheduler_module.db, "add_task_run", side_effect=RuntimeError("db down"),
+        ), patch.object(scheduler, "_settle_change_targets"), patch.object(
+            scheduler, "_notify_failure",
+        ):
+            result = scheduler.run_blocking("manual")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "db down")
+        self.assertTrue(scheduler._run_lock.acquire(blocking=False))
+        scheduler._run_lock.release()
+
     def test_per_file_failures_persist_partial_task_state(self) -> None:
         from app.modules import scheduler as scheduler_module
 
         scheduler = scheduler_module.STRMScheduler()
+        self.addCleanup(scheduler.stop, 2.0)
         partial_stats = {
             "total": 1,
             "generated": 0,

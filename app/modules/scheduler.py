@@ -1366,16 +1366,19 @@ class STRMScheduler:
     def _execute_locked(self, trigger_type: str) -> dict:
         options = dict(self._run_options)
         request_ids = _request_ids(options)
-        run_id = db.add_task_run(TASK_NAME, trigger_type)
+        run_id = 0
         claimed_targets: list[dict] = []
         lease_heartbeat: _ChangeTargetLeaseHeartbeat | None = None
-        for request_id in request_ids:
-            db.update_download_request(
-                request_id, strm_run_id=run_id, strm_status="running",
-                strm_error="", strm_finished_at=None,
-            )
         started = datetime.now()
         try:
+            # 任务记录初始化也属于持锁执行阶段。数据库异常必须经过 finally
+            # 释放全局 STRM 锁，否则后续 Web、Telegram 与调度请求都会永久 busy。
+            run_id = db.add_task_run(TASK_NAME, trigger_type)
+            for request_id in request_ids:
+                db.update_download_request(
+                    request_id, strm_run_id=run_id, strm_status="running",
+                    strm_error="", strm_finished_at=None,
+                )
             error = self.validate_config(auto_only=False)
             if error:
                 raise ValueError(error)
@@ -1671,7 +1674,8 @@ class STRMScheduler:
                         row["status"] = "failed"
             error_text = str(exc)
             self._set_progress("failed", 1, 1, "同步失败")
-            db.finish_task_run(run_id, "failed", error=error_text)
+            if run_id:
+                db.finish_task_run(run_id, "failed", error=error_text)
             for request_id in request_ids:
                 db.update_download_request(
                     request_id, strm_status="failed", strm_error=error_text[:500],
