@@ -157,7 +157,7 @@ class PagesUiContractTests(unittest.TestCase):
 
     def test_settings_large_screen_layout_and_network_2col_contract(self):
         html = (SETTINGS_HTML.read_text(encoding="utf-8") + SETTINGS_JS.read_text(encoding="utf-8"))
-        self.assertIn("css/settings-agent.css') }}?v=20260821a", html)
+        self.assertIn("css/settings-agent.css') }}?v=20260825a", html)
         self.assertIn('id="settings-panel-network"', html)
         self.assertIn('class="settings-layout-2col"', html)
         self.assertIn('aria-label="网络代理遥测与探针"', html)
@@ -170,6 +170,17 @@ class PagesUiContractTests(unittest.TestCase):
         self.assertNotIn("max-width: 1360px;", css)
         self.assertIn("grid-template-columns: minmax(0, 1.25fr) minmax(320px, 1fr);", css)
         self.assertIn(".settings-network-card .network-config-grid", css)
+
+    def test_settings_discovery_cards_do_not_inherit_catalog_hover_motion(self):
+        css = (ROOT / "app" / "static" / "css" / "settings-agent.css").read_text(encoding="utf-8")
+
+        self.assertIn(".settings-page #settings-panel-discovery .discovery-card {", css)
+        self.assertIn("transition: none;", css)
+        self.assertIn(".settings-page #settings-panel-discovery .discovery-card:hover {", css)
+        self.assertIn("transform: none;", css)
+        self.assertIn("background: var(--bg-elevated);", css)
+        self.assertIn("box-shadow: 0 1px 2px rgba(15, 23, 42, .035);", css)
+        self.assertIn(".settings-page #settings-panel-discovery .discovery-card:focus-within {", css)
 
 
 if __name__ == "__main__":

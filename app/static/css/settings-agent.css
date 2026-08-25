@@ -753,6 +753,18 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     border-radius: 14px;
     box-shadow: 0 1px 2px rgba(15, 23, 42, .035);
 }
+.settings-page #settings-panel-discovery .discovery-card {
+    transition: none;
+}
+.settings-page #settings-panel-discovery .discovery-card:hover {
+    border-color: var(--border);
+    background: var(--bg-elevated);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, .035);
+    transform: none;
+}
+.settings-page #settings-panel-discovery .discovery-card:focus-within {
+    border-color: var(--discovery-amber);
+}
 .discovery-card-head {
     min-height: 86px;
     display: flex;

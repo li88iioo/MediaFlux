@@ -1722,7 +1722,7 @@ class AIPreviewAndSettingsTests(unittest.TestCase):
         self.assertIn("scrape-lab-ai", css)
         self.assertIn("min-height", css)
         self.assertNotIn("AI_RECOGNITION_API_KEY", logs)
-        self.assertIn("settings-agent.css') }}?v=20260821a", settings)
+        self.assertIn("settings-agent.css') }}?v=20260825a", settings)
 
 
 class AIRecognitionConfigTests(unittest.TestCase):
