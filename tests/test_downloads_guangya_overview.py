@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, PropertyMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -56,6 +56,56 @@ class GuangYaDownloadOverviewTests(InitializedWebTestCase):
         self.assertEqual(task["downloaded"], 4096)
         self.assertEqual(task["status_label"], "已完成")
         self.assertEqual(task["status_kind"], "done")
+
+    def test_status_two_is_reported_as_completed(self):
+        task = GuangYaClient._to_offline_task({
+            "taskId": "task-2",
+            "fileName": "Completed.By.Cloud",
+            "status": 2,
+            "progress": 100,
+            "totalSize": 8192,
+        })
+
+        self.assertEqual(task["status_label"], "已完成")
+        self.assertEqual(task["status_kind"], "done")
+        self.assertEqual(task["progress"], 1.0)
+        self.assertEqual(task["downloaded"], 8192)
+
+    def test_offline_task_list_requests_all_statuses_and_paginates(self):
+        first = [{"taskId": f"task-{index}", "status": 0} for index in range(50)]
+        second = [{"taskId": "task-50", "status": 2}]
+        raw = Mock()
+        raw.cloud_task_list.side_effect = [
+            {"data": {"list": first}},
+            {"data": {"list": second}},
+        ]
+        client = object.__new__(GuangYaClient)
+        client._call_read = Mock(side_effect=lambda _name, callback: callback())
+
+        with patch.object(GuangYaClient, "raw", new_callable=PropertyMock, return_value=raw):
+            tasks = client.list_offline_tasks()
+
+        self.assertEqual(len(tasks), 51)
+        self.assertEqual(tasks[-1]["status_kind"], "done")
+        self.assertEqual(raw.cloud_task_list.call_count, 2)
+        self.assertEqual(
+            raw.cloud_task_list.call_args_list[0].kwargs,
+            {"page": 0, "page_size": 50, "status": [0, 1, 2, 3, 4]},
+        )
+        self.assertEqual(raw.cloud_task_list.call_args_list[1].kwargs["page"], 1)
+
+    def test_offline_task_list_stops_on_repeated_full_page(self):
+        page = [{"taskId": f"task-{index}", "status": 0} for index in range(50)]
+        raw = Mock()
+        raw.cloud_task_list.side_effect = [page, page]
+        client = object.__new__(GuangYaClient)
+        client._call_read = Mock(side_effect=lambda _name, callback: callback())
+
+        with patch.object(GuangYaClient, "raw", new_callable=PropertyMock, return_value=raw):
+            tasks = client.list_offline_tasks()
+
+        self.assertEqual(len(tasks), 50)
+        self.assertEqual(raw.cloud_task_list.call_count, 2)
 
     def test_overview_does_not_query_or_return_guangya_live_tasks(self):
         headers = self._authenticated_headers()

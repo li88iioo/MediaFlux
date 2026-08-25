@@ -20,6 +20,7 @@ from app.modules.download_dispatcher import (
     create_request,
     dispatch_request,
     normalize_download_url,
+    public_dispatch_summary,
     torrent_download_input,
 )
 
@@ -81,13 +82,6 @@ async def _resolved_download_input(
         return torrent_input(_torrent_filename(resolved), response.body)
     except ValueError as exc:
         raise InvalidDownloadData() from exc
-
-
-def _public_target_results(value: Any) -> list[str]:
-    if not isinstance(value, (list, tuple, set, frozenset)):
-        return []
-    values = set(value)
-    return [target for target in ("qb", "guangya") if target in values]
 
 
 def failed_download_result(result_id: str, target: str, error: str) -> dict[str, Any]:
@@ -170,17 +164,12 @@ async def download_result(
             dispatch=dispatch,
         )
 
-    duplicate = bool(result.get("duplicate"))
-    succeeded = _public_target_results(result.get("succeeded"))
-    failed = _public_target_results(result.get("failed"))
-    if duplicate:
-        status, error = "duplicate", "该下载请求已提交或正在处理"
-    elif succeeded and failed:
-        status, error = "partial", ""
-    elif succeeded:
-        status, error = "submitted", ""
-    else:
-        status, error = "failed", "下载提交失败"
+    public = public_dispatch_summary(result)
+    duplicate = public["duplicate"]
+    succeeded = public["succeeded"]
+    failed = public["failed"]
+    status = public["status"]
+    error = public["error"]
     return {
         "result_id": result_id,
         "ok": status in {"submitted", "partial"},

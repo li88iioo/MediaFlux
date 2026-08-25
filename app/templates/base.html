@@ -9,7 +9,7 @@
     <title>{% block title %}MediaFlux{% endblock %}</title>
     {% include "_theme_bootstrap.html" %}
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='favicon.svg') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='css/main.css') }}?v=20260825f">
+    <link rel="stylesheet" href="{{ url_for('static', path='css/main.css') }}?v=20260825h">
     {% block page_styles %}{% endblock %}
 </head>
 <body class="{% block body_class %}{% endblock %}{% if active in ['logs', 'local_media', 'organize', 'organize_rules', 'downloads', 'rss', 'guangya', 'guangya_offline', 'guangya_more', 'share_transfer', 'guangya_strm', 'media_proxy', 'gcid'] %} compact-workspace-page{% endif %}">

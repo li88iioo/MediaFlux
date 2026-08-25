@@ -26,6 +26,7 @@ from app.modules.download_dispatcher import (
     dispatch_missing_targets,
     dispatch_request,
     normalize_download_url,
+    public_dispatch_summary,
     request_key,
     request_keys,
     torrent_download_input,
@@ -107,13 +108,6 @@ async def _resolved_download_input(service, stored, resolved: ResolvedDownload):
         return torrent_download_input(_torrent_filename(resolved), response.body)
     except ValueError as exc:
         raise InvalidDownloadData() from exc
-
-
-def _public_target_results(value: Any) -> list[str]:
-    if not isinstance(value, (list, tuple, set, frozenset)):
-        return []
-    values = set(value)
-    return [target for target in ("qb", "guangya") if target in values]
 
 
 def _failed_download_result(result_id: str, target: str, error: str) -> dict[str, Any]:
@@ -291,25 +285,12 @@ async def download_indexer_result(
             **({"admission_id": admission_id} if admission_id is not None else {}),
         )
 
-    duplicate = bool(result.get("duplicate"))
-    succeeded = _public_target_results(result.get("succeeded"))
-    failed = _public_target_results(result.get("failed"))
-    dispatch_status = str(result.get("status") or "")
-    if dispatch_status == "manual_review":
-        status = "manual_review"
-        error = str(result.get("error") or "下载提交结果需要人工核验")
-    elif duplicate:
-        status = "duplicate"
-        error = "该下载请求已提交或正在处理"
-    elif succeeded and failed:
-        status = "partial"
-        error = ""
-    elif succeeded:
-        status = "submitted"
-        error = ""
-    else:
-        status = "failed"
-        error = "下载提交失败"
+    public = public_dispatch_summary(result)
+    duplicate = public["duplicate"]
+    succeeded = public["succeeded"]
+    failed = public["failed"]
+    status = public["status"]
+    error = public["error"]
     return {
         "result_id": result_id,
         "ok": status in {"submitted", "partial"},

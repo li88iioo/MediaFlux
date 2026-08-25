@@ -12,6 +12,7 @@ from app.clients.guangya import GuangYaClient
 from app.clients.qbittorrent import QBittorrentClient, is_qb_torrent_complete
 from app.config import get
 from app.logger import get_logger, log_throttled
+from app.modules.naming import sanitize_name
 from app.modules.organize import OrganizeRules
 from app.modules.organize_tasks import get_organize_manager
 from app.notifier import NotificationEvent, send_event
@@ -532,9 +533,161 @@ class DownloadTracker:
             chat_id=str(DownloadTracker._row_value(row, "chat_id", "") or "") or None,
         )
 
+    def _retain_staging_without_organize(self, row, reason: str) -> None:
+        """保留无法安全收口的隔离目录，并让待处理页给出明确原因。"""
+        message = str(reason or "下载目录需要人工核验")[:500]
+        db.update_download_request(
+            int(row["id"]),
+            organize_started=-1, organize_status="skipped", organize_error="",
+            organize_finished_at=db.now(), strm_status="skipped", strm_error="",
+            strm_finished_at=db.now(), error="",
+            gy_staging_cleanup_status="retained", gy_staging_cleanup_error=message,
+        )
+        logger.warning("光鸭下载暂存目录已保留 request=%s reason=%s", int(row["id"]), message)
+
+    def _finalize_staging_without_organize(self, row) -> bool:
+        """未配置自动入库时，把稳定的 MF 暂存目录安全收口到用户目标。
+
+        单个顶层对象直接提升到目标目录；多个顶层对象保留资源边界，但把
+        ``MF-*`` 重命名为用户可读的发布名。冲突或身份变化时不移动、不覆盖。
+        """
+        if not int(self._row_value(row, "gy_isolated", 0) or 0):
+            return False
+        request_id = int(row["id"])
+        staging_id = str(self._row_value(row, "gy_target_dir", "") or "")
+        parent_id = str(self._row_value(row, "gy_staging_parent_dir", "") or "0")
+        expected_name = str(self._row_value(row, "gy_staging_name", "") or "")
+        if not staging_id or not expected_name:
+            self._retain_staging_without_organize(row, "暂存目录身份信息不完整，未自动移动")
+            return True
+
+        try:
+            client = GuangYaClient()
+            if not client.logged_in:
+                raise RuntimeError("光鸭未登录")
+            info = client.file_info(staging_id)
+            if (
+                info is None or not info.is_dir
+                or str(info.parent_id or "0") != parent_id
+                or str(info.name or "") != expected_name
+            ):
+                self._retain_staging_without_organize(row, "暂存目录身份已变化，未自动移动")
+                return True
+            children = client.list_dir(staging_id)
+            if not children:
+                self._retain_staging_without_organize(row, "暂存目录为空，未找到可收口的下载内容")
+                return True
+            parent_entries = client.list_dir(parent_id)
+        except Exception as exc:
+            self._retain_staging_without_organize(
+                row, f"读取暂存目录失败: {type(exc).__name__}"
+            )
+            return True
+
+        def has_conflict(name: str, *, ignore_id: str = "") -> bool:
+            key = str(name or "").strip().casefold()
+            return any(
+                str(item.file_id or "") != ignore_id
+                and str(item.name or "").strip().casefold() == key
+                for item in parent_entries
+            )
+
+        if len(children) == 1:
+            child = children[0]
+            if not child.file_id or has_conflict(child.name, ignore_id=staging_id):
+                self._retain_staging_without_organize(
+                    row, f"目标目录已存在同名内容：{child.name or '未命名对象'}"
+                )
+                return True
+            try:
+                client.move([child.file_id], parent_id)
+                moved = client.file_info(child.file_id)
+                if moved is None or str(moved.parent_id or "0") != parent_id:
+                    raise RuntimeError("移动后未能确认目标位置")
+                latest = client.file_info(staging_id)
+                if (
+                    latest is None or not latest.is_dir
+                    or str(latest.parent_id or "0") != parent_id
+                    or str(latest.name or "") != expected_name
+                ):
+                    raise RuntimeError("移动后暂存目录身份已变化")
+                if not client.supports_guarded_empty_directory_delete:
+                    self._retain_staging_without_organize(
+                        row, "下载内容已移入目标目录，但 Provider 不支持安全删除空暂存目录"
+                    )
+                    return True
+                client.delete_empty_directory(
+                    staging_id,
+                    expected_etag=str(latest.etag or ""),
+                    expected_updated_at=int(latest.updated_at or 0),
+                )
+            except Exception as exc:
+                self._retain_staging_without_organize(
+                    row, f"暂存内容收口失败: {type(exc).__name__}"
+                )
+                return True
+            db.update_download_request(
+                request_id,
+                gy_target_dir=parent_id, gy_target_name=str(
+                    self._row_value(row, "gy_staging_parent_name", "")
+                    or get("OFFLINE_TARGET_DIR_NAME", "离线目录")
+                ),
+                gy_isolated=0, gy_staging_cleanup_status="completed",
+                gy_staging_cleanup_error="",
+                organize_started=-1, organize_status="skipped", organize_error="",
+                organize_finished_at=db.now(), strm_status="skipped", strm_error="",
+                strm_finished_at=db.now(), error="",
+            )
+            logger.info(
+                "光鸭单项下载已移入目标目录 request=%s item=%s",
+                request_id, child.file_id,
+            )
+            return True
+
+        try:
+            final_name = sanitize_name(str(self._row_value(row, "title", "") or "离线下载"))[:180]
+        except ValueError:
+            final_name = f"离线下载-{request_id}"
+        if has_conflict(final_name, ignore_id=staging_id):
+            self._retain_staging_without_organize(
+                row, f"目标目录已存在同名资源目录：{final_name}"
+            )
+            return True
+        try:
+            if final_name != expected_name:
+                client.rename(staging_id, final_name)
+            renamed = client.file_info(staging_id)
+            if (
+                renamed is None or not renamed.is_dir
+                or str(renamed.parent_id or "0") != parent_id
+                or str(renamed.name or "") != final_name
+            ):
+                raise RuntimeError("重命名后未能确认目录身份")
+        except Exception as exc:
+            self._retain_staging_without_organize(
+                row, f"资源目录收口失败: {type(exc).__name__}"
+            )
+            return True
+        db.update_download_request(
+            request_id,
+            gy_target_dir=staging_id, gy_target_name=final_name,
+            gy_isolated=0, gy_staging_name=final_name,
+            gy_staging_cleanup_status="completed", gy_staging_cleanup_error="",
+            organize_started=-1, organize_status="skipped", organize_error="",
+            organize_finished_at=db.now(), strm_status="skipped", strm_error="",
+            strm_finished_at=db.now(), error="",
+        )
+        logger.info(
+            "光鸭多项下载目录已完成可读化收口 request=%s name=%s",
+            request_id, final_name,
+        )
+        return True
+
     def _start_organize(self, row) -> None:
         source_id = str(row["gy_target_dir"] or get("OFFLINE_TARGET_DIR", "0") or "0")
         target_id = get("GY_ORGANIZE_TARGET_DIR", "").strip()
+        if not target_id and self._finalize_staging_without_organize(row):
+            return
         if source_id in {"", "0"} or not target_id:
             message = "下载完成，但未配置有效的光鸭整理源/目标目录"
             db.update_download_request(
@@ -548,7 +701,7 @@ class DownloadTracker:
                     "⚠️ 自动入库未启动",
                     fields=(("任务", DownloadTracker._row_value(row, "title", "") or "未命名任务"), ("原因", message)),
                 ),
-                chat_id=str(row["chat_id"] or "") or None,
+                chat_id=str(self._row_value(row, "chat_id", "") or "") or None,
             )
             return
         if not db.claim_download_request_organize(int(row["id"])):

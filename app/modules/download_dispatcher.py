@@ -270,6 +270,74 @@ def _submission_has_unknown(results: dict[str, dict[str, Any]]) -> bool:
     )
 
 
+def _public_dispatch_targets(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    targets = set(value)
+    return [target for target in ("qb", "guangya") if target in targets]
+
+
+def _public_guangya_failure(error: str) -> str:
+    """把内部光鸭错误归类为固定公开文案，禁止透传上游响应或资源地址。"""
+    rules = (
+        ("光鸭未登录", "光鸭未登录"),
+        ("资源中没有符合下载规则的文件", "光鸭未找到符合下载规则的文件"),
+        ("未解析到可验证文件列表", "光鸭磁力未解析到有效文件列表"),
+        ("创建任务隔离目录失败", "光鸭隔离目录创建失败"),
+        ("光鸭资源解析失败", "光鸭资源解析失败"),
+        ("光鸭任务创建失败", "光鸭任务创建失败"),
+    )
+    for marker, public_message in rules:
+        if marker in error:
+            return public_message
+    return "光鸭提交失败"
+
+
+def public_dispatch_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """投影稳定的公共下载结果；绝不复制 dispatcher 的原始错误和后端详情。"""
+    duplicate = bool(result.get("duplicate"))
+    succeeded = _public_dispatch_targets(result.get("succeeded"))
+    failed = _public_dispatch_targets(result.get("failed"))
+    review_required = bool(
+        result.get("review_required")
+        or result.get("outcome_unknown")
+        or str(result.get("status") or "") == "manual_review"
+    )
+
+    if duplicate:
+        status, error = "duplicate", "该下载请求已提交或正在处理"
+    elif review_required:
+        status = "manual_review"
+        error = (
+            "部分下载后端已提交，其余结果待核对，请先核对下载器，勿直接重复提交"
+            if succeeded else
+            "下载后端提交结果未知，请先核对下载器，勿直接重复提交"
+        )
+    elif succeeded and failed:
+        status = "partial"
+        if failed == ["guangya"]:
+            error = _public_guangya_failure(str(result.get("error") or ""))
+        else:
+            error = "部分下载目标提交失败"
+    elif succeeded:
+        status, error = "submitted", ""
+    else:
+        status = "failed"
+        if failed == ["guangya"]:
+            error = _public_guangya_failure(str(result.get("error") or ""))
+        else:
+            error = "下载提交失败"
+
+    return {
+        "ok": status in {"submitted", "partial"},
+        "status": status,
+        "succeeded": succeeded,
+        "failed": failed,
+        "duplicate": duplicate,
+        "error": error,
+    }
+
+
 def download_resubmit_capabilities(row) -> dict[str, dict[str, Any]]:
     """返回旧下载请求可重新提交的目标，不暴露原始链接或种子内容。
 

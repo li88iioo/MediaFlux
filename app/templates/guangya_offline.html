@@ -66,17 +66,6 @@
                         </div>
                     </div>
 
-                    <div class="offline-protocol-card offline-protocol-card--fallback organize-toggle-tile">
-                        <div class="offline-protocol-fallback-icon"><i data-lucide="shield-alert"></i></div>
-                        <div class="offline-protocol-copy offline-protocol-fallback-copy">
-                            <label for="offlineMagnetFallback">磁力解析失败自动隔离</label>
-                            <div class="offline-protocol-hint">无法取得文件树时，仅允许自动任务整单进入独立目录；默认开启，可手动关闭</div>
-                        </div>
-                        <label class="toggle">
-                            <input id="offlineMagnetFallback" type="checkbox" data-key="OFFLINE_MAGNET_UNVERIFIED_FALLBACK" checked>
-                            <span class="toggle-slider"></span>
-                        </label>
-                    </div>
                 </div>
 
                 <!-- 2. 默认保存目录 -->
@@ -193,8 +182,8 @@
                 <!-- 3. 允许扩展名 -->
                 <div class="form-row offline-textarea-row">
                     <div class="field-label">
-                        <div class="name">允许扩展名</div>
-                        <div class="hint">当前生效的默认媒体类型已展开；按 Enter 或逗号添加，点击标签可删除</div>
+                        <div class="name">允许视频扩展名</div>
+                        <div class="hint">仅可选择视频格式；音频、字幕、图片、文本和广告附件始终不会提交</div>
                     </div>
                     <div class="field-control">
                         <input type="hidden" data-key="OFFLINE_ALLOWED_EXTS" id="offlineAllowedExts">
@@ -388,7 +377,6 @@
         secondaryTagInput.setTagsFromString(config.OFFLINE_SECONDARY_KEYWORDS || '');
         if(!config.OFFLINE_MAGNET_ENABLED)form.querySelector('[data-key="OFFLINE_MAGNET_ENABLED"]').checked=true;
         if(!config.OFFLINE_ED2K_ENABLED)form.querySelector('[data-key="OFFLINE_ED2K_ENABLED"]').checked=true;
-        if(config.OFFLINE_MAGNET_UNVERIFIED_FALLBACK===undefined||config.OFFLINE_MAGNET_UNVERIFIED_FALLBACK==='')form.querySelector('[data-key="OFFLINE_MAGNET_UNVERIFIED_FALLBACK"]').checked=true;
         renderDirs();
     }).catch(error=>{
         saveState.className='is-error';

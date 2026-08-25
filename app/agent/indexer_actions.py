@@ -486,6 +486,14 @@ def submit_resource(arguments: dict[str, str]) -> ToolResult:
             data=public,
             error="请勿重复提交。",
         )
+    if result.get("status") == "manual_review":
+        return ToolResult(
+            False,
+            "review_required",
+            "下载任务提交结果待核对",
+            data=public,
+            error="请先核对下载器，勿直接重复提交。",
+        )
     if not result.get("ok"):
         return ToolResult(
             False,
@@ -635,13 +643,16 @@ def submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
         return ToolResult(False, "unavailable", "批量下载处理失败", error="下载处理失败，请稍后重试。")
     counts = {
         status: sum(item.get("status") == status for item in items)
-        for status in ("submitted", "partial", "failed", "duplicate")
+        for status in ("submitted", "partial", "manual_review", "failed", "duplicate")
     }
     accepted = counts["submitted"] + counts["partial"]
-    if accepted and not counts["failed"] and not counts["duplicate"]:
+    review_required = counts["manual_review"]
+    if accepted and not counts["failed"] and not counts["duplicate"] and not review_required:
         status, summary = "accepted", f"{accepted} 个下载任务已提交"
     elif accepted:
         status, summary = "partial", f"批量提交完成：{accepted} 个已受理，{len(items) - accepted} 个未受理"
+    elif review_required:
+        status, summary = "review_required", f"{review_required} 个下载任务提交结果待核对"
     elif counts["duplicate"] and not counts["failed"]:
         status, summary = "conflict", "所选资源均已提交或正在处理中"
     else:
@@ -654,6 +665,7 @@ def submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
             "target": arguments["target"],
             "total": len(items),
             "succeeded": accepted,
+            "review_required": review_required,
             "failed": counts["failed"],
             "duplicate": counts["duplicate"],
             "items": items,
@@ -664,5 +676,10 @@ def submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
             _now(),
         )],
         suggestions=["可询问：刚才批量下载到哪了。"],
-        error="部分或全部资源未被下载后端接受。" if accepted < len(items) else "",
+        error=(
+            "部分下载任务提交结果待核对，请先核对下载器，勿直接重复提交。"
+            if review_required
+            else "部分或全部资源未被下载后端接受。" if accepted < len(items)
+            else ""
+        ),
     )

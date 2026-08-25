@@ -364,6 +364,7 @@ async def batch_download(request: Request, data: Any = Body(default=None)):
         "total": len(items),
         "succeeded": sum(item["status"] == "submitted" for item in items),
         "partial": sum(item["status"] == "partial" for item in items),
+        "review_required": sum(item["status"] == "manual_review" for item in items),
         "failed": sum(item["status"] == "failed" for item in items),
         "duplicate": sum(item["status"] == "duplicate" for item in items),
     }

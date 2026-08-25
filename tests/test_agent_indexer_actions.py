@@ -16,6 +16,7 @@ from app.agent.indexer_actions import (
     submit_arguments,
     submit_confirmation_context,
     submit_resource,
+    submit_resource_batch,
 )
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import AgentOrchestrator
@@ -373,6 +374,59 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         self.assertFalse(internal.ok)
         self.assertEqual(internal.status, "unavailable")
         self.assertNotIn("secret internal error", str(internal.to_dict()))
+
+    def test_submit_resource_preserves_manual_review_without_private_error(self):
+        service = FakeIndexerService()
+        dispatch = AsyncMock(return_value={
+            "result_id": _RESULT_ID,
+            "ok": False,
+            "request_id": 12,
+            "created": True,
+            "target": "guangya",
+            "status": "manual_review",
+            "succeeded": [],
+            "failed": ["guangya"],
+            "duplicate": False,
+            "error": "private timeout magnet:?xt=urn:btih:secret",
+        })
+        with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
+            "app.agent.indexer_actions.get_indexer_service", return_value=service
+        ), patch("app.agent.indexer_actions.download_result", dispatch):
+            result = submit_resource({"result_id": _RESULT_ID, "target": "guangya"})
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "review_required")
+        self.assertEqual(result.summary, "下载任务提交结果待核对")
+        self.assertNotIn("private timeout", str(result.to_dict()))
+        self.assertNotIn("magnet:", str(result.to_dict()))
+
+    def test_submit_resource_batch_counts_manual_review_separately(self):
+        service = FakeIndexerService()
+        public_result = {
+            "result_id": _RESULT_ID,
+            "ok": False,
+            "request_id": 12,
+            "created": True,
+            "target": "guangya",
+            "status": "manual_review",
+            "succeeded": [],
+            "failed": ["guangya"],
+            "duplicate": False,
+            "error": "下载后端提交结果未知，请先核对下载器，勿直接重复提交",
+        }
+        dispatch = AsyncMock(return_value=public_result)
+        result_ids = [_RESULT_ID, "opaque-result-5678"]
+        with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
+            "app.agent.indexer_actions.get_indexer_service", return_value=service
+        ), patch("app.agent.indexer_actions.download_result_public", dispatch):
+            result = submit_resource_batch({"result_ids": result_ids, "target": "guangya"})
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "review_required")
+        self.assertEqual(result.data["review_required"], 2)
+        self.assertEqual(result.data["failed"], 0)
+        self.assertIn("勿直接重复提交", result.error)
+        self.assertEqual(dispatch.await_count, 2)
 
     def test_shared_download_service_dispatches_only_server_resolved_value(self):
         item = _resource_item(download_kinds=("magnet",))

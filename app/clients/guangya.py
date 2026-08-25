@@ -354,7 +354,7 @@ def _offline_file_excluded(raw: dict) -> bool:
     return False
 
 
-def _offline_is_file(raw: dict) -> bool:
+def _offline_is_file(raw: dict, index: int | None = None) -> bool:
     item_type = str(
         raw.get("type") or raw.get("fileType") or raw.get("kind") or raw.get("resType") or ""
     ).strip().lower()
@@ -362,7 +362,37 @@ def _offline_is_file(raw: dict) -> bool:
         return False
     if not _offline_file_name(raw):
         return False
-    return _offline_file_index(raw) is not None
+    return index is not None or _offline_file_index(raw) is not None
+
+
+def _bt_positional_file_indexes(parent: dict, key: str, items: list) -> dict[int, int]:
+    """兼容光鸭 BT 解析响应省略 ``fileIndex: 0``。
+
+    光鸭的 Go 响应会在首个文件索引为零时偶发省略该字段。只有能证明当前
+    ``subfiles`` 是 BT 根清单、其余显式索引与数组位置完全一致，且唯一缺失项
+    正好位于位置 0 时才补回索引；其他树形响应继续要求显式索引，避免猜测。
+    """
+    if str(key).lower() != "subfiles" or not items:
+        return {}
+    is_bt_manifest = any(
+        marker in parent
+        for marker in ("infoHash", "info_hash", "torrentHash", "torrent_hash", "subfilesNum")
+    )
+    if not is_bt_manifest:
+        return {}
+    explicit: list[tuple[int, int]] = []
+    missing: list[int] = []
+    for position, item in enumerate(items):
+        if not isinstance(item, dict):
+            return {}
+        index = _offline_file_index(item)
+        if index is None:
+            missing.append(position)
+        else:
+            explicit.append((position, index))
+    if missing != [0] or any(position != index for position, index in explicit):
+        return {}
+    return {0: 0}
 
 
 def _excluded_indexes(raw: dict) -> set[int]:
@@ -385,11 +415,14 @@ def _collect_offline_files(value, output: list[dict], inherited_excluded: set[in
     local_excluded = inherited_excluded | _excluded_indexes(value)
     for key, child in value.items():
         if key in OFFLINE_FILE_TREE_KEYS and isinstance(child, list):
-            for item in child:
+            positional_indexes = _bt_positional_file_indexes(value, key, child)
+            for position, item in enumerate(child):
                 if not isinstance(item, dict):
                     continue
-                if _offline_is_file(item):
-                    index = _offline_file_index(item)
+                index = _offline_file_index(item)
+                if index is None:
+                    index = positional_indexes.get(position)
+                if _offline_is_file(item, index):
                     output.append({
                         "index": index,
                         "name": _offline_file_name(item),
@@ -1666,9 +1699,49 @@ class GuangYaClient:
         }
 
     def list_offline_tasks(self) -> list[dict]:
-        """读取并归一化光鸭离线任务，保留 raw 便于诊断接口变更。"""
-        res = self._call_read("list_offline_tasks", lambda: self.raw.cloud_task_list())
-        return [self._to_offline_task(item) for item in self._extract_list(res)]
+        """完整读取并归一化光鸭离线任务。
+
+        光鸭 SDK 的默认状态集合不含 ``2``，且默认只返回第一页；MediaFlux
+        显式读取 0-4 全状态并分页去重，避免已离线完成任务长期显示“下载中”。
+        """
+        page_size = 50
+        max_pages = 200
+        status_filter = [0, 1, 2, 3, 4]
+        tasks: list[dict] = []
+        seen_ids: set[str] = set()
+        seen_pages: set[tuple[str, ...]] = set()
+        for page in range(max_pages):
+            res = self._call_read(
+                "list_offline_tasks",
+                lambda page=page: self.raw.cloud_task_list(
+                    page=page, page_size=page_size, status=status_filter,
+                ),
+            )
+            items = self._extract_list(res)
+            page_keys: list[str] = []
+            new_count = 0
+            for position, item in enumerate(items):
+                normalized = self._to_offline_task(item)
+                identity = str(normalized.get("id") or "").strip()
+                # 极少数上游响应缺 taskId；仍保留项目，但以页内稳定摘要防止
+                # 同一错误页无限循环。
+                key = identity or f"anonymous:{page}:{position}:{normalized.get('name', '')}"
+                page_keys.append(identity or f"{position}:{normalized.get('name', '')}")
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                tasks.append(normalized)
+                new_count += 1
+            signature = tuple(page_keys)
+            if len(items) < page_size:
+                break
+            if not items or signature in seen_pages or new_count == 0:
+                logger.warning("光鸭离线任务分页未推进，已停止读取 page=%s", page)
+                break
+            seen_pages.add(signature)
+        else:
+            logger.warning("光鸭离线任务超过安全分页上限 pages=%s", max_pages)
+        return tasks
 
     @staticmethod
     def _to_offline_task(raw: dict) -> dict:
@@ -1680,8 +1753,8 @@ class GuangYaClient:
                 or raw.get("title") or raw.get("url") or "未命名任务")
         status = raw.get("status") if raw.get("status") is not None else raw.get("state")
         normalized_status = str(status).strip().lower()
-        completed = status in {1, 3} or normalized_status in {
-            "1", "3", "completed", "complete", "success", "succeeded", "finished", "done",
+        completed = status in {1, 2, 3} or normalized_status in {
+            "1", "2", "3", "completed", "complete", "success", "succeeded", "finished", "done",
         }
         failed = status in {4, -1} or normalized_status in {
             "4", "-1", "failed", "error", "cancelled", "canceled", "invalid",

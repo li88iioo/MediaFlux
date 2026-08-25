@@ -545,7 +545,7 @@ class IndexerAPITests(unittest.TestCase):
         self.assertEqual(payload.get("status"), "partial")
         self.assertEqual(payload.get("succeeded"), ["qb"])
         self.assertEqual(payload.get("failed"), ["guangya"])
-        self.assertEqual(payload["error"], "")
+        self.assertEqual(payload["error"], "光鸭提交失败")
         self.assertNotIn("internal-success", response.text)
         self.assertNotIn("magnet:", response.text)
         self.assertNotIn(".torrent", response.text)
@@ -591,6 +591,131 @@ class IndexerAPITests(unittest.TestCase):
         self.assertNotIn(".torrent", response.text)
         self.assertNotIn("/details/", response.text)
         self.assertNotIn("torrent-bytes", response.text)
+
+    def test_download_exposes_known_guangya_failure_without_internal_details(self):
+        headers = self.authenticate()
+        service = FakeIndexerService()
+        with patch(
+            "app.routes.indexers_api.get_indexer_service",
+            return_value=service,
+        ), patch(
+            "app.modules.indexer_download.normalize_download_url",
+            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+        ), patch(
+            "app.modules.indexer_download.create_request",
+            return_value={"id": 31, "created": True},
+        ), patch(
+            "app.modules.indexer_download.dispatch_request",
+            return_value={
+                "ok": False,
+                "status": "failed",
+                "succeeded": [],
+                "failed": ["guangya"],
+                "error": (
+                    "guangya: 资源中没有符合下载规则的文件：解析器标记为排除 "
+                    "magnet:?xt=urn:btih:secret https://indexer.example/demo.torrent"
+                ),
+            },
+        ):
+            response = self.client.post(
+                "/api/indexers/download",
+                json={"result_id": "opaque-result", "target": "guangya"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["error"], "光鸭未找到符合下载规则的文件")
+        self.assertNotIn("magnet:", response.text)
+        self.assertNotIn("indexer.example", response.text)
+        self.assertNotIn("解析器标记为排除", response.text)
+
+    def test_download_preserves_unknown_submission_as_manual_review(self):
+        headers = self.authenticate()
+        service = FakeIndexerService()
+        with patch(
+            "app.routes.indexers_api.get_indexer_service",
+            return_value=service,
+        ), patch(
+            "app.modules.indexer_download.normalize_download_url",
+            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+        ), patch(
+            "app.modules.indexer_download.create_request",
+            return_value={"id": 31, "created": True},
+        ), patch(
+            "app.modules.indexer_download.dispatch_request",
+            return_value={
+                "ok": False,
+                "status": "submitted",
+                "succeeded": [],
+                "failed": ["guangya"],
+                "outcome_unknown": True,
+                "review_required": True,
+                "error": "guangya: timeout magnet:?xt=urn:btih:secret",
+            },
+        ):
+            response = self.client.post(
+                "/api/indexers/download",
+                json={"result_id": "opaque-result", "target": "guangya"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 502)
+        payload = response.json()
+        self.assertEqual(payload["status"], "manual_review")
+        self.assertEqual(
+            payload["error"],
+            "下载后端提交结果未知，请先核对下载器，勿直接重复提交",
+        )
+        self.assertNotIn("timeout", response.text)
+        self.assertNotIn("magnet:", response.text)
+
+    def test_download_preserves_mixed_unknown_submission_as_manual_review(self):
+        headers = self.authenticate()
+        service = FakeIndexerService()
+        with patch(
+            "app.routes.indexers_api.get_indexer_service",
+            return_value=service,
+        ), patch(
+            "app.modules.indexer_download.normalize_download_url",
+            return_value=SimpleNamespace(
+                kind="magnet",
+                title="Demo",
+                source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                torrent_data=None,
+            ),
+        ), patch(
+            "app.modules.indexer_download.create_request",
+            return_value={"id": 31, "created": True},
+        ), patch(
+            "app.modules.indexer_download.dispatch_request",
+            return_value={
+                "ok": True,
+                "status": "submitted",
+                "succeeded": ["qb"],
+                "failed": ["guangya"],
+                "outcome_unknown": True,
+                "review_required": True,
+                "error": "guangya: timeout magnet:?xt=urn:btih:secret",
+            },
+        ):
+            response = self.client.post(
+                "/api/indexers/download",
+                json={"result_id": "opaque-result", "target": "both"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 502)
+        payload = response.json()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "manual_review")
+        self.assertEqual(payload["succeeded"], ["qb"])
+        self.assertEqual(payload["failed"], ["guangya"])
+        self.assertEqual(
+            payload["error"],
+            "部分下载后端已提交，其余结果待核对，请先核对下载器，勿直接重复提交",
+        )
+        self.assertNotIn("timeout", response.text)
+        self.assertNotIn("magnet:", response.text)
 
     def test_download_fetches_and_validates_torrent_server_side(self):
         headers = self.authenticate()
@@ -710,6 +835,7 @@ class IndexerAPITests(unittest.TestCase):
             "total": 2,
             "succeeded": 1,
             "partial": 0,
+            "review_required": 0,
             "failed": 1,
             "duplicate": 0,
         })
@@ -751,9 +877,64 @@ class IndexerAPITests(unittest.TestCase):
             "total": 1,
             "succeeded": 0,
             "partial": 1,
+            "review_required": 0,
             "failed": 0,
             "duplicate": 0,
         })
+
+    def test_batch_download_counts_unknown_submission_as_review_required(self):
+        headers = self.authenticate()
+        service = FakeIndexerService()
+        with patch(
+            "app.routes.indexers_api.get_indexer_service",
+            return_value=service,
+        ), patch(
+            "app.modules.indexer_download.normalize_download_url",
+            return_value=SimpleNamespace(
+                kind="magnet",
+                title="Demo",
+                source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                torrent_data=None,
+            ),
+        ), patch(
+            "app.modules.indexer_download.create_request",
+            return_value={"id": 31, "created": True},
+        ), patch(
+            "app.modules.indexer_download.dispatch_request",
+            return_value={
+                "ok": False,
+                "status": "submitted",
+                "succeeded": [],
+                "failed": ["guangya"],
+                "outcome_unknown": True,
+                "review_required": True,
+                "error": "private timeout magnet:?xt=urn:btih:secret",
+            },
+        ):
+            response = self.client.post(
+                "/api/indexers/download/batch",
+                json={"result_ids": ["opaque-result"], "target": "guangya"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["items"][0]["status"], "manual_review")
+        self.assertEqual(payload["summary"], {
+            "total": 1,
+            "succeeded": 0,
+            "partial": 0,
+            "review_required": 1,
+            "failed": 0,
+            "duplicate": 0,
+        })
+        self.assertEqual(
+            payload["items"][0]["error"],
+            "下载后端提交结果未知，请先核对下载器，勿直接重复提交",
+        )
+        self.assertNotIn("private timeout", response.text)
+        self.assertNotIn("magnet:", response.text)
 
     def test_batch_download_limits_concurrency_to_three(self):
         headers = self.authenticate()
@@ -1005,6 +1186,7 @@ class IndexerAPITests(unittest.TestCase):
             "total": 2,
             "succeeded": 1,
             "partial": 0,
+            "review_required": 0,
             "failed": 0,
             "duplicate": 1,
         })
@@ -1095,6 +1277,7 @@ class IndexerAPITests(unittest.TestCase):
             "total": 1,
             "succeeded": 0,
             "partial": 0,
+            "review_required": 0,
             "failed": 1,
             "duplicate": 0,
         })

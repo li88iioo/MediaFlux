@@ -18,11 +18,16 @@ logger = get_logger(__name__)
 
 MAGNET_PREFIX = "magnet:?"
 ED2K_PREFIX = "ed2k://"
-DEFAULT_MEDIA_EXTS = (
-    "mkv", "mp4", "ts", "m2ts", "iso", "avi", "mov", "wmv", "flv", "rmvb",
-    "mp3", "flac", "aac", "wav", "m4a",
+# 光鸭“仅视频”在客户端解析文件树后通过 fileIndexes 提交；默认列表只含
+# 视频/光盘镜像格式，避免音频、图片、文本和广告附件进入云盘。
+DEFAULT_VIDEO_EXTS = (
+    "mkv", "mp4", "ts", "m2ts", "mts", "iso", "avi", "mov", "m4v",
+    "webm", "mpeg", "mpg", "wmv", "flv", "vob", "tp", "f4v", "rm", "rmvb",
 )
-DEFAULT_MEDIA_EXTS_CSV = ",".join(DEFAULT_MEDIA_EXTS)
+# 保留旧常量名作为内部兼容别名；其语义从本版起就是“仅视频”。
+DEFAULT_MEDIA_EXTS = DEFAULT_VIDEO_EXTS
+DEFAULT_MEDIA_EXTS_CSV = ",".join(DEFAULT_VIDEO_EXTS)
+_DEFAULT_VIDEO_EXT_SET = frozenset(DEFAULT_VIDEO_EXTS)
 
 
 @dataclass(frozen=True)
@@ -54,7 +59,7 @@ class OfflineRules:
             secondary_keywords=tuple(_split(get("OFFLINE_SECONDARY_KEYWORDS", ""))),
             exclude_keywords=tuple(_split(get("OFFLINE_EXCLUDE_KEYWORDS", ""))),
             min_file_mb=max(0, get_int("OFFLINE_MIN_FILE_MB", 0)),
-            allowed_exts=tuple(_extensions(get("OFFLINE_ALLOWED_EXTS", ""))),
+            allowed_exts=normalize_video_extensions(get("OFFLINE_ALLOWED_EXTS", "")),
         )
 
     @classmethod
@@ -73,7 +78,7 @@ class OfflineRules:
             secondary_keywords=tuple(_split(str(data.get("secondary_keywords", "")))),
             exclude_keywords=tuple(_split(str(data.get("exclude_keywords", "")))),
             min_file_mb=max(0, _to_int(data.get("min_file_mb"), base.min_file_mb)),
-            allowed_exts=tuple(_extensions(str(data.get("allowed_exts", "")))),
+            allowed_exts=normalize_video_extensions(str(data.get("allowed_exts", ""))),
         )
 
 
@@ -100,6 +105,11 @@ def _manifest_diagnostic(response: object) -> str:
         f"data字段={','.join(data_keys) or '-'}；"
         f"文件树字段={','.join(tree_keys) or '-'}"
     )
+
+
+def _resolver_excluded_only(files: list[dict]) -> bool:
+    """解析器只返回禁止选择项时，视为尚未得到可验证清单。"""
+    return bool(files) and all(bool(item.get("excluded")) for item in files)
 
 
 def _resolve_offline_manifest(
@@ -130,16 +140,22 @@ def _resolve_offline_manifest(
             continue
         last_response = response if isinstance(response, dict) else {"raw_type": type(response).__name__}
         last_files = GuangYaClient.normalize_offline_files(last_response)
-        if last_files or protocol != "magnet":
+        resolver_excluded_only = _resolver_excluded_only(last_files)
+        if protocol != "magnet" or (last_files and not resolver_excluded_only):
             return OfflineManifestResolution(last_response, last_files, attempt, _manifest_diagnostic(last_response))
         if attempt < attempts and delay > 0:
             time.sleep(delay * attempt)
     diagnostic = (
         f"解析异常={type(last_error).__name__}"
-        if last_error is not None else _manifest_diagnostic(last_response)
+        if last_error is not None
+        else (
+            f"解析器仅返回排除项；{_manifest_diagnostic(last_response)}"
+            if _resolver_excluded_only(last_files)
+            else _manifest_diagnostic(last_response)
+        )
     )
     logger.warning(
-        "光鸭磁力解析未返回文件树 attempts=%s diagnostic=%s", attempts, diagnostic,
+        "光鸭磁力解析未返回可用文件清单 attempts=%s diagnostic=%s", attempts, diagnostic,
     )
     return OfflineManifestResolution(last_response, last_files, attempts, diagnostic)
 
@@ -336,9 +352,9 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                    isolate_task: bool = False, task_key: str = "") -> dict:
     """按正式离线规则提交任务。
 
-    自动入口先解析文件树并强制应用扩展名、排除词和最小体积；磁力无法
-    得到可验证文件树时，仅允许已启用任务隔离的入口按配置降级为整单写入。
-    下载整理链可为每个请求创建独立临时目录，使完成后的整理只扫描本次任务。
+    自动入口先解析文件树并强制应用仅视频扩展名、排除词和最小体积。
+    磁力无法取得可验证文件树时一律失败关闭，不再整单下载；隔离目录只会
+    在已经得到明确 fileIndexes 后创建，用于后续下载落稳与安全整理。
     """
     rules = OfflineRules.from_config()
     decision = analyze_offline_url(url, title=title, rules=rules)
@@ -364,32 +380,29 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             "error": f"光鸭资源解析失败，未创建整单任务: {exc}",
         }
 
-    unverified_manifest = False
-    if decision.protocol == "magnet" and not choices:
-        allow_fallback = isolate_task and get_bool("OFFLINE_MAGNET_UNVERIFIED_FALLBACK", True)
-        if not allow_fallback:
-            fallback_hint = (
-                "隔离目录整单降级已关闭，可在离线转存设置中重新启用。"
-                if isolate_task else
-                "当前入口未启用任务隔离，不能安全执行整单降级。"
-            )
-            return {
-                "ok": False, "decision": decision.as_dict(),
-                "resolve_attempts": resolution.attempts,
-                "resolve_diagnostic": resolution.diagnostic,
-                "error": (
-                    f"磁力资源连续 {resolution.attempts} 次未解析到可验证文件列表，"
-                    f"已阻止整单下载；{fallback_hint}"
-                ),
-            }
-        unverified_manifest = True
+    manifest_unverifiable = not choices or _resolver_excluded_only(files)
+    if decision.protocol == "magnet" and manifest_unverifiable:
+        return {
+            "ok": False, "decision": decision.as_dict(),
+            "resolve_attempts": resolution.attempts,
+            "resolve_diagnostic": resolution.diagnostic,
+            "error": (
+                f"磁力资源连续 {resolution.attempts} 次未解析到可验证文件列表，"
+                "已阻止整单下载；请稍后重试或更换资源。"
+            ),
+        }
 
     selected = [int(item["index"]) for item in choices if item.get("selected")]
     if choices and not selected:
-        reasons = sorted({str(item.get("exclude_reason") or "不符合规则") for item in choices})
+        detail = "；".join(
+            f"{item.get('name') or item.get('index')}: {item.get('exclude_reason') or '不符合规则'}"
+            for item in choices[:5]
+        )
         return {
             "ok": False, "decision": decision.as_dict(),
-            "error": f"资源中没有符合下载规则的文件：{'；'.join(reasons[:3])}",
+            "resolve_attempts": resolution.attempts,
+            "selected_count": 0, "excluded_count": len(choices),
+            "error": f"资源中没有符合仅视频规则的文件" + (f"（{detail}）" if detail else ""),
         }
 
     staging_id = ""
@@ -398,7 +411,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
     if isolate_task:
         staging_name = _offline_staging_name(title, task_key)
         try:
-            staging_id = client.create_dir(staging_name, decision.target_dir_id)
+            staging_id = str(client.create_dir(staging_name, decision.target_dir_id) or "")
         except Exception as exc:
             return {
                 "ok": False, "decision": decision.as_dict(),
@@ -458,7 +471,9 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                     "error": str(created.get("error") or "光鸭任务创建失败"),
                 }
             return {"ok": True, **common, "error": ""}
-        # HTTP/ED2K 若上游只能确认单文件且没有文件树，保留兼容路径；磁力已在上方关闭。
+
+        # HTTP/ED2K 的上游响应可能只描述单文件而没有文件树，保留兼容提交；
+        # 磁力已在上方强制要求可验证 fileIndexes。
         created = client.add_offline_task(
             url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
         )
@@ -481,10 +496,10 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             staging_cleanup_error = ""
         return {
             "ok": ok, "decision": effective.as_dict(),
-            "selection_mode": "legacy_unverified_magnet" if unverified_manifest else "legacy",
-            "unverified_manifest": unverified_manifest,
+            "selection_mode": "legacy",
+            "unverified_manifest": False,
             "resolve_attempts": resolution.attempts,
-            "selected_count": 0, "excluded_count": 0,
+            "selected_count": 0, "excluded_count": len(choices),
             "task_ids": task_ids, "batch_count": batch_count,
             "staging": {"id": staging_id, "parent_id": str(decision.target_dir_id or "0"),
                         "name": staging_name, "isolated": bool(staging_id),
@@ -507,6 +522,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             "outcome_unknown": True,
             "error": f"光鸭任务创建失败: {exc}",
         }
+
 
 
 def preview_offline_selection(url: str, title: str = "", client: GuangYaClient | None = None,
@@ -775,6 +791,14 @@ def _extensions(raw: str) -> list[str]:
             seen.add(ext)
             result.append(ext)
     return result
+
+
+def normalize_video_extensions(raw: str) -> tuple[str, ...]:
+    """只保留 MediaFlux 支持的离线视频扩展名；空值使用内置仅视频列表。"""
+    values = _extensions(raw)
+    if not values:
+        return DEFAULT_VIDEO_EXTS
+    return tuple(item for item in values if item in _DEFAULT_VIDEO_EXT_SET)
 
 
 def _normalize_selected_indexes(values: list[int]) -> list[int]:

@@ -84,6 +84,22 @@ RESOLVE_FILE_LIST_FIXTURE = {
 }
 
 
+RESOLVE_EXCLUDED_ONLY_FIXTURE = {
+    "code": 0,
+    "msg": "success",
+    "data": {
+        "resourceType": "magnet",
+        "resourceName": "resolver excluded payload",
+        "excludeIndices": [0, 1, 2],
+        "subfiles": [
+            {"fileIndex": 0, "name": "ad-1.png", "size": 1468006},
+            {"fileIndex": 1, "name": "ad-2.png", "size": 1363148},
+            {"fileIndex": 2, "name": "ad-3.png", "size": 1258291},
+        ],
+    },
+}
+
+
 class FakeResponse:
     def __init__(self, payload: dict):
         self._payload = payload
@@ -135,6 +151,52 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
                 {"index": 8, "name": "Episode.S01E02.ts", "size": 0, "excluded": True},
             ],
         )
+
+    def test_normalize_offline_files_recovers_omitted_zero_index_in_bt_manifest(self):
+        response = {
+            "msg": "success",
+            "data": {
+                "btResInfo": {
+                    "infoHash": "example",
+                    "fileName": "Complete.Series",
+                    "subfilesNum": 3,
+                    "excludeIndices": [2],
+                    "subfiles": [
+                        {"fileName": "Show.S01E01.mkv", "fileSize": 700},
+                        {"fileIndex": 1, "fileName": "Show.S01E02.mkv", "fileSize": 800},
+                        {"fileIndex": 2, "fileName": "poster.png", "fileSize": 10},
+                    ],
+                },
+            },
+        }
+
+        files = GuangYaClient.normalize_offline_files(response)
+
+        self.assertEqual(files, [
+            {"index": 0, "name": "Show.S01E01.mkv", "size": 700, "excluded": False},
+            {"index": 1, "name": "Show.S01E02.mkv", "size": 800, "excluded": False},
+            {"index": 2, "name": "poster.png", "size": 10, "excluded": True},
+        ])
+
+    def test_normalize_offline_files_does_not_guess_ambiguous_bt_indexes(self):
+        response = {
+            "data": {
+                "btResInfo": {
+                    "infoHash": "example",
+                    "subfilesNum": 2,
+                    "subfiles": [
+                        {"fileName": "unknown.mkv", "fileSize": 700},
+                        {"fileIndex": 7, "fileName": "indexed.mkv", "fileSize": 800},
+                    ],
+                },
+            },
+        }
+
+        files = GuangYaClient.normalize_offline_files(response)
+
+        self.assertEqual(files, [
+            {"index": 7, "name": "indexed.mkv", "size": 800, "excluded": False},
+        ])
 
     def test_normalize_offline_files_ignores_unrelated_id_only_metadata_lists(self):
         response = {
@@ -452,58 +514,156 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         self.assertEqual(client.selection_calls[0]["target_dir_id"], "staging-7")
         self.assertEqual(client.legacy_calls, [])
 
-    def test_automatic_submit_can_fallback_to_isolated_whole_magnet(self):
+    def test_automatic_submit_fails_closed_before_creating_isolated_whole_magnet(self):
         client = FakeSelectionClient({
             "code": 0,
             "msg": "success",
             "data": {"resourceType": "magnet", "resourceName": "unresolved torrent"},
         })
-        client.create_dir = Mock(return_value="staging-8")
-        client.list_dir = Mock(return_value=[])
-        client.delete = Mock(return_value=True)
+        client.create_dir = Mock(return_value="must-not-be-created")
 
         with patch.object(offline.OfflineRules, "from_config", return_value=self.rules), patch.object(
-            offline, "get_bool", side_effect=lambda _key, default=False: default,
-        ) as get_bool, patch.object(offline.time, "sleep"):
+            offline.time, "sleep",
+        ):
             result = offline.submit_offline(
-                "magnet:?xt=urn:btih:fallback",
+                "magnet:?xt=urn:btih:no-whole-fallback",
                 title="Demo Release",
                 client=client,
                 isolate_task=True,
                 task_key="8",
             )
 
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["unverified_manifest"])
-        self.assertEqual(result["selection_mode"], "legacy_unverified_magnet")
-        self.assertEqual(result["selected_count"], 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["resolve_attempts"], 4)
+        self.assertIn("已阻止整单下载", result["error"])
+        client.create_dir.assert_not_called()
         self.assertEqual(client.selection_calls, [])
-        self.assertEqual(client.legacy_calls[0]["target_dir_id"], "staging-8")
-        get_bool.assert_called_with("OFFLINE_MAGNET_UNVERIFIED_FALLBACK", True)
+        self.assertEqual(client.legacy_calls, [])
 
-    def test_automatic_submit_respects_explicitly_disabled_magnet_fallback(self):
-        client = FakeSelectionClient({
-            "code": 0,
-            "msg": "success",
-            "data": {"resourceType": "magnet", "resourceName": "unresolved torrent"},
-        })
-        client.create_dir = Mock(return_value="should-not-be-created")
+    def test_automatic_submit_retries_excluded_only_manifest_and_recovers_selection(self):
+        client = FakeSelectionClient(RESOLVE_EXCLUDED_ONLY_FIXTURE)
+        client.resolve_url = Mock(side_effect=[
+            RESOLVE_EXCLUDED_ONLY_FIXTURE,
+            RESOLVE_SUBFILES_FIXTURE,
+        ])
+        client.create_dir = Mock(return_value="staging-recovered")
+        client.list_dir = Mock(return_value=[])
+        client.delete = Mock(return_value=True)
 
         with patch.object(offline.OfflineRules, "from_config", return_value=self.rules), patch.object(
-            offline, "get_bool", return_value=False,
-        ), patch.object(offline.time, "sleep"):
+            offline.time, "sleep",
+        ):
             result = offline.submit_offline(
-                "magnet:?xt=urn:btih:fallback-disabled",
+                "magnet:?xt=urn:btih:excluded-then-valid",
                 title="Demo Release",
                 client=client,
                 isolate_task=True,
-                task_key="disabled",
+                task_key="recovered",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["unverified_manifest"])
+        self.assertEqual(result["selection_mode"], "files")
+        self.assertEqual(result["resolve_attempts"], 2)
+        self.assertEqual(client.resolve_url.call_count, 2)
+        self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
+        self.assertEqual(client.legacy_calls, [])
+
+    def test_automatic_submit_fails_closed_when_manifest_only_has_resolver_exclusions(self):
+        client = FakeSelectionClient(RESOLVE_EXCLUDED_ONLY_FIXTURE)
+        client.resolve_url = Mock(side_effect=[RESOLVE_EXCLUDED_ONLY_FIXTURE] * 4)
+        client.create_dir = Mock(return_value="must-not-be-created")
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules), patch.object(
+            offline.time, "sleep",
+        ):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:excluded-only",
+                title="Demo Release",
+                client=client,
+                isolate_task=True,
+                task_key="excluded",
             )
 
         self.assertFalse(result["ok"])
-        self.assertIn("隔离目录整单降级已关闭", result["error"])
+        self.assertEqual(result["resolve_attempts"], 4)
+        self.assertIn("已阻止整单下载", result["error"])
+        self.assertEqual(client.resolve_url.call_count, 4)
         client.create_dir.assert_not_called()
+        self.assertEqual(client.selection_calls, [])
         self.assertEqual(client.legacy_calls, [])
+
+    def test_automatic_submit_fails_closed_without_isolation_for_excluded_only_manifest(self):
+        client = FakeSelectionClient(RESOLVE_EXCLUDED_ONLY_FIXTURE)
+        client.resolve_url = Mock(side_effect=[RESOLVE_EXCLUDED_ONLY_FIXTURE] * 4)
+        client.create_dir = Mock(return_value="must-not-be-created")
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules), patch.object(
+            offline.time, "sleep",
+        ):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:excluded-no-isolation",
+                title="Demo Release",
+                client=client,
+                isolate_task=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["resolve_attempts"], 4)
+        self.assertIn("已阻止整单下载", result["error"])
+        client.create_dir.assert_not_called()
+        self.assertEqual(client.selection_calls, [])
+        self.assertEqual(client.legacy_calls, [])
+
+    def test_automatic_submit_does_not_fallback_when_only_junk_files_are_available(self):
+        client = FakeSelectionClient({
+            "code": 0,
+            "data": {
+                "resourceType": "magnet",
+                "subfiles": [
+                    {"fileIndex": 0, "name": "xx.com poster.png", "size": 4096},
+                    {"fileIndex": 1, "name": "readme.txt", "size": 4096},
+                    {"fileIndex": 2, "name": "website.url", "size": 512},
+                    {"fileIndex": 3, "name": "theme.flac", "size": 4096},
+                ],
+            },
+        })
+        client.create_dir = Mock(return_value="must-not-be-created")
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:user-filtered",
+                title="Demo Release",
+                client=client,
+                isolate_task=True,
+                task_key="filtered",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("没有符合仅视频规则", result["error"])
+        self.assertIn("扩展名不允许", result["error"])
+        client.create_dir.assert_not_called()
+        self.assertEqual(client.selection_calls, [])
+        self.assertEqual(client.legacy_calls, [])
+
+    def test_empty_extension_config_defaults_to_video_only(self):
+        rules = replace(self.rules, min_file_mb=0, exclude_keywords=(), allowed_exts=())
+        choices = offline.build_offline_file_choices([
+            {"index": 0, "name": "Movie.mkv", "size": 1024},
+            {"index": 1, "name": "Episode.webm", "size": 1024},
+            {"index": 2, "name": "theme.mp3", "size": 1024},
+            {"index": 3, "name": "poster.jpg", "size": 1024},
+            {"index": 4, "name": "subtitle.ass", "size": 1024},
+            {"index": 5, "name": "website.url", "size": 1024},
+        ], rules)
+
+        self.assertEqual(
+            [item["index"] for item in choices if item["selected"]],
+            [0, 1],
+        )
+        self.assertTrue(all(
+            item["exclude_reason"] == "扩展名不允许" for item in choices[2:]
+        ))
 
     def test_magnet_manifest_retries_transient_resolve_exception(self):
         client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)

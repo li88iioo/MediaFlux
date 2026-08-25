@@ -17,7 +17,7 @@
     const INDEXER_DOWNLOAD_PATH = '/api/indexers/download';
     const INDEXER_DOWNLOAD_BATCH_PATH = '/api/indexers/download/batch';
     const RESOURCE_SELECTION_LIMIT = 50;
-    const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown']);
+    const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown', 'manual_review']);
     const RESOURCE_MANUAL_REVIEW_MESSAGE = '请核对下载列表/目标状态，必要时重新检索后人工处理';
     const VIEW_CACHE_FRESH_MS = 120000;
     const VIEW_CACHE_LIMIT = 24;
@@ -1674,8 +1674,10 @@
         if (submitState.status === 'partial') {
             const partialSuccessLabel = '部分成功：';
             const partialFailedLabel = '；失败：';
+            const failureReason = String(submitState.error || '').trim();
             return `${partialSuccessLabel}${asArray(submitState.succeeded).join(' + ') || '—'}`
                 + `${partialFailedLabel}${asArray(submitState.failed).join(' + ') || '—'}`
+                + (failureReason ? `；${failureReason}` : '')
                 + `；${RESOURCE_MANUAL_REVIEW_MESSAGE}`;
         }
         if (submitState.ok) {
@@ -2024,6 +2026,7 @@
             return {...base, status: 'expired'};
         }
         if (item.duplicate) return {...base, status: 'duplicate'};
+        if (item.status === 'manual_review') return {...base, status: 'manual_review'};
         const hasFailedTargets = asArray(item.failed).length > 0;
         if (item.status === 'partial' || (item.ok === true && hasFailedTargets)) {
             return {...base, status: 'partial'};
@@ -2088,7 +2091,14 @@
     }
 
     function summarizeResourceBatchItems(items) {
-        const summary = {total: items.length, succeeded: 0, partial: 0, failed: 0, duplicate: 0};
+        const summary = {
+            total: items.length,
+            succeeded: 0,
+            partial: 0,
+            review_required: 0,
+            failed: 0,
+            duplicate: 0,
+        };
         items.forEach((item) => {
             if (item.duplicate) {
                 summary.duplicate += 1;
@@ -2096,6 +2106,8 @@
                 summary.succeeded += 1;
             } else if (item.status === 'partial') {
                 summary.partial += 1;
+            } else if (item.status === 'manual_review') {
+                summary.review_required += 1;
             } else {
                 summary.failed += 1;
             }
@@ -2154,12 +2166,14 @@
             });
             const items = normalizeResourceBatchItems(resultIds, payload.items, true);
             const summary = summarizeResourceBatchItems(items);
-            const countsMessage = `成功 ${summary.succeeded}，部分 ${summary.partial}，失败 ${summary.failed}，重复 ${summary.duplicate}`;
-            const requiresManualReview = summary.partial > 0 || summary.failed > 0;
+            const countsMessage = `成功 ${summary.succeeded}，部分 ${summary.partial}，待核对 ${summary.review_required}，失败 ${summary.failed}，重复 ${summary.duplicate}`;
+            const requiresManualReview = summary.partial > 0
+                || summary.review_required > 0
+                || summary.failed > 0;
             const message = requiresManualReview
                 ? `${countsMessage}；${RESOURCE_MANUAL_REVIEW_MESSAGE}`
                 : countsMessage;
-            const alertType = summary.partial > 0 ? 'warning'
+            const alertType = summary.partial > 0 || summary.review_required > 0 ? 'warning'
                 : summary.failed > 0 ? (summary.succeeded ? 'warning' : 'error')
                     : summary.duplicate > 0 ? 'warning' : 'success';
             if (resourceSubmissionContextActive(submission)) {
@@ -2173,7 +2187,8 @@
             }
             notifyResourceCompletion({
                 type: alertType,
-                title: summary.partial > 0 ? '批量提交部分完成' : '批量提交完成',
+                title: summary.partial > 0 ? '批量提交部分完成'
+                    : summary.review_required > 0 ? '批量提交需要核对' : '批量提交完成',
                 message,
             }, submission);
         } catch (error) {

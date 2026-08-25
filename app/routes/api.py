@@ -882,11 +882,14 @@ def get_config(request: Request):
     }
     # 运行目录只作为缺省值展示；用户保存的 STRM_ROOT（包括显式空值）仍优先。
     items.setdefault("STRM_ROOT", config.get("STRM_ROOT", ""))
-    # 离线扩展名空值代表内置默认；API 返回有效值，前端无需再点快捷填入。
-    if not str(items.get("OFFLINE_ALLOWED_EXTS") or "").strip():
-        from app.modules.offline import DEFAULT_MEDIA_EXTS_CSV
+    # 旧版整单降级开关已停用；即使数据库仍有历史值也不再暴露给前端。
+    items.pop("OFFLINE_MAGNET_UNVERIFIED_FALLBACK", None)
+    # 离线选择固定为仅视频；历史音频/附件扩展名在展示与执行时都会被剔除。
+    from app.modules.offline import DEFAULT_MEDIA_EXTS_CSV, normalize_video_extensions
 
-        items["OFFLINE_ALLOWED_EXTS"] = DEFAULT_MEDIA_EXTS_CSV
+    items["OFFLINE_ALLOWED_EXTS"] = ",".join(
+        normalize_video_extensions(str(items.get("OFFLINE_ALLOWED_EXTS") or ""))
+    ) or DEFAULT_MEDIA_EXTS_CSV
     managed_fields = sorted(
         key for key in _CONFIG_UI_MANAGED_KEYS
         if config.has_external_override(key)
@@ -977,7 +980,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         "AGENT_LIBRARY_PATROL_ENABLED", "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED",
         "AGENT_LIBRARY_PATROL_INTERVAL_HOURS",
         "AGENT_LIBRARY_PATROL_MAX_SERIES",
-        "OFFLINE_MAGNET_ENABLED", "OFFLINE_MAGNET_UNVERIFIED_FALLBACK", "OFFLINE_ED2K_ENABLED",
+        "OFFLINE_MAGNET_ENABLED", "OFFLINE_ED2K_ENABLED",
         "OFFLINE_HTTP_ENABLED", "OFFLINE_TARGET_DIR", "OFFLINE_TARGET_DIR_NAME",
         "OFFLINE_SECONDARY_ENABLED", "OFFLINE_SECONDARY_DIR", "OFFLINE_SECONDARY_DIR_NAME",
         "OFFLINE_SECONDARY_KEYWORDS", "OFFLINE_EXCLUDE_KEYWORDS", "OFFLINE_MIN_FILE_MB",
@@ -1209,11 +1212,19 @@ def save_config(request: Request, data: Any = Body(default=None)):
         try:
             from app.modules.offline import DEFAULT_MEDIA_EXTS
 
-            data["OFFLINE_ALLOWED_EXTS"] = _normalize_organize_extensions(
+            normalized_exts = _normalize_organize_extensions(
                 data.get("OFFLINE_ALLOWED_EXTS"),
                 defaults=DEFAULT_MEDIA_EXTS,
                 label="离线允许扩展名",
             )
+            unsupported = [
+                item for item in normalized_exts.split(",") if item not in DEFAULT_MEDIA_EXTS
+            ]
+            if unsupported:
+                raise ValueError(
+                    "离线转存仅允许视频扩展名，不支持: " + ", ".join(unsupported[:5])
+                )
+            data["OFFLINE_ALLOWED_EXTS"] = normalized_exts
         except ValueError as exc:
             return api_error(str(exc), 400)
     special_updates: dict[str, str] = {}

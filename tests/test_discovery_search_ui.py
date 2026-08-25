@@ -516,11 +516,14 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
 
     def test_partial_summary_is_separate_visible_and_warns(self):
         for contract in (
-            "const summary = {total: items.length, succeeded: 0, partial: 0, failed: 0, duplicate: 0}",
+            "review_required: 0",
             "else if (item.status === 'partial')",
             "summary.partial += 1",
+            "else if (item.status === 'manual_review')",
+            "summary.review_required += 1",
             "部分 ${summary.partial}",
-            "summary.partial > 0 ? 'warning'",
+            "待核对 ${summary.review_required}",
+            "summary.partial > 0 || summary.review_required > 0 ? 'warning'",
         ):
             self.assertIn(contract, self.script)
         self.assertNotRegex(
@@ -530,14 +533,14 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
 
     def test_resource_terminal_failures_clear_selection_without_replay_promises(self):
         for contract in (
-            "const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown'])",
+            "const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown', 'manual_review'])",
             "RESOURCE_TERMINAL_STATUSES.has(item?.status)",
             "submitted.has('qb') && submitted.has('guangya')",
             "请核对下载列表/目标状态，必要时重新检索后人工处理",
             "提交状态未知，先核对下载列表；不要直接重复提交",
             "资源结果已过期，请刷新或重新检索",
             "item.error === '资源结果已过期'",
-            "const requiresManualReview = summary.partial > 0 || summary.failed > 0",
+            "|| summary.review_required > 0",
             "`${countsMessage}；${RESOURCE_MANUAL_REVIEW_MESSAGE}`",
             "normalizeResourceBatchItems(resultIds, payload.items, true)",
             "resourceSubmissionState({",

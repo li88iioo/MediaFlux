@@ -257,6 +257,118 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(DownloadTracker._match_gy(row, tasks)["id"], "b")
 
+    def test_tracker_promotes_single_staged_item_when_auto_organize_is_unconfigured(self):
+        tracker = DownloadTracker()
+        row = {
+            "id": 74, "title": "Movie Release", "chat_id": "",
+            "gy_target_dir": "staging", "gy_target_name": "MF staging",
+            "gy_isolated": 1, "gy_staging_parent_dir": "parent",
+            "gy_staging_name": "MF-74-Movie-Release",
+        }
+        staging_before = GuangYaFile(
+            "staging", "MF-74-Movie-Release", True, parent_id="parent", etag="before",
+        )
+        child = GuangYaFile("video", "Movie.Release.mkv", False, parent_id="staging")
+        moved = GuangYaFile("video", "Movie.Release.mkv", False, parent_id="parent")
+        staging_after = GuangYaFile(
+            "staging", "MF-74-Movie-Release", True, parent_id="parent",
+            etag="after", updated_at=123,
+        )
+        client = SimpleNamespace(
+            logged_in=True,
+            file_info=Mock(side_effect=[staging_before, moved, staging_after]),
+            list_dir=Mock(side_effect=[[child], [staging_before]]),
+            move=Mock(return_value=True),
+            rename=Mock(return_value=True),
+            supports_guarded_empty_directory_delete=True,
+            delete_empty_directory=Mock(return_value=True),
+        )
+        with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch(
+            "app.modules.download_tracker.get",
+            side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
+        ), patch.object(db, "update_download_request") as update:
+            tracker._start_organize(row)
+
+        client.move.assert_called_once_with(["video"], "parent")
+        client.delete_empty_directory.assert_called_once_with(
+            "staging", expected_etag="after", expected_updated_at=123,
+        )
+        self.assertEqual(update.call_args.kwargs["gy_target_dir"], "parent")
+        self.assertEqual(update.call_args.kwargs["gy_isolated"], 0)
+        self.assertEqual(update.call_args.kwargs["gy_staging_cleanup_status"], "completed")
+        self.assertEqual(update.call_args.kwargs["organize_status"], "skipped")
+
+    def test_tracker_renames_multi_item_staging_to_release_name_without_flattening(self):
+        tracker = DownloadTracker()
+        row = {
+            "id": 75, "title": "Show Release", "chat_id": "",
+            "gy_target_dir": "staging", "gy_target_name": "MF staging",
+            "gy_isolated": 1, "gy_staging_parent_dir": "parent",
+            "gy_staging_name": "MF-75-Show-Release",
+        }
+        before = GuangYaFile(
+            "staging", "MF-75-Show-Release", True, parent_id="parent", etag="before",
+        )
+        after = GuangYaFile(
+            "staging", "Show Release", True, parent_id="parent", etag="after",
+        )
+        children = [
+            GuangYaFile("e1", "Episode.S01E01.mkv", False, parent_id="staging"),
+            GuangYaFile("e2", "Episode.S01E02.mkv", False, parent_id="staging"),
+        ]
+        client = SimpleNamespace(
+            logged_in=True,
+            file_info=Mock(side_effect=[before, after]),
+            list_dir=Mock(side_effect=[children, [before]]),
+            move=Mock(return_value=True),
+            rename=Mock(return_value=True),
+        )
+        with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch(
+            "app.modules.download_tracker.get",
+            side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
+        ), patch.object(db, "update_download_request") as update:
+            tracker._start_organize(row)
+
+        client.move.assert_not_called()
+        client.rename.assert_called_once_with("staging", "Show Release")
+        self.assertEqual(update.call_args.kwargs["gy_target_dir"], "staging")
+        self.assertEqual(update.call_args.kwargs["gy_target_name"], "Show Release")
+        self.assertEqual(update.call_args.kwargs["gy_isolated"], 0)
+        self.assertEqual(update.call_args.kwargs["gy_staging_cleanup_status"], "completed")
+
+    def test_tracker_retains_staging_when_final_target_name_conflicts(self):
+        tracker = DownloadTracker()
+        row = {
+            "id": 76, "title": "Show Release", "chat_id": "",
+            "gy_target_dir": "staging", "gy_target_name": "MF staging",
+            "gy_isolated": 1, "gy_staging_parent_dir": "parent",
+            "gy_staging_name": "MF-76-Show-Release",
+        }
+        staging = GuangYaFile(
+            "staging", "MF-76-Show-Release", True, parent_id="parent", etag="before",
+        )
+        children = [
+            GuangYaFile("e1", "Episode.S01E01.mkv", False, parent_id="staging"),
+            GuangYaFile("e2", "Episode.S01E02.mkv", False, parent_id="staging"),
+        ]
+        conflict = GuangYaFile("existing", "Show Release", True, parent_id="parent")
+        client = SimpleNamespace(
+            logged_in=True,
+            file_info=Mock(return_value=staging),
+            list_dir=Mock(side_effect=[children, [staging, conflict]]),
+            move=Mock(), rename=Mock(),
+        )
+        with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch(
+            "app.modules.download_tracker.get",
+            side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
+        ), patch.object(db, "update_download_request") as update:
+            tracker._start_organize(row)
+
+        client.move.assert_not_called()
+        client.rename.assert_not_called()
+        self.assertEqual(update.call_args.kwargs["gy_staging_cleanup_status"], "retained")
+        self.assertIn("同名资源目录", update.call_args.kwargs["gy_staging_cleanup_error"])
+
     def test_tracker_respects_organize_backoff_while_other_backend_is_downloading(self):
         tracker = DownloadTracker()
         row = {

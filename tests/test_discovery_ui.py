@@ -245,7 +245,7 @@ class DiscoveryPageTests(InitializedWebTestCase):
         self.assertIn("resourceSubmitState: new Map()", source)
         self.assertIn("resourceResults: new Map()", source)
         self.assertIn("INDEXER_DOWNLOAD_BATCH_PATH", source)
-        self.assertIn("summary.partial > 0 ? 'warning'", source)
+        self.assertIn("summary.partial > 0 || summary.review_required > 0 ? 'warning'", source)
         self.assertIn("summary.failed > 0 ? (summary.succeeded ? 'warning' : 'error')", source)
         self.assertIn("summary.duplicate > 0 ? 'warning' : 'success'", source)
         self.assertIn("item.status === 'partial'", source)
@@ -258,7 +258,7 @@ class DiscoveryPageTests(InitializedWebTestCase):
         self.assertIn("isTerminalResourceSelection", source)
         self.assertIn("resourceResultSubmitting", source)
         self.assertIn(
-            "`成功 ${summary.succeeded}，部分 ${summary.partial}，失败 ${summary.failed}，重复 ${summary.duplicate}`",
+            "`成功 ${summary.succeeded}，部分 ${summary.partial}，待核对 ${summary.review_required}，失败 ${summary.failed}，重复 ${summary.duplicate}`",
             source,
         )
         self.assertIn("RESOURCE_MANUAL_REVIEW_MESSAGE", source)

@@ -18,39 +18,38 @@ class GuangyaOfflineUiContractTests(unittest.TestCase):
         self.base_template = BASE_TEMPLATE.read_text(encoding="utf-8")
         self.styles = STYLES.read_text(encoding="utf-8")
 
-    def test_protocol_cards_place_ed2k_before_http_and_fallback_on_second_row(self):
-        keys = (
-            "OFFLINE_MAGNET_ENABLED",
-            "OFFLINE_ED2K_ENABLED",
-            "OFFLINE_HTTP_ENABLED",
-            "OFFLINE_MAGNET_UNVERIFIED_FALLBACK",
-        )
+    def test_protocol_cards_place_ed2k_before_http_and_remove_whole_magnet_fallback(self):
+        keys = ("OFFLINE_MAGNET_ENABLED", "OFFLINE_ED2K_ENABLED", "OFFLINE_HTTP_ENABLED")
         positions = [self.template.index(f'data-key="{key}"') for key in keys]
         self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("OFFLINE_MAGNET_UNVERIFIED_FALLBACK", self.template)
+        self.assertNotIn("磁力解析失败自动隔离", self.template)
 
-    def test_protocol_cards_use_isolated_layout_instead_of_conflicting_strm_card(self):
+    def test_protocol_cards_keep_only_the_three_protocol_controls(self):
         start = self.template.index('<div class="offline-protocol-grid">')
-        end = self.template.index('<div class="form-row offline-textarea-row">', start)
+        end = self.template.index('<!-- 2. 默认保存目录 -->', start)
         protocol_markup = self.template[start:end]
         self.assertNotIn("strm-toggle-card", protocol_markup)
-        fallback_start = protocol_markup.index(
-            'class="offline-protocol-card offline-protocol-card--fallback organize-toggle-tile"'
+        self.assertEqual(
+            protocol_markup.count('class="offline-protocol-card organize-toggle-tile"'),
+            3,
         )
-        fallback_markup = protocol_markup[fallback_start:]
-        self.assertNotIn('data-lucide="shield-check"', fallback_markup)
         for contract in (
-            'class="offline-protocol-card organize-toggle-tile"',
-            'class="offline-protocol-card offline-protocol-card--fallback organize-toggle-tile"',
             'class="offline-protocol-copy"',
-            'class="offline-protocol-hint"',
-            'class="offline-protocol-copy offline-protocol-fallback-copy"',
+            'for="offlineMagnetEnabled"',
+            'for="offlineEd2kEnabled"',
             'for="offlineHttpEnabled"',
-            'for="offlineMagnetFallback"',
-            'id="offlineMagnetFallback" type="checkbox" data-key="OFFLINE_MAGNET_UNVERIFIED_FALLBACK" checked',
-            '磁力解析失败自动隔离',
-            '默认开启，可手动关闭',
         ):
             self.assertIn(contract, protocol_markup)
+        for removed in (
+            "offline-protocol-card--policy",
+            "offline-protocol-policy-copy",
+            "offline-protocol-policy-badge",
+            'data-lucide="file-video-2"',
+            "仅视频提交",
+            "安全模式",
+        ):
+            self.assertNotIn(removed, protocol_markup)
 
     def test_protocol_layout_reserves_copy_width_without_equal_height_stretch(self):
         for contract in (
@@ -59,8 +58,6 @@ class GuangyaOfflineUiContractTests(unittest.TestCase):
             ".offline-protocol-card .offline-protocol-title { min-width: 0; flex: 1 1 auto;",
             ".offline-protocol-copy { min-width: 0; flex: 1 1 auto; }",
             ".offline-protocol-hint { margin-top: 4px;",
-            ".offline-settings-section .offline-protocol-card--fallback { grid-column: 1 / -1; min-height: 78px; display: flex; flex-direction: row;",
-            ".offline-protocol-card--fallback .offline-protocol-copy > label { color: var(--text-primary); font-size: 13.5px; font-weight: 700;",
             ".offline-settings-section .offline-protocol-card .toggle { margin-left: 12px; flex: 0 0 auto; }",
         ):
             self.assertIn(contract, self.styles)
@@ -68,6 +65,8 @@ class GuangyaOfflineUiContractTests(unittest.TestCase):
             self.styles,
             re.compile(r"@media \(max-width: 900px\) \{\s+\.offline-protocol-grid,", re.S),
         )
+        self.assertNotIn("offline-protocol-card--policy", self.styles)
+        self.assertNotIn("offline-protocol-policy-badge", self.styles)
 
     def test_main_stylesheet_cache_key_includes_offline_protocol_release(self):
         match = re.search(r"css/main\.css'\) }}\?v=(\d{8}[a-z])", self.base_template)
