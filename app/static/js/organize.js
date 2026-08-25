@@ -1,7 +1,30 @@
 (function(){
     const workspace=document.getElementById('organizeWorkspace');
     const isRules=document.body.classList.contains('organize-rules-page');
-    if(isRules)setupTabGroup(workspace);
+    if(isRules){
+        setupTabGroup(workspace);
+        const ruleTabs=[...workspace.querySelectorAll('[data-tab-target]')];
+        const validRuleTabs=new Set(ruleTabs.map(button=>button.dataset.tabTarget));
+        let applyingRuleHash=false;
+        const activateRuleHash=()=>{
+            const requested=window.location.hash.slice(1);
+            const normalized=validRuleTabs.has(requested)?requested:'naming';
+            const button=ruleTabs.find(item=>item.dataset.tabTarget===normalized);
+            if(!button||button.classList.contains('active'))return;
+            applyingRuleHash=true;
+            button.click();
+            applyingRuleHash=false;
+        };
+        ruleTabs.forEach(button=>button.addEventListener('click',()=>{
+            if(applyingRuleHash)return;
+            const tab=button.dataset.tabTarget;
+            const url=new URL(window.location.href);
+            url.hash=tab==='naming'?'':tab;
+            window.history.replaceState(window.history.state,'',`${url.pathname}${url.search}${url.hash}`);
+        }));
+        activateRuleHash();
+        window.addEventListener('hashchange',activateRuleHash);
+    }
     const sourceInput=document.getElementById('organizeSourceDirs');
     let sources=[];
     let pollTimer=null;

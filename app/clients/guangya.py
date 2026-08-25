@@ -46,9 +46,12 @@ _TOKEN_PROCESS_LOCKS: dict[Path, CrossProcessLock] = {}
 _LAST_LOGGED_TOKEN_FINGERPRINT = ""
 
 
+_READ_METRICS_MAX_LATENCY_SAMPLES = 1024
+
+
 @dataclass
 class GuangYaReadMetrics:
-    """一次光鸭只读扫描的线程安全观测器。"""
+    """一次光鸭只读扫描的线程安全有界观测器。"""
 
     requests: int = 0
     pages: int = 0
@@ -56,13 +59,22 @@ class GuangYaReadMetrics:
     rate_limit_retries: int = 0
     failures: int = 0
     _latencies_ms: list[float] = field(default_factory=list, repr=False)
+    _latency_cursor: int = field(default=0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def record_request(self, elapsed_seconds: float, *, failed: bool = False) -> None:
+        latency_ms = max(0.0, float(elapsed_seconds)) * 1000
         with self._lock:
             self.requests += 1
             self.failures += int(failed)
-            self._latencies_ms.append(max(0.0, float(elapsed_seconds)) * 1000)
+            if len(self._latencies_ms) < _READ_METRICS_MAX_LATENCY_SAMPLES:
+                self._latencies_ms.append(latency_ms)
+            else:
+                # 固定容量环形样本保留最近请求，避免大库扫描观测数据自身无界增长。
+                self._latencies_ms[self._latency_cursor] = latency_ms
+                self._latency_cursor = (
+                    self._latency_cursor + 1
+                ) % _READ_METRICS_MAX_LATENCY_SAMPLES
 
     def record_page(self) -> None:
         with self._lock:
@@ -74,25 +86,26 @@ class GuangYaReadMetrics:
             self.rate_limit_retries += int(status_code == 429)
 
     @staticmethod
-    def _percentile(values: list[float], percentile: float) -> float:
-        if not values:
+    def _percentile(ordered: list[float], percentile: float) -> float:
+        if not ordered:
             return 0.0
-        ordered = sorted(values)
         index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * percentile)))
         return round(ordered[index], 1)
 
     def snapshot(self) -> dict[str, int | float]:
         with self._lock:
-            latencies = list(self._latencies_ms)
+            ordered = sorted(self._latencies_ms)
             return {
                 "directory_requests": self.requests,
                 "scan_pages": self.pages,
                 "read_retries": self.retries,
                 "rate_limit_retries": self.rate_limit_retries,
                 "read_failures": self.failures,
-                "request_p50_ms": self._percentile(latencies, 0.50),
-                "request_p95_ms": self._percentile(latencies, 0.95),
-                "request_p99_ms": self._percentile(latencies, 0.99),
+                "latency_samples": len(ordered),
+                "latency_sampled": int(self.requests > len(ordered)),
+                "request_p50_ms": self._percentile(ordered, 0.50),
+                "request_p95_ms": self._percentile(ordered, 0.95),
+                "request_p99_ms": self._percentile(ordered, 0.99),
             }
 
 

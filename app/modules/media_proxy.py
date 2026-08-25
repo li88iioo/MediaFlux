@@ -536,7 +536,9 @@ class SignedUrlCache:
         """解析常见签名 URL 的绝对到期时间；不保存或输出 URL。"""
         try:
             query = {key.lower(): value for key, value in parse_qsl(urlsplit(url).query)}
-            for key in ("expires", "x-oss-expires", "oss-expires", "expiry", "exp"):
+            for key in (
+                "expires", "x-oss-expires", "oss-expires", "expiry", "exp", "ts",
+            ):
                 value = query.get(key)
                 if value:
                     parsed = float(value)
@@ -724,6 +726,22 @@ class SignedUrlCache:
             for key in keys:
                 self._entries.pop(key, None)
             return len(keys)
+
+    def invalidate(
+        self,
+        file_id: str,
+        *,
+        scope: str = "",
+        user_agent: str = "",
+        ua_bound: bool = False,
+    ) -> bool:
+        """精确淘汰一条 signed URL，供 relay 收到 CDN 鉴权失败时单次重取。"""
+        normalized = str(file_id or "").strip()
+        if not normalized:
+            return False
+        key = self._key(normalized, scope, user_agent, ua_bound)
+        with self._guard:
+            return self._entries.pop(key, None) is not None
 
     def metrics(self) -> dict[str, int]:
         with self._guard:
@@ -4590,7 +4608,12 @@ def create_proxy_app(
                     "media_name": getattr(request.state, "proxy_media_name", ""),
                 })
 
-    async def _relay_signed_media(request: Request, signed_url: str) -> Response:
+    async def _relay_signed_media(
+        request: Request,
+        signed_url: str,
+        *,
+        refresh_signed_url: Callable[[], Awaitable[str | None]] | None = None,
+    ) -> Response:
         current_url = str(signed_url or "").strip()
         started = time.monotonic()
         relay_client: httpx.AsyncClient | None = None
@@ -4607,6 +4630,7 @@ def create_proxy_app(
                 await client.aclose()
 
         redirect_count = 0
+        auth_refresh_attempted = False
         try:
             while True:
                 try:
@@ -4693,6 +4717,35 @@ def create_proxy_app(
                         )
                     redirect_count += 1
                     current_url = urljoin(pinned.logical_url, location)
+                    continue
+
+                if (
+                    response.status_code in {401, 403}
+                    and refresh_signed_url is not None
+                    and not auth_refresh_attempted
+                ):
+                    auth_refresh_attempted = True
+                    await response.aclose()
+                    await close_relay_client()
+                    try:
+                        refreshed_url = str(await refresh_signed_url() or "").strip()
+                    except Exception as exc:
+                        request.state.proxy_failure_stage = "signed_url_refresh"
+                        logger.warning(
+                            "媒体反代直链鉴权失败后重取地址失败 instance=%s type=%s",
+                            instance_id,
+                            type(exc).__name__,
+                        )
+                        return JSONResponse(
+                            {"error": "媒体直链已失效且刷新失败"}, status_code=502,
+                        )
+                    if not refreshed_url:
+                        request.state.proxy_failure_stage = "signed_url_refresh"
+                        return JSONResponse(
+                            {"error": "媒体直链已失效且无法刷新"}, status_code=502,
+                        )
+                    current_url = refreshed_url
+                    redirect_count = 0
                     continue
 
                 request.state.proxy_route_class = "guangya_direct"
@@ -4837,6 +4890,23 @@ def create_proxy_app(
                     status_code=502,
                 )
             client_url = str(result.url).strip()
+
+            async def refresh_cached_url() -> str | None:
+                signed_urls.invalidate(
+                    file_id,
+                    scope=scope,
+                    user_agent=request.headers.get("user-agent", ""),
+                    ua_bound=ua_bound,
+                )
+                refreshed = await signed_urls.get_or_fetch_result(
+                    file_id,
+                    fetch_url,
+                    scope=scope,
+                    user_agent=request.headers.get("user-agent", ""),
+                    ua_bound=ua_bound,
+                )
+                request.state.proxy_cache_hit = False
+                return refreshed.url
             browser_direct_redirect = bool(
                 not is_head_probe
                 and getattr(
@@ -4890,7 +4960,11 @@ def create_proxy_app(
                     request.state.proxy_action = "guangya_relay_native_chain"
                 elif native_cross_protocol_relay:
                     request.state.proxy_action = "guangya_relay_cross_protocol"
-                return await _relay_signed_media(request, client_url)
+                return await _relay_signed_media(
+                    request,
+                    client_url,
+                    refresh_signed_url=refresh_cached_url,
+                )
             redirect_url = client_url
             if browser_direct_redirect:
                 # 浏览器会自行解析 Location，无法复用 relay 的物理 IP pinning；

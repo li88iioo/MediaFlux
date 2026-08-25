@@ -561,6 +561,17 @@ class AgentToolTests(unittest.TestCase):
             search_library({"query": "Show", "limit": 8})
         search.assert_called_once_with("Show", limit=8)
 
+    def test_library_search_cache_has_a_hard_entry_limit(self):
+        reset_agent_tool_caches_for_tests()
+        with patch("app.agent.tools._SEARCH_CACHE_MAX_ENTRIES", 2), patch(
+            "app.agent.tools.search_media_servers", return_value=[]
+        ) as search:
+            search_library({"query": "Show One", "limit": 8})
+            search_library({"query": "Show Two", "limit": 8})
+            search_library({"query": "Show Three", "limit": 8})
+            search_library({"query": "Show One", "limit": 8})
+        self.assertEqual(search.call_count, 4)
+
     def test_registry_argument_validation_is_strict(self):
         registry = build_tool_registry()
         with self.assertRaises(AgentToolError):

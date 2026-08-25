@@ -821,7 +821,7 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
         self.assertEqual(results, {})
         self.assertEqual(used, [])
 
-    def test_many_targets_are_refreshed_in_complete_batches(self):
+    def test_many_targets_share_one_media_library_enumeration(self):
         from app.modules.scheduler import STRMScheduler
 
         calls: list[list[str]] = []
@@ -851,13 +851,10 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             )
 
         self.assertEqual(results, {"Jellyfin": True})
-        self.assertEqual([len(batch) for batch in calls], [MAX_REFRESH_TARGETS, 5])
-        self.assertEqual(
-            sorted(target for batch in calls for target in batch),
-            sorted(changed_dirs),
-        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sorted(calls[0]), sorted(changed_dirs))
 
-    def test_failure_in_a_later_refresh_batch_is_reported(self):
+    def test_refresh_failure_is_reported(self):
         from app.modules.scheduler import STRMScheduler
 
         calls = 0
@@ -868,7 +865,7 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             def refresh_for_paths(self, _paths):
                 nonlocal calls
                 calls += 1
-                return {"ok": calls == 1, "items": [], "libraries": [], "fallback": ""}
+                return {"ok": False, "items": [], "libraries": [], "fallback": ""}
 
         settings = {
             "JELLYFIN_ENABLED": True, "EMBY_ENABLED": False,
@@ -887,7 +884,8 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
                 has_changes=True, changed_paths=[], changed_dirs=changed_dirs,
             )
 
-        self.assertEqual(calls, 2)
+        self.assertEqual(calls, 1)
+        self.assertEqual(results, {"Jellyfin": False})
         self.assertEqual(results, {"Jellyfin": False})
 
     def test_no_changes_skips_refresh_entirely(self):

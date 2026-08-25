@@ -987,12 +987,19 @@ class RSSEngine:
                 existing = True
                 result = TorrentAddResult(True, "", False)
             elif claim_status != "claimed":
-                failure_code = (
-                    "qb_outcome_unknown"
-                    if claim_status in {"busy", "unknown"}
-                    else "unknown_failure"
-                )
-                db.record_rss_entry_failure(entry_id, failure_code, False)
+                if claim_status == "busy":
+                    failure_code = "qb_dedupe_busy"
+                    retryable = True
+                    failure_message = "相同资源正在提交，本条已保留为可重试状态"
+                elif claim_status == "unknown":
+                    failure_code = "qb_outcome_unknown"
+                    retryable = False
+                    failure_message = "相同资源提交结果待核对，已阻止重复提交"
+                else:
+                    failure_code = "unknown_failure"
+                    retryable = False
+                    failure_message = "RSS 条目状态已变化，本次未提交"
+                db.record_rss_entry_failure(entry_id, failure_code, retryable)
                 failed += 1
                 if failure_code == "qb_outcome_unknown":
                     outcome_unknown_count += 1
@@ -1001,7 +1008,7 @@ class RSSEngine:
                     path=_safe_download_source_marker(torrent_url),
                     rss_item_id=int(row["rss_item_id"]), status="failed",
                     backend_task_id=infohash,
-                    error="相同资源正在提交或结果待核对，已阻止重复提交",
+                    error=failure_message,
                 )
                 continue
             if not existing:

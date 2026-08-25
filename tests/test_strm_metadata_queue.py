@@ -27,6 +27,7 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         with db.get_conn() as conn:
             conn.execute("DELETE FROM strm_metadata_queue")
+            conn.execute("DELETE FROM strm_metadata_refresh_outbox")
 
     def _rows(self, status: str = "all") -> list[dict]:
         return [dict(row) for row in db.list_strm_metadata_queue(status=status)]
@@ -151,6 +152,25 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(stale, "stale")
         self.assertEqual(current, "completed")
+
+    def test_completed_metadata_persists_media_refresh_until_acknowledged(self):
+        db.enqueue_strm_metadata_jobs([_job()])
+        claimed = db.claim_due_strm_metadata_jobs(owner="worker-a")[0]
+        refresh_path = "/strm/电影/Movie/Movie.nfo"
+
+        state = db.complete_strm_metadata_job(
+            claimed["id"],
+            expected_owner="worker-a",
+            expected_lease_generation=claimed["lease_generation"],
+            expected_revision=claimed["revision"],
+            refresh_path=refresh_path,
+        )
+
+        self.assertEqual(state, "completed")
+        self.assertEqual(db.list_strm_metadata_refresh_paths(), [refresh_path])
+        self.assertEqual(db.count_strm_metadata_refresh_paths(), 1)
+        self.assertEqual(db.acknowledge_strm_metadata_refresh_paths([refresh_path]), 1)
+        self.assertEqual(db.list_strm_metadata_refresh_paths(), [])
 
     def test_failures_use_exponential_retry_and_end_in_failed(self):
         db.enqueue_strm_metadata_jobs([_job()], max_attempts=2)
@@ -282,6 +302,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         with db.get_conn() as conn:
             conn.execute("DELETE FROM strm_metadata_queue")
+            conn.execute("DELETE FROM strm_metadata_refresh_outbox")
             conn.execute("DELETE FROM strm_index")
             conn.execute("DELETE FROM strm_failures")
 
@@ -400,3 +421,30 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(worker._changed_paths, [])
         self.assertFalse(worker._refresh_retry_pending)
+
+    def test_new_worker_replays_durable_media_refresh_after_restart(self):
+        from unittest.mock import patch
+
+        from app.modules.strm_metadata_worker import STRMMetadataWorker
+
+        db.enqueue_strm_metadata_jobs([_job()])
+        claimed = db.claim_due_strm_metadata_jobs(owner="old-worker")[0]
+        path = "/strm/Movie/Movie.nfo"
+        db.complete_strm_metadata_job(
+            claimed["id"],
+            expected_owner="old-worker",
+            expected_lease_generation=claimed["lease_generation"],
+            expected_revision=claimed["revision"],
+            refresh_path=path,
+        )
+        worker = STRMMetadataWorker()
+
+        with patch(
+            "app.modules.scheduler.STRMScheduler._refresh_media_servers",
+            return_value={"Jellyfin": True},
+        ) as refresh:
+            worker._flush_media_refresh(force=True)
+
+        refresh.assert_called_once()
+        self.assertEqual(refresh.call_args.kwargs["changed_paths"], [path])
+        self.assertEqual(db.count_strm_metadata_refresh_paths(), 0)

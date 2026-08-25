@@ -97,6 +97,14 @@ def _is_path_within_root(target: Path | str, strm_root: Path | str) -> bool:
 # 精准媒体库刷新需要本轮真实变化的 STRM 路径；展示用变化记录会脱敏，
 # 无法反推真实路径，因此单独有界记录。
 _MAX_TRACKED_CHANGED_PATHS = 5000
+_MAX_TRACKED_OVERFLOW_DIRS = 256
+
+
+def _parent_path_text(path: str) -> str:
+    parent = Path(path).parent
+    if "/" in path and "\\" not in path:
+        return parent.as_posix()
+    return str(parent)
 
 
 def _record_changed_path(stats: dict, target: object) -> None:
@@ -110,6 +118,15 @@ def _record_changed_path(stats: dict, target: object) -> None:
         stats["changed_paths_omitted"] = int(
             stats.get("changed_paths_omitted", 0) or 0
         ) + 1
+        overflow_dirs = stats.setdefault("changed_overflow_dirs", [])
+        parent = _parent_path_text(path)
+        if (
+            isinstance(overflow_dirs, list)
+            and parent
+            and parent not in overflow_dirs
+            and len(overflow_dirs) < _MAX_TRACKED_OVERFLOW_DIRS
+        ):
+            overflow_dirs.append(parent)
         return
     paths.append(path)
 
@@ -206,13 +223,11 @@ def finalize_changed_paths(stats: dict) -> dict:
     ]
     unique_paths = list(dict.fromkeys(paths))
     stats["changed_strm_paths"] = unique_paths
-    changed_dirs = []
+    changed_dirs = [
+        str(item) for item in (stats.get("changed_overflow_dirs") or []) if str(item)
+    ]
     for item in unique_paths:
-        parent = Path(item).parent
-        if "/" in item and "\\" not in item:
-            changed_dirs.append(parent.as_posix())
-        else:
-            changed_dirs.append(str(parent))
+        changed_dirs.append(_parent_path_text(item))
     stats["changed_dirs"] = list(dict.fromkeys(changed_dirs))
     return stats
 

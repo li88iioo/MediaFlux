@@ -3074,7 +3074,7 @@ def start_bot() -> bool:
 
 def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) -> bool:
     """在生命周期控制锁内停止 polling 与恢复线程。"""
-    global _bot, _bot_thread, _bot_thread_stop
+    global _bot, _bot_thread, _bot_thread_stop, _registered_bot_id
     global _progress_recovery_thread, _progress_recovery_stop
     with _lifecycle_lock:
         bot = _bot
@@ -3086,12 +3086,6 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
         thread_stop.set()
     if recovery_stop is not None:
         recovery_stop.set()
-    try:
-        from app.bot.progress import stop_terminal_delivery_retries
-
-        stop_terminal_delivery_retries(timeout=timeout)
-    except Exception as exc:
-        logger.warning("停止 Telegram 终态重投失败 type=%s", type(exc).__name__)
     if bot is not None:
         try:
             if cancel_operations:
@@ -3100,6 +3094,14 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
                 cancel_active_operations("服务正在停止，本次操作已结束；启动完成后可重新发起。")
         except Exception as exc:
             logger.warning("收尾 Telegram 长任务失败 type=%s", type(exc).__name__)
+    try:
+        from app.bot.progress import stop_terminal_delivery_retries
+
+        # 先让运行中的操作持久化终态，再停止本代重投；下次 start 会创建新代恢复。
+        stop_terminal_delivery_retries(timeout=timeout)
+    except Exception as exc:
+        logger.warning("停止 Telegram 终态重投失败 type=%s", type(exc).__name__)
+    if bot is not None:
         try:
             bot.stop_polling()
             logger.info("TG Bot polling 已停止")
@@ -3129,6 +3131,10 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
             _progress_recovery_thread = None
         if _progress_recovery_stop is recovery_stop and recovery_finished:
             _progress_recovery_stop = None
+        if thread_finished and recovery_finished:
+            # notifier 可能复用同一个 TeleBot 对象；每次 polling 新代都必须
+            # 重新创建终态重投/恢复 generation，不能只依赖对象 identity。
+            _registered_bot_id = None
     try:
         from app.modules.telegram_resource_search import shutdown_telegram_indexer_worker
 

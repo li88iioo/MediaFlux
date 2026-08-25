@@ -888,6 +888,7 @@ _RSS_FAILURE_CODES = {
     "qb_rejected",
     "qb_unavailable",
     "qb_rate_limited",
+    "qb_dedupe_busy",
     "qb_server_error",
     "qb_outcome_unknown",
     "submission_outcome_unknown",

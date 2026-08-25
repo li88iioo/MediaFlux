@@ -27,6 +27,7 @@ _QB_FAILED_STATES = {"error", "missingfiles"}
 _TRACKER_CURSOR_KEY = "download_tracker.active_cursor_id"
 _DEFAULT_MISSING_GRACE_SECONDS = 900
 _MAX_LOCAL_IMPORT_PROBE_ATTEMPTS = 8
+_NOTIFICATION_LEASE_SECONDS = 300
 
 
 class DownloadTracker:
@@ -675,9 +676,40 @@ class DownloadTracker:
         gy_status = str(payload.get("gy_status") or gy_status)
         claim: dict[str, object] | None = None
         if request_id:
-            claim = db.claim_download_request_notification(request_id)
+            claim = db.claim_download_request_notification(
+                request_id, lease_seconds=_NOTIFICATION_LEASE_SECONDS,
+            )
             if claim is None:
                 return
+        token = str(claim.get("token") or "") if claim else ""
+        attempts = int(claim.get("attempts") or 0) + 1 if claim else 1
+        lease_stop = threading.Event()
+        lease_thread: threading.Thread | None = None
+        if request_id and token:
+            def renew_notification_lease() -> None:
+                interval = max(10.0, _NOTIFICATION_LEASE_SECONDS / 3.0)
+                while not lease_stop.wait(interval):
+                    try:
+                        if not db.renew_download_request_notification_lease(
+                            request_id,
+                            token,
+                            lease_seconds=_NOTIFICATION_LEASE_SECONDS,
+                        ):
+                            return
+                    except Exception as exc:
+                        logger.warning(
+                            "下载任务通知续租异常 request#%s type=%s",
+                            request_id,
+                            type(exc).__name__,
+                        )
+                        return
+
+            lease_thread = threading.Thread(
+                target=renew_notification_lease,
+                name=f"download-notification-lease-{request_id}",
+                daemon=True,
+            )
+            lease_thread.start()
         fields = [(
             "任务",
             str(payload.get("title") or DownloadTracker._row_value(row, "title", "") or "未命名任务"),
@@ -707,10 +739,12 @@ class DownloadTracker:
                 request_id,
                 type(exc).__name__,
             )
+        finally:
+            lease_stop.set()
+            if lease_thread is not None:
+                lease_thread.join(timeout=1.0)
         if not request_id or claim is None:
             return
-        token = str(claim.get("token") or "")
-        attempts = int(claim.get("attempts") or 0) + 1
         delay = min(3600, 30 * (2 ** min(attempts - 1, 6)))
         retry_at = (datetime.now() + timedelta(seconds=delay)).strftime(
             "%Y-%m-%d %H:%M:%S"

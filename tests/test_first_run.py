@@ -99,7 +99,7 @@ class FirstRunTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertIn("/static/js/lucide.min.js?v=20260816a", response.text)
-        self.assertIn("/static/js/app.js?v=20260816a", response.text)
+        self.assertIn("/static/js/app.js?v=20260824a", response.text)
         return response
 
     def test_empty_data_dir_redirects_login_to_setup_after_lifespan_creates_schema(self):

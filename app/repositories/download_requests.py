@@ -812,6 +812,30 @@ def claim_download_request_notification(
         }
 
 
+def renew_download_request_notification_lease(
+    request_id: int,
+    token: str,
+    *,
+    lease_seconds: int = 300,
+) -> bool:
+    """续租发送中的通知，避免慢网络期间被另一 tracker 重复领取。"""
+    normalized_token = str(token or "").strip()
+    if not normalized_token:
+        return False
+    timestamp = now()
+    lease_until = (
+        datetime.now() + timedelta(seconds=max(30, int(lease_seconds or 300)))
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE download_requests SET notification_lease_expires_at=?,updated_at=? "
+            "WHERE id=? AND notification_delivery_status='sending' "
+            "AND notification_lease_token=?",
+            (lease_until, timestamp, int(request_id), normalized_token),
+        )
+        return cur.rowcount == 1
+
+
 def finalize_download_request_notification(
     request_id: int,
     token: str,

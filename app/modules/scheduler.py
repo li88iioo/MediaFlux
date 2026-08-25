@@ -305,38 +305,48 @@ class STRMScheduler:
                 result.get("error") or "unknown",
             )
 
-    def stop(self, timeout: float = 30.0) -> None:
-        """请求调度线程退出并等待收尾；重复调用安全。"""
+    def stop(self, timeout: float = 30.0) -> bool:
+        """请求调度线程退出并等待收尾；返回全部依赖 worker 是否已退出。"""
+        deadline = monotonic() + max(0.0, float(timeout or 0.0))
+
+        def remaining() -> float:
+            return max(0.0, deadline - monotonic())
+
+        def join_thread(thread: threading.Thread | None) -> bool:
+            if thread and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=remaining())
+            return thread is None or not thread.is_alive()
+
         with self._admission_lock:
             self._stop_event.set()
             self._wake_event.set()
             self._run_released_event.set()
         thread = self._thread
-        if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
-        if not thread or not thread.is_alive():
+        scheduler_stopped = join_thread(thread)
+        if scheduler_stopped:
             self._thread = None
         pending_thread = self._pending_thread
-        if (
-            pending_thread
-            and pending_thread.is_alive()
-            and pending_thread is not threading.current_thread()
-        ):
-            pending_thread.join(timeout=timeout)
-        if not pending_thread or not pending_thread.is_alive():
+        pending_stopped = join_thread(pending_thread)
+        if pending_stopped:
             self._pending_thread = None
         worker = self._worker
-        if worker and worker.is_alive() and worker is not threading.current_thread():
-            worker.join(timeout=timeout)
-        if not worker or not worker.is_alive():
+        worker_stopped = join_thread(worker)
+        if worker_stopped:
             self._worker = None
         else:
-            logger.warning("STRM 工作线程未能在关闭超时内结束 trigger=%s", self._current_trigger)
+            logger.warning(
+                "STRM 工作线程未能在关闭超时内结束 trigger=%s",
+                self._current_trigger,
+            )
         from app.modules.strm_metadata_worker import get_strm_metadata_worker
         from app.modules.organize_probe_worker import get_organize_probe_worker
 
-        get_organize_probe_worker().stop(timeout=timeout)
-        get_strm_metadata_worker().stop(timeout=timeout)
+        probe_stopped = get_organize_probe_worker().stop(timeout=remaining())
+        metadata_stopped = get_strm_metadata_worker().stop(timeout=remaining())
+        return all((
+            scheduler_stopped, pending_stopped, worker_stopped,
+            probe_stopped, metadata_stopped,
+        ))
 
     def reload(self) -> None:
         """配置保存后立即重算下次运行时间。"""
@@ -893,7 +903,8 @@ class STRMScheduler:
             "failure_resolve_elapsed_seconds": 0.0,
             "failure_ledger_failed": 0,
             "error_samples": [], "changes": [], "omitted_count": 0,
-            "changed_strm_paths": [], "changed_dirs": [], "changed_paths_omitted": 0,
+            "changed_strm_paths": [], "changed_dirs": [], "changed_overflow_dirs": [],
+            "changed_paths_omitted": 0,
             "retired_sources": 0, "retired_blocked": 0,
         }
 
@@ -904,7 +915,7 @@ class STRMScheduler:
         for key in list(aggregate):
             if key in {
                 "error_samples", "changes", "omitted_count",
-                "changed_strm_paths", "changed_dirs",
+                "changed_strm_paths", "changed_dirs", "changed_overflow_dirs",
                 "retired_sources", "retired_blocked",
             }:
                 continue
@@ -938,6 +949,10 @@ class STRMScheduler:
         aggregate["changed_dirs"] = list(dict.fromkeys([
             *aggregate.get("changed_dirs", []),
             *current.get("changed_dirs", []),
+        ]))
+        aggregate["changed_overflow_dirs"] = list(dict.fromkeys([
+            *aggregate.get("changed_overflow_dirs", []),
+            *current.get("changed_overflow_dirs", []),
         ]))
         for sample in current.get("error_samples") or []:
             text = f"{source_name}/{sample}"
@@ -1790,30 +1805,28 @@ class STRMScheduler:
             return {}
 
         def refresh(client) -> bool:
-            all_ok = True
-            for index, batch in enumerate(plan.batches, start=1):
-                outcome = client.refresh_for_paths(list(batch))
-                scope = str(outcome.get("scope") or "unknown")
-                log = logger.warning if scope in {"global", "skipped"} else logger.info
-                log(
-                    "%s 刷新结果 batch=%s/%s scope=%s ok=%s requested=%s mapped=%s "
-                    "matched=%s unmatched=%s ambiguous=%s items=%s libraries=%s reason=%s",
-                    client.display_name,
-                    index,
-                    len(plan.batches),
-                    scope,
-                    bool(outcome.get("ok")),
-                    int(outcome.get("requested", 0) or 0),
-                    int(outcome.get("mapped", 0) or 0),
-                    int(outcome.get("matched", 0) or 0),
-                    int(outcome.get("unmatched", 0) or 0),
-                    int(outcome.get("ambiguous", 0) or 0),
-                    len(outcome.get("items") or []),
-                    len(outcome.get("libraries") or []),
-                    outcome.get("fallback") or "-",
-                )
-                all_ok = bool(outcome.get("ok")) and all_ok
-            return all_ok
+            # refresh_for_paths 会先枚举媒体库并建立路径映射；在调度层分批会让
+            # 同一大库被重复完整枚举。一次传入全部已收敛目标，由客户端内部
+            # 对最终 Item 请求去重，网络复杂度从 O(批次×库大小) 降为 O(库大小)。
+            outcome = client.refresh_for_paths(list(plan.targets))
+            scope = str(outcome.get("scope") or "unknown")
+            log = logger.warning if scope in {"global", "skipped"} else logger.info
+            log(
+                "%s 刷新结果 scope=%s ok=%s requested=%s mapped=%s "
+                "matched=%s unmatched=%s ambiguous=%s items=%s libraries=%s reason=%s",
+                client.display_name,
+                scope,
+                bool(outcome.get("ok")),
+                int(outcome.get("requested", 0) or 0),
+                int(outcome.get("mapped", 0) or 0),
+                int(outcome.get("matched", 0) or 0),
+                int(outcome.get("unmatched", 0) or 0),
+                int(outcome.get("ambiguous", 0) or 0),
+                len(outcome.get("items") or []),
+                len(outcome.get("libraries") or []),
+                outcome.get("fallback") or "-",
+            )
+            return bool(outcome.get("ok"))
 
         results: dict[str, bool] = {}
         if get_bool("JELLYFIN_ENABLED") and get("JELLYFIN_URL") and get("JELLYFIN_API_KEY"):

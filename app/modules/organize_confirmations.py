@@ -629,8 +629,8 @@ def wake_confirmation_dispatcher() -> bool:
         return True
 
 
-def stop_confirmation_dispatcher(timeout: float = 2.0) -> None:
-    """停止队列消费者；已持久化的 queued 项会在下次启动继续执行。"""
+def stop_confirmation_dispatcher(timeout: float = 2.0) -> bool:
+    """停止队列消费者；返回是否已退出，queued 项留待下次启动。"""
     global _dispatch_thread, _dispatch_accepting
     with _dispatch_guard:
         _dispatch_accepting = False
@@ -639,9 +639,11 @@ def stop_confirmation_dispatcher(timeout: float = 2.0) -> None:
         thread = _dispatch_thread
     if thread and thread.is_alive() and thread is not threading.current_thread():
         thread.join(max(0.0, float(timeout)))
+    stopped = thread is None or not thread.is_alive()
     with _dispatch_guard:
-        if _dispatch_thread is thread and (thread is None or not thread.is_alive()):
+        if _dispatch_thread is thread and stopped:
             _dispatch_thread = None
+    return stopped
 
 
 def start_confirmation(

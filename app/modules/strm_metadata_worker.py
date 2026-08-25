@@ -57,24 +57,26 @@ class STRMMetadataWorker:
         self._wake_event.set()
         logger.info("STRM 元数据后台下载器已启动")
 
-    def stop(self, timeout: float = 30.0) -> None:
+    def stop(self, timeout: float = 30.0) -> bool:
         self._stop_event.set()
         self._wake_event.set()
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.1, float(timeout or 0.1)))
-        if not thread or not thread.is_alive():
+        stopped = not thread or not thread.is_alive()
+        if stopped:
             self._thread = None
+            client = self._client
+            self._client = None
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         else:
             logger.warning("STRM 元数据后台下载器未能在关闭超时内结束")
-        client = self._client
-        self._client = None
-        close = getattr(client, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
+        return stopped
 
     def wake(self) -> None:
         self._wake_event.set()
@@ -125,11 +127,12 @@ class STRMMetadataWorker:
                     worked = False
                 if worked:
                     interval_ms = max(
-                        100, min(
-                            get_int("STRM_METADATA_REQUEST_INTERVAL_MS", 500), 10000
+                        0, min(
+                            get_int("STRM_METADATA_REQUEST_INTERVAL_MS", 0), 10000
                         )
                     )
-                    self._stop_event.wait(interval_ms / 1000.0)
+                    if interval_ms:
+                        self._stop_event.wait(interval_ms / 1000.0)
                     continue
                 self._flush_media_refresh(force=True)
                 self._wake_event.wait(timeout=5.0)
@@ -244,6 +247,7 @@ class STRMMetadataWorker:
                     expected_lease_generation=lease_generation,
                     expected_revision=revision,
                     expected_owner=self._owner,
+                    refresh_path=str(result.get("path") or ""),
                 )
             finally:
                 STRM_OPERATION_LOCK.release()
@@ -316,7 +320,9 @@ class STRMMetadataWorker:
                 self._current_job_id = 0
 
     def _flush_media_refresh(self, *, force: bool) -> None:
-        if not self._changed_paths:
+        durable_paths = db.list_strm_metadata_refresh_paths(limit=20000)
+        paths = list(dict.fromkeys([*durable_paths, *self._changed_paths]))
+        if not paths:
             return
         batch_size = max(
             50, min(get_int("STRM_METADATA_REFRESH_BATCH_SIZE", 500), 5000)
@@ -327,9 +333,8 @@ class STRMMetadataWorker:
         elapsed = time.monotonic() - self._last_refresh_at
         if self._refresh_retry_pending and not force and elapsed < interval:
             return
-        if not force and len(self._changed_paths) < batch_size and elapsed < interval:
+        if not force and len(paths) < batch_size and elapsed < interval:
             return
-        paths = list(dict.fromkeys(self._changed_paths))
         self._last_refresh_at = time.monotonic()
         try:
             from app.modules.scheduler import STRMScheduler
@@ -347,7 +352,8 @@ class STRMMetadataWorker:
             self._refresh_retry_pending = True
             logger.warning("STRM 元数据已落盘，但媒体库刷新未全部成功，将稍后重试")
             return
-        self._changed_paths.clear()
+        db.acknowledge_strm_metadata_refresh_paths(durable_paths)
+        self._changed_paths = [path for path in self._changed_paths if path not in paths]
         self._refresh_retry_pending = False
 
 

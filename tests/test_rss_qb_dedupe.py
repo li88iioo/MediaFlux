@@ -214,6 +214,36 @@ class RSSQBPersistentClaimTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["failed"][0]["review_required"])
         self.assertIn("勿直接重复提交", result["failed"][0]["error"])
 
+    def test_agent_batch_busy_claim_remains_retryable(self):
+        infohash = "8" * 40
+        _sub, entry_id = self._entry("batch-busy", infohash)
+        snapshot = db.get_pending_rss_qb_snapshot()
+        expected = [{
+            "id": int(row["id"]),
+            "rss_item_id": int(row["rss_item_id"]),
+            "title": str(row["title"] or ""),
+            "payload": str(row["payload"] or ""),
+            "created_at": str(row["created_at"] or ""),
+            "download_method": str(row["download_method"] or ""),
+            "qb_save_path": str(row["qb_save_path"] or ""),
+        } for row in snapshot if int(row["id"]) == entry_id]
+        claimed = db.claim_pending_rss_qb_entries(expected)
+        self.assertEqual(len(claimed), 1)
+
+        with patch(
+            "app.modules.rss.db.claim_rss_qb_download",
+            return_value={"status": "busy", "lease_token": ""},
+        ):
+            submitted, failed, unknown = RSSEngine()._submit_claimed_qb_rows(
+                claimed,
+                {"url": "http://qb.invalid", "timeout": 1},
+            )
+
+        self.assertEqual((submitted, failed, unknown), (0, 1, 0))
+        entry = db.get_rss_entry(entry_id)
+        self.assertEqual(entry["failure_code"], "qb_dedupe_busy")
+        self.assertEqual(int(entry["failure_retryable"]), 1)
+
     def test_same_opaque_url_across_entries_is_submitted_once(self):
         url = "https://example.invalid/download?id=opaque-same"
         _sub1, first = self._entry("opaque-first", url=url)

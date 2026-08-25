@@ -20,6 +20,7 @@ from app.modules.local_storage import (
     LocalFilesystemAdapter,
     LocalScanLimitExceeded,
     is_ignored_local_media_directory,
+    move_entry_no_replace_at,
 )
 
 _CLEANUP_QUARANTINE_DIR = ".mediaflux-trash"
@@ -46,6 +47,19 @@ _AD_TEXT_RE = re.compile(
     r"(?i)(readme|广告|说明|声明|最新网址|下载必看|本站|发布页|公众号|微信|高清影视之家)"
 )
 _SAMPLE_RE = re.compile(r"(?i)(?:^|[._\-\s])(sample|proof)(?:$|[._\-\s])")
+
+
+def is_probable_sample_video(
+    path: Path,
+    size: int,
+    *,
+    sample_max_bytes: int = 300 * 1024 * 1024,
+) -> bool:
+    """判断文件是否为需保留、但不应自动拆成独立任务的 sample/proof。"""
+    return bool(
+        int(size or 0) <= max(1, int(sample_max_bytes))
+        and _SAMPLE_RE.search(Path(path).stem)
+    )
 
 
 def classify_cleanup_items(
@@ -188,11 +202,12 @@ def delete_cleanup_items(
                     int(info.st_ino),
                 ) if stat_module.S_ISREG(info.st_mode) else None
                 if moved_identity != candidate.snapshot.identity:
-                    os.replace(
+                    move_entry_no_replace_at(
                         quarantine_name,
                         path.name,
-                        src_dir_fd=run_fd,
-                        dst_dir_fd=source_parent_fd,
+                        source_dir_fd=run_fd,
+                        target_dir_fd=source_parent_fd,
+                        is_directory=False,
                     )
                     moved = False
                     raise RuntimeError("垃圾文件在删除前被替换，已保留并停止清理")
@@ -297,8 +312,9 @@ def probable_sample_video_paths(
         item.path
         for item in items
         if item.role == "video"
-        and item.size <= max(1, int(sample_max_bytes))
-        and _SAMPLE_RE.search(item.path.stem)
+        and is_probable_sample_video(
+            item.path, item.size, sample_max_bytes=sample_max_bytes
+        )
     }
 
 

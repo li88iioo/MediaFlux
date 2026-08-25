@@ -440,6 +440,7 @@ from app.agent.registry import AgentToolError, ToolRegistry
 from app.services import search_media_servers
 
 _SEARCH_CACHE_TTL_SECONDS = 15
+_SEARCH_CACHE_MAX_ENTRIES = 128
 _search_cache: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
 _search_cache_lock = threading.Lock()
 
@@ -977,11 +978,16 @@ def _search_sources(query: str, limit: int) -> list[dict[str, Any]]:
             return cached[1]
     sources = search_media_servers(query, limit=limit)
     with _search_cache_lock:
+        expired = [
+            key for key, value in _search_cache.items()
+            if now - value[0] >= _SEARCH_CACHE_TTL_SECONDS
+        ]
+        for key in expired:
+            _search_cache.pop(key, None)
+        while len(_search_cache) >= _SEARCH_CACHE_MAX_ENTRIES:
+            oldest = min(_search_cache, key=lambda key: _search_cache[key][0])
+            _search_cache.pop(oldest, None)
         _search_cache[cache_key] = (now, sources)
-        if len(_search_cache) > 128:
-            expired = [key for key, value in _search_cache.items() if now - value[0] >= _SEARCH_CACHE_TTL_SECONDS]
-            for key in expired:
-                _search_cache.pop(key, None)
     return sources
 
 

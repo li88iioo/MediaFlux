@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaReadMetrics
 from app.modules.strm import sync_strm
 
 
@@ -117,6 +117,22 @@ class StrmDirectoryConcurrencyTests(unittest.TestCase):
         self.assertEqual(stats["scan_limit_reason"], "deadline")
         self.assertTrue(stats["clean_skipped"])
         cleanup.assert_not_called()
+
+
+class GuangYaReadMetricsTests(unittest.TestCase):
+    def test_latency_samples_are_bounded_to_latest_requests(self):
+        collector = GuangYaReadMetrics()
+        with patch("app.clients.guangya._READ_METRICS_MAX_LATENCY_SAMPLES", 3):
+            for milliseconds in (10, 20, 30, 40, 50):
+                collector.record_request(milliseconds / 1000)
+
+        metrics = collector.snapshot()
+        self.assertEqual(metrics["directory_requests"], 5)
+        self.assertEqual(metrics["latency_samples"], 3)
+        self.assertEqual(metrics["latency_sampled"], 1)
+        self.assertEqual(metrics["request_p50_ms"], 40.0)
+        self.assertEqual(metrics["request_p95_ms"], 40.0)
+        self.assertEqual(metrics["request_p99_ms"], 40.0)
 
 
 class GuangYaRequestConcurrencyTests(unittest.TestCase):

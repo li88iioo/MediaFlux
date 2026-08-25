@@ -365,6 +365,7 @@ def complete_strm_metadata_job(
     expected_lease_generation: int,
     expected_revision: int,
     expected_owner: str = "",
+    refresh_path: str = "",
 ) -> str:
     """提交成功结果；运行中快照已变化时自动重新排队最新版本。"""
     database = _database()
@@ -395,7 +396,55 @@ def complete_strm_metadata_job(
                 int(expected_lease_generation),
             ),
         )
-        return status if cur.rowcount == 1 else "stale"
+        if cur.rowcount != 1:
+            return "stale"
+        normalized_path = str(refresh_path or "").strip()
+        if status == "completed" and normalized_path:
+            conn.execute(
+                "INSERT INTO strm_metadata_refresh_outbox(path,created_at,updated_at) "
+                "VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET updated_at=excluded.updated_at",
+                (normalized_path, stamp, stamp),
+            )
+        return status
+
+
+def list_strm_metadata_refresh_paths(*, limit: int = 5000) -> list[str]:
+    """读取尚未确认完成媒体库刷新的元数据路径。"""
+    safe_limit = max(1, min(int(limit or 5000), 20000))
+    with _database().get_conn() as conn:
+        rows = conn.execute(
+            "SELECT path FROM strm_metadata_refresh_outbox "
+            "ORDER BY updated_at,path LIMIT ?",
+            (safe_limit,),
+        ).fetchall()
+    return [str(row["path"] or "") for row in rows if str(row["path"] or "")]
+
+
+def count_strm_metadata_refresh_paths() -> int:
+    with _database().get_conn() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM strm_metadata_refresh_outbox"
+        ).fetchone()[0] or 0)
+
+
+def acknowledge_strm_metadata_refresh_paths(paths: object) -> int:
+    """媒体库刷新成功后按路径确认 outbox；失败时不调用即可安全重试。"""
+    normalized = tuple(dict.fromkeys(
+        str(path or "").strip() for path in (paths or ()) if str(path or "").strip()
+    ))
+    if not normalized:
+        return 0
+    deleted = 0
+    with _database().get_conn() as conn:
+        for offset in range(0, len(normalized), 500):
+            batch = normalized[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            cur = conn.execute(
+                f"DELETE FROM strm_metadata_refresh_outbox WHERE path IN ({placeholders})",
+                batch,
+            )
+            deleted += int(cur.rowcount or 0)
+    return deleted
 
 
 def strm_metadata_job_is_current(

@@ -75,14 +75,16 @@ class AgentLibraryPatrolScheduler:
         self._thread.start()
         logger.info("Agent 全库缺集巡检调度器已启动")
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 5.0) -> bool:
         self._stop_event.set()
         self._wake_event.set()
         thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=timeout)
-        if not thread or not thread.is_alive():
+        stopped = not thread or not thread.is_alive()
+        if stopped:
             self._thread = None
+        return stopped
 
     def reload(self, *, immediate: bool = True) -> None:
         current = self._now()

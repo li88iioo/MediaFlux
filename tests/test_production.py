@@ -2864,7 +2864,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(login.status_code, 200)
         self.assertEqual(login.headers["cache-control"], "no-store")
         self.assertIn("/static/js/lucide.min.js?v=20260816a", login.text)
-        self.assertIn("/static/js/app.js?v=20260816a", login.text)
+        self.assertIn("/static/js/app.js?v=20260824a", login.text)
 
     def test_authenticated_html_is_no_store_without_affecting_static_assets(self):
         self._authenticated()

@@ -16,6 +16,40 @@ from app.modules.local_storage import LocalFilesystemAdapter
 
 
 class LocalMediaCleanupTests(unittest.TestCase):
+    def test_quarantine_rollback_never_overwrites_recreated_file(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw); group = root / "Movie"; group.mkdir()
+            junk = group / "广告说明.txt"; junk.write_bytes(b"old")
+            cleanup, _ = classify_cleanup_items([
+                LocalFilesystemAdapter(root).snapshot(junk)
+            ])
+            original_replace = os.replace
+            moved_once = False
+
+            def recreate_after_move(src, dst, *args, **kwargs):
+                nonlocal moved_once
+                result = original_replace(src, dst, *args, **kwargs)
+                if not moved_once and kwargs.get("dst_dir_fd") is not None:
+                    moved_once = True
+                    junk.write_bytes(b"new producer data")
+                    trash = root / ".mediaflux-trash"
+                    run_dir = next(trash.iterdir())
+                    (run_dir / str(dst)).write_bytes(b"changed quarantine data")
+                return result
+
+            with patch(
+                "app.modules.local_media_cleanup.os.replace",
+                side_effect=recreate_after_move,
+            ):
+                result = delete_cleanup_items(
+                    cleanup, allowed_root=root, selected_path=group,
+                )
+
+            self.assertEqual(junk.read_bytes(), b"new producer data")
+            self.assertEqual(result.deleted, [])
+            self.assertTrue(any(".mediaflux-trash" in item for item in result.retained))
+            self.assertTrue(result.warnings)
+
     def test_cleanup_discovery_ignores_system_and_temporary_directories(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)

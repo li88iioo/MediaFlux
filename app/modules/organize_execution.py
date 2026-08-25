@@ -293,6 +293,8 @@ def execute_organize_plans(
         existing_original_name = ""
         target_id = ""
         rollback_incomplete = False
+        companion_rollback_errors: dict[str, str] = {}
+        companion_journal: list[dict[str, object]] = []
         replacement_deleted = False
         companion_key = f"{p.original_path}:{normalized_stem(p.original_name)}"
         candidates = companion_files.get(p.original_path, [])
@@ -373,8 +375,6 @@ def execute_organize_plans(
                     replacement_backup_name = (
                         f"{existing.name}.mediaflux-backup-{existing.file_id[-8:]}"
                     )
-                    if cancel_event:
-                        cancel_event.is_set()
                     organizer.client.rename(existing.file_id, replacement_backup_name)
                     stats["conflict"] += 1
                 else:
@@ -386,7 +386,6 @@ def execute_organize_plans(
             video_move_attempted = False
             video_moved_to_target = False
             moved_metadata: list[tuple[GuangYaFile, str]] = []
-            companion_journal: list[dict[str, object]] = []
             actual_name = p.original_name
             video_renamed = False
             try:
@@ -399,14 +398,10 @@ def execute_organize_plans(
                     ),
                     role="待整理视频",
                 )
-                if cancel_event:
-                    cancel_event.is_set()
                 video_move_attempted = True
                 organizer.client.move([p.file_id], target_id)
                 video_moved_to_target = True
                 if rules.rename_enabled and p.new_name and p.new_name != p.original_name:
-                    if cancel_event:
-                        cancel_event.is_set()
                     organizer.client.rename(p.file_id, p.new_name)
                     actual_name = p.new_name
                     video_renamed = True
@@ -424,8 +419,6 @@ def execute_organize_plans(
                         "current_name": item.name,
                     }
                     companion_journal.append(journal_entry)
-                    if cancel_event:
-                        cancel_event.is_set()
                     organizer.client.move([item.file_id], target_id)
                     subtitle_plan = subtitle_plan_by_id.get(item.file_id)
                     target_name = (
@@ -436,8 +429,6 @@ def execute_organize_plans(
                         )
                     )
                     if rules.rename_enabled and target_name != item.name:
-                        if cancel_event:
-                            cancel_event.is_set()
                         organizer.client.rename(item.file_id, target_name)
                         journal_entry["current_name"] = target_name
                     moved_metadata.append((item, target_name))
@@ -453,6 +444,9 @@ def execute_organize_plans(
                         )
                     except Exception as rollback_exc:
                         rollback_incomplete = True
+                        companion_rollback_errors[str(item.file_id)] = (
+                            _safe_organize_failure(rollback_exc)
+                        )
                         logger.error(
                             "回滚伴随文件失败 file=%s type=%s",
                             item.name, type(rollback_exc).__name__,
@@ -532,8 +526,6 @@ def execute_organize_plans(
                         )
                     else:
                         try:
-                            if cancel_event:
-                                cancel_event.is_set()
                             result = execute_recycle_bin_delete(
                                 organizer.client, trigger="replacement",
                                 reason=conflict_note or "同版本新文件胜出",
@@ -784,7 +776,32 @@ def execute_organize_plans(
                     "target_name": p.new_name,
                     "size": p.size, "etag": p.etag,
                     "status": "failed", "error": failure_message,
-                }],
+                }, *[{
+                    "file_id": item.file_id, "role": media_role(item.name),
+                    "original_parent_id": item.parent_id or p.original_parent_id,
+                    "original_name": item.name,
+                    "current_parent_id": (
+                        "" if str(item.file_id) in companion_rollback_errors
+                        else item.parent_id or p.original_parent_id
+                    ),
+                    "current_name": (
+                        "" if str(item.file_id) in companion_rollback_errors else item.name
+                    ),
+                    "target_parent_id": target_id,
+                    "target_name": next((
+                        str(entry.get("current_name") or item.name)
+                        for entry in companion_journal
+                        if getattr(entry.get("item"), "file_id", "") == item.file_id
+                    ), item.name),
+                    "size": item.size, "etag": item.etag,
+                    "status": "failed",
+                    "error": (
+                        f"{failure_message}；伴随文件回滚失败："
+                        f"{companion_rollback_errors[str(item.file_id)]}"
+                        if str(item.file_id) in companion_rollback_errors
+                        else failure_message
+                    ),
+                } for item in companions]],
             )
             if delete_audit_id and isinstance(failed_log_id, int):
                 db.update_organize_delete_audit(

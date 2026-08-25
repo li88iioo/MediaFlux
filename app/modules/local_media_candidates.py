@@ -14,10 +14,12 @@ from app.modules.local_path_mapping import (
     assert_within,
     require_container_absolute_path,
 )
+from app.modules.local_media_cleanup import is_probable_sample_video
 from app.modules.local_storage import (
     LocalFilesystemAdapter,
     LocalStorageError,
     is_ignored_local_media_directory,
+    move_entry_no_replace_at,
 )
 
 LOCAL_MEDIA_TRASH_DIR = ".mediaflux-trash"
@@ -45,8 +47,25 @@ def discover_local_media_candidates(source) -> tuple[list[Path], str]:
         )
 
     unique = {str(candidate): candidate for candidate in expanded}
+    sample_flags: dict[str, bool] = {}
+    parents_with_primary: set[Path] = set()
+    for candidate in unique.values():
+        try:
+            is_sample = is_probable_sample_video(candidate, candidate.lstat().st_size)
+        except OSError:
+            is_sample = False
+        sample_flags[str(candidate)] = is_sample
+        if not is_sample:
+            parents_with_primary.add(candidate.parent)
+    filtered = [
+        candidate for candidate in unique.values()
+        if not (
+            sample_flags.get(str(candidate), False)
+            and candidate.parent in parents_with_primary
+        )
+    ]
     return sorted(
-        unique.values(),
+        filtered,
         key=lambda item: item.relative_to(root).as_posix().casefold(),
     ), ""
 
@@ -298,11 +317,12 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
             "inode": int(published.st_ino),
         }
         if published_identity != normalized_expected:
-            os.replace(
+            move_entry_no_replace_at(
                 destination_name,
                 selected.name,
-                src_dir_fd=trash_fd,
-                dst_dir_fd=root_fd,
+                source_dir_fd=trash_fd,
+                target_dir_fd=root_fd,
+                is_directory=is_directory,
             )
             moved = False
             raise PathMappingError("条目移动到回收区时发生变化，已恢复原位置")
@@ -312,11 +332,12 @@ def move_candidate_to_trash(source, path: Path | str, expected_identity: dict[st
     except Exception:
         if moved and root_fd is not None and trash_fd is not None:
             try:
-                os.replace(
+                move_entry_no_replace_at(
                     destination_name,
                     selected.name,
-                    src_dir_fd=trash_fd,
-                    dst_dir_fd=root_fd,
+                    source_dir_fd=trash_fd,
+                    target_dir_fd=root_fd,
+                    is_directory=is_directory,
                 )
             except Exception:
                 pass

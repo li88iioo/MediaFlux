@@ -213,6 +213,29 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         self.assertEqual(int(row["request_id"]), request_id)
         self.assertEqual(row["status"], "dispatching")
 
+    def test_startup_reconcile_immediately_releases_fresh_bound_pending_request(self):
+        subscription_id, candidate_id = self._seed()
+        admission_id = self._claim_dispatching(subscription_id, candidate_id)
+        request_id, created = db.create_download_request(
+            "fresh-bound-pending", "magnet", title="刚创建的待提交资源",
+            admission_id=admission_id,
+        )
+        self.assertTrue(created)
+
+        projected, released = db.reconcile_startup_media_download_admissions(
+            stale_seconds=3600
+        )
+
+        self.assertEqual(projected, 0)
+        self.assertEqual(released, 1)
+        with db.get_conn() as conn:
+            admission = conn.execute(
+                "SELECT request_id,status FROM media_download_admissions WHERE id=?",
+                (admission_id,),
+            ).fetchone()
+        self.assertEqual(int(admission["request_id"]), request_id)
+        self.assertEqual(admission["status"], "released")
+
     def test_dispatch_exception_preserves_request_and_admission_for_manual_review(self):
         subscription_id, candidate_id = self._seed()
         admission_id = self._claim_dispatching(subscription_id, candidate_id)
@@ -444,6 +467,37 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             count = conn.execute("SELECT COUNT(*) FROM media_download_admissions").fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_completed_download_with_failed_postprocess_releases_media_key(self):
+        subscription_id, candidate_id = self._seed()
+        request_id, _ = db.create_download_request(
+            "postprocess-failure", "magnet", title="后处理失败资源"
+        )
+        admission_id = db.claim_media_download_admission(
+            media_key="tmdb:1:tv:S01E001", tmdb_id="1", media_type="tv",
+            subscription_id=subscription_id, candidate_id=candidate_id,
+            season=1, episode=1, subscription_revision=1,
+        )
+        db.update_media_download_admission(
+            admission_id, status="submitted", request_id=request_id
+        )
+        db.update_download_request(
+            request_id,
+            status="completed",
+            qb_status="completed",
+            local_import_status="failed",
+            local_import_error="目标目录不可写",
+        )
+
+        self.assertEqual(db.sync_media_download_admission_for_request(request_id), 1)
+        with db.get_conn() as conn:
+            admission = conn.execute(
+                "SELECT status,error,completed_at FROM media_download_admissions WHERE id=?",
+                (admission_id,),
+            ).fetchone()
+        self.assertEqual(admission["status"], "failed")
+        self.assertIn("本地入库", admission["error"])
+        self.assertTrue(admission["completed_at"])
 
     def test_manual_review_result_keeps_candidate_and_admission_bound(self):
         subscription_id, candidate_id = self._seed()

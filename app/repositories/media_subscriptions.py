@@ -977,7 +977,9 @@ def _sync_media_download_admission_for_request_conn(
     """使用调用方连接投影请求状态，供 tracker 的原子写路径复用。"""
     try:
         request = conn.execute(
-            "SELECT status,error FROM download_requests WHERE id=?", (int(request_id),)
+            "SELECT status,error,organize_started,organize_status,organize_error,"
+            "strm_status,strm_error,local_import_status,local_import_error "
+            "FROM download_requests WHERE id=?", (int(request_id),)
         ).fetchone()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():
@@ -994,7 +996,24 @@ def _sync_media_download_admission_for_request_conn(
         completed_at = stamp
         error = str(request["error"] or "下载请求失败")[:500]
     elif request_status == "completed":
-        status = "processing"
+        failed_stage = next((
+            (label, str(request[error_key] or ""))
+            for state_key, error_key, label in (
+                ("organize_status", "organize_error", "自动整理"),
+                ("local_import_status", "local_import_error", "本地入库"),
+                ("strm_status", "strm_error", "STRM 联动"),
+            )
+            if str(request[state_key] or "") == "failed"
+        ), None)
+        if failed_stage is None and int(request["organize_started"] or 0) < 0:
+            failed_stage = ("自动整理", str(request["organize_error"] or ""))
+        if failed_stage is not None:
+            label, detail = failed_stage
+            status = "failed"
+            completed_at = stamp
+            error = f"下载后处理失败（{label}）：{detail or '请在下载记录中重试'}"[:500]
+        else:
+            status = "processing"
     elif request_status in {"submitted", "downloading"}:
         status = request_status
     elif request_status == "manual_review":
@@ -1033,9 +1052,9 @@ def reconcile_startup_media_download_admissions(
     """
     database = _database()
     stamp = database.now()
-    cutoff = (
-        datetime.now() - timedelta(seconds=max(60, int(stale_seconds or 900)))
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    # 保留参数兼容旧调用；启动恢复只处理尚未提交到任何后端的状态，
+    # 不需要等待 stale 窗口，否则刚创建 pending 请求后重启会永久占住 media_key。
+    _ = stale_seconds
     projected = 0
     released = 0
     with database.get_conn() as conn:
@@ -1058,14 +1077,13 @@ def reconcile_startup_media_download_admissions(
         stale = conn.execute(
             "UPDATE media_download_admissions SET status='released',error=?,"
             "completed_at=?,updated_at=? WHERE status IN ('claimed','dispatching') "
-            "AND (request_id IS NULL OR (updated_at<=? AND EXISTS ("
+            "AND (request_id IS NULL OR EXISTS ("
             "SELECT 1 FROM download_requests r WHERE r.id=media_download_admissions.request_id "
-            "AND r.status='pending')))",
+            "AND r.status='pending'))",
             (
                 "启动恢复：下载尚未提交到后端，可安全重试",
                 stamp,
                 stamp,
-                cutoff,
             ),
         )
         released = int(stale.rowcount or 0)
@@ -1091,7 +1109,9 @@ def reconcile_media_download_admissions(
             query_params.append(int(expected_revision))
         rows = conn.execute(
             "SELECT a.id,a.media_key,a.request_id,a.status AS admission_status,"
-            "r.id AS request_exists,r.status AS request_status,r.error AS request_error "
+            "r.id AS request_exists,r.status AS request_status,r.error AS request_error,"
+            "r.organize_started,r.organize_status,r.organize_error,"
+            "r.strm_status,r.strm_error,r.local_import_status,r.local_import_error "
             "FROM media_download_admissions a "
             "JOIN media_subscriptions s ON s.id=a.subscription_id "
             "LEFT JOIN download_requests r ON r.id=a.request_id "
@@ -1124,7 +1144,26 @@ def reconcile_media_download_admissions(
                         status = "failed"
                         error = str(row["request_error"] or "下载请求失败")[:500]
                     elif request_status == "completed":
-                        status = "processing"
+                        failed_stage = next((
+                            (label, str(row[error_key] or ""))
+                            for state_key, error_key, label in (
+                                ("organize_status", "organize_error", "自动整理"),
+                                ("local_import_status", "local_import_error", "本地入库"),
+                                ("strm_status", "strm_error", "STRM 联动"),
+                            )
+                            if str(row[state_key] or "") == "failed"
+                        ), None)
+                        if failed_stage is None and int(row["organize_started"] or 0) < 0:
+                            failed_stage = ("自动整理", str(row["organize_error"] or ""))
+                        if failed_stage is not None:
+                            label, detail = failed_stage
+                            status = "failed"
+                            completed_at = stamp
+                            error = (
+                                f"下载后处理失败（{label}）：{detail or '请在下载记录中重试'}"
+                            )[:500]
+                        else:
+                            status = "processing"
                     elif request_status in {"submitted", "downloading"}:
                         status = request_status
                     else:

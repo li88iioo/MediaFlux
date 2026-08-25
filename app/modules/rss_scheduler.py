@@ -100,10 +100,11 @@ class RSSScheduler:
     def _clear_issue(self, sub_id: int) -> None:
         with self._lock:
             had_issue = self._alert_signatures.pop(sub_id, None) is not None
-            loaded = sub_id in self._loaded_alert_ids
         try:
-            if not loaded:
-                had_issue = self._persisted_signature(sub_id) is not None or had_issue
+            # 即使本进程已经读取过签名，也必须核对持久值：若另一种告警发送
+            # 失败，内存不会记住它，但旧签名仍需在订阅恢复后清除，否则旧问题
+            # 下次复发会被误判为“已经通知”。
+            had_issue = self._persisted_signature(sub_id) is not None or had_issue
             if not had_issue:
                 return
             db.kv_set(self._alert_key(sub_id), "")

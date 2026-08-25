@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import os
 import shutil
 import stat as stat_module
@@ -342,3 +343,72 @@ def snapshot_digest(snapshots: Iterable[LocalFileSnapshot]) -> str:
         digest.update(f"{item.size}:{item.mtime_ns}:{item.device}:{item.inode}:{item.role}".encode())
         digest.update(b"\n")
     return digest.hexdigest()
+# Linux/Docker 优先使用 renameat2(RENAME_NOREPLACE)；不支持时，普通文件
+# 退化为原子硬链接发布。目录没有同等安全的可移植退化方式，宁可保留回收
+# 副本并让用户重试，也绝不覆盖并发新建的同名内容。
+def move_entry_no_replace_at(
+    source_name: str,
+    target_name: str,
+    *,
+    source_dir_fd: int,
+    target_dir_fd: int,
+    is_directory: bool,
+) -> None:
+    if os.name == "nt":
+        os.rename(
+            source_name,
+            target_name,
+            src_dir_fd=source_dir_fd,
+            dst_dir_fd=target_dir_fd,
+        )
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = [
+                ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameat2.restype = ctypes.c_int
+            result = renameat2(
+                source_dir_fd,
+                os.fsencode(source_name),
+                target_dir_fd,
+                os.fsencode(target_name),
+                1,  # RENAME_NOREPLACE
+            )
+            if result == 0:
+                return
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                raise FileExistsError(
+                    error_number, os.strerror(error_number), target_name,
+                )
+            if error_number not in {
+                errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP,
+            }:
+                raise OSError(error_number, os.strerror(error_number), target_name)
+    except AttributeError:
+        pass
+    if is_directory:
+        raise LocalStorageError("当前文件系统不支持目录的安全无覆盖恢复")
+    try:
+        os.link(
+            source_name,
+            target_name,
+            src_dir_fd=source_dir_fd,
+            dst_dir_fd=target_dir_fd,
+            follow_symlinks=False,
+        )
+    except TypeError:
+        os.link(
+            source_name,
+            target_name,
+            src_dir_fd=source_dir_fd,
+            dst_dir_fd=target_dir_fd,
+        )
+    os.unlink(source_name, dir_fd=source_dir_fd)

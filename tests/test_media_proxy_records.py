@@ -116,6 +116,40 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(cache.metrics()["expired"], 1)
 
+    async def test_guangya_ts_expiry_and_exact_invalidation(self):
+        mono = [10.0]
+        wall = [1000.0]
+        cache = media_proxy.SignedUrlCache(
+            ttl_seconds=60,
+            expiry_margin_seconds=5,
+            clock=lambda: mono[0],
+            wall_clock=lambda: wall[0],
+        )
+        calls = []
+
+        async def fetch():
+            calls.append(1)
+            return f"https://signed.invalid/file?ts=1010&token={len(calls)}"
+
+        first = await cache.get_or_fetch(
+            "file", fetch, scope="1:account", user_agent="UA", ua_bound=True,
+        )
+        mono[0] += 4
+        wall[0] += 4
+        second = await cache.get_or_fetch(
+            "file", fetch, scope="1:account", user_agent="UA", ua_bound=True,
+        )
+        self.assertEqual(first, second)
+        self.assertTrue(cache.invalidate(
+            "file", scope="1:account", user_agent="UA", ua_bound=True,
+        ))
+        third = await cache.get_or_fetch(
+            "file", fetch, scope="1:account", user_agent="UA", ua_bound=True,
+        )
+
+        self.assertNotEqual(second, third)
+        self.assertEqual(len(calls), 2)
+
     async def test_clear_scope_does_not_evict_other_instances(self):
         cache = media_proxy.SignedUrlCache()
         await cache.get_or_fetch("file", lambda: _value("https://signed.invalid/1"), scope="1:a")

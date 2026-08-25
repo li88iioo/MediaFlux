@@ -1040,6 +1040,16 @@ CREATE INDEX IF NOT EXISTS idx_strm_metadata_queue_lease
 CREATE INDEX IF NOT EXISTS idx_strm_metadata_queue_diagnostics
     ON strm_metadata_queue(status, source_id, updated_at DESC, id DESC);
 
+-- 元数据已经落盘但媒体库尚未确认刷新的持久化 outbox。文件写入与入队在
+-- 同一事务完成，进程在两者之间退出也不会永久漏掉 Jellyfin/Emby 刷新。
+CREATE TABLE IF NOT EXISTS strm_metadata_refresh_outbox (
+    path TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strm_metadata_refresh_outbox_updated
+    ON strm_metadata_refresh_outbox(updated_at, path);
+
 CREATE TABLE IF NOT EXISTS strm_retired_sources (
     source_id TEXT PRIMARY KEY,
     source_name TEXT DEFAULT '',
@@ -3839,6 +3849,7 @@ from app.repositories.download_requests import (  # noqa: E402
     mark_download_request_local_media_failed,
     mark_download_request_local_media_skipped,
     finalize_download_request_notification,
+    renew_download_request_notification_lease,
     update_download_request,
     update_download_request_and_sync_media_admission,
     update_download_request_for_local_media_task,
@@ -3937,6 +3948,7 @@ from app.repositories.strm import (  # noqa: E402
     complete_strm_change_target,
     count_due_strm_change_targets,
     count_strm_metadata_jobs,
+    count_strm_metadata_refresh_paths,
     count_pending_strm_change_targets,
     delete_strm_index_ids,
     enqueue_strm_metadata_jobs,
@@ -3945,6 +3957,7 @@ from app.repositories.strm import (  # noqa: E402
     fail_strm_change_target,
     group_changes_by_target,
     list_strm_metadata_queue,
+    list_strm_metadata_refresh_paths,
     list_strm_change_queue,
     list_strm_index,
     list_strm_index_by_prefix,
@@ -3956,6 +3969,7 @@ from app.repositories.strm import (  # noqa: E402
     seconds_until_next_strm_change_target,
     renew_strm_change_target_leases,
     renew_strm_metadata_job_lease,
+    acknowledge_strm_metadata_refresh_paths,
     requeue_strm_metadata_jobs,
     release_strm_change_targets,
     strm_metadata_job_is_current,

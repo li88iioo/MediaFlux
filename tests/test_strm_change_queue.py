@@ -14,7 +14,7 @@ from unittest.mock import patch
 from app import database as db
 from app.modules.scheduler import STRMScheduler
 from app.notifier import TelegramSendResult
-from app.modules.strm import finalize_changed_paths
+from app.modules.strm import _record_changed_path, finalize_changed_paths
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -635,6 +635,23 @@ class ChangedPathProjectionTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(stats["changed_strm_paths"], [])
         self.assertEqual(stats["changed_dirs"], [])
+
+    def test_changed_path_overflow_retains_affected_directory(self):
+        stats: dict = {"changed_strm_paths": []}
+        with patch("app.modules.strm._MAX_TRACKED_CHANGED_PATHS", 1):
+            _record_changed_path(stats, "/data/strm/光鸭云盘/A/E01.strm")
+            _record_changed_path(stats, "/data/strm/光鸭云盘/B/E01.strm")
+
+        finalize_changed_paths(stats)
+
+        self.assertEqual(stats["changed_paths_omitted"], 1)
+        self.assertEqual(stats["changed_strm_paths"], [
+            "/data/strm/光鸭云盘/A/E01.strm",
+        ])
+        self.assertEqual(stats["changed_dirs"], [
+            "/data/strm/光鸭云盘/B",
+            "/data/strm/光鸭云盘/A",
+        ])
 
     def test_source_stats_merge_unions_changed_paths(self):
         aggregate = STRMScheduler._empty_stats()

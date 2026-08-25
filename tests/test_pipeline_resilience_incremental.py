@@ -91,6 +91,30 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["notification_delivery_status"], "sent")
         self.assertEqual(row["notification_lease_token"], "")
 
+    def test_download_notification_lease_can_only_be_renewed_by_owner(self):
+        request_id, _ = db.create_download_request(
+            "notification-renew", "magnet", title="慢网络通知"
+        )
+        db.update_download_request(
+            request_id,
+            status="completed",
+            notification_event_status="completed",
+            notification_delivery_status="pending",
+        )
+        claim = db.claim_download_request_notification(request_id, lease_seconds=30)
+        self.assertIsNotNone(claim)
+        token = str(claim["token"])
+
+        self.assertFalse(db.renew_download_request_notification_lease(
+            request_id, "stale-token", lease_seconds=300,
+        ))
+        self.assertTrue(db.renew_download_request_notification_lease(
+            request_id, token, lease_seconds=300,
+        ))
+        row = db.get_download_request(request_id)
+        self.assertEqual(row["notification_delivery_status"], "sending")
+        self.assertEqual(row["notification_lease_token"], token)
+
     def test_guangya_organize_claim_survives_qb_manual_review(self):
         request_id, _ = db.create_download_request(
             "mixed-terminal-organize", "magnet", title="混合终态资源"

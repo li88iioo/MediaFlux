@@ -112,9 +112,86 @@ jobs:
           docker stop --time 60 mediaflux-smoke
           test "$(docker inspect --format '{{.State.ExitCode}}' mediaflux-smoke)" = "0"
           docker logs mediaflux-smoke
-      - name: Cleanup smoke container
+      - name: Smoke test persisted v0.1.4 database upgrade
+        if: success()
+        env:
+          WEB_SECRET_KEY: ci-upgrade-secret-key-with-more-than-32-bytes
+          MEDIAFLUX_INITIALIZED: "1"
+          ENV_WEB_PASSPORT: admin
+          ENV_WEB_PASSWORD: ci-upgrade-password-with-more-than-16-bytes
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mediaflux-v014-db" "$RUNNER_TEMP/mediaflux-v014-strm"
+          python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+
+          database = Path("${{ runner.temp }}") / "mediaflux-v014-db" / "mediaflux.db"
+          fixture = Path("tests/fixtures/database/v0.1.4-schema.sql")
+          connection = sqlite3.connect(database)
+          try:
+              connection.executescript(fixture.read_text(encoding="utf-8"))
+              connection.execute(
+                  "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?)",
+                  ("docker_upgrade_sentinel", "preserved", "2026-08-25"),
+              )
+              connection.execute("PRAGMA user_version=1")
+              connection.commit()
+          finally:
+              connection.close()
+          PY
+          sudo chown -R 10001:10001 \
+            "$RUNNER_TEMP/mediaflux-v014-db" "$RUNNER_TEMP/mediaflux-v014-strm"
+          docker run --detach --name mediaflux-v014-upgrade \
+            --publish 127.0.0.1:1259:1258 \
+            --env WEB_SECRET_KEY --env MEDIAFLUX_INITIALIZED \
+            --env ENV_WEB_PASSPORT --env ENV_WEB_PASSWORD \
+            --volume "$RUNNER_TEMP/mediaflux-v014-db:/app/db" \
+            --volume "$RUNNER_TEMP/mediaflux-v014-strm:/data/strm" \
+            mediaflux:smoke
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:1259/readyz >/dev/null; then
+              docker exec -i mediaflux-v014-upgrade python - <<'PY'
+          import sqlite3
+
+          connection = sqlite3.connect("/app/db/mediaflux.db")
+          try:
+              version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+              sentinel = connection.execute(
+                  "SELECT value FROM settings_kv WHERE key='docker_upgrade_sentinel'"
+              ).fetchone()
+              outbox = connection.execute(
+                  "SELECT 1 FROM sqlite_master WHERE type='table' "
+                  "AND name='strm_metadata_refresh_outbox'"
+              ).fetchone()
+              integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+              foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+              assert version == 6, version
+              assert sentinel == ("preserved",), sentinel
+              assert outbox == (1,), outbox
+              assert integrity == "ok", integrity
+              assert foreign_keys == [], foreign_keys
+          finally:
+              connection.close()
+          PY
+              docker exec mediaflux-v014-upgrade python mediaflux.py doctor --json \
+                > "$RUNNER_TEMP/docker-v014-doctor.json"
+              jq -e 'all(.[]; .status != "error")' \
+                "$RUNNER_TEMP/docker-v014-doctor.json"
+              docker stop --time 60 mediaflux-v014-upgrade
+              test "$(docker inspect --format '{{.State.ExitCode}}' mediaflux-v014-upgrade)" = "0"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs mediaflux-v014-upgrade
+          exit 1
+
+      - name: Cleanup smoke containers
         if: always()
-        run: docker rm --force mediaflux-smoke >/dev/null 2>&1 || true
+        run: |
+          docker rm --force mediaflux-smoke >/dev/null 2>&1 || true
+          docker rm --force mediaflux-v014-upgrade >/dev/null 2>&1 || true
 
   build:
     if: github.event_name != 'pull_request'
@@ -284,6 +361,31 @@ jobs:
               --arg arch "$expected_arch" \
               '.version == $version and .arch == $arch and .package == "docker" and .commit == $sha' \
               "$output"
+
+            container="mediaflux-${safe_platform}-startup"
+            docker run --detach --platform "$platform" --name "$container" \
+              --env WEB_SECRET_KEY=ci-platform-secret-key-with-more-than-32-bytes \
+              --env MEDIAFLUX_INITIALIZED=1 \
+              --env ENV_WEB_PASSPORT=admin \
+              --env ENV_WEB_PASSWORD=ci-platform-password-with-more-than-16-bytes \
+              "$IMAGE_REPOSITORY@$platform_digest"
+            ready=false
+            for attempt in $(seq 1 45); do
+              if docker exec "$container" python -c \
+                "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1258/readyz', timeout=3)"; then
+                ready=true
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$ready" != "true" ]]; then
+              docker logs "$container"
+              docker rm --force "$container" >/dev/null 2>&1 || true
+              exit 1
+            fi
+            docker stop --time 60 "$container"
+            test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = "0"
+            docker rm "$container"
           done
 
       - name: Re-verify release tag before promotion

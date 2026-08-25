@@ -49,6 +49,17 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn('test "$image_app_js_bytes" -lt "$source_app_js_bytes"', self.text)
         self.assertIn("! command -v node", self.text)
 
+    def test_smoke_upgrades_a_persisted_v014_database_without_losing_data(self) -> None:
+        smoke_job = self.text.split("  smoke:", 1)[1].split("  build:", 1)[0]
+        self.assertIn("tests/fixtures/database/v0.1.4-schema.sql", smoke_job)
+        self.assertIn("docker_upgrade_sentinel", smoke_job)
+        self.assertIn("PRAGMA user_version=1", smoke_job)
+        self.assertIn("mediaflux-v014-upgrade", smoke_job)
+        self.assertIn("strm_metadata_refresh_outbox", smoke_job)
+        self.assertIn("PRAGMA integrity_check", smoke_job)
+        self.assertIn("PRAGMA foreign_key_check", smoke_job)
+        self.assertIn("docker stop --time 60 mediaflux-v014-upgrade", smoke_job)
+
     def test_full_test_job_installs_runtime_dependencies(self) -> None:
         test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
         self.assertIn("npm ci --ignore-scripts --no-audit --no-fund", test_job)
@@ -84,6 +95,10 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn('.arch == $arch', self.text)
         self.assertIn('platform_digest=$(jq -r', self.text)
         self.assertIn('$IMAGE_REPOSITORY@$platform_digest', self.text)
+        self.assertIn('container="mediaflux-${safe_platform}-startup"', self.text)
+        self.assertIn('docker run --detach --platform "$platform"', self.text)
+        self.assertIn("http://127.0.0.1:1258/readyz", self.text)
+        self.assertIn('docker stop --time 60 "$container"', self.text)
         candidate_smoke = self.text.split("      - name: Smoke test candidate images", 1)[1].split(
             "      - name: Re-verify release tag before promotion", 1
         )[0]
@@ -111,21 +126,25 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn('--arg arch "$expected_arch"', promote)
         self.assertIn(".arch == $arch", promote)
 
-    def test_prepare_build_context_shell_is_syntactically_valid(self) -> None:
+    def test_all_workflow_shell_blocks_are_syntactically_valid(self) -> None:
         workflow = yaml.safe_load(self.text)
-        prepare_script = next(
-            step["run"]
-            for step in workflow["jobs"]["build"]["steps"]
-            if step.get("name") == "Prepare build context"
-        )
-        result = subprocess.run(
-            ["bash", "-n"],
-            input=prepare_script,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        for job_name, job in workflow["jobs"].items():
+            for step in job.get("steps", []):
+                script = step.get("run")
+                if not script:
+                    continue
+                result = subprocess.run(
+                    ["bash", "-n"],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"{job_name}/{step.get('name', 'unnamed')}: {result.stderr}",
+                )
 
     def test_release_build_uses_shared_build_info_contract(self) -> None:
         self.assertIn("packaging/scripts/generate_build_info.py", self.text)

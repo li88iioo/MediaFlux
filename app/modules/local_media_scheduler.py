@@ -82,16 +82,18 @@ class LocalMediaScheduler:
             self._thread.start()
         logger.info("本地媒体调度器已启动")
 
-    def stop(self, timeout: float = 30.0) -> None:
+    def stop(self, timeout: float = 30.0) -> bool:
         with self._guard:
             self._stop_event.set()
             self._wake_event.set()
             thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=timeout)
+        stopped = not thread or not thread.is_alive()
         with self._guard:
-            if self._thread is thread and (not thread or not thread.is_alive()):
+            if self._thread is thread and stopped:
                 self._thread = None
+        return stopped
 
     def reload(self) -> None:
         self._wake_event.set()

@@ -310,7 +310,14 @@ def stop_background_services() -> bool:
     rss_workers_stopped = True
     bot_workers_stopped = True
     download_tracker_stopped = True
+    agent_jobs_stopped = True
+    agent_patrol_stopped = True
+    agent_verification_stopped = True
+    organize_scheduler_stopped = True
+    local_media_scheduler_stopped = True
+    confirmation_dispatcher_stopped = True
     organize_drained = True
+    strm_workers_stopped = True
     # 先关闭整理准入，避免迟到的 TG 回调或调度器在关机窗口提交新任务。
     from app.modules.organize_tasks import get_organize_manager
 
@@ -330,24 +337,29 @@ def stop_background_services() -> bool:
     try:
         from app.modules.agent_jobs_scheduler import get_agent_jobs_scheduler
 
-        get_agent_jobs_scheduler().stop()
+        agent_jobs_stopped = bool(get_agent_jobs_scheduler().stop())
     except Exception as exc:
+        agent_jobs_stopped = False
         logger.warning("停止 Agent 持久化长任务调度器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.agent_library_patrol_scheduler import (
             get_agent_library_patrol_scheduler,
         )
 
-        get_agent_library_patrol_scheduler().stop()
+        agent_patrol_stopped = bool(get_agent_library_patrol_scheduler().stop())
     except Exception as exc:
+        agent_patrol_stopped = False
         logger.warning("停止 Agent 全库缺集巡检调度器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.agent_download_verification_scheduler import (
             get_download_library_verification_scheduler,
         )
 
-        get_download_library_verification_scheduler().stop()
+        agent_verification_stopped = bool(
+            get_download_library_verification_scheduler().stop()
+        )
     except Exception as exc:
+        agent_verification_stopped = False
         logger.warning("停止 Agent 下载后媒体库复核调度器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.download_tracker import get_download_tracker
@@ -377,22 +389,25 @@ def stop_background_services() -> bool:
     try:
         from app.modules.organize_scheduler import get_organize_scheduler
 
-        get_organize_scheduler().stop()
+        organize_scheduler_stopped = bool(get_organize_scheduler().stop())
     except Exception as exc:
+        organize_scheduler_stopped = False
         logger.warning("停止网盘整理调度器失败 type=%s", type(exc).__name__)
     try:
         from app.modules.local_media_scheduler import get_local_media_scheduler
 
-        get_local_media_scheduler().stop()
+        local_media_scheduler_stopped = bool(get_local_media_scheduler().stop())
     except Exception as exc:
+        local_media_scheduler_stopped = False
         logger.warning("停止本地媒体调度器失败 type=%s", type(exc).__name__)
 
     # 停止 Telegram 候选队列消费者，保留 queued 项供下次启动恢复。
     try:
         from app.modules.organize_confirmations import stop_confirmation_dispatcher
 
-        stop_confirmation_dispatcher()
+        confirmation_dispatcher_stopped = bool(stop_confirmation_dispatcher())
     except Exception as exc:
+        confirmation_dispatcher_stopped = False
         logger.warning("停止 Telegram 整理确认队列失败 type=%s", type(exc).__name__)
 
     # 整理完成时可能排队触发 STRM，因此先收敛整理，再停止 STRM。
@@ -406,15 +421,25 @@ def stop_background_services() -> bool:
     try:
         from app.modules.scheduler import get_scheduler
 
-        get_scheduler().stop()
+        strm_workers_stopped = bool(get_scheduler().stop())
+        if not strm_workers_stopped:
+            logger.warning("停止 STRM 调度器超时，保留依赖运行时直到进程退出")
     except Exception as exc:
+        strm_workers_stopped = False
         logger.warning("停止 STRM 调度器失败 type=%s", type(exc).__name__)
     return all((
         bot_workers_stopped,
         download_tracker_stopped,
         rss_workers_stopped,
         subscription_workers_stopped,
+        agent_jobs_stopped,
+        agent_patrol_stopped,
+        agent_verification_stopped,
+        organize_scheduler_stopped,
+        local_media_scheduler_stopped,
+        confirmation_dispatcher_stopped,
         organize_drained,
+        strm_workers_stopped,
     ))
 
 
@@ -443,6 +468,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
             from app.indexers.runtime import bind_indexer_event_loop
 
             indexer_event_loop = asyncio.get_running_loop()
+            previous_exception_handler = indexer_event_loop.get_exception_handler()
 
             def _silence_proactor_connection_lost(
                 loop: asyncio.AbstractEventLoop, context: dict
@@ -538,6 +564,13 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                     else:
                         logger.warning(
                             "索引器运行时保持关闭门控，等待进程退出，避免存活 worker 跨事件循环复用客户端"
+                        )
+                    if (
+                        indexer_event_loop.get_exception_handler()
+                        is _silence_proactor_connection_lost
+                    ):
+                        indexer_event_loop.set_exception_handler(
+                            previous_exception_handler
                         )
 
     app = FastAPI(title="MediaFlux", docs_url=None, redoc_url=None, lifespan=lifespan)

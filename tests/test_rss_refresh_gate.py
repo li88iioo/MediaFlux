@@ -441,6 +441,24 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             restarted._execute(sid, "subscribe")
         self.assertEqual(db.kv_get(restarted._alert_key(sid), "missing"), "")
 
+    def test_recovery_clears_old_persisted_signature_after_new_alert_delivery_fails(self):
+        scheduler = RSSScheduler()
+        db.kv_set(
+            scheduler._alert_key(9),
+            scheduler._serialize_signature(("old_issue", "旧错误")),
+        )
+        with patch(
+            "app.modules.rss_scheduler.db.get_rss_subscription",
+            return_value={"name": "测试订阅"},
+        ), patch(
+            "app.modules.rss_scheduler.send_event", return_value=False,
+        ):
+            scheduler._notify_issue(9, "new_issue", [("错误", "新错误")])
+
+        scheduler._clear_issue(9)
+
+        self.assertEqual(db.kv_get(scheduler._alert_key(9), "missing"), "")
+
     def test_scheduler_warns_when_auto_download_outcome_is_unknown(self):
         scheduler = RSSScheduler()
         with patch("app.modules.rss_scheduler.RSSEngine") as engine:
