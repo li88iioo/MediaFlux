@@ -18,6 +18,9 @@ def test_shared_mobile_modals_use_dynamic_viewport_and_single_scroll_owner():
     assert re.search(r"\.media-config-dialog \{[^}]*100dvh[^}]*safe-area-inset-bottom", css)
     assert re.search(r"\.organize-detail-dialog \{[^}]*100dvh[^}]*safe-area-inset-bottom", css)
     assert re.search(r"\.organize-detail-body \{[^}]*min-height: 0[^}]*flex: 1 1 auto[^}]*overflow-y: auto", css)
+    assert re.search(r"\.organize-detail-footer \{[^}]*flex: 0 0 auto", css)
+    assert ".organize-detail-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr));" in css
+    assert "#organizeReorganizeBtn { grid-column: 1 / -1; }" in css
     assert re.search(r"\.settings-dir-dialog \{[^}]*100dvh[^}]*safe-area-inset-bottom", css)
     assert ".rss-sub-modal { display: none;" in css
     rss_overlay = css.split(".rss-sub-modal {", 1)[1].split("}", 1)[0]
@@ -31,6 +34,10 @@ def test_organize_rule_and_knowledge_modals_keep_actions_inside_visible_viewport
     assert "recognition-knowledge-dialog" in css
     assert "100dvh" in css
     assert "env(safe-area-inset-bottom,0px)" in css
+    assert ".recognition-knowledge-ledger>.tmdb-regex-toolbar,.recognition-knowledge-search{flex:0 0 auto}" in css
+    assert ".recognition-knowledge-actions{display:flex;flex:0 0 auto" in css
+    assert ".recognition-knowledge-ledger>.tmdb-regex-toolbar{align-items:center;flex-direction:row" in css
+    assert ".recognition-knowledge-ledger>.tmdb-regex-toolbar .jump-btn{width:auto" in css
     assert ".recognition-knowledge-actions{align-items:stretch;flex-direction:column" in css
     assert ".tmdb-regex-editor-actions{position:sticky;bottom:0;z-index:2}" in css
     assert ".tmdb-regex-editor-scroll{flex:none;max-height:none;overflow:visible}" in css
