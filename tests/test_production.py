@@ -4195,11 +4195,14 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn(".nav-cluster-flyout", css)
         self.assertIn("max-height: calc(100vh - 24px)", css)
         self.assertIn("overflow-y: auto", css)
+        self.assertIn("scrollbar-width: none", css)
+        self.assertIn(".nav::-webkit-scrollbar { width: 0; height: 0; display: none; }", css)
+        self.assertIn("overscroll-behavior: contain", css)
         self.assertIn("@media (max-width: 900px)", css)
         self.assertIn("--sidebar-w: 160px;", css)
         self.assertIn("--sidebar-collapsed-w: 72px;", css)
         self.assertIn(
-            'padding-inline: 6px; scrollbar-gutter: stable both-edges;',
+            'padding-inline: 6px; scrollbar-gutter: auto;',
             css,
         )
         self.assertIn("transform: translateX(calc(-100% - 2px)); box-shadow: none;", css)

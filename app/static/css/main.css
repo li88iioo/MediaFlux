@@ -240,7 +240,8 @@ svg { display: block; flex: 0 0 auto; }
 .sidebar-collapse-btn:hover { color: var(--accent); background: var(--bg-card); border-color: var(--accent); transform: translateY(-50%) scale(1.04); }
 .sidebar-collapse-btn svg { width: 13px; height: 13px; }
 .brand-sub { display: none; margin-top: 5px; color: var(--text-muted); font-family: "SFMono-Regular", Consolas, monospace; font-size: 9px; letter-spacing: 1.4px; }
-.nav { flex: 1; display: flex; flex-direction: column; gap: 3px; padding: 18px 8px; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-gutter: stable; }
+.nav { flex: 1; display: flex; flex-direction: column; gap: 3px; padding: 18px 8px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; scrollbar-width: none; scrollbar-gutter: auto; -ms-overflow-style: none; }
+.nav::-webkit-scrollbar { width: 0; height: 0; display: none; }
 .nav::before { content: "WORKSPACE"; margin: 0 10px 9px; color: var(--text-muted); font: 9px/1 "SFMono-Regular", Consolas, monospace; letter-spacing: 1.4px; }
 .nav-item {
     min-height: 42px;
@@ -309,7 +310,7 @@ svg { display: block; flex: 0 0 auto; }
     :root[data-sidebar="collapsed"] .nav-cluster-chevron,
     :root[data-sidebar="collapsed"] .nav-submenu { display: none; }
     :root[data-sidebar="collapsed"] .sidebar-collapse-btn { top: 56px; right: -13px; width: 27px; height: 27px; background: var(--bg-sidebar); transform: none; }
-    :root[data-sidebar="collapsed"] .nav { padding-inline: 6px; scrollbar-gutter: stable both-edges; }
+    :root[data-sidebar="collapsed"] .nav { padding-inline: 6px; scrollbar-gutter: auto; }
     :root[data-sidebar="collapsed"] .nav-item { justify-content: center; gap: 0; padding: 0; }
     :root[data-sidebar="collapsed"] .nav-item:hover { transform: none; }
     :root[data-sidebar="collapsed"] .sidebar-footer .nav-item { min-height: 42px; }
