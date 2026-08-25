@@ -1043,12 +1043,8 @@ def telegram_user_is_allowed(user_id: object) -> bool:
     return bool(_ALLOWED_ID_RE.fullmatch(user) and user in _allowed_user_ids())
 
 
-def telegram_agent_access(chat_id: object, user_id: object) -> str:
-    """返回 ``disabled``、``unauthorized`` 或 ``allowed``，默认拒绝。"""
-    if not is_agent_enabled():
-        return "disabled"
-    if not _enabled(get("TG_AGENT_ENABLED", "0")):
-        return "disabled"
+def telegram_agent_control_access(chat_id: object, user_id: object) -> str:
+    """校验 Agent 控制面板身份，不受 Agent 开关状态影响。"""
     chat = str(chat_id or "").strip()
     user = str(user_id or "").strip()
     configured_chat = str(get("TG_CHAT_ID", "") or "").strip()
@@ -1062,6 +1058,15 @@ def telegram_agent_access(chat_id: object, user_id: object) -> str:
     ):
         return "unauthorized"
     return "allowed"
+
+
+def telegram_agent_access(chat_id: object, user_id: object) -> str:
+    """返回 ``disabled``、``unauthorized`` 或 ``allowed``，默认拒绝。"""
+    if not is_agent_enabled():
+        return "disabled"
+    if not _enabled(get("TG_AGENT_ENABLED", "0")):
+        return "disabled"
+    return telegram_agent_control_access(chat_id, user_id)
 
 
 def telegram_agent_owner(chat_id: object, user_id: object) -> str:
@@ -2396,24 +2401,324 @@ def _record_telegram_conversation(
         logger.warning("Telegram Agent 对话历史写入失败 type=%s", type(exc).__name__)
 
 
-def handle_agent_guide(bot: Any, message: Any) -> None:
-    """展示 Telegram Agent 使用入口，不触发 Agent 查询或外部调用。"""
+def _agent_control_state() -> tuple[bool, bool]:
+    return is_agent_enabled(), _enabled(get("TG_AGENT_ENABLED", "0"))
+
+
+def _agent_control_panel_text(*, notice: str = "") -> str:
+    global_enabled, telegram_enabled = _agent_control_state()
+    if not global_enabled:
+        telegram_label = "随全局关闭" if telegram_enabled else "已关闭"
+        detail = (
+            "Media Agent 当前全局关闭；Web Agent、Telegram Agent 与后台任务均不运行。"
+        )
+    elif not telegram_enabled:
+        telegram_label = "已关闭"
+        detail = "Web Agent 与后台任务继续运行，仅 Telegram Agent 接入已关闭。"
+    else:
+        telegram_label = "已开启"
+        detail = (
+            "直接发送问题即可查询媒体库、下载、RSS 或整理状态，也可搜索资源并选择 "
+            "qBittorrent / 光鸭；写操作会先要求确认。"
+        )
+
+    lines = [
+        "<b>Media Agent</b>",
+        "",
+        f"全局服务：<b>{'已开启' if global_enabled else '已关闭'}</b>",
+        f"Telegram 接入：<b>{telegram_label}</b>",
+        f"后台任务：<b>{'已启用' if global_enabled else '已关闭'}</b>",
+        "",
+        detail,
+        "传统整理、同步、搜索、RSS 与状态命令不受 Agent 开关影响。",
+    ]
+    if global_enabled and telegram_enabled:
+        lines.extend(["", "使用 /agent_reset 可清除当前 Agent 会话和待确认操作。"])
+    if notice:
+        lines.extend(["", f"<b>{html.escape(notice)}</b>"])
+    return "\n".join(lines)
+
+
+def _agent_control_panel_markup(
+    telebot_module: Any,
+    *,
+    chat_id: str,
+    user_id: str,
+) -> Any:
+    from app.modules.telegram_write_confirmations import (
+        get_telegram_write_confirmation_store,
+    )
+
+    global_enabled, telegram_enabled = _agent_control_state()
+    if not global_enabled:
+        buttons = [("开启 Media Agent", "preview", {"action": "enable_all"})]
+    elif not telegram_enabled:
+        buttons = [
+            ("开启 Telegram Agent", "apply", {"action": "enable_telegram"}),
+            ("关闭全部 Media Agent", "preview", {"action": "disable_all"}),
+        ]
+    else:
+        buttons = [
+            ("关闭 Telegram Agent", "apply", {"action": "disable_telegram"}),
+            ("关闭全部 Media Agent", "preview", {"action": "disable_all"}),
+        ]
+    action_ids = get_telegram_write_confirmation_store().create_group(
+        chat_id=chat_id,
+        user_id=user_id,
+        operation="agent_control",
+        actions=[(decision, value) for _label, decision, value in buttons],
+    )
+    markup = telebot_module.types.InlineKeyboardMarkup(row_width=1)
+    for (label, _decision, _value), action_id in zip(buttons, action_ids):
+        markup.add(
+            telebot_module.types.InlineKeyboardButton(
+                label,
+                callback_data=f"tgc:{action_id}",
+            )
+        )
+    return markup
+
+
+def _edit_agent_control_panel(
+    bot: Any,
+    call: Any,
+    telebot_module: Any,
+    *,
+    notice: str = "",
+) -> bool:
+    chat_id, user_id = _identity(call)
+    message = call.message
+    try:
+        markup = _agent_control_panel_markup(
+            telebot_module,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+    except Exception as exc:
+        logger.warning("刷新 Telegram Agent 控制按钮失败 type=%s", type(exc).__name__)
+        markup = None
+    try:
+        bot.edit_message_text(
+            _agent_control_panel_text(notice=notice),
+            message.chat.id,
+            message.message_id,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        return True
+    except Exception as exc:
+        logger.info("刷新 Telegram Agent 控制面板失败 type=%s", type(exc).__name__)
+        return False
+
+
+def _agent_control_updates(action_name: str) -> dict[str, str]:
+    global_enabled, telegram_enabled = _agent_control_state()
+    if action_name == "enable_all":
+        desired = {"AGENT_ENABLED": "1", "TG_AGENT_ENABLED": "1"}
+    elif action_name == "enable_telegram":
+        if not global_enabled:
+            raise ValueError("Media Agent 全局服务尚未开启")
+        desired = {"TG_AGENT_ENABLED": "1"}
+    elif action_name == "disable_telegram":
+        desired = {"TG_AGENT_ENABLED": "0"}
+    elif action_name == "disable_all":
+        desired = {"AGENT_ENABLED": "0"}
+    else:
+        raise ValueError("Agent 控制操作无效")
+
+    if action_name in {"enable_all", "enable_telegram"}:
+        if not str(get("TG_BOT_TOKEN", "") or "").strip():
+            raise ValueError("Telegram Bot Token 尚未配置")
+        if not str(get("TG_CHAT_ID", "") or "").strip():
+            raise ValueError("Telegram Chat ID 尚未配置")
+        if not _allowed_user_ids():
+            raise ValueError("Telegram Agent 用户白名单尚未配置")
+
+    current = {
+        "AGENT_ENABLED": "1" if global_enabled else "0",
+        "TG_AGENT_ENABLED": "1" if telegram_enabled else "0",
+    }
+    return {key: value for key, value in desired.items() if current[key] != value}
+
+
+def _apply_agent_control_action(action_name: str, *, owner: str) -> str:
+    from app import config
+
+    updates = _agent_control_updates(action_name)
+    if updates:
+        config.set_and_save(updates)
+        if "AGENT_ENABLED" in updates:
+            try:
+                from app.modules.agent_runtime import request_agent_runtime_reconcile
+
+                request_agent_runtime_reconcile()
+            except Exception as exc:
+                logger.warning(
+                    "Telegram Agent 运行态刷新请求失败 type=%s",
+                    type(exc).__name__,
+                )
+        try:
+            from app.bot.handlers import request_command_menu_refresh
+
+            request_command_menu_refresh()
+        except Exception as exc:
+            logger.warning(
+                "Telegram Agent 菜单刷新请求失败 type=%s",
+                type(exc).__name__,
+            )
+    if action_name in {"disable_telegram", "disable_all"}:
+        try:
+            get_telegram_agent_action_store().revoke_owner(owner=owner)
+        except Exception as exc:
+            logger.warning(
+                "Telegram Agent 旧按钮撤销失败 type=%s",
+                type(exc).__name__,
+            )
+    return {
+        "enable_all": "Media Agent 已开启",
+        "enable_telegram": "Telegram Agent 已开启",
+        "disable_telegram": "Telegram Agent 已关闭",
+        "disable_all": "Media Agent 已全部关闭",
+    }[action_name]
+
+
+def handle_agent_control_action(
+    bot: Any,
+    call: Any,
+    telebot_module: Any,
+    action: dict[str, Any],
+) -> None:
+    """处理 owner 绑定的一次性 Agent 开关操作。"""
+    from app.config import (
+        ConcurrentConfigUpdateError,
+        CorruptConfigFileError,
+        ExternalConfigOverrideError,
+    )
+    from app.modules.telegram_write_confirmations import (
+        TelegramWriteConfirmationError,
+        get_telegram_write_confirmation_store,
+    )
+
+    chat_id, user_id = _identity(call)
+    if telegram_agent_control_access(chat_id, user_id) != "allowed":
+        _remove_callback_keyboard(bot, call.message)
+        bot.answer_callback_query(call.id, "当前身份无权管理 Media Agent", show_alert=True)
+        return
+
+    decision = str(action.get("decision") or "")
+    value = action.get("value") if isinstance(action.get("value"), dict) else {}
+    action_name = str(value.get("action") or "")
+    if decision == "cancel":
+        _edit_agent_control_panel(bot, call, telebot_module, notice="操作已取消")
+        bot.answer_callback_query(call.id, "操作已取消")
+        return
+    if decision == "preview" and action_name in {"enable_all", "disable_all"}:
+        enabling = action_name == "enable_all"
+        confirm_id, cancel_id = get_telegram_write_confirmation_store().create_pair(
+            chat_id=chat_id,
+            user_id=user_id,
+            operation="agent_control",
+            value={"action": action_name, "confirmed": True},
+        )
+        markup = telebot_module.types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            telebot_module.types.InlineKeyboardButton(
+                "确认开启全部" if enabling else "确认关闭全部",
+                callback_data=f"tgc:{confirm_id}",
+            ),
+            telebot_module.types.InlineKeyboardButton(
+                "取消",
+                callback_data=f"tgc:{cancel_id}",
+            ),
+        )
+        if enabling:
+            title = "确认开启 Media Agent"
+            detail = "这会启用 Web Agent、Telegram Agent 与 Agent 后台任务。"
+        else:
+            title = "确认关闭全部 Media Agent"
+            detail = (
+                "这会停止 Web Agent、Telegram Agent 与 Agent 后台任务；"
+                "传统整理、同步、搜索、RSS 与状态命令仍可使用。"
+            )
+        bot.edit_message_text(
+            f"<b>{title}</b>\n\n{detail}",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+        bot.answer_callback_query(
+            call.id,
+            "请确认是否开启 Media Agent" if enabling else "请确认是否关闭全部 Media Agent",
+        )
+        return
+    if decision not in {"apply", "confirm"}:
+        raise TelegramWriteConfirmationError("Agent 控制操作无效")
+    if action_name in {"enable_all", "disable_all"} and not bool(
+        value.get("confirmed")
+    ):
+        raise TelegramWriteConfirmationError("全局 Media Agent 开关需要再次确认")
+
+    try:
+        owner = telegram_agent_owner(chat_id, user_id)
+        notice = _apply_agent_control_action(action_name, owner=owner)
+    except ExternalConfigOverrideError:
+        notice = "操作未完成：该开关由 Docker 或部署环境管理"
+        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        bot.answer_callback_query(call.id, notice, show_alert=True)
+        return
+    except ConcurrentConfigUpdateError:
+        notice = "操作未完成：配置刚被其他操作修改，请重试"
+        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        bot.answer_callback_query(call.id, notice, show_alert=True)
+        return
+    except CorruptConfigFileError:
+        notice = "操作未完成：user.env 无法安全读取"
+        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        bot.answer_callback_query(call.id, notice, show_alert=True)
+        return
+    except ValueError as exc:
+        notice = f"操作未完成：{str(exc)}"
+        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        bot.answer_callback_query(call.id, notice, show_alert=True)
+        return
+    except Exception as exc:
+        logger.warning("Telegram Agent 开关更新失败 type=%s", type(exc).__name__)
+        notice = "操作未完成：配置保存失败，请稍后重试"
+        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        bot.answer_callback_query(call.id, notice, show_alert=True)
+        return
+
+    _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+    bot.answer_callback_query(call.id, notice)
+
+
+def handle_agent_guide(
+    bot: Any,
+    message: Any,
+    telebot_module: Any | None = None,
+) -> None:
+    """展示永久可用的 Telegram Agent 状态与控制入口。"""
     chat_id, user_id = _identity(message)
-    access = telegram_agent_access(chat_id, user_id)
-    if access == "disabled":
-        bot.reply_to(message, "Media Agent 当前未启用。请在控制台启用后再试。")
+    if telegram_agent_control_access(chat_id, user_id) != "allowed":
+        bot.reply_to(message, "当前身份未获准管理 Media Agent。")
         return
-    if access != "allowed":
-        bot.reply_to(message, "当前身份未获准使用 Media Agent。")
-        return
+    if telebot_module is None:
+        import telebot as telebot_module
+    try:
+        markup = _agent_control_panel_markup(
+            telebot_module,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+    except Exception as exc:
+        logger.warning("创建 Telegram Agent 控制面板失败 type=%s", type(exc).__name__)
+        markup = None
     bot.reply_to(
         message,
-        "<b>Media Agent 已就绪</b>\n\n"
-        "直接发送问题即可查询媒体库、下载、RSS 或整理状态，也可搜索资源并选择"
-        " qBittorrent / 光鸭；"
-        "下载链接仍按原下载流程处理。写操作会先要求确认。\n\n"
-        "使用 /agent_reset 可清除当前 Agent 会话和待确认操作。",
+        _agent_control_panel_text(),
         parse_mode="HTML",
+        reply_markup=markup,
     )
 
 

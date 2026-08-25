@@ -910,13 +910,9 @@ def _command_menu_specs() -> list[tuple[str, str]]:
         ("rss_refresh", "刷新RSS订阅"),
         ("rss_dl", "下载RSS条目"),
     ]
+    commands.append(("agent", "管理 Media Agent"))
     if _telegram_agent_available():
-        commands.extend(
-            [
-                ("agent", "使用 Media Agent"),
-                ("agent_reset", "重置 Agent 会话"),
-            ]
-        )
+        commands.append(("agent_reset", "重置 Agent 会话"))
     commands.extend(
         [
             ("status", "查看运行状态"),
@@ -1032,12 +1028,13 @@ def _register_commands(bot, telebot):
             "/rss_refresh ID — 刷新订阅\n"
             "/rss_dl ID — 下载条目",
         ]
+        agent_lines = [
+            "<b>Media Agent</b>",
+            "/agent — 查看状态并开启或关闭 Agent",
+        ]
         if _telegram_agent_available():
-            sections.append(
-                "<b>Media Agent</b>\n"
-                "/agent — 使用 Media Agent\n"
-                "/agent_reset — 重置 Agent 会话"
-            )
+            agent_lines.append("/agent_reset — 重置 Agent 会话")
+        sections.append("\n".join(agent_lines))
         sections.append(
             "<b>运行状态</b>\n"
             "/status — 查看整理、同步与待处理状态"
@@ -1085,7 +1082,7 @@ def _register_commands(bot, telebot):
     def cmd_agent(msg):
         from app.bot.agent_adapter import handle_agent_guide
 
-        handle_agent_guide(bot, msg)
+        handle_agent_guide(bot, msg, telebot)
 
     @bot.message_handler(commands=["agent_reset"])
     @require_auth
@@ -1816,6 +1813,11 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
         claimed = True
         operation = str(action["operation"])
         value = action["value"] if isinstance(action.get("value"), dict) else {}
+        if operation == "agent_control":
+            from app.bot.agent_adapter import handle_agent_control_action
+
+            handle_agent_control_action(bot, call, telebot, action)
+            return
         if operation == "download_request":
             request_id = int(value.get("request_id"))
             row = db.bind_pending_download_request_owner(

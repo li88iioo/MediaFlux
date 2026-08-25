@@ -28,12 +28,14 @@ from app.bot.agent_adapter import (
     _stream_preview_html,
     _truncate_telegram_html,
     handle_agent_callback,
+    handle_agent_control_action,
     handle_agent_guide,
     handle_agent_message,
     handle_agent_patrol_callback,
     handle_agent_reset,
     render_agent_response,
     telegram_agent_access,
+    telegram_agent_control_access,
     telegram_agent_owner,
 )
 from app.clients.openai_compatible import ProviderStreamError
@@ -1410,39 +1412,274 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("raw-error", text)
         self.assertNotIn("secret-value", text)
 
-    def test_agent_guide_is_discoverable_without_querying_service(self):
+    def test_agent_control_access_ignores_switches_but_keeps_identity_fail_closed(self):
+        values = {
+            "TG_AGENT_ENABLED": "0",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            self.assertEqual(telegram_agent_control_access("100", "200"), "allowed")
+            self.assertEqual(telegram_agent_control_access("100", "201"), "unauthorized")
+            self.assertEqual(telegram_agent_control_access("101", "200"), "unauthorized")
+
+    def test_agent_guide_is_a_permanent_state_control_panel(self):
+        from app.modules.telegram_write_confirmations import (
+            reset_telegram_write_confirmation_store_for_tests,
+        )
+
+        reset_telegram_write_confirmation_store_for_tests()
         cases = (
-            ({"TG_AGENT_ENABLED": "0"}, "Media Agent 当前未启用。请在控制台启用后再试。"),
             (
+                False,
                 {
-                    "TG_AGENT_ENABLED": "1",
+                    "TG_AGENT_ENABLED": "0",
                     "TG_CHAT_ID": "100",
-                    "TG_AGENT_ALLOWED_USER_IDS": "201",
+                    "TG_AGENT_ALLOWED_USER_IDS": "200",
                 },
-                "当前身份未获准使用 Media Agent。",
+                "全局服务：<b>已关闭</b>",
+                ["开启 Media Agent"],
             ),
             (
+                True,
+                {
+                    "TG_AGENT_ENABLED": "0",
+                    "TG_CHAT_ID": "100",
+                    "TG_AGENT_ALLOWED_USER_IDS": "200",
+                },
+                "Telegram 接入：<b>已关闭</b>",
+                ["开启 Telegram Agent", "关闭全部 Media Agent"],
+            ),
+            (
+                True,
                 {
                     "TG_AGENT_ENABLED": "1",
                     "TG_CHAT_ID": "100",
                     "TG_AGENT_ALLOWED_USER_IDS": "200",
                 },
-                "Media Agent 已就绪",
+                "Telegram 接入：<b>已开启</b>",
+                ["关闭 Telegram Agent", "关闭全部 Media Agent"],
             ),
         )
-        for values, expected in cases:
+        for global_enabled, values, expected, labels in cases:
             with self.subTest(expected=expected):
                 bot = _Bot()
                 with patch(
+                    "app.bot.agent_adapter.is_agent_enabled",
+                    return_value=global_enabled,
+                ), patch(
                     "app.bot.agent_adapter.get",
                     side_effect=lambda key, default="": values.get(key, default),
                 ), patch("app.bot.agent_adapter.get_agent_service") as service:
-                    handle_agent_guide(bot, _message("/agent"))
+                    handle_agent_guide(bot, _message("/agent"), _Telebot)
                 service.assert_not_called()
                 self.assertIn(expected, bot.replies[0][1])
-                if expected == "Media Agent 已就绪":
-                    self.assertIn("下载链接仍按原下载流程处理", bot.replies[0][1])
-                    self.assertIn("/agent_reset", bot.replies[0][1])
+                self.assertIn(
+                    "传统整理、同步、搜索、RSS 与状态命令不受 Agent 开关影响",
+                    bot.replies[0][1],
+                )
+                markup = bot.replies[0][2]["reply_markup"]
+                self.assertEqual([button.text for button in markup.buttons], labels)
+                self.assertTrue(
+                    all(button.callback_data.startswith("tgc:") for button in markup.buttons)
+                )
+
+        bot = _Bot()
+        values = {
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "201",
+        }
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            handle_agent_guide(bot, _message("/agent"), _Telebot)
+        self.assertIn("当前身份未获准管理 Media Agent", bot.replies[0][1])
+
+    def test_agent_control_switches_runtime_without_restarting_bot(self):
+        values = {
+            "AGENT_ENABLED": "1",
+            "TG_AGENT_ENABLED": "1",
+            "TG_BOT_TOKEN": "123:token",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+
+        def fake_get(key, default=""):
+            return values.get(key, default)
+
+        def fake_save(updates):
+            values.update(updates)
+
+        bot = _Bot()
+        call = _callback("tgc:control", callback_id="control")
+        action_store = Mock()
+        with patch(
+            "app.bot.agent_adapter.is_agent_enabled",
+            side_effect=lambda: values["AGENT_ENABLED"] == "1",
+        ), patch(
+            "app.bot.agent_adapter.get", side_effect=fake_get
+        ), patch(
+            "app.config.set_and_save", side_effect=fake_save
+        ) as save, patch(
+            "app.bot.handlers.request_command_menu_refresh"
+        ) as refresh, patch(
+            "app.modules.agent_runtime.request_agent_runtime_reconcile"
+        ) as reconcile, patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=action_store,
+        ):
+            handle_agent_control_action(
+                bot,
+                call,
+                _Telebot,
+                {
+                    "decision": "apply",
+                    "operation": "agent_control",
+                    "value": {"action": "disable_telegram"},
+                },
+            )
+
+        save.assert_called_once_with({"TG_AGENT_ENABLED": "0"})
+        refresh.assert_called_once_with()
+        reconcile.assert_not_called()
+        action_store.revoke_owner.assert_called_once_with(owner="tg:v1:100\x1f200")
+        self.assertIn("Telegram 接入：<b>已关闭</b>", bot.edits[-1][0])
+        self.assertEqual(bot.answers[-1][1], "Telegram Agent 已关闭")
+
+    def test_agent_control_enable_all_updates_both_switches_and_reconciles(self):
+        values = {
+            "AGENT_ENABLED": "0",
+            "TG_AGENT_ENABLED": "0",
+            "TG_BOT_TOKEN": "123:token",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+
+        def fake_get(key, default=""):
+            return values.get(key, default)
+
+        def fake_save(updates):
+            values.update(updates)
+
+        bot = _Bot()
+        with patch(
+            "app.bot.agent_adapter.is_agent_enabled",
+            side_effect=lambda: values["AGENT_ENABLED"] == "1",
+        ), patch(
+            "app.bot.agent_adapter.get", side_effect=fake_get
+        ), patch(
+            "app.config.set_and_save", side_effect=fake_save
+        ) as save, patch(
+            "app.bot.handlers.request_command_menu_refresh"
+        ) as refresh, patch(
+            "app.modules.agent_runtime.request_agent_runtime_reconcile"
+        ) as reconcile:
+            handle_agent_control_action(
+                bot,
+                _callback("tgc:enable-preview", callback_id="enable-preview"),
+                _Telebot,
+                {
+                    "decision": "preview",
+                    "operation": "agent_control",
+                    "value": {"action": "enable_all"},
+                },
+            )
+            save.assert_not_called()
+            self.assertIn("确认开启 Media Agent", bot.edits[-1][0])
+            self.assertEqual(
+                [button.text for button in bot.edits[-1][3]["reply_markup"].buttons],
+                ["确认开启全部", "取消"],
+            )
+
+            handle_agent_control_action(
+                bot,
+                _callback("tgc:enable", callback_id="enable"),
+                _Telebot,
+                {
+                    "decision": "confirm",
+                    "operation": "agent_control",
+                    "value": {"action": "enable_all", "confirmed": True},
+                },
+            )
+
+        save.assert_called_once_with(
+            {"AGENT_ENABLED": "1", "TG_AGENT_ENABLED": "1"}
+        )
+        refresh.assert_called_once_with()
+        reconcile.assert_called_once_with()
+        self.assertIn("全局服务：<b>已开启</b>", bot.edits[-1][0])
+        self.assertIn("Telegram 接入：<b>已开启</b>", bot.edits[-1][0])
+        self.assertEqual(bot.answers[-1][1], "Media Agent 已开启")
+
+    def test_agent_control_global_close_requires_confirmation_and_reconciles(self):
+        from app.modules.telegram_write_confirmations import (
+            reset_telegram_write_confirmation_store_for_tests,
+        )
+
+        reset_telegram_write_confirmation_store_for_tests()
+        values = {
+            "AGENT_ENABLED": "1",
+            "TG_AGENT_ENABLED": "1",
+            "TG_BOT_TOKEN": "123:token",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+
+        def fake_get(key, default=""):
+            return values.get(key, default)
+
+        def fake_save(updates):
+            values.update(updates)
+
+        bot = _Bot()
+        call = _callback("tgc:preview", callback_id="preview")
+        with patch(
+            "app.bot.agent_adapter.is_agent_enabled",
+            side_effect=lambda: values["AGENT_ENABLED"] == "1",
+        ), patch(
+            "app.bot.agent_adapter.get", side_effect=fake_get
+        ), patch("app.config.set_and_save", side_effect=fake_save) as save, patch(
+            "app.bot.handlers.request_command_menu_refresh"
+        ) as refresh, patch(
+            "app.modules.agent_runtime.request_agent_runtime_reconcile"
+        ) as reconcile:
+            handle_agent_control_action(
+                bot,
+                call,
+                _Telebot,
+                {
+                    "decision": "preview",
+                    "operation": "agent_control",
+                    "value": {"action": "disable_all"},
+                },
+            )
+            save.assert_not_called()
+            self.assertIn("确认关闭全部 Media Agent", bot.edits[-1][0])
+            self.assertEqual(
+                [button.text for button in bot.edits[-1][3]["reply_markup"].buttons],
+                ["确认关闭全部", "取消"],
+            )
+
+            handle_agent_control_action(
+                bot,
+                _callback("tgc:confirm", callback_id="confirm"),
+                _Telebot,
+                {
+                    "decision": "confirm",
+                    "operation": "agent_control",
+                    "value": {"action": "disable_all", "confirmed": True},
+                },
+            )
+
+        save.assert_called_once_with({"AGENT_ENABLED": "0"})
+        refresh.assert_called_once_with()
+        reconcile.assert_called_once_with()
+        self.assertIn("全局服务：<b>已关闭</b>", bot.edits[-1][0])
+        self.assertEqual(bot.answers[-1][1], "Media Agent 已全部关闭")
 
     def test_agent_reset_is_owner_scoped_and_fail_closed(self):
         allowed = {

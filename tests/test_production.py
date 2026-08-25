@@ -14,7 +14,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -2384,7 +2384,7 @@ class TelegramBotTests(unittest.TestCase):
             ) as reset:
                 agent(command_message)
                 agent_reset(command_message)
-            guide.assert_called_once_with(bot, command_message)
+            guide.assert_called_once_with(bot, command_message, ANY)
             reset.assert_called_once_with(bot, command_message)
         self.assertEqual(bot.replies[0][1], "未授权会话")
         self.assertIn("<b>MediaFlux Bot</b>", bot.replies[1][1])
@@ -2394,7 +2394,7 @@ class TelegramBotTests(unittest.TestCase):
             "agent", "agent_reset",
         })
 
-    def test_disabled_agent_is_hidden_but_classic_commands_remain(self):
+    def test_disabled_agent_keeps_control_entry_and_classic_commands(self):
         from app.bot import handlers
 
         bot = self.FakeBot()
@@ -2421,14 +2421,16 @@ class TelegramBotTests(unittest.TestCase):
                 ))
 
         commands = {item.command for item in bot.commands}
-        self.assertNotIn("agent", commands)
+        self.assertIn("agent", commands)
         self.assertNotIn("agent_reset", commands)
         self.assertTrue({
             "start", "help", "status", "sync_gy", "organize", "media_search",
             "rss", "rss_refresh", "rss_dl",
         }.issubset(commands))
         help_text = bot.replies[-2][1]
-        self.assertNotIn("<b>Media Agent</b>", help_text)
+        self.assertIn("<b>Media Agent</b>", help_text)
+        self.assertIn("/agent — 查看状态并开启或关闭 Agent", help_text)
+        self.assertNotIn("/agent_reset", help_text)
         self.assertIn("/rss_refresh ID — 刷新订阅", help_text)
         self.assertIn("/status — 查看整理、同步与待处理状态", help_text)
         self.assertIn("暂无 RSS 订阅", bot.replies[-1][1])
