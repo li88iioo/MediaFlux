@@ -3,7 +3,7 @@
 {% block body_class %}organize-page{% if organize_view == "rules" %} organize-rules-page{% endif %} persistent-savebar-page{% endblock %}
 {% block page_title %}{{ "整理规则" if organize_view == "rules" else "光鸭整理" }}{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/organize.css') }}?v=20260821d">
+<link rel="stylesheet" href="{{ url_for('static', path='css/organize.css') }}?v=20260825b">
 {% endblock %}
 
 {% block content %}
@@ -578,15 +578,19 @@
             <div><span>RECOGNITION PREPROCESS</span><h3 id="preprocessRulesTitle">识别预处理规则</h3><p>常见与复合发布组由本地识别词库清洗；这里用于特殊来源、别名和季集纠偏，危险模板默认停用。</p></div>
             <button type="button" class="icon-btn" data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
         </div>
-        <div class="media-config-body tmdb-regex-body">
-            <section class="tmdb-regex-ledger" aria-label="预处理规则列表">
+        <div class="rules-workbench-tabs" role="tablist" aria-label="识别预处理规则视图">
+            <button type="button" class="rules-workbench-tab active" id="preprocessLedgerTab" role="tab" aria-selected="true" aria-controls="preprocessLedgerPanel" data-rules-tab="ledger"><i data-lucide="list"></i><span>规则台账</span></button>
+            <button type="button" class="rules-workbench-tab" id="preprocessEditorTab" role="tab" aria-selected="false" aria-controls="preprocessEditorPanel" data-rules-tab="editor"><i data-lucide="square-pen"></i><span>新建 / 编辑</span></button>
+        </div>
+        <div class="media-config-body tmdb-regex-body rules-workbench-body">
+            <section class="tmdb-regex-ledger" id="preprocessLedgerPanel" role="tabpanel" aria-labelledby="preprocessLedgerTab" aria-label="预处理规则列表" data-rules-panel="ledger">
                 <div class="tmdb-regex-toolbar">
                     <div><strong>规则台账</strong><span id="preprocessRuleListState">打开后读取规则</span></div>
                     <div class="preprocess-toolbar-actions"><button type="button" class="jump-btn" id="restorePreprocessRulesBtn"><i data-lucide="rotate-ccw"></i>恢复推荐</button><button type="button" class="jump-btn" id="newPreprocessRuleBtn"><i data-lucide="plus"></i>新建规则</button></div>
                 </div>
                 <div class="tmdb-regex-table-frame tmdb-regex-rule-list" id="preprocessRuleTableBody" aria-live="polite"><div class="tmdb-regex-rule-empty">打开后读取规则</div></div>
             </section>
-            <section class="tmdb-regex-editor" aria-label="预处理规则编辑器">
+            <section class="tmdb-regex-editor" id="preprocessEditorPanel" role="tabpanel" aria-labelledby="preprocessEditorTab" aria-label="预处理规则编辑器" data-rules-panel="editor">
                 <div class="tmdb-regex-toolbar"><div><strong id="preprocessEditorTitle">新建规则</strong><span>标题动作先执行，季集动作只调整已解析出的数字</span></div></div>
                 <form id="preprocessRuleForm">
                     <input type="hidden" id="preprocessRuleId">
@@ -627,22 +631,30 @@
 
 
 <div id="recognitionKnowledgeModal" class="media-config-modal" hidden>
-    <div class="media-config-dialog recognition-knowledge-dialog" role="dialog" aria-modal="true" aria-labelledby="recognitionKnowledgeTitle">
+    <div class="media-config-dialog tmdb-regex-dialog recognition-knowledge-dialog" role="dialog" aria-modal="true" aria-labelledby="recognitionKnowledgeTitle">
         <div class="media-config-head">
             <div><span>LOCAL RECOGNITION KNOWLEDGE</span><h3 id="recognitionKnowledgeTitle">本地识别词库</h3><p>精确管理发布组和尾部制作组；内置词条可停用，AI 学习词条需两个不同样本后才会自动启用。</p></div>
             <button type="button" class="icon-btn" data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
         </div>
-        <div class="media-config-body recognition-knowledge-body">
-            <section class="recognition-knowledge-ledger" aria-label="识别知识列表">
-                <div class="tmdb-regex-toolbar"><div><strong>词条台账</strong><span id="recognitionKnowledgeListState">打开后读取词库</span></div><button type="button" class="jump-btn" id="newRecognitionKnowledgeBtn"><i data-lucide="plus"></i>新建词条</button></div>
-                <div class="recognition-knowledge-search"><input class="form-input" id="recognitionKnowledgeSearch" maxlength="160" placeholder="搜索标准名称或别名"><select class="form-select" id="recognitionKnowledgeFilter"><option value="">全部类型</option><option value="release_group">前置发布组</option><option value="release_suffix">尾部制作组</option></select></div>
+        <div class="rules-workbench-tabs" role="tablist" aria-label="本地识别词库视图">
+            <button type="button" class="rules-workbench-tab active" id="recognitionKnowledgeLedgerTab" role="tab" aria-selected="true" aria-controls="recognitionKnowledgeLedgerPanel" data-rules-tab="ledger"><i data-lucide="list"></i><span>词条台账</span></button>
+            <button type="button" class="rules-workbench-tab" id="recognitionKnowledgeEditorTab" role="tab" aria-selected="false" aria-controls="recognitionKnowledgeEditorPanel" data-rules-tab="editor"><i data-lucide="square-pen"></i><span>新建 / 编辑</span></button>
+        </div>
+        <div class="media-config-body tmdb-regex-body rules-workbench-body recognition-knowledge-body">
+            <section class="tmdb-regex-ledger recognition-knowledge-ledger" id="recognitionKnowledgeLedgerPanel" role="tabpanel" aria-labelledby="recognitionKnowledgeLedgerTab" aria-label="识别知识列表" data-rules-panel="ledger">
+                <div class="tmdb-regex-toolbar recognition-knowledge-toolbar">
+                    <div class="recognition-knowledge-toolbar-copy"><strong>词条台账</strong><span id="recognitionKnowledgeListState">打开后读取词库</span></div>
+                    <input class="form-input" id="recognitionKnowledgeSearch" maxlength="160" aria-label="搜索标准名称或别名" placeholder="搜索标准名称或别名">
+                    <select class="form-select" id="recognitionKnowledgeFilter" aria-label="筛选词条类型"><option value="">全部类型</option><option value="release_group">前置发布组</option><option value="release_suffix">尾部制作组</option></select>
+                    <button type="button" class="jump-btn" id="newRecognitionKnowledgeBtn"><i data-lucide="plus"></i>新建词条</button>
+                </div>
                 <div class="tmdb-regex-table-frame tmdb-regex-rule-list recognition-knowledge-list" id="recognitionKnowledgeTableBody" aria-live="polite"><div class="tmdb-regex-rule-empty">打开后读取词库</div></div>
             </section>
-            <section class="recognition-knowledge-editor" aria-label="识别知识编辑器">
+            <section class="tmdb-regex-editor recognition-knowledge-editor" id="recognitionKnowledgeEditorPanel" role="tabpanel" aria-labelledby="recognitionKnowledgeEditorTab" aria-label="识别知识编辑器" data-rules-panel="editor">
                 <div class="tmdb-regex-toolbar"><div><strong id="recognitionKnowledgeEditorTitle">新建词条</strong><span>只保存精确别名，不接受可执行正则</span></div></div>
                 <form id="recognitionKnowledgeForm">
                     <input type="hidden" id="recognitionKnowledgeId">
-                    <div class="recognition-knowledge-editor-scroll">
+                    <div class="tmdb-regex-editor-scroll recognition-knowledge-editor-scroll">
                         <div class="recognition-knowledge-form">
                             <label><span>词条类型</span><select class="form-select" id="recognitionKnowledgeType"><option value="release_group">前置发布组</option><option value="release_suffix">尾部制作组</option></select></label>
                             <label><span>状态</span><select class="form-select" id="recognitionKnowledgeDisabled"><option value="0">启用</option><option value="1">停用</option></select></label>
@@ -651,7 +663,7 @@
                         </div>
                         <div class="recognition-knowledge-note" id="recognitionKnowledgeEvidence">用户词条保存后立即热加载。AI 学习词条必须同时通过高置信发布组分类与 TMDB 严格复核，且需要两个不同样本才会自动启用。</div>
                     </div>
-                    <div class="recognition-knowledge-actions"><span id="recognitionKnowledgeFormState" aria-live="polite"></span><button type="submit" class="btn btn-primary" id="saveRecognitionKnowledgeBtn">保存词条</button></div>
+                    <div class="tmdb-regex-editor-actions recognition-knowledge-actions"><span id="recognitionKnowledgeFormState" aria-live="polite"></span><button type="submit" class="btn btn-primary" id="saveRecognitionKnowledgeBtn">保存词条</button></div>
                 </form>
             </section>
         </div>
@@ -664,8 +676,12 @@
             <div><span>DETERMINISTIC RECOGNITION</span><h3 id="tmdbRegexRulesTitle">TMDB 强制匹配规则</h3><p>仅为固定发布组或异常命名建立规则；高优先级规则先执行，保存前会校验 TMDB 目标。</p></div>
             <button type="button" class="icon-btn" data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
         </div>
-        <div class="media-config-body tmdb-regex-body">
-            <section class="tmdb-regex-ledger" aria-label="强制匹配规则列表">
+        <div class="rules-workbench-tabs" role="tablist" aria-label="TMDB 强制匹配规则视图">
+            <button type="button" class="rules-workbench-tab active" id="tmdbRegexLedgerTab" role="tab" aria-selected="true" aria-controls="tmdbRegexLedgerPanel" data-rules-tab="ledger"><i data-lucide="list"></i><span>规则台账</span></button>
+            <button type="button" class="rules-workbench-tab" id="tmdbRegexEditorTab" role="tab" aria-selected="false" aria-controls="tmdbRegexEditorPanel" data-rules-tab="editor"><i data-lucide="square-pen"></i><span>新建 / 编辑</span></button>
+        </div>
+        <div class="media-config-body tmdb-regex-body rules-workbench-body">
+            <section class="tmdb-regex-ledger" id="tmdbRegexLedgerPanel" role="tabpanel" aria-labelledby="tmdbRegexLedgerTab" aria-label="强制匹配规则列表" data-rules-panel="ledger">
                 <div class="tmdb-regex-toolbar">
                     <div><strong>规则列表</strong><span id="tmdbRegexRuleListState">打开后读取规则</span></div>
                     <button type="button" class="jump-btn" id="newTmdbRegexRuleBtn"><i data-lucide="plus"></i>新建规则</button>
@@ -674,7 +690,7 @@
                     <div class="tmdb-regex-rule-empty">打开后读取规则</div>
                 </div>
             </section>
-            <section class="tmdb-regex-editor" aria-label="规则编辑器">
+            <section class="tmdb-regex-editor" id="tmdbRegexEditorPanel" role="tabpanel" aria-labelledby="tmdbRegexEditorTab" aria-label="规则编辑器" data-rules-panel="editor">
                 <div class="tmdb-regex-toolbar"><div><strong id="tmdbRegexEditorTitle">新建规则</strong><span>先定义命中条件，再锁定 TMDB 结果并用真实样例验证</span></div></div>
                 <form id="tmdbRegexRuleForm">
                     <input type="hidden" id="tmdbRegexRuleId">
@@ -716,5 +732,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/organize.js') }}?v=20260825a"></script>
+<script src="{{ url_for('static', path='js/organize.js') }}?v=20260825b"></script>
 {% endblock %}

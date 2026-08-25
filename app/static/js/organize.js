@@ -65,8 +65,66 @@
     }
     const extensionEditors=isRules?{video:createExtensionEditor('video','r_video_exts'),metadata:createExtensionEditor('metadata','r_metadata_exts')}:{};
 
+    function createResponsiveRulesWorkbench(modalElement){
+        if(!modalElement)return {activate(){},isMobile(){return false;}};
+        const tablist=modalElement.querySelector('.rules-workbench-tabs');
+        const tabs=Array.from(modalElement.querySelectorAll('[data-rules-tab]'));
+        const panels=Array.from(modalElement.querySelectorAll('[data-rules-panel]'));
+        const media=window.matchMedia('(max-width: 920px)');
+        let active=tabs.find(tab=>tab.classList.contains('active'))?.dataset.rulesTab||'ledger';
+        const apply=({focusTab=false,resetScroll=false}={})=>{
+            const mobile=media.matches;
+            tablist.hidden=!mobile;
+            tabs.forEach(tab=>{
+                const selected=tab.dataset.rulesTab===active;
+                tab.classList.toggle('active',selected);
+                tab.setAttribute('aria-selected',String(selected));
+                tab.tabIndex=selected?0:-1;
+            });
+            panels.forEach(panel=>{
+                const selected=panel.dataset.rulesPanel===active;
+                panel.hidden=mobile&&!selected;
+                if(mobile&&!selected)panel.setAttribute('aria-hidden','true');
+                else panel.removeAttribute('aria-hidden');
+            });
+            modalElement.dataset.rulesPanel=mobile?active:'desktop';
+            if(resetScroll){
+                const body=modalElement.querySelector('.rules-workbench-body');
+                const panel=panels.find(item=>item.dataset.rulesPanel===active);
+                if(body)body.scrollTop=0;
+                const scroller=panel?.querySelector('.tmdb-regex-table-frame,.tmdb-regex-editor-scroll');
+                if(scroller)scroller.scrollTop=0;
+            }
+            if(focusTab&&mobile)tabs.find(tab=>tab.dataset.rulesTab===active)?.focus({preventScroll:true});
+        };
+        const activate=(target,options={})=>{
+            if(!panels.some(panel=>panel.dataset.rulesPanel===target))return;
+            active=target;
+            apply(options);
+        };
+        tabs.forEach((tab,index)=>{
+            tab.addEventListener('click',()=>activate(tab.dataset.rulesTab));
+            tab.addEventListener('keydown',event=>{
+                let nextIndex=null;
+                if(event.key==='ArrowRight')nextIndex=(index+1)%tabs.length;
+                else if(event.key==='ArrowLeft')nextIndex=(index-1+tabs.length)%tabs.length;
+                else if(event.key==='Home')nextIndex=0;
+                else if(event.key==='End')nextIndex=tabs.length-1;
+                if(nextIndex===null)return;
+                event.preventDefault();
+                activate(tabs[nextIndex].dataset.rulesTab,{focusTab:true});
+            });
+        });
+        const onBreakpointChange=()=>apply();
+        if(typeof media.addEventListener==='function')media.addEventListener('change',onBreakpointChange);
+        else media.addListener(onBreakpointChange);
+        apply();
+        return {activate,isMobile:()=>media.matches};
+    }
+
     const regexModalElement=document.getElementById('tmdbRegexRulesModal');
     const regexRulesModal=regexModalElement?createAppModal(regexModalElement):null;
+    const regexRulesWorkbench=createResponsiveRulesWorkbench(regexModalElement);
     const regexRuleBody=document.getElementById('tmdbRegexRuleTableBody');
     let regexRules=[];
     let regexRulesLoaded=false;
@@ -75,6 +133,7 @@
 
     const preprocessModalElement=document.getElementById('preprocessRulesModal');
     const preprocessRulesModal=preprocessModalElement?createAppModal(preprocessModalElement):null;
+    const preprocessRulesWorkbench=createResponsiveRulesWorkbench(preprocessModalElement);
     const preprocessRuleBody=document.getElementById('preprocessRuleTableBody');
     let preprocessRules=[];
     let preprocessRulesLoaded=false;
@@ -82,6 +141,7 @@
     const preprocessScopeLabels={filename:'文件名',parent:'父路径',both:'父路径 + 文件名'};
     const recognitionKnowledgeElement=document.getElementById('recognitionKnowledgeModal');
     const recognitionKnowledgeModal=recognitionKnowledgeElement?createAppModal(recognitionKnowledgeElement):null;
+    const recognitionKnowledgeWorkbench=createResponsiveRulesWorkbench(recognitionKnowledgeElement);
     const recognitionKnowledgeBody=document.getElementById('recognitionKnowledgeTableBody');
     let recognitionKnowledge=[];
     let recognitionKnowledgeLoaded=false;
@@ -93,13 +153,18 @@
     function recognitionKnowledgePayload(){
         return {knowledge_type:document.getElementById('recognitionKnowledgeType').value,canonical_value:document.getElementById('recognitionKnowledgeCanonical').value.trim(),aliases:document.getElementById('recognitionKnowledgeAliases').value,disabled:document.getElementById('recognitionKnowledgeDisabled').value==='1'};
     }
+    function openRecognitionKnowledgeEditor(item={}){
+        recognitionKnowledgeWorkbench.activate('editor',{resetScroll:true});
+        resetRecognitionKnowledgeForm(item);
+        if(recognitionKnowledgeWorkbench.isMobile())document.getElementById('recognitionKnowledgeCanonical').focus({preventScroll:true});
+    }
     function resetRecognitionKnowledgeForm(item={}){
         document.getElementById('recognitionKnowledgeId').value=item.id||'';document.getElementById('recognitionKnowledgeType').value=item.knowledge_type||'release_group';document.getElementById('recognitionKnowledgeCanonical').value=item.canonical_value||'';document.getElementById('recognitionKnowledgeAliases').value=(item.aliases||[]).filter(value=>value!==item.canonical_value).join(', ');document.getElementById('recognitionKnowledgeDisabled').value=item.disabled?'1':'0';document.getElementById('recognitionKnowledgeEditorTitle').textContent=item.id?`编辑词条 #${item.id}`:'新建词条';document.getElementById('recognitionKnowledgeFormState').textContent='';const evidence=document.getElementById('recognitionKnowledgeEvidence');if(item.source==='learned'){evidence.textContent=`AI 学习样本 ${item.success_count||0}/2 · ${item.disabled?'尚未启用':'已通过双样本验证并热加载'}`;}else if(item.source==='builtin'){evidence.textContent='内置词条随版本提供，可以停用或修改，但不能删除；后续种子升级不会覆盖你的修改。';}else{evidence.textContent='用户词条保存后立即热加载，自动整理、人工识别、本地整理与 TG 整理共用。';}
     }
     function renderRecognitionKnowledgeEmpty(message){recognitionKnowledgeBody.replaceChildren();const empty=document.createElement('div');empty.className='tmdb-regex-rule-empty';empty.textContent=message;recognitionKnowledgeBody.appendChild(empty);}
     function createRecognitionKnowledgeCard(item){
         const card=document.createElement('article');card.className='tmdb-regex-rule-card recognition-knowledge-card';card.classList.toggle('is-disabled',Boolean(item.disabled));card.classList.toggle('is-pending',item.source==='learned'&&item.disabled);
-        const copy=document.createElement('div');copy.className='tmdb-regex-rule-copy';copy.tabIndex=0;copy.setAttribute('role','button');const open=()=>resetRecognitionKnowledgeForm(item);copy.addEventListener('click',open);copy.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();open();}});
+        const copy=document.createElement('div');copy.className='tmdb-regex-rule-copy';copy.tabIndex=0;copy.setAttribute('role','button');const open=()=>openRecognitionKnowledgeEditor(item);copy.addEventListener('click',open);copy.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();open();}});
         const main=document.createElement('div');main.className='tmdb-regex-rule-main';const dot=document.createElement('span');dot.className=`connection-dot ${item.disabled?'offline':'online'}`;const name=document.createElement('strong');name.textContent=item.canonical_value;const source=document.createElement('span');source.className='recognition-knowledge-source';source.textContent=recognitionKnowledgeSourceLabels[item.source]||item.source;main.append(dot,name,source);
         const meta=document.createElement('div');meta.className='tmdb-regex-rule-meta';meta.textContent=`${recognitionKnowledgeTypeLabels[item.knowledge_type]||item.knowledge_type} · ${item.disabled?'停用':'启用'} · ${item.aliases?.length||0} 个别名${item.source==='learned'?` · 样本 ${item.success_count||0}/2`:''}`;const aliases=document.createElement('code');aliases.className='tmdb-regex-rule-pattern';aliases.textContent=(item.aliases||[]).join(' · ');copy.append(main,meta,aliases);
         const actions=document.createElement('div');actions.className='tmdb-regex-rule-actions';const edit=document.createElement('button');edit.type='button';edit.className='icon-action';edit.title='编辑';edit.innerHTML='<i data-lucide="pencil"></i>';edit.addEventListener('click',open);actions.appendChild(edit);if(item.source!=='builtin'){const remove=document.createElement('button');remove.type='button';remove.className='icon-action danger';remove.title='删除';remove.innerHTML='<i data-lucide="trash-2"></i>';remove.addEventListener('click',async event=>{const confirmed=await appConfirm({trigger:event.currentTarget,title:'删除本地识别词条',message:`删除「${item.canonical_value}」后会立即停止识别其所有别名。`,confirmText:'删除词条',danger:true});if(!confirmed)return;const response=await fetch(`/api/tools/recognition-knowledge/${item.id}`,{method:'DELETE'});const data=await response.json();if(!response.ok){await appAlert({type:'error',title:'删除失败',message:data.error||'无法删除词条'});return;}if(String(item.id)===document.getElementById('recognitionKnowledgeId').value)resetRecognitionKnowledgeForm();await loadRecognitionKnowledge(true);});actions.appendChild(remove);}card.append(copy,actions);return card;
@@ -147,6 +212,12 @@
         preprocessRuleBody.querySelectorAll('.tmdb-regex-rule-card').forEach(card=>card.classList.toggle('is-active',card.dataset.ruleId===activeId));
     }
 
+    function openPreprocessRuleEditor(rule){
+        preprocessRulesWorkbench.activate('editor',{resetScroll:true});
+        resetPreprocessRuleForm(rule);
+        if(rule?.id&&preprocessRulesWorkbench.isMobile())document.getElementById('preprocessRuleName').focus({preventScroll:true});
+    }
+
     function resetPreprocessRuleForm(rule){
         const value=rule||{};
         document.getElementById('preprocessRuleId').value=value.id||'';
@@ -191,7 +262,7 @@
         const card=document.createElement('article');card.className='tmdb-regex-rule-card preprocess-rule-card';card.dataset.ruleId=String(rule.id);
         card.classList.toggle('is-disabled',Boolean(rule.disabled));card.classList.toggle('is-builtin',Boolean(rule.builtin));
         const copy=document.createElement('div');copy.className='tmdb-regex-rule-copy';copy.tabIndex=0;copy.setAttribute('role','button');copy.setAttribute('aria-label',`编辑规则 ${rule.name}`);
-        const open=()=>resetPreprocessRuleForm(rule);copy.addEventListener('click',open);copy.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();open();}});
+        const open=()=>openPreprocessRuleEditor(rule);copy.addEventListener('click',open);copy.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();open();}});
         const main=document.createElement('div');main.className='tmdb-regex-rule-main';const dot=document.createElement('span');dot.className=`connection-dot ${rule.disabled?'offline':'online'}`;const name=document.createElement('strong');name.textContent=rule.name;main.append(dot,name);
         if(rule.builtin){const badge=document.createElement('span');badge.className='preprocess-badge';badge.textContent='推荐';main.appendChild(badge);}
         const priority=document.createElement('span');priority.className='tmdb-regex-priority';priority.textContent=`P${rule.priority}`;main.appendChild(priority);
@@ -254,6 +325,12 @@
         if(!regexRuleBody)return;
         const activeId=document.getElementById('tmdbRegexRuleId').value;
         regexRuleBody.querySelectorAll('.tmdb-regex-rule-card').forEach(card=>card.classList.toggle('is-active',card.dataset.ruleId===activeId));
+    }
+
+    function openRegexRuleEditor(rule){
+        regexRulesWorkbench.activate('editor',{resetScroll:true});
+        resetRegexRuleForm(rule);
+        if(rule?.id&&regexRulesWorkbench.isMobile())document.getElementById('tmdbRegexRuleName').focus({preventScroll:true});
     }
 
     function resetRegexRuleForm(rule){
@@ -325,7 +402,7 @@
         copy.tabIndex=0;
         copy.setAttribute('role','button');
         copy.setAttribute('aria-label',`编辑规则 ${rule.name}`);
-        const openRule=()=>resetRegexRuleForm(rule);
+        const openRule=()=>openRegexRuleEditor(rule);
         copy.addEventListener('click',openRule);
         copy.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();openRule();}});
 
@@ -357,7 +434,7 @@
         edit.title='编辑规则';
         edit.setAttribute('aria-label','编辑规则');
         edit.innerHTML='<i data-lucide="pencil"></i>';
-        edit.addEventListener('click',()=>resetRegexRuleForm(rule));
+        edit.addEventListener('click',openRule);
         const remove=document.createElement('button');
         remove.type='button';
         remove.className='icon-action danger';
@@ -709,19 +786,22 @@
 
     document.getElementById('saveOrganizeConfigBtn').addEventListener('click',saveConfig);
     if(isRules){
-    document.getElementById('openPreprocessRulesBtn').addEventListener('click',event=>{preprocessRulesModal.open(event.currentTarget);loadPreprocessRules(preprocessRulesLoaded);});
-    document.getElementById('newPreprocessRuleBtn').addEventListener('click',()=>resetPreprocessRuleForm());
+    document.getElementById('openPreprocessRulesBtn').addEventListener('click',event=>{preprocessRulesWorkbench.activate('ledger',{resetScroll:true});preprocessRulesModal.open(event.currentTarget);loadPreprocessRules(preprocessRulesLoaded);});
+    document.getElementById('newPreprocessRuleBtn').addEventListener('click',()=>openPreprocessRuleEditor());
+    document.getElementById('preprocessEditorTab').addEventListener('click',()=>openPreprocessRuleEditor());
     document.getElementById('restorePreprocessRulesBtn').addEventListener('click',restorePreprocessRules);
     document.getElementById('previewPreprocessRuleBtn').addEventListener('click',previewPreprocessRule);
     document.getElementById('preprocessRuleForm').addEventListener('submit',savePreprocessRule);
     document.getElementById('preprocessAction').addEventListener('change',syncPreprocessActionFields);
-    document.getElementById('openRecognitionKnowledgeBtn').addEventListener('click',event=>{recognitionKnowledgeModal.open(event.currentTarget);loadRecognitionKnowledge(recognitionKnowledgeLoaded);});
-    document.getElementById('newRecognitionKnowledgeBtn').addEventListener('click',()=>resetRecognitionKnowledgeForm());
+    document.getElementById('openRecognitionKnowledgeBtn').addEventListener('click',event=>{recognitionKnowledgeWorkbench.activate('ledger',{resetScroll:true});recognitionKnowledgeModal.open(event.currentTarget);loadRecognitionKnowledge(recognitionKnowledgeLoaded);});
+    document.getElementById('newRecognitionKnowledgeBtn').addEventListener('click',()=>openRecognitionKnowledgeEditor());
+    document.getElementById('recognitionKnowledgeEditorTab').addEventListener('click',()=>openRecognitionKnowledgeEditor());
     document.getElementById('recognitionKnowledgeForm').addEventListener('submit',saveRecognitionKnowledge);
     document.getElementById('recognitionKnowledgeSearch').addEventListener('input',scheduleRecognitionKnowledgeSearch);
     document.getElementById('recognitionKnowledgeFilter').addEventListener('change',()=>loadRecognitionKnowledge(true));
-    document.getElementById('openTmdbRegexRulesBtn').addEventListener('click',event=>{regexRulesModal.open(event.currentTarget);loadRegexRules(regexRulesLoaded);});
-    document.getElementById('newTmdbRegexRuleBtn').addEventListener('click',()=>resetRegexRuleForm());
+    document.getElementById('openTmdbRegexRulesBtn').addEventListener('click',event=>{regexRulesWorkbench.activate('ledger',{resetScroll:true});regexRulesModal.open(event.currentTarget);loadRegexRules(regexRulesLoaded);});
+    document.getElementById('newTmdbRegexRuleBtn').addEventListener('click',()=>openRegexRuleEditor());
+    document.getElementById('tmdbRegexEditorTab').addEventListener('click',()=>openRegexRuleEditor());
     document.getElementById('previewTmdbRegexRuleBtn').addEventListener('click',previewRegexRule);
     document.getElementById('tmdbRegexRuleForm').addEventListener('submit',saveRegexRule);
     document.getElementById('tmdbRegexMediaType').addEventListener('change',syncRegexSeasonField);

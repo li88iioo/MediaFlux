@@ -32,6 +32,21 @@ def test_logs_template_markup_contract():
     assert 'id="runtimePauseBtn"' in content
     assert 'id="runtimeClearBtn"' in content
 
+    # 整理详情去除重复提示与正文危险区，回收站操作统一收入口底栏。
+    template = template_path.read_text(encoding="utf-8")
+    assert "organize-correction-hint" not in template
+    assert "organizeDangerZone" not in content
+    footer = template[template.index('<footer class="organize-detail-footer">'):template.index("</footer>", template.index('<footer class="organize-detail-footer">'))]
+    assert footer.index('id="organizeDeleteBtn"') < footer.index('id="organizeReturnBtn"')
+    assert "deleteButton.hidden=!data.allowed_actions.delete" in content
+
+    # 首次异步加载完成前分页器不可见，避免在短占位行下方闪入内容区。
+    assert 'id="organizePagination" aria-label="整理日志分页" aria-busy="true" aria-hidden="true"' in template
+    assert 'id="organizePrev" disabled' in template
+    assert 'id="organizeNext" disabled' in template
+    assert "function revealOrganizePagination()" in content
+    assert "pagination.classList.remove('is-initializing')" in content
+
 
 def test_logs_responsive_css_contract():
     css_path = Path("app/static/css/main.css")
@@ -40,6 +55,7 @@ def test_logs_responsive_css_contract():
 
     # 基础样式中需包含 search-row 定义
     assert ".logs-search-row" in css
+    assert ".table-pagination.is-initializing { visibility: hidden; pointer-events: none; }" in css
 
     # 移动端/小屏响应式中需包含整理日志的分行规则：来源/状态、搜索行、批量改名/回退两列、回收站通栏
     assert ".logs-filterbar:not(.runtime-log-filterbar)" in css
@@ -49,6 +65,9 @@ def test_logs_responsive_css_contract():
     assert "#organizeBatchRevertBtn" in css
     assert "#organizeBatchDeleteBtn" in css
     assert "grid-column: 1 / -1" in css
+    assert ".organize-detail-actions .jump-btn, .organize-detail-actions .btn { width: auto; min-height: 40px; height: 40px; }" in css
+    assert ".organize-detail-actions .jump-btn, .organize-detail-actions .btn { width: 100%; min-width: 0; min-height: 42px; height: 42px; white-space: nowrap; }" in css
+    assert "#organizeDeleteBtn, #organizeReorganizeBtn { grid-column: 1 / -1; }" in css
 
     # 实时日志移动端需包含级别+搜索框并排、控制条整行两端并排
     assert ".runtime-log-filterbar" in css

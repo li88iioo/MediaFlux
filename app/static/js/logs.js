@@ -79,6 +79,13 @@ function loadOverview() {
     });
 }
 
+function revealOrganizePagination() {
+    const pagination=document.getElementById('organizePagination');
+    pagination.classList.remove('is-initializing');
+    pagination.setAttribute('aria-busy','false');
+    pagination.removeAttribute('aria-hidden');
+}
+
 function loadOrganize(page=organizePage) {
     const requestSerial = ++organizeRequestSerial;
     loadingOrg = true;
@@ -100,7 +107,7 @@ function loadOrganize(page=organizePage) {
         document.getElementById('organizeNext').disabled=!pages||organizePage>=pages;
         const body = document.getElementById('organizeList');
         const releaseHeight=lockElementHeight(body.closest('.table-wrap'));
-        if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="table-empty">暂无整理日志</td></tr>'; organizeRows=[];selectedOrganizeLogs.clear();updateOrganizeBatchState();releaseHeight();return; }
+        if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="table-empty">暂无整理日志</td></tr>'; organizeRows=[];selectedOrganizeLogs.clear();updateOrganizeBatchState();revealOrganizePagination();releaseHeight();return; }
         organizeRows=rows;selectedOrganizeLogs.clear();
         body.innerHTML = rows.map(r=>{
             const st = orgStatusMap[r.status] || [r.raw_status||r.status, ''];
@@ -132,6 +139,7 @@ function loadOrganize(page=organizePage) {
         });
         document.getElementById('organizeSelectAll').checked=false;updateOrganizeBatchState();
         document.getElementById('lastRefresh').textContent = '更新于 '+new Date().toLocaleTimeString();
+        revealOrganizePagination();
         releaseHeight();
     }).catch(error=>{
         if(requestSerial!==organizeRequestSerial)return;
@@ -233,8 +241,9 @@ function _renderOrganizeDetail(data){
     document.getElementById('organizeReorganizeBtn').disabled=!data.allowed_actions.reorganize;
     document.getElementById('organizeReturnBtn').disabled=!data.allowed_actions.return_to_source;
     document.getElementById('organizeRevertBtn').disabled=!data.allowed_actions.revert;
-    document.getElementById('organizeDeleteBtn').disabled=!data.allowed_actions.delete;
-    document.getElementById('organizeDangerZone').hidden=!data.allowed_actions.delete;
+    const deleteButton=document.getElementById('organizeDeleteBtn');
+    deleteButton.disabled=!data.allowed_actions.delete;
+    deleteButton.hidden=!data.allowed_actions.delete;
     document.getElementById('organizeTmdbCandidates').replaceChildren();const namingPreview=document.getElementById('organizeNamingPreview');namingPreview.replaceChildren();namingPreview.hidden=true;if(!organizeTaskPolling)_setOrganizeState('');
     window.renderLucideIcons?.(document.getElementById('organizeDetailModal'));
 }
