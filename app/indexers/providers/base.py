@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from ..errors import IndexerInvalidResponse, IndexerSecurityError
@@ -11,6 +14,14 @@ from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearc
 _INFOHASH_HEX = re.compile(r"^[0-9a-fA-F]{40}$")
 _INFOHASH_BASE32 = re.compile(r"^[A-Z2-7]{32}$", re.IGNORECASE)
 _BTMH_SHA256 = re.compile(r"^1220[0-9a-fA-F]{64}$")
+_CHALLENGE_MARKERS = (
+    "just a moment",
+    "verify you are human",
+    "performing security verification",
+    "challenge-platform",
+    "cf-browser-verification",
+    "turnstile",
+)
 
 
 class IndexerAdapter(ABC):
@@ -38,6 +49,34 @@ class IndexerAdapter(ABC):
     def search_timeout_overhead_seconds(self) -> float:
         """不挤占站点主体请求预算的轻量预检时长，默认没有额外预算。"""
         return 0.0
+
+
+class SearchRequestPacer:
+    """为无自身限流能力的站点提供每适配器平滑请求间隔。"""
+
+    def __init__(
+        self,
+        interval_seconds: float = 0,
+        *,
+        monotonic: Callable[[], float] | None = None,
+        sleeper: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self._monotonic = monotonic or time.monotonic
+        self._sleep = sleeper or asyncio.sleep
+        self._lock = asyncio.Lock()
+        self._last_started: float | None = None
+
+    async def wait(self) -> None:
+        if self.interval_seconds <= 0:
+            return
+        async with self._lock:
+            now = self._monotonic()
+            if self._last_started is not None:
+                remaining = self.interval_seconds - (now - self._last_started)
+                if remaining > 0:
+                    await self._sleep(remaining)
+            self._last_started = self._monotonic()
 
 
 class DirectResultAdapter(IndexerAdapter):
@@ -89,6 +128,22 @@ def magnet_infohash(value: str | None) -> str | None:
             if _BTMH_SHA256.fullmatch(multihash):
                 return multihash[4:44].lower()
     return None
+
+
+def is_likely_challenge_page(
+    body: bytes | str,
+    *,
+    usable_markers: tuple[str, ...] = (),
+) -> bool:
+    """识别返回 HTTP 200 的人机验证页，同时避免覆盖包含有效业务结构的页面。"""
+    if isinstance(body, bytes):
+        text = body[:256 * 1024].decode("utf-8", errors="replace")
+    else:
+        text = str(body or "")[:256 * 1024]
+    normalized = text.casefold()
+    if any(marker.casefold() in normalized for marker in usable_markers):
+        return False
+    return any(marker in normalized for marker in _CHALLENGE_MARKERS)
 
 
 def require_html_response(response) -> None:

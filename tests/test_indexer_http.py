@@ -174,20 +174,20 @@ class IndexerHttpTests(unittest.IsolatedAsyncioTestCase):
             await client.get("https://nyaa.si/")
 
     async def test_browser_client_rewrites_sni_keeps_host_and_impersonates_chrome(self):
-        session = FakeCurlSession([FakeCurlResponse(url="https://btbtla.com/search/demo")])
+        session = FakeCurlSession([FakeCurlResponse(url="https://btbtlb.com/search/demo")])
         client = BrowserImpersonatingHttpClient(
-            allowed_hosts={"www.btbtla.com", "btbtla.com"},
+            allowed_hosts={"www.btbtlb.com", "btbtlb.com"},
             resolver=PUBLIC_DNS,
             session_factory=lambda: session,
-            sni_host="btbtla.com",
+            sni_host="btbtlb.com",
         )
         self.client = client
 
-        response = await client.get("https://www.btbtla.com/search/demo")
+        response = await client.get("https://www.btbtlb.com/search/demo")
 
         url, options = session.calls[0]
-        self.assertEqual(url, "https://btbtla.com/search/demo")
-        self.assertEqual(options["headers"]["Host"], "www.btbtla.com")
+        self.assertEqual(url, "https://btbtlb.com/search/demo")
+        self.assertEqual(options["headers"]["Host"], "www.btbtlb.com")
         self.assertEqual(options["impersonate"], "chrome")
         self.assertFalse(options["allow_redirects"] )
         self.assertEqual(response.body, b"ok")
@@ -195,29 +195,29 @@ class IndexerHttpTests(unittest.IsolatedAsyncioTestCase):
     async def test_browser_client_rejects_unregistered_sni_host(self):
         with self.assertRaisesRegex(ValueError, "sni_host"):
             BrowserImpersonatingHttpClient(
-                allowed_hosts={"www.btbtla.com"},
+                allowed_hosts={"www.btbtlb.com"},
                 resolver=PUBLIC_DNS,
                 session_factory=lambda: FakeCurlSession([]),
-                sni_host="btbtla.com",
+                sni_host="btbtlb.com",
             )
 
     async def test_browser_client_validates_actual_sni_host_dns(self):
         session = FakeCurlSession([])
 
         def resolver(host, port):
-            address = "127.0.0.1" if host == "btbtla.com" else "93.184.216.34"
+            address = "127.0.0.1" if host == "btbtlb.com" else "93.184.216.34"
             return [(2, 1, 6, "", (address, port))]
 
         client = BrowserImpersonatingHttpClient(
-            allowed_hosts={"www.btbtla.com", "btbtla.com"},
+            allowed_hosts={"www.btbtlb.com", "btbtlb.com"},
             resolver=resolver,
             session_factory=lambda: session,
-            sni_host="btbtla.com",
+            sni_host="btbtlb.com",
         )
         self.client = client
 
         with self.assertRaises(IndexerSecurityError):
-            await client.get("https://www.btbtla.com/search/demo")
+            await client.get("https://www.btbtlb.com/search/demo")
         self.assertEqual(session.calls, [])
 
     async def test_browser_client_warms_up_once_and_reuses_cookie_session(self):

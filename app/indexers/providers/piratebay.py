@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from ..errors import IndexerInvalidResponse, IndexerRateLimited, IndexerUnavailable
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest
-from .base import DirectResultAdapter
+from .base import DirectResultAdapter, SearchRequestPacer
 
 _INFO_HASH = re.compile(r"^[0-9a-fA-F]{40}$")
 _TRACKERS = (
@@ -33,8 +33,25 @@ class PirateBayAdapter(DirectResultAdapter):
     default_enabled = True
     capabilities = IndexerCapabilities(False, ("magnet",))
 
-    def __init__(self, *, http) -> None:
+    def __init__(
+        self,
+        *,
+        http,
+        min_interval_seconds: float = 0,
+        monotonic=None,
+        sleeper=None,
+        trackers: tuple[str, ...] | None = None,
+    ) -> None:
         self.http = http
+        self.trackers = _normalize_trackers(trackers if trackers is not None else _TRACKERS)
+        self._search_pacer = SearchRequestPacer(
+            min_interval_seconds,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+
+    async def wait_for_search_slot(self, request: IndexerSearchRequest) -> None:
+        await self._search_pacer.wait()
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
         if request.page > 1:
@@ -75,7 +92,7 @@ class PirateBayAdapter(DirectResultAdapter):
         normalized_hash = info_hash.lower()
         magnet = (
             f"magnet:?xt=urn:btih:{normalized_hash}&dn={quote(title, safe='')}"
-            + "".join(f"&tr={tracker}" for tracker in _TRACKERS)
+            + "".join(f"&tr={quote(tracker, safe='')}" for tracker in self.trackers)
         )
         return IndexerItem(
             site_id=self.site_id,
@@ -127,6 +144,24 @@ def _integer(value) -> int | None | object:
     except (TypeError, ValueError, OverflowError):
         return _INVALID_NUMBER
     return result if result >= 0 else _INVALID_NUMBER
+
+
+def _normalize_trackers(values) -> tuple[str, ...]:
+    trackers: list[str] = []
+    for value in values or ():
+        tracker = str(value or "").strip()
+        parsed = urlsplit(tracker)
+        if (
+            parsed.scheme.lower() not in {"http", "https", "udp"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+        ):
+            continue
+        if tracker not in trackers:
+            trackers.append(tracker)
+    return tuple(trackers)
 
 
 def _timestamp(value: int | None) -> datetime | None:

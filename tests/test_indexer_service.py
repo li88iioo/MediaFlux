@@ -116,10 +116,12 @@ class QueryAwareAdapter(FakeAdapter):
         super().__init__(site_id)
         self.items_by_query = {query: list(items) for query, items in items_by_query.items()}
         self.queries = []
+        self.media_types = []
 
     async def search(self, request):
         self.calls += 1
         self.queries.append(request.query)
+        self.media_types.append(request.media_type)
         return IndexerPage(
             items=list(self.items_by_query.get(request.query, [])),
             page=request.page,
@@ -201,6 +203,8 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             ["Tefuda ga Oome no Victoria", "手札が多めのビクトリア"],
         )
         self.assertEqual(mikan.queries, ["奇招百出的维多利亚"] )
+        self.assertEqual(nyaa.media_types, ["tv", "tv"])
+        self.assertEqual(mikan.media_types, ["tv"])
         self.assertEqual([entry.title for entry in result.items], ["Japanese hit", "Chinese hit"] )
         self.assertEqual(
             result.site_queries,
@@ -268,6 +272,24 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.search("fallback", 1, ("1lou",))
 
         self.assertEqual([entry.title for entry in result.items], ["google fallback"])
+        self.assertEqual(result.errors, [])
+
+    async def test_provider_timeout_overhead_extends_total_search_budget(self):
+        adapter = TimeoutOverheadAdapter(
+            "btbtla",
+            [item("btbtla", "mirror fallback", magnet=f"magnet:?xt=urn:btih:{HASH}")],
+            delay=0.02,
+            overhead_seconds=0.04,
+        )
+        service = self.service(
+            [adapter],
+            site_timeout_seconds=0.01,
+            total_timeout_seconds=0.005,
+        )
+
+        result = await service.search("fallback", 1, ("btbtla",))
+
+        self.assertEqual([entry.title for entry in result.items], ["mirror fallback"])
         self.assertEqual(result.errors, [])
 
     async def test_site_timeout_and_total_timeout_preserve_completed_results(self):
@@ -378,7 +400,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             site_id="btbtla",
             site_name="BTBtla",
             title="Frieren",
-            detail_url="https://www.btbtla.com/detail/frieren",
+            detail_url="https://www.btbtlb.com/detail/frieren",
             download_state="resolvable",
             download_kinds=("magnet",),
         )
@@ -390,7 +412,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resolved.kind, "magnet")
         self.assertEqual(len(adapter.resolve_calls), 1)
-        self.assertEqual(adapter.resolve_calls[0].detail_url, "https://www.btbtla.com/detail/frieren")
+        self.assertEqual(adapter.resolve_calls[0].detail_url, "https://www.btbtlb.com/detail/frieren")
         self.assertIsNone(adapter.resolve_calls[0].result_id)
 
     async def test_resolve_rejects_disabled_stored_provider_without_calling_adapter(self):
@@ -421,7 +443,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
                 site_id="btbtla",
                 site_name="BTBtla",
                 title="Frieren",
-                detail_url="https://www.btbtla.com/detail.htm",
+                detail_url="https://www.btbtlb.com/detail.htm",
                 download_state="resolvable",
                 download_kinds=("magnet",),
             )
@@ -440,7 +462,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
                 site_id="btbtla",
                 site_name="BTBtla",
                 title="Frieren",
-                detail_url="https://www.btbtla.com/detail.htm",
+                detail_url="https://www.btbtlb.com/detail.htm",
                 download_state="resolvable",
                 download_kinds=("magnet",),
             )

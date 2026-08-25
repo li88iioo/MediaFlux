@@ -74,11 +74,37 @@ class NyaaAdapter(DirectResultAdapter):
         raise IndexerInvalidResponse("result has no downloadable candidate")
 
     async def _search_base(self, base_url: str, request: IndexerSearchRequest) -> IndexerPage:
+        last_page: IndexerPage | None = None
+        for category in self._search_categories(request):
+            page = await self._search_category(base_url, request, category=category)
+            if page.items:
+                return page
+            last_page = page
+        assert last_page is not None
+        return last_page
+
+    def _search_categories(self, request: IndexerSearchRequest) -> tuple[str, ...]:
+        if self.site_id == "sukebei":
+            return ("2_2", "0_0")
+        media_type = str(getattr(request, "media_type", "") or "").strip().lower()
+        if media_type in {"anime", "tv"}:
+            return ("1_0", "0_0")
+        if media_type == "movie":
+            return ("4_0", "0_0")
+        return ("0_0",)
+
+    async def _search_category(
+        self,
+        base_url: str,
+        request: IndexerSearchRequest,
+        *,
+        category: str,
+    ) -> IndexerPage:
         response = await self.http.get(
             base_url,
             params={
                 "f": "0",
-                "c": "0_0",
+                "c": category,
                 "q": request.query,
                 "s": "seeders",
                 "o": "desc",

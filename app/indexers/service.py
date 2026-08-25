@@ -218,11 +218,15 @@ class IndexerService:
         if cached is not None:
             return cached
 
+        media_type = ranking_context.media_type if ranking_context is not None else ""
         tasks = {
-            site_id: asyncio.create_task(self._search_site_plan(site_id, plans[site_id], page))
+            site_id: asyncio.create_task(
+                self._search_site_plan(site_id, plans[site_id], page, media_type=media_type)
+            )
             for site_id in selected
         }
-        done, pending = await asyncio.wait(tasks.values(), timeout=self.total_timeout_seconds)
+        total_timeout_seconds = self.total_timeout_seconds + self._maximum_timeout_overhead(selected)
+        done, pending = await asyncio.wait(tasks.values(), timeout=total_timeout_seconds)
         outcome_by_site: dict[str, _ProviderOutcome] = {}
         for task in done:
             outcome = task.result()
@@ -441,6 +445,8 @@ class IndexerService:
         site_id: str,
         queries: tuple[str, ...],
         page: int,
+        *,
+        media_type: str = "",
     ) -> _ProviderOutcome:
         circuit_error = self._circuit_error(site_id)
         if circuit_error is not None:
@@ -452,7 +458,10 @@ class IndexerService:
             )
         last_outcome: _ProviderOutcome | None = None
         for attempts, query in enumerate(queries, start=1):
-            outcome = await self._search_site(site_id, IndexerSearchRequest.create(query, page))
+            outcome = await self._search_site(
+                site_id,
+                IndexerSearchRequest.create(query, page, media_type=media_type),
+            )
             outcome.query = query
             outcome.attempts = attempts
             if outcome.error is not None:
@@ -547,6 +556,15 @@ class IndexerService:
             outcome = self._error_outcome(site_id, IndexerUnavailable("unexpected provider failure"))
         outcome.duration_ms = round((perf_counter() - started) * 1000)
         return outcome
+
+    def _maximum_timeout_overhead(self, selected: tuple[str, ...]) -> float:
+        overhead_seconds = 0.0
+        for site_id in selected:
+            adapter = self.registry.get(site_id)
+            timeout_overhead = getattr(adapter, "search_timeout_overhead_seconds", None)
+            if callable(timeout_overhead):
+                overhead_seconds = max(overhead_seconds, max(0.0, float(timeout_overhead())))
+        return overhead_seconds
 
     def _loop_semaphore(self) -> asyncio.Semaphore:
         """返回当前事件循环专用的并发门，避免跨线程复用 asyncio 原语。"""

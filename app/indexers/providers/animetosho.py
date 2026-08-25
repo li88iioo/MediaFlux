@@ -5,7 +5,15 @@ from datetime import datetime, timezone
 
 from ..errors import IndexerInvalidResponse, IndexerRateLimited, IndexerSecurityError, IndexerUnavailable
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
-from .base import IndexerAdapter, fixed_host_join, magnet_infohash
+from .base import (
+    IndexerAdapter,
+    SearchRequestPacer,
+    fixed_host_join,
+    magnet_infohash,
+)
+
+
+_DEFAULT_PAGE_SIZE = 75
 
 
 class AnimeToshoAdapter(IndexerAdapter):
@@ -16,8 +24,25 @@ class AnimeToshoAdapter(IndexerAdapter):
     default_enabled = True
     capabilities = IndexerCapabilities(True, ("magnet", "torrent"))
 
-    def __init__(self, *, http) -> None:
+    def __init__(
+        self,
+        *,
+        http,
+        min_interval_seconds: float = 0,
+        monotonic=None,
+        sleeper=None,
+        page_size: int = _DEFAULT_PAGE_SIZE,
+    ) -> None:
         self.http = http
+        self.page_size = max(1, min(int(page_size), 500))
+        self._search_pacer = SearchRequestPacer(
+            min_interval_seconds,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+
+    async def wait_for_search_slot(self, request: IndexerSearchRequest) -> None:
+        await self._search_pacer.wait()
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
         response = await self.http.get(
@@ -36,7 +61,7 @@ class AnimeToshoAdapter(IndexerAdapter):
         return IndexerPage(
             items=items,
             page=request.page,
-            has_more=bool(entries) and request.page < 100,
+            has_more=len(entries) >= self.page_size and request.page < 100,
             pagination_supported=True,
         )
 

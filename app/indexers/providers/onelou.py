@@ -19,7 +19,13 @@ from ..errors import (
     IndexerUnavailable,
 )
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
-from .base import IndexerAdapter, fixed_host_join, magnet_infohash, require_html_response
+from .base import (
+    IndexerAdapter,
+    fixed_host_join,
+    is_likely_challenge_page,
+    magnet_infohash,
+    require_html_response,
+)
 from .google_site import GoogleSiteResult, GoogleSiteSearch
 
 # 网盘帖没有种子/磁力，除非标题同时带 BT 标记，否则跳过。
@@ -172,6 +178,7 @@ class OneLouAdapter(IndexerAdapter):
                     params={"q": request.query, **_SEARCH_API_PARAMS},
                 )
                 self._validate_status(response.status_code)
+                self._raise_if_challenge(response.body)
                 items = self._parse_api_items(response.body, base_url=base_url)
                 if items is not None:
                     return items
@@ -200,6 +207,7 @@ class OneLouAdapter(IndexerAdapter):
                     fixed_host_join(base_url, f"/search-{quote(request.query, safe='')}.htm"),
                 )
                 self._validate_status(response.status_code)
+                self._raise_if_challenge(response.body)
                 return self._parse_html_items(response, base_url=base_url)
             except httpx.TransportError:
                 best_error = self._prefer_error(
@@ -314,6 +322,7 @@ class OneLouAdapter(IndexerAdapter):
         detail_url = self._join_known_host(stored_result.detail_url or "")
         response = await self.http.get(detail_url)
         self._validate_status(response.status_code)
+        self._raise_if_challenge(response.body)
         require_html_response(response)
         soup = BeautifulSoup(response.body, "lxml")
         anchor = soup.select_one('a[href*="attach-download"]')
@@ -341,6 +350,20 @@ class OneLouAdapter(IndexerAdapter):
             raise IndexerInvalidResponse("result is not resolvable as torrent")
         if not stored_result.detail_url:
             raise IndexerInvalidResponse("result detail URL is missing")
+
+    @staticmethod
+    def _raise_if_challenge(body: bytes) -> None:
+        if is_likely_challenge_page(
+            body,
+            usable_markers=(
+                '"hits"',
+                'class="media thread',
+                "thread-",
+                "attach-download",
+                "magnet:?",
+            ),
+        ):
+            raise IndexerUnavailable("1lou returned a verification page")
 
     @staticmethod
     def _validate_status(status_code: int) -> None:

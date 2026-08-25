@@ -49,6 +49,8 @@ def build_default_registry(
     user_agent: str = "MediaFlux/1.0",
     btbtla_min_interval_seconds: float = 5,
     onelou_min_interval_seconds: float = 5,
+    animetosho_min_interval_seconds: float = 1,
+    tpb_min_interval_seconds: float = 1,
     onelou_google_enabled: bool = True,
 ) -> IndexerRegistry:
     supplied = dict(http_clients or {})
@@ -61,14 +63,14 @@ def build_default_registry(
         user_agent=user_agent,
     )
     mikan_http = supplied.get("mikan") or FixedHostHttpClient(
-        allowed_hosts={"mikanani.me"},
+        allowed_hosts={"mikanani.me", "mikanime.tv"},
         user_agent=user_agent,
         # Mikan 搜索页内嵌全部剧集条目，热门作品实测 4MiB+，默认 2MiB 会截断。
         max_response_bytes=8 * 1024 * 1024,
     )
     btbtla_http = supplied.get("btbtla") or BrowserImpersonatingHttpClient(
-        allowed_hosts={"www.btbtla.com", "btbtla.com"},
-        sni_host="btbtla.com",
+        allowed_hosts={"www.btbtlb.com", "btbtlb.com"},
+        sni_host="btbtlb.com",
     )
     onelou_http = supplied.get("1lou") or FixedHostHttpClient(
         allowed_hosts={"www.1lou.me", "1lou.me", "www.1lou.pro", "1lou.pro"},
@@ -120,7 +122,13 @@ def build_default_registry(
                 google_search=GoogleSiteSearch(http=google_http) if google_http is not None else None,
                 min_interval_seconds=onelou_min_interval_seconds,
             ),
-            "animetosho": AnimeToshoAdapter(http=animetosho_http),
-            "tpb": PirateBayAdapter(http=tpb_http),
+            "animetosho": AnimeToshoAdapter(
+                http=animetosho_http,
+                min_interval_seconds=animetosho_min_interval_seconds,
+            ),
+            "tpb": PirateBayAdapter(
+                http=tpb_http,
+                min_interval_seconds=tpb_min_interval_seconds,
+            ),
         }
     )

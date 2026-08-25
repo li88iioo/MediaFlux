@@ -10,9 +10,14 @@ from app.indexers.result_store import IndexerResultStore
 
 class IndexerModelTests(unittest.TestCase):
     def test_search_request_normalizes_query_and_bounds_page(self):
-        request = IndexerSearchRequest.create("  葬送   的芙莉莲  ", page=3)
+        request = IndexerSearchRequest.create(
+            "  葬送   的芙莉莲  ",
+            page=3,
+            media_type="TV",
+        )
         self.assertEqual(request.query, "葬送 的芙莉莲")
         self.assertEqual(request.page, 3)
+        self.assertEqual(request.media_type, "tv")
 
         for query in ("", "   ", "x" * 121):
             with self.subTest(query_length=len(query)):
@@ -22,6 +27,8 @@ class IndexerModelTests(unittest.TestCase):
             with self.subTest(page=page):
                 with self.assertRaises(IndexerValidationError):
                     IndexerSearchRequest.create("valid", page=page)
+        with self.assertRaises(IndexerValidationError):
+            IndexerSearchRequest.create("valid", media_type="person")
 
     def test_media_search_request_normalizes_titles_aliases_and_metadata(self):
         request = IndexerMediaSearchRequest.create(

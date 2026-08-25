@@ -17,12 +17,20 @@ _DOWNLOAD_KINDS = frozenset({"magnet", "torrent"})
 class IndexerSearchRequest:
     query: str
     page: int = 1
+    media_type: str = ""
 
     @classmethod
-    def create(cls, query: str, page: int = 1) -> "IndexerSearchRequest":
+    def create(
+        cls,
+        query: str,
+        page: int = 1,
+        *,
+        media_type: str = "",
+    ) -> "IndexerSearchRequest":
         normalized = _normalize_search_text(query, required=True)
+        normalized_media_type = _normalize_media_type(media_type)
         _validate_page(page)
-        return cls(query=normalized, page=page)
+        return cls(query=normalized, page=page, media_type=normalized_media_type)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +76,7 @@ class IndexerMediaSearchRequest:
             seen.add(alias.casefold())
             normalized_aliases.append(alias)
         normalized_year = _normalize_media_year(year)
-        normalized_media_type = str(media_type or "").strip().lower()
-        if normalized_media_type not in {"", "movie", "tv", "anime"}:
-            raise IndexerValidationError("invalid media type")
+        normalized_media_type = _normalize_media_type(media_type)
         _validate_page(page)
         return cls(
             title=normalized_title,
@@ -99,6 +105,13 @@ def _normalize_search_text(value: object, *, required: bool = False) -> str:
         raise IndexerValidationError("title is required")
     if len(normalized) > 120:
         raise IndexerValidationError("title length cannot exceed 120")
+    return normalized
+
+
+def _normalize_media_type(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in {"", "movie", "tv", "anime"}:
+        raise IndexerValidationError("invalid media type")
     return normalized
 
 

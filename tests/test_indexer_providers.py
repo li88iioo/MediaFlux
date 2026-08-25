@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import unittest
 
 import httpx
@@ -24,18 +25,8 @@ from app.indexers.providers.piratebay import PirateBayAdapter
 from app.indexers.registry import IndexerRegistry, build_default_registry
 
 
-NYAA_HTML = b"""
-<table class="torrent-list"><tbody>
-<tr>
-  <td><a title="Anime - English-translated">Anime</a></td>
-  <td><a href="/view/123" title="[Group] Frieren 01">[Group] Frieren 01</a></td>
-  <td><a href="/download/123.torrent">torrent</a><a href="magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567&amp;dn=Frieren">magnet</a></td>
-  <td>1.2 GiB</td><td data-timestamp="1720000000">2026-07-26</td>
-  <td>88</td><td>4</td><td>500</td>
-</tr>
-</tbody></table>
-<ul class="pagination"><li><a href="/?p=2">Next</a></li></ul>
-"""
+_INDEXER_FIXTURES = Path(__file__).with_name("fixtures") / "indexers"
+NYAA_HTML = (_INDEXER_FIXTURES / "nyaa-search.html").read_bytes()
 
 MIKAN_HTML = b"""
 <table><tbody>
@@ -46,36 +37,10 @@ MIKAN_HTML = b"""
 </tbody></table>
 """
 
-BTBTLA_SEARCH_HTML = b"""
-<div class="module-item">
-  <div class="video-name"><a href="/detail/frieren" title="Frieren Complete">Frieren Complete</a></div>
-  <div class="module-item-caption"><span class="video-class">Animation</span></div>
-</div>
-"""
+BTBTLA_SEARCH_HTML = (_INDEXER_FIXTURES / "btbtla-search.html").read_bytes()
 
-BTBTLA_DETAIL_HTML = b"""
-<div id="download-list" class="module">
-  <div class="module-row-one active">
-    <div class="module-row-info">
-      <a class="module-row-text copy" href="/tdown/848617892.html" title="Frieren.S01E28.2160p.torrent">Frieren S01E28 2160p [1.68GiB]</a>
-    </div>
-    <a class="btn-pc btn-down" href="/tdown/848617892.html">5</a>
-  </div>
-  <div class="module-row-one active">
-    <div class="module-row-info">
-      <a class="module-row-text copy" href="/pdown/cloud-28.html">Frieren S01E28 Cloud [4.00GiB]</a>
-    </div>
-    <a class="btn-pc btn-down" href="/pdown/cloud-28.html">99</a>
-  </div>
-  <div class="module-row-one active">
-    <div class="module-row-info">
-      <a class="module-row-text copy" href="/tdown/848617891.html" title="Frieren.S01E27.1080p.torrent">Frieren S01E27 1080p [854MiB]</a>
-    </div>
-    <a class="btn-pc btn-down" href="/tdown/848617891.html">4</a>
-  </div>
-</div>
-"""
-BTBTLA_DOWNLOAD_HTML = b'<a href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=Frieren">Magnet</a>'
+BTBTLA_DETAIL_HTML = (_INDEXER_FIXTURES / "btbtla-detail.html").read_bytes()
+BTBTLA_DOWNLOAD_HTML = (_INDEXER_FIXTURES / "btbtla-download.html").read_bytes()
 
 ONELOU_GOOGLE_HTML = """
 <html><body>
@@ -120,26 +85,9 @@ ONELOU_DETAIL_MAGNET_HTML = (
     b'<a href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=Frieren">magnet</a>'
 )
 
-ANIMETOSHO_JSON = b"""[
-  {
-    "title": "[Group] Frieren 01",
-    "link": "https://animetosho.org/view/100",
-    "torrent_url": "https://storage.animetosho.org/torrent/abc.torrent",
-    "magnet_uri": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
-    "total_size": 1073741824,
-    "seeders": 20,
-    "leechers": 2,
-    "torrent_downloaded_count": 88,
-    "timestamp": 1720000000
-  }
-]"""
+ANIMETOSHO_JSON = (_INDEXER_FIXTURES / "animetosho-search.json").read_bytes()
 
-TPB_JSON = b"""[
-  {"id":"1","name":"Frieren S01 1080p","info_hash":"0123456789ABCDEF0123456789ABCDEF01234567",
-   "size":"2147483648","seeders":"50","leechers":"3","added":"1720000000","category":"201"},
-  {"id":"2","name":"Unrelated Hot Movie","info_hash":"89ABCDEF0123456789ABCDEF0123456789ABCDEF",
-   "size":"100","seeders":"999","leechers":"1","added":"1720000000","category":"201"}
-]"""
+TPB_JSON = (_INDEXER_FIXTURES / "tpb-search.json").read_bytes()
 
 
 
@@ -181,6 +129,10 @@ class ClosableHttpClient(FakeHttpClient):
         self.close_calls += 1
 
 
+async def _record_sleep(calls: list[float], delay: float) -> None:
+    calls.append(delay)
+
+
 class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_tpb_builds_magnet_and_filters_unrelated_hot_results(self):
         adapter = PirateBayAdapter(
@@ -197,9 +149,9 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item.leechers, 3)
         self.assertIn("urn:btih:0123456789abcdef0123456789abcdef01234567", item.magnet)
         self.assertIn("dn=Frieren%20S01%201080p", item.magnet)
-        self.assertIn("tr=udp://tracker.coppersurfer.tk:6969/announce", item.magnet)
-        self.assertIn("tr=udp://tracker.leechers-paradise.org:6969", item.magnet)
-        self.assertIn("tr=udp://open.demonii.com:1337/announce", item.magnet)
+        self.assertIn("tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969%2Fannounce", item.magnet)
+        self.assertIn("tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969", item.magnet)
+        self.assertIn("tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce", item.magnet)
 
     async def test_tpb_treats_api_no_result_sentinel_as_empty_page(self):
         http = FakeHttpClient(b'[{"id":"0"}]', content_type="application/json")
@@ -209,6 +161,24 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.items, [])
         self.assertFalse(page.has_more)
         self.assertFalse(page.pagination_supported)
+
+    async def test_tpb_tracker_policy_deduplicates_and_rejects_invalid_urls(self):
+        adapter = PirateBayAdapter(
+            http=FakeHttpClient(TPB_JSON, content_type="application/json"),
+            trackers=(
+                "udp://tracker.example:6969/announce",
+                "udp://tracker.example:6969/announce",
+                "javascript:alert(1)",
+                "https://user:secret@tracker.example/announce",
+            ),
+        )
+
+        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
+        magnet = page.items[0].magnet or ""
+
+        self.assertEqual(magnet.count("tracker.example"), 1)
+        self.assertNotIn("javascript", magnet)
+        self.assertNotIn("secret", magnet)
 
     async def test_tpb_rejects_malformed_json(self):
         adapter = PirateBayAdapter(
@@ -295,6 +265,62 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item.download_kinds, ("magnet", "torrent"))
         resolved = await adapter.resolve(item)
         self.assertEqual(resolved.kind, "magnet")
+
+    async def test_animetosho_only_reports_next_page_for_a_full_upstream_page(self):
+        short_http = FakeHttpClient(ANIMETOSHO_JSON, content_type="application/json")
+        short_page = await AnimeToshoAdapter(http=short_http).search(
+            IndexerSearchRequest.create("Frieren")
+        )
+        self.assertFalse(short_page.has_more)
+
+        full_payload = b"[" + b",".join([ANIMETOSHO_JSON[1:-1]] * 75) + b"]"
+        full_http = FakeHttpClient(full_payload, content_type="application/json")
+        full_page = await AnimeToshoAdapter(http=full_http).search(
+            IndexerSearchRequest.create("Frieren")
+        )
+        self.assertTrue(full_page.has_more)
+
+    async def test_animetosho_and_tpb_pacers_delay_repeated_search_slots(self):
+        sleeps: list[float] = []
+        times = iter([10.0, 10.0, 10.25, 11.0, 20.0, 20.0, 20.5, 21.0])
+        monotonic = lambda: next(times)
+        sleeper = lambda delay: _record_sleep(sleeps, delay)
+        anime = AnimeToshoAdapter(
+            http=FakeHttpClient(ANIMETOSHO_JSON, content_type="application/json"),
+            min_interval_seconds=1,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+        tpb = PirateBayAdapter(
+            http=FakeHttpClient(TPB_JSON, content_type="application/json"),
+            min_interval_seconds=1,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+        request = IndexerSearchRequest.create("Frieren")
+
+        await anime.wait_for_search_slot(request)
+        await anime.wait_for_search_slot(request)
+        await tpb.wait_for_search_slot(request)
+        await tpb.wait_for_search_slot(request)
+
+        self.assertEqual(sleeps, [0.75, 0.5])
+
+    async def test_search_pacer_handles_zero_monotonic_origin(self):
+        sleeps: list[float] = []
+        times = iter([0.0, 0.0, 0.25, 1.0])
+        adapter = AnimeToshoAdapter(
+            http=FakeHttpClient(ANIMETOSHO_JSON, content_type="application/json"),
+            min_interval_seconds=1,
+            monotonic=lambda: next(times),
+            sleeper=lambda delay: _record_sleep(sleeps, delay),
+        )
+        request = IndexerSearchRequest.create("Frieren")
+
+        await adapter.wait_for_search_slot(request)
+        await adapter.wait_for_search_slot(request)
+
+        self.assertEqual(sleeps, [0.75])
 
     async def test_animetosho_rejects_malformed_json(self):
         adapter = AnimeToshoAdapter(
@@ -490,6 +516,40 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(item.published_at)
         self.assertEqual(item.detail_url, "https://nyaa.net/view/456")
 
+    async def test_nyaa_prefers_media_category_and_falls_back_to_all(self):
+        empty_html = b'<table class="torrent-list"><tbody></tbody></table><p>No results found</p>'
+        http = FakeHttpClient(NYAA_HTML)
+        http.responses = [empty_html, NYAA_HTML]
+        adapter = NyaaAdapter(
+            site_id="nyaa",
+            site_name="Nyaa",
+            base_url="https://nyaa.si/",
+            http=http,
+            default_enabled=True,
+        )
+
+        page = await adapter.search(
+            IndexerSearchRequest.create("Frieren", media_type="tv")
+        )
+
+        self.assertEqual(len(page.items), 1)
+        self.assertEqual([call["params"]["c"] for call in http.calls], ["1_0", "0_0"])
+
+    async def test_sukebei_prefers_adult_category_before_all(self):
+        http = FakeHttpClient(NYAA_HTML)
+        adapter = NyaaAdapter(
+            site_id="sukebei",
+            site_name="Sukebei",
+            base_url="https://sukebei.nyaa.si/",
+            http=http,
+            default_enabled=False,
+        )
+
+        page = await adapter.search(IndexerSearchRequest.create("Example"))
+
+        self.assertEqual(len(page.items), 1)
+        self.assertEqual(http.calls[0]["params"]["c"], "2_2")
+
     async def test_mikan_returns_page_one_without_inventing_pagination(self):
         http = FakeHttpClient(MIKAN_HTML)
         adapter = MikanAdapter(http=http)
@@ -506,6 +566,76 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(http.calls), 1)
         self.assertEqual(http.calls[0]["params"], {"searchstr": "Frieren"})
         self.assertEqual(http.calls[0]["headers"]["Referer"], "https://mikanani.me/")
+
+    async def test_mikan_fixture_extracts_torrent_size_and_published_time(self):
+        fixture = (_INDEXER_FIXTURES / "mikan-search.html").read_bytes()
+        adapter = MikanAdapter(http=FakeHttpClient(fixture))
+
+        page = await adapter.search(IndexerSearchRequest.create("凡人修仙传"))
+
+        self.assertEqual(len(page.items), 2)
+        first = page.items[0]
+        self.assertEqual(first.download_kinds, ("magnet", "torrent"))
+        self.assertEqual(
+            first.torrent_url,
+            "https://mikanani.me/Download/20260822/"
+            "a9091799ffb7c2cb0d3bfdc66697f1e308a9689e.torrent",
+        )
+        self.assertEqual(first.size_text, "1.15 GB")
+        self.assertEqual(first.size_bytes, 1_150_000_000)
+        self.assertIsNotNone(first.published_at)
+        self.assertEqual(page.items[1].size_bytes, 848_300_000)
+
+    async def test_mikan_keeps_torrent_only_rows_downloadable(self):
+        body = (
+            b'<table><tr class="js-search-results-row"><td></td><td>'
+            b'<a href="/Home/Episode/only">Torrent only</a></td><td>700 MiB</td>'
+            b'<td><a href="/Download/only.torrent">DL</a></td></tr></table>'
+        )
+        adapter = MikanAdapter(http=FakeHttpClient(body))
+
+        page = await adapter.search(IndexerSearchRequest.create("Torrent only"))
+
+        self.assertEqual(len(page.items), 1)
+        self.assertEqual(page.items[0].download_kinds, ("torrent",))
+        resolved = await adapter.resolve(page.items[0])
+        self.assertEqual(resolved.kind, "torrent")
+        self.assertEqual(resolved.value, "https://mikanani.me/Download/only.torrent")
+
+    async def test_mikan_falls_back_to_mirror_and_preserves_mirror_download_host(self):
+        mirror_html = (
+            b'<table><tr class="js-search-results-row"><td></td><td>'
+            b'<a href="/Home/Episode/mirror">Mirror result</a></td><td>700 MiB</td>'
+            b'<td><a href="/Download/mirror.torrent">DL</a></td></tr></table>'
+        )
+        http = FakeHttpClient(b"<html>domain parking</html>")
+        http.responses = [b"<html>domain parking</html>", mirror_html]
+        adapter = MikanAdapter(http=http)
+
+        page = await adapter.search(IndexerSearchRequest.create("Mirror result"))
+
+        self.assertEqual(len(http.calls), 2)
+        self.assertEqual(http.calls[0]["url"], "https://mikanani.me/Home/Search")
+        self.assertEqual(http.calls[1]["url"], "https://mikanime.tv/Home/Search")
+        self.assertEqual(http.calls[1]["headers"]["Referer"], "https://mikanime.tv/")
+        item = page.items[0]
+        self.assertEqual(item.detail_url, "https://mikanime.tv/Home/Episode/mirror")
+        self.assertEqual(item.torrent_url, "https://mikanime.tv/Download/mirror.torrent")
+        resolved = await adapter.resolve(item)
+        self.assertEqual(resolved.value, "https://mikanime.tv/Download/mirror.torrent")
+
+    async def test_mikan_resolve_rejects_unregistered_mirror_host(self):
+        stored = IndexerItem(
+            site_id="mikan",
+            site_name="Mikan",
+            title="Unsafe",
+            torrent_url="https://evil.example/file.torrent",
+            download_state="ready",
+            download_kinds=("torrent",),
+        )
+
+        with self.assertRaises(IndexerSecurityError):
+            await MikanAdapter(http=FakeHttpClient(MIKAN_HTML)).resolve(stored)
 
     async def test_btbtla_parses_redesigned_search_and_detail_layout(self):
         """改版布局：标题锚点换成 a.module-item-title，资源行只剩 module-row-info。"""
@@ -535,7 +665,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Frieren S02E01", item.title)
         self.assertEqual(item.category, "动漫")
         self.assertTrue(item.detail_url.endswith("/tdown/900101.html"))
-        self.assertEqual(item.download_kinds, ("magnet",))
+        self.assertEqual(item.download_kinds, ("magnet", "torrent"))
 
     async def test_btbtla_search_expands_detail_into_concrete_torrent_resources(self):
         http = FakeHttpClient(BTBTLA_SEARCH_HTML)
@@ -547,7 +677,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page.pagination_supported)
         self.assertFalse(page.has_more)
         self.assertEqual(len(http.calls), 2, "search should load only the best matching show detail")
-        self.assertEqual(http.calls[1]["url"], "https://www.btbtla.com/detail/frieren")
+        self.assertEqual(http.calls[1]["url"], "https://www.btbtlb.com/detail/frieren")
         self.assertEqual(len(page.items), 2, "cloud-drive /pdown entries must stay excluded")
         item = page.items[0]
         self.assertEqual(item.title, "Frieren S01E28 2160p")
@@ -556,20 +686,88 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item.size_bytes, int(1.68 * 1024**3))
         self.assertEqual(item.downloads, 5)
         self.assertEqual(item.download_state, "resolvable")
-        self.assertEqual(item.download_kinds, ("magnet",))
-        self.assertEqual(item.detail_url, "https://www.btbtla.com/tdown/848617892.html")
+        self.assertEqual(item.download_kinds, ("magnet", "torrent"))
+        self.assertEqual(item.detail_url, "https://www.btbtlb.com/tdown/848617892.html")
 
         http.responses = [BTBTLA_DOWNLOAD_HTML]
         resolved = await adapter.resolve(item)
         self.assertEqual(len(http.calls), 3)
-        self.assertEqual(http.calls[2]["url"], "https://www.btbtla.com/tdown/848617892.html")
+        self.assertEqual(http.calls[2]["url"], "https://www.btbtlb.com/tdown/848617892.html")
         self.assertEqual(resolved.kind, "magnet")
         self.assertIn("urn:btih:0123456789abcdef0123456789abcdef01234567", resolved.value)
 
-    async def test_btbtla_rejects_non_magnet_download_and_classifies_404(self):
+    async def test_btbtla_resolve_falls_back_to_trusted_torrent_url(self):
+        download_html = b'<a href="/dlt/token-123">Torrent file</a>'
+        adapter = BTBtlaAdapter(http=FakeHttpClient(download_html))
+        stored = IndexerItem(
+            site_id="btbtla",
+            site_name="BTBtla",
+            title="Frieren",
+            detail_url="https://www.btbtlb.com/tdown/123.html",
+            download_state="resolvable",
+            download_kinds=("magnet", "torrent"),
+        )
+
+        resolved = await adapter.resolve(stored)
+
+        self.assertEqual(resolved.kind, "torrent")
+        self.assertEqual(resolved.value, "https://www.btbtlb.com/dlt/token-123")
+
+    async def test_btbtla_uses_second_ranked_detail_when_first_has_no_resources(self):
+        search_html = b"""
+        <div class="module-item"><a class="module-item-title" href="/detail/first.html">Frieren</a></div>
+        <div class="module-item"><a class="module-item-title" href="/detail/second.html">Frieren Season 2</a></div>
+        """
+        empty_detail = b'<div id="download-list"></div>'
+        second_detail = b"""
+        <div class="module-row-info">
+          <a class="module-row-text" href="/tdown/second.html"><h4>Frieren S02E01 [900MiB]</h4></a>
+        </div>
+        """
+        http = FakeHttpClient(search_html)
+        http.responses = [search_html, empty_detail, second_detail]
+        adapter = BTBtlaAdapter(http=http, max_detail_candidates=2)
+
+        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
+
+        self.assertEqual(len(http.calls), 3)
+        self.assertEqual([item.title for item in page.items], ["Frieren S02E01"])
+
+    async def test_btbtla_falls_back_from_www_to_apex_and_preserves_source_host(self):
+        http = FakeHttpClient(b"<html>domain parking</html>")
+        http.responses = [b"<html>domain parking</html>", BTBTLA_SEARCH_HTML, BTBTLA_DETAIL_HTML]
+        adapter = BTBtlaAdapter(http=http)
+
+        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
+
+        self.assertEqual(len(http.calls), 3)
+        self.assertTrue(http.calls[0]["url"].startswith("https://www.btbtlb.com/search/"))
+        self.assertTrue(http.calls[1]["url"].startswith("https://btbtlb.com/search/"))
+        self.assertEqual(http.calls[2]["url"], "https://btbtlb.com/detail/frieren")
+        self.assertEqual(page.items[0].detail_url, "https://btbtlb.com/tdown/848617892.html")
+
+    async def test_btbtla_resolve_preserves_apex_torrent_host(self):
+        stored = IndexerItem(
+            site_id="btbtla",
+            site_name="BTBtla",
+            title="Demo",
+            detail_url="https://btbtlb.com/tdown/123.html",
+            download_state="resolvable",
+            download_kinds=("magnet", "torrent"),
+        )
+        adapter = BTBtlaAdapter(
+            http=FakeHttpClient(b'<a href="/dlt/token-123">seed</a>')
+        )
+
+        resolved = await adapter.resolve(stored)
+
+        self.assertEqual(resolved.kind, "torrent")
+        self.assertEqual(resolved.value, "https://btbtlb.com/dlt/token-123")
+
+    async def test_btbtla_rejects_non_download_candidate_and_classifies_404(self):
         stored = IndexerItem(
             site_id="btbtla", site_name="BTBtla", title="Demo",
-            detail_url="https://www.btbtla.com/tdown/demo",
+            detail_url="https://www.btbtlb.com/tdown/demo",
             download_state="resolvable", download_kinds=("magnet",),
         )
         http = FakeHttpClient('<a href="https://example.com/file">普通链接</a>'.encode())
@@ -596,6 +794,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
             http=FakeHttpClient("<p>暂无</p>".encode()), min_interval_seconds=5,
             monotonic=lambda: current[0], sleeper=sleeper,
         )
+        self.assertEqual(adapter.search_timeout_overhead_seconds(), 20.0)
         await adapter.search(IndexerSearchRequest.create("one"))
         await adapter.search(IndexerSearchRequest.create("two"))
         self.assertEqual(sleeps, [5.0])
@@ -617,7 +816,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(302, headers={"Location": "https://evil.example/download"})
 
         client = FixedHostHttpClient(
-            allowed_hosts={"www.btbtla.com"},
+            allowed_hosts={"www.btbtlb.com"},
             transport=httpx.MockTransport(handler),
             resolver=lambda host, port: [(2, 1, 6, "", ("93.184.216.34", port))],
         )
@@ -627,14 +826,14 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
             site_id="btbtla",
             site_name="BTBtla",
             title="Frieren",
-            detail_url="https://www.btbtla.com/detail/frieren",
+            detail_url="https://www.btbtlb.com/detail/frieren",
             download_state="resolvable",
             download_kinds=("magnet",),
         )
 
         with self.assertRaises(IndexerSecurityError):
             await adapter.resolve(stored)
-        self.assertEqual(seen, ["https://www.btbtla.com/detail/frieren"])
+        self.assertEqual(seen, ["https://www.btbtlb.com/detail/frieren"])
 
     async def test_onelou_search_is_list_only_and_resolves_torrent_attachment_lazily(self):
         http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
@@ -812,6 +1011,34 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(http.calls[1]["url"].startswith("https://www.1lou.pro/"))
         self.assertEqual(page.items[0].detail_url, "https://www.1lou.pro/thread-101.htm")
 
+    async def test_onelou_classifies_http_200_verification_page_as_unavailable(self):
+        challenge = (
+            b"<html><title>Just a moment...</title>"
+            b"<div id='challenge-platform'>Verify you are human</div></html>"
+        )
+        http = FakeHttpClient(challenge)
+        adapter = OneLouAdapter(http=http)
+
+        with self.assertRaises(IndexerUnavailable):
+            await adapter.search(IndexerSearchRequest.create("Frieren"))
+
+        self.assertEqual(len(http.calls), 2, "verification pages should try the trusted mirror only")
+
+    async def test_onelou_resolve_rejects_http_200_verification_page(self):
+        challenge = b"<html><title>Just a moment...</title><div class='turnstile'>Verify you are human</div></html>"
+        adapter = OneLouAdapter(http=FakeHttpClient(challenge))
+        stored = IndexerItem(
+            site_id="1lou",
+            site_name="1lou",
+            title="Frieren",
+            detail_url="https://www.1lou.me/thread-101.htm",
+            download_state="resolvable",
+            download_kinds=("torrent", "magnet"),
+        )
+
+        with self.assertRaises(IndexerUnavailable):
+            await adapter.resolve(stored)
+
     async def test_onelou_classifies_http_429_as_rate_limited_after_mirrors_fail(self):
         http = FakeHttpClient(b"slow down", status_code=429)
         adapter = OneLouAdapter(http=http)
@@ -920,7 +1147,13 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         registry = build_default_registry()
 
         self.assertIsInstance(registry.get("btbtla").http, BrowserImpersonatingHttpClient)
-        self.assertEqual(registry.get("btbtla").http.sni_host, "btbtla.com")
+        self.assertEqual(registry.get("btbtla").base_url, "https://www.btbtlb.com/")
+        self.assertEqual(registry.get("btbtla").mirror_base_urls, ("https://btbtlb.com/",))
+        self.assertEqual(registry.get("btbtla").http.sni_host, "btbtlb.com")
+        self.assertIn("www.btbtlb.com", registry.get("btbtla").http.allowed_hosts)
+        self.assertIn("btbtlb.com", registry.get("btbtla").http.allowed_hosts)
+        self.assertEqual(registry.get("mikan").mirror_base_urls, ("https://mikanime.tv/",))
+        self.assertIn("mikanime.tv", registry.get("mikan").http.allowed_hosts)
         self.assertEqual(registry.get("1lou").min_interval_seconds, 5)
         self.assertIsNotNone(registry.get("1lou").google_search)
         self.assertIn("www.1lou.pro", registry.get("1lou").http.allowed_hosts)
