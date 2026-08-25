@@ -129,6 +129,7 @@ class LocalMediaTask:
     operation_token: str
     snapshot_digest: str
     rules_snapshot: str
+    recognition_summary: str
     tmdb_id: str
     media_type: str
     season_override: int | None
@@ -152,6 +153,7 @@ class LocalMediaTask:
             trigger=str(row["trigger"]), status=str(row["status"]),  # type: ignore[arg-type]
             operation_token=str(row["operation_token"]), snapshot_digest=str(_value(row, "snapshot_digest")),
             rules_snapshot=str(_value(row, "rules_snapshot")),
+            recognition_summary=str(_value(row, "recognition_summary")),
             tmdb_id=str(_value(row, "tmdb_id")), media_type=str(_value(row, "media_type")),
             season_override=(
                 None if _value(row, "season_override", None) is None

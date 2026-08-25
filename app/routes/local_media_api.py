@@ -25,6 +25,12 @@ from app.modules.local_media_candidates import (
 from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES, LOCAL_MEDIA_CATEGORIES
 from app.modules.media_server_profiles import list_configured_profiles
 from app.modules.local_media_notifications import notify_local_media_task
+from app.modules.local_media_recognition_summary import (
+    infer_recognition_summary,
+    merge_recognition_summaries,
+    parse_recognition_summary,
+    summary_from_task,
+)
 from app.modules.local_media_scheduler import get_local_media_scheduler
 from app.modules.local_media_service import LocalMediaServiceError, get_local_media_service
 from app.web import api_error, require_api_login
@@ -153,6 +159,27 @@ def _task_detail_payload(task) -> dict:
         "stable_since": task.stable_since,
     })
     return payload
+
+
+def _task_recognition_payload(task, item_rows) -> dict:
+    persisted = parse_recognition_summary(
+        getattr(task, "recognition_summary", "")
+    )
+    if persisted:
+        return persisted
+    selected = summary_from_task(task)
+    inferred: dict = {}
+    if item_rows and str(getattr(task, "status", "")) == "completed":
+        try:
+            inferred = infer_recognition_summary(
+                item_rows, scraper=get_local_media_service().scraper,
+            )
+        except Exception as exc:
+            logger.debug(
+                "本地整理历史识别摘要推断失败 task_id=%s type=%s",
+                getattr(task, "id", ""), type(exc).__name__,
+            )
+    return merge_recognition_summaries(selected, inferred)
 
 
 def _task_item_payload(row) -> dict:
@@ -555,12 +582,11 @@ def task_detail(task_id: int, request: Request):
         task = db.get_local_media_task(task_id, owner=_OWNER)
         if task is None:
             return api_error("本地整理日志不存在", 404)
+        item_rows = db.list_local_media_task_items(task_id, owner=_OWNER)
         return {
             "task": _task_detail_payload(task),
-            "items": [
-                _task_item_payload(row)
-                for row in db.list_local_media_task_items(task_id, owner=_OWNER)
-            ],
+            "recognition": _task_recognition_payload(task, item_rows),
+            "items": [_task_item_payload(row) for row in item_rows],
             "steps": [
                 _task_step_payload(row)
                 for row in db.list_local_media_operation_steps(task_id, owner=_OWNER)

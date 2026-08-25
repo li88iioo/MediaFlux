@@ -15,7 +15,7 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
-    def test_fresh_database_contains_complete_v6_schema(self) -> None:
+    def test_fresh_database_contains_complete_v7_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             task_columns = {
@@ -50,8 +50,9 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             }
 
         self.assertEqual(version, db.SCHEMA_VERSION)
-        self.assertEqual(version, 6)
+        self.assertEqual(version, db.SCHEMA_VERSION)
         self.assertIn("rules_snapshot", task_columns)
+        self.assertIn("recognition_summary", task_columns)
         self.assertIn("season_override", task_columns)
         self.assertIn("episode_override", task_columns)
         self.assertIn("session_id", playback_columns)
@@ -190,7 +191,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 assert_upgraded(source_paths.database_path)
 
                 backups = list(source_paths.backup_dir.glob(
-                    "mediaflux-*-pre-migration-1-to-6-*.zip"
+                    f"mediaflux-*-pre-migration-1-to-{db.SCHEMA_VERSION}-*.zip"
                 ))
                 self.assertEqual(len(backups), 1)
                 manifest = verify_backup(backups[0])
@@ -269,7 +270,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                         "owner_digest,context_type,payload,expires_at,created_at"
                         ") VALUES('digest','resource_candidates','{}',9999999999,'2026-08-01')"
                     )
-                self.assertEqual(version, 6)
+                self.assertEqual(version, db.SCHEMA_VERSION)
                 self.assertEqual(preserved["context_type"], "patrol")
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
@@ -341,7 +342,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 self.assertIsNone(legacy_table)
                 backup.assert_called_once()
                 kwargs = backup.call_args.kwargs
-                self.assertEqual(kwargs["reason"], "pre-migration-1-to-6")
+                self.assertEqual(kwargs["reason"], f"pre-migration-1-to-{db.SCHEMA_VERSION}")
                 self.assertFalse(kwargs["include_settings"])
                 self.assertEqual(Path(kwargs["output"]).parent, path.parent / "backups")
                 self.assertIsInstance(kwargs["source_connection"], sqlite3.Connection)
@@ -679,7 +680,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                         "SELECT 1 FROM sqlite_master WHERE type='table' "
                         "AND name='agent_session_context_generation_sequence'"
                     ).fetchone()
-                self.assertEqual(version, 6)
+                self.assertEqual(version, db.SCHEMA_VERSION)
                 self.assertIn("context_generation", columns)
                 self.assertEqual(preserved["context_type"], "patrol")
                 self.assertEqual(int(preserved["context_generation"]), 0)
@@ -761,7 +762,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                             "PRAGMA table_info(organize_operation_jobs)"
                         )
                     }
-                self.assertEqual(version, 6)
+                self.assertEqual(version, db.SCHEMA_VERSION)
                 self.assertIsNotNone(table)
                 self.assertIn("idx_organize_operation_jobs_active_dedupe", indexes)
                 self.assertTrue({
@@ -822,7 +823,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                         str(row["name"])
                         for row in migrated.execute("PRAGMA table_info(organize_operation_jobs)")
                     }
-                self.assertEqual(version, 6)
+                self.assertEqual(version, db.SCHEMA_VERSION)
                 self.assertTrue({"payload_auth", "cancel_requested", "expires_at", "purged_at"}.issubset(columns))
                 self.assertEqual(result["a" * 32]["status"], "cancelled")
                 self.assertEqual(result["a" * 32]["payload_json"], "{}")
@@ -888,10 +889,53 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                     preserved = migrated.execute(
                         "SELECT summary,confirmation_id FROM agent_action_history"
                     ).fetchone()
-                self.assertEqual(version, 6)
+                self.assertEqual(version, db.SCHEMA_VERSION)
                 self.assertIn("confirmation_id", columns)
                 self.assertIn("idx_agent_action_history_confirmation", indexes)
                 self.assertEqual(tuple(preserved), ("历史记录", ""))
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_v6_local_media_tasks_gain_recognition_summary(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-local-media-v7-") as root:
+            path = Path(root) / "v6.db"
+            conn = sqlite3.connect(path)
+            try:
+                legacy_schema = db._SCHEMA.replace(
+                    "    recognition_summary TEXT NOT NULL DEFAULT '',\n", "", 1,
+                )
+                conn.executescript(legacy_schema)
+                conn.execute(
+                    "INSERT INTO local_media_sources(id,name,local_root,created_at,updated_at) "
+                    "VALUES(1,'历史来源','/downloads','2026-08-01','2026-08-01')"
+                )
+                conn.execute(
+                    "INSERT INTO local_media_tasks("
+                    "id,source_id,content_path,operation_token,created_at,updated_at"
+                    ") VALUES(1,1,'/downloads/Show.S01E01.mkv','legacy-token',"
+                    "'2026-08-01','2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=6")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {
+                        str(row["name"])
+                        for row in migrated.execute("PRAGMA table_info(local_media_tasks)")
+                    }
+                    preserved = migrated.execute(
+                        "SELECT content_path,recognition_summary FROM local_media_tasks WHERE id=1"
+                    ).fetchone()
+                self.assertEqual(version, db.SCHEMA_VERSION)
+                self.assertIn("recognition_summary", columns)
+                self.assertEqual(tuple(preserved), ("/downloads/Show.S01E01.mkv", ""))
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
@@ -961,7 +1005,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 backup.assert_called_once()
                 self.assertEqual(
                     backup.call_args.kwargs["reason"],
-                    "pre-migration-0-to-6",
+                    f"pre-migration-0-to-{db.SCHEMA_VERSION}",
                 )
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)

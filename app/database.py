@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -1185,6 +1185,7 @@ CREATE TABLE IF NOT EXISTS local_media_tasks (
     stable_since TEXT DEFAULT '',
     snapshot_digest TEXT DEFAULT '',
     rules_snapshot TEXT NOT NULL DEFAULT '',
+    recognition_summary TEXT NOT NULL DEFAULT '',
     tmdb_id TEXT DEFAULT '',
     media_type TEXT DEFAULT '',
     season_override INTEGER,
@@ -2073,6 +2074,19 @@ def _migrate_agent_action_history_v6(conn: sqlite3.Connection) -> None:
     _ensure_agent_action_history_schema(conn)
 
 
+def _migrate_local_media_recognition_summary_v7(conn: sqlite3.Connection) -> None:
+    """持久化本地整理的最终媒体识别摘要。"""
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(local_media_tasks)")
+    }
+    if columns and "recognition_summary" not in columns:
+        conn.execute(
+            "ALTER TABLE local_media_tasks ADD COLUMN "
+            "recognition_summary TEXT NOT NULL DEFAULT ''"
+        )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2080,6 +2094,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     3: _migrate_organize_operation_jobs_v4,
     4: _migrate_organize_operation_jobs_v5,
     5: _migrate_agent_action_history_v6,
+    6: _migrate_local_media_recognition_summary_v7,
 }
 
 
@@ -6108,7 +6123,8 @@ def prepare_manual_local_media_task(
             task_id = int(existing["id"])
             cur = conn.execute(
                 "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',snapshot_digest='',"
-                "rules_snapshot=?,tmdb_id=?,media_type=?,season_override=?,episode_override=?,"
+                "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
+                "season_override=?,episode_override=?,"
                 "operation_token=?,error='',warning='',completed_at=NULL,"
                 "version=version+1,updated_at=? WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
                 (str(rules_snapshot or ""), str(tmdb_id or "").strip(), normalized_type,
@@ -6199,7 +6215,8 @@ def claim_local_media_confirmation_task(
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE local_media_tasks SET status='recognizing',attempts=attempts+1,"
-            "rules_snapshot=?,tmdb_id=?,media_type=?,season_override=?,episode_override=?,"
+            "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
+            "season_override=?,episode_override=?,"
             "title=?,year=?,error='',warning='',completed_at=NULL,version=version+1,updated_at=? "
             f"WHERE {where}",
             params,
@@ -6211,7 +6228,8 @@ def update_local_media_task(task_id: int, *, owner: str = "admin", **fields) -> 
     from app.modules.local_media_models import LOCAL_TASK_STATUSES
 
     allowed = {
-        "status", "stable_since", "snapshot_digest", "rules_snapshot", "tmdb_id", "media_type",
+        "status", "stable_since", "snapshot_digest", "rules_snapshot", "recognition_summary",
+        "tmdb_id", "media_type",
         "season_override", "episode_override", "title", "year",
         "error", "warning", "completed_at", "content_path",
     }
@@ -6433,7 +6451,8 @@ def reset_local_media_task(
         raise ValueError("电影任务不能指定季数或集数")
     assignments = [
         "status='waiting_stable'", "stable_since=''", "snapshot_digest=''",
-        "error=''", "warning=''", "completed_at=NULL", "version=version+1", "updated_at=?",
+        "recognition_summary=''", "error=''", "warning=''", "completed_at=NULL",
+        "version=version+1", "updated_at=?",
     ]
     params: list[object] = [now()]
     if tmdb_id is not None:
@@ -6505,7 +6524,8 @@ def reset_local_media_task_if_current(
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',"
-            "snapshot_digest='',operation_token=?,error='',warning='',completed_at=NULL,"
+            "snapshot_digest='',recognition_summary='',operation_token=?,"
+            "error='',warning='',completed_at=NULL,"
             "version=version+1,updated_at=? WHERE id=? AND owner=? AND version=? AND status=?",
             (
                 uuid.uuid4().hex,

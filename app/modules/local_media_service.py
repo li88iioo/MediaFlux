@@ -26,6 +26,10 @@ from app.modules.local_media_cleanup import (
     delete_cleanup_items,
     probable_sample_video_paths,
 )
+from app.modules.local_media_recognition_summary import (
+    build_recognition_summary,
+    serialize_recognition_summary,
+)
 from app.modules.organize import (
     OrganizeRules,
     Organizer,
@@ -893,7 +897,23 @@ class LocalMediaService:
                     mtime_ns=plan.source.mtime_ns, device=plan.source.device, inode=plan.source.inode,
                     owner=owner,
                 )
-            db.update_local_media_task(task_id, owner=owner, status="planned", error="")
+            recognition = build_recognition_summary(preview.get("matches", []))
+            recognition_fields: dict[str, object] = {
+                "status": "planned",
+                "error": "",
+                "recognition_summary": serialize_recognition_summary(recognition),
+            }
+            resolved_media = recognition.get("media") if recognition.get("status") == "resolved" else None
+            if isinstance(resolved_media, list) and len(resolved_media) == 1:
+                primary = resolved_media[0]
+                if isinstance(primary, dict):
+                    recognition_fields.update({
+                        "tmdb_id": str(primary.get("tmdb_id") or ""),
+                        "title": str(primary.get("title") or ""),
+                        "year": str(primary.get("year") or ""),
+                        "media_type": str(primary.get("media_type") or ""),
+                    })
+            db.update_local_media_task(task_id, owner=owner, **recognition_fields)
             if source.mode == "preview_only":
                 warning = "仅预览模式：未移动文件"
                 db.update_local_media_task(

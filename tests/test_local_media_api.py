@@ -547,6 +547,43 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(response.json()["inspection_id"], "inspect-task-1")
         service.inspect_task.assert_called_once_with("admin", 88)
 
+    def test_task_detail_infers_missing_historical_recognition_from_target_path(self):
+        self.login()
+        source_id = db.create_local_media_source(
+            name="历史本地下载", qb_profile="", qb_path_prefix="",
+            local_root=str(self.local_root), owner="admin",
+        )
+        task_id = db.create_local_media_task(
+            source_id, "", str(self.local_root / "Show.S02E08.mp4"),
+            owner="admin", trigger="scan",
+        )
+        target = (
+            self.default_target / "动漫" /
+            "骸骨骑士大人异世界冒险中 (2022) {tmdb-1235283}" / "Season 2" /
+            "骸骨骑士大人异世界冒险中.2022.S02E08-WEB-DL.1080p.mp4"
+        )
+        db.add_local_media_task_item(
+            task_id, str(self.local_root / "Show.S02E08.mp4"), str(target),
+            role="video", size=507, owner="admin",
+        )
+        db.update_local_media_task(task_id, owner="admin", status="completed")
+        scraper = Mock()
+        scraper.parse_media.return_value = SimpleNamespace(
+            title="骸骨骑士大人异世界冒险中", year="2022", media_type="tv",
+            effective_season=2, effective_episode=8,
+        )
+        with patch(
+            "app.routes.local_media_api.get_local_media_service",
+            return_value=SimpleNamespace(scraper=scraper),
+        ):
+            response = self.client.get(f"/api/local-media/tasks/{task_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        recognition = response.json()["recognition"]
+        self.assertEqual(recognition["source"], "history_inferred")
+        self.assertEqual(recognition["media"][0]["tmdb_id"], "1235283")
+        self.assertEqual(recognition["media"][0]["seasons"][0]["episodes"], [8])
+        scraper.parse_media.assert_called_once()
+
     def test_task_detail_and_selected_log_clear_are_owner_scoped_and_safe(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}
         source_id = db.create_local_media_source(
@@ -578,6 +615,8 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(detail.status_code, 200, detail.text)
         self.assertEqual(detail.json()["task"]["content_path"], str(self.local_root / "Movie.2026.mkv"))
         self.assertEqual(detail.json()["task"]["title"], "Movie")
+        self.assertEqual(detail.json()["recognition"]["source"], "manual_selection")
+        self.assertEqual(detail.json()["recognition"]["media"][0]["title"], "Movie")
         self.assertTrue(detail.json()["task"]["clearable"])
         self.assertEqual(detail.json()["items"][0]["role"], "video")
         self.assertEqual(detail.json()["steps"][0]["action"], "move")

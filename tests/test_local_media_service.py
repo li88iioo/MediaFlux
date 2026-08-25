@@ -447,6 +447,12 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             result = service.execute_task("admin", task_id)
             self.assertEqual(result["status"], "completed")
             self.assertIn("S02E07", result["preview"]["plans"][0]["target_name"])
+            stored = db.get_local_media_task(task_id, owner="admin")
+            summary = json.loads(stored.recognition_summary)
+            self.assertEqual(summary["media"][0]["seasons"], [{
+                "episodes": [7], "file_count": 1, "season": 2,
+            }])
+            self.assertEqual((stored.season_override, stored.episode_override), (2, None))
             self.assertTrue(episode.exists())
 
     def test_single_video_directory_allows_one_episode_override(self):
@@ -561,6 +567,12 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertTrue(movie.exists())
             task = db.get_local_media_task(task_id, owner="admin")
             self.assertEqual(task.status, "completed")
+            self.assertEqual((task.title, task.year, task.tmdb_id, task.media_type), (
+                "Movie", "2026", "1", "movie",
+            ))
+            summary = json.loads(task.recognition_summary)
+            self.assertEqual(summary["status"], "resolved")
+            self.assertEqual(summary["media"][0]["title"], "Movie")
             self.assertIn("仅预览模式", task.warning)
 
     def test_tv_without_episode_requires_manual_and_writes_nothing(self):

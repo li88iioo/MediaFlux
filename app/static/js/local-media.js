@@ -388,24 +388,98 @@
         return `<div class="lm-task-detail-field"><span>${esc(label)}</span>${code ? `<code>${esc(safeValue)}</code>` : `<strong>${esc(safeValue)}</strong>`}</div>`;
     }
 
+    function localMediaTypeLabel(value) {
+        return {movie: '电影', tv: '剧集'}[value] || value || '—';
+    }
+
+    function localMediaCategoryLabel(value) {
+        return {
+            default: '', movie: '电影', tv: '剧集', anime: '动漫',
+            documentary: '纪录片', variety: '综艺', concert: '演唱会', kids: '少儿',
+        }[value] ?? value ?? '';
+    }
+
+    function episodeListLabel(values) {
+        const episodes = [...new Set((Array.isArray(values) ? values : [])
+            .map((value) => Number(value))
+            .filter((value) => Number.isInteger(value) && value > 0))].sort((a, b) => a - b);
+        if (!episodes.length) return '';
+        const episode = (value) => `E${String(value).padStart(2, '0')}`;
+        const consecutive = episodes.every((value, index) => !index || value === episodes[index - 1] + 1);
+        if (episodes.length === 1) return episode(episodes[0]);
+        if (consecutive) return `${episode(episodes[0])}–${episode(episodes[episodes.length - 1])}`;
+        if (episodes.length <= 4) return episodes.map(episode).join('、');
+        return `${episodes.length} 集`;
+    }
+
+    function recognitionPosition(media, recognition, task) {
+        const mediaType = media?.media_type || task.media_type || '';
+        if (mediaType === 'movie') return '不适用';
+        const seasons = Array.isArray(media?.seasons) ? media.seasons : [];
+        if (!seasons.length) {
+            if (mediaType !== 'tv') return '—';
+            const season = task.season == null ? '—' : task.season;
+            const episode = task.episode == null ? '—' : task.episode;
+            return `第 ${season} 季 / 第 ${episode} 集`;
+        }
+        if (seasons.length > 1) {
+            const episodes = seasons.reduce((total, item) => total + (Array.isArray(item.episodes) ? item.episodes.length : 0), 0);
+            return `${seasons.length} 季${episodes ? ` · ${episodes} 集` : ''}`;
+        }
+        const current = seasons[0] || {};
+        const season = current.season == null
+            ? ''
+            : current.season === 0 ? '特别篇' : `S${String(current.season).padStart(2, '0')}`;
+        const episodes = episodeListLabel(current.episodes);
+        return [season, episodes].filter(Boolean).join(' · ') || `${recognition.file_count || media?.file_count || 0} 个视频`;
+    }
+
+    function recognitionDisplay(task, recognition) {
+        const media = Array.isArray(recognition?.media) ? recognition.media : [];
+        if (media.length > 1) {
+            return {
+                title: `多媒体整理任务 · ${recognition.media_count || media.length} 项`,
+                tmdb: `${recognition.media_count || media.length} 个媒体`,
+                mediaType: '混合',
+                position: `${recognition.file_count || media.reduce((sum, item) => sum + Number(item.file_count || 0), 0) || media.length} 个视频`,
+            };
+        }
+        const primary = media[0] || null;
+        const categories = Array.isArray(primary?.categories)
+            ? primary.categories.map(localMediaCategoryLabel).filter(Boolean)
+            : [];
+        const mediaType = primary?.media_type || task.media_type || '';
+        return {
+            title: [primary?.title || task.title, primary?.year || task.year].filter(Boolean).join(' · '),
+            tmdb: primary?.tmdb_id || task.tmdb_id || '',
+            mediaType: [localMediaTypeLabel(mediaType), ...categories.slice(0, 1)].filter((value, index, all) => value && all.indexOf(value) === index).join(' · '),
+            position: recognitionPosition(primary, recognition || {}, task),
+        };
+    }
+
     function renderTaskDetail(data) {
         const task = data.task || {};
+        const recognition = data.recognition || {};
+        const display = recognitionDisplay(task, recognition);
         const state = states[task.status] || [task.status || '未知', ''];
-        const position = task.media_type === 'tv'
-            ? `第 ${task.season ?? '—'} 季 / 第 ${task.episode ?? '—'} 集`
-            : '—';
+        const recognitionSource = {
+            recognition: '整理识别结果',
+            manual_selection: '人工选择结果',
+            manual_selection_with_history: '人工选择 · 历史路径补全',
+            history_inferred: '历史目标路径推断',
+        }[recognition.source] || '';
         const items = Array.isArray(data.items) ? data.items : [];
         const steps = Array.isArray(data.steps) ? data.steps : [];
         $('lmTaskDetailTitle').textContent = taskDisplayName(task) || `整理日志 #${task.id || ''}`;
         $('lmTaskDetailSubtitle').textContent = `${task.source_name || '已删除来源'} · 日志 #${task.id || '—'}`;
         $('lmTaskDetailBody').innerHTML = `
             <section class="lm-task-detail-overview">
-                <div class="lm-task-detail-status"><span class="status-pill ${state[1]}">${esc(state[0])}</span><span>${esc(triggerLabels[task.trigger] || task.trigger || '未知触发')}</span></div>
+                <div class="lm-task-detail-status"><span class="status-pill ${state[1]}">${esc(state[0])}</span><span>${esc(triggerLabels[task.trigger] || task.trigger || '未知触发')}</span>${recognitionSource ? `<span class="lm-task-detail-origin">${esc(recognitionSource)}</span>` : ''}</div>
                 <div class="lm-task-detail-grid">
-                    ${taskDetailField('媒体标题', [task.title, task.year].filter(Boolean).join(' · '))}
-                    ${taskDetailField('TMDB', task.tmdb_id)}
-                    ${taskDetailField('媒体类型', task.media_type)}
-                    ${taskDetailField('季 / 集', position)}
+                    ${taskDetailField('媒体标题', display.title)}
+                    ${taskDetailField('TMDB', display.tmdb)}
+                    ${taskDetailField('媒体类型', display.mediaType)}
+                    ${taskDetailField('季 / 集', display.position)}
                     ${taskDetailField('尝试次数', task.attempts ?? 0)}
                     ${taskDetailField('创建时间', formatItemDate(task.created_at))}
                     ${taskDetailField('更新时间', formatItemDate(task.updated_at))}

@@ -82,7 +82,7 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn("opacity: 0", css)
         self.assertIn(".lm-initial-loading.is-visible", css)
         self.assertIn(".lm-initial-loading svg", css)
-        self.assertIn("?v=20260822a", template)
+        self.assertIn("?v=20260825a", template)
 
     def test_initial_hash_tab_is_prepainted_before_page_script_loads(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
@@ -198,6 +198,10 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn(".lm-task-step-list::before", css)
         self.assertIn(".lm-task-step > div > span", css)
         self.assertIn(".lm-task-step.is-completed .lm-task-step-index", css)
+        self.assertIn("function recognitionDisplay(task, recognition)", js)
+        self.assertIn("history_inferred: '历史目标路径推断'", js)
+        self.assertIn("taskDetailField('季 / 集', display.position)", js)
+        self.assertIn(".lm-task-detail-origin", css)
         self.assertRegex(css, r"\.lm-task-detail-dialog\s*\{[^}]*padding:\s*0[^}]*gap:\s*0")
         self.assertRegex(css, r"\.lm-task-detail-body\s*\{[^}]*min-height:\s*0[^}]*flex:\s*1")
         self.assertRegex(css, r"\.lm-dialog-actions\s*\{[^}]*display:\s*flex[^}]*justify-content:\s*flex-end")

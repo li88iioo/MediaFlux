@@ -180,12 +180,37 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         )
         task = db.get_local_media_task(task_id, owner="admin")
         self.assertEqual((task.season_override, task.episode_override), (2, 7))
-        db.update_local_media_task(task_id, owner="admin", status="requires_manual")
+        db.update_local_media_task(
+            task_id, owner="admin", status="requires_manual",
+            recognition_summary='{"schema_version":1,"media":[]}',
+        )
         self.assertTrue(db.reset_local_media_task(task_id, owner="admin"))
         retried = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(retried.recognition_summary, "")
         self.assertEqual(retried.tmdb_id, "42")
         self.assertEqual(retried.media_type, "tv")
         self.assertEqual((retried.season_override, retried.episode_override), (2, 7))
+
+    def test_task_recognition_summary_round_trip_is_versioned(self):
+        source_id = db.create_local_media_source(
+            name="recognition-summary", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/recognition-summary", owner="admin",
+        )
+        task_id = db.create_local_media_task(
+            source_id, "", "/tmp/recognition-summary/Show.S02E08.mkv",
+            owner="admin", trigger="scan",
+        )
+        before = db.get_local_media_task(task_id, owner="admin")
+        summary = '{"schema_version":1,"media":[]}'
+        self.assertTrue(db.update_local_media_task(
+            task_id, owner="admin", recognition_summary=summary,
+        ))
+        after = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(after.recognition_summary, summary)
+        self.assertEqual(after.version, before.version + 1)
+        self.assertEqual(
+            db.list_local_media_tasks(owner="admin")[0].recognition_summary, summary,
+        )
 
     def test_local_confirmation_claim_is_versioned_and_atomic(self):
         source_id = db.create_local_media_source(
