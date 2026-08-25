@@ -267,7 +267,11 @@ class AgentSettingsUiTests(unittest.TestCase):
             side_effect=lambda key, default="": values.get(key, default),
         ), patch("app.routes.api.config.set_and_save") as persist, patch(
             "app.bot.restart_bot"
-        ) as restart, patch("app.services.clear_dashboard_cache"):
+        ) as restart, patch("app.services.clear_dashboard_cache"), patch(
+            "app.modules.agent_runtime.request_agent_runtime_reconcile"
+        ) as reconcile, patch(
+            "app.bot.handlers.request_command_menu_refresh"
+        ) as refresh_menu:
             unchanged = save_config(self._request(), {"AGENT_ENABLED": "1"})
             changed = save_config(
                 self._request(),
@@ -278,64 +282,50 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertEqual(changed, {"success": True})
         persist.assert_called_once_with({"AGENT_LLM_MODEL": "new-model"})
         restart.assert_not_called()
+        reconcile.assert_not_called()
+        refresh_menu.assert_not_called()
 
-    def test_agent_feature_gate_hot_toggle_controls_all_schedulers(self):
+    def test_agent_feature_gate_hot_toggle_queues_runtime_without_bot_restart(self):
         request = self._request()
         request.app.state.background_services_enabled = True
-        verification = MagicMock()
-        patrol = MagicMock()
-        durable = MagicMock()
 
         with patch(
             "app.routes.api.config.get",
             side_effect=lambda key, default="": "1" if key == "AGENT_ENABLED" else default,
         ), patch("app.routes.api.config.set_and_save"), patch(
             "app.bot.restart_bot"
-        ), patch("app.services.clear_dashboard_cache"), patch(
-            "app.agent.feature_gate.is_agent_enabled", return_value=False
-        ), patch(
-            "app.modules.agent_download_verification_scheduler.get_download_library_verification_scheduler",
-            return_value=verification,
-        ), patch(
-            "app.modules.agent_library_patrol_scheduler.get_agent_library_patrol_scheduler",
-            return_value=patrol,
-        ), patch(
-            "app.modules.agent_jobs_scheduler.get_agent_jobs_scheduler",
-            return_value=durable,
-        ):
+        ) as restart, patch("app.services.clear_dashboard_cache"), patch(
+            "app.modules.agent_runtime.request_agent_runtime_reconcile"
+        ) as reconcile, patch(
+            "app.bot.handlers.request_command_menu_refresh"
+        ) as refresh_menu:
             response = save_config(request, {"AGENT_ENABLED": "0"})
 
         self.assertEqual(response, {"success": True})
-        for scheduler in (verification, patrol, durable):
-            scheduler.stop.assert_called_once_with()
-            scheduler.start.assert_not_called()
+        restart.assert_not_called()
+        reconcile.assert_called_once_with()
+        refresh_menu.assert_called_once_with()
 
-        verification.reset_mock()
-        patrol.reset_mock()
-        durable.reset_mock()
+    def test_telegram_agent_toggle_only_refreshes_menu(self):
+        request = self._request()
+        request.app.state.background_services_enabled = True
+
         with patch(
             "app.routes.api.config.get",
-            side_effect=lambda key, default="": "0" if key == "AGENT_ENABLED" else default,
+            side_effect=lambda key, default="": "1" if key == "TG_AGENT_ENABLED" else default,
         ), patch("app.routes.api.config.set_and_save"), patch(
             "app.bot.restart_bot"
-        ), patch("app.services.clear_dashboard_cache"), patch(
-            "app.agent.feature_gate.is_agent_enabled", return_value=True
-        ), patch(
-            "app.modules.agent_download_verification_scheduler.get_download_library_verification_scheduler",
-            return_value=verification,
-        ), patch(
-            "app.modules.agent_library_patrol_scheduler.get_agent_library_patrol_scheduler",
-            return_value=patrol,
-        ), patch(
-            "app.modules.agent_jobs_scheduler.get_agent_jobs_scheduler",
-            return_value=durable,
-        ):
-            response = save_config(request, {"AGENT_ENABLED": "1"})
+        ) as restart, patch("app.services.clear_dashboard_cache"), patch(
+            "app.modules.agent_runtime.request_agent_runtime_reconcile"
+        ) as reconcile, patch(
+            "app.bot.handlers.request_command_menu_refresh"
+        ) as refresh_menu:
+            response = save_config(request, {"TG_AGENT_ENABLED": "0"})
 
         self.assertEqual(response, {"success": True})
-        for scheduler in (verification, patrol, durable):
-            scheduler.start.assert_called_once_with()
-            scheduler.stop.assert_not_called()
+        restart.assert_not_called()
+        reconcile.assert_not_called()
+        refresh_menu.assert_called_once_with()
 
     def test_secret_can_be_replaced_or_explicitly_cleared_without_reveal(self):
         with patch("app.routes.api.config.set_and_save") as persist, patch(

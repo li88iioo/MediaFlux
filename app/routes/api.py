@@ -1357,10 +1357,16 @@ def save_config(request: Request, data: Any = Body(default=None)):
             )
     bot_restart_ms = 0
     warnings: list[str] = []
-    if {"TG_BOT_TOKEN", "TG_CHAT_ID", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS", "AGENT_ENABLED"} & updates.keys():
+    background_services_enabled = getattr(
+        request.app.state, "background_services_enabled", False
+    )
+    changed_keys = persisted_updates.keys()
+    bot_connection_keys = {"TG_BOT_TOKEN", "TG_CHAT_ID"}
+    bot_agent_menu_keys = {"AGENT_ENABLED", "TG_AGENT_ENABLED"}
+    if bot_connection_keys & changed_keys:
         bot_restart_started = time.perf_counter()
         try:
-            if getattr(request.app.state, "background_services_enabled", False):
+            if background_services_enabled:
                 from app.bot import restart_bot
 
                 if not restart_bot():
@@ -1382,31 +1388,23 @@ def save_config(request: Request, data: Any = Body(default=None)):
             logger.warning("Telegram Bot 配置热更新失败 type=%s", type(exc).__name__)
         finally:
             bot_restart_ms = max(1, round((time.perf_counter() - bot_restart_started) * 1000))
-    if "AGENT_ENABLED" in updates:
+    elif background_services_enabled and bot_agent_menu_keys & changed_keys:
         try:
-            if getattr(request.app.state, "background_services_enabled", False):
-                from app.agent.feature_gate import is_agent_enabled
-                from app.modules.agent_download_verification_scheduler import (
-                    get_download_library_verification_scheduler,
-                )
-                from app.modules.agent_library_patrol_scheduler import (
-                    get_agent_library_patrol_scheduler,
-                )
-                from app.modules.agent_jobs_scheduler import get_agent_jobs_scheduler
+            from app.bot.handlers import request_command_menu_refresh
 
-                schedulers = (
-                    get_download_library_verification_scheduler(),
-                    get_agent_library_patrol_scheduler(),
-                    get_agent_jobs_scheduler(),
-                )
-                for scheduler in schedulers:
-                    if is_agent_enabled():
-                        scheduler.start()
-                    else:
-                        scheduler.stop()
+            request_command_menu_refresh()
         except Exception as exc:
             logger.warning(
-                "Agent 总开关热更新失败 type=%s", type(exc).__name__
+                "Telegram Bot 命令菜单后台刷新失败 type=%s", type(exc).__name__
+            )
+    if "AGENT_ENABLED" in changed_keys and background_services_enabled:
+        try:
+            from app.modules.agent_runtime import request_agent_runtime_reconcile
+
+            request_agent_runtime_reconcile()
+        except Exception as exc:
+            logger.warning(
+                "Agent 总开关后台热更新启动失败 type=%s", type(exc).__name__
             )
     from app.services import clear_dashboard_cache
 
@@ -1474,7 +1472,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
     total_ms = max(1, round((time.perf_counter() - request_started) * 1000))
     logger.info(
         "配置保存完成 changed=%s persist_ms=%s bot_restart_ms=%s patrol_reload_ms=%s total_ms=%s",
-        len(updates), persist_ms, bot_restart_ms, patrol_reload_ms, total_ms,
+        len(persisted_updates), persist_ms, bot_restart_ms, patrol_reload_ms, total_ms,
     )
     result: dict[str, object] = {"success": True}
     if warnings:

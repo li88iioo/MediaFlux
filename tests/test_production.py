@@ -2357,7 +2357,9 @@ class TelegramBotTests(unittest.TestCase):
 
         bot = self.FakeBot()
         values = {"TG_CHAT_ID": "100"}
-        with patch("app.bot.handlers.get", side_effect=lambda key, default="": values.get(key, default)):
+        with patch("app.bot.handlers.get", side_effect=lambda key, default="": values.get(key, default)), patch(
+            "app.bot.handlers.get_bool", return_value=True
+        ):
             handlers._register_commands(bot, self._telebot_types())
             start = next(
                 handler for filters, handler in bot.message_handlers
@@ -2391,6 +2393,45 @@ class TelegramBotTests(unittest.TestCase):
             "start", "help", "status", "sync_gy", "organize", "media_search", "rss", "rss_refresh", "rss_dl",
             "agent", "agent_reset",
         })
+
+    def test_disabled_agent_is_hidden_but_classic_commands_remain(self):
+        from app.bot import handlers
+
+        bot = self.FakeBot()
+        values = {"TG_CHAT_ID": "100"}
+        with patch(
+            "app.bot.handlers.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch("app.bot.handlers.get_bool", return_value=False):
+            handlers._register_commands(bot, self._telebot_types())
+            start = next(
+                handler for filters, handler in bot.message_handlers
+                if filters.get("commands") == ["start"]
+            )
+            rss_refresh = next(
+                handler for filters, handler in bot.message_handlers
+                if filters.get("commands") == ["rss_refresh"]
+            )
+            start(SimpleNamespace(chat=SimpleNamespace(id=100)))
+            with patch("app.bot.handlers.db.list_rss_subscriptions", return_value=[]):
+                rss_refresh(SimpleNamespace(
+                    chat=SimpleNamespace(id=100),
+                    from_user=SimpleNamespace(id=9),
+                    text="/rss_refresh",
+                ))
+
+        commands = {item.command for item in bot.commands}
+        self.assertNotIn("agent", commands)
+        self.assertNotIn("agent_reset", commands)
+        self.assertTrue({
+            "start", "help", "status", "sync_gy", "organize", "media_search",
+            "rss", "rss_refresh", "rss_dl",
+        }.issubset(commands))
+        help_text = bot.replies[-2][1]
+        self.assertNotIn("<b>Media Agent</b>", help_text)
+        self.assertIn("/rss_refresh ID — 刷新订阅", help_text)
+        self.assertIn("/status — 查看整理、同步与待处理状态", help_text)
+        self.assertIn("暂无 RSS 订阅", bot.replies[-1][1])
 
 
     def test_status_command_reports_runtime_state_and_escapes_current_source(self):

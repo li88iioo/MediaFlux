@@ -283,7 +283,9 @@ def start_background_services() -> None:
     from app.modules.agent_jobs_scheduler import get_agent_jobs_scheduler
     from app.modules.local_media_scheduler import get_local_media_scheduler
     from app.modules.organize_confirmations import start_confirmation_dispatcher
+    from app.modules.agent_runtime import resume_agent_runtime
 
+    resume_agent_runtime()
     get_organize_manager().resume()
     start_confirmation_dispatcher()
     get_scheduler().start()
@@ -323,6 +325,13 @@ def stop_background_services() -> bool:
 
     organize_manager = get_organize_manager()
     organize_manager.begin_shutdown()
+    try:
+        from app.modules.agent_runtime import shutdown_agent_runtime
+
+        if not shutdown_agent_runtime():
+            logger.warning("Agent 运行时协调线程未在关机窗口内退出")
+    except Exception as exc:
+        logger.warning("停止 Agent 运行时协调线程失败 type=%s", type(exc).__name__)
 
     # 再关闭会产生新任务的入口和轮询器。
     try:

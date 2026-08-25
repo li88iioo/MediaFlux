@@ -35,6 +35,9 @@ _bot_thread: threading.Thread | None = None
 _bot_thread_stop: threading.Event | None = None
 _registered_bot_id: int | None = None
 _command_menu_bot_id: int | None = None
+_command_menu_refresh_thread: threading.Thread | None = None
+_command_menu_refresh_lock = threading.Lock()
+_command_menu_refresh_requested = threading.Event()
 _progress_recovery_thread: threading.Thread | None = None
 _progress_recovery_stop: threading.Event | None = None
 _lifecycle_lock = threading.RLock()
@@ -894,22 +897,43 @@ def _start_organize_all(bot, telebot, source_message) -> bool:
         return False
 
 
+def _telegram_agent_available() -> bool:
+    return get_bool("AGENT_ENABLED", False) and get_bool("TG_AGENT_ENABLED", False)
+
+
+def _command_menu_specs() -> list[tuple[str, str]]:
+    commands = [
+        ("organize", "整理光鸭云盘或本地媒体"),
+        ("sync_gy", "同步光鸭云盘STRM"),
+        ("media_search", "搜索媒体资源"),
+        ("rss", "查看RSS订阅"),
+        ("rss_refresh", "刷新RSS订阅"),
+        ("rss_dl", "下载RSS条目"),
+    ]
+    if _telegram_agent_available():
+        commands.extend(
+            [
+                ("agent", "使用 Media Agent"),
+                ("agent_reset", "重置 Agent 会话"),
+            ]
+        )
+    commands.extend(
+        [
+            ("status", "查看运行状态"),
+            ("help", "查看使用帮助"),
+            ("start", "开始"),
+        ]
+    )
+    return commands
+
+
 def _set_command_menu(bot, telebot) -> bool:
     global _command_menu_bot_id
     try:
         bot.set_my_commands(
             [
-                telebot.types.BotCommand("organize", "整理光鸭云盘或本地媒体"),
-                telebot.types.BotCommand("sync_gy", "同步光鸭云盘STRM"),
-                telebot.types.BotCommand("media_search", "搜索媒体资源"),
-                telebot.types.BotCommand("rss", "查看RSS订阅"),
-                telebot.types.BotCommand("rss_refresh", "刷新RSS订阅"),
-                telebot.types.BotCommand("rss_dl", "下载RSS条目"),
-                telebot.types.BotCommand("agent", "使用 Media Agent"),
-                telebot.types.BotCommand("agent_reset", "重置 Agent 会话"),
-                telebot.types.BotCommand("status", "查看运行状态"),
-                telebot.types.BotCommand("help", "查看使用帮助"),
-                telebot.types.BotCommand("start", "开始"),
+                telebot.types.BotCommand(command, description)
+                for command, description in _command_menu_specs()
             ]
         )
     except Exception as exc:
@@ -917,6 +941,53 @@ def _set_command_menu(bot, telebot) -> bool:
         return False
     _command_menu_bot_id = id(bot)
     return True
+
+
+def _refresh_command_menu_worker() -> None:
+    global _command_menu_refresh_thread
+    rerun = False
+    try:
+        while True:
+            _command_menu_refresh_requested.clear()
+            bot = _bot
+            if bot is not None:
+                import telebot
+
+                _set_command_menu(bot, telebot)
+            with _command_menu_refresh_lock:
+                if _command_menu_refresh_requested.is_set():
+                    continue
+                _command_menu_refresh_thread = None
+                return
+    except Exception as exc:
+        logger.warning("刷新 Telegram 命令菜单失败 type=%s", type(exc).__name__)
+    finally:
+        with _command_menu_refresh_lock:
+            if _command_menu_refresh_thread is threading.current_thread():
+                _command_menu_refresh_thread = None
+            rerun = _command_menu_refresh_requested.is_set()
+        if rerun:
+            request_command_menu_refresh()
+
+
+def request_command_menu_refresh() -> bool:
+    """后台刷新命令菜单，避免配置保存等待 Telegram 网络请求。"""
+    global _command_menu_refresh_thread
+    _command_menu_refresh_requested.set()
+    with _command_menu_refresh_lock:
+        if (
+            _command_menu_refresh_thread is not None
+            and _command_menu_refresh_thread.is_alive()
+        ):
+            return False
+        thread = threading.Thread(
+            target=_refresh_command_menu_worker,
+            name="telegram-command-menu-refresh",
+            daemon=True,
+        )
+        _command_menu_refresh_thread = thread
+        thread.start()
+        return True
 
 
 def _ensure_command_menu(bot) -> bool:
@@ -946,27 +1017,32 @@ def _register_commands(bot, telebot):
     @bot.message_handler(commands=["start"])
     @require_auth
     def cmd_start(msg):
-        bot.reply_to(
-            msg,
+        sections = [
             "<b>MediaFlux Bot</b>\n\n"
             "发送磁力、ED2K、HTTP(S) 链接或 .torrent 文件，"
-            "可选择推送到光鸭、qBittorrent 或两者。\n\n"
+            "可选择推送到光鸭、qBittorrent 或两者。",
             "<b>资源搜索</b>\n"
             "/media_search 片名 — 搜索媒体资源\n"
-            "/媒体搜索 片名 — 搜索媒体资源\n\n"
+            "/媒体搜索 片名 — 搜索媒体资源",
             "<b>整理与同步</b>\n"
             "/sync_gy — 完整扫描并校准光鸭 STRM\n"
-            "/organize — 选择整理光鸭云盘、本地下载或全部\n\n"
+            "/organize — 选择整理光鸭云盘、本地下载或全部",
             "<b>RSS 订阅</b>\n"
             "/rss — 查看订阅\n"
             "/rss_refresh ID — 刷新订阅\n"
-            "/rss_dl ID — 下载条目\n\n"
-            "<b>Media Agent</b>\n"
-            "/agent — 使用 Media Agent\n"
-            "/agent_reset — 重置 Agent 会话\n\n"
+            "/rss_dl ID — 下载条目",
+        ]
+        if _telegram_agent_available():
+            sections.append(
+                "<b>Media Agent</b>\n"
+                "/agent — 使用 Media Agent\n"
+                "/agent_reset — 重置 Agent 会话"
+            )
+        sections.append(
             "<b>运行状态</b>\n"
-            "/status — 查看整理、同步与待处理状态",
+            "/status — 查看整理、同步与待处理状态"
         )
+        bot.reply_to(msg, "\n\n".join(sections))
 
     @bot.message_handler(commands=["status"])
     @require_auth
