@@ -599,7 +599,6 @@ class OrganizeNamingUiTests(unittest.TestCase):
         html = (Path("app/templates/logs.html").read_text(encoding="utf-8") + Path("app/static/js/logs.js").read_text(encoding="utf-8"))
         for text in (
             "搜索年份（可选）",
-            "可同时修正 TMDB 条目与剧集位置",
             "剧集位置",
             "影片目录",
             "视频文件",

@@ -33,7 +33,7 @@ class PageAssetExtractionTests(unittest.TestCase):
         css = Path("app/static/css/organize.css").read_text(encoding="utf-8")
 
         self.assertIn("path='css/organize.css'", template)
-        self.assertIn("path='css/organize.css') }}?v=20260821d", template)
+        self.assertIn("path='css/organize.css') }}?v=20260825b", template)
         self.assertNotIn("<style>", template)
         self.assertIn(".organize-rules-nav-card", css)
         self.assertIn(".recognition-knowledge-dialog", css)
