@@ -51,6 +51,8 @@ from app.web import api_error, api_response, csrf_token, require_api_login
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/tools")
 
+_TMDB_DRAFT_TEST_HOSTS = {"api.themoviedb.org", "api.tmdb.org"}
+
 
 def _safe_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name or "")
@@ -899,6 +901,39 @@ def _ai_model_test_rate_key(request: Request) -> str:
     return f"settings:ai-model-test:{digest}"
 
 
+def _tmdb_test_rate_key(request: Request) -> str:
+    token = csrf_token(request)
+    digest = hashlib.sha256(
+        b"mediaflux-tmdb-test:v1\0" + token.encode("utf-8")
+    ).hexdigest()
+    return f"settings:tmdb-test:{digest}"
+
+
+def _normalize_tmdb_api_url(raw_value: object) -> str:
+    raw = str(raw_value or "").strip().rstrip("/")
+    if not raw or len(raw) > 2048 or "\r" in raw or "\n" in raw:
+        raise ValueError("TMDB API URL 格式无效")
+    try:
+        parsed = urlparse(raw)
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("TMDB API URL 格式无效") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("TMDB API URL 必须是无内嵌凭据、无查询参数的 HTTP(S) 地址")
+    return parsed._replace(
+        scheme=parsed.scheme.lower(), netloc=parsed.netloc.lower(),
+        params="", query="", fragment=""
+    ).geturl().rstrip("/")
+
+
 def _ai_model_test_timeout(raw_value: object) -> int:
     if isinstance(raw_value, bool):
         raise ValueError("请求超时必须是 2–30 秒的整数")
@@ -1317,3 +1352,102 @@ def proxy_test(request: Request, data: dict | None = Body(default=None)):
             "elapsed_ms": max(1, int((perf_counter() - started) * 1000)),
         },
     })
+
+
+@router.post("/tmdb/test")
+def tmdb_test(request: Request, data: dict | None = Body(default=None)):
+    """测试当前 TMDB 表单草稿的连通性与密钥有效性。"""
+    require_api_login(request)
+    data = data or {}
+    unknown = sorted(set(data) - {"api_key", "api_url"})
+    if unknown:
+        return api_error("TMDB 测试包含不支持的参数", 400)
+    if not agent_rate_limiter.allow(
+        _tmdb_test_rate_key(request), limit=6, window_seconds=60
+    ):
+        return api_error("TMDB 测试过于频繁，请稍后再试", 429)
+
+    configured_url_raw = config.get("TMDB_API_URL", "").strip()
+    configured_url_raw = configured_url_raw or "https://api.themoviedb.org/3"
+    draft_url_raw = str(data.get("api_url") or "").strip()
+    try:
+        configured_url = _normalize_tmdb_api_url(configured_url_raw)
+        api_url = _normalize_tmdb_api_url(draft_url_raw or configured_url)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+    if (
+        api_url != configured_url
+        and (urlparse(api_url).hostname or "").lower() not in _TMDB_DRAFT_TEST_HOSTS
+    ):
+        return api_error("自定义 TMDB 网关请先保存设置，再执行连通性测试", 400)
+
+    draft_api_key = str(data.get("api_key") or "").strip()
+    uses_saved_key = not draft_api_key or draft_api_key == "********"
+    if uses_saved_key and api_url != configured_url:
+        return api_error("测试未保存的 TMDB API URL 时，请输入该地址对应的 API Key", 400)
+    api_key = (
+        config.get("TMDB_API_KEY", "").strip() if uses_saved_key else draft_api_key
+    )
+    if not api_key:
+        return api_error("请先填写 TMDB API Key", 400)
+    if len(api_key) > 512 or "\r" in api_key or "\n" in api_key:
+        return api_error("TMDB API Key 格式无效", 400)
+
+    proxies = None
+    proxy = config.get("PROXY_URL", "").strip()
+    if proxy:
+        if "://" in proxy and not proxy.startswith(("http://", "https://")):
+            return api_error("代理地址无效", 400)
+        proxy_url = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
+        try:
+            parsed_proxy = urlparse(proxy_url)
+            parsed_proxy.port
+        except ValueError:
+            return api_error("代理地址无效", 400)
+        if (
+            parsed_proxy.scheme not in {"http", "https"}
+            or not parsed_proxy.hostname
+            or parsed_proxy.query
+            or parsed_proxy.fragment
+        ):
+            return api_error("代理地址无效", 400)
+        proxies = {"http": proxy_url, "https": proxy_url}
+
+    started = perf_counter()
+    try:
+        resp = requests.get(
+            f"{api_url}/configuration",
+            params={"api_key": api_key},
+            headers={"User-Agent": "MediaFlux/1.0"},
+            proxies=proxies,
+            timeout=(3.0, 8.0),
+            allow_redirects=False,
+        )
+        elapsed_ms = max(1, int((perf_counter() - started) * 1000))
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except ValueError:
+                return api_error("TMDB 返回了无法识别的响应", 502)
+            if not isinstance(payload, dict) or not isinstance(payload.get("images"), dict):
+                return api_error("TMDB 返回了不完整的配置响应", 502)
+            return api_response({
+                "ok": True,
+                "status_code": 200,
+                "elapsed_ms": elapsed_ms,
+                "message": f"连接正常 · 延迟 {elapsed_ms} ms",
+            })
+        if resp.status_code in (301, 302, 303, 307, 308):
+            return api_error("TMDB 测试拒绝跟随上游重定向，请检查 API URL", 502)
+        if resp.status_code in (401, 403):
+            return api_error("TMDB API Key 无效或未通过鉴权", 502)
+        return api_error(f"TMDB 接口返回 HTTP {resp.status_code}", 502)
+    except requests.exceptions.Timeout:
+        return api_error("连接 TMDB 超时，请检查网络或配置代理", 504)
+    except requests.exceptions.RequestException as exc:
+        logger.warning("TMDB 连通性测试传输失败 type=%s", type(exc).__name__)
+        return api_error("无法连接 TMDB，请检查地址、网络与代理设置", 502)
+    except Exception as exc:
+        logger.warning("TMDB 连通性测试失败 type=%s", type(exc).__name__)
+        return api_error("TMDB 连接测试失败，请检查地址与密钥", 502)

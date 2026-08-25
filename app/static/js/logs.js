@@ -185,18 +185,43 @@ document.getElementById('clearOrganizeLogsBtn').addEventListener('click',async(e
 });
 
 function _operationToken(){return (crypto.randomUUID?.()||String(Date.now())+'-'+Math.random().toString(16).slice(2)).replaceAll('-','');}
+function _setOrganizeState(message,type=''){const el=document.getElementById('organizeOperationState');if(el){el.textContent=message||'';el.className='inline-save-state'+(type?' is-'+type:'');}}
 function _formatRole(role){return ({video:'视频',subtitle:'字幕',nfo:'NFO',image:'图片',metadata:'元数据'}[role]||role||'文件');}
-function _setOrganizeState(message,type=''){const el=document.getElementById('organizeOperationState');el.textContent=message||'';el.className='inline-save-state'+(type?' is-'+type:'');}
+function _extractMediaTags(filename){
+    if(!filename)return [];
+    const tags=[];
+    const fn=String(filename);
+    const has=pattern=>new RegExp(`(?:^|[^A-Z0-9])(?:${pattern})(?=$|[^A-Z0-9])`,'i').test(fn);
+    if(has('2160P|4K|UHD'))tags.push('4K UHD');
+    else if(has('1080P|FHD'))tags.push('1080p');
+    else if(has('720P'))tags.push('720p');
+    if(has('H[._ -]?265|HEVC|X265'))tags.push('HEVC');
+    else if(has('H[._ -]?264|AVC|X264'))tags.push('AVC');
+    else if(has('AV1'))tags.push('AV1');
+    if(has('DV|DOVI|DOLBY[._ -]+VISION'))tags.push('Dolby Vision');
+    else if(has('HDR10\\+|HDR10PLUS'))tags.push('HDR10+');
+    else if(has('HDR'))tags.push('HDR');
+    else if(has('SDR'))tags.push('SDR');
+    if(has('WEB[._ -]?DL'))tags.push('WEB-DL');
+    else if(has('REMUX'))tags.push('REMUX');
+    else if(has('BLU[._ -]?RAY|BDMV'))tags.push('BluRay');
+    if(has('ATMOS'))tags.push('Atmos');
+    else if(has('TRUEHD'))tags.push('TrueHD');
+    else if(has('DTS[._ -]?HD'))tags.push('DTS-HD');
+    else if(has('AAC'))tags.push('AAC');
+    return tags.slice(0,4);
+}
 function _formatReleasePosition(position){
-    if(!position||typeof position!=='object')return '未提取';
-    const season=Number.isInteger(position.season)?`S${String(position.season).padStart(2,'0')}`:'';
-    const episode=Number.isInteger(position.episode)?`E${String(position.episode).padStart(2,'0')}`:'';
-    return season||episode?`${season}${episode}`:'未提取';
+    if(!position||typeof position!=='object')return '-';
+    const season=position.season!=null?`S${String(position.season).padStart(2,'0')}`:'';
+    const episode=position.episode!=null?`E${String(position.episode).padStart(2,'0')}`:'';
+    return `${season}${episode}`||'-';
 }
 function _formatReleaseEvidence(item){
-    const sourceMap={filename:'文件名',parent_directory:'父目录',release_context:'季集上下文',recognition_preprocess:'预处理规则',explicit_marker:'显式标记'};
-    const kindMap={title:'标题',year:'年份',season:'季号',episode:'集号',preprocess_rule:'规则',tmdb_id:'TMDB'};
-    const source=sourceMap[item?.source]||item?.source||'解析器';
+    if(!item||typeof item!=='object')return '-';
+    const sourceMap={filename:'文件名',parent:'父目录',parent_directory:'父目录',release_context:'发布信息',recognition_preprocess:'预处理',explicit_marker:'显式标记',title:'标题',year:'年份',regex:'正则'};
+    const kindMap={title:'标题',year:'年份',season:'季号',episode:'集号',preprocess_rule:'预处理规则',tmdb_id:'TMDB ID',strip_tail:'剥离尾缀'};
+    const source=sourceMap[item?.source]||item?.source||'解析';
     const kind=kindMap[item?.kind]||item?.kind||'证据';
     const value=item?.value==null?'':String(item.value);
     return `${source} · ${kind}${value?`：${value}`:''}`;
@@ -209,26 +234,140 @@ function _renderReleaseParse(parse){
     if(!valid){target.replaceChildren();return;}
     const sourcePosition=_formatReleasePosition(parse.source_position);
     const effectivePosition=_formatReleasePosition(parse.effective_position);
-    const identity=[parse.media_type==='tv'?'剧集':parse.media_type==='movie'?'电影':parse.media_type,parse.year].filter(Boolean).join(' · ')||'未确定类型';
+    const isPositionShifted = sourcePosition !== effectivePosition && sourcePosition !== '-' && effectivePosition !== '-';
+    const mediaTypeLabel = parse.media_type==='tv'?'剧集':parse.media_type==='movie'?'电影':(parse.media_type||'');
     const evidence=(Array.isArray(parse.evidence)?parse.evidence:[]).slice(0,3);
-    const rules=(Array.isArray(parse.preprocess_rules)?parse.preprocess_rules:[]).slice(0,3).map(rule=>({source:'recognition_preprocess',kind:'preprocess_rule',value:rule?.name||rule?.action||'规则'}));
+    const rules=(Array.isArray(parse.preprocess_rules)?parse.preprocess_rules:[]).slice(0,3).map(rule=>({source:'预处理',kind:'规则',value:rule?.name||rule?.action||'规则'}));
     const proof=[...evidence,...rules].slice(0,3);
     target.innerHTML=`
-        <div><span>清洗标题</span><strong title="${_attr(parse.title||'')}">${_esc(parse.title||'未提取')}</strong><small>${_esc(identity)}</small></div>
-        <div><span>季集映射</span><strong>${_esc(sourcePosition===effectivePosition?effectivePosition:`${sourcePosition} → ${effectivePosition}`)}</strong><small>${sourcePosition===effectivePosition?'未发生位置换算':'已应用季集映射或人工覆盖'}</small></div>
-        <div class="organize-release-evidence"><span>主要证据</span>${proof.length?proof.map(item=>`<small>${_esc(_formatReleaseEvidence(item))}</small>`).join(''):'<small>旧记录未保存解析证据</small>'}</div>`;
+        <div class="organize-parse-card">
+            <span class="organize-parse-label">清洗标题</span>
+            <div class="organize-parse-main">
+                <strong class="organize-parse-title" title="${_attr(parse.title||'')}">${_esc(parse.title||'未提取')}</strong>
+                <div class="organize-parse-tags">
+                    ${mediaTypeLabel ? `<span class="organize-type-badge"><i data-lucide="${parse.media_type==='tv'?'tv':'film'}"></i>${_esc(mediaTypeLabel)}</span>` : ''}
+                    ${parse.year ? `<span class="organize-year-badge">${_esc(parse.year)}</span>` : ''}
+                </div>
+            </div>
+        </div>
+        <div class="organize-parse-card">
+            <span class="organize-parse-label">季集映射</span>
+            <div class="organize-parse-main">
+                <code class="organize-pos-badge">${_esc(isPositionShifted ? `${sourcePosition} → ${effectivePosition}` : (effectivePosition || '-'))}</code>
+                <small class="organize-parse-sub">${isPositionShifted ? '已纠偏映射/覆盖' : '未发生位置换算'}</small>
+            </div>
+        </div>
+        <div class="organize-parse-card organize-parse-card-proof">
+            <span class="organize-parse-label">主要证据</span>
+            <div class="organize-proof-chips">
+                ${proof.length ? proof.map(item => `<span class="organize-proof-chip" title="${_attr(_formatReleaseEvidence(item))}">${_esc(_formatReleaseEvidence(item))}</span>`).join('') : '<small class="text-muted">历史记录未保存证据快照</small>'}
+            </div>
+        </div>`;
 }
 function _renderOrganizeDetail(data){
     organizeDetail=data;selectedOrganizeCandidate=null;
     document.getElementById('organizeDetailTitle').textContent=`整理日志 #${data.id}`;
-    document.getElementById('organizeDetailSubtitle').textContent=[data.title,data.year,data.tmdb_id?`tmdb-${data.tmdb_id}`:''].filter(Boolean).join(' · ')||'媒体组纠偏与操作审计';
+    const [statusLabel, statusClass] = orgStatusMap[data.status] || [data.status, 'running'];
+    const subtitleParts = [data.title, data.year, data.tmdb_id ? `TMDB-${data.tmdb_id}` : ''].filter(Boolean);
+    document.getElementById('organizeDetailSubtitle').innerHTML = `
+        <span class="organize-detail-status-badge ${statusClass}">
+            <span class="status-dot"></span>
+            <span>${_esc(statusLabel)}</span>
+        </span>
+        <span class="organize-detail-media-meta">${_esc(subtitleParts.join(' · ') || '媒体组纠偏与操作审计')}</span>
+    `;
     const notice=document.getElementById('organizeSafetyNotice');notice.hidden=!data.safety_notice;notice.textContent=data.safety_notice||'';
-    document.getElementById('organizeDetailSummary').innerHTML=[
-        ['状态',(orgStatusMap[data.status]||[data.status])[0]],['原始文件',data.original_name||'-'],['当前文件',data.current_name||'-'],['原始目录 ID',data.original_parent_id||'-'],['当前目录 ID',data.current_parent_id||'-'],
-        ...(data.error?[[(data.status==='skipped'?'跳过原因':'错误诊断'),data.error,'is-warning']]:[])
-    ].map(([label,value,tone])=>`<div class="${tone||''}"><span>${_esc(label)}</span><strong title="${_esc(value)}">${_esc(value)}</strong></div>`).join('');
+    const originalName = data.original_name || '-';
+    const currentName = data.current_name || '-';
+    const originalParentId = data.original_parent_id || '-';
+    const currentParentId = data.current_parent_id || '-';
+    document.getElementById('organizeDetailSummary').innerHTML = `
+        <div class="organize-flow-hero">
+            <div class="organize-flow-node from-node">
+                <div class="organize-flow-node-badge">
+                    <i data-lucide="folder-input"></i>
+                    <span>原始来源</span>
+                </div>
+                <div class="organize-flow-filename" title="${_attr(originalName)}">
+                    <strong>${_esc(originalName)}</strong>
+                </div>
+                <div class="organize-flow-meta">
+                    <span class="organize-meta-chip" title="原始目录 ID: ${_attr(originalParentId)}">
+                        <i data-lucide="database"></i>
+                        <span>目录 ID: ${_esc(originalParentId)}</span>
+                    </span>
+                </div>
+            </div>
+            <div class="organize-flow-arrow">
+                <div class="organize-flow-status-pill ${statusClass}">
+                    <span class="status-dot"></span>
+                    <span>${_esc(statusLabel)}</span>
+                </div>
+                <div class="organize-flow-connector"><i data-lucide="arrow-right"></i></div>
+            </div>
+            <div class="organize-flow-node to-node">
+                <div class="organize-flow-node-badge is-target">
+                    <i data-lucide="film"></i>
+                    <span>归档目标</span>
+                </div>
+                <div class="organize-flow-filename is-target" title="${_attr(currentName)}">
+                    <strong>${_esc(currentName)}</strong>
+                </div>
+                <div class="organize-flow-meta">
+                    <span class="organize-meta-chip" title="当前目录 ID: ${_attr(currentParentId)}">
+                        <i data-lucide="database"></i>
+                        <span>目录 ID: ${_esc(currentParentId)}</span>
+                    </span>
+                </div>
+            </div>
+        </div>
+        ${data.error ? `
+            <div class="organize-summary-alert ${data.status==='skipped'?'is-skipped':'is-error'}">
+                <i data-lucide="${data.status==='skipped'?'info':'alert-triangle'}"></i>
+                <div>
+                    <strong>${data.status==='skipped'?'跳过说明':'错误诊断'}</strong>
+                    <p>${_esc(data.error)}</p>
+                </div>
+            </div>
+        ` : ''}
+    `;
     _renderReleaseParse(data.release_parse);
-    const items=data.items||[];document.getElementById('organizeDetailItems').innerHTML=items.length?items.map(item=>`<div class="organize-item"><span class="tag-mini">${_esc(_formatRole(item.role))}</span><div><strong>${_esc(item.current_name||item.original_name||item.file_id)}</strong><small>${_esc(item.file_id)} · ${_esc(item.current_parent_id||'-')}</small>${item.error?`<small class="organize-item-reason">${item.status==='skipped'?'跳过原因':'错误'}：${_esc(item.error)}</small>`:''}</div><span class="status-pill ${(item.status==='success'?'done':item.status==='deleted'?'failed':'paused')}">${_esc(item.status||'-')}</span></div>`).join(''):'<div class="table-empty">旧记录没有媒体组成员快照</div>';
+    const items=data.items||[];
+    document.getElementById('organizeDetailItems').innerHTML=items.length?items.map(item=>{
+        const fn = item.current_name || item.original_name || item.file_id;
+        const tags = _extractMediaTags(fn);
+        const rawRole = String(item.role || 'video');
+        const role = ['video','subtitle','nfo','image','metadata'].includes(rawRole) ? rawRole : 'metadata';
+        const roleIcon = role==='video' ? 'video' : role==='subtitle' ? 'captions' : 'file-text';
+        const roleLabel = _formatRole(rawRole);
+        const st = item.status || '-';
+        const stClass = st==='success'?'done':st==='deleted'?'failed':'paused';
+        return `
+            <div class="organize-item organize-item-card">
+                <div class="organize-item-role-col">
+                    <span class="organize-item-role role-${role}">
+                        <i data-lucide="${roleIcon}"></i>
+                        <span>${_esc(roleLabel)}</span>
+                    </span>
+                </div>
+                <div class="organize-item-content">
+                    <div class="organize-item-name-row">
+                        <strong class="organize-item-name" title="${_attr(fn)}">${_esc(fn)}</strong>
+                        ${tags.length ? `<div class="organize-item-tags">${tags.map(t=>`<span class="organize-spec-tag">${_esc(t)}</span>`).join('')}</div>` : ''}
+                    </div>
+                    <div class="organize-item-meta">
+                        <span>ID: ${_esc(item.file_id || '-')}</span>
+                        <span>·</span>
+                        <span>父目录: ${_esc(item.current_parent_id || '-')}</span>
+                    </div>
+                    ${item.error ? `<div class="organize-item-reason"><i data-lucide="alert-circle"></i><span>${item.status==='skipped'?'跳过原因':'错误'}：${_esc(item.error)}</span></div>` : ''}
+                </div>
+                <div class="organize-item-status-col">
+                    <span class="status-pill ${stClass}">${_esc(st)}</span>
+                </div>
+            </div>
+        `;
+    }).join(''):'<div class="table-empty">旧记录没有媒体组成员快照</div>';
     const operations=data.operations||[];document.getElementById('organizeOperationSection').hidden=!operations.length;document.getElementById('organizeDetailOperations').innerHTML=operations.map(step=>`<div class="organize-operation"><span class="status-pill ${step.status==='success'?'done':step.status==='failed'?'failed':'running'}">${_esc(step.status)}</span><div><strong>${_esc(step.action)}</strong><small>${_esc(step.from_name||'-')} → ${_esc(step.to_name||'-')}</small>${step.error?`<small class="organize-item-reason">错误：${_esc(step.error)}</small>`:''}</div><time>${_esc(step.finished_at||step.started_at||'-')}</time></div>`).join('');
     const audits=data.delete_audits||[];document.getElementById('organizeDeleteAuditSection').hidden=!audits.length;document.getElementById('organizeDeleteAudits').innerHTML=audits.map(audit=>`<div class="organize-delete-audit"><span class="status-pill ${audit.status==='success'?'done':audit.status==='failed'?'failed':'paused'}">${_esc(audit.status)}</span><div><strong>${_esc(audit.reason||'未记录原因')}</strong><small>${_esc(audit.file_name||audit.file_id)}${audit.replacement_name?` → 替换为 ${_esc(audit.replacement_name)}`:''}</small><small>${_esc(audit.provider||'guangya')} · ${_esc(audit.provider_result||audit.error||'-')}</small></div></div>`).join('');
     document.getElementById('organizeTmdbQuery').value=data.title||data.original_name||'';

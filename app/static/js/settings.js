@@ -558,4 +558,65 @@
         catch(error){result.className='proxy-result proxy-result-list is-error';result.textContent=error.message||'测试请求失败';}
         finally{button.disabled=false;}
     });
+
+    const testTmdbBtn = document.getElementById('testTmdbBtn');
+    if (testTmdbBtn) {
+        testTmdbBtn.addEventListener('click', async () => {
+            const state = document.getElementById('tmdbConnectionState');
+            const apiKeyInput = document.getElementById('tmdbApiKeyInput');
+            const apiUrlInput = document.getElementById('tmdbApiUrlInput');
+            testTmdbBtn.disabled = true;
+            if (state) {
+                state.className = 'tmdb-connection-status is-testing';
+                state.innerHTML = '<i data-lucide="loader-circle"></i><span>正在测试 TMDB API 连通性...</span>';
+                window.renderLucideIcons?.(state);
+            }
+            try {
+                const response = await fetch('/api/tools/tmdb/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        api_key: apiKeyInput?.value || '',
+                        api_url: apiUrlInput?.value || ''
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || '连接测试失败');
+                if (state) {
+                    state.className = 'tmdb-connection-status is-ok';
+                    state.innerHTML = `<i data-lucide="check-circle"></i><span>${escapeHtml(data.message || '连接正常')}</span>`;
+                    window.renderLucideIcons?.(state);
+                }
+            } catch (error) {
+                if (state) {
+                    state.className = 'tmdb-connection-status is-error';
+                    state.innerHTML = `<i data-lucide="alert-circle"></i><span>${escapeHtml(error.message || '连接失败')}</span>`;
+                    window.renderLucideIcons?.(state);
+                }
+            } finally {
+                testTmdbBtn.disabled = false;
+            }
+        });
+    }
+
+    const resetTmdbConnectionState = () => {
+        const state = document.getElementById('tmdbConnectionState');
+        if (!state || state.classList.contains('is-testing')) return;
+        state.className = 'tmdb-connection-status is-idle';
+        state.innerHTML = '<span>TMDB 连接状态</span>';
+    };
+    ['tmdbApiKeyInput', 'tmdbApiUrlInput'].forEach(id => {
+        document.getElementById(id)?.addEventListener('input', resetTmdbConnectionState);
+    });
+
+    document.querySelectorAll('.preset-chip[data-preset-url]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const urlInput = document.getElementById('tmdbApiUrlInput');
+            if (urlInput) {
+                urlInput.value = btn.dataset.presetUrl;
+                urlInput.dispatchEvent(new Event('input', { bubbles: true }));
+                urlInput.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        });
+    });
 })();

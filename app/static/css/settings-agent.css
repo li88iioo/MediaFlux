@@ -608,6 +608,12 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     gap: 28px;
     padding-top: 28px;
 }
+.metadata-column {
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+    min-width: 0;
+}
 .metadata-settings-card {
     min-width: 0;
     overflow: hidden;
@@ -681,27 +687,188 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     align-items: baseline;
     justify-content: space-between;
     gap: 16px;
-    margin-bottom: 2px;
+    margin-bottom: 8px;
 }
 .metadata-compact-heading strong { color: var(--text-primary); font-size: 12px; }
 .metadata-compact-heading span { color: var(--text-muted); font-size: 10px; text-align: right; }
+
+.metadata-card-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 650;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-border);
+}
+.metadata-card-tag svg { width: 12px; height: 12px; }
+
+.field-control-with-action {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+}
+.field-control-with-action .field-control { flex: 1 1 auto; }
+.tmdb-test-btn {
+    flex: 0 0 auto;
+    min-height: 42px;
+    height: 42px;
+    padding: 0 14px;
+    font-size: 12px;
+    font-weight: 650;
+    border-radius: 8px;
+    gap: 6px;
+    white-space: nowrap;
+}
+.tmdb-test-btn svg { width: 14px; height: 14px; color: var(--accent); }
+
+.tmdb-connection-status {
+    min-height: 31px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: 6px;
+    padding: 6px 12px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.4;
+    transition: color .2s ease, background-color .2s ease, border-color .2s ease;
+}
+.tmdb-connection-status.is-idle { visibility: hidden; }
+.tmdb-connection-status.is-testing {
+    color: var(--text-muted);
+    background: var(--control-tint);
+    border: 1px solid var(--border-soft);
+}
+.tmdb-connection-status.is-ok {
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-border);
+}
+.tmdb-connection-status.is-error {
+    color: var(--danger);
+    background: var(--danger-soft);
+    border: 1px solid var(--danger-border);
+}
+
+.tmdb-preset-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 7px;
+    flex-wrap: wrap;
+}
+.preset-label {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.preset-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 9px;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: var(--bg-input);
+    border: 1px solid var(--border-soft);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: color .15s ease, border-color .15s ease, background-color .15s ease;
+}
+.preset-chip:hover {
+    color: var(--accent);
+    border-color: var(--accent-border);
+    background: var(--accent-soft);
+}
+
+/* AI Fallback Gauge Cards */
+.ai-threshold-wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.ai-threshold-input {
+    width: 110px !important;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-weight: 600;
+}
+.ai-threshold-guide {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
 .metadata-control-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    column-gap: 18px;
+    gap: 10px;
+    margin-top: 4px;
 }
-.metadata-control-grid .metadata-field:nth-last-child(-n + 2) { border-bottom: 0; }
+.metadata-gauge-card {
+    display: flex;
+    flex-direction: column;
+    padding: 10px 12px;
+    background: var(--bg-input);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    cursor: default;
+    transition: border-color .15s ease, background .15s ease;
+}
+.metadata-gauge-card:focus-within {
+    border-color: var(--accent);
+    background: var(--bg-card);
+}
+.gauge-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+.gauge-head svg { width: 13px; height: 13px; color: var(--accent); }
+.gauge-input-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.gauge-input-wrap .form-input {
+    min-height: 34px;
+    height: 34px;
+    padding: 4px 8px;
+    font-size: 13px;
+    font-weight: 700;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    color: var(--text-primary);
+    background: var(--bg-card);
+    border-radius: 6px;
+}
+.gauge-input-wrap .unit {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 600;
+    white-space: nowrap;
+}
+.gauge-hint {
+    margin-top: 4px;
+    font-size: 9.5px;
+    color: var(--text-muted);
+}
 
-/* Metadata AI fallback reuses the Media Agent provider instead of duplicating credentials. */
-.ai-recognition-box .naming-template-head { align-items: flex-start; }
 .ai-recognition-badge {
     display: inline-flex;
     align-items: center;
     flex: 0 0 auto;
     padding: 3px 8px;
-    color: var(--text-muted);
-    background: var(--control-tint);
-    border: 1px solid var(--border);
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-border);
     border-radius: 6px;
     font-size: 11px;
     font-weight: 650;

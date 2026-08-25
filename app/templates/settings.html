@@ -9,7 +9,7 @@
     if(target&&target!=='console'&&['telegram','agent','metadata','discovery','downloads','network'].includes(target))document.documentElement.dataset.settingsBoot='pending';
 })();
 </script>
-<link rel="stylesheet" href="{{ url_for('static', path='css/settings-agent.css') }}?v=20260825a">
+<link rel="stylesheet" href="{{ url_for('static', path='css/settings-agent.css') }}?v=20260825h">
 {% endblock %}
 
 {% block content %}
@@ -235,44 +235,188 @@
             <form class="settings-panel settings-panel-metadata" id="settings-panel-metadata" data-settings-panel="metadata" role="tabpanel" aria-labelledby="settings-tab-metadata" hidden onsubmit="return false;" novalidate>
                 <div class="metadata-settings-shell">
                     <div class="metadata-settings-grid">
-                        <section class="metadata-settings-card" aria-labelledby="metadata-tmdb-heading">
-                            <header class="metadata-card-head">
-                                <span class="metadata-card-icon"><i data-lucide="eye"></i></span>
-                                <h3 id="metadata-tmdb-heading">TMDB 核心配置</h3>
-                                <button type="button" class="jump-btn" id="openLocksBtn"><i data-lucide="lock-keyhole"></i>管理映射锁</button>
-                            </header>
-                            <div class="metadata-card-body">
-                                <div class="metadata-field metadata-field-wide"><div class="field-label"><div class="name">TMDB API Key</div><div class="hint">从 themoviedb.org 申请</div></div><div class="field-control field-control-password"><input type="password" class="form-input" data-key="TMDB_API_KEY"></div></div>
-                                <div class="metadata-field metadata-field-wide"><div class="field-label"><div class="name">TMDB API URL</div><div class="hint">使用官方反代或私有网关时可修改</div></div><div class="field-control"><input type="url" class="form-input" data-key="TMDB_API_URL" placeholder="https://api.themoviedb.org/3"></div></div>
-                                <div class="metadata-field metadata-field-wide"><div class="field-label"><div class="name">TMDB 候选召回模式</div><div class="hint">控制标题候选的基础检索门槛；严格更稳，宽松只扩大候选，不代表自动入库</div></div><div class="field-control"><select class="form-select" data-key="TMDB_MATCH_MODE"><option value="strict">严格</option><option value="loose">宽松</option></select></div></div>
-                            </div>
-                        </section>
+                        <div class="metadata-column">
+                            <section class="metadata-settings-card" aria-labelledby="metadata-tmdb-heading">
+                                <header class="metadata-card-head">
+                                    <span class="metadata-card-icon"><i data-lucide="clapperboard"></i></span>
+                                    <div class="metadata-card-title-shell">
+                                        <h3 id="metadata-tmdb-heading">TMDB 核心配置</h3>
+                                        <span class="metadata-card-tag"><i data-lucide="shield-check"></i>主刮削引擎</span>
+                                    </div>
+                                    <button type="button" class="jump-btn" id="openLocksBtn"><i data-lucide="lock-keyhole"></i>管理映射锁</button>
+                                </header>
+                                <div class="metadata-card-body">
+                                    <div class="metadata-field metadata-field-wide">
+                                        <div class="field-label">
+                                            <div class="name">TMDB API Key</div>
+                                            <div class="hint">从 themoviedb.org 申请，用于检索影视元数据与演职员信息</div>
+                                        </div>
+                                        <div class="field-control-with-action">
+                                            <div class="field-control field-control-password">
+                                                <input type="password" class="form-input" data-key="TMDB_API_KEY" id="tmdbApiKeyInput">
+                                            </div>
+                                            <button type="button" class="jump-btn tmdb-test-btn" id="testTmdbBtn" title="测试 TMDB 连接与密钥有效性">
+                                                <i data-lucide="zap"></i><span>测试连通性</span>
+                                            </button>
+                                        </div>
+                                        <div class="tmdb-connection-status is-idle" id="tmdbConnectionState" aria-live="polite"><span>TMDB 连接状态</span></div>
+                                    </div>
 
-                        <section class="metadata-settings-card" aria-labelledby="metadata-ai-heading">
-                            <header class="metadata-card-head">
-                                <span class="metadata-card-icon"><i data-lucide="lightbulb"></i></span>
-                                <div class="metadata-card-title-shell">
-                                    <h3 id="metadata-ai-heading">AI 结构化回退</h3>
-                                    <span class="ai-recognition-badge">默认关闭</span>
-                                </div>
-                            </header>
-                            <div class="metadata-card-body">
-                                <div class="metadata-option"><span><strong>启用 AI 回退</strong><small>只在确定性 TMDB 匹配失败时复用 Media Agent 的模型连接</small></span><label class="toggle"><input type="checkbox" data-key="AI_RECOGNITION_ENABLED" data-bool="1"><span class="toggle-slider"></span></label></div>
-                                <label class="metadata-field metadata-field-wide"><span class="field-label"><span class="name">AI 线索可信门槛</span><span class="hint">0.5–0.99；仅决定 AI 修正是否进入 TMDB 复核，不能绕过自动入库门槛</span></span><span class="field-control"><input type="number" min="0.5" max="0.99" step="0.01" value="0.8" class="form-input" data-key="AI_RECOGNITION_CONFIDENCE_THRESHOLD"></span></label>
-                                <div class="metadata-compact-section" aria-labelledby="metadata-ai-governance-heading">
-                                    <div class="metadata-compact-heading" id="metadata-ai-governance-heading"><strong>请求治理</strong><span>限制自动回退的频率、并发和故障重试</span></div>
-                                    <div class="metadata-control-grid">
-                                        <label class="metadata-field"><span class="field-label"><span class="name">每分钟请求</span><span class="hint">1–30 次</span></span><span class="field-control"><input type="number" min="1" max="30" step="1" value="6" class="form-input" data-key="AI_RECOGNITION_REQUESTS_PER_MINUTE"></span></label>
-                                        <label class="metadata-field"><span class="field-label"><span class="name">每日请求上限</span><span class="hint">按真实 Provider 请求计数</span></span><span class="field-control"><input type="number" min="1" max="100000" step="1" value="100" class="form-input" data-key="AI_RECOGNITION_DAILY_REQUEST_LIMIT"></span></label>
-                                        <label class="metadata-field"><span class="field-label"><span class="name">最大并发</span><span class="hint">1–8 个任务</span></span><span class="field-control"><input type="number" min="1" max="8" step="1" value="2" class="form-input" data-key="AI_RECOGNITION_MAX_CONCURRENCY"></span></label>
-                                        <label class="metadata-field"><span class="field-label"><span class="name">熔断时间</span><span class="hint">连续故障后暂停 10–600 秒</span></span><span class="field-control"><input type="number" min="10" max="600" step="1" value="60" class="form-input" data-key="AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS"></span></label>
+                                    <div class="metadata-field metadata-field-wide">
+                                        <div class="field-label">
+                                            <div class="name">TMDB API URL</div>
+                                            <div class="hint">官方接口受限或使用私有网关反代时可修改</div>
+                                        </div>
+                                        <div class="field-control">
+                                            <input type="url" class="form-input" data-key="TMDB_API_URL" id="tmdbApiUrlInput" placeholder="https://api.themoviedb.org/3">
+                                        </div>
+                                        <div class="tmdb-preset-row">
+                                            <span class="preset-label">常用预设：</span>
+                                            <button type="button" class="preset-chip" data-preset-url="https://api.themoviedb.org/3">官方默认</button>
+                                            <button type="button" class="preset-chip" data-preset-url="https://api.tmdb.org/3">备用镜像</button>
+                                        </div>
+                                    </div>
+
+                                    <div class="metadata-field metadata-field-wide">
+                                        <div class="field-label">
+                                            <div class="name">TMDB 候选召回模式</div>
+                                            <div class="hint">控制标题候选的基础检索门槛；严格更稳，宽松只扩大候选，不代表自动入库</div>
+                                        </div>
+                                        <div class="field-control">
+                                            <select class="form-select tmdb-mode-select" data-key="TMDB_MATCH_MODE" id="tmdbMatchModeSelect">
+                                                <option value="strict">严格模式（默认推荐 · 降低误匹率）</option>
+                                                <option value="loose">宽松模式（扩大召回 · 适配冷门）</option>
+                                            </select>
+                                        </div>
                                     </div>
                                 </div>
-                                <div class="metadata-option"><span><strong>Tavily 标题线索</strong><small>仅在 AI Provider 网络不可用时查询标题，并重新通过 TMDB 严格校验</small></span><label class="toggle"><input type="checkbox" data-key="ORGANIZE_TAVILY_HINTS_ENABLED" data-bool="1"><span class="toggle-slider"></span></label></div>
-                                <label class="metadata-field metadata-field-wide"><span class="field-label"><span class="name">Tavily 每日识别额度</span><span class="hint">与 Agent 日常网页搜索额度分开计数；默认关闭且最多每次扣 1 额度</span></span><span class="field-control"><input type="number" min="1" max="100000" step="1" value="20" class="form-input" data-key="ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT"></span></label>
-                                <p class="ai-recognition-boundary"><strong>安全边界：</strong>AI 仅接收清洗后的标题、年份、媒体类型和季集信息；Tavily 只返回标题字符串。两者都不能直接指定 TMDB ID 或绕过 TMDB 复核。</p>
-                            </div>
-                        </section>
+                            </section>
+
+                            <section class="metadata-settings-card" aria-labelledby="metadata-tavily-heading">
+                                <header class="metadata-card-head">
+                                    <span class="metadata-card-icon"><i data-lucide="globe"></i></span>
+                                    <div class="metadata-card-title-shell">
+                                        <h3 id="metadata-tavily-heading">联网搜索辅助 (Tavily)</h3>
+                                        <span class="ai-recognition-badge">冷门特例</span>
+                                    </div>
+                                </header>
+                                <div class="metadata-card-body">
+                                    <div class="metadata-option">
+                                        <span>
+                                            <strong>Tavily 标题线索</strong>
+                                            <small>仅在确定性匹配与 AI 模型均不可用时查询网页线索，并重新通过 TMDB 严格校验</small>
+                                        </span>
+                                        <label class="toggle">
+                                            <input type="checkbox" data-key="ORGANIZE_TAVILY_HINTS_ENABLED" data-bool="1">
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+
+                                    <label class="metadata-field metadata-field-wide">
+                                        <span class="field-label">
+                                            <span class="name">Tavily 每日识别额度</span>
+                                            <span class="hint">与 Agent 日常网页搜索额度分开计数；默认关闭且最多每次扣 1 额度</span>
+                                        </span>
+                                        <span class="field-control">
+                                            <input type="number" min="1" max="100000" step="1" value="20" class="form-input" data-key="ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT">
+                                        </span>
+                                    </label>
+                                </div>
+                            </section>
+                        </div>
+
+                        <div class="metadata-column">
+                            <section class="metadata-settings-card" aria-labelledby="metadata-ai-heading">
+                                <header class="metadata-card-head">
+                                    <span class="metadata-card-icon"><i data-lucide="sparkles"></i></span>
+                                    <div class="metadata-card-title-shell">
+                                        <h3 id="metadata-ai-heading">AI 结构化回退</h3>
+                                        <span class="ai-recognition-badge">智能纠偏</span>
+                                    </div>
+                                </header>
+                                <div class="metadata-card-body">
+                                    <div class="metadata-option">
+                                        <span>
+                                            <strong>启用 AI 回退</strong>
+                                            <small>只在确定性 TMDB 匹配失败时复用 Media Agent 的模型连接</small>
+                                        </span>
+                                        <label class="toggle">
+                                            <input type="checkbox" data-key="AI_RECOGNITION_ENABLED" data-bool="1">
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+
+                                    <label class="metadata-field metadata-field-wide">
+                                        <span class="field-label">
+                                            <span class="name">AI 线索可信门槛</span>
+                                            <span class="hint">0.5–0.99；仅决定 AI 修正是否进入 TMDB 复核，不能绕过自动入库门槛</span>
+                                        </span>
+                                        <span class="field-control">
+                                            <div class="ai-threshold-wrap">
+                                                <input type="number" min="0.5" max="0.99" step="0.01" value="0.8" class="form-input ai-threshold-input" data-key="AI_RECOGNITION_CONFIDENCE_THRESHOLD" id="aiThresholdInput">
+                                                <span class="ai-threshold-guide">推荐 0.80（兼顾准确与召回）</span>
+                                            </div>
+                                        </span>
+                                    </label>
+
+                                    <div class="metadata-compact-section" aria-labelledby="metadata-ai-governance-heading">
+                                        <div class="metadata-compact-heading" id="metadata-ai-governance-heading">
+                                            <strong>请求治理与流量保护</strong>
+                                            <span>限制自动回退的频率、并发与熔断</span>
+                                        </div>
+                                        <div class="metadata-control-grid">
+                                            <label class="metadata-gauge-card">
+                                                <div class="gauge-head">
+                                                    <i data-lucide="timer"></i>
+                                                    <span>每分钟请求</span>
+                                                </div>
+                                                <div class="gauge-input-wrap">
+                                                    <input type="number" min="1" max="30" step="1" value="6" class="form-input" data-key="AI_RECOGNITION_REQUESTS_PER_MINUTE">
+                                                    <span class="unit">次/分</span>
+                                                </div>
+                                                <small class="gauge-hint">1–30 次</small>
+                                            </label>
+
+                                            <label class="metadata-gauge-card">
+                                                <div class="gauge-head">
+                                                    <i data-lucide="calendar-range"></i>
+                                                    <span>每日请求上限</span>
+                                                </div>
+                                                <div class="gauge-input-wrap">
+                                                    <input type="number" min="1" max="100000" step="1" value="100" class="form-input" data-key="AI_RECOGNITION_DAILY_REQUEST_LIMIT">
+                                                    <span class="unit">次/天</span>
+                                                </div>
+                                                <small class="gauge-hint">按真实 Provider 计数</small>
+                                            </label>
+
+                                            <label class="metadata-gauge-card">
+                                                <div class="gauge-head">
+                                                    <i data-lucide="cpu"></i>
+                                                    <span>最大并发</span>
+                                                </div>
+                                                <div class="gauge-input-wrap">
+                                                    <input type="number" min="1" max="8" step="1" value="2" class="form-input" data-key="AI_RECOGNITION_MAX_CONCURRENCY">
+                                                    <span class="unit">任务</span>
+                                                </div>
+                                                <small class="gauge-hint">1–8 个并发</small>
+                                            </label>
+
+                                            <label class="metadata-gauge-card">
+                                                <div class="gauge-head">
+                                                    <i data-lucide="shield-off"></i>
+                                                    <span>熔断时间</span>
+                                                </div>
+                                                <div class="gauge-input-wrap">
+                                                    <input type="number" min="10" max="600" step="1" value="60" class="form-input" data-key="AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS">
+                                                    <span class="unit">秒</span>
+                                                </div>
+                                                <small class="gauge-hint">连续故障暂停</small>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
                     </div>
 
                 </div>
@@ -562,5 +706,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/settings.js') }}?v=20260825a"></script>
+<script src="{{ url_for('static', path='js/settings.js') }}?v=20260825h"></script>
 {% endblock %}
