@@ -24,7 +24,8 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         )
         target_id = db.upsert_local_library_target(
             source_id, "movie", "/mnt/media/Movies",
-            provider="jellyfin", library_name="电影", library_id="movies", owner="admin",
+            provider="jellyfin", library_name="电影", library_id="movies",
+            server_path="//NAS/Media/Movies", owner="admin",
         )
         task_id = db.create_local_media_task(
             source_id, "hash-1", "/mnt/downloads/1/Movie.mkv", owner="admin"
@@ -40,6 +41,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(target.id, target_id)
         self.assertEqual(target.library_id, "movies")
         self.assertEqual(target.library_name, "电影")
+        self.assertEqual(target.server_path, "//NAS/Media/Movies")
         self.assertTrue(db.claim_local_media_task(task_id, expected="waiting_stable", owner="admin"))
         self.assertFalse(db.claim_local_media_task(task_id, expected="waiting_stable", owner="admin"))
         self.assertEqual(db.get_local_media_task(task_id, owner="admin").status, "recognizing")

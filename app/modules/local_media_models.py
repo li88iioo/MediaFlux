@@ -103,6 +103,7 @@ class LocalLibraryTarget:
     provider: str
     library_id: str
     library_name: str
+    server_path: str
     created_at: str
     updated_at: str
 
@@ -113,6 +114,7 @@ class LocalLibraryTarget:
             category=str(row["category"]), path=str(row["path"]),
             provider=str(_value(row, "provider")), library_id=str(_value(row, "library_id")),
             library_name=str(_value(row, "library_name")),
+            server_path=str(_value(row, "server_path")),
             created_at=str(row["created_at"]), updated_at=str(_value(row, "updated_at")),
         )
 

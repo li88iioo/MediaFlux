@@ -71,6 +71,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             "targets": [{
                 "category": "movie", "path": str(self.movie_target),
                 "provider": "jellyfin", "library_id": "movies", "library_name": "电影",
+                "server_path": "//NAS/Video/Movies",
             }],
         }
         with patch("app.routes.local_media_api.get_local_media_scheduler") as scheduler:
@@ -82,6 +83,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(created.json()["targets"][0]["provider"], "jellyfin")
         self.assertEqual(created.json()["targets"][0]["library_id"], "movies")
         self.assertEqual(created.json()["targets"][0]["library_name"], "电影")
+        self.assertEqual(created.json()["targets"][0]["server_path"], "//NAS/Video/Movies")
         self.assertNotIn("smb_user", created.json())
         self.assertNotIn("has_smb_pass", created.json())
         self.assertNotIn("secret123", created.text)
@@ -94,10 +96,20 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
                 ("legacy-user", "legacy-pass", source_id),
             )
 
+        preserved = self.client.put(
+            f"/api/local-media/sources/{source_id}",
+            json={"name": "只改名称"}, headers=headers,
+        )
+        self.assertEqual(preserved.status_code, 200, preserved.text)
+        self.assertEqual(
+            preserved.json()["targets"][0]["server_path"], "//NAS/Video/Movies",
+        )
+
         payload["name"] = "主下载目录"
         payload["targets"] = [{
             "category": "default", "path": str(self.default_target),
             "provider": "emby", "library_id": "library-1", "library_name": "媒体库",
+            "server_path": "D:/Media",
         }]
         updated = self.client.put(
             f"/api/local-media/sources/{source_id}", json=payload, headers=headers
@@ -105,6 +117,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(updated.status_code, 200, updated.text)
         self.assertEqual(updated.json()["name"], "主下载目录")
         self.assertEqual([item["category"] for item in updated.json()["targets"]], ["default"])
+        self.assertEqual(updated.json()["targets"][0]["server_path"], "D:/Media")
         self.assertNotIn("smb_user", updated.json())
         self.assertNotIn("has_smb_pass", updated.json())
         stored_source = db.get_local_media_source(source_id, owner="admin")

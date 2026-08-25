@@ -618,6 +618,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
     from app.routes.discovery_image import router as discovery_image_router
     from app.routes.indexers_api import router as indexers_api_router
     from app.routes.local_media_api import router as local_media_api_router
+    from app.routes.media_libraries_api import router as media_libraries_api_router
     from app.routes.agent_api import router as agent_api_router
     from app.routes.recognition_knowledge_api import router as recognition_knowledge_api_router
 
@@ -628,7 +629,8 @@ def create_app(*, start_background: bool = False) -> FastAPI:
         tools_router, logs_router, offline_router, share_router,
         media_image_router, media_proxy_api_router,
         discovery_api_router, discovery_image_router, indexers_api_router,
-        local_media_api_router, agent_api_router, recognition_knowledge_api_router,
+        local_media_api_router, media_libraries_api_router, agent_api_router,
+        recognition_knowledge_api_router,
     ):
         app.include_router(router)
 

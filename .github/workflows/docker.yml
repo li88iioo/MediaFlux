@@ -154,6 +154,8 @@ jobs:
               docker exec -i mediaflux-v014-upgrade python - <<'PY'
           import sqlite3
 
+          from app.database import SCHEMA_VERSION
+
           connection = sqlite3.connect("/app/db/mediaflux.db")
           try:
               version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -166,7 +168,7 @@ jobs:
               ).fetchone()
               integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
               foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
-              assert version == 6, version
+              assert version == SCHEMA_VERSION, (version, SCHEMA_VERSION)
               assert sentinel == ("preserved",), sentinel
               assert outbox == (1,), outbox
               assert integrity == "ok", integrity

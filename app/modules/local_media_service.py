@@ -37,7 +37,10 @@ from app.modules.organize import (
     enforce_fixed_organize_rules,
 )
 from app.modules.media_probe import ProbeBudget, probe_local_media_profile
-from app.modules.media_server_path_mapping import configured_media_server_refresh_options
+from app.modules.media_server_path_mapping import (
+    MediaServerPathMapping,
+    configured_media_server_refresh_options,
+)
 from app.modules.recognition_policy import (
     automatic_match_confirmation_message,
     automatic_match_policy,
@@ -71,6 +74,8 @@ class LocalMovePlan:
     provider: str = ""
     library_id: str = ""
     library_name: str = ""
+    local_target_root: str = ""
+    server_path: str = ""
     expected_target_identity: tuple[int, int, int, int] | None = None
 
 
@@ -620,6 +625,7 @@ class LocalMediaService:
                 video, target, "video", group_id, action=video_action, note=video_note,
                 provider=target_config.provider, library_id=target_config.library_id,
                 library_name=target_config.library_name,
+                local_target_root=target_config.path, server_path=target_config.server_path,
                 expected_target_identity=(
                     video_target_identity if video_action == "replace" else None
                 ),
@@ -645,6 +651,7 @@ class LocalMediaService:
                     action=subtitle_action, note=subtitle_note,
                     provider=target_config.provider, library_id=target_config.library_id,
                     library_name=target_config.library_name,
+                    local_target_root=target_config.path, server_path=target_config.server_path,
                     expected_target_identity=(
                         subtitle_target_identity if subtitle_action == "replace" else None
                     ),
@@ -765,6 +772,18 @@ class LocalMediaService:
             if not library_id and not library_name:
                 warnings.append(f"{provider} 目标缺少媒体库绑定，已跳过刷新")
                 continue
+            server_path = str(getattr(item, "server_path", "") or "").strip()
+            if server_path:
+                local_root = str(getattr(item, "local_target_root", "") or "").strip()
+                try:
+                    target_parent = MediaServerPathMapping(
+                        local_root, server_path,
+                    ).apply(target_parent)
+                except ValueError as exc:
+                    warnings.append(
+                        f"{provider} 服务端路径映射无效，已跳过刷新: {exc}"
+                    )
+                    continue
             bound_paths.setdefault(
                 (provider, library_id, library_name), set(),
             ).add(target_parent)

@@ -48,6 +48,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         tmdb_id: str = "12345",
         season: int | None = None,
         episode: int | None = None,
+        server_path: str = "",
     ) -> int:
         source_id = db.create_local_media_source(
             name="PRIVATE-SOURCE",
@@ -64,6 +65,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                 provider="jellyfin",
                 library_id="private-library-id",
                 library_name="媒体库",
+                server_path=server_path,
                 owner="admin",
             )
         task_id = db.create_local_media_task(
@@ -283,7 +285,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             )
 
     def test_precise_refresh_uses_only_bound_library_and_stales_on_drift(self) -> None:
-        task_id = self._task(status="completed", bound=True)
+        task_id = self._task(
+            status="completed", bound=True, server_path="//NAS/Video",
+        )
         service = get_agent_service()
         service.invoke(
             "local_media.task_summaries", {"scope": "history", "limit": 12}, owner="owner-a"
@@ -316,7 +320,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             )
         self.assertEqual(confirmed["result"]["status"], "completed")
         client.refresh_for_paths.assert_called_once_with(
-            ["/private/library/示例影片"],
+            ["//NAS/Video/示例影片"],
             allowed_library_ids=("private-library-id",),
             allow_library_fallback=False,
         )

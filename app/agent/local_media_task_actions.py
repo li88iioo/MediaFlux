@@ -29,7 +29,10 @@ from app.agent.state_commit import (
 from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES, LOCAL_TASK_STATUSES
 from app.modules.local_media_scheduler import get_local_media_scheduler
 from app.modules.local_media_service import LocalMediaServiceError, get_local_media_service
-from app.modules.media_server_path_mapping import configured_media_server_refresh_options
+from app.modules.media_server_path_mapping import (
+    MediaServerPathMapping,
+    configured_media_server_refresh_options,
+)
 from app.modules.media_server_profiles import list_configured_profiles
 from app.modules.web_secret import get_web_secret
 
@@ -1281,7 +1284,17 @@ def _bound_task_scope(task: Any) -> dict[str, Any]:
     library_id = str(folder.get("id") or "").strip()
     if not library_id:
         raise AgentToolError("媒体库绑定缺少可用标识", code="precondition_failed")
-    paths = sorted({str(path) for _target, path in resolved})
+    try:
+        paths = sorted({
+            MediaServerPathMapping(target.path, target.server_path).apply(str(path))
+            if str(getattr(target, "server_path", "") or "").strip()
+            else str(path)
+            for target, path in resolved
+        })
+    except ValueError:
+        raise AgentToolError(
+            "媒体库服务端路径映射无效，请重新绑定", code="precondition_failed"
+        ) from None
     server_config_digest = _server_config_digest(
         provider, profile, refresh_options
     )

@@ -23,6 +23,7 @@ from app.modules.local_media_candidates import (
     move_candidate_to_trash,
 )
 from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES, LOCAL_MEDIA_CATEGORIES
+from app.modules.media_server_path_mapping import MediaServerPathMapping
 from app.modules.media_server_profiles import list_configured_profiles
 from app.modules.local_media_notifications import notify_local_media_task
 from app.modules.local_media_recognition_summary import (
@@ -109,7 +110,7 @@ def _source_payload(source) -> dict:
         "targets": [
             {"id": item.id, "category": item.category, "path": item.path,
              "provider": item.provider, "library_id": item.library_id,
-             "library_name": item.library_name}
+             "library_name": item.library_name, "server_path": item.server_path}
             for item in targets
         ],
     }
@@ -227,21 +228,26 @@ def _validated_targets(payload: dict) -> list[dict[str, str]] | None:
         if category not in LOCAL_MEDIA_CATEGORIES or category in submitted:
             raise ValueError("目标分类无效或重复")
         submitted.add(category)
+        path = _text(item, "path", required=True)
         provider = _text(item, "provider", max_length=32).lower()
         library_id = _text(item, "library_id", max_length=256)
         library_name = _text(item, "library_name", max_length=128)
+        server_path = _text(item, "server_path", max_length=2048)
         if provider not in {"", "jellyfin", "emby"}:
             raise ValueError("目标媒体服务器类型无效")
         if provider and not library_name:
             raise ValueError("媒体服务器和媒体库名称必须同时选择")
-        if not provider and (library_id or library_name):
-            raise ValueError("未选择媒体服务器时不能绑定媒体库")
+        if not provider and (library_id or library_name or server_path):
+            raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
+        if server_path:
+            server_path = MediaServerPathMapping(path, server_path).server_prefix
         normalized.append({
             "category": category,
-            "path": _text(item, "path", required=True),
+            "path": path,
             "provider": provider,
             "library_id": library_id,
             "library_name": library_name,
+            "server_path": server_path,
         })
     return normalized
 
@@ -377,7 +383,8 @@ def update_source(source_id: int, request: Request, data: dict | None = Body(def
         targets = _validated_targets(payload)
         existing_targets = [
             {"category": item.category, "path": item.path, "provider": item.provider,
-             "library_id": item.library_id, "library_name": item.library_name}
+             "library_id": item.library_id, "library_name": item.library_name,
+             "server_path": item.server_path}
             for item in db.list_local_library_targets(source_id, owner=_OWNER)
         ]
         effective_targets = targets if targets is not None else existing_targets

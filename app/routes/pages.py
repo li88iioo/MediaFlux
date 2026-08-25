@@ -245,6 +245,11 @@ def local_media(request: Request):
     return _page(request, "local_media.html", "local_media")
 
 
+@router.get("/media-libraries", name="pages.media_libraries")
+def media_libraries(request: Request):
+    return _page(request, "media_libraries.html", "media_libraries")
+
+
 @router.get("/discovery", name="pages.discovery")
 def discovery(request: Request):
     if not config.get_bool("DISCOVERY_ENABLED", False):

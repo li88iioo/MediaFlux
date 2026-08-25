@@ -742,14 +742,70 @@
         return libraryCache.get(provider);
     }
 
+    function mediaServerPathKey(value) {
+        const normalized = String(value || '').trim().replaceAll('\\', '/').replace(/\/+$/, '');
+        return normalized.startsWith('//') || /^[A-Za-z]:\//.test(normalized)
+            ? normalized.toLocaleLowerCase() : normalized;
+    }
+
+    function renderServerPathSelect(row, library, selectedPath = '') {
+        const provider = row.querySelector('[data-target-provider]').value;
+        const select = row.querySelector('[data-target-server-path]');
+        const locations = [...new Set((Array.isArray(library?.locations) ? library.locations : [])
+            .map((item) => String(item || '').trim()).filter(Boolean))];
+        let value = String(selectedPath || row.dataset.serverPath || '').trim();
+        if (!provider) {
+            row.dataset.serverPath = '';
+            row.dataset.serverPathRequired = '0';
+            select.disabled = true;
+            select.classList.remove('is-required');
+            select.innerHTML = '<option value="">绑定媒体库后选择可见路径</option>';
+            return;
+        }
+        if (!library) {
+            row.dataset.serverPath = value;
+            row.dataset.serverPathRequired = '0';
+            select.disabled = true;
+            select.classList.remove('is-required');
+            select.innerHTML = value
+                ? `<option value="${esc(value)}" selected>${esc(value)}（当前不可用）</option>`
+                : '<option value="">选择媒体库后显示路径</option>';
+            return;
+        }
+        if (!value) {
+            const localKey = mediaServerPathKey(row.querySelector('[data-target-path]').value);
+            value = locations.find((item) => mediaServerPathKey(item) === localKey)
+                || (locations.length === 1 ? locations[0] : '');
+        }
+        select.innerHTML = `<option value="">${locations.length ? '请选择服务端可见路径' : '媒体库未返回可见路径'}</option>`
+            + locations.map((item) => `<option value="${esc(item)}">${esc(item)}</option>`).join('');
+        if (value && !locations.some((item) => mediaServerPathKey(item) === mediaServerPathKey(value))) {
+            select.insertAdjacentHTML('beforeend', `<option value="${esc(value)}">${esc(value)}（当前不可用）</option>`);
+        }
+        const matched = locations.find((item) => mediaServerPathKey(item) === mediaServerPathKey(value));
+        select.value = matched || value;
+        row.dataset.serverPath = select.value;
+        const required = locations.length > 0 && !select.value;
+        row.dataset.serverPathRequired = required ? '1' : '0';
+        select.classList.toggle('is-required', required);
+        select.disabled = locations.length === 0 && !select.value;
+        select.title = select.value || '选择该媒体库在 Jellyfin / Emby 中实际看到的目录';
+    }
+
     async function populateLibrarySelect(row, selected = {}) {
         const provider = row.querySelector('[data-target-provider]').value;
         const select = row.querySelector('[data-target-library]');
+        const serverPathSelect = row.querySelector('[data-target-server-path]');
         const requestVersion = Number(row.dataset.libraryRequest || 0) + 1;
         row.dataset.libraryRequest = String(requestVersion);
         select.disabled = !provider;
         select.innerHTML = `<option value="">${provider ? '正在读取媒体库…' : '未绑定媒体库'}</option>`;
-        if (!provider) return;
+        serverPathSelect.disabled = true;
+        serverPathSelect.innerHTML = `<option value="">${provider ? '正在读取服务器路径…' : '绑定媒体库后选择可见路径'}</option>`;
+        if (!provider) {
+            renderServerPathSelect(row, null, '');
+            return;
+        }
         try {
             const libraries = await librariesFor(provider);
             if (row.dataset.libraryRequest !== String(requestVersion)
@@ -768,6 +824,7 @@
                 const fallbackId = selectedId || '';
                 select.insertAdjacentHTML('beforeend', `<option value="${esc(fallbackId)}" data-name="${esc(selectedName)}" selected>${esc(selectedName || selectedId)}（当前不可用）</option>`);
             }
+            renderServerPathSelect(row, matched || null, selected.serverPath || '');
         } catch (error) {
             if (row.dataset.libraryRequest !== String(requestVersion)
                 || row.querySelector('[data-target-provider]').value !== provider) return;
@@ -776,13 +833,35 @@
             select.innerHTML = selectedId || selectedName
                 ? `<option value="${esc(selectedId)}" data-name="${esc(selectedName)}" selected>${esc(selectedName || selectedId)}（读取失败）</option>`
                 : '<option value="">媒体库读取失败</option>';
+            renderServerPathSelect(row, null, selected.serverPath || '');
+        }
+    }
+
+    async function populateCurrentServerPath(row) {
+        const provider = row.querySelector('[data-target-provider]').value;
+        const libraryId = row.dataset.libraryId || '';
+        const libraryName = row.dataset.libraryName || '';
+        if (!provider || (!libraryId && !libraryName)) {
+            renderServerPathSelect(row, null, '');
+            return;
+        }
+        const requestVersion = row.dataset.libraryRequest || '';
+        try {
+            const libraries = await librariesFor(provider);
+            if (row.dataset.libraryRequest !== requestVersion
+                || row.querySelector('[data-target-provider]').value !== provider) return;
+            const library = libraries.find((item) => item.id === libraryId
+                || (!libraryId && item.name === libraryName));
+            renderServerPathSelect(row, library || null, '');
+        } catch (_error) {
+            renderServerPathSelect(row, null, '');
         }
     }
 
     function targetRows(values = {}) {
         $('lmTargetRows').innerHTML = categories.map(([key, label]) => {
             const target = values[key] || {};
-            return `<div class="lm-target-row" data-target-row="${key}" data-library-id="${esc(target.library_id || '')}" data-library-name="${esc(target.library_name || '')}">
+            return `<div class="lm-target-row" data-target-row="${key}" data-library-id="${esc(target.library_id || '')}" data-library-name="${esc(target.library_name || '')}" data-server-path="${esc(target.server_path || '')}" data-server-path-required="0">
                 <span>${label}</span>
                 <div class="lm-target-fields">
                     <span class="lm-path-control">
@@ -790,15 +869,20 @@
                         <button class="jump-btn lm-picker-btn" type="button" data-pick-target="${key}" aria-label="选择${label}目录" title="选择${label}目录"><i data-lucide="folder-open"></i></button>
                     </span>
                     <span class="lm-target-binding">
-                        <select class="form-select" data-target-provider>${providerOptions(target.provider || '')}</select>
-                        <select class="form-select" data-target-library disabled><option value="">未绑定媒体库</option></select>
+                        <select class="form-select" data-target-provider aria-label="${label}媒体服务器">${providerOptions(target.provider || '')}</select>
+                        <select class="form-select" data-target-library aria-label="${label}媒体库" disabled><option value="">未绑定媒体库</option></select>
+                        <select class="form-select lm-target-server-path" data-target-server-path aria-label="${label}服务端可见路径" disabled><option value="">绑定媒体库后选择可见路径</option></select>
                     </span>
                 </div>
             </div>`;
         }).join('');
         document.querySelectorAll('[data-target-row]').forEach((row) => {
             const target = values[row.dataset.targetRow] || {};
-            populateLibrarySelect(row, {id: target.library_id || '', name: target.library_name || ''});
+            populateLibrarySelect(row, {
+                id: target.library_id || '',
+                name: target.library_name || '',
+                serverPath: target.server_path || '',
+            });
         });
         icons($('lmTargetRows'));
     }
@@ -982,18 +1066,31 @@
         const button = $('lmSaveSourceBtn');
         if (button.disabled) return;
         const id = $('lmSourceId').value;
-        const targets = [...document.querySelectorAll('[data-target-row]')].map((row) => {
+        const targets = [];
+        for (const row of document.querySelectorAll('[data-target-row]')) {
             const path = row.querySelector('[data-target-path]').value.trim();
+            if (!path) continue;
             const provider = row.querySelector('[data-target-provider]').value;
             const select = row.querySelector('[data-target-library]');
+            const serverPathSelect = row.querySelector('[data-target-server-path]');
             const selectedOption = select.selectedOptions[0];
             const libraryId = select.value || row.dataset.libraryId || '';
             const libraryName = selectedOption?.dataset.name || row.dataset.libraryName || '';
-            return {
+            if (provider && libraryName && row.dataset.serverPathRequired === '1') {
+                serverPathSelect.focus();
+                appAlert({
+                    type: 'warning',
+                    title: '请选择服务端可见路径',
+                    message: '该媒体库包含多个目录，请选择 Jellyfin / Emby 实际看到的归档目录。',
+                });
+                return;
+            }
+            targets.push({
                 category: row.dataset.targetRow, path, provider,
                 library_id: libraryId, library_name: libraryName,
-            };
-        }).filter((target) => target.path);
+                server_path: serverPathSelect.value || row.dataset.serverPath || '',
+            });
+        }
         const payload = {
             name: $('lmSourceName').value.trim(),
             qb_profile: 'configured:qb',
@@ -1607,6 +1704,7 @@
         if (event.target.matches('[data-target-provider]')) {
             row.dataset.libraryId = '';
             row.dataset.libraryName = '';
+            row.dataset.serverPath = '';
             await populateLibrarySelect(row);
             return;
         }
@@ -1614,6 +1712,17 @@
             const option = event.target.selectedOptions[0];
             row.dataset.libraryId = event.target.value;
             row.dataset.libraryName = option?.dataset.name || '';
+            row.dataset.serverPath = '';
+            await populateCurrentServerPath(row);
+            return;
+        }
+        if (event.target.matches('[data-target-server-path]')) {
+            row.dataset.serverPath = event.target.value;
+            const hasAvailableLocations = [...event.target.options]
+                .some((option) => option.value && !option.textContent.includes('当前不可用'));
+            const required = hasAvailableLocations && !event.target.value;
+            row.dataset.serverPathRequired = required ? '1' : '0';
+            event.target.classList.toggle('is-required', required);
         }
     });
 

@@ -12,7 +12,7 @@
     <link rel="stylesheet" href="{{ url_for('static', path='css/main.css') }}?v=20260825h">
     {% block page_styles %}{% endblock %}
 </head>
-<body class="{% block body_class %}{% endblock %}{% if active in ['logs', 'local_media', 'organize', 'organize_rules', 'downloads', 'rss', 'guangya', 'guangya_offline', 'guangya_more', 'share_transfer', 'guangya_strm', 'media_proxy', 'gcid'] %} compact-workspace-page{% endif %}">
+<body class="{% block body_class %}{% endblock %}{% if active in ['logs', 'local_media', 'organize', 'organize_rules', 'downloads', 'rss', 'guangya', 'guangya_offline', 'guangya_more', 'share_transfer', 'guangya_strm', 'media_proxy', 'gcid', 'media_libraries'] %} compact-workspace-page{% endif %}">
     <div class="app-shell">
         <aside class="sidebar" id="sidebar">
             <div class="brand">
@@ -53,6 +53,7 @@
                 <a href="{{ url_for('pages.organize_rules') }}" class="nav-item {% if active=='organize_rules' %}active{% endif %}"><i data-lucide="list-checks"></i><span>整理规则</span></a>
                 <a href="{{ url_for('pages.local_media') }}" class="nav-item {% if active=='local_media' %}active{% endif %}"><i data-lucide="hard-drive"></i><span>本地整理</span></a>
                 <a href="{{ url_for('pages.logs') }}" class="nav-item {% if active=='logs' %}active{% endif %}"><i data-lucide="scroll-text"></i><span>日志记录</span></a>
+                <a href="{{ url_for('pages.media_libraries') }}" class="nav-item {% if active=='media_libraries' %}active{% endif %}"><i data-lucide="library-big"></i><span>媒体库</span></a>
                 <a href="{{ url_for('pages.settings') }}" class="nav-item {% if active=='settings' %}active{% endif %}"><i data-lucide="settings-2"></i><span>设置</span></a>
             </nav>
 

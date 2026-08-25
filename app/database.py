@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -1162,6 +1162,7 @@ CREATE TABLE IF NOT EXISTS local_library_targets (
     provider TEXT DEFAULT '',
     library_id TEXT DEFAULT '',
     library_name TEXT DEFAULT '',
+    server_path TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (source_id) REFERENCES local_media_sources(id) ON DELETE CASCADE,
@@ -2087,6 +2088,19 @@ def _migrate_local_media_recognition_summary_v7(conn: sqlite3.Connection) -> Non
         )
 
 
+def _migrate_local_library_target_server_path_v8(conn: sqlite3.Connection) -> None:
+    """保存分类目标在 Jellyfin / Emby 中实际可见的目录根。"""
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(local_library_targets)")
+    }
+    if columns and "server_path" not in columns:
+        conn.execute(
+            "ALTER TABLE local_library_targets ADD COLUMN "
+            "server_path TEXT NOT NULL DEFAULT ''"
+        )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2095,6 +2109,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     4: _migrate_organize_operation_jobs_v5,
     5: _migrate_agent_action_history_v6,
     6: _migrate_local_media_recognition_summary_v7,
+    7: _migrate_local_library_target_server_path_v8,
 }
 
 
@@ -5612,16 +5627,21 @@ def save_local_media_source_bundle(
             provider = str(item.get("provider") or "").strip().lower()
             library_id = str(item.get("library_id") or "").strip()
             library_name = str(item.get("library_name") or "").strip()
+            server_path = str(item.get("server_path") or "").strip()
             if provider not in {"", "jellyfin", "emby"}:
                 raise ValueError("目标媒体服务器类型无效")
             if provider and not library_name:
                 raise ValueError("媒体服务器和媒体库名称必须同时选择")
-            if not provider and (library_id or library_name):
-                raise ValueError("未选择媒体服务器时不能绑定媒体库")
+            if not provider and (library_id or library_name or server_path):
+                raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
+            if server_path:
+                from app.modules.media_server_path_mapping import MediaServerPathMapping
+                server_path = MediaServerPathMapping(target_path, server_path).server_prefix
             seen.add(category)
             normalized_targets.append({
                 "category": category, "path": target_path, "provider": provider,
                 "library_id": library_id, "library_name": library_name,
+                "server_path": server_path,
             })
     timestamp = now()
     with get_conn() as conn:
@@ -5658,10 +5678,10 @@ def save_local_media_source_bundle(
             conn.execute("DELETE FROM local_library_targets WHERE source_id=? AND owner=?", (saved_id, safe_owner))
             for item in normalized_targets:
                 conn.execute(
-                    "INSERT INTO local_library_targets(source_id,owner,category,path,provider,library_id,library_name,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO local_library_targets(source_id,owner,category,path,provider,library_id,library_name,server_path,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (saved_id, safe_owner, item["category"], item["path"], item["provider"],
-                     item["library_id"], item["library_name"], timestamp, timestamp),
+                     item["library_id"], item["library_name"], item["server_path"], timestamp, timestamp),
                 )
         return saved_id
 
@@ -5697,6 +5717,7 @@ def upsert_local_library_target(
     provider: str = "",
     library_name: str = "",
     library_id: str = "",
+    server_path: str = "",
     *,
     owner: str = "admin",
 ) -> int:
@@ -5708,6 +5729,7 @@ def upsert_local_library_target(
     safe_provider = str(provider or "").strip().lower()
     safe_library_id = str(library_id or "").strip()
     safe_library_name = str(library_name or "").strip()
+    safe_server_path = str(server_path or "").strip()
     if safe_category not in LOCAL_MEDIA_CATEGORIES:
         raise ValueError("不支持的本地媒体分类")
     if not safe_path:
@@ -5716,8 +5738,11 @@ def upsert_local_library_target(
         raise ValueError("目标媒体服务器类型无效")
     if safe_provider and not safe_library_name:
         raise ValueError("媒体服务器和媒体库名称必须同时选择")
-    if not safe_provider and (safe_library_id or safe_library_name):
-        raise ValueError("未选择媒体服务器时不能绑定媒体库")
+    if not safe_provider and (safe_library_id or safe_library_name or safe_server_path):
+        raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
+    if safe_server_path:
+        from app.modules.media_server_path_mapping import MediaServerPathMapping
+        safe_server_path = MediaServerPathMapping(safe_path, safe_server_path).server_prefix
     timestamp = now()
     with get_conn() as conn:
         source = conn.execute(
@@ -5727,13 +5752,14 @@ def upsert_local_library_target(
         if not source:
             raise LookupError("本地媒体来源不存在")
         conn.execute(
-            "INSERT INTO local_library_targets(source_id,owner,category,path,provider,library_id,library_name,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,category) DO UPDATE SET "
+            "INSERT INTO local_library_targets(source_id,owner,category,path,provider,library_id,library_name,server_path,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,category) DO UPDATE SET "
             "owner=excluded.owner,path=excluded.path,provider=excluded.provider,"
-            "library_id=excluded.library_id,library_name=excluded.library_name,updated_at=excluded.updated_at",
+            "library_id=excluded.library_id,library_name=excluded.library_name,"
+            "server_path=excluded.server_path,updated_at=excluded.updated_at",
             (
                 int(source_id), safe_owner, safe_category, safe_path,
-                safe_provider, safe_library_id, safe_library_name, timestamp, timestamp,
+                safe_provider, safe_library_id, safe_library_name, safe_server_path, timestamp, timestamp,
             ),
         )
         row = conn.execute(

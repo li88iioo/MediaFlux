@@ -3,7 +3,7 @@
 {% block page_title %}本地媒体{% endblock %}
 {% block body_class %}local-media-page{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260825a">
+<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260825b">
 <script>
 (() => {
     const hashTab = (window.location.hash || '').replace('#', '').trim();
@@ -209,7 +209,7 @@
                     </div>
                 </section>
                 <section class="lm-dialog-section">
-                    <div class="lm-dialog-section-title"><strong>分类媒体库</strong><small>具体分类未配置时使用默认目标</small></div>
+                    <div class="lm-dialog-section-title"><strong>分类媒体库</strong><small>设置容器归档目录，并选择媒体服务器实际可见的对应路径；具体分类未配置时使用默认目标</small></div>
                     <div class="lm-target-editor"><div id="lmTargetRows"></div></div>
                 </section>
             </div>
@@ -223,5 +223,5 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260821a"></script>
-<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260825a"></script>
+<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260825b"></script>
 {% endblock %}

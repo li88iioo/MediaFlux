@@ -105,6 +105,35 @@ class LocalMediaRefreshTests(TestCase):
         client.refresh_library.assert_not_called()
         fallback.assert_not_called()
 
+    def test_bound_target_maps_container_path_to_selected_server_location(self):
+        profile = SimpleNamespace(
+            server_type="jellyfin", label="Jellyfin", url="http://jellyfin",
+            credential="token", enabled=True, configured=True,
+        )
+        client = Mock()
+        client.list_virtual_folders.return_value = [{
+            "id": "anime", "name": "动漫",
+            "locations": ["//NAS/Video/Anime", "//NAS/STRM/Anime"],
+        }]
+        client.refresh_for_paths.return_value = {"ok": True, "fallback": ""}
+        plans = [SimpleNamespace(
+            provider="jellyfin", library_id="anime", library_name="动漫",
+            target=Path("/media/library/动漫/作品/Season 1/E01.mkv"),
+            local_target_root="/media/library/动漫",
+            server_path="//NAS/Video/Anime",
+        )]
+        with patch(
+            "app.modules.media_server_profiles.list_configured_profiles",
+            return_value=[profile],
+        ), patch("app.clients.jellyfin.JellyfinClient", return_value=client):
+            warnings = LocalMediaService._refresh_plans(plans)
+
+        self.assertEqual(warnings, [])
+        client.refresh_for_paths.assert_called_once_with(
+            ["//NAS/Video/Anime/作品/Season 1"],
+            allowed_library_ids=("anime",),
+        )
+
     def test_bound_target_with_mismatched_library_name_is_safely_skipped(self):
         profile = SimpleNamespace(
             server_type="jellyfin", label="Jellyfin", url="http://jellyfin",

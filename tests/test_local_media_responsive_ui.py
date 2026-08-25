@@ -59,6 +59,20 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn(".lm-review-item,", css)
         self.assertIn("?v=20260821a", template)
 
+    def test_media_source_targets_bind_server_visible_library_locations(self):
+        template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
+        js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
+        css = Path("app/static/css/local-media.css").read_text(encoding="utf-8")
+
+        self.assertIn("媒体服务器实际可见的对应路径", template)
+        self.assertIn("data-target-server-path", js)
+        self.assertIn("server_path: serverPathSelect.value", js)
+        self.assertIn("library?.locations", js)
+        self.assertIn("row.dataset.serverPathRequired", js)
+        self.assertIn("hasAvailableLocations && !event.target.value", js)
+        self.assertIn("classList.toggle('is-required', required)", js)
+        self.assertIn(".lm-target-server-path.is-required", css)
+
     def test_all_initial_tab_loading_hints_are_delayed_and_have_minimum_visible_time(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
         js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
@@ -82,7 +96,7 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn("opacity: 0", css)
         self.assertIn(".lm-initial-loading.is-visible", css)
         self.assertIn(".lm-initial-loading svg", css)
-        self.assertIn("?v=20260825a", template)
+        self.assertIn("?v=20260825b", template)
 
     def test_initial_hash_tab_is_prepainted_before_page_script_loads(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")

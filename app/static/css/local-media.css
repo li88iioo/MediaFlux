@@ -1138,7 +1138,7 @@ body.lm-scrape-open { overflow: hidden; }
 /* 弹窗样式 */
 .lm-modal { padding: 18px; }
 .lm-source-dialog {
-    width: min(900px, calc(100vw - 32px));
+    width: min(1080px, calc(100vw - 32px));
     max-height: min(780px, calc(100dvh - 36px));
     display: flex;
     flex-direction: column;
@@ -1345,7 +1345,7 @@ body.lm-scrape-open { overflow: hidden; }
 
 .lm-target-editor { overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-sm); }
 .lm-target-row {
-    min-height: 52px;
+    min-height: 58px;
     padding: 7px 10px;
     display: grid;
     grid-template-columns: 88px minmax(0, 1fr);
@@ -1553,21 +1553,31 @@ body.lm-scrape-open { overflow: hidden; }
 .lm-target-fields {
     min-width: 0;
     display: grid;
-    grid-template-columns: minmax(0, 1.45fr) minmax(220px, 1fr);
+    grid-template-columns: minmax(220px, 1.2fr) minmax(460px, 1.8fr);
     gap: 8px;
 }
 
 .lm-target-binding {
     min-width: 0;
     display: grid;
-    grid-template-columns: minmax(100px, .9fr) minmax(120px, 1.1fr);
+    grid-template-columns: minmax(100px, .72fr) minmax(120px, .9fr) minmax(210px, 1.55fr);
     gap: 6px;
 }
-.lm-target-binding select { min-height: 36px; font-size: 9.5px; }
+.lm-target-binding select { min-height: 36px; font-size: 9.2px; }
+.lm-target-server-path.is-required {
+    border-color: color-mix(in srgb, var(--warning) 62%, var(--border));
+    background: color-mix(in srgb, var(--warning) 6%, var(--bg-input));
+}
 
-@media (max-width: 760px) {
+@media (max-width: 920px) {
     .lm-target-fields { grid-template-columns: 1fr; }
     .lm-target-binding { grid-template-columns: 1fr 1fr; }
+    .lm-target-server-path { grid-column: 1 / -1; }
+}
+
+@media (max-width: 560px) {
+    .lm-target-binding { grid-template-columns: 1fr; }
+    .lm-target-server-path { grid-column: auto; }
 }
 
 /* 本地来源配置之上的二级目录选择器，关闭后回到原配置上下文。 */

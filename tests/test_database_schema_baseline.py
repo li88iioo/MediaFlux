@@ -15,12 +15,16 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
-    def test_fresh_database_contains_complete_v7_schema(self) -> None:
+    def test_fresh_database_contains_complete_v8_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             task_columns = {
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(local_media_tasks)")
+            }
+            target_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(local_library_targets)")
             }
             playback_columns = {
                 str(row["name"])
@@ -53,6 +57,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertEqual(version, db.SCHEMA_VERSION)
         self.assertIn("rules_snapshot", task_columns)
         self.assertIn("recognition_summary", task_columns)
+        self.assertIn("server_path", target_columns)
         self.assertIn("season_override", task_columns)
         self.assertIn("episode_override", task_columns)
         self.assertIn("session_id", playback_columns)
@@ -936,6 +941,49 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 self.assertEqual(version, db.SCHEMA_VERSION)
                 self.assertIn("recognition_summary", columns)
                 self.assertEqual(tuple(preserved), ("/downloads/Show.S01E01.mkv", ""))
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_v7_local_library_targets_gain_server_path(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-local-media-v8-") as root:
+            path = Path(root) / "v7.db"
+            conn = sqlite3.connect(path)
+            try:
+                legacy_schema = db._SCHEMA.replace(
+                    "    server_path TEXT NOT NULL DEFAULT '',\n", "", 1,
+                )
+                conn.executescript(legacy_schema)
+                conn.execute(
+                    "INSERT INTO local_media_sources(id,name,local_root,created_at,updated_at) "
+                    "VALUES(1,'历史来源','/downloads','2026-08-01','2026-08-01')"
+                )
+                conn.execute(
+                    "INSERT INTO local_library_targets("
+                    "id,source_id,category,path,provider,library_id,library_name,created_at,updated_at"
+                    ") VALUES(1,1,'anime','/media/library/动漫','jellyfin','anime','动漫',"
+                    "'2026-08-01','2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=7")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {
+                        str(row["name"])
+                        for row in migrated.execute("PRAGMA table_info(local_library_targets)")
+                    }
+                    preserved = migrated.execute(
+                        "SELECT path,server_path FROM local_library_targets WHERE id=1"
+                    ).fetchone()
+                self.assertEqual(version, db.SCHEMA_VERSION)
+                self.assertIn("server_path", columns)
+                self.assertEqual(tuple(preserved), ("/media/library/动漫", ""))
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
