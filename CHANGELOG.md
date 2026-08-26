@@ -7,14 +7,17 @@
 ## [0.1.6] - 2026-08-26
 
 ### Added
+- 媒体反代实例新增可信代理来源配置，可按实例校验直接连接方的 IP/CIDR，并在明确授权后安全还原 `X-Forwarded-For` 中的真实客户端地址（[`0430e3d`](https://github.com/li88iioo/MediaFlux/commit/0430e3d)）。
 - 新增统一的媒体库路径映射管理，可为本地媒体分类和 STRM 子目录绑定 Jellyfin/Emby 媒体库及服务器可见路径，并据此执行精准刷新（[`fedd358`](https://github.com/li88iioo/MediaFlux/commit/fedd358)）。
 - Telegram 新增 Media Agent 控制面板，可直接查看并切换全局与 Telegram Agent 状态，传统整理、同步、搜索、RSS 和运行状态命令保持独立可用（[`1bff479`](https://github.com/li88iioo/MediaFlux/commit/1bff479)）。
 
 ### Changed
+- 拆分媒体反代的播放信息、签名直链与重定向耗时统计，使首播延迟、缓存命中和具体慢点可独立诊断（[`8129a72`](https://github.com/li88iioo/MediaFlux/commit/8129a72)）。
 - 优化索引器站点适配、镜像故障切换、请求超时与重试边界，提高 Mikan、BtBtLa 等来源失效时的检索可用性（[`b96ccc5`](https://github.com/li88iioo/MediaFlux/commit/b96ccc5)）。
 - 统一整理规则、元数据设置、整理详情和日志界面的视觉细节，稳定移动端弹窗布局并移除不必要的卡片动效与侧栏滚动条干扰（[`e7aded8`](https://github.com/li88iioo/MediaFlux/commit/e7aded8)、[`6593c49`](https://github.com/li88iioo/MediaFlux/commit/6593c49)、[`e9d671d`](https://github.com/li88iioo/MediaFlux/commit/e9d671d)、[`051e06b`](https://github.com/li88iioo/MediaFlux/commit/051e06b)、[`74ae25e`](https://github.com/li88iioo/MediaFlux/commit/74ae25e)、[`ae55d10`](https://github.com/li88iioo/MediaFlux/commit/ae55d10)）。
 
 ### Fixed
+- 修复媒体反代高级配置折叠区因浏览器命中旧主样式缓存而显示为散落图标和文本的问题（[`fd5ecb0`](https://github.com/li88iioo/MediaFlux/commit/fd5ecb0)）。
 - 修复仪表盘可播放媒体统计偏差，以及本地媒体整理识别结果未完整持久化、详情中标题/TMDB/类型/季集信息缺失的问题（[`03be7dd`](https://github.com/li88iioo/MediaFlux/commit/03be7dd)、[`5bf3078`](https://github.com/li88iioo/MediaFlux/commit/5bf3078)）。
 - 加强下载、RSS、订阅、整理、媒体代理、通知和任务队列的端到端生命周期、并发边界、失败恢复与状态一致性（[`f250ff9`](https://github.com/li88iioo/MediaFlux/commit/f250ff9)、[`2a4e179`](https://github.com/li88iioo/MediaFlux/commit/2a4e179)、[`0a86175`](https://github.com/li88iioo/MediaFlux/commit/0a86175)、[`07f8a6a`](https://github.com/li88iioo/MediaFlux/commit/07f8a6a)、[`fa244da`](https://github.com/li88iioo/MediaFlux/commit/fa244da)）。
 - 修复光鸭离线任务仅视频选择、完成状态与整理触发边界，并支持清理历史记录后显式重新提交同一资源（[`c2745c1`](https://github.com/li88iioo/MediaFlux/commit/c2745c1)、[`5594d78`](https://github.com/li88iioo/MediaFlux/commit/5594d78)）。
