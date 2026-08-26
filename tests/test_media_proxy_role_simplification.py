@@ -665,6 +665,8 @@ class MediaProxyTemplateTests(unittest.TestCase):
         self.assertIn(".proxy-config-details", css)
         self.assertIn(".proxy-config-details-body .form-group", css)
         self.assertIn(".proxy-trusted-cidrs-input", css)
+        base = Path("app/templates/base.html").read_text(encoding="utf-8")
+        self.assertIn("css/main.css') }}?v=20260826j", base)
 
     def test_proxy_playback_latency_is_split_by_stage_without_extra_columns(self):
         template = Path("app/templates/media_proxy.html").read_text(encoding="utf-8")
