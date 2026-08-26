@@ -4,7 +4,7 @@
 {% block body_class %}dashboard-page media-hub-page global-search-page{% endblock %}
 {% block page_styles %}
 <link rel="stylesheet" href="{{ url_for('static', path='css/dashboard-workbench.css') }}?v=20260818c">
-<link rel="stylesheet" href="{{ url_for('static', path='css/media-hub.css') }}?v=20260826a">
+<link rel="stylesheet" href="{{ url_for('static', path='css/media-hub.css') }}?v=20260826b">
 {% endblock %}
 {% block workspace_bar %}
 <header class="dashboard-topbar media-hub-topbar">
@@ -103,7 +103,7 @@
                     {% for item in task_section['items'] %}
                     <a class="global-task-card" href="{{ item.url }}">
                         <span class="global-task-head"><strong>{{ item.title }}</strong><b>{{ item.progress_percent }}%</b></span>
-                        <span class="global-task-progress"><i style="width: {{ item.progress_percent }}%"></i></span>
+                        <progress class="global-task-progress" value="{{ item.progress_percent }}" max="100" aria-label="下载进度 {{ item.progress_percent }}%">{{ item.progress_percent }}%</progress>
                         <span class="global-task-meta"><small>{{ item.source_label }} · {{ item.status_label }}</small><em>{{ item.path or item.created_at }}</em></span>
                     </a>
                     {% endfor %}

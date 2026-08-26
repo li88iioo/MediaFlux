@@ -246,7 +246,7 @@ class MediaHubPageContractTests(InitializedWebTestCase):
         self.assertIn('name="server"', response.text)
         self.assertIn('name="type"', response.text)
         self.assertIn('name="q"', response.text)
-        self.assertIn("/static/css/media-hub.css?v=20260826a", response.text)
+        self.assertIn("/static/css/media-hub.css?v=20260826b", response.text)
         self.assertIn("dashboard-page media-hub-page", response.text)
         self.assertIn('class="media-recent-shell"', response.text)
         self.assertIn('class="media-recent-toolbar"', response.text)
@@ -348,7 +348,10 @@ class MediaHubPageContractTests(InitializedWebTestCase):
         self.assertNotIn("/discovery?q=", response.text)
         self.assertIn("打开媒体库", response.text)
         self.assertNotIn("媒体档案", response.text)
-        self.assertIn("/static/css/media-hub.css?v=20260826a", response.text)
+        self.assertIn("/static/css/media-hub.css?v=20260826b", response.text)
+        template = Path("app/templates/global_search.html").read_text(encoding="utf-8")
+        self.assertIn('<progress class="global-task-progress"', template)
+        self.assertNotRegex(template, r'style="[^"]*\{\{')
         self.assertRegex(
             response.text,
             re.compile(r'<div class="global-top-primary">.*<div class="global-top-context">', re.S),
