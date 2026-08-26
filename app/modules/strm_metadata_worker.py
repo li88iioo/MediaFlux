@@ -42,7 +42,7 @@ class STRMMetadataWorker:
         self._completed_session = 0
         self._failed_session = 0
         self._changed_paths: list[str] = []
-        self._last_refresh_at = 0.0
+        self._last_refresh_at: float | None = None
         self._refresh_retry_pending = False
 
     def start(self) -> None:
@@ -333,12 +333,17 @@ class STRMMetadataWorker:
         interval = max(
             30, min(get_int("STRM_METADATA_REFRESH_INTERVAL_SECONDS", 300), 3600)
         )
-        elapsed = time.monotonic() - self._last_refresh_at
+        now_mono = time.monotonic()
+        elapsed = (
+            interval
+            if self._last_refresh_at is None
+            else max(0.0, now_mono - self._last_refresh_at)
+        )
         if self._refresh_retry_pending and not force and elapsed < interval:
             return
         if not force and len(paths) < batch_size and elapsed < interval:
             return
-        self._last_refresh_at = time.monotonic()
+        self._last_refresh_at = now_mono
         try:
             from app.modules.scheduler import STRMScheduler
 

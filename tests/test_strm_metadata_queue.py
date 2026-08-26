@@ -442,7 +442,10 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         with patch(
             "app.modules.scheduler.STRMScheduler._refresh_media_servers",
             return_value={"Jellyfin": True},
-        ) as refresh:
+        ) as refresh, patch(
+            "app.modules.strm_metadata_worker.time.monotonic",
+            return_value=120.0,
+        ):
             worker._flush_media_refresh(force=False)
 
         refresh.assert_called_once()
