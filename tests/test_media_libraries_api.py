@@ -196,12 +196,13 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                 )
 
         self.assertEqual(root_response.status_code, 200, root_response.text)
-        self.assertEqual(
-            [item["name"] for item in root_response.json()["directories"]],
-            ["NSFW", "整理"],
-        )
+        root_directories = root_response.json()["directories"]
+        self.assertEqual([item["name"] for item in root_directories], ["NSFW", "整理"])
+        self.assertTrue(all(item["is_dir"] is True for item in root_directories))
         self.assertEqual(source_response.status_code, 200, source_response.text)
-        self.assertEqual(source_response.json()["directories"][0]["path"], str(anime))
+        source_directory = source_response.json()["directories"][0]
+        self.assertEqual(source_directory["path"], str(anime))
+        self.assertIs(source_directory["is_dir"], True)
         self.assertEqual(leaf_response.status_code, 200, leaf_response.text)
         self.assertEqual(leaf_response.json()["current"], str(anime))
         self.assertEqual(leaf_response.json()["directories"], [])

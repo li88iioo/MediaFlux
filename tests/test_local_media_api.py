@@ -164,7 +164,9 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
                 nested = self.client.get("/api/local-media/directories", params={"path": str(root)})
             self.assertEqual(listing.status_code, 200, listing.text)
             self.assertEqual(listing.json()["directories"][0]["path"], str(root))
+            self.assertIs(listing.json()["directories"][0]["is_dir"], True)
             self.assertEqual([item["name"] for item in nested.json()["directories"]], ["Movies"])
+            self.assertIs(nested.json()["directories"][0]["is_dir"], True)
 
             with patch("app.modules.local_directory_browser.get", return_value=""), patch(
                 "app.modules.local_directory_browser._platform_roots", return_value=[root]
@@ -174,7 +176,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
                 )
             self.assertEqual(fallback.status_code, 200, fallback.text)
             self.assertEqual(fallback.json()["directories"], [
-                {"id": str(root), "name": root.name, "path": str(root)}
+                {"id": str(root), "name": root.name, "path": str(root), "is_dir": True}
             ])
 
             source_id = db.create_local_media_source(

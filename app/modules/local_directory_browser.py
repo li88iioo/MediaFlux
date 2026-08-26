@@ -92,7 +92,12 @@ def browse_local_directories(
                 "current": VIRTUAL_ROOT,
                 "parent": "",
                 "directories": [
-                    {"id": str(root), "name": _display_name(root), "path": str(root)}
+                    {
+                        "id": str(root),
+                        "name": _display_name(root),
+                        "path": str(root),
+                        "is_dir": True,
+                    }
                     for root in roots
                 ],
             }
@@ -117,7 +122,7 @@ def browse_local_directories(
     except OSError as exc:
         raise _directory_access_error("目录读取", exc) from exc
 
-    directories: list[dict[str, str]] = []
+    directories: list[dict[str, str | bool]] = []
     for child in children:
         try:
             if child.is_symlink() or not child.is_dir():
@@ -125,7 +130,12 @@ def browse_local_directories(
             safe_child = _allowed_root(child, roots)
         except (OSError, PathMappingError):
             continue
-        directories.append({"id": str(safe_child), "name": child.name, "path": str(safe_child)})
+        directories.append({
+            "id": str(safe_child),
+            "name": child.name,
+            "path": str(safe_child),
+            "is_dir": True,
+        })
 
     root = next(root for root in roots if current == root or root in current.parents)
     parent = ""
