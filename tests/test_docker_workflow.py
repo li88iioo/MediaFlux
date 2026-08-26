@@ -155,6 +155,14 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("SOURCE_DATE_EPOCH=${{ steps.context.outputs.source_date_epoch }}", self.text)
         self.assertIn("ARG SOURCE_DATE_EPOCH", Path("Dockerfile").read_text(encoding="utf-8"))
 
+    def test_release_assets_reuse_commit_epoch_for_annotated_tags(self) -> None:
+        publish = self.text.split("      - name: Publish GitHub Release", 1)[1]
+        self.assertIn(
+            "SOURCE_DATE_EPOCH: ${{ steps.context.outputs.source_date_epoch }}",
+            publish,
+        )
+        self.assertNotIn('git show -s --format=%ct "$VERSION_REF"', publish)
+
 
 if __name__ == "__main__":
     unittest.main()
