@@ -18,9 +18,12 @@ from app.agent.state_commit import commit_or_defer_agent_state
 from app.bot.agent_adapter import (
     SQLiteTelegramAgentActionStore,
     TelegramAgentActionStore,
+    _StreamMessage,
+    _TelegramAgentProgress,
     _TelegramTypingHeartbeat,
     _begin_agent_stream,
     _message_context,
+    _render_agent_progress_card,
     _render_resource_candidates,
     _resource_markup,
     _safe_callback_history_response,
@@ -39,6 +42,7 @@ from app.bot.agent_adapter import (
     telegram_agent_control_access,
     telegram_agent_owner,
 )
+from app.agent.progress_events import AgentProgressEvent
 from app.clients.openai_compatible import ProviderStreamError
 from tests.support import isolated_test_database
 
@@ -675,6 +679,79 @@ class TelegramAgentAdapterTests(unittest.TestCase):
     def test_rich_thinking_block_is_not_double_wrapped(self):
         thinking = "<tg-thinking>正在理解请求…</tg-thinking>"
         self.assertEqual(_telegram_rich_html(thinking), thinking)
+
+    def test_progress_card_quotes_request_and_redacts_private_input(self):
+        message = _message(
+            "检查 https://private.example/a token=secret-value /root/private/file"
+        )
+        message.from_user.first_name = "aXi"
+        message.from_user.last_name = "Ba"
+
+        rendered = _render_agent_progress_card(
+            message,
+            target_mode="rich_draft",
+            active_label="🧭 正在理解请求…",
+        )
+
+        self.assertIn("<blockquote><b>aXi Ba</b><br>", rendered)
+        self.assertIn("[链接已隐藏]", rendered)
+        self.assertIn("[凭据已隐藏]", rendered)
+        self.assertIn("[路径已隐藏]", rendered)
+        self.assertIn("<tg-thinking>🧭 正在理解请求...</tg-thinking>", rendered)
+        self.assertNotIn("private.example", rendered)
+        self.assertNotIn("secret-value", rendered)
+        self.assertNotIn("/root/private", rendered)
+
+    def test_live_progress_uses_public_tool_labels_and_completed_steps(self):
+        bot = _RichDraftBot()
+        message = _message("检查一下我关注的动漫有更新吗？")
+        message.from_user.first_name = "aXi"
+        message.from_user.last_name = "Ba"
+        target = _StreamMessage(
+            mode="rich_draft",
+            chat_id=100,
+            source_message_id=9,
+            draft_id=123,
+        )
+
+        def publish(callback):
+            return True, callback()
+
+        progress = _TelegramAgentProgress(
+            bot,
+            _RichTelebot,
+            target,
+            message,
+            publish=publish,
+            update_interval_seconds=0,
+        )
+        progress.handle(AgentProgressEvent(phase="model_wait"))
+        progress.handle(
+            AgentProgressEvent(
+                phase="tool_start",
+                tool_name="media.subscription_updates",
+            )
+        )
+        progress.handle(
+            AgentProgressEvent(
+                phase="tool_finish",
+                tool_name="media.subscription_updates",
+                ok=True,
+            )
+        )
+        progress.mark_answering()
+
+        self.assertGreaterEqual(len(bot.rich_drafts), 4)
+        planning = bot.rich_drafts[0][2].html
+        started = bot.rich_drafts[1][2].html
+        finished = bot.rich_drafts[-1][2].html
+        self.assertIn("✅ 已理解请求", planning)
+        self.assertIn("正在分析请求并规划检查步骤", planning)
+        self.assertIn("媒体追更实时更新检查", started)
+        self.assertNotIn("media.subscription_updates", started)
+        self.assertIn("✅ 媒体追更实时更新检查", finished)
+        self.assertIn("正在整理回答", finished)
+        self.assertIn("检查一下我关注的动漫有更新吗", finished)
 
     def test_failed_narrative_keeps_the_deterministic_error(self):
         text = render_agent_response({
@@ -1360,7 +1437,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         ]
         text = _render_resource_candidates(response, candidates)
         self.assertNotIn("**", text)
-        self.assertIn("<b>已找到资源。</b>", text)
+        self.assertIn("已找到资源。", text)
         self.assertNotIn("找到两个候选", text)
         self.assertNotIn("已检查 3 个站点", text)
         self.assertIn("<b>候选资源</b>", text)
@@ -2959,11 +3036,12 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             session_id=ANY,
             present=False,
         )
-        # 半句话不会发布；只保留初始 thinking 与完整句子的末尾 flush。
-        self.assertEqual(len(bot.rich_drafts), 2)
+        # 半句话不会发布；初始进度卡、回答整理阶段和完整句子的末尾 flush 各更新一次。
+        self.assertEqual(len(bot.rich_drafts), 3)
         self.assertIn("tg-thinking", bot.rich_drafts[0][2].html)
-        self.assertIn("下载队列状态正常", bot.rich_drafts[1][2].html)
-        self.assertIn("共 16 项任务", bot.rich_drafts[1][2].html)
+        self.assertIn("正在整理回答", bot.rich_drafts[1][2].html)
+        self.assertIn("下载队列状态正常", bot.rich_drafts[-1][2].html)
+        self.assertIn("共 16 项任务", bot.rich_drafts[-1][2].html)
         self.assertEqual(len(bot.rich_messages), 1)
         self.assertIn("下载队列状态正常", bot.rich_messages[0][1].html)
         self.assertIn("16 项任务", bot.rich_messages[0][1].html)
@@ -3193,7 +3271,8 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(bot.replies, [])
         self.assertEqual(len(bot.drafts), 2)
         self.assertEqual({item[1] for item in bot.drafts}, {bot.drafts[0][1]})
-        self.assertEqual(bot.drafts[0][2], "")
+        self.assertIn("正在理解请求", bot.drafts[0][2])
+        self.assertIn("检查媒体库", bot.drafts[0][2])
         self.assertEqual(len(bot.sent), 1)
         self.assertIn("检查完成", bot.sent[0][1])
         self.assertNotIn("Agent 已完成", bot.sent[0][1])

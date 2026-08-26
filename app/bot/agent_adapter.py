@@ -57,6 +57,10 @@ from app.agent.presentation_stream import (
     apply_streamed_answer,
     select_agent_answer_stream,
 )
+from app.agent.progress_events import (
+    AgentProgressEvent,
+    bind_agent_progress_listener,
+)
 from app.agent.rate_limit import agent_rate_limiter, allow_agent_tool
 from app.agent.registry import AgentToolError
 from app.agent.result_projection import (
@@ -124,6 +128,8 @@ _RESOURCE_PAGE_PAYLOAD_LIMIT = 32768
 _EPISODE_FOLLOWUP_LIMIT = 3
 _WORKSPACE_ACTION_LIMIT = 5
 _TELEGRAM_STREAM_UPDATE_INTERVAL_SECONDS = 0.35
+_TELEGRAM_PROGRESS_UPDATE_INTERVAL_SECONDS = 0.45
+_TELEGRAM_PROGRESS_MAX_COMPLETED_STEPS = 4
 _TELEGRAM_TYPING_INTERVAL_SECONDS = 4.0
 _TELEGRAM_TYPING_TIMEOUT_SECONDS = 120.0
 _TELEGRAM_TYPING_REGISTRY_LOCK = threading.RLock()
@@ -1320,6 +1326,216 @@ def _telegram_rich_html(value: object) -> str:
     return "".join(blocks)
 
 
+def _telegram_progress_request(message: Any) -> tuple[str, str]:
+    """返回可放入临时进度卡的用户名和请求摘要。"""
+
+    user = getattr(message, "from_user", None)
+    name_parts = [
+        str(getattr(user, field, "") or "").strip()
+        for field in ("first_name", "last_name")
+    ]
+    display_name = " ".join(part for part in name_parts if part)
+    if not display_name:
+        username = str(getattr(user, "username", "") or "").strip()
+        display_name = f"@{username}" if username else "你的请求"
+    query = str(getattr(message, "text", "") or "").strip()
+    return (
+        _public_text(display_name, limit=48) or "你的请求",
+        _public_text(query, limit=180) or "正在处理本次请求",
+    )
+
+
+def _render_agent_progress_card(
+    message: Any,
+    *,
+    target_mode: str,
+    active_label: str,
+    completed_steps: tuple[str, ...] = (),
+) -> str:
+    """渲染不暴露参数、路径和内部工具名的 Telegram 工作进度卡。"""
+
+    display_name, query = _telegram_progress_request(message)
+    active = _public_text(active_label, limit=100) or "正在处理…"
+    completed = tuple(
+        text
+        for raw in completed_steps[-_TELEGRAM_PROGRESS_MAX_COMPLETED_STEPS :]
+        if (text := _public_text(raw, limit=100))
+    )
+    # Telegram 草稿接口没有 reply_parameters；富/文本草稿内模拟引用卡。
+    # 可编辑占位本身已经 reply_to 原消息，因此不重复展示请求。
+    include_request = target_mode in {"rich_draft", "draft"}
+
+    if target_mode == "rich_draft":
+        blocks: list[str] = []
+        if include_request:
+            blocks.append(
+                f"<blockquote><b>{display_name}</b><br>{query}</blockquote>"
+            )
+        if completed:
+            blocks.append(f"<p>{'<br>'.join(completed)}</p>")
+        blocks.append(f"<tg-thinking>{active}</tg-thinking>")
+        return "".join(blocks)
+
+    lines: list[str] = []
+    if include_request:
+        lines.extend(
+            [f"<blockquote><b>{display_name}</b><br>{query}</blockquote>", ""]
+        )
+    else:
+        lines.extend(["<b>Media Agent</b>", ""])
+    lines.extend(completed)
+    if completed:
+        lines.append("")
+    lines.append(f"<i>{active}</i>")
+    return "\n".join(lines)
+
+
+class _TelegramAgentProgress:
+    """把真实 Agent 阶段投影为同一条 Telegram 草稿中的公开进度。"""
+
+    def __init__(
+        self,
+        bot: Any,
+        telebot: Any,
+        target: _StreamMessage | None,
+        message: Any,
+        *,
+        publish: Callable[[Callable[[], Any]], tuple[bool, Any | None]],
+        clock: Callable[[], float] = time.monotonic,
+        update_interval_seconds: float = _TELEGRAM_PROGRESS_UPDATE_INTERVAL_SECONDS,
+    ) -> None:
+        self.bot = bot
+        self.telebot = telebot
+        self.target = target if isinstance(target, _StreamMessage) else None
+        self.message = message
+        self.publish = publish
+        self.clock = clock
+        self.update_interval_seconds = max(0.0, float(update_interval_seconds))
+        self._active = self.target is not None
+        self._active_label = "🧭 正在理解请求…"
+        self._completed_steps: list[str] = []
+        self._last_rendered = (
+            _render_agent_progress_card(
+                message,
+                target_mode=self.target.mode,
+                active_label=self._active_label,
+            )
+            if self.target is not None
+            else ""
+        )
+        self._last_update_at = self.clock()
+        self._lock = threading.RLock()
+
+    def handle(self, event: AgentProgressEvent) -> None:
+        """接收真实进度事件；只显示公开工具名称，不显示参数和原始摘要。"""
+
+        phase = str(getattr(event, "phase", "") or "").strip()
+        tool_name = str(getattr(event, "tool_name", "") or "").strip()
+        force = False
+        with self._lock:
+            if not self._active or self.target is None:
+                return
+            if phase == "routing":
+                self._active_label = "🧭 正在理解请求…"
+            elif phase == "planning":
+                self._remember_completed("✅ 已理解请求")
+                self._active_label = "🧭 正在选择检查范围…"
+                force = True
+            elif phase == "model_wait":
+                self._remember_completed("✅ 已理解请求")
+                self._active_label = "🧭 正在分析请求并规划检查步骤…"
+                force = True
+            elif phase in {"tool_start", "preview_start"} and tool_name:
+                label = public_tool_label(tool_name)
+                self._active_label = (
+                    f"🛡️ 正在生成安全预检：{label}…"
+                    if phase == "preview_start"
+                    else f"🔎 正在检查：{label}…"
+                )
+                force = True
+            elif phase in {"tool_finish", "preview_finish"} and tool_name:
+                label = public_tool_label(tool_name)
+                ok = getattr(event, "ok", None) is not False
+                completed = (
+                    f"✅ {label}"
+                    if ok
+                    else f"⚠️ {label}未正常返回"
+                )
+                self._remember_completed(completed)
+                self._active_label = (
+                    "🛡️ 正在核对预检结果…"
+                    if phase == "preview_finish"
+                    else "🔎 正在核对检查结果…"
+                )
+            else:
+                return
+        self._publish(force=force)
+
+    def mark_answering(self) -> None:
+        with self._lock:
+            if not self._active:
+                return
+            self._active_label = "✍️ 正在整理回答…"
+        self._publish(force=True)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._active = False
+
+    def _remember_completed(self, value: str) -> None:
+        label = str(value or "").strip()
+        if not label:
+            return
+        normalized = label.removeprefix("✅ ").removeprefix("⚠️ ")
+        self._completed_steps = [
+            item
+            for item in self._completed_steps
+            if item.removeprefix("✅ ").removeprefix("⚠️ ") != normalized
+        ]
+        self._completed_steps.append(label)
+        if len(self._completed_steps) > _TELEGRAM_PROGRESS_MAX_COMPLETED_STEPS:
+            self._completed_steps = self._completed_steps[
+                -_TELEGRAM_PROGRESS_MAX_COMPLETED_STEPS :
+            ]
+
+    def _publish(self, *, force: bool) -> None:
+        with self._lock:
+            target = self.target
+            if not self._active or target is None:
+                return
+            now = self.clock()
+            if (
+                not force
+                and now - self._last_update_at < self.update_interval_seconds
+            ):
+                return
+            rendered = _render_agent_progress_card(
+                self.message,
+                target_mode=target.mode,
+                active_label=self._active_label,
+                completed_steps=tuple(self._completed_steps),
+            )
+            if rendered == self._last_rendered:
+                return
+            self._last_rendered = rendered
+            self._last_update_at = now
+
+        try:
+            allowed, _result = self.publish(
+                lambda: _update_agent_stream(
+                    self.bot,
+                    self.telebot,
+                    target,
+                    rendered,
+                    reply_markup=None,
+                )
+            )
+        except Exception:
+            allowed = False
+        if not allowed:
+            self.stop()
+
+
 def _begin_agent_stream(
     bot: Any, telebot: Any, message: Any
 ) -> _StreamMessage | None:
@@ -1334,7 +1550,12 @@ def _begin_agent_stream(
     send_rich_draft = getattr(bot, "send_rich_message_draft", None)
     send_rich = getattr(bot, "send_rich_message", None)
     thinking = _rich_message(
-        telebot, "<tg-thinking>正在理解请求…</tg-thinking>"
+        telebot,
+        _render_agent_progress_card(
+            message,
+            target_mode="rich_draft",
+            active_label="🧭 正在理解请求…",
+        ),
     )
     if callable(send_rich_draft) and callable(send_rich) and thinking is not None:
         try:
@@ -1360,7 +1581,17 @@ def _begin_agent_stream(
             draft_kwargs = {}
             if message_thread_id is not None:
                 draft_kwargs["message_thread_id"] = message_thread_id
-            if send_draft(chat_id, draft_id, "", **draft_kwargs):
+            if send_draft(
+                chat_id,
+                draft_id,
+                _render_agent_progress_card(
+                    message,
+                    target_mode="draft",
+                    active_label="🧭 正在理解请求…",
+                ),
+                parse_mode="HTML",
+                **draft_kwargs,
+            ):
                 return _StreamMessage(
                     mode="draft",
                     chat_id=chat_id,
@@ -1388,7 +1619,11 @@ def _begin_agent_stream(
     try:
         placeholder = send_message(
             chat_id,
-            "<b>Media Agent</b>\n正在理解请求…",
+            _render_agent_progress_card(
+                message,
+                target_mode="edit",
+                active_label="🧭 正在理解请求…",
+            ),
             **kwargs,
         )
     except Exception as exc:
@@ -3317,6 +3552,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
     state_buffer = AgentStateCommitBuffer(owner=owner)
     llm_budget_token = begin_llm_request_budget(owner)
     stream_target = None
+    progress: _TelegramAgentProgress | None = None
     message_chat_id, _source_message_id, message_thread_id = _message_context(message)
     typing_heartbeat = _TelegramTypingHeartbeat(
         bot,
@@ -3336,6 +3572,13 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         if not allowed:
             _delete_stale_telegram_delivery(bot, stream_target)
             return True
+        progress = _TelegramAgentProgress(
+            bot,
+            telebot,
+            stream_target,
+            message,
+            publish=publish_if_current,
+        )
 
         conversation_context, history_generation = _telegram_conversation_context(owner)
         _principal, trace_session_id = _telegram_history_identity(owner)
@@ -3358,8 +3601,13 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         if stream_target is not None:
             # 工具选择与参数必须先完整校验；只把最终公开自然语言改成 Provider 流。
             query_kwargs["present"] = False
-        with defer_agent_state_commits(state_buffer):
+        with bind_agent_progress_listener(
+            progress.handle if progress is not None else None
+        ), defer_agent_state_commits(state_buffer):
             response = service.query(user_message, **query_kwargs)
+        if progress is not None:
+            progress.mark_answering()
+            progress.stop()
         if not operation_is_current():
             raise AgentOperationCancelled("Telegram Agent 操作已失效")
 
@@ -3513,7 +3761,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                 stream_target,
                 rendered,
                 reply_markup=markup,
-                show_progress=not streamed,
+                show_progress=False,
             )
             if result.sent:
                 return result
@@ -3592,6 +3840,8 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             ):
                 _delete_stale_telegram_delivery(bot, publish_result.delivery)
     finally:
+        if progress is not None:
+            progress.stop()
         state_buffer.discard()
         reset_llm_request_budget(llm_budget_token)
         typing_heartbeat.stop()

@@ -22,6 +22,7 @@ from app.agent.conversation_summary import (
     conversation_summary_schema,
     normalize_conversation_summary,
 )
+from app.agent.progress_events import emit_agent_progress
 from app.agent.prompts import DEFAULT_AGENT_SYSTEM_PROMPT
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.token_budget import (
@@ -2851,6 +2852,7 @@ def run_native_read_agent(
         or not _reserve_llm_provider_request(owner)
     ):
         return None
+    emit_agent_progress("model_wait")
     try:
         return run_awaitable_sync(
             _request_native_read_agent(
@@ -2930,6 +2932,7 @@ def answer_conversation(
         return None
     if not _reserve_llm_provider_request(owner):
         return None
+    emit_agent_progress("model_wait")
     try:
         return run_awaitable_sync(
             _request_conversation_reply(

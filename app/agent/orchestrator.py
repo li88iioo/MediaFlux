@@ -84,6 +84,7 @@ from app.agent.recent_download_submissions import (
     sanitize_submission_confirmation_result,
 )
 from app.agent.episode_audit import invalidate_episode_audit_cache
+from app.agent.progress_events import emit_agent_progress
 from app.agent.rate_limit import allow_agent_tool
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.rss_reference import resolve_rss_subscription_name
@@ -5799,10 +5800,20 @@ class AgentOrchestrator:
             normalized_arguments = self.registry.validate_read_call(
                 tool_name, normalized_arguments
             )
-        result, elapsed_ms = self.registry.execute(
-            tool_name,
-            arguments,
-            context=trace_context,
+        emit_agent_progress("tool_start", tool_name=tool_name)
+        try:
+            result, elapsed_ms = self.registry.execute(
+                tool_name,
+                arguments,
+                context=trace_context,
+            )
+        except Exception:
+            emit_agent_progress(
+                "tool_finish", tool_name=tool_name, ok=False
+            )
+            raise
+        emit_agent_progress(
+            "tool_finish", tool_name=tool_name, ok=bool(result.ok)
         )
         if owner:
             # 续接状态必须与最终响应一起取得 latest-wins 发布权。流式请求被取消、
@@ -6660,10 +6671,22 @@ class AgentOrchestrator:
             if expected_owner_generation is None
             else int(expected_owner_generation)
         )
-        spec, normalized, context, preview, elapsed_ms = self.registry.prepare_confirmation(
-            tool_name,
-            arguments,
-            context=trace_context,
+        emit_agent_progress("preview_start", tool_name=tool_name)
+        try:
+            spec, normalized, context, preview, elapsed_ms = (
+                self.registry.prepare_confirmation(
+                    tool_name,
+                    arguments,
+                    context=trace_context,
+                )
+            )
+        except Exception:
+            emit_agent_progress(
+                "preview_finish", tool_name=tool_name, ok=False
+            )
+            raise
+        emit_agent_progress(
+            "preview_finish", tool_name=tool_name, ok=bool(preview.ok)
         )
         confirmation_contract = build_confirmation_contract(
             tool_name=spec.name,
@@ -7123,6 +7146,7 @@ class AgentOrchestrator:
         query_started = monotonic()
         try:
             message = normalize_agent_message(value)
+            emit_agent_progress("routing")
         except Exception:
             agent_metrics.record_query(
                 elapsed_ms=max(0, int((monotonic() - query_started) * 1000)),
@@ -7379,6 +7403,7 @@ class AgentOrchestrator:
                 )
             # 强上下文与确认接力已由服务端绑定；其余请求进入统一编排层：
             # _query_raw 先尝试受注册表约束的模型规划，再回退到兼容性业务路由。
+            emit_agent_progress("planning")
             response = self._query_raw(
                 message,
                 owner=owner,
@@ -7545,6 +7570,7 @@ class AgentOrchestrator:
         动作请求可以由模型准备一张确认票据，但永远不能直接执行写操作。非法名称、
         越权风险、重复确认或参数错误均按失败关闭处理。
         """
+        emit_agent_progress("model_wait")
         rate_identity = llm_tool_rate_identity or llm_rate_owner or owner
         action_request = is_agent_action_request(message)
 
