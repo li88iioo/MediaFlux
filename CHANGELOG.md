@@ -20,6 +20,7 @@
 - 修复光鸭离线任务仅视频选择、完成状态与整理触发边界，并支持清理历史记录后显式重新提交同一资源（[`c2745c1`](https://github.com/li88iioo/MediaFlux/commit/c2745c1)、[`5594d78`](https://github.com/li88iioo/MediaFlux/commit/5594d78)）。
 - Agent 开关改为运行时切换，不再为了启停 Telegram Agent 重启 Bot；关闭时会阻止旧任务继续产生受控副作用（[`71281d0`](https://github.com/li88iioo/MediaFlux/commit/71281d0)）。
 - 修复进程重启后 STRM 元数据持久刷新任务可能在启动初期被错误节流的问题，确保待刷新路径会立即恢复执行（[`ea56761`](https://github.com/li88iioo/MediaFlux/commit/ea56761)）。
+- 修复媒体库路径映射的 STRM 目录选择器将真实子目录误判为空的问题，现在可从 `/data/strm/光鸭云盘` 逐级选择整理目录与媒体分类（[`c0eede0`](https://github.com/li88iioo/MediaFlux/commit/c0eede0)）。
 
 ## [0.1.5] - 2026-08-24
 
