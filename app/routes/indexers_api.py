@@ -22,7 +22,9 @@ from app.modules.indexer_download import (
     InvalidDownloadData as _InvalidDownloadData,
     download_indexer_result,
     download_indexer_result_public,
+    resubmit_indexer_download_request,
 )
+from app.modules.download_dispatcher import public_dispatch_summary
 from app.modules.scraper import parse_release_position
 from app.web import api_error, api_response, require_api_login
 
@@ -333,7 +335,7 @@ async def download(request: Request, data: Any = Body(default=None)):
         return api_response({"error": "下载处理失败", "code": "download_failed"}, 500)
 
     status = 200 if item["ok"] else (409 if item["duplicate"] else 502)
-    return JSONResponse({
+    response = {
         "ok": item["ok"],
         "request_id": item["request_id"],
         "created": item["created"],
@@ -343,7 +345,50 @@ async def download(request: Request, data: Any = Body(default=None)):
         "failed": item["failed"],
         "duplicate": item["duplicate"],
         "error": item["error"],
-    }, status_code=status)
+    }
+    if item["duplicate"]:
+        response.update({
+            "existing_status": item.get("existing_status", ""),
+            "can_resubmit": bool(item.get("can_resubmit")),
+            "resubmit_target": item.get("resubmit_target", ""),
+        })
+    return JSONResponse(response, status_code=status)
+
+
+@router.post("/download/resubmit")
+async def resubmit_download(request: Request, data: Any = Body(default=None)):
+    require_api_login(request)
+    if not isinstance(data, dict):
+        return api_error("重新提交参数必须是 JSON 对象", 400)
+    try:
+        request_id = int(data.get("request_id") or 0)
+    except (TypeError, ValueError):
+        request_id = 0
+    target = str(data.get("target") or "").strip().lower()
+    if request_id <= 0:
+        return api_error("下载请求 ID 无效", 400)
+    if target not in _DOWNLOAD_TARGETS:
+        return api_error("下载目标仅支持 qb、guangya 或 both", 400)
+
+    result = await asyncio.to_thread(
+        resubmit_indexer_download_request,
+        request_id,
+        target,
+    )
+    if result.get("not_found"):
+        return api_error("下载请求不存在", 404)
+    if result.get("blocked"):
+        return api_error(str(result.get("error") or "当前目标不可重新提交"), 409)
+    public = public_dispatch_summary(result)
+    response = {
+        **public,
+        "source_request_id": request_id,
+        "request_id": int(result.get("request_id") or request_id),
+        "created": bool(result.get("created")),
+        "target": target,
+    }
+    status = 200 if public["ok"] else (409 if public["duplicate"] else 502)
+    return JSONResponse(response, status_code=status)
 
 
 @router.post("/download/batch")

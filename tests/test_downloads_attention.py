@@ -407,6 +407,67 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertFalse(capabilities["both"]["enabled"])
         self.assertIn("已完成", capabilities["both"]["reason"])
 
+    def test_explicit_history_resubmit_can_retry_a_completed_backend(self):
+        item = download_dispatcher.DownloadInput(
+            kind="magnet",
+            title="Deleted remote task",
+            source_value="magnet:?xt=urn:btih:4234567890abcdef1234567890abcdef12345678",
+        )
+        request_id, created = db.create_download_request(
+            download_dispatcher.request_key(item),
+            item.kind,
+            title=item.title,
+            source_value=item.source_value,
+            origin="indexer:nyaa",
+        )
+        self.assertTrue(created)
+        db.update_download_request(
+            request_id,
+            targets="guangya",
+            status="completed",
+            gy_status="completed",
+        )
+
+        with (
+            patch.object(download_dispatcher, "get", return_value="http://qb.local"),
+            patch.object(download_dispatcher, "analyze_offline_url") as analyze,
+        ):
+            analyze.return_value.allowed = True
+            analyze.return_value.reason = ""
+            capabilities = download_dispatcher.download_resubmit_capabilities(
+                db.get_download_request(request_id),
+                allow_completed=True,
+            )
+
+        self.assertTrue(capabilities["guangya"]["enabled"])
+
+        dispatch_result = {
+            "ok": True,
+            "status": "submitted",
+            "succeeded": ["guangya"],
+            "failed": [],
+            "error": "",
+        }
+        with (
+            patch.object(download_dispatcher, "get", return_value="http://qb.local"),
+            patch.object(download_dispatcher, "analyze_offline_url") as analyze,
+            patch.object(download_dispatcher, "dispatch_request", return_value=dispatch_result),
+        ):
+            analyze.return_value.allowed = True
+            analyze.return_value.reason = ""
+            result = download_dispatcher.resubmit_download_request(
+                request_id,
+                "guangya",
+                allow_completed=True,
+                origin="indexer:nyaa",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertNotEqual(result["request_id"], request_id)
+        successor = db.get_download_request(int(result["request_id"]))
+        self.assertEqual(successor["origin"], "indexer:nyaa")
+        self.assertEqual(db.get_download_request(request_id)["status"], "completed")
+
     def test_resubmit_capabilities_never_retry_a_resubmitted_backend(self):
         item = download_dispatcher.DownloadInput(
             kind="magnet",

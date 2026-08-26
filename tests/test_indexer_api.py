@@ -337,6 +337,77 @@ class IndexerAPITests(unittest.TestCase):
         create.assert_not_called()
         dispatch.assert_not_called()
 
+    def test_completed_duplicate_exposes_explicit_resubmit_action(self):
+        existing = {
+            "id": 7,
+            "status": "completed",
+            "qb_status": "",
+            "gy_status": "completed",
+        }
+        item = SimpleNamespace(
+            kind="magnet",
+            title="Demo",
+            source_value="magnet:?xt=urn:btih:" + "a" * 40,
+            torrent_data=None,
+        )
+        capabilities = {
+            "qb": {"enabled": False, "reason": ""},
+            "guangya": {"enabled": True, "reason": ""},
+            "both": {"enabled": False, "reason": ""},
+        }
+        with patch(
+            "app.modules.indexer_download.db.get_download_request_by_request_key",
+            return_value=existing,
+        ), patch(
+            "app.modules.indexer_download.download_resubmit_capabilities",
+            return_value=capabilities,
+        ), patch("app.modules.indexer_download.create_request") as create, patch(
+            "app.modules.indexer_download.dispatch_request"
+        ) as dispatch:
+            created, request_id, result = indexer_download._persist_and_dispatch(
+                item, "indexer:nyaa", "guangya"
+            )
+
+        self.assertFalse(created["created"])
+        self.assertEqual(request_id, 7)
+        self.assertEqual(result["existing_status"], "completed")
+        self.assertTrue(result["can_resubmit"])
+        self.assertEqual(result["resubmit_target"], "guangya")
+        self.assertEqual(result["error"], "已有历史任务")
+        create.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_cancelled_download_retries_only_missing_target(self):
+        existing = {
+            "id": 7,
+            "status": "cancelled",
+            "qb_status": "completed",
+            "gy_status": "failed",
+        }
+        item = SimpleNamespace(
+            kind="magnet",
+            title="Demo",
+            source_value="magnet:?xt=urn:btih:" + "b" * 40,
+            torrent_data=None,
+        )
+        with patch(
+            "app.modules.indexer_download.db.get_download_request_by_request_key",
+            return_value=existing,
+        ), patch(
+            "app.modules.indexer_download.create_request",
+            return_value={"id": 8, "created": True},
+        ), patch(
+            "app.modules.indexer_download.dispatch_request",
+            return_value={"ok": True},
+        ) as dispatch:
+            created, request_id, _result = indexer_download._persist_and_dispatch(
+                item, "indexer:nyaa", "both"
+            )
+
+        self.assertTrue(created["created"])
+        self.assertEqual(request_id, 8)
+        dispatch.assert_called_once_with(8, "guangya")
+
     def test_public_source_url_rejects_malformed_port_without_raising(self):
         adapter = SimpleNamespace(http=SimpleNamespace(allowed_hosts={"nyaa.si"}))
         service = SimpleNamespace(registry=SimpleNamespace(get=lambda _site_id: adapter))
@@ -508,6 +579,68 @@ class IndexerAPITests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         dispatch.assert_called_once_with(31, "both")
+
+    def test_download_duplicate_returns_history_resubmit_contract(self):
+        headers = self.authenticate()
+        item = {
+            "result_id": "opaque-result",
+            "ok": False,
+            "request_id": 31,
+            "created": False,
+            "target": "guangya",
+            "status": "duplicate",
+            "succeeded": [],
+            "failed": [],
+            "duplicate": True,
+            "error": "已有历史任务",
+            "existing_status": "completed",
+            "can_resubmit": True,
+            "resubmit_target": "guangya",
+        }
+        with patch(
+            "app.routes.indexers_api._download_result",
+            new=AsyncMock(return_value=item),
+        ):
+            response = self.client.post(
+                "/api/indexers/download",
+                json={"result_id": "opaque-result", "target": "guangya"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 409)
+        payload = response.json()
+        self.assertEqual(payload["existing_status"], "completed")
+        self.assertTrue(payload["can_resubmit"])
+        self.assertEqual(payload["resubmit_target"], "guangya")
+
+    def test_indexer_history_resubmit_dispatches_successor(self):
+        headers = self.authenticate()
+        result = {
+            "ok": True,
+            "status": "submitted",
+            "request_id": 32,
+            "created": True,
+            "succeeded": ["guangya"],
+            "failed": [],
+            "duplicate": False,
+            "error": "",
+        }
+        with patch(
+            "app.routes.indexers_api.resubmit_indexer_download_request",
+            return_value=result,
+        ) as resubmit:
+            response = self.client.post(
+                "/api/indexers/download/resubmit",
+                json={"request_id": 31, "target": "guangya"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["source_request_id"], 31)
+        self.assertEqual(payload["request_id"], 32)
+        resubmit.assert_called_once_with(31, "guangya")
 
     def test_download_both_reports_sanitized_partial_targets(self):
         headers = self.authenticate()

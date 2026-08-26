@@ -237,7 +237,6 @@ def create_request(
 
 
 _ACTIVE_BACKEND_STATUSES = {"submitting", "submitted", "downloading", "outcome_unknown"}
-_TERMINAL_BACKEND_STATUSES = {"completed", "resubmitted"}
 
 
 def _guangya_outcome_unknown(result: dict[str, Any]) -> bool:
@@ -305,7 +304,16 @@ def public_dispatch_summary(result: dict[str, Any]) -> dict[str, Any]:
     )
 
     if duplicate:
-        status, error = "duplicate", "该下载请求已提交或正在处理"
+        existing_status = str(result.get("existing_status") or "").strip().lower()
+        if result.get("can_resubmit"):
+            error = "已有历史任务"
+        elif existing_status in _ACTIVE_BACKEND_STATUSES | {"pending"}:
+            error = "任务正在处理"
+        elif existing_status == "manual_review":
+            error = "等待核对"
+        else:
+            error = "该下载请求已提交或正在处理"
+        status = "duplicate"
     elif review_required:
         status = "manual_review"
         error = (
@@ -328,7 +336,7 @@ def public_dispatch_summary(result: dict[str, Any]) -> dict[str, Any]:
         else:
             error = "下载提交失败"
 
-    return {
+    summary = {
         "ok": status in {"submitted", "partial"},
         "status": status,
         "succeeded": succeeded,
@@ -336,9 +344,20 @@ def public_dispatch_summary(result: dict[str, Any]) -> dict[str, Any]:
         "duplicate": duplicate,
         "error": error,
     }
+    if duplicate:
+        summary.update({
+            "existing_status": str(result.get("existing_status") or ""),
+            "can_resubmit": bool(result.get("can_resubmit")),
+            "resubmit_target": str(result.get("resubmit_target") or ""),
+        })
+    return summary
 
 
-def download_resubmit_capabilities(row) -> dict[str, dict[str, Any]]:
+def download_resubmit_capabilities(
+    row,
+    *,
+    allow_completed: bool = False,
+) -> dict[str, dict[str, Any]]:
     """返回旧下载请求可重新提交的目标，不暴露原始链接或种子内容。
 
     仍在处理或提交结果未知的后端不得创建第二份任务；另一个已经失败或进入
@@ -378,9 +397,12 @@ def download_resubmit_capabilities(row) -> dict[str, dict[str, Any]]:
     if qb_status in _ACTIVE_BACKEND_STATUSES:
         qb_enabled = False
         qb_reason = "qBittorrent 任务仍在处理或提交结果待确认，请勿重复提交"
-    elif qb_status in _TERMINAL_BACKEND_STATUSES:
+    elif qb_status == "resubmitted":
         qb_enabled = False
-        qb_reason = "qBittorrent 已完成或已重新提交，无需再次提交"
+        qb_reason = "qBittorrent 已重新提交"
+    elif qb_status == "completed" and not allow_completed:
+        qb_enabled = False
+        qb_reason = "qBittorrent 已完成"
 
     gy_enabled = False
     gy_reason = "此请求无法重新提交到光鸭"
@@ -393,17 +415,24 @@ def download_resubmit_capabilities(row) -> dict[str, dict[str, Any]]:
     if gy_status in _ACTIVE_BACKEND_STATUSES:
         gy_enabled = False
         gy_reason = "光鸭任务仍在处理或提交结果待确认，请勿重复提交"
-    elif gy_status in _TERMINAL_BACKEND_STATUSES:
+    elif gy_status == "resubmitted":
         gy_enabled = False
-        gy_reason = "光鸭任务已完成或已重新提交，无需再次提交"
+        gy_reason = "光鸭任务已重新提交"
+    elif gy_status == "completed" and not allow_completed:
+        gy_enabled = False
+        gy_reason = "光鸭任务已完成"
 
     both_enabled = qb_enabled and gy_enabled
     if both_enabled:
         both_reason = ""
     elif qb_status in _ACTIVE_BACKEND_STATUSES or gy_status in _ACTIVE_BACKEND_STATUSES:
         both_reason = "已有下载目标仍在处理或提交结果待确认，不能同时重复提交"
-    elif qb_status in _TERMINAL_BACKEND_STATUSES or gy_status in _TERMINAL_BACKEND_STATUSES:
-        both_reason = "至少一个下载目标已完成或已重新提交，不能再次同时提交"
+    elif qb_status == "resubmitted" or gy_status == "resubmitted":
+        both_reason = "至少一个下载目标已重新提交"
+    elif not allow_completed and (
+        qb_status == "completed" or gy_status == "completed"
+    ):
+        both_reason = "至少一个下载目标已完成"
     else:
         both_reason = "qBittorrent 与光鸭必须同时可用"
     return {
@@ -413,7 +442,13 @@ def download_resubmit_capabilities(row) -> dict[str, dict[str, Any]]:
     }
 
 
-def resubmit_download_request(source_request_id: int, targets: str) -> dict[str, Any]:
+def resubmit_download_request(
+    source_request_id: int,
+    targets: str,
+    *,
+    allow_completed: bool = False,
+    origin: str = "web",
+) -> dict[str, Any]:
     """复制旧请求的后端保存资源，并作为新的下载请求重新分发。"""
     if targets not in SUPPORTED_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
@@ -421,7 +456,10 @@ def resubmit_download_request(source_request_id: int, targets: str) -> dict[str,
     if not source_row:
         return {"ok": False, "error": "原下载请求不存在"}
 
-    capabilities = download_resubmit_capabilities(source_row)
+    capabilities = download_resubmit_capabilities(
+        source_row,
+        allow_completed=allow_completed,
+    )
     target_capability = capabilities.get(targets) or {}
     if not target_capability.get("enabled"):
         return {
@@ -438,13 +476,18 @@ def resubmit_download_request(source_request_id: int, targets: str) -> dict[str,
         source_value=str(source_row["source_value"] or ""),
         torrent_data=None if guangya_only_torrent else source_row["torrent_data"],
     )
+    source_status = str(source_row["status"] or "").strip().lower()
     created = create_request(
         item,
         str(source_row["chat_id"] or ""),
         f"resubmit:{int(source_request_id)}",
-        origin="web",
+        origin=str(origin or "web"),
         user_id=str(source_row["user_id"] or ""),
-        supersede_request_id=int(source_request_id),
+        # manual_review 不属于普通终态，必须显式指定被接管请求；completed、
+        # failed、cancelled 走仓储层既有的终态归档与新建逻辑。
+        supersede_request_id=(
+            int(source_request_id) if source_status == "manual_review" else None
+        ),
     )
     successor_id = int(created.get("id") or 0)
     if not successor_id:

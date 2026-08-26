@@ -694,14 +694,19 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             'id="discovery-dialog-notice"',
             'id="discovery-dialog-notice-title"',
             'id="discovery-dialog-notice-text"',
+            'id="discovery-dialog-notice-actions"',
             'id="discovery-dialog-notice-close"',
             'data-discovery-dialog-notice',
         ):
             self.assertIn(contract, self.template)
+        self.assertNotIn('RESOURCE DISPATCH', self.template)
         for contract in (
             "const DIALOG_NOTICE_SUCCESS_MS = 4000",
+            "const INDEXER_DOWNLOAD_RESUBMIT_PATH = '/api/indexers/download/resubmit'",
             "function showDialogNotification",
             "function hideDialogNotification",
+            "function resourceDuplicateNotification",
+            "function resubmitResourceRequest",
             "state.dialogNoticeTimer",
             "notification.type === 'success'",
             "elements.dialogNotice.hidden = false",
@@ -727,6 +732,8 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             ),
         )
         self.assertIn('.discovery-dialog-notice[hidden]', self.styles)
+        self.assertIn('.discovery-dialog-notice-actions[hidden]', self.styles)
+        self.assertIn('.discovery-dialog-notice-action.is-primary', self.styles)
         self.assertIn('@media (prefers-reduced-motion: reduce)', self.styles)
 
     def test_pending_global_notifications_are_fifo_and_flushed_serially(self):

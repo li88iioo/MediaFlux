@@ -23,18 +23,22 @@ from app import database as db
 from app.logger import get_logger
 from app.modules.download_dispatcher import (
     create_request,
+    download_resubmit_capabilities,
     dispatch_missing_targets,
     dispatch_request,
     normalize_download_url,
     public_dispatch_summary,
-    request_key,
     request_keys,
+    resubmit_download_request,
     torrent_download_input,
 )
 
 logger = get_logger(__name__)
 
 DOWNLOAD_TARGETS = frozenset({"qb", "guangya", "both"})
+INDEXER_RESUBMITTABLE_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "manual_review"}
+)
 _DOWNLOAD_LIMIT = 3
 _DOWNLOAD_LIMITERS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
     weakref.WeakKeyDictionary()
@@ -143,7 +147,28 @@ def _missing_terminal_targets(existing, target: str) -> tuple[str, ...]:
     return tuple(name for name in _requested_targets(target) if statuses[name] in retryable_statuses)
 
 
-def _duplicate_dispatch_result(request_id: int) -> dict[str, Any]:
+def _duplicate_dispatch_result(existing, target: str) -> dict[str, Any]:
+    request_id = int(existing["id"] or 0)
+    existing_status = str(existing["status"] or "").strip().lower()
+    can_resubmit = False
+    if existing_status in INDEXER_RESUBMITTABLE_STATUSES:
+        try:
+            capability = download_resubmit_capabilities(
+                existing,
+                allow_completed=True,
+            ).get(target) or {}
+            can_resubmit = bool(capability.get("enabled"))
+        except (IndexError, KeyError, TypeError, ValueError):
+            # 兼容迁移期残缺记录；重复保护本身不能因展示能力判断而失效。
+            can_resubmit = False
+    if can_resubmit:
+        error = "已有历史任务"
+    elif existing_status in {"pending", "submitting", "submitted", "downloading"}:
+        error = "任务正在处理"
+    elif existing_status == "manual_review":
+        error = "等待核对"
+    else:
+        error = "该资源已提交"
     return {
         "handled": False,
         "ok": False,
@@ -152,8 +177,43 @@ def _duplicate_dispatch_result(request_id: int) -> dict[str, Any]:
         "succeeded": [],
         "failed": [],
         "duplicate": True,
-        "error": "该目标已提交或正在处理",
+        "error": error,
+        "existing_status": existing_status,
+        "can_resubmit": can_resubmit,
+        "resubmit_target": target if can_resubmit else "",
     }
+
+
+def resubmit_indexer_download_request(
+    request_id: int,
+    target: str,
+) -> dict[str, Any]:
+    """按用户明确操作为资源站历史任务创建 successor 请求。"""
+    normalized_target = str(target or "").strip().lower()
+    if normalized_target not in DOWNLOAD_TARGETS:
+        return {"ok": False, "error": "下载目标无效"}
+    existing = db.get_download_request(int(request_id))
+    if existing is None:
+        return {"ok": False, "not_found": True, "error": "下载请求不存在"}
+    existing_status = str(existing["status"] or "").strip().lower()
+    if existing_status not in INDEXER_RESUBMITTABLE_STATUSES:
+        return _duplicate_dispatch_result(existing, normalized_target)
+    capability = download_resubmit_capabilities(
+        existing,
+        allow_completed=True,
+    ).get(normalized_target) or {}
+    if not capability.get("enabled"):
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": str(capability.get("reason") or "当前目标不可重新提交"),
+        }
+    return resubmit_download_request(
+        int(request_id),
+        normalized_target,
+        allow_completed=True,
+        origin=str(existing["origin"] or "indexer"),
+    )
 
 
 def _persist_and_dispatch(
@@ -182,14 +242,17 @@ def _persist_and_dispatch(
             return (
                 {"id": existing_id, "created": False},
                 existing_id,
-                _duplicate_dispatch_result(existing_id),
+                _duplicate_dispatch_result(existing, target),
             )
-        if existing_status in {"completed", "failed"}:
+        if existing_status in {"completed", "failed", "cancelled"}:
             missing = _missing_terminal_targets(existing, target)
             if not missing:
                 if admission_id is not None:
                     db.bind_media_download_admission_request(admission_id, existing_id)
-                return {"id": existing_id, "created": False}, existing_id, _duplicate_dispatch_result(existing_id)
+                return {
+                    "id": existing_id,
+                    "created": False,
+                }, existing_id, _duplicate_dispatch_result(existing, target)
             dispatch_target = _target_name(missing)
         elif existing_status == "pending":
             # 请求已持久化但尚未被任何后端认领（常见于创建后进程中断）。
@@ -205,7 +268,10 @@ def _persist_and_dispatch(
             appended = dispatch_missing_targets(existing_id, target)
             if appended.get("handled"):
                 return {"id": existing_id, "created": False}, existing_id, appended
-            return {"id": existing_id, "created": False}, existing_id, _duplicate_dispatch_result(existing_id)
+            return {
+                "id": existing_id,
+                "created": False,
+            }, existing_id, _duplicate_dispatch_result(existing, target)
     if created is None:
         created = create_request(
             item,
@@ -291,7 +357,7 @@ async def download_indexer_result(
     failed = public["failed"]
     status = public["status"]
     error = public["error"]
-    return {
+    response = {
         "result_id": result_id,
         "ok": status in {"submitted", "partial"},
         "request_id": request_id,
@@ -303,6 +369,13 @@ async def download_indexer_result(
         "duplicate": duplicate,
         "error": error,
     }
+    if duplicate:
+        response.update({
+            "existing_status": public.get("existing_status", ""),
+            "can_resubmit": bool(public.get("can_resubmit")),
+            "resubmit_target": public.get("resubmit_target", ""),
+        })
+    return response
 
 
 async def download_indexer_result_public(

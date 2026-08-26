@@ -16,9 +16,22 @@
     const INDEXER_SEARCH_PATH = '/api/indexers/search';
     const INDEXER_DOWNLOAD_PATH = '/api/indexers/download';
     const INDEXER_DOWNLOAD_BATCH_PATH = '/api/indexers/download/batch';
+    const INDEXER_DOWNLOAD_RESUBMIT_PATH = '/api/indexers/download/resubmit';
     const RESOURCE_SELECTION_LIMIT = 50;
     const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown', 'manual_review']);
     const RESOURCE_MANUAL_REVIEW_MESSAGE = '请核对下载列表/目标状态，必要时重新检索后人工处理';
+    const DOWNLOAD_REQUEST_STATUS_LABELS = {
+        pending: '等待提交',
+        submitting: '提交中',
+        submitted: '已提交',
+        downloading: '下载中',
+        completed: '已完成',
+        failed: '失败',
+        cancelled: '已取消',
+        manual_review: '待核对',
+        outcome_unknown: '待核对',
+        resubmitted: '已重新提交',
+    };
     const VIEW_CACHE_FRESH_MS = 120000;
     const VIEW_CACHE_LIMIT = 24;
     const SECTION_PRIMARY_CONCURRENCY = 3;
@@ -87,6 +100,7 @@
         dialogNoticeIcon: document.getElementById('discovery-dialog-notice-icon'),
         dialogNoticeTitle: document.getElementById('discovery-dialog-notice-title'),
         dialogNoticeText: document.getElementById('discovery-dialog-notice-text'),
+        dialogNoticeActions: document.getElementById('discovery-dialog-notice-actions'),
         dialogNoticeClose: document.getElementById('discovery-dialog-notice-close'),
     };
 
@@ -1392,6 +1406,8 @@
 
     function hideDialogNotification() {
         clearDialogNotificationTimer();
+        elements.dialogNoticeActions.replaceChildren();
+        elements.dialogNoticeActions.hidden = true;
         elements.dialogNotice.hidden = true;
     }
 
@@ -1401,12 +1417,31 @@
         clearDialogNotificationTimer();
         elements.dialogNotice.className = `discovery-dialog-notice is-${type}`;
         elements.dialogNotice.setAttribute('role', type === 'error' ? 'alert' : 'status');
-        elements.dialogNoticeTitle.textContent = notification.title || '下载任务状态';
+        elements.dialogNoticeTitle.textContent = notification.title || '下载状态';
         elements.dialogNoticeText.textContent = notification.message || '';
         elements.dialogNoticeIcon.replaceChildren(icon(icons[type]));
+        const actions = asArray(notification.actions).filter((action) => action?.label);
+        elements.dialogNoticeActions.replaceChildren();
+        actions.forEach((action) => {
+            const control = node(
+                action.href ? 'a' : 'button',
+                `discovery-dialog-notice-action${action.primary ? ' is-primary' : ''}`,
+                action.label,
+            );
+            if (action.href) {
+                control.href = action.href;
+            } else {
+                control.type = 'button';
+                control.addEventListener('click', () => {
+                    Promise.resolve(action.onClick?.(control)).catch(() => {});
+                });
+            }
+            elements.dialogNoticeActions.append(control);
+        });
+        elements.dialogNoticeActions.hidden = actions.length === 0;
         elements.dialogNotice.hidden = false;
         renderIcons(elements.dialogNotice);
-        if (notification.type === 'success') {
+        if (notification.type === 'success' && actions.length === 0) {
             state.dialogNoticeTimer = window.setTimeout(hideDialogNotification, DIALOG_NOTICE_SUCCESS_MS);
         }
     }
@@ -1670,7 +1705,10 @@
             return '提交状态未知，先核对下载列表；不要直接重复提交';
         }
         if (submitState.status === 'expired') return '资源结果已过期，请刷新或重新检索';
-        if (submitState.duplicate) return submitState.error || '该资源已提交或正在处理';
+        if (submitState.duplicate) {
+            if (submitState.can_resubmit) return '已有历史任务，可重新提交';
+            return submitState.error || '任务正在处理';
+        }
         if (submitState.status === 'partial') {
             const partialSuccessLabel = '部分成功：';
             const partialFailedLabel = '；失败：';
@@ -1687,6 +1725,92 @@
             return destinations.length ? `已提交：${destinations.join(' + ')}` : '资源提交成功';
         }
         return `${submitState.error || '资源提交失败'}；${RESOURCE_MANUAL_REVIEW_MESSAGE}`;
+    }
+
+    function downloadRequestStatusLabel(status) {
+        const normalized = String(status || '').trim().toLowerCase();
+        return DOWNLOAD_REQUEST_STATUS_LABELS[normalized] || '';
+    }
+
+    async function resubmitResourceRequest(resultId, item, target, label, control) {
+        if (!resultId || !item?.request_id || !target) return;
+        const previous = state.resourceSubmitState.get(resultId) || item;
+        control.disabled = true;
+        control.textContent = '提交中';
+        control.setAttribute('aria-busy', 'true');
+        try {
+            const payload = await api(INDEXER_DOWNLOAD_RESUBMIT_PATH, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({request_id: item.request_id, target}),
+            });
+            const next = resourceSubmissionState(
+                {...payload, result_id: resultId},
+                true,
+                previous,
+            );
+            state.resourceSubmitState.set(resultId, next);
+            syncResourceControls();
+            const notification = {
+                type: 'success',
+                title: '已重新提交',
+                message: `请求 #${payload.request_id} · ${label}`,
+            };
+            renderResourceNotice(notification);
+            showDialogNotification(notification);
+            announce(notification.message);
+        } catch (error) {
+            const payload = error.payload || {};
+            const next = resourceSubmissionState({
+                ...payload,
+                result_id: resultId,
+                ok: false,
+                error: payload.error || error.message || '重新提交失败',
+            }, true, previous);
+            state.resourceSubmitState.set(resultId, next);
+            syncResourceControls();
+            const notification = next.duplicate
+                ? resourceDuplicateNotification(resultId, next, target, label)
+                : {type: 'error', title: '重新提交失败', message: next.error};
+            renderResourceNotice(notification);
+            showDialogNotification(notification);
+            announce(notification.message);
+        }
+    }
+
+    function resourceDuplicateNotification(resultId, item, target, label) {
+        const existingStatus = String(item?.existing_status || '').trim().toLowerCase();
+        const statusLabel = downloadRequestStatusLabel(existingStatus);
+        const requestId = Number.parseInt(item?.request_id || 0, 10) || 0;
+        const active = ['pending', 'submitting', 'submitted', 'downloading'].includes(existingStatus);
+        const canResubmit = Boolean(item?.can_resubmit && requestId);
+        const message = [requestId ? `请求 #${requestId}` : '', statusLabel]
+            .filter(Boolean)
+            .join(' · ') || resourceStatusLabel(item);
+        const actions = requestId ? [{label: '查看任务', href: '/downloads'}] : [];
+        if (canResubmit) {
+            const resubmitTarget = item.resubmit_target || target;
+            actions.push({
+                label: '重新提交',
+                primary: true,
+                onClick: (control) => resubmitResourceRequest(
+                    resultId,
+                    item,
+                    resubmitTarget,
+                    label,
+                    control,
+                ),
+            });
+        }
+        return {
+            type: 'warning',
+            title: canResubmit ? '已有历史任务'
+                : active ? '任务正在处理'
+                    : existingStatus === 'manual_review' || existingStatus === 'outcome_unknown'
+                        ? '等待核对' : '该资源已提交',
+            message,
+            actions,
+        };
     }
 
     function syncDialogHeader(item = null, detail = null, isResourceMode = false) {
@@ -2139,11 +2263,11 @@
         const targetLabel = target === 'qb' ? 'qBittorrent' : target === 'guangya' ? '光鸭' : 'qBittorrent 与光鸭';
         const confirmed = await window.appConfirm?.({
             trigger,
-            kicker: 'RESOURCE DISPATCH',
-            title: `确认提交 ${resultIds.length} 条资源`,
+            kicker: '资源下载',
+            title: `提交 ${resultIds.length} 条资源？`,
             message: target === 'both'
-                ? `每条资源将同时尝试提交到 qBittorrent 与光鸭，可能出现部分成功。提交后请核对两个下载列表。`
-                : `即将把 ${resultIds.length} 条资源提交到 ${targetLabel}。请确认标题、季集和目标无误。`,
+                ? '将同时提交到 qBittorrent 与光鸭。'
+                : `目标：${targetLabel}`,
             confirmText: `提交到${target === 'both' ? '两者' : target === 'qb' ? ' qB' : '光鸭'}`,
             icon: 'send',
         });
@@ -2260,11 +2384,13 @@
                 const complete = isCompleteResourceSuccess(item);
                 const terminalSelection = isTerminalResourceSelection(item);
                 const message = complete ? `已发送到${label}。` : resourceStatusLabel(item);
-                const notification = {
-                    type: complete ? 'success' : (item.status === 'partial' || item.duplicate ? 'warning' : 'error'),
-                    title: complete ? '下载任务已提交' : (item.status === 'partial' ? '下载任务部分完成' : item.duplicate ? '重复提交' : '提交失败'),
-                    message,
-                };
+                const notification = item.duplicate
+                    ? resourceDuplicateNotification(result.result_id, item, target, label)
+                    : {
+                        type: complete ? 'success' : (item.status === 'partial' ? 'warning' : 'error'),
+                        title: complete ? '已提交' : (item.status === 'partial' ? '部分完成' : '提交失败'),
+                        message,
+                    };
                 if (resourceSubmissionContextActive(submission)) {
                     state.resourceSubmitState.set(result.result_id, item);
                     if (terminalSelection) state.selectedResourceIds.delete(result.result_id);
@@ -2299,11 +2425,14 @@
                     button.setAttribute('aria-busy', 'false');
                     syncResourceControls();
                 }
-                notifyResourceCompletion({
-                    type: item.duplicate || item.status === 'request_unknown' || item.status === 'expired' ? 'warning' : 'error',
-                    title: item.duplicate ? '重复提交' : item.status === 'expired' ? '资源结果已过期' : item.status === 'request_unknown' ? '提交状态未知' : '提交失败',
-                    message,
-                }, submission);
+                const notification = item.duplicate
+                    ? resourceDuplicateNotification(result.result_id, item, target, label)
+                    : {
+                        type: item.status === 'request_unknown' || item.status === 'expired' ? 'warning' : 'error',
+                        title: item.status === 'expired' ? '资源已过期' : item.status === 'request_unknown' ? '状态未知' : '提交失败',
+                        message,
+                    };
+                notifyResourceCompletion(notification, submission);
             } finally {
                 state.resourceSubmissionRequests.delete(submission.requestId);
                 if (dialogIsOpen()) syncResourceControls();

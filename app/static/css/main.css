@@ -4917,9 +4917,16 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .discovery-dialog-notice-icon { width: 42px; height: 42px; display: grid; place-items: center; color: currentColor; background: var(--info-soft); border: 1px solid var(--info-border); border-radius: 10px; }
 .discovery-dialog-notice-icon svg { width: 20px; height: 20px; }
 .discovery-dialog-notice-copy { min-width: 0; padding-top: 1px; }
-.discovery-dialog-notice-copy > span { display: block; margin-bottom: 5px; font: 700 8px/1.2 "SFMono-Regular",Consolas,monospace; letter-spacing: .14em; }
 .discovery-dialog-notice-copy strong { display: block; color: var(--text-primary); font-family: Georgia,"Songti SC",serif; font-size: 17px; font-weight: 500; line-height: 1.25; }
 .discovery-dialog-notice-copy p { margin-top: 5px; color: var(--text-secondary); font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.discovery-dialog-notice-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-height: 30px; margin-top: 10px; }
+.discovery-dialog-notice-actions[hidden] { display: none; }
+.discovery-dialog-notice-action { display: inline-flex; align-items: center; justify-content: center; min-height: 30px; padding: 6px 11px; color: var(--text-primary); background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; font-size: 10px; font-weight: 700; line-height: 1; text-decoration: none; white-space: nowrap; cursor: pointer; }
+.discovery-dialog-notice-action:hover { border-color: var(--border-strong); background: var(--control-tint); }
+.discovery-dialog-notice-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.discovery-dialog-notice-action.is-primary { color: var(--accent-dark); background: var(--accent); border-color: var(--accent); }
+.discovery-dialog-notice-action.is-primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
+.discovery-dialog-notice-action:disabled { opacity: .58; cursor: wait; }
 .discovery-dialog-notice-close { width: 34px; height: 34px; min-height: 34px; align-self: start; }
 .discovery-dialog-notice.is-success { color: var(--success); background: color-mix(in srgb,var(--bg-elevated) 96%,var(--success) 4%); border-color: var(--accent-border); }
 .discovery-dialog-notice.is-success .discovery-dialog-notice-icon { background: var(--accent-soft); border-color: var(--accent-border); }
@@ -5155,6 +5162,8 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     .discovery-dialog-head h2 { font-size: clamp(13px,4.2vw,18px); line-height: 1.2; letter-spacing: -.01em; white-space: nowrap; }
     .discovery-dialog-notice { top: 64px; right: 8px; width: calc(100% - 16px); grid-template-columns: 36px minmax(0,1fr) 30px; gap: 8px; min-height: 68px; padding: 8px 10px; }
     .discovery-dialog-notice-icon { width: 36px; height: 36px; }
+    .discovery-dialog-notice-copy strong { font-size: 15px; }
+    .discovery-dialog-notice-actions { gap: 6px; margin-top: 8px; }
     .discovery-dialog-notice-close { width: 30px; height: 30px; min-height: 30px; }
     .discovery-dialog-body { padding: 10px 12px 0; }
     .discovery-resource-panel { padding: 0; }
