@@ -516,6 +516,56 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 "completed",
             )
 
+    def test_silent_manual_review_can_capture_result_for_telegram_card(self):
+        class ManualReviewService:
+            @staticmethod
+            def execute_task(owner, task_id, qb_client=None):
+                del qb_client
+                db.update_local_media_task(
+                    task_id, owner=owner, status="requires_manual", error="匹配置信度不足",
+                )
+                return {
+                    "status": "requires_manual",
+                    "preview": {
+                        "reason": "匹配置信度不足",
+                        "snapshot_digest": "digest-1",
+                        "rules_snapshot": "{}",
+                        "files": [{"name": "Movie.mkv"}],
+                        "candidate": {
+                            "tmdb_id": "1", "media_type": "movie",
+                            "title": "候选电影", "provider": "tmdb",
+                        },
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "downloads"
+            target_root = root / "library"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "Movie.mkv").write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="已有下载", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), enabled=False, scan_enabled=False,
+                stable_seconds=0, owner="admin",
+            )
+            db.upsert_local_library_target(
+                source_id, "default", str(target_root), owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=ManualReviewService())
+            batch = scheduler.enqueue_manual_scan_candidates(
+                silent=True, capture_results=True,
+            )
+            task_id = batch["task_ids"][0]
+
+            self.assertEqual(scheduler.run_once(), 1)
+            captured = scheduler.take_captured_task_result(task_id)
+
+        self.assertEqual(captured["status"], "requires_manual")
+        self.assertEqual(captured["preview"]["candidate"]["tmdb_id"], "1")
+        self.assertIsNone(scheduler.take_captured_task_result(task_id))
+
     def test_manual_scan_filters_non_media_files_and_directories(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)

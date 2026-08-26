@@ -29,6 +29,7 @@ logger = get_logger(__name__)
 
 MANUAL_SCAN_TOKEN_PREFIX = "manual-scan:"
 SILENT_MANUAL_SCAN_TOKEN_PREFIX = "silent-manual-scan:"
+_MAX_CAPTURED_TASK_RESULTS = 1000
 
 
 class LocalMediaProbeRetryable(RuntimeError):
@@ -60,6 +61,8 @@ class LocalMediaScheduler:
         self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._path_locks: set[str] = set()
+        self._capture_result_task_ids: set[int] = set()
+        self._captured_task_results: dict[int, dict[str, object]] = {}
         self._guard = threading.RLock()
 
     @staticmethod
@@ -190,7 +193,12 @@ class LocalMediaScheduler:
                     logger.warning("本地媒体扫描候选入队失败 %s: %s", candidate.name, exc)
         return count
 
-    def enqueue_manual_scan_candidates(self, *, silent: bool = False) -> dict[str, object]:
+    def enqueue_manual_scan_candidates(
+        self,
+        *,
+        silent: bool = False,
+        capture_results: bool = False,
+    ) -> dict[str, object]:
         """显式扫描全部本地来源，把已存在媒体作为手动任务加入队列。
 
         与定时扫描不同，本入口不要求 ``scan_enabled``，用于 Web/TG 的一次性
@@ -257,6 +265,9 @@ class LocalMediaScheduler:
                 "error": "",
             })
         unique_task_ids = list(dict.fromkeys(task_ids))
+        if capture_results and unique_task_ids:
+            with self._guard:
+                self._capture_result_task_ids.update(unique_task_ids)
         if unique_task_ids:
             self.reload()
         return {
@@ -268,6 +279,31 @@ class LocalMediaScheduler:
             "task_ids": unique_task_ids,
             "sources": source_results,
         }
+
+    def _complete_captured_task_result(
+        self,
+        task_id: int,
+        result: dict[str, object] | None,
+    ) -> None:
+        normalized_id = int(task_id)
+        with self._guard:
+            if normalized_id not in self._capture_result_task_ids:
+                return
+            self._capture_result_task_ids.discard(normalized_id)
+            if not isinstance(result, dict):
+                return
+            self._captured_task_results.pop(normalized_id, None)
+            self._captured_task_results[normalized_id] = result
+            while len(self._captured_task_results) > _MAX_CAPTURED_TASK_RESULTS:
+                oldest_id = next(iter(self._captured_task_results))
+                self._captured_task_results.pop(oldest_id, None)
+
+    def take_captured_task_result(self, task_id: int) -> dict[str, object] | None:
+        """消费 TG 手动批次的任务结果；其他扫描任务不会进入该缓存。"""
+        normalized_id = int(task_id)
+        with self._guard:
+            self._capture_result_task_ids.discard(normalized_id)
+            return self._captured_task_results.pop(normalized_id, None)
 
     @staticmethod
     def _is_manual_scan_task(task) -> bool:
@@ -336,6 +372,7 @@ class LocalMediaScheduler:
             qb_client = self.qb_factory() if task.qb_hash else None
             result = self.service.execute_task(self.owner, task.id, qb_client=qb_client)
         except Exception as exc:
+            self._complete_captured_task_result(task.id, None)
             current = db.get_local_media_task(task.id, owner=self.owner)
             terminal_statuses = {"completed", "requires_manual", "failed"}
             if current and current.status not in terminal_statuses:
@@ -364,6 +401,12 @@ class LocalMediaScheduler:
                     )
             return False
         else:
+            captured_result = (
+                result
+                if str(result.get("status") or "") == "requires_manual"
+                else None
+            )
+            self._complete_captured_task_result(task.id, captured_result)
             try:
                 db.update_download_request_for_local_media_task(
                     task.id, str(result.get("status") or "failed"),

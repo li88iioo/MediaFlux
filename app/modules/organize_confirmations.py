@@ -919,7 +919,9 @@ def _execute_local_media_confirmation(
             )
             raise ValueError(f"{reason}；请前往 Web 继续处理")
         try:
-            db.update_download_request_for_local_media_task(task_id, "completed")
+            db.update_download_request_for_local_media_task(
+                task_id, "completed", resolve_manual=True
+            )
         except Exception as exc:
             logger.warning(
                 "本地媒体确认完成状态回写失败 task=%s type=%s",

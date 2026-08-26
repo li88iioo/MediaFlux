@@ -1011,8 +1011,10 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             },
         }
         local_summary = {
-            "completed": 1, "requires_manual": 0, "failed": 0,
+            "completed": 1, "requires_manual": 1, "failed": 0,
             "moved_items": 3, "source_errors": [],
+            "task_ids": [7],
+            "task_results": {7: {"status": "requires_manual", "preview": {}}},
         }
         progress.finish.side_effect = lambda _text: order.append("summary")
         with patch(
@@ -1027,8 +1029,11 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             "app.modules.organize.OrganizeRules.from_config", return_value=rules,
         ), patch(
             "app.modules.organize.Organizer.notify_task_confirmations",
-            side_effect=lambda *args, **kwargs: order.append("confirmations") or True,
+            side_effect=lambda *args, **kwargs: order.append("cloud-confirmations") or True,
         ) as notify_confirmations, patch(
+            "app.bot.handlers._notify_local_organize_confirmations",
+            side_effect=lambda *args, **kwargs: order.append("local-confirmations") or 1,
+        ) as notify_local_confirmations, patch(
             "app.bot.handlers.send",
         ) as send:
             handlers._organize_running = True
@@ -1037,7 +1042,10 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
                 100, [{"id": "source-id", "name": "动画"}], "target-id", progress,
             )
 
-        self.assertEqual(order, ["cloud", "local", "summary", "confirmations"])
+        self.assertEqual(order, [
+            "cloud", "local", "summary",
+            "cloud-confirmations", "local-confirmations",
+        ])
         progress.finish.assert_called_once_with("combined-result")
         notify_confirmations.assert_called_once_with(
             cloud_state["stats"],
@@ -1045,6 +1053,7 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             source_name="1 个源目录",
             chat_id="100",
         )
+        notify_local_confirmations.assert_called_once_with(local_summary, "100")
         send.assert_not_called()
         self.assertFalse(handlers._organize_running)
         self.assertFalse(handlers._local_organize_running)
@@ -1072,6 +1081,55 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
         self.assertEqual(dict(event.fields)["状态"], "需要处理")
         self.assertIn("若未收到", str(event.footer))
         self.assertIn("Web", str(event.footer))
+
+    def test_local_organize_finishes_summary_then_sends_confirmation_cards(self):
+        progress = Mock()
+        order = []
+        summary = {
+            "completed": 0,
+            "requires_manual": 1,
+            "failed": 0,
+            "moved_items": 0,
+            "source_errors": [],
+            "task_ids": [7],
+            "task_results": {7: {"status": "requires_manual", "preview": {}}},
+        }
+        progress.finish.side_effect = lambda _text: order.append("summary")
+        with patch(
+            "app.bot.handlers._run_local_organize_stage", return_value=summary,
+        ), patch(
+            "app.bot.handlers.render_event", return_value="local-result",
+        ), patch(
+            "app.bot.handlers._notify_local_organize_confirmations",
+            side_effect=lambda *args, **kwargs: order.append("confirmations") or 1,
+        ) as notify_confirmations:
+            handlers._local_organize_running = True
+            handlers._do_organize_local("100", progress)
+
+        self.assertEqual(order, ["summary", "confirmations"])
+        progress.finish.assert_called_once_with("local-result")
+        notify_confirmations.assert_called_once_with(summary, "100")
+        self.assertFalse(handlers._local_organize_running)
+
+    def test_local_confirmation_dispatch_uses_captured_preview_and_chat(self):
+        result = {"status": "requires_manual", "preview": {"candidate": {"tmdb_id": "1"}}}
+        task = SimpleNamespace(status="requires_manual")
+        summary = {
+            "task_ids": [7],
+            "task_results": {7: result},
+        }
+        with patch(
+            "app.bot.handlers.db.get_local_media_task", return_value=task,
+        ), patch(
+            "app.modules.local_media_notifications.notify_local_media_task",
+            return_value=True,
+        ) as notify:
+            delivered = handlers._notify_local_organize_confirmations(summary, "-100")
+
+        self.assertEqual(delivered, 1)
+        notify.assert_called_once_with(
+            7, result, owner="admin", chat_id="-100",
+        )
 
     def test_sync_and_organize_commands_require_owner_bound_confirmation(self):
         from app.modules.telegram_write_confirmations import (

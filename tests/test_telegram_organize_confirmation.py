@@ -922,6 +922,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         stop_confirmation_dispatcher()
         with db.get_conn() as conn:
             conn.execute("DELETE FROM organize_confirmations")
+            conn.execute("DELETE FROM download_requests")
             conn.execute("DELETE FROM local_media_tasks")
             conn.execute("DELETE FROM local_media_sources")
         self.source_id = db.create_local_media_source(
@@ -1023,6 +1024,23 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         local.assert_not_called()
 
     def test_local_candidate_executes_through_shared_queue(self):
+        request_id, _created = db.create_download_request(
+            "local-confirmation-status", "magnet", title="Movie.2026"
+        )
+        self.assertTrue(db.link_download_request_to_local_media_task(
+            request_id, self.task_id, "/downloads/Movie.2026.mkv"
+        ))
+        self.assertEqual(
+            db.update_download_request_for_local_media_task(
+                self.task_id, "requires_manual", error="匹配置信度不足"
+            ),
+            1,
+        )
+        self.assertEqual(
+            db.get_download_request(request_id)["local_import_status"],
+            "requires_manual",
+        )
+
         actions = self._actions()
         token = actions[0].callback_data.split(":")[1]
         callbacks = []
@@ -1069,6 +1087,10 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         self.assertEqual(queued["status"], "running")
         self.assertEqual(worker_result["local_task_id"], self.task_id)
         self.assertEqual(db.get_local_media_task(self.task_id, owner="admin").status, "completed")
+        request = db.get_download_request(request_id)
+        self.assertEqual(request["local_import_status"], "completed")
+        self.assertEqual(request["local_import_error"], "")
+        self.assertTrue(request["local_import_completed_at"])
         self.assertEqual(db.get_organize_confirmation(token)["status"], "completed")
         delivery = db.get_organize_confirmation_delivery(token)
         self.assertEqual(delivery["status"], "sent")

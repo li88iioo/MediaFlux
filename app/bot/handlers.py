@@ -2841,7 +2841,10 @@ def _run_local_organize_stage(
 
     scheduler = get_local_media_scheduler()
     was_running = bool(scheduler.status().get("running"))
-    scan_result = scheduler.enqueue_manual_scan_candidates(silent=True)
+    scan_result = scheduler.enqueue_manual_scan_candidates(
+        silent=True,
+        capture_results=True,
+    )
     if scan_result.get("task_ids") and not was_running:
         scheduler.start()
     _detach_organize_confirmation(progress, accepted_title="本地整理任务已接纳")
@@ -2876,12 +2879,21 @@ def _run_local_organize_stage(
     failed = 0
     moved_items = 0
     skipped_items = 0
+    task_results: dict[int, dict] = {}
+    take_result = getattr(scheduler, "take_captured_task_result", None)
     for task_id in task_ids:
         task = db.get_local_media_task(task_id, owner="admin")
         status = str(getattr(task, "status", "failed"))
         completed += int(status == "completed")
         requires_manual += int(status == "requires_manual")
         failed += int(status == "failed")
+        captured_result = take_result(task_id) if callable(take_result) else None
+        if status == "requires_manual":
+            task_results[task_id] = (
+                captured_result
+                if isinstance(captured_result, dict)
+                else {"status": "requires_manual"}
+            )
         if status == "completed":
             for item in db.list_local_media_task_items(task_id, owner="admin"):
                 if str(item["action"] or "") == "skip":
@@ -2901,6 +2913,7 @@ def _run_local_organize_stage(
         "moved_items": moved_items,
         "skipped_items": skipped_items,
         "source_errors": source_errors,
+        "task_results": task_results,
     }
 
 
@@ -2940,8 +2953,11 @@ def _local_organize_event(summary: dict) -> NotificationEvent:
             ),
         ),
         lines=tuple(lines),
-        footer=("待确认项目请前往 Web「本地媒体 → 待确认」处理。"
-                if int(summary.get("requires_manual", 0) or 0) else ""),
+        footer=(
+            "本地待确认项目将继续发送候选卡；若未收到，"
+            "请前往 Web「本地媒体 → 待确认」处理。"
+            if int(summary.get("requires_manual", 0) or 0) else ""
+        ),
     )
 
 
@@ -2985,9 +3001,14 @@ def _all_organize_event(cloud_state: dict, local_summary: dict) -> NotificationE
         or local_attention
     )
     footer = "全部整理按“光鸭云盘 → 本地下载”顺序执行。"
+    pending_sources: list[str] = []
     if cloud_need_confirm:
+        pending_sources.append("光鸭")
+    if int(local_summary.get("requires_manual", 0) or 0):
+        pending_sources.append("本地")
+    if pending_sources:
         footer += (
-            "\n\n光鸭待确认项目将继续发送候选卡；"
+            f"\n\n{'、'.join(pending_sources)}待确认项目将继续发送候选卡；"
             "若未收到，请前往 Web 待确认队列继续处理。"
         )
     return NotificationEvent(
@@ -3014,6 +3035,44 @@ def _all_organize_event(cloud_state: dict, local_summary: dict) -> NotificationE
         lines=tuple(lines),
         footer=footer,
     )
+
+
+def _notify_local_organize_confirmations(summary: dict, chat_id: object) -> int:
+    """只发送本地 requires_manual 候选卡，保持批量完成通知静音。"""
+    from app.modules.local_media_notifications import notify_local_media_task
+
+    raw_results = summary.get("task_results")
+    task_results = raw_results if isinstance(raw_results, dict) else {}
+    delivered = 0
+    seen: set[int] = set()
+    for raw_task_id in summary.get("task_ids") or []:
+        try:
+            task_id = int(raw_task_id)
+        except (TypeError, ValueError):
+            continue
+        if task_id <= 0 or task_id in seen:
+            continue
+        seen.add(task_id)
+        task = db.get_local_media_task(task_id, owner="admin")
+        if str(getattr(task, "status", "")) != "requires_manual":
+            continue
+        result = task_results.get(task_id, task_results.get(str(task_id)))
+        if not isinstance(result, dict):
+            result = {"status": "requires_manual"}
+        try:
+            delivered += int(bool(notify_local_media_task(
+                task_id,
+                result,
+                owner="admin",
+                chat_id=str(chat_id),
+            )))
+        except Exception as exc:
+            logger.warning(
+                "Telegram 本地整理待确认通知失败 task=%s type=%s",
+                task_id,
+                type(exc).__name__,
+            )
+    return delivered
 
 
 def _do_organize(
@@ -3070,6 +3129,7 @@ def _do_organize_local(chat_id, progress: TelegramProgress | None = None) -> Non
             progress.finish(render_event(event))
         else:
             send(event, chat_id=str(chat_id))
+        _notify_local_organize_confirmations(summary, str(chat_id))
     except Exception as exc:
         logger.error("Telegram 本地整理失败 type=%s", type(exc).__name__)
         if progress is not None:
@@ -3132,6 +3192,7 @@ def _do_organize_all(
                     "Telegram 全部整理待确认通知失败 type=%s",
                     type(exc).__name__,
                 )
+        _notify_local_organize_confirmations(local_summary, str(chat_id))
     except Exception as exc:
         logger.error("Telegram 全部整理失败 type=%s", type(exc).__name__)
         if progress is not None:

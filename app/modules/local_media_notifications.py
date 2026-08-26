@@ -28,7 +28,14 @@ def _basename(value: object) -> str:
     return text.rsplit("/", 1)[-1] if text else ""
 
 
-def build_local_media_event(task, source, result: Mapping[str, Any] | None = None, *, error: str = "") -> NotificationEvent:
+def build_local_media_event(
+    task,
+    source,
+    result: Mapping[str, Any] | None = None,
+    *,
+    error: str = "",
+    chat_id: str = "",
+) -> NotificationEvent:
     """根据任务终态生成一条可安全发送的通知。"""
     payload = result or {}
     status = str(_value(payload, "status", getattr(task, "status", "")) or "")
@@ -105,6 +112,7 @@ def build_local_media_event(task, source, result: Mapping[str, Any] | None = Non
                 source,
                 dict(preview) if isinstance(preview, Mapping) else {},
                 owner=str(getattr(task, "owner", "admin") or "admin"),
+                chat_id=chat_id,
             )
         except Exception as exc:
             actions = ()
@@ -133,7 +141,14 @@ def build_local_media_event(task, source, result: Mapping[str, Any] | None = Non
     return NotificationEvent("❌ 本地媒体整理失败", fields=tuple(fields))
 
 
-def notify_local_media_task(task_id: int, result: Mapping[str, Any] | None = None, *, owner: str = "admin", error: str = "") -> bool:
+def notify_local_media_task(
+    task_id: int,
+    result: Mapping[str, Any] | None = None,
+    *,
+    owner: str = "admin",
+    error: str = "",
+    chat_id: str = "",
+) -> bool:
     """读取任务上下文并发送通知；任务不存在时静默跳过。"""
     if (not config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
             or not config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY", True)):
@@ -142,4 +157,13 @@ def notify_local_media_task(task_id: int, result: Mapping[str, Any] | None = Non
     if task is None:
         return False
     source = db.get_local_media_source(task.source_id, owner=owner)
-    return bool(send(build_local_media_event(task, source, result, error=error)))
+    event = build_local_media_event(
+        task,
+        source,
+        result,
+        error=error,
+        chat_id=chat_id,
+    )
+    if chat_id:
+        return bool(send(event, chat_id=chat_id))
+    return bool(send(event))

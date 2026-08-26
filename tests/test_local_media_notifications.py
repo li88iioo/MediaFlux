@@ -148,6 +148,34 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
             self.assertTrue(notify_local_media_task(self.task_id, result, owner="admin"))
         sender.assert_called_once()
 
+    def test_notify_binds_local_confirmation_buttons_to_explicit_chat(self):
+        db.update_local_media_task(
+            self.task_id, owner="admin", status="requires_manual", error="匹配置信度不足",
+        )
+        result = {
+            "status": "requires_manual",
+            "preview": {
+                "reason": "匹配置信度不足",
+                "snapshot_digest": "digest-1",
+                "rules_snapshot": "{}",
+                "files": [{"name": "file.mkv"}],
+                "candidate": {
+                    "title": "封神第二部", "year": "2025", "tmdb_id": "1155281",
+                    "media_type": "movie", "confidence": 0.82, "provider": "tmdb",
+                },
+            },
+        }
+        with patch(
+            "app.modules.local_media_notifications.send", return_value=True,
+        ) as sender:
+            self.assertTrue(notify_local_media_task(
+                self.task_id, result, owner="admin", chat_id="-100",
+            ))
+
+        event = sender.call_args.args[0]
+        self.assertTrue(event.actions)
+        self.assertEqual(sender.call_args.kwargs["chat_id"], "-100")
+
     def test_warning_and_failure_details_never_expose_absolute_paths(self):
         task = db.get_local_media_task(self.task_id, owner="admin")
         source = db.get_local_media_source(self.source_id, owner="admin")
