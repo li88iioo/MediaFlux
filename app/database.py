@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -1594,6 +1594,8 @@ CREATE TABLE IF NOT EXISTS media_proxy_instances (
     listen_host TEXT NOT NULL DEFAULT '0.0.0.0',
     listen_port INTEGER NOT NULL,
     local_root TEXT DEFAULT '',
+    trust_forwarded_headers INTEGER NOT NULL DEFAULT 0,
+    trusted_proxy_cidrs_json TEXT NOT NULL DEFAULT '[]',
     enabled INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'stopped',
     last_error TEXT DEFAULT '',
@@ -2101,6 +2103,24 @@ def _migrate_local_library_target_server_path_v8(conn: sqlite3.Connection) -> No
         )
 
 
+def _migrate_media_proxy_trusted_forwarders_v9(conn: sqlite3.Connection) -> None:
+    """为每个媒体反代实例保存独立的可信代理边界。"""
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(media_proxy_instances)")
+    }
+    if columns and "trust_forwarded_headers" not in columns:
+        conn.execute(
+            "ALTER TABLE media_proxy_instances ADD COLUMN "
+            "trust_forwarded_headers INTEGER NOT NULL DEFAULT 0"
+        )
+    if columns and "trusted_proxy_cidrs_json" not in columns:
+        conn.execute(
+            "ALTER TABLE media_proxy_instances ADD COLUMN "
+            "trusted_proxy_cidrs_json TEXT NOT NULL DEFAULT '[]'"
+        )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2110,6 +2130,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     5: _migrate_agent_action_history_v6,
     6: _migrate_local_media_recognition_summary_v7,
     7: _migrate_local_library_target_server_path_v8,
+    8: _migrate_media_proxy_trusted_forwarders_v9,
 }
 
 

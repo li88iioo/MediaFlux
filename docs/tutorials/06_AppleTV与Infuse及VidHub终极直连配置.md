@@ -160,9 +160,11 @@ Location: https://...guangyacdn.com/...
 - Apple TV 能访问 302 的最终光鸭 CDN 域名；
 - 防火墙只开放实际需要的端口。
 
-若客户端通过 Nginx、Caddy 或负载均衡器访问 MediaFlux，MediaFlux 默认只信任它实际看到的 TCP 对端地址，不接受客户端自行提交的 `X-Forwarded-For`。因此 Jellyfin 设备页可能显示前置代理或 MediaFlux 地址，这不影响视频是否真 302。
+若客户端通过 Nginx、Caddy、负载均衡器或 FRP 隧道访问 MediaFlux，MediaFlux 默认只信任实际 TCP 对端，不接受客户端自行提交的 `X-Forwarded-For`。因此 Jellyfin 设备页可能显示前置代理或 MediaFlux 地址，这不影响视频是否真 302。
 
-若需要 Jellyfin 识别直接连接 MediaFlux 的客户端 IP，可在 Jellyfin 的 **Known Proxies（已知代理）** 中仅加入 MediaFlux 实际连接上游时使用的可信 IP。不要信任任意公网地址或无边界网段。
+需要还原真实客户端 IP 时，在对应反代实例的 **「真实客户端 IP」** 中显式开启转发头信任，并至少填写 MediaFlux 实际收到连接的直接来源 IP/CIDR。Docker bridge 场景常见值可能是 `172.18.0.1/32`；host 网络或其他隧道拓扑应以实际 socket 对端为准。若 `X-Forwarded-For` 中还包含其他受控中间代理，也应逐项加入。MediaFlux 会从可信代理链右侧开始解析，拒绝通配符和全网信任。
+
+Jellyfin 的 **Known Proxies（已知代理）** 应填写 Jellyfin 实际看到的 MediaFlux 直连地址，而不是照抄上一步的可信入口。若同一 Docker NAT 来源也承载不受控的局域网直连请求，应先限制端口来源，否则保持该开关关闭。
 
 ---
 

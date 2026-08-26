@@ -192,13 +192,17 @@ services:
 
 ## 7. 客户端 IP 与 Jellyfin “Known Proxies”
 
-MediaFlux 会丢弃客户端伪造的转发头，并把它实际看到的 TCP 对端 IP 安全转发给 Jellyfin。若希望 Jellyfin 设备页显示真实客户端 IP：
+MediaFlux 默认丢弃外部传入的转发头，只把实际 TCP 对端 IP 转发给 Jellyfin。若播放器直接连接媒体反代实例，无需额外配置。
 
-1. 让客户端直接访问媒体反代实例；
-2. 在 Jellyfin 网络设置的 **Known Proxies（已知代理）** 中，仅加入 MediaFlux 实际连接 Jellyfin 时使用的可信 IP；
-3. 不要把任意网段或公网来源无条件设为可信代理。
+当链路前面还有 Nginx、Caddy、负载均衡器或 FRP 隧道，并且希望 Jellyfin 设备页显示最终客户端 IP：
 
-若媒体反代前面还有 Nginx、Caddy 或负载均衡器，MediaFlux 默认看到的是前置代理 IP，而不是最终播放器 IP；这是防止伪造 `X-Forwarded-For` 的安全边界。此时 Jellyfin 显示前置代理或 MediaFlux 地址并不影响 302 播放本身。
+1. 编辑对应的媒体反代实例，展开 **「真实客户端 IP」**；
+2. 开启 **「信任上游转发头」**；
+3. 在 **「可信代理来源」** 中至少填写 MediaFlux 实际收到连接的直接来源 IP/CIDR，例如 Docker bridge 下可能是 `172.18.0.1/32`；若 `X-Forwarded-For` 中还包含其他受控中间代理，也应逐项加入；
+4. MediaFlux 只有在 socket 对端命中该列表时才解析 `X-Forwarded-For`，并按可信代理链从右向左选择首个不可信地址；其他请求仍会丢弃伪造头；
+5. 在 Jellyfin 的 **Known Proxies（已知代理）** 中，只填写 Jellyfin 实际看到的 MediaFlux 直连地址。它与 MediaFlux 表单中的“可信直接代理来源”属于链路的不同一跳，不应机械填写为同一个值。
+
+不要填写 `*`、`0.0.0.0/0` 或 `::/0`。若局域网直连用户与可信入口经过同一个 NAT 地址进入 MediaFlux，应先通过防火墙限制该实例端口只允许可信入口访问，否则不要启用转发头信任。该功能只影响 Jellyfin / Emby 看到的客户端 IP，不改变真 302、兼容中继或 HLS 的播放选择。
 
 另外：
 

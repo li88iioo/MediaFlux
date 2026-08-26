@@ -40,6 +40,7 @@ from app.clients.guangya import GuangYaClient
 from app.config import get
 from app.logger import get_logger, log_throttled
 from app.modules.media_proxy_recorder import PlaybackRecordWriter
+from app.modules.media_proxy_forwarding import media_proxy_forwarding_config
 from app.modules.media_proxy_safety import safe_media_name as _safe_media_name
 from app.modules.media_server_profiles import resolve_proxy_instance
 
@@ -5877,6 +5878,7 @@ class ProxyRuntime:
     task: asyncio.Task
     sock: socket.socket
     signed_urls: SignedUrlCache
+    forwarding: tuple[bool, tuple[str, ...]] = (False, ())
 
 
 class MediaProxyManager:
@@ -5998,13 +6000,48 @@ class MediaProxyManager:
                     )
                     continue
                 desired = (validate_listen_host(row["listen_host"]), int(row["listen_port"]))
-                if desired == runtime.bind:
+                try:
+                    desired_forwarding = media_proxy_forwarding_config(row)
+                except ValueError as exc:
+                    message = str(exc)
+                    failed[instance_id] = message
+                    await self._stop_runtime(runtime)
+                    self._runtimes.pop(instance_id, None)
+                    stopped.append(instance_id)
+                    await asyncio.to_thread(
+                        database.update_media_proxy_instance,
+                        instance_id,
+                        {"status": "error", "last_error": message},
+                    )
+                    continue
+                if desired == runtime.bind and desired_forwarding == runtime.forwarding:
                     await asyncio.to_thread(
                         database.update_media_proxy_instance,
                         instance_id,
                         {"status": "running", "last_error": ""},
                     )
                     continue
+
+                # 同一监听端口无法先启动替代 Uvicorn；配置变更时先释放旧 socket。
+                if desired == runtime.bind:
+                    await self._stop_runtime(runtime)
+                    self._runtimes.pop(instance_id, None)
+                    stopped.append(instance_id)
+                    try:
+                        replacement = await self._start_runtime(row)
+                    except Exception as exc:
+                        message = str(exc)
+                        failed[instance_id] = message
+                        await asyncio.to_thread(
+                            database.update_media_proxy_instance,
+                            instance_id,
+                            {"status": "error", "last_error": message},
+                        )
+                        continue
+                    self._runtimes[instance_id] = replacement
+                    started.append(instance_id)
+                    continue
+
                 try:
                     replacement = await self._start_runtime(row)
                 except Exception as exc:
@@ -6021,7 +6058,11 @@ class MediaProxyManager:
                 started.append(instance_id)
 
             for instance_id, row in rows.items():
-                if instance_id in self._runtimes or not int(row["enabled"] or 0):
+                if (
+                    instance_id in self._runtimes
+                    or instance_id in failed
+                    or not int(row["enabled"] or 0)
+                ):
                     continue
                 try:
                     runtime = await self._start_runtime(row)
@@ -6047,6 +6088,8 @@ class MediaProxyManager:
         if port < 1024 or port > 65535:
             raise ValueError("监听端口必须在 1024 到 65535 之间")
         validate_upstream_url(str(row["upstream_url"]))
+        forwarding = media_proxy_forwarding_config(row)
+        trust_forwarded_headers, trusted_proxy_cidrs = forwarding
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -6066,9 +6109,10 @@ class MediaProxyManager:
             log_config=None,
             access_log=False,
             lifespan="on",
-            # 不能继承 FORWARDED_ALLOW_IPS 后让 Uvicorn 先改写 ASGI client；
-            # 本反代只把真实 TCP peer 作为可信客户端来源。
-            proxy_headers=False,
+            # 默认仍只信任真实 TCP peer；显式配置可信来源后，由 Uvicorn
+            # 按代理链从右向左解析首个不可信地址，再由本模块清洗重写。
+            proxy_headers=trust_forwarded_headers,
+            forwarded_allow_ips=list(trusted_proxy_cidrs),
             ws_max_size=_proxy_websocket_message_limit(),
         )
         server = uvicorn.Server(config)
@@ -6085,7 +6129,15 @@ class MediaProxyManager:
             {"status": "running", "last_error": ""},
         )
         logger.info(f"媒体反代实例启动 id={instance_id} listen={host}:{port}")
-        return ProxyRuntime(instance_id, (host, port), server, task, sock, signed_urls)
+        return ProxyRuntime(
+            instance_id,
+            (host, port),
+            server,
+            task,
+            sock,
+            signed_urls,
+            forwarding,
+        )
 
     @staticmethod
     async def _stop_runtime(runtime: ProxyRuntime) -> None:

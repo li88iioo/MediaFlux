@@ -43,6 +43,8 @@ def add_media_proxy_instance(
     listen_host: str,
     listen_port: int,
     local_root: str = "",
+    trust_forwarded_headers: int = 0,
+    trusted_proxy_cidrs_json: str = "[]",
     enabled: int = 1,
 ) -> int:
     timestamp = now()
@@ -50,8 +52,9 @@ def add_media_proxy_instance(
         cur = conn.execute(
             "INSERT INTO media_proxy_instances("
             "name,server_type,config_source,upstream_url,api_key,listen_host,listen_port,local_root,"
+            "trust_forwarded_headers,trusted_proxy_cidrs_json,"
             "enabled,status,last_error,created_at,updated_at"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 name,
                 server_type,
@@ -61,6 +64,8 @@ def add_media_proxy_instance(
                 listen_host,
                 int(listen_port),
                 local_root,
+                1 if trust_forwarded_headers else 0,
+                str(trusted_proxy_cidrs_json or "[]"),
                 1 if enabled else 0,
                 "stopped",
                 "",
@@ -89,7 +94,8 @@ def get_media_proxy_instance(instance_id: int) -> sqlite3.Row | None:
 def update_media_proxy_instance(instance_id: int, fields: dict) -> bool:
     allowed = {
         "name", "server_type", "config_source", "upstream_url", "api_key", "listen_host",
-        "listen_port", "local_root", "enabled", "status", "last_error",
+        "listen_port", "local_root", "trust_forwarded_headers",
+        "trusted_proxy_cidrs_json", "enabled", "status", "last_error",
     }
     sets: list[str] = []
     values: list = []

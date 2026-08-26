@@ -15,7 +15,7 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
-    def test_fresh_database_contains_complete_v8_schema(self) -> None:
+    def test_fresh_database_contains_complete_v9_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             task_columns = {
@@ -33,6 +33,10 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             mapping_columns = {
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(media_external_ids)")
+            }
+            proxy_instance_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(media_proxy_instances)")
             }
             action_indexes = {
                 str(row["name"])
@@ -62,6 +66,8 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertIn("episode_override", task_columns)
         self.assertIn("session_id", playback_columns)
         self.assertIn("version", mapping_columns)
+        self.assertIn("trust_forwarded_headers", proxy_instance_columns)
+        self.assertIn("trusted_proxy_cidrs_json", proxy_instance_columns)
         self.assertIn("idx_agent_action_history_owner_id", action_indexes)
         self.assertIn("idx_agent_action_history_confirmation", action_indexes)
         self.assertIn("confirmation_id", action_columns)
@@ -984,6 +990,58 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 self.assertEqual(version, db.SCHEMA_VERSION)
                 self.assertIn("server_path", columns)
                 self.assertEqual(tuple(preserved), ("/media/library/动漫", ""))
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_v8_media_proxy_instances_gain_trusted_forwarder_config(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-proxy-v9-") as root:
+            path = Path(root) / "v8.db"
+            conn = sqlite3.connect(path)
+            try:
+                legacy_schema = db._SCHEMA.replace(
+                    "    trust_forwarded_headers INTEGER NOT NULL DEFAULT 0,\n",
+                    "",
+                    1,
+                ).replace(
+                    "    trusted_proxy_cidrs_json TEXT NOT NULL DEFAULT '[]',\n",
+                    "",
+                    1,
+                )
+                conn.executescript(legacy_schema)
+                conn.execute(
+                    "INSERT INTO media_proxy_instances("
+                    "id,name,server_type,config_source,upstream_url,api_key,"
+                    "listen_host,listen_port,local_root,enabled,status,last_error,"
+                    "created_at,updated_at"
+                    ") VALUES(1,'历史反代','jellyfin','custom',"
+                    "'http://127.0.0.1:8096','','127.0.0.1',18096,'',1,"
+                    "'stopped','','2026-08-01','2026-08-01')"
+                )
+                conn.execute("PRAGMA user_version=8")
+                conn.commit()
+            finally:
+                conn.close()
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    columns = {
+                        str(row["name"])
+                        for row in migrated.execute(
+                            "PRAGMA table_info(media_proxy_instances)"
+                        )
+                    }
+                    preserved = migrated.execute(
+                        "SELECT name,trust_forwarded_headers,trusted_proxy_cidrs_json "
+                        "FROM media_proxy_instances WHERE id=1"
+                    ).fetchone()
+                self.assertEqual(version, db.SCHEMA_VERSION)
+                self.assertIn("trust_forwarded_headers", columns)
+                self.assertIn("trusted_proxy_cidrs_json", columns)
+                self.assertEqual(tuple(preserved), ("历史反代", 0, "[]"))
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 

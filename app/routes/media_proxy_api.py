@@ -21,6 +21,11 @@ from app.modules.media_proxy import (
     validate_listen_host,
     validate_upstream_url,
 )
+from app.modules.media_proxy_forwarding import (
+    decode_trusted_proxy_cidrs,
+    encode_trusted_proxy_cidrs,
+    normalize_trusted_proxy_cidrs,
+)
 from app.web import api_error, api_response, require_api_login
 
 router = APIRouter(prefix="/api/media-proxy")
@@ -29,6 +34,28 @@ _MASK = "********"
 
 def _manager(request: Request):
     return getattr(request.app.state, "media_proxy_manager", get_media_proxy_manager())
+
+
+def _row_value(row, key: str, default=None):
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _boolean_value(value, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    normalized = str(value).strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("转发头信任开关无效")
 
 
 def _instance_json(row, runtime: dict | None = None) -> dict:
@@ -57,6 +84,14 @@ def _instance_json(row, runtime: dict | None = None) -> dict:
         "listen_host": row["listen_host"],
         "listen_port": int(row["listen_port"]),
         "local_root": row["local_root"] or "",
+        "trust_forwarded_headers": bool(
+            int(_row_value(row, "trust_forwarded_headers", 0) or 0)
+        ),
+        "trusted_proxy_cidrs": list(
+            decode_trusted_proxy_cidrs(
+                _row_value(row, "trusted_proxy_cidrs_json", "[]")
+            )
+        ),
         "enabled": bool(row["enabled"]),
         "status": "running" if runtime.get("running") else (row["status"] or "stopped"),
         "last_error": row["last_error"] or "",
@@ -108,6 +143,26 @@ def _validated_instance(data: dict, existing=None) -> tuple[dict | None, str]:
         if not root.is_absolute():
             return None, "本地媒体根目录必须是绝对路径"
         local_root = str(root.resolve(strict=False))
+
+    existing_trust = bool(
+        int(_row_value(existing, "trust_forwarded_headers", 0) or 0)
+    )
+    try:
+        trust_forwarded_headers = _boolean_value(
+            data.get("trust_forwarded_headers"),
+            default=existing_trust,
+        )
+        trusted_proxy_cidrs = normalize_trusted_proxy_cidrs(
+            data.get(
+                "trusted_proxy_cidrs",
+                _row_value(existing, "trusted_proxy_cidrs_json", "[]"),
+            )
+        )
+    except ValueError as exc:
+        return None, str(exc)
+    if trust_forwarded_headers and not trusted_proxy_cidrs:
+        return None, "启用转发头信任时至少填写一个可信代理地址"
+
     if config_source == "custom":
         server_type = str(data.get("server_type") or "jellyfin").strip().lower()
         if server_type not in {"jellyfin", "emby"}:
@@ -141,6 +196,10 @@ def _validated_instance(data: dict, existing=None) -> tuple[dict | None, str]:
         "listen_host": listen_host,
         "listen_port": listen_port,
         "local_root": local_root,
+        "trust_forwarded_headers": 1 if trust_forwarded_headers else 0,
+        "trusted_proxy_cidrs_json": encode_trusted_proxy_cidrs(
+            trusted_proxy_cidrs
+        ),
         "enabled": 1 if data.get("enabled", True) else 0,
     }, ""
 

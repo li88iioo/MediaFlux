@@ -475,12 +475,45 @@ class MediaProxyTests(InitializedWebTestCase):
                             "listen_host": "127.0.0.1",
                             "listen_port": 18097,
                             "local_root": root,
+                            "trust_forwarded_headers": True,
+                            "trusted_proxy_cidrs": [
+                                "172.18.0.1",
+                                "192.168.88.110/32",
+                            ],
                             "enabled": False,
                         },
                     )
                     self.assertEqual(created.status_code, 201, created.text)
                     instance = created.json()["instance"]
                     self.assertEqual(instance["api_key"], "********")
+                    self.assertTrue(instance["trust_forwarded_headers"])
+                    self.assertEqual(
+                        instance["trusted_proxy_cidrs"],
+                        ["172.18.0.1/32", "192.168.88.110/32"],
+                    )
+                    updated = client.put(
+                        f"/api/media-proxy/{instance['id']}",
+                        headers=headers,
+                        json={
+                            "name": "API Proxy",
+                            "server_type": "jellyfin",
+                            "upstream_url": "http://127.0.0.1:8096",
+                            "api_key": "********",
+                            "listen_host": "127.0.0.1",
+                            "listen_port": 18097,
+                            "local_root": root,
+                            "trust_forwarded_headers": False,
+                            "trusted_proxy_cidrs": ["192.168.88.110"],
+                            "enabled": False,
+                        },
+                    )
+                    self.assertEqual(updated.status_code, 200, updated.text)
+                    updated_instance = updated.json()["instance"]
+                    self.assertFalse(updated_instance["trust_forwarded_headers"])
+                    self.assertEqual(
+                        updated_instance["trusted_proxy_cidrs"],
+                        ["192.168.88.110/32"],
+                    )
                     rejected = client.post(
                         f"/api/media-proxy/{instance['id']}/bindings",
                         headers=headers,

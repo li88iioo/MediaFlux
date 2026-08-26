@@ -38,6 +38,27 @@ class MediaProxyRepositoryTests(unittest.TestCase):
                 api_key="secret",
                 listen_host="127.0.0.1",
                 listen_port=18096,
+                trust_forwarded_headers=1,
+                trusted_proxy_cidrs_json='["172.18.0.1/32"]',
+            )
+            instance = repository.get_media_proxy_instance(instance_id)
+            self.assertEqual(int(instance["trust_forwarded_headers"]), 1)
+            self.assertEqual(
+                instance["trusted_proxy_cidrs_json"],
+                '["172.18.0.1/32"]',
+            )
+            self.assertTrue(repository.update_media_proxy_instance(
+                instance_id,
+                {
+                    "trust_forwarded_headers": 0,
+                    "trusted_proxy_cidrs_json": '["192.168.88.110/32"]',
+                },
+            ))
+            instance = repository.get_media_proxy_instance(instance_id)
+            self.assertEqual(int(instance["trust_forwarded_headers"]), 0)
+            self.assertEqual(
+                instance["trusted_proxy_cidrs_json"],
+                '["192.168.88.110/32"]',
             )
             repository.add_media_proxy_binding(
                 instance_id=instance_id,

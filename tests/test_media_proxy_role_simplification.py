@@ -196,9 +196,50 @@ class MediaProxyLoggingBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(config.call_args.kwargs["access_log"])
         self.assertEqual(config.call_args.kwargs["lifespan"], "on")
         self.assertFalse(config.call_args.kwargs["proxy_headers"])
+        self.assertEqual(config.call_args.kwargs["forwarded_allow_ips"], [])
         self.assertEqual(
             config.call_args.kwargs["ws_max_size"],
             media_proxy._proxy_websocket_message_limit(),
+        )
+
+
+    async def test_runtime_enables_proxy_headers_only_for_instance_cidrs(self):
+        from app.modules import media_proxy
+
+        row = {
+            "id": 10,
+            "listen_host": "127.0.0.1",
+            "listen_port": 18100,
+            "upstream_url": "http://127.0.0.1:8096",
+            "trust_forwarded_headers": 1,
+            "trusted_proxy_cidrs_json": (
+                '["172.18.0.1/32","192.168.88.110/32"]'
+            ),
+        }
+        fake_socket = MagicMock()
+        fake_task = MagicMock()
+        fake_task.done.return_value = False
+        fake_server = MagicMock()
+        with (
+            patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
+            patch.object(media_proxy.socket, "socket", return_value=fake_socket),
+            patch.object(media_proxy, "create_proxy_app", return_value=object()),
+            patch.object(media_proxy.uvicorn, "Config", return_value=object()) as config,
+            patch.object(media_proxy.uvicorn, "Server", return_value=fake_server),
+            patch.object(media_proxy.asyncio, "create_task", return_value=fake_task),
+            patch.object(media_proxy.asyncio, "sleep", new=AsyncMock()),
+            patch.object(media_proxy.database, "update_media_proxy_instance"),
+        ):
+            runtime = await media_proxy.MediaProxyManager()._start_runtime(row)
+
+        self.assertTrue(config.call_args.kwargs["proxy_headers"])
+        self.assertEqual(
+            config.call_args.kwargs["forwarded_allow_ips"],
+            ["172.18.0.1/32", "192.168.88.110/32"],
+        )
+        self.assertEqual(
+            runtime.forwarding,
+            (True, ("172.18.0.1/32", "192.168.88.110/32")),
         )
 
 
@@ -246,6 +287,55 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             call.args == (9, {"status": "error", "last_error": "媒体反代运行任务意外退出"})
             for call in update.call_args_list
         ))
+
+    async def test_reconcile_restarts_same_bind_after_forwarding_config_changes(self):
+        from app.modules import media_proxy
+
+        row = {
+            "id": 9,
+            "listen_host": "127.0.0.1",
+            "listen_port": 18099,
+            "upstream_url": "http://127.0.0.1:8096",
+            "enabled": 1,
+            "trust_forwarded_headers": 1,
+            "trusted_proxy_cidrs_json": '["172.18.0.1/32"]',
+        }
+        task = MagicMock()
+        task.done.return_value = False
+        previous = media_proxy.ProxyRuntime(
+            instance_id=9,
+            bind=("127.0.0.1", 18099),
+            server=MagicMock(),
+            task=task,
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+        )
+        replacement = MagicMock()
+        manager = media_proxy.MediaProxyManager()
+        manager._runtimes[9] = previous
+        events: list[str] = []
+
+        async def stop_runtime(runtime):
+            self.assertIs(runtime, previous)
+            events.append("stop")
+
+        async def start_runtime(runtime_row):
+            self.assertIs(runtime_row, row)
+            events.append("start")
+            return replacement
+
+        with (
+            patch.object(media_proxy.database, "list_media_proxy_instances", return_value=[row]),
+            patch.object(media_proxy.database, "update_media_proxy_instance"),
+            patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
+            patch.object(manager, "_stop_runtime", side_effect=stop_runtime),
+            patch.object(manager, "_start_runtime", side_effect=start_runtime),
+        ):
+            result = await manager.reconcile()
+
+        self.assertEqual(events, ["stop", "start"])
+        self.assertIs(manager._runtimes[9], replacement)
+        self.assertEqual(result, {"started": [9], "stopped": [9], "failed": {}})
 
     async def test_reconcile_offloads_sqlite_work_from_event_loop(self):
         from app.modules import media_proxy
@@ -560,6 +650,21 @@ class MediaProxyTemplateTests(unittest.TestCase):
         self.assertNotIn("本地相对路径", template)
         self.assertNotIn("一期边界", template)
         self.assertNotIn("本地单段 Range/HEAD", template)
+
+    def test_proxy_instance_modal_exposes_scoped_forwarded_header_trust(self):
+        template = Path("app/templates/media_proxy.html").read_text(encoding="utf-8")
+        css = Path("app/static/css/main.css").read_text(encoding="utf-8")
+
+        self.assertIn('class="proxy-config-details proxy-custom-upstream"', template)
+        self.assertIn('class="proxy-config-details proxy-forwarded-trust"', template)
+        self.assertIn('id="proxyForwardedDetails"', template)
+        self.assertIn('id="proxyTrustForwardedHeaders"', template)
+        self.assertIn('id="proxyTrustedProxyCidrs"', template)
+        self.assertIn("trust_forwarded_headers", template)
+        self.assertIn("trusted_proxy_cidrs", template)
+        self.assertIn(".proxy-config-details", css)
+        self.assertIn(".proxy-config-details-body .form-group", css)
+        self.assertIn(".proxy-trusted-cidrs-input", css)
 
     def test_proxy_playback_latency_is_split_by_stage_without_extra_columns(self):
         template = Path("app/templates/media_proxy.html").read_text(encoding="utf-8")
