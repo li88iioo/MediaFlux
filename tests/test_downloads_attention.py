@@ -18,6 +18,10 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TORRENT_DATA = (
+    b"d4:infod6:lengthi1e4:name4:test12:piece lengthi16384e"
+    b"6:pieces20:xxxxxxxxxxxxxxxxxxxxee"
+)
 
 
 def _create_interrupted_request() -> int:
@@ -26,7 +30,7 @@ def _create_interrupted_request() -> int:
         "torrent",
         title="E.T.外星人.1982.2160p",
         source_value="magnet:?xt=urn:btih:secret-value",
-        torrent_data=b"private-torrent-data",
+        torrent_data=TORRENT_DATA,
         chat_id="-100123",
         user_id="9988",
         message_id="456",
@@ -113,6 +117,8 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(successor["origin"], "web")
         self.assertEqual(successor["chat_id"], "-100123")
         self.assertEqual(successor["user_id"], "9988")
+        self.assertEqual(successor["kind"], "torrent")
+        self.assertEqual(successor["torrent_data"], TORRENT_DATA)
         attention_ids = {
             int(row["id"])
             for row in db.list_download_requests_requiring_attention(limit=100, offset=0)
@@ -266,6 +272,113 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             request_id,
             {int(row["id"]) for row in db.list_active_download_requests()},
         )
+
+    def test_cleaned_torrent_is_recovered_from_qb_5_export_for_resubmit(self):
+        item = download_dispatcher.torrent_download_input(
+            "recover-from-qb.torrent",
+            TORRENT_DATA,
+        )
+        _title, torrent_id = download_dispatcher.parse_torrent_metadata(TORRENT_DATA)
+        request_id, created = db.create_download_request(
+            download_dispatcher.request_key(item),
+            item.kind,
+            title=item.title,
+            source_value=item.source_value,
+            torrent_data=item.torrent_data,
+        )
+        self.assertTrue(created)
+        db.update_download_request(
+            request_id,
+            targets="qb",
+            status="failed",
+            qb_status="failed",
+            qb_task_id=torrent_id,
+            torrent_data=None,
+        )
+        values = {
+            "QB_URL": "http://qb.local",
+            "QB_USERNAME": "",
+            "QB_PASSWORD": "",
+            "QB_API_KEY": "token",
+        }
+        dispatch_result = {
+            "ok": True,
+            "status": "submitted",
+            "succeeded": ["qb"],
+            "failed": [],
+            "error": "",
+        }
+
+        with (
+            patch.object(
+                download_dispatcher,
+                "get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ),
+            patch.object(
+                download_dispatcher.QBittorrentClient,
+                "export_torrent",
+                return_value=TORRENT_DATA,
+            ) as export_torrent,
+            patch.object(
+                download_dispatcher,
+                "dispatch_request",
+                return_value=dispatch_result,
+            ),
+        ):
+            result = download_dispatcher.resubmit_download_request(request_id, "qb")
+
+        self.assertTrue(result["ok"])
+        export_torrent.assert_called_once_with(torrent_id)
+        successor = db.get_download_request(int(result["request_id"]))
+        self.assertEqual(successor["kind"], "torrent")
+        self.assertEqual(successor["torrent_data"], TORRENT_DATA)
+
+    def test_cleaned_torrent_without_qb_task_falls_back_to_valid_magnet(self):
+        item = download_dispatcher.torrent_download_input(
+            "recover-from-magnet.torrent",
+            TORRENT_DATA,
+        )
+        request_id, created = db.create_download_request(
+            download_dispatcher.request_key(item),
+            item.kind,
+            title=item.title,
+            source_value=item.source_value,
+            torrent_data=None,
+        )
+        self.assertTrue(created)
+        db.update_download_request(
+            request_id,
+            targets="qb",
+            status="failed",
+            qb_status="failed",
+        )
+        dispatch_result = {
+            "ok": True,
+            "status": "submitted",
+            "succeeded": ["qb"],
+            "failed": [],
+            "error": "",
+        }
+
+        with (
+            patch.object(download_dispatcher, "get", return_value="http://qb.local"),
+            patch.object(
+                download_dispatcher,
+                "dispatch_request",
+                return_value=dispatch_result,
+            ),
+        ):
+            capabilities = download_dispatcher.download_resubmit_capabilities(
+                db.get_download_request(request_id)
+            )
+            result = download_dispatcher.resubmit_download_request(request_id, "qb")
+
+        self.assertTrue(capabilities["qb"]["enabled"])
+        self.assertTrue(result["ok"])
+        successor = db.get_download_request(int(result["request_id"]))
+        self.assertEqual(successor["kind"], "magnet")
+        self.assertIsNone(successor["torrent_data"])
 
     def test_failed_manual_review_successor_preserves_original_attention(self):
         item = download_dispatcher.DownloadInput(

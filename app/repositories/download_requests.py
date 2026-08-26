@@ -578,6 +578,41 @@ def mark_download_request_resubmitted(
         return cur.rowcount == 1
 
 
+def purge_expired_download_request_torrent_data(
+    retention_days: int,
+    *,
+    limit: int = 500,
+) -> int:
+    """清空超过保留期的原始种子 BLOB，保留请求、日志和可审计字段。
+
+    仅处理明确终态的请求。``manual_review`` 以及仍有活动后端的
+    ``resubmitted`` 请求会继续保留原始种子，避免自动清理妨碍人工恢复。
+    """
+    days = int(retention_days or 0)
+    if days <= 0:
+        return 0
+    batch_limit = max(1, min(int(limit or 500), 5000))
+    terminal_timestamp = (
+        "COALESCE(NULLIF(completed_at,''),NULLIF(updated_at,''),created_at)"
+    )
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE download_requests SET torrent_data=NULL WHERE id IN ("
+            "SELECT id FROM download_requests "
+            "WHERE kind='torrent' AND torrent_data IS NOT NULL AND ("
+            "status IN ('completed','failed','cancelled') OR ("
+            "status='resubmitted' "
+            "AND COALESCE(qb_status,'') IN ('','completed','failed','cancelled','resubmitted') "
+            "AND COALESCE(gy_status,'') IN ('','completed','failed','cancelled','resubmitted')"
+            ")) AND datetime(" + terminal_timestamp + ") "
+            "< datetime('now','localtime',?) "
+            "ORDER BY datetime(" + terminal_timestamp + ") ASC,id ASC LIMIT ?"
+            ")",
+            (f"-{days} days", batch_limit),
+        )
+        return int(cur.rowcount or 0)
+
+
 def get_download_request_status_snapshot(
     request_id: int,
 ) -> tuple[sqlite3.Row | None, list[sqlite3.Row]]:

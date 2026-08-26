@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from app import database as db
-from app.clients.qbittorrent import QBittorrentClient
+from app.clients.qbittorrent import QBittorrentClient, QBTorrentExportError
 from app.config import get
 from app.indexers.providers.base import magnet_infohash
 from app.logger import get_logger
@@ -21,6 +21,7 @@ logger = get_logger(__name__)
 
 SUPPORTED_TARGETS = {"qb", "guangya", "both"}
 _URL_RE = re.compile(r"(?i)(magnet:\?\S+|ed2k://\S+|https?://\S+)")
+_QB_TORRENT_ID_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 @dataclass(frozen=True)
@@ -281,6 +282,7 @@ def _public_guangya_failure(error: str) -> str:
     rules = (
         ("光鸭未登录", "光鸭未登录"),
         ("资源中没有符合下载规则的文件", "光鸭未找到符合下载规则的文件"),
+        ("种子文件未解析到可验证文件列表", "光鸭种子未解析到有效文件列表"),
         ("未解析到可验证文件列表", "光鸭磁力未解析到有效文件列表"),
         ("创建任务隔离目录失败", "光鸭隔离目录创建失败"),
         ("光鸭资源解析失败", "光鸭资源解析失败"),
@@ -353,6 +355,46 @@ def public_dispatch_summary(result: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _export_qb_torrent_for_resubmit(row, torrent_id: str) -> bytes | None:
+    """尽力从 qB 5.x 恢复种子；失败时由调用者继续走本地或 Magnet 回退。"""
+    qb_url = get("QB_URL", "").strip()
+    if not qb_url or not _QB_TORRENT_ID_RE.fullmatch(str(torrent_id or "")):
+        return None
+    request_id = 0
+    try:
+        request_id = int(row["id"] or 0)
+    except (KeyError, TypeError, ValueError):
+        request_id = 0
+    client = QBittorrentClient(
+        url=qb_url,
+        username=get("QB_USERNAME"),
+        password=get("QB_PASSWORD"),
+        api_key=get("QB_API_KEY"),
+    )
+    try:
+        payload = client.export_torrent(str(torrent_id).lower())
+        _title, exported_id = parse_torrent_metadata(payload)
+        if exported_id.lower() != str(torrent_id).lower():
+            logger.warning("qB 导出种子身份不匹配 request=%s", request_id)
+            return None
+        return payload
+    except QBTorrentExportError as exc:
+        logger.warning(
+            "qB 导出种子不可用 request=%s code=%s",
+            request_id,
+            exc.code,
+        )
+    except (TypeError, ValueError):
+        logger.warning("qB 导出种子结构无效 request=%s", request_id)
+    except Exception as exc:
+        logger.warning(
+            "qB 导出种子异常 request=%s type=%s",
+            request_id,
+            type(exc).__name__,
+        )
+    return None
+
+
 def download_resubmit_capabilities(
     row,
     *,
@@ -366,29 +408,43 @@ def download_resubmit_capabilities(
     kind = str(row["kind"] or "").strip().lower()
     source_value = str(row["source_value"] or "").strip()
     torrent_data = row["torrent_data"]
+    qb_task_id = str(row["qb_task_id"] or "").strip().lower()
     qb_status = str(row["qb_status"] or "").strip().lower()
     gy_status = str(row["gy_status"] or "").strip().lower()
     retryable = kind in {"magnet", "torrent", "ed2k", "http"}
 
-    qb_enabled = retryable and bool(get("QB_URL", "").strip())
+    qb_configured = bool(get("QB_URL", "").strip())
+    qb_export_available = bool(
+        qb_configured and _QB_TORRENT_ID_RE.fullmatch(qb_task_id)
+    )
+    torrent_magnet_available = bool(
+        kind == "torrent" and source_value and magnet_infohash(source_value)
+    )
+    qb_enabled = retryable and qb_configured
     torrent_error = ""
     if kind == "torrent":
-        qb_enabled = qb_enabled and bool(torrent_data)
-        if qb_enabled:
+        local_torrent_available = bool(torrent_data)
+        if local_torrent_available:
             try:
                 parse_torrent_metadata(torrent_data)
             except (TypeError, ValueError):
-                qb_enabled = False
+                local_torrent_available = False
                 torrent_error = "原始种子数据已损坏"
+        qb_enabled = qb_enabled and bool(
+            local_torrent_available or qb_export_available or torrent_magnet_available
+        )
     else:
         qb_enabled = qb_enabled and bool(source_value)
     if not retryable:
         qb_reason = "此请求无法重新提交到 qBittorrent"
-    elif not get("QB_URL", "").strip():
+    elif not qb_configured:
         qb_reason = "尚未配置 qBittorrent"
-    elif kind == "torrent" and not torrent_data:
-        qb_reason = "原始种子数据已不可用"
-    elif torrent_error:
+    elif kind == "torrent" and not qb_enabled:
+        if torrent_error:
+            qb_reason = "原始种子已损坏，且没有可导出的 qB 任务或 Magnet 备选"
+        else:
+            qb_reason = "原始种子已按保留策略清理，且没有可导出的 qB 任务或 Magnet 备选"
+    elif torrent_error and not (qb_export_available or torrent_magnet_available):
         qb_reason = torrent_error
     elif not source_value:
         qb_reason = "原始下载地址已不可用"
@@ -468,13 +524,51 @@ def resubmit_download_request(
         }
 
     source_kind = str(source_row["kind"] or "")
-    # 光鸭接收种子转换出的磁力地址，不需要再次解析或上传种子 BLOB。
-    guangya_only_torrent = source_kind == "torrent" and targets == "guangya"
+    source_value = str(source_row["source_value"] or "").strip()
+    source_torrent_data = source_row["torrent_data"]
+    item_kind = source_kind
+    item_torrent_data = source_torrent_data
+    if source_kind == "torrent":
+        local_torrent_valid = False
+        try:
+            if source_torrent_data is not None:
+                parse_torrent_metadata(source_torrent_data)
+                local_torrent_valid = True
+        except (TypeError, ValueError):
+            local_torrent_valid = False
+
+        # 光鸭优先使用 MediaFlux 缓存，避免无意义依赖 qB；qB/both 在已有远端
+        # 任务时优先从 qB 5.x 导出，以验证重新提交不依赖本地长期保存 BLOB。
+        exported_torrent = None
+        qb_task_id = str(source_row["qb_task_id"] or "").strip().lower()
+        should_export_first = targets in {"qb", "both"}
+        if _QB_TORRENT_ID_RE.fullmatch(qb_task_id) and (
+            should_export_first or not local_torrent_valid
+        ):
+            exported_torrent = _export_qb_torrent_for_resubmit(
+                source_row,
+                qb_task_id,
+            )
+
+        if exported_torrent is not None:
+            item_torrent_data = exported_torrent
+        elif local_torrent_valid:
+            item_torrent_data = source_torrent_data
+        elif source_value and magnet_infohash(source_value):
+            # qB 导出和本地缓存都不可用时，保留 Magnet 最后回退；对于光鸭，
+            # 后续若仍无法解析文件列表，会进入明确的失败/人工处理状态。
+            item_kind = "magnet"
+            item_torrent_data = None
+        else:
+            return {
+                "ok": False,
+                "error": "原始种子已不可用，且无法从 qBittorrent 恢复",
+            }
     item = DownloadInput(
-        kind="magnet" if guangya_only_torrent else source_kind,
+        kind=item_kind,
         title=str(source_row["title"] or ""),
         source_value=str(source_row["source_value"] or ""),
-        torrent_data=None if guangya_only_torrent else source_row["torrent_data"],
+        torrent_data=item_torrent_data,
     )
     source_status = str(source_row["status"] or "").strip().lower()
     created = create_request(
@@ -997,6 +1091,7 @@ def _submit_qb(row) -> dict[str, Any]:
 
 
 def _submit_guangya(row, *, target_dir_id: str = "", target_dir_name: str = "") -> dict[str, Any]:
+    torrent_data = row["torrent_data"] if row["kind"] == "torrent" else None
     result = submit_offline(
         str(row["source_value"] or ""),
         title=str(row["title"] or ""),
@@ -1004,6 +1099,7 @@ def _submit_guangya(row, *, target_dir_id: str = "", target_dir_name: str = "") 
         target_dir_name=target_dir_name,
         isolate_task=True,
         task_key=str(row["id"]),
+        torrent_data=torrent_data,
     )
     task_ids = [str(item) for item in (result.get("task_ids") or []) if str(item)]
     return {**result, "task_id": task_ids[0] if task_ids else ""}

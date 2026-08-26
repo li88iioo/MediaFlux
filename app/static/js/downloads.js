@@ -907,6 +907,77 @@ document.getElementById('downloadLogPrev').addEventListener('click',()=>loadLogs
 document.getElementById('downloadLogNext').addEventListener('click',()=>loadLogs(downloadLogPage+1));
 document.getElementById('downloadIssuePrev').addEventListener('click',()=>loadIssues(downloadIssuePage-1));
 document.getElementById('downloadIssueNext').addEventListener('click',()=>loadIssues(downloadIssuePage+1));
+
+const torrentCachePolicyForm=document.getElementById('torrentCachePolicyForm');
+const torrentCachePolicyButton=document.getElementById('torrentCachePolicyBtn');
+const torrentCachePolicySave=document.getElementById('torrentCachePolicySave');
+const torrentCacheRetentionDays=document.getElementById('torrentCacheRetentionDays');
+const torrentCachePolicyState=document.getElementById('torrentCachePolicyState');
+const torrentCachePolicyModal=window.createAppModal?.(document.getElementById('torrentCachePolicyModal'));
+
+function setTorrentCachePolicyState(message,tone=''){
+    if(!torrentCachePolicyState)return;
+    torrentCachePolicyState.textContent=message;
+    torrentCachePolicyState.className='inline-save-state'+(tone?` is-${tone}`:'');
+}
+
+async function openTorrentCachePolicy(){
+    if(!torrentCachePolicyModal||!torrentCachePolicyForm)return;
+    torrentCachePolicyModal.open(torrentCachePolicyButton);
+    setTorrentCachePolicyState('读取中…');
+    torrentCachePolicySave.disabled=true;
+    torrentCacheRetentionDays.readOnly=true;
+    try{
+        const config=await window.loadAppConfig();
+        window.fillConfigFields(torrentCachePolicyForm,config);
+        if(!torrentCacheRetentionDays.value)torrentCacheRetentionDays.value='0';
+        const managed=torrentCacheRetentionDays.dataset.managedByEnvironment==='true';
+        torrentCacheRetentionDays.readOnly=managed;
+        torrentCachePolicySave.disabled=managed;
+        setTorrentCachePolicyState(managed?'由部署环境管理':'');
+    }catch(error){
+        torrentCacheRetentionDays.readOnly=true;
+        torrentCachePolicySave.disabled=true;
+        setTorrentCachePolicyState(error.message||'策略读取失败，请稍后重试','error');
+    }
+}
+
+async function saveTorrentCachePolicy(){
+    if(!torrentCachePolicyForm||torrentCachePolicySave.disabled)return;
+    const raw=String(torrentCacheRetentionDays.value||'').trim();
+    if(!/^\d+$/.test(raw)||Number(raw)<0||Number(raw)>3650){
+        setTorrentCachePolicyState('请输入 0 到 3650 的整数天数','error');
+        torrentCacheRetentionDays.focus();
+        return;
+    }
+    torrentCacheRetentionDays.value=String(Number(raw));
+    torrentCachePolicySave.disabled=true;
+    torrentCacheRetentionDays.readOnly=true;
+    torrentCachePolicySave.setAttribute('aria-busy','true');
+    setTorrentCachePolicyState('保存中…');
+    try{
+        await window.saveAppConfig(torrentCachePolicyForm,{toast:false});
+        setTorrentCachePolicyState('已保存','success');
+        window.showToast?.('种子缓存策略已保存','success');
+    }catch(error){
+        setTorrentCachePolicyState(error.message||'策略保存失败','error');
+    }finally{
+        const managed=torrentCacheRetentionDays.dataset.managedByEnvironment==='true';
+        torrentCacheRetentionDays.readOnly=managed;
+        torrentCachePolicySave.disabled=managed;
+        torrentCachePolicySave.removeAttribute('aria-busy');
+    }
+}
+
+torrentCachePolicyButton?.addEventListener('click',openTorrentCachePolicy);
+torrentCachePolicySave?.addEventListener('click',saveTorrentCachePolicy);
+torrentCacheRetentionDays?.addEventListener('keydown',event=>{
+    if(event.key==='Enter'){
+        event.preventDefault();
+        saveTorrentCachePolicy();
+    }
+});
+
 let overviewTimer=null;
 function syncOverviewPolling(){
     if(document.hidden){if(overviewTimer){clearInterval(overviewTimer);overviewTimer=null;}return;}

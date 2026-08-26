@@ -5,7 +5,12 @@ import json
 import unittest
 from unittest.mock import patch
 
-from app.modules.download_dispatcher import dispatch_missing_targets, dispatch_request
+from app.modules.download_dispatcher import (
+    _submit_guangya,
+    dispatch_missing_targets,
+    dispatch_request,
+    public_dispatch_summary,
+)
 from app.modules.download_tracker import DownloadTracker
 
 
@@ -76,6 +81,36 @@ class GuangYaSubmissionOutcomeTests(unittest.TestCase):
         self.assertTrue(result["outcome_unknown"])
         self.assertEqual(update.call_args.kwargs["gy_status"], "outcome_unknown")
         self.assertEqual(add_log.call_args.kwargs["status"], "outcome_unknown")
+
+    def test_torrent_submission_passes_original_bytes_to_guangya_resolver(self):
+        torrent_data = b"private-torrent-bytes"
+        row = {
+            "id": 95,
+            "title": "Torrent upload",
+            "source_value": "magnet:?xt=urn:btih:" + "a" * 40,
+            "kind": "torrent",
+            "torrent_data": torrent_data,
+        }
+        with patch(
+            "app.modules.download_dispatcher.submit_offline",
+            return_value={"ok": True, "task_ids": ["gy-task"]},
+        ) as submit:
+            result = _submit_guangya(row)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["task_id"], "gy-task")
+        self.assertEqual(submit.call_args.kwargs["torrent_data"], torrent_data)
+
+    def test_public_failure_distinguishes_torrent_from_magnet_resolution(self):
+        summary = public_dispatch_summary({
+            "ok": False,
+            "status": "failed",
+            "succeeded": [],
+            "failed": ["guangya"],
+            "error": "guangya: 种子文件未解析到可验证文件列表（尝试 1 次）",
+        })
+
+        self.assertEqual(summary["error"], "光鸭种子未解析到有效文件列表")
 
     def test_tracker_reconciles_unknown_submission_with_known_task_id(self):
         tracker = DownloadTracker()

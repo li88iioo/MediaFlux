@@ -343,6 +343,16 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
         self.assertEqual(first_call.kwargs["json"]["url"], "magnet:?xt=urn:btih:selection")
         self.assertEqual(first_call.kwargs["json"]["parentId"], "1927445875113771071")
 
+    def test_torrent_resolution_uploads_original_bytes_through_sdk(self):
+        raw = Mock()
+        raw.cloud_resolve_torrent.return_value = RESOLVE_SUBFILES_FIXTURE
+        client = self._client_with_raw(raw)
+
+        result = client.resolve_torrent(b"private-torrent-bytes")
+
+        self.assertEqual(result, RESOLVE_SUBFILES_FIXTURE)
+        raw.cloud_resolve_torrent.assert_called_once_with(b"private-torrent-bytes")
+
     def test_selected_task_submission_reports_second_batch_failure(self):
         raw = Mock()
         raw.request.side_effect = [
@@ -436,12 +446,17 @@ class FakeSelectionClient:
         self.logged_in = True
         self.resolve_payload = resolve_payload
         self.resolve_calls: list[str] = []
+        self.torrent_resolve_calls: list[bytes] = []
         self.selection_calls: list[dict] = []
         self.legacy_calls: list[dict] = []
         self.selection_result: dict | None = None
 
     def resolve_url(self, url: str) -> dict:
         self.resolve_calls.append(url)
+        return self.resolve_payload
+
+    def resolve_torrent(self, torrent_data: bytes) -> dict:
+        self.torrent_resolve_calls.append(torrent_data)
         return self.resolve_payload
 
     def add_offline_selection(self, url: str, target_dir_id: str, file_indexes: list[int]) -> dict:
@@ -513,6 +528,67 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
         self.assertEqual(client.selection_calls[0]["target_dir_id"], "staging-7")
         self.assertEqual(client.legacy_calls, [])
+
+    def test_torrent_submit_uploads_original_metadata_before_creating_magnet_selection(self):
+        response = {
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "btResInfo": {
+                    "infoHash": "a1754038e29417449a65271a689dde5699575d54",
+                    "fileName": "[GM-Team][国漫][牧神记][97][1080P].mp4",
+                    "subfilesNum": 1,
+                    "subfiles": [{
+                        "fileName": "[GM-Team][国漫][牧神记][97][1080P].mp4",
+                        "fileSize": 989755300,
+                    }],
+                },
+            },
+        }
+        client = FakeSelectionClient(response)
+        client.create_dir = Mock(return_value="staging-torrent")
+        client.list_dir = Mock(return_value=[])
+        client.delete = Mock(return_value=True)
+        torrent_data = b"d4:infod4:name12:demo.mp4ee"
+        magnet = "magnet:?xt=urn:btih:a1754038e29417449a65271a689dde5699575d54"
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules):
+            result = offline.submit_offline(
+                magnet,
+                title="牧神记 97",
+                client=client,
+                isolate_task=True,
+                task_key="torrent",
+                torrent_data=torrent_data,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.resolve_calls, [])
+        self.assertEqual(client.torrent_resolve_calls, [torrent_data])
+        self.assertEqual(client.selection_calls, [{
+            "url": magnet,
+            "target_dir_id": "staging-torrent",
+            "file_indexes": [0],
+        }])
+
+    def test_unresolved_torrent_reports_torrent_specific_failure(self):
+        client = FakeSelectionClient({
+            "code": 0,
+            "msg": "success",
+            "data": {"resourceType": "torrent", "resourceName": "unresolved"},
+        })
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:" + "a" * 40,
+                client=client,
+                torrent_data=b"private-torrent-bytes",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("种子文件未解析到可验证文件列表", result["error"])
+        self.assertNotIn("磁力资源连续", result["error"])
+        self.assertEqual(client.torrent_resolve_calls, [b"private-torrent-bytes"])
 
     def test_unknown_submit_outcome_retains_isolated_task_directory(self):
         client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)

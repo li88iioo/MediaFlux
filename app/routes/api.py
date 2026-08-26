@@ -10,6 +10,10 @@ from fastapi import APIRouter, Body, Request
 
 from app import config
 from app.clients.douban_authenticated import normalize_dbcl2
+from app.defaults import (
+    DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS,
+    MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
+)
 from app.indexers.config import build_indexer_site_updates, encode_indexer_site_ids
 from app.logger import configure_telebot_logging, get_logger
 from app.security import redact_config
@@ -889,6 +893,10 @@ def get_config(request: Request):
     }
     # 运行目录只作为缺省值展示；用户保存的 STRM_ROOT（包括显式空值）仍优先。
     items.setdefault("STRM_ROOT", config.get("STRM_ROOT", ""))
+    items.setdefault(
+        "DOWNLOAD_TORRENT_RETENTION_DAYS",
+        str(DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS),
+    )
     # 旧版整单降级开关已停用；即使数据库仍有历史值也不再暴露给前端。
     items.pop("OFFLINE_MAGNET_UNVERIFIED_FALLBACK", None)
     # 离线选择固定为仅视频；历史音频/附件扩展名在展示与执行时都会被剔除。
@@ -960,6 +968,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         "JELLYFIN_ENABLED", "JELLYFIN_URL", "JELLYFIN_API_KEY", "JELLYFIN_USER_ID",
         *_MEDIA_SERVER_REFRESH_KEYS,
         "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY",
+        "DOWNLOAD_TORRENT_RETENTION_DAYS",
         "TG_QB_CATEGORY", "TG_QB_SAVE_PATH",
         "TMDB_API_KEY", "TMDB_API_URL",
         "TMDB_MATCH_MODE", "PROXY_URL", "TG_BOT_TOKEN", "TG_CHAT_ID",
@@ -1214,6 +1223,22 @@ def save_config(request: Request, data: Any = Body(default=None)):
         if number < minimum or (maximum is not None and number > maximum):
             scope = f"{minimum} 到 {maximum}" if maximum is not None else f"不小于 {minimum}"
             return api_error(f"{key} 必须{scope}", 400)
+    torrent_retention_key = "DOWNLOAD_TORRENT_RETENTION_DAYS"
+    if torrent_retention_key in data:
+        raw_retention_days = str(data[torrent_retention_key] or "").strip()
+        if not raw_retention_days:
+            raw_retention_days = str(DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS)
+        try:
+            retention_days = int(raw_retention_days)
+        except (TypeError, ValueError):
+            return api_error(f"{torrent_retention_key} 必须是整数", 400)
+        if not 0 <= retention_days <= MAX_DOWNLOAD_TORRENT_RETENTION_DAYS:
+            return api_error(
+                f"{torrent_retention_key} 必须是 0 到 "
+                f"{MAX_DOWNLOAD_TORRENT_RETENTION_DAYS} 的整数",
+                400,
+            )
+        data[torrent_retention_key] = str(retention_days)
     updates = dict(web_updates)
     if "OFFLINE_ALLOWED_EXTS" in data:
         try:
@@ -1516,6 +1541,16 @@ def save_config(request: Request, data: Any = Body(default=None)):
         except Exception as exc:
             logger.warning(
                 "Agent 下载后媒体库复核配置热加载失败 type=%s",
+                type(exc).__name__,
+            )
+    if "DOWNLOAD_TORRENT_RETENTION_DAYS" in persisted_updates:
+        try:
+            from app.modules.download_tracker import get_download_tracker
+
+            get_download_tracker().reload(reset_torrent_cleanup=True)
+        except Exception as exc:
+            logger.warning(
+                "原始种子保留期配置热加载失败 type=%s",
                 type(exc).__name__,
             )
     total_ms = max(1, round((time.perf_counter() - request_started) * 1000))

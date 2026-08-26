@@ -46,6 +46,14 @@ class QBConnectionTestError(RuntimeError):
         self.code = str(code or "connection")
 
 
+class QBTorrentExportError(RuntimeError):
+    """qBittorrent 5.x 种子导出的稳定失败分类。"""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = str(code or "export_failed")
+
+
 @dataclass(frozen=True)
 class TorrentAddResult:
     ok: bool
@@ -328,6 +336,47 @@ class QBittorrentClient:
             )
             for index, item in enumerate(data if isinstance(data, list) else [])
         ]
+
+    def export_torrent(self, torrent_hash: str) -> bytes:
+        """通过 qB 5.x Web API 导出现有任务的原始 ``.torrent`` 数据。"""
+        normalized_hash = str(torrent_hash or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", normalized_hash):
+            raise QBTorrentExportError("invalid_hash")
+        if not self.api_key and not self.login():
+            raise QBTorrentExportError("authentication")
+        headers = self._headers()
+        headers["Accept"] = "application/x-bittorrent, application/octet-stream;q=0.9, */*;q=0.1"
+        try:
+            response = self._session.post(
+                f"{self.url}/api/v2/torrents/export",
+                headers=headers,
+                data={"hash": normalized_hash},
+                timeout=self.timeout,
+            )
+        except requests.Timeout as exc:
+            raise QBTorrentExportError("timeout") from exc
+        except requests.RequestException as exc:
+            raise QBTorrentExportError("connection") from exc
+
+        status = int(response.status_code or 0)
+        if status in {401, 403}:
+            raise QBTorrentExportError("authentication")
+        if status == 404:
+            raise QBTorrentExportError("not_found")
+        if status == 409:
+            raise QBTorrentExportError("unavailable")
+        if status == 429:
+            raise QBTorrentExportError("rate_limited")
+        if status >= 500:
+            raise QBTorrentExportError("server_error")
+        if status < 200 or status >= 300:
+            raise QBTorrentExportError("invalid_response")
+        payload = bytes(response.content or b"")
+        if not payload:
+            raise QBTorrentExportError("empty_response")
+        if len(payload) > 10 * 1024 * 1024:
+            raise QBTorrentExportError("too_large")
+        return payload
 
     def get_transfer_info(self) -> TransferInfo:
         if not self.api_key:

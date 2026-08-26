@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% block title %}下载 - MediaFlux{% endblock %}
 {% block page_title %}下载管理{% endblock %}
+{% block page_actions %}
+<button type="button" class="jump-btn download-cache-policy-trigger" id="torrentCachePolicyBtn" title="配置原始种子恢复缓存">
+    <i data-lucide="database-zap"></i><span>种子缓存</span>
+</button>
+{% endblock %}
 
 {% block content %}
 <div class="download-summary" id="summary">
@@ -171,8 +176,46 @@
         </div>
     </section>
 </div>
+
+<div class="app-modal download-cache-modal" id="torrentCachePolicyModal" hidden>
+    <form class="download-cache-dialog" id="torrentCachePolicyForm" role="dialog" aria-modal="true" aria-labelledby="torrentCachePolicyTitle" onsubmit="return false;" novalidate>
+        <header class="download-cache-head">
+            <div class="download-cache-heading">
+                <span class="download-cache-heading-icon" aria-hidden="true"><i data-lucide="database"></i></span>
+                <div class="download-cache-title-group">
+                    <h2 id="torrentCachePolicyTitle">种子缓存</h2>
+                    <p>设置原始 .torrent 的保留时间</p>
+                </div>
+            </div>
+            <button type="button" class="icon-action" data-modal-close aria-label="关闭种子缓存设置"><i data-lucide="x"></i></button>
+        </header>
+
+        <div class="download-cache-body">
+            <div class="download-cache-field-row">
+                <div class="download-cache-field-copy">
+                    <label for="torrentCacheRetentionDays">保留天数</label>
+                    <p id="torrentCachePolicyHint">0 表示永久，最多 3650 天。</p>
+                </div>
+                <div class="download-cache-input-unit">
+                    <input id="torrentCacheRetentionDays" class="form-input" type="number" min="0" max="3650" step="1" inputmode="numeric" value="0" data-key="DOWNLOAD_TORRENT_RETENTION_DAYS" aria-describedby="torrentCachePolicyHint torrentCachePolicyState">
+                    <span>天</span>
+                </div>
+            </div>
+
+            <div class="download-cache-note"><i data-lucide="info"></i><span>不删除下载任务或本地文件。</span></div>
+        </div>
+
+        <footer class="download-cache-footer">
+            <span class="inline-save-state" id="torrentCachePolicyState" role="status" aria-live="polite"></span>
+            <div class="download-cache-actions">
+                <button type="button" class="jump-btn download-cache-action" data-modal-close>取消</button>
+                <button type="button" class="btn btn-primary download-cache-action" id="torrentCachePolicySave">保存</button>
+            </div>
+        </footer>
+    </form>
+</div>
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/downloads.js') }}?v=20260826a"></script>
+<script src="{{ url_for('static', path='js/downloads.js') }}?v=20260826d"></script>
 {% endblock %}

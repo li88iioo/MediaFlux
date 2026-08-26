@@ -3638,6 +3638,7 @@ from app.repositories.download_requests import (  # noqa: E402
     list_download_logs,
     list_download_requests_requiring_attention,
     mark_download_request_resubmitted,
+    purge_expired_download_request_torrent_data,
     update_download_log,
 )
 

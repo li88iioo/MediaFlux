@@ -113,10 +113,13 @@ def _resolver_excluded_only(files: list[dict]) -> bool:
 
 
 def _resolve_offline_manifest(
-    client: GuangYaClient, url: str, protocol: str,
+    client: GuangYaClient, url: str, protocol: str, *,
+    torrent_data: bytes | None = None,
 ) -> OfflineManifestResolution:
+    from_torrent = bool(torrent_data)
+    source_label = "种子" if from_torrent else "磁力"
     attempts = 1
-    if protocol == "magnet":
+    if protocol == "magnet" and not from_torrent:
         attempts = max(1, min(get_int("OFFLINE_MAGNET_RESOLVE_ATTEMPTS", 4), 6))
     delay = max(0.0, min(float(get("OFFLINE_MAGNET_RESOLVE_DELAY_SECONDS", "0.5") or 0.5), 5.0))
     last_response: dict = {}
@@ -124,7 +127,11 @@ def _resolve_offline_manifest(
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            response = client.resolve_url(url)
+            response = (
+                client.resolve_torrent(torrent_data)
+                if from_torrent and torrent_data is not None
+                else client.resolve_url(url)
+            )
             last_error = None
         except Exception as exc:
             last_error = exc
@@ -132,8 +139,8 @@ def _resolve_offline_manifest(
             if protocol != "magnet" or attempt >= attempts:
                 break
             logger.warning(
-                "光鸭磁力解析暂时失败，准备重试 attempt=%s/%s error=%s",
-                attempt, attempts, type(exc).__name__,
+                "光鸭%s解析暂时失败，准备重试 attempt=%s/%s error=%s",
+                source_label, attempt, attempts, type(exc).__name__,
             )
             if delay > 0:
                 time.sleep(delay * attempt)
@@ -155,7 +162,8 @@ def _resolve_offline_manifest(
         )
     )
     logger.warning(
-        "光鸭磁力解析未返回可用文件清单 attempts=%s diagnostic=%s", attempts, diagnostic,
+        "光鸭%s解析未返回可用文件清单 attempts=%s diagnostic=%s",
+        source_label, attempts, diagnostic,
     )
     return OfflineManifestResolution(last_response, last_files, attempts, diagnostic)
 
@@ -349,11 +357,13 @@ def _remove_empty_staging(
 
 def submit_offline(url: str, title: str = "", client: GuangYaClient | None = None,
                    target_dir_id: str = "", target_dir_name: str = "", *,
-                   isolate_task: bool = False, task_key: str = "") -> dict:
+                   isolate_task: bool = False, task_key: str = "",
+                   torrent_data: bytes | None = None) -> dict:
     """按正式离线规则提交任务。
 
     自动入口先解析文件树并强制应用仅视频扩展名、排除词和最小体积。
-    磁力无法取得可验证文件树时一律失败关闭，不再整单下载；隔离目录只会
+    原始种子优先上传到光鸭解析，避免只转换为磁力后依赖 DHT 获取元数据；
+    磁力无法取得可验证文件树时一律失败关闭，不再整单下载。隔离目录只会
     在已经得到明确 fileIndexes 后创建，用于后续下载落稳与安全整理。
     """
     rules = OfflineRules.from_config()
@@ -371,7 +381,12 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
         return {"ok": False, "decision": decision.as_dict(), "error": "光鸭未登录"}
 
     try:
-        resolution = _resolve_offline_manifest(client, url, decision.protocol)
+        resolution = _resolve_offline_manifest(
+            client,
+            url,
+            decision.protocol,
+            torrent_data=torrent_data,
+        )
         files = resolution.files
         choices = build_offline_file_choices(files, rules)
     except Exception as exc:
@@ -382,13 +397,17 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
 
     manifest_unverifiable = not choices or _resolver_excluded_only(files)
     if decision.protocol == "magnet" and manifest_unverifiable:
+        unresolved_error = (
+            f"种子文件未解析到可验证文件列表（尝试 {resolution.attempts} 次），"
+            if torrent_data else
+            f"磁力资源连续 {resolution.attempts} 次未解析到可验证文件列表，"
+        )
         return {
             "ok": False, "decision": decision.as_dict(),
             "resolve_attempts": resolution.attempts,
             "resolve_diagnostic": resolution.diagnostic,
             "error": (
-                f"磁力资源连续 {resolution.attempts} 次未解析到可验证文件列表，"
-                "已阻止整单下载；请稍后重试或更换资源。"
+                f"{unresolved_error}已阻止整单下载；请稍后重试或更换资源。"
             ),
         }
 

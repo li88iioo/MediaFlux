@@ -8,7 +8,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from app.clients.qbittorrent import QBittorrentClient, TorrentAddResult
+from app.clients.qbittorrent import (
+    QBittorrentClient,
+    QBTorrentExportError,
+    TorrentAddResult,
+)
 from app.modules.download_dispatcher import (
     _submit_qb,
     normalize_download_url,
@@ -25,6 +29,7 @@ class _Response:
     def __init__(self, status_code: int, payload):
         self.status_code = status_code
         self._payload = payload
+        self.content = payload if isinstance(payload, bytes) else str(payload).encode()
         self.text = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload)
 
     def json(self):
@@ -94,6 +99,36 @@ class QBittorrent523IdentityTests(unittest.TestCase):
         result = client.add_torrent_detailed(torrents=b"torrent")
 
         self.assertEqual(result, TorrentAddResult(True, task_ids=(task_id,)))
+
+    def test_qb_5_export_returns_original_torrent_bytes(self):
+        task_id = "a" * 40
+        torrent = _bencode({
+            b"info": {
+                b"length": 1,
+                b"name": b"exported",
+                b"piece length": 16384,
+                b"pieces": b"x" * 20,
+            },
+        })
+        client = QBittorrentClient("http://qb.invalid", api_key="token")
+        client._session.post = Mock(return_value=_Response(200, torrent))
+
+        self.assertEqual(client.export_torrent(task_id), torrent)
+
+        call = client._session.post.call_args
+        self.assertEqual(call.args[0], "http://qb.invalid/api/v2/torrents/export")
+        self.assertEqual(call.kwargs["data"], {"hash": task_id})
+        self.assertEqual(call.kwargs["headers"]["Authorization"], "Bearer token")
+        self.assertIn("application/x-bittorrent", call.kwargs["headers"]["Accept"])
+
+    def test_qb_5_export_classifies_missing_remote_task(self):
+        client = QBittorrentClient("http://qb.invalid", api_key="token")
+        client._session.post = Mock(return_value=_Response(404, b"not found"))
+
+        with self.assertRaises(QBTorrentExportError) as raised:
+            client.export_torrent("a" * 40)
+
+        self.assertEqual(raised.exception.code, "not_found")
 
     def test_submit_prefers_qb_returned_task_id_over_precomputed_identity(self):
         returned_id = "b" * 40

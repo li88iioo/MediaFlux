@@ -1813,6 +1813,16 @@ class GuangYaClient:
         )
         return res if isinstance(res, dict) else {"raw": str(res)}
 
+    def resolve_torrent(self, torrent_data: bytes) -> dict:
+        """上传并解析 BT 种子元数据，不创建离线任务。"""
+        if not isinstance(torrent_data, bytes) or not torrent_data:
+            raise ValueError("种子文件为空")
+        res = self._call_read(
+            "resolve_torrent",
+            lambda: self.raw.cloud_resolve_torrent(torrent_data),
+        )
+        return res if isinstance(res, dict) else {"raw": str(res)}
+
     @staticmethod
     def normalize_offline_files(response: dict) -> list[dict]:
         """把不同 resolve_res 响应归一化为 index/name/size/excluded。"""

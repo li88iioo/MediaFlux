@@ -106,7 +106,30 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn('id="testQbBtn"', downloads_panel)
         self.assertIn('class="settings-layout-2col"', downloads_panel)
         self.assertIn('class="settings-telemetry-card"', downloads_panel)
+        self.assertNotIn('data-key="DOWNLOAD_TORRENT_RETENTION_DAYS"', downloads_panel)
         self.assertNotIn('class="qb-connection-status"', downloads_panel)
+
+        downloads_ui = (
+            Path("app/templates/downloads.html").read_text(encoding="utf-8")
+            + Path("app/static/js/downloads.js").read_text(encoding="utf-8")
+        )
+        downloads_styles = Path("app/static/css/main.css").read_text(encoding="utf-8")
+        self.assertIn('id="torrentCachePolicyModal"', downloads_ui)
+        self.assertIn('class="download-cache-dialog"', downloads_ui)
+        self.assertNotIn('class="card download-cache-dialog"', downloads_ui)
+        self.assertIn('data-key="DOWNLOAD_TORRENT_RETENTION_DAYS"', downloads_ui)
+        self.assertIn('min="0" max="3650"', downloads_ui)
+        self.assertIn("设置原始 .torrent 的保留时间", downloads_ui)
+        self.assertIn("0 表示永久，最多 3650 天", downloads_ui)
+        self.assertIn("不删除下载任务或本地文件", downloads_ui)
+        self.assertNotIn("data-cache-retention-days", downloads_ui)
+        self.assertNotIn("qB Web API 导出原始种子", downloads_ui)
+        self.assertNotIn("download-cache-backends", downloads_ui)
+        self.assertIn("window.loadAppConfig()", downloads_ui)
+        self.assertIn("window.saveAppConfig(torrentCachePolicyForm", downloads_ui)
+        self.assertIn(".download-cache-actions .download-cache-action", downloads_styles)
+        self.assertIn("height: 40px;", downloads_styles)
+        self.assertIn("width: 132px;", downloads_styles)
         agent_panel = html[html.index('id="settings-panel-agent"'):html.index('id="settings-panel-metadata"')]
         telegram_panel = html[html.index('id="settings-panel-telegram"'):html.index('id="settings-panel-agent"')]
         discovery_panel = html[html.index('id="settings-panel-discovery"'):html.index('id="settings-panel-downloads"')]
@@ -243,6 +266,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertEqual(payload["AGENT_LLM_MODEL"], "deployment-model")
         self.assertEqual(payload["AGENT_LIBRARY_PATROL_ENABLED"], "1")
         self.assertEqual(payload["GY_STRM_BASE_URL"], "http://mediaflux.internal:1258")
+        self.assertEqual(payload["DOWNLOAD_TORRENT_RETENTION_DAYS"], "0")
         self.assertEqual(
             payload["__managed_fields"],
             [
@@ -352,6 +376,53 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         self.assertEqual(response, {"success": True})
         scheduler.reload.assert_called_once_with()
+
+    def test_torrent_retention_days_are_validated_saved_and_reloaded(self):
+        request = self._request()
+        tracker = MagicMock()
+
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda _key, default="": default,
+        ), patch("app.routes.api.config.set_and_save") as persist, patch(
+            "app.services.clear_dashboard_cache"
+        ), patch(
+            "app.modules.download_tracker.get_download_tracker",
+            return_value=tracker,
+        ):
+            response = save_config(
+                request, {"DOWNLOAD_TORRENT_RETENTION_DAYS": "30"}
+            )
+
+        self.assertEqual(response, {"success": True})
+        persist.assert_called_once_with({"DOWNLOAD_TORRENT_RETENTION_DAYS": "30"})
+        tracker.reload.assert_called_once_with(reset_torrent_cleanup=True)
+
+        for invalid in ("-1", "3651", "1.5", "not-a-number"):
+            with patch("app.routes.api.config.set_and_save") as rejected_persist:
+                rejected = save_config(
+                    request, {"DOWNLOAD_TORRENT_RETENTION_DAYS": invalid}
+                )
+            self.assertEqual(rejected.status_code, 400)
+            rejected_persist.assert_not_called()
+
+    def test_blank_torrent_retention_normalizes_to_permanent(self):
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": (
+                "30" if key == "DOWNLOAD_TORRENT_RETENTION_DAYS" else default
+            ),
+        ), patch("app.routes.api.config.set_and_save") as persist, patch(
+            "app.services.clear_dashboard_cache"
+        ), patch(
+            "app.modules.download_tracker.get_download_tracker"
+        ):
+            response = save_config(
+                self._request(), {"DOWNLOAD_TORRENT_RETENTION_DAYS": ""}
+            )
+
+        self.assertEqual(response, {"success": True})
+        persist.assert_called_once_with({"DOWNLOAD_TORRENT_RETENTION_DAYS": "0"})
 
     def test_secret_can_be_replaced_or_explicitly_cleared_without_reveal(self):
         with patch("app.routes.api.config.set_and_save") as persist, patch(

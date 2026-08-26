@@ -5,12 +5,17 @@ import hashlib
 import logging
 import json
 import threading
+import time
 from datetime import datetime, timedelta
 
 from app import database as db
 from app.clients.guangya import GuangYaClient
 from app.clients.qbittorrent import QBittorrentClient, TorrentTask, is_qb_torrent_complete
 from app.config import get
+from app.defaults import (
+    DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS,
+    MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
+)
 from app.logger import get_logger, log_throttled
 from app.modules.naming import sanitize_name
 from app.modules.organize import OrganizeRules
@@ -29,6 +34,8 @@ _TRACKER_CURSOR_KEY = "download_tracker.active_cursor_id"
 _DEFAULT_MISSING_GRACE_SECONDS = 900
 _MAX_LOCAL_IMPORT_PROBE_ATTEMPTS = 8
 _NOTIFICATION_LEASE_SECONDS = 300
+_TORRENT_DATA_CLEANUP_INTERVAL_SECONDS = 3600
+_TORRENT_DATA_CLEANUP_BATCH_SIZE = 500
 
 
 class DownloadTracker:
@@ -40,6 +47,7 @@ class DownloadTracker:
         self._run_lock = threading.Lock()
         self._stopping = False
         self._lifecycle_generation = 0
+        self._last_torrent_data_cleanup_at = 0.0
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -92,7 +100,10 @@ class DownloadTracker:
             logger.warning("下载任务跟踪器未能在关闭超时内结束")
         return stopped
 
-    def reload(self) -> None:
+    def reload(self, *, reset_torrent_cleanup: bool = False) -> None:
+        if reset_torrent_cleanup:
+            with self._lifecycle_lock:
+                self._last_torrent_data_cleanup_at = 0.0
         self._wake_event.set()
 
     def run_once(self) -> int:
@@ -100,6 +111,7 @@ class DownloadTracker:
             return self._run_once_locked()
 
     def _run_once_locked(self) -> int:
+        self._run_torrent_data_cleanup_if_due()
         local_media_enabled = bool(db.list_local_media_sources(owner="admin", enabled_only=True))
         try:
             cursor = max(0, int(db.kv_get(_TRACKER_CURSOR_KEY, "0") or 0))
@@ -127,6 +139,59 @@ class DownloadTracker:
             )
         db.kv_set(_TRACKER_CURSOR_KEY, str(int(rows[-1]["id"])))
         return len(rows)
+
+    @staticmethod
+    def _torrent_data_retention_days() -> int:
+        raw = get(
+            "DOWNLOAD_TORRENT_RETENTION_DAYS",
+            str(DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS),
+        )
+        try:
+            days = int(str(raw or "").strip() or DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS)
+        except (TypeError, ValueError):
+            return DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS
+        if days < 0 or days > MAX_DOWNLOAD_TORRENT_RETENTION_DAYS:
+            return DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS
+        return days
+
+    def _run_torrent_data_cleanup_if_due(self) -> int:
+        current = time.monotonic()
+        if (
+            self._last_torrent_data_cleanup_at
+            and current - self._last_torrent_data_cleanup_at
+            < _TORRENT_DATA_CLEANUP_INTERVAL_SECONDS
+        ):
+            return 0
+        retention_days = self._torrent_data_retention_days()
+        if retention_days <= 0:
+            self._last_torrent_data_cleanup_at = current
+            return 0
+        try:
+            cleared = db.purge_expired_download_request_torrent_data(
+                retention_days,
+                limit=_TORRENT_DATA_CLEANUP_BATCH_SIZE,
+            )
+        except Exception as exc:
+            self._last_torrent_data_cleanup_at = current
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"torrent-data-retention:{type(exc).__name__}",
+                "原始种子保留期清理失败 type=%s",
+                type(exc).__name__,
+            )
+            return 0
+        # 满批时让下一轮继续处理积压；不足一批则按小时节流。
+        self._last_torrent_data_cleanup_at = (
+            0.0 if cleared >= _TORRENT_DATA_CLEANUP_BATCH_SIZE else current
+        )
+        if cleared:
+            logger.info(
+                "已清理 %s 条超过 %s 天的原始种子数据，下载请求与日志仍保留",
+                cleared,
+                retention_days,
+            )
+        return cleared
 
     @staticmethod
     def _missing_grace_seconds() -> int:
