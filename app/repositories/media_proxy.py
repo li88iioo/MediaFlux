@@ -523,8 +523,15 @@ def list_media_proxy_playback_records(*, instance_id: int | None = None,
             "ORDER BY id DESC LIMIT ? OFFSET ?",
             [*params, normalized_size, (normalized_page - 1) * normalized_size],
         ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        total_ms = max(0, int(item["total_latency_ms"] or 0))
+        upstream_ms = max(0, int(item["upstream_latency_ms"] or 0))
+        item["internal_latency_ms"] = max(0, total_ms - upstream_ms)
+        items.append(item)
     return {
-        "items": [dict(row) for row in rows],
+        "items": items,
         "total": total,
         "page": normalized_page,
         "page_size": normalized_size,
@@ -573,12 +580,44 @@ def list_media_proxy_playback_sessions(*, instance_id: int | None = None,
             "ORDER BY last_request_at DESC,id DESC LIMIT ? OFFSET ?",
             [*params, normalized_size, (normalized_page - 1) * normalized_size],
         ).fetchall()
+        session_ids = [int(row["id"]) for row in rows]
+        stage_metrics = {}
+        if session_ids:
+            placeholders = ",".join("?" for _ in session_ids)
+            metric_rows = conn.execute(
+                "SELECT session_id,"
+                "SUM(CASE WHEN source='playback_info' THEN 1 ELSE 0 END) "
+                "AS playback_info_request_count,"
+                "SUM(CASE WHEN source='playback_info' THEN total_latency_ms ELSE 0 END) "
+                "AS playback_info_latency_ms_total,"
+                "SUM(CASE WHEN route_class='guangya_direct' AND status_code=302 "
+                "THEN 1 ELSE 0 END) AS redirect_request_count,"
+                "SUM(CASE WHEN route_class='guangya_direct' AND status_code=302 "
+                "THEN total_latency_ms ELSE 0 END) AS redirect_latency_ms_total "
+                "FROM media_proxy_playback_records "
+                f"WHERE session_id IN ({placeholders}) GROUP BY session_id",
+                session_ids,
+            ).fetchall()
+            stage_metrics = {int(row["session_id"]): dict(row) for row in metric_rows}
     items = []
     for row in rows:
         item = dict(row)
         count = max(1, int(item["request_count"] or 0))
         item["average_total_latency_ms"] = int(item["total_latency_ms_total"] or 0) // count
         item["average_upstream_latency_ms"] = int(item["upstream_latency_ms_total"] or 0) // count
+        metrics = stage_metrics.get(int(item["id"]), {})
+        playback_count = int(metrics.get("playback_info_request_count") or 0)
+        redirect_count = int(metrics.get("redirect_request_count") or 0)
+        item["playback_info_request_count"] = playback_count
+        item["redirect_request_count"] = redirect_count
+        item["average_playback_info_latency_ms"] = (
+            int(metrics.get("playback_info_latency_ms_total") or 0) // playback_count
+            if playback_count else 0
+        )
+        item["average_redirect_latency_ms"] = (
+            int(metrics.get("redirect_latency_ms_total") or 0) // redirect_count
+            if redirect_count else 0
+        )
         items.append(item)
     return {
         "items": items,

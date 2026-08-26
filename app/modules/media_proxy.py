@@ -4751,7 +4751,7 @@ def create_proxy_app(
                 request.state.proxy_route_class = "guangya_direct"
                 request.state.proxy_source = "guangya"
                 request.state.proxy_action = "guangya_relay"
-                request.state.proxy_upstream_latency_ms = round(
+                request.state.proxy_upstream_latency_ms += round(
                     (time.monotonic() - started) * 1000
                 )
                 response_headers = _signed_media_response_headers(response.headers)
@@ -4860,6 +4860,7 @@ def create_proxy_app(
                     **options,
                 )
 
+            signed_url_started = time.monotonic()
             try:
                 result = await signed_urls.get_or_fetch_result(
                     file_id,
@@ -4882,6 +4883,10 @@ def create_proxy_app(
                     {"error": "光鸭播放地址获取超时"},
                     status_code=504,
                 )
+            finally:
+                request.state.proxy_upstream_latency_ms += round(
+                    (time.monotonic() - signed_url_started) * 1000
+                )
             request.state.proxy_cache_hit = result.cache_hit
             if not result.url:
                 request.state.proxy_failure_stage = "signed_url"
@@ -4898,13 +4903,19 @@ def create_proxy_app(
                     user_agent=request.headers.get("user-agent", ""),
                     ua_bound=ua_bound,
                 )
-                refreshed = await signed_urls.get_or_fetch_result(
-                    file_id,
-                    fetch_url,
-                    scope=scope,
-                    user_agent=request.headers.get("user-agent", ""),
-                    ua_bound=ua_bound,
-                )
+                refresh_started = time.monotonic()
+                try:
+                    refreshed = await signed_urls.get_or_fetch_result(
+                        file_id,
+                        fetch_url,
+                        scope=scope,
+                        user_agent=request.headers.get("user-agent", ""),
+                        ua_bound=ua_bound,
+                    )
+                finally:
+                    request.state.proxy_upstream_latency_ms += round(
+                        (time.monotonic() - refresh_started) * 1000
+                    )
                 request.state.proxy_cache_hit = False
                 return refreshed.url
             browser_direct_redirect = bool(

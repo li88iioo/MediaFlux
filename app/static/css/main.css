@@ -5560,7 +5560,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .proxy-session-card { border-bottom: 1px solid var(--border-soft); background: transparent; }
 .proxy-session-card:last-child { border-bottom: 0; }
 .proxy-session-card[open] { background: color-mix(in srgb, var(--accent-soft) 32%, transparent); }
-.proxy-session-summary { min-height: 96px; display: grid; grid-template-columns: 34px minmax(210px,1.5fr) minmax(112px,.7fr) 88px 72px 96px minmax(118px,.72fr) 20px; gap: 12px; align-items: center; padding: 14px 16px; cursor: pointer; list-style: none; transition: background .16s ease; }
+.proxy-session-summary { min-height: 96px; display: grid; grid-template-columns: 34px minmax(210px,1.5fr) minmax(112px,.7fr) 88px 72px 96px minmax(164px,.86fr) 20px; gap: 12px; align-items: center; padding: 14px 16px; cursor: pointer; list-style: none; transition: background .16s ease; }
 .proxy-session-summary::-webkit-details-marker { display: none; }
 .proxy-session-summary:hover { background: var(--bg-card-hover); }
 .proxy-session-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -5573,8 +5573,11 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .proxy-session-identity strong { margin-top: 5px; overflow: hidden; color: var(--text-primary); font-size: 13.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .proxy-session-identity small { margin-top: 4px; overflow: hidden; color: var(--text-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .proxy-session-count strong, .proxy-session-count small, .proxy-session-cache strong, .proxy-session-cache small, .proxy-session-latency strong, .proxy-session-latency small { display: block; }
+.proxy-session-latency { min-width: 0; min-height: 54px; display: grid; align-content: center; }
 .proxy-session-count strong, .proxy-session-cache strong, .proxy-session-latency strong { color: var(--text-primary); font: 650 12px "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
 .proxy-session-count small, .proxy-session-cache small, .proxy-session-latency small { margin-top: 4px; color: var(--text-muted); font-size: 10px; line-height: 1.25; }
+.proxy-session-latency small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proxy-session-latency .proxy-session-latency-detail { margin-top: 2px; color: var(--text-secondary); }
 .proxy-session-cache.active strong { color: var(--success); }
 .proxy-session-chevron { display: grid; place-items: center; color: var(--text-muted); transition: transform .18s ease, color .18s ease; }
 .proxy-session-chevron svg { width: 17px; height: 17px; }
@@ -5590,7 +5593,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .proxy-session-last-error { margin: -5px 16px 14px 62px; padding: 8px 12px; color: var(--danger); background: var(--danger-soft); border-radius: 6px; font-size: 11px; overflow-wrap: anywhere; }
 @keyframes proxy-session-spin { to { transform: rotate(360deg); } }
 
-.proxy-record-table-head, .proxy-record-card { display: grid; grid-template-columns: minmax(200px,1.45fr) minmax(120px,.7fr) 90px 80px minmax(90px,.6fr); gap: 12px; align-items: center; }
+.proxy-record-table-head, .proxy-record-card { display: grid; grid-template-columns: minmax(200px,1.45fr) minmax(120px,.7fr) 90px 80px minmax(158px,.78fr); gap: 12px; align-items: center; }
 .proxy-record-table-head { min-height: 40px; padding: 0 16px; color: var(--text-muted); background: var(--bg-card-hover); border-bottom: 1px solid var(--border-soft); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
 .proxy-record-card { min-height: 72px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); transition: background 0.15s ease; }
 .proxy-record-card:last-child { border-bottom: 0; }
@@ -5604,9 +5607,10 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .proxy-record-cache { width: 56px; padding: 4px 0; border: 1px solid var(--border-soft); border-radius: 999px; font: 700 10px "SFMono-Regular", Consolas, monospace; text-align: center; }
 .proxy-record-cache.hit { color: var(--success); background: var(--accent-soft); border-color: var(--success); }
 .proxy-record-cache.miss, .proxy-record-cache.neutral { color: var(--text-muted); background: var(--bg-card-hover); }
+.proxy-record-latency { min-width: 0; }
 .proxy-record-latency strong, .proxy-record-latency small { display: block; }
 .proxy-record-latency strong { font: 600 12px "SFMono-Regular", Consolas, monospace; color: var(--text-primary); }
-.proxy-record-latency small { margin-top: 3px; color: var(--text-muted); font-size: 10px; }
+.proxy-record-latency small { margin-top: 3px; overflow: hidden; color: var(--text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .proxy-record-error { grid-column: 1 / -1; margin: -2px 0 0; padding: 8px 12px; color: var(--danger); background: var(--danger-soft); border-radius: 6px; font-size: 11px; overflow-wrap: anywhere; }
 .proxy-record-pagination { min-height: 52px; display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 12px; }
 .proxy-record-pagination > span { min-width: 150px; color: var(--text-secondary); font: 12px "SFMono-Regular", Consolas, monospace; text-align: center; }

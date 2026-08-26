@@ -561,6 +561,19 @@ class MediaProxyTemplateTests(unittest.TestCase):
         self.assertNotIn("一期边界", template)
         self.assertNotIn("本地单段 Range/HEAD", template)
 
+    def test_proxy_playback_latency_is_split_by_stage_without_extra_columns(self):
+        template = Path("app/templates/media_proxy.html").read_text(encoding="utf-8")
+        css = Path("app/static/css/main.css").read_text(encoding="utf-8")
+
+        self.assertIn("average_redirect_latency_ms", template)
+        self.assertIn("average_playback_info_latency_ms", template)
+        self.assertIn("internal_latency_ms", template)
+        self.assertIn("302 平均", template)
+        self.assertIn("上游阶段", template)
+        self.assertIn("proxy-session-latency-detail", template)
+        self.assertIn(".proxy-session-latency-detail", css)
+        self.assertIn("min-height: 54px", css)
+
     def test_proxy_async_regions_reserve_stable_space(self):
         css = Path("app/static/css/main.css").read_text(encoding="utf-8")
         self.assertIn(".proxy-profile-grid", css)

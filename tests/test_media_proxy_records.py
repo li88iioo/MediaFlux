@@ -5,6 +5,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import unittest
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -996,6 +997,7 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             method="POST",
             status_code=200,
             source="playback_info",
+            upstream_latency_ms=24,
             total_latency_ms=30,
         )
         second_id = db.record_media_proxy_playback_attempt(
@@ -1009,7 +1011,22 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
             status_code=302,
             source="guangya",
             cache_hit=True,
+            upstream_latency_ms=7,
             total_latency_ms=10,
+        )
+        relay_id = db.record_media_proxy_playback_attempt(
+            instance_id=self.instance_id,
+            playback_session_key="session-digest-1",
+            media_item_id="item-1",
+            media_source_id="source-1",
+            guangya_file_id="file-1",
+            route_class="guangya_direct",
+            method="GET",
+            status_code=206,
+            source="guangya",
+            cache_hit=False,
+            upstream_latency_ms=80,
+            total_latency_ms=90,
         )
 
         sessions = db.list_media_proxy_playback_sessions(instance_id=self.instance_id)
@@ -1021,14 +1038,28 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(summary["media_name"], "Movie Name.mkv")
         self.assertEqual(summary["guangya_file_id"], "file-1")
         self.assertNotIn("secret", json.dumps(dict(summary), ensure_ascii=False))
-        self.assertEqual(summary["request_count"], 2)
-        self.assertEqual(summary["success_count"], 2)
+        self.assertEqual(summary["request_count"], 3)
+        self.assertEqual(summary["success_count"], 3)
         self.assertEqual(summary["error_count"], 0)
         self.assertEqual(summary["cache_hit_count"], 1)
-        self.assertEqual(summary["average_total_latency_ms"], 20)
+        self.assertEqual(summary["average_total_latency_ms"], 43)
+        self.assertEqual(summary["playback_info_request_count"], 1)
+        self.assertEqual(summary["average_playback_info_latency_ms"], 30)
+        self.assertEqual(summary["redirect_request_count"], 1)
+        self.assertEqual(summary["average_redirect_latency_ms"], 10)
         details = db.list_media_proxy_playback_records(session_id=summary["id"])
-        self.assertEqual(details["total"], 2)
-        self.assertEqual({row["id"] for row in details["items"]}, {first_id, second_id})
+        self.assertEqual(details["total"], 3)
+        self.assertEqual(
+            {row["id"] for row in details["items"]},
+            {first_id, second_id, relay_id},
+        )
+        internal_by_id = {
+            row["id"]: row["internal_latency_ms"] for row in details["items"]
+        }
+        self.assertEqual(
+            internal_by_id,
+            {first_id: 6, second_id: 3, relay_id: 10},
+        )
 
 
 class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
@@ -1090,6 +1121,7 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
 
             def get_download_url(self, _file_id, **_kwargs):
                 self.__class__.calls += 1
+                time.sleep(0.02)
                 return "https://signed.invalid/file?Expires=4102444800&token=secret"
 
         instance = {
@@ -1109,7 +1141,10 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
         self.assertEqual(Client.calls, 1)
         rows = db.list_media_proxy_playback_records(instance_id=7)["items"]
         self.assertEqual(len(rows), 2)
-        self.assertEqual([row["cache_hit"] for row in reversed(rows)], [0, 1])
+        ordered_rows = list(reversed(rows))
+        self.assertEqual([row["cache_hit"] for row in ordered_rows], [0, 1])
+        self.assertGreaterEqual(ordered_rows[0]["upstream_latency_ms"], 10)
+        self.assertLess(ordered_rows[1]["upstream_latency_ms"], 10)
         self.assertTrue(all(row["route_class"] == "guangya_direct" for row in rows))
         sessions = db.list_media_proxy_playback_sessions(instance_id=7)
         self.assertEqual(sessions["total"], 2)
