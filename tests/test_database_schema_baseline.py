@@ -1442,3 +1442,22 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                     db.init_db()
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_schema_script_failure_rolls_back_every_completed_statement(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                db._run_schema_savepoint(
+                    conn,
+                    operation=lambda connection: db._execute_schema_script(
+                        connection,
+                        "CREATE TABLE transient_table(id INTEGER);\n"
+                        "CREATE TABLE broken_table(\n",
+                    ),
+                )
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='transient_table'"
+            ).fetchone()
+            self.assertIsNone(exists)
+        finally:
+            conn.close()

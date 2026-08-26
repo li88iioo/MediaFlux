@@ -31,6 +31,10 @@ _MEDIA_ITEM_PAGE_SIZE = 5_000
 _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH = 100_000
 
 
+class MediaLibraryEnumerationTooLarge(RuntimeError):
+    """媒体库过大，无法安全枚举到单条 Item；调用方可降级为库级刷新。"""
+
+
 def runtime_ticks_to_minutes(value: Any) -> int:
     """将 MediaBrowser 的 100ns RunTimeTicks 转为四舍五入分钟。"""
     if isinstance(value, bool):
@@ -650,7 +654,7 @@ class MediaServerClient:
             elif total != expected_total:
                 raise RuntimeError("媒体库条目分页总数发生变化，已停止精准刷新")
             if total > _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH:
-                raise RuntimeError(
+                raise MediaLibraryEnumerationTooLarge(
                     f"媒体库条目超过精准刷新安全上限 "
                     f"{_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
                 )
@@ -689,7 +693,7 @@ class MediaServerClient:
             if len(page) < _MEDIA_ITEM_PAGE_SIZE:
                 raise RuntimeError("媒体库条目分页提前结束，已停止精准刷新")
 
-        raise RuntimeError(
+        raise MediaLibraryEnumerationTooLarge(
             f"媒体库条目超过精准刷新安全上限 {_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
         )
 
@@ -881,10 +885,18 @@ class MediaServerClient:
         item_ids: list[str] = []
         library_fallbacks: list[str] = []
         failed_item_listings: set[str] = set()
+        oversized_item_listings: set[str] = set()
         for target, (library_id, library_location) in library_for_target.items():
             if library_id not in items_by_library:
                 try:
                     items_by_library[library_id] = self._library_items_with_paths(library_id)
+                except MediaLibraryEnumerationTooLarge:
+                    logger.info(
+                        "[%s] 媒体库 %s 超过精准枚举上限，降级为库级刷新",
+                        self.display_name, library_id,
+                    )
+                    items_by_library[library_id] = []
+                    oversized_item_listings.add(library_id)
                 except Exception as exc:
                     logger.warning(
                         "[%s] 读取媒体库 %s 条目失败，已安全跳过该库刷新: %s",
@@ -892,6 +904,9 @@ class MediaServerClient:
                     )
                     items_by_library[library_id] = []
                     failed_item_listings.add(library_id)
+            if library_id in oversized_item_listings:
+                library_fallbacks.append(library_id)
+                continue
             if library_id in failed_item_listings:
                 continue
             items = items_by_library[library_id]
@@ -957,6 +972,10 @@ class MediaServerClient:
         reasons: list[str] = []
         if libraries:
             reasons.append("部分目标仅能定位到媒体库，已按媒体库刷新")
+        if oversized_item_listings:
+            reasons.append(
+                f"{len(oversized_item_listings)} 个大库已降级为媒体库刷新"
+            )
         if failed_item_listings:
             reasons.append(
                 f"{len(failed_item_listings)} 个媒体库条目读取失败，已安全跳过"

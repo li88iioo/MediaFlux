@@ -248,6 +248,35 @@ class QBittorrent523CompletionTests(unittest.TestCase):
         self.assertEqual(update.call_args.kwargs["qb_status"], "completed")
         start_import.assert_called_once_with(self._row(), task)
 
+    def test_completed_request_reacquires_qb_task_until_local_import_finishes(self):
+        tracker = DownloadTracker()
+        row = {
+            **self._row(),
+            "qb_status": "completed",
+            "local_import_status": "pending",
+        }
+        task = SimpleNamespace(
+            hash="a" * 40,
+            name="Demo",
+            progress=1.0,
+            state="stalledUP",
+            content_path="/downloads/Demo",
+        )
+        with patch.object(tracker, "_update_backend_log"), patch.object(
+            tracker, "_start_local_import"
+        ) as start_import, patch.object(
+            tracker, "_notify_completion"
+        ), patch(
+            "app.modules.download_tracker.db.update_download_request_and_sync_media_admission"
+        ) as update:
+            tracker._update_request(
+                row, [task], [], qb_available=True, gy_available=False,
+            )
+
+        start_import.assert_called_once_with(row, task)
+        if update.called:
+            self.assertNotIn("qb_status", update.call_args.kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()

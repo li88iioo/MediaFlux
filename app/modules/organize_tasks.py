@@ -283,7 +283,17 @@ class OrganizeTaskManager:
         request_ids = list(dict.fromkeys(int(item) for item in (download_request_ids or [])))
         resolved_chat_id = str(chat_id or "").strip()
         if not resolved_chat_id and request_ids:
-            request_row = db.get_download_request(request_ids[0])
+            try:
+                request_row = db.get_download_request(request_ids[0])
+            except Exception as exc:
+                # 通知上下文是可选信息；数据库短暂不可读不应在已取得跨进程
+                # 锁后中断任务并泄漏锁。后续状态写入仍按各自错误边界处理。
+                logger.warning(
+                    "读取整理任务通知上下文失败 request=%s type=%s",
+                    request_ids[0],
+                    type(exc).__name__,
+                )
+                request_row = None
             if request_row is not None:
                 resolved_chat_id = str(request_row["chat_id"] or "").strip()
         chat_id = resolved_chat_id
@@ -1575,6 +1585,16 @@ class OrganizeTaskManager:
                         "organize_error": (
                             "整理任务已停止，可能已有部分文件完成移动；"
                             "请先核对整理日志，勿直接重复执行"
+                        ),
+                    })
+                elif partial:
+                    # partial 可能已经移动了部分文件，既不能静默完成，也不能
+                    # 由 tracker 自动重跑；转入待处理供用户核验具体失败项。
+                    fields.update({
+                        "organize_started": -1,
+                        "organize_error": (
+                            "整理任务部分完成，可能仍有文件未入库；"
+                            "请核对整理日志后人工处理"
                         ),
                     })
                 strm_result = aggregate.get("strm") or {}

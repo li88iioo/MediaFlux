@@ -8,6 +8,11 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from app.agent.async_bridge import AsyncBridgeUnavailable, run_awaitable_sync
+from app.agent.feature_gate import (
+    agent_runtime_generation_is_current,
+    current_agent_runtime_generation,
+    invalidate_agent_runtime_generation,
+)
 from app.agent.rate_limit import AgentRateLimiter
 from app.main import AgentBodyLimitMiddleware
 
@@ -163,6 +168,16 @@ class AsyncBridgeTests(unittest.TestCase):
             self.assertLess(time.perf_counter() - started, 0.05)
 
         asyncio.run(scenario())
+
+
+class AgentRuntimeGenerationTests(unittest.TestCase):
+    def test_invalidation_revokes_only_preexisting_runtime_work(self):
+        previous = current_agent_runtime_generation()
+        current = invalidate_agent_runtime_generation()
+
+        self.assertGreater(current, previous)
+        self.assertFalse(agent_runtime_generation_is_current(previous))
+        self.assertTrue(agent_runtime_generation_is_current(current))
 
 
 if __name__ == "__main__":

@@ -435,14 +435,20 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
             completed_batches = int(created.get("completed_batches") or 0)
             partial_success = bool(created.get("partial_success") or task_ids or completed_batches)
+            outcome_unknown = bool(created.get("outcome_unknown"))
+            tracking_incomplete = bool(created.get("tracking_incomplete"))
             staging_cleanup_status = "pending" if staging_id else ""
             staging_cleanup_error = ""
             # 云端离线任务为异步写入；只要已有任一批次被接受，就不能依据
-            # “目录当前为空”删除 staging，否则会破坏仍在写入的远端任务。
-            if not ok and not partial_success:
+            # “目录当前为空”删除 staging。结果未知/跟踪信息不完整同样意味着
+            # 服务端可能已受理请求，必须保留目录供 tracker 与人工核验。
+            if not ok and not partial_success and not outcome_unknown and not tracking_incomplete:
                 staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
                     client, staging_id
                 )
+            elif not ok and staging_id:
+                staging_cleanup_status = "retained"
+                staging_cleanup_error = "提交结果待核对，已保留隔离目录"
             common = {
                 "decision": effective.as_dict(),
                 "selection_mode": "files",
@@ -454,8 +460,8 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                 "batch_count": int(created.get("batch_count") or 0),
                 "completed_batches": completed_batches,
                 "partial_success": partial_success,
-                "outcome_unknown": bool(created.get("outcome_unknown")),
-                "tracking_incomplete": bool(created.get("tracking_incomplete")),
+                "outcome_unknown": outcome_unknown,
+                "tracking_incomplete": tracking_incomplete,
                 "staging": {
                     "id": staging_id,
                     "parent_id": str(decision.target_dir_id or "0"),
@@ -477,20 +483,27 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
         created = client.add_offline_task(
             url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
         )
+        outcome_unknown = False
+        tracking_incomplete = False
         if isinstance(created, dict):
             ok = bool(created.get("ok"))
             task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
             batch_count = int(created.get("batch_count") or (1 if ok else 0))
             create_error = str(created.get("error") or "")
+            outcome_unknown = bool(created.get("outcome_unknown"))
+            tracking_incomplete = bool(created.get("tracking_incomplete"))
         else:
             ok = bool(created)
             task_ids = []
             batch_count = 1 if ok else 0
             create_error = ""
-        if not ok:
+        if not ok and not outcome_unknown and not tracking_incomplete:
             staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
                 client, staging_id
             )
+        elif not ok and staging_id:
+            staging_cleanup_status = "retained"
+            staging_cleanup_error = "提交结果待核对，已保留隔离目录"
         else:
             staging_cleanup_status = "pending" if staging_id else ""
             staging_cleanup_error = ""
@@ -501,6 +514,8 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             "resolve_attempts": resolution.attempts,
             "selected_count": 0, "excluded_count": len(choices),
             "task_ids": task_ids, "batch_count": batch_count,
+            "outcome_unknown": outcome_unknown,
+            "tracking_incomplete": tracking_incomplete,
             "staging": {"id": staging_id, "parent_id": str(decision.target_dir_id or "0"),
                         "name": staging_name, "isolated": bool(staging_id),
                         "cleanup_status": staging_cleanup_status,
@@ -508,7 +523,10 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             "error": "" if ok else (create_error or "光鸭任务创建失败"),
         }
     except Exception as exc:
-        cleanup_status, cleanup_error = _remove_empty_staging(client, staging_id)
+        # 请求异常无法证明服务端未受理；宁可保留空目录供后续核验，也不能
+        # 删除一个远端可能仍会异步写入的任务目标。
+        cleanup_status = "retained" if staging_id else ""
+        cleanup_error = "提交结果待核对，已保留隔离目录" if staging_id else ""
         return {
             "ok": False, "decision": effective.as_dict(),
             "staging": {
@@ -652,6 +670,8 @@ def submit_offline_selection(url: str, selected_indexes: list[int] | None,
         return {
             **base,
             "partial_success": bool(created.get("partial_success")),
+            "outcome_unknown": bool(created.get("outcome_unknown")),
+            "tracking_incomplete": bool(created.get("tracking_incomplete")),
             "selection_mode": "files",
             "selected_count": int(created.get("selected_count", len(requested))),
             "completed_batches": int(created.get("completed_batches", 0)),
@@ -666,6 +686,8 @@ def submit_offline_selection(url: str, selected_indexes: list[int] | None,
         **base,
         "ok": True,
         "partial_success": False,
+        "outcome_unknown": False,
+        "tracking_incomplete": bool(created.get("tracking_incomplete")),
         "error": "",
         "selection_mode": "files",
         "selected_count": int(created.get("selected_count", len(requested))),

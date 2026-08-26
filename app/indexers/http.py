@@ -448,23 +448,45 @@ class BrowserImpersonatingHttpClient:
         raise IndexerSecurityError("redirect limit exceeded")
 
     def _request_once(self, logical_url: httpx.URL, params, headers) -> IndexerHttpResponse:
-        self._validate_url(logical_url)
+        logical_addresses = self._validated_addresses(logical_url)
         request_url = logical_url
         request_headers = dict(headers or {})
         if self.sni_host:
             request_headers.setdefault("Host", logical_url.host or "")
             request_url = logical_url.copy_with(host=self.sni_host)
             # 实际连接目标与逻辑 Host 必须遵守同一固定白名单和公网 DNS 契约。
-            self._validate_url(request_url)
+            connect_addresses = self._validated_addresses(request_url)
+        else:
+            connect_addresses = logical_addresses
         request_headers.setdefault("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        response = self._session.get(
-            str(request_url),
-            params=params,
-            headers=request_headers,
-            impersonate="chrome",
-            timeout=self.timeout_seconds,
-            allow_redirects=False,
-        )
+        try:
+            from curl_cffi.const import CurlOpt
+        except ImportError as exc:  # pragma: no cover - 默认 session 已要求 curl_cffi
+            raise RuntimeError("curl_cffi is required for browser indexer transport") from exc
+        if not hasattr(self._session, "curl_options"):
+            self._session.curl_options = {}
+        previous_resolve = self._session.curl_options.get(CurlOpt.RESOLVE)
+        connect_host = str(request_url.host or "")
+        connect_address = str(connect_addresses[0])
+        if ":" in connect_address:
+            connect_address = f"[{connect_address}]"
+        self._session.curl_options[CurlOpt.RESOLVE] = [
+            f"{connect_host}:443:{connect_address}"
+        ]
+        try:
+            response = self._session.get(
+                str(request_url),
+                params=params,
+                headers=request_headers,
+                impersonate="chrome",
+                timeout=self.timeout_seconds,
+                allow_redirects=False,
+            )
+        finally:
+            if previous_resolve is None:
+                self._session.curl_options.pop(CurlOpt.RESOLVE, None)
+            else:
+                self._session.curl_options[CurlOpt.RESOLVE] = previous_resolve
         response_headers = {str(key).lower(): str(value) for key, value in dict(response.headers or {}).items()}
         body = bytes(response.content or b"")
         declared_size = FixedHostHttpClient._content_length(response_headers.get("content-length"))
@@ -479,7 +501,9 @@ class BrowserImpersonatingHttpClient:
             body=body,
         )
 
-    def _validate_url(self, url: httpx.URL) -> None:
+    def _validated_addresses(
+        self, url: httpx.URL,
+    ) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
         if url.scheme.lower() != "https" or url.username or url.password:
             raise IndexerSecurityError("only registered HTTPS URLs are allowed")
         host = (url.host or "").rstrip(".").lower()
@@ -494,3 +518,7 @@ class BrowserImpersonatingHttpClient:
             raise IndexerSecurityError("upstream DNS validation failed") from exc
         if not addresses or any(not address.is_global for address in addresses):
             raise IndexerSecurityError("upstream host resolved to a non-public address")
+        return sorted(addresses, key=lambda address: (address.version, int(address)))
+
+    def _validate_url(self, url: httpx.URL) -> None:
+        self._validated_addresses(url)

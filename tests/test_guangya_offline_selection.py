@@ -514,6 +514,59 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         self.assertEqual(client.selection_calls[0]["target_dir_id"], "staging-7")
         self.assertEqual(client.legacy_calls, [])
 
+    def test_unknown_submit_outcome_retains_isolated_task_directory(self):
+        client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        client.selection_result = {
+            "ok": False,
+            "outcome_unknown": True,
+            "tracking_incomplete": True,
+            "task_ids": [],
+            "batch_count": 1,
+            "completed_batches": 0,
+            "error": "upstream timeout",
+        }
+        client.create_dir = Mock(return_value="staging-unknown")
+        client.list_dir = Mock(return_value=[])
+        client.delete = Mock(return_value=True)
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:unknown-outcome",
+                title="Demo Release",
+                client=client,
+                isolate_task=True,
+                task_key="unknown",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["outcome_unknown"])
+        self.assertTrue(result["tracking_incomplete"])
+        self.assertEqual(result["staging"]["cleanup_status"], "retained")
+        client.list_dir.assert_not_called()
+        client.delete.assert_not_called()
+
+    def test_submit_exception_retains_isolated_task_directory(self):
+        client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        client.add_offline_selection = Mock(side_effect=TimeoutError("read timeout"))
+        client.create_dir = Mock(return_value="staging-timeout")
+        client.list_dir = Mock(return_value=[])
+        client.delete = Mock(return_value=True)
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:timeout-outcome",
+                title="Demo Release",
+                client=client,
+                isolate_task=True,
+                task_key="timeout",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["outcome_unknown"])
+        self.assertEqual(result["staging"]["cleanup_status"], "retained")
+        client.list_dir.assert_not_called()
+        client.delete.assert_not_called()
+
     def test_automatic_submit_fails_closed_before_creating_isolated_whole_magnet(self):
         client = FakeSelectionClient({
             "code": 0,

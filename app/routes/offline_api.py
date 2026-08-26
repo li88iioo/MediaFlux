@@ -96,6 +96,9 @@ def submit(request: Request, data: dict | None = Body(default=None)):
             return JSONResponse({"error": "预览目标已变化，请重新解析"}, status_code=409)
     if result.get("partial_success"):
         return JSONResponse(result, status_code=207)
+    if result.get("outcome_unknown") or result.get("tracking_incomplete"):
+        # 远端可能已经受理，明确阻止前端把它当普通失败立即重放。
+        return JSONResponse(result, status_code=409)
     if not result.get("ok"):
         return JSONResponse(result, status_code=400)
     return result

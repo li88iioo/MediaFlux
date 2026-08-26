@@ -672,6 +672,12 @@ def _telegram_send_error(exc: Exception) -> TelegramSendResult:
     )
 
 
+def _photo_failure_allows_text_fallback(result: TelegramSendResult) -> bool:
+    """仅在 Telegram 明确拒绝图片请求时回退文本，避免未知结果重复通知。"""
+    status = int(result.status_code or 0)
+    return 400 <= status < 500 and status not in {408, 429}
+
+
 def send_result(
     text: str,
     chat_id: Optional[str] = None,
@@ -691,9 +697,17 @@ def send_result(
             try:
                 bot.send_photo(target, image, caption=chunks[0])
             except Exception as exc:
+                result = _telegram_send_error(exc)
+                if not _photo_failure_allows_text_fallback(result):
+                    logger.warning(
+                        "Telegram 结果封面发送结果未知，停止文本回退 "
+                        "type=%s status=%s",
+                        type(exc).__name__, result.status_code or "-",
+                    )
+                    return result
                 logger.warning(
-                    "Telegram 结果封面发送失败，回退文本 type=%s",
-                    type(exc).__name__,
+                    "Telegram 明确拒绝结果封面，回退文本 type=%s status=%s",
+                    type(exc).__name__, result.status_code,
                 )
                 return TelegramSendResult(ok=bool(_send_text(bot, target, text)))
             for chunk in chunks[1:]:
@@ -778,7 +792,17 @@ def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
         photo_kwargs = {"reply_markup": reply_markup} if reply_markup is not None and len(caption_chunks) == 1 else {}
         bot.send_photo(target, image_url, caption=caption_chunks[0], **photo_kwargs)
     except Exception as exc:
-        logger.warning("Telegram 图片发送失败，回退文本 type=%s", type(exc).__name__)
+        result = _telegram_send_error(exc)
+        if not _photo_failure_allows_text_fallback(result):
+            logger.warning(
+                "Telegram 图片发送结果未知，停止文本回退 type=%s status=%s",
+                type(exc).__name__, result.status_code or "-",
+            )
+            return False
+        logger.warning(
+            "Telegram 明确拒绝图片，回退文本 type=%s status=%s",
+            type(exc).__name__, result.status_code,
+        )
         try:
             return _send_text(bot, target, text, reply_markup=reply_markup)
         except Exception as fallback_exc:

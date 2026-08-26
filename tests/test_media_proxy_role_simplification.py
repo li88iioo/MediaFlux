@@ -473,6 +473,7 @@ class MediaProxyRuntimeProfileTests(unittest.TestCase):
         values = {
             "JELLYFIN_URL": "http://127.0.0.1:8096",
             "JELLYFIN_API_KEY": "current-key",
+            "JELLYFIN_ENABLED": "true",
         }
         with patch.object(media_proxy.database, "get_media_proxy_instance", return_value=row), \
              patch.object(profiles.config, "get", side_effect=lambda key, default="": values.get(key, default)), \

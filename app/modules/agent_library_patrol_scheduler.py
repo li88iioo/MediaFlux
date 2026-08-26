@@ -8,6 +8,10 @@ import time
 from typing import Callable
 
 from app import config, database as db
+from app.agent.feature_gate import (
+    agent_runtime_generation_is_current,
+    current_agent_runtime_generation,
+)
 from app.agent.models import ToolResult
 from app.agent.library_patrol_status import serialize_patrol_projection
 from app.agent.library_patrol_progress import (
@@ -142,13 +146,17 @@ class AgentLibraryPatrolScheduler:
             )
             return 0
         try:
-            self._process(job, current=current)
+            self._process(
+                job,
+                current=current,
+                runtime_generation=current_agent_runtime_generation(),
+            )
         except Exception as exc:
             logger.warning("Agent 全库缺集巡检失败 type=%s", type(exc).__name__)
             self._complete_failure(job, current=current, error_type=type(exc).__name__)
         return 1
 
-    def _process(self, job, *, current: str) -> None:
+    def _process(self, job, *, current: str, runtime_generation: int) -> None:
         cycle_as_of = str(job["cycle_as_of"] or "")
         as_of = cycle_as_of or self._clock().date().isoformat()
         arguments = {
@@ -159,6 +167,12 @@ class AgentLibraryPatrolScheduler:
         if cursor:
             arguments["after_tmdb_id"] = cursor
         result, _elapsed_ms = self._audit_executor(arguments)
+        if not agent_runtime_generation_is_current(runtime_generation):
+            db.cancel_agent_library_patrol_lease(
+                next_run_at=current,
+                expected_lease_generation=int(job["lease_generation"]),
+            )
+            return
         _batch_json, batch_projection = serialize_patrol_projection(result)
         previous = load_patrol_progress(job["cycle_accumulator_json"], as_of=as_of)
         merged = merge_patrol_progress(previous, batch_projection)

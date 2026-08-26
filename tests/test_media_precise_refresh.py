@@ -382,7 +382,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertIn("条目读取失败", result["fallback"])
                 self.assertEqual(result["scope"], "skipped")
 
-    def test_item_listing_safety_limit_never_degrades_to_library_refresh(self):
+    def test_item_listing_safety_limit_degrades_to_target_library_refresh(self):
         for label, client in self._clients():
             with self.subTest(server=label):
                 recorder = _RefreshRecorder(client, _folders(), _items())
@@ -398,9 +398,9 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 ):
                     result = client.refresh_for_paths([f"{ROOT}/剧集/作品 A/Season 01"])
 
-                self.assertFalse(result["ok"])
-                self.assertEqual(result["scope"], "skipped")
-                self.assertEqual(recorder.refreshed, [])
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["scope"], "library")
+                self.assertEqual(recorder.refreshed, ["lib-tv"])
                 self.assertEqual(recorder.refresh_all_calls, 0)
 
     def test_paths_outside_every_library_are_safely_skipped(self):

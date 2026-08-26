@@ -1125,6 +1125,12 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
 
 
 class NotificationActionTests(unittest.TestCase):
+    class TelegramPhotoRejected(RuntimeError):
+        result_json = {
+            "error_code": 400,
+            "description": "Bad Request: failed to get HTTP URL content",
+        }
+
     class FakeBot:
         def __init__(self):
             self.messages = []
@@ -1137,7 +1143,7 @@ class NotificationActionTests(unittest.TestCase):
         def send_photo(self, chat_id, image_url, **kwargs):
             self.photos.append((chat_id, image_url, kwargs))
             if self.fail_photo:
-                raise RuntimeError("图片不可用")
+                raise NotificationActionTests.TelegramPhotoRejected("图片不可用")
 
     def setUp(self):
         notifier.reset()

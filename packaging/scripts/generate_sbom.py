@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """从锁定的 Python 依赖清单生成范围明确的 SPDX 2.3 JSON SBOM。"""
 from __future__ import annotations
-import argparse, hashlib, json, re
+import argparse, hashlib, json, os, re
 from datetime import datetime,timezone
 from pathlib import Path
 from typing import Sequence
@@ -15,10 +15,16 @@ def dependencies(files:list[Path])->list[dict[str,str]]:
    m=REQ.match(line)
    if m: result[m.group(1).lower()]={'name':m.group(1),'versionInfo':m.group(3) or 'unspecified'}
  return [result[k] for k in sorted(result)]
-def generate_sbom(files:list[Path],output:Path,namespace:str)->Path:
+def _created_timestamp(source_date_epoch:int|str|None=None)->str:
+ raw=source_date_epoch if source_date_epoch is not None else os.getenv('SOURCE_DATE_EPOCH','')
+ try: timestamp=int(raw) if str(raw).strip() else None
+ except (TypeError,ValueError) as exc: raise ValueError('SOURCE_DATE_EPOCH must be an integer') from exc
+ moment=datetime.fromtimestamp(timestamp,timezone.utc) if timestamp is not None else datetime.now(timezone.utc)
+ return moment.replace(microsecond=0).isoformat().replace('+00:00','Z')
+def generate_sbom(files:list[Path],output:Path,namespace:str,source_date_epoch:int|str|None=None)->Path:
  packages=[]
  for index,item in enumerate(dependencies(files),1): packages.append({'SPDXID':f'SPDXRef-Package-{index}','name':item['name'],'versionInfo':item['versionInfo'],'downloadLocation':'NOASSERTION','filesAnalyzed':False,'licenseConcluded':'NOASSERTION','licenseDeclared':'NOASSERTION'})
- payload={'spdxVersion':'SPDX-2.3','dataLicense':'CC0-1.0','SPDXID':'SPDXRef-DOCUMENT','name':'MediaFlux locked Python dependencies','documentNamespace':namespace,'creationInfo':{'created':datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00','Z'),'creators':['Tool: MediaFlux-generate_sbom']},'packages':packages}
+ payload={'spdxVersion':'SPDX-2.3','dataLicense':'CC0-1.0','SPDXID':'SPDXRef-DOCUMENT','name':'MediaFlux locked Python dependencies','documentNamespace':namespace,'creationInfo':{'created':_created_timestamp(source_date_epoch),'creators':['Tool: MediaFlux-generate_sbom']},'packages':packages}
  output.write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n',encoding='utf-8'); return output
 def main(argv:Sequence[str]|None=None)->int:
  p=argparse.ArgumentParser(description=__doc__); p.add_argument('requirements',nargs='+',type=Path); p.add_argument('--output',type=Path,required=True); p.add_argument('--namespace',default='https://mediaflux.invalid/sbom/development'); a=p.parse_args(argv); print(generate_sbom(a.requirements,a.output,a.namespace)); return 0

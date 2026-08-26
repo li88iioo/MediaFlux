@@ -44,7 +44,9 @@ class FakeCurlSession:
         self.cookies = {}
 
     def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
+        recorded = dict(kwargs)
+        recorded["curl_options"] = dict(getattr(self, "curl_options", {}))
+        self.calls.append((url, recorded))
         return self.responses.pop(0)
 
     def close(self):
@@ -190,6 +192,12 @@ class IndexerHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options["headers"]["Host"], "www.btbtlb.com")
         self.assertEqual(options["impersonate"], "chrome")
         self.assertFalse(options["allow_redirects"] )
+        from curl_cffi.const import CurlOpt
+        self.assertEqual(
+            options["curl_options"][CurlOpt.RESOLVE],
+            ["btbtlb.com:443:93.184.216.34"],
+        )
+        self.assertNotIn(CurlOpt.RESOLVE, session.curl_options)
         self.assertEqual(response.body, b"ok")
 
     async def test_browser_client_rejects_unregistered_sni_host(self):

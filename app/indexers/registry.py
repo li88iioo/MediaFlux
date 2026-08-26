@@ -57,14 +57,17 @@ def build_default_registry(
     # nyaa.si 会按来源 IP 限流；nyaa.net 为同引擎镜像，主站失败时回落。
     nyaa_http = supplied.get("nyaa") or FixedHostHttpClient(
         allowed_hosts={"nyaa.si", "nyaa.net"}, user_agent=user_agent,
+        pin_resolved_address=True,
     )
     sukebei_http = supplied.get("sukebei") or FixedHostHttpClient(
         allowed_hosts={"sukebei.nyaa.si"},
         user_agent=user_agent,
+        pin_resolved_address=True,
     )
     mikan_http = supplied.get("mikan") or FixedHostHttpClient(
         allowed_hosts={"mikanani.me", "mikanime.tv"},
         user_agent=user_agent,
+        pin_resolved_address=True,
         # Mikan 搜索页内嵌全部剧集条目，热门作品实测 4MiB+，默认 2MiB 会截断。
         max_response_bytes=8 * 1024 * 1024,
     )
@@ -75,6 +78,7 @@ def build_default_registry(
     onelou_http = supplied.get("1lou") or FixedHostHttpClient(
         allowed_hosts={"www.1lou.me", "1lou.me", "www.1lou.pro", "1lou.pro"},
         user_agent=user_agent,
+        pin_resolved_address=True,
     )
     google_http = None
     if onelou_google_enabled:
@@ -82,6 +86,7 @@ def build_default_registry(
             allowed_hosts={"www.google.com"},
             user_agent=user_agent,
             max_redirects=0,
+            pin_resolved_address=True,
         )
     animetosho_http = supplied.get("animetosho") or FixedHostHttpClient(
         allowed_hosts={
@@ -90,10 +95,12 @@ def build_default_registry(
             "animetosho.org",
         },
         user_agent=user_agent,
+        pin_resolved_address=True,
     )
     tpb_http = supplied.get("tpb") or FixedHostHttpClient(
         allowed_hosts={"apibay.org"},
         user_agent=user_agent,
+        pin_resolved_address=True,
     )
     return IndexerRegistry(
         {

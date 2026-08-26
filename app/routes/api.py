@@ -690,10 +690,12 @@ def test_telegram_message(request: Request, data: Any = Body(default=None)):
     chat_id = str(data.get("chat_id") or "").strip()
     # 密钥字段保存后不会回填真实值，前端会提交空字符串或脱敏占位符。
     # 两种情况都应测试当前已保存的 Bot Token；有新输入时仍优先使用新值。
-    if not token or token == "********":
-        token = config.get("TG_BOT_TOKEN", "").strip()
-    if not chat_id:
-        chat_id = config.get("TG_CHAT_ID", "").strip()
+    if not token or token == "********" or not chat_id:
+        saved = config.get_many(("TG_BOT_TOKEN", "TG_CHAT_ID"))
+        if not token or token == "********":
+            token = saved["TG_BOT_TOKEN"].strip()
+        if not chat_id:
+            chat_id = saved["TG_CHAT_ID"].strip()
     if not token or ":" not in token:
         return api_error("请输入有效的 Bot Token", 400)
     if not chat_id or len(chat_id) > 64:
@@ -1413,11 +1415,15 @@ def save_config(request: Request, data: Any = Body(default=None)):
             logger.warning(
                 "Telegram Bot 命令菜单后台刷新失败 type=%s", type(exc).__name__
             )
-    if "AGENT_ENABLED" in changed_keys and background_services_enabled:
+    if "AGENT_ENABLED" in changed_keys:
         try:
-            from app.modules.agent_runtime import request_agent_runtime_reconcile
+            from app.agent.feature_gate import invalidate_agent_runtime_generation
 
-            request_agent_runtime_reconcile()
+            invalidate_agent_runtime_generation()
+            if background_services_enabled:
+                from app.modules.agent_runtime import request_agent_runtime_reconcile
+
+                request_agent_runtime_reconcile()
         except Exception as exc:
             logger.warning(
                 "Agent 总开关后台热更新启动失败 type=%s", type(exc).__name__

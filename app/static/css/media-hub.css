@@ -1407,9 +1407,9 @@
 .media-hub-page .media-hub-filter-reset span { display: none; }
 
 /* Stable async result plane: old content remains until the filtered grid is ready. */
-.media-hub-page .media-recent-shell { view-transition-name: media-recent-results; }
-.media-hub-page .media-recent-shell.is-updating { cursor: progress; }
-.media-hub-page .media-recent-shell.is-updating .media-recent-grid { opacity: .68; }
+.media-hub-page [data-media-recent-results] { view-transition-name: media-recent-results; }
+.media-hub-page [data-media-recent-results].is-updating { cursor: progress; }
+.media-hub-page [data-media-recent-results].is-updating .media-recent-grid { opacity: .68; }
 .media-hub-page .media-recent-grid { transition: opacity .16s ease; }
 @media (prefers-reduced-motion: reduce) {
     .media-hub-page .media-recent-grid { transition: none; }

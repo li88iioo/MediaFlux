@@ -9,6 +9,10 @@ from typing import Callable
 from app import database as db
 from app.agent.episode_audit import invalidate_episode_audit_cache
 from app.agent.models import ToolResult
+from app.agent.feature_gate import (
+    agent_runtime_generation_is_current,
+    current_agent_runtime_generation,
+)
 from app.agent.owner_routes import (
     parse_telegram_owner_route,
     telegram_owner_route_is_currently_authorized,
@@ -102,10 +106,43 @@ class DownloadLibraryVerificationScheduler:
             "notifications_enabled": self._notifications_enabled(),
         }
 
+    def _runtime_allows(self, generation: int) -> bool:
+        return bool(
+            not self._stop_event.is_set()
+            and agent_runtime_generation_is_current(generation)
+        )
+
+    @staticmethod
+    def _release_verification_job(
+        job,
+        *,
+        current: str,
+        attempts: int | None = None,
+        last_checked_at=None,
+    ) -> bool:
+        """无损释放尚未发布终态的核验租约。"""
+        return db.update_agent_download_verification(
+            int(job["request_id"]),
+            status="pending",
+            result=str(job["result"] or ""),
+            attempts=int(job["attempts"] or 0) if attempts is None else max(0, int(attempts)),
+            next_check_at=current,
+            last_checked_at=(
+                job["last_checked_at"]
+                if last_checked_at is None else last_checked_at
+            ),
+            expected_lease_generation=int(job["lease_generation"]),
+        )
+
     def run_once(self, *, limit: int = 10) -> int:
+        runtime_generation = current_agent_runtime_generation()
+        if not self._runtime_allows(runtime_generation):
+            return 0
         self._maybe_purge_expired_history()
         processed = 0
         for _ in range(max(1, min(int(limit), 100))):
+            if not self._runtime_allows(runtime_generation):
+                break
             current = self._now()
             stale_before = self._format(
                 self._clock() - timedelta(seconds=_RUNNING_LEASE_SECONDS)
@@ -116,17 +153,32 @@ class DownloadLibraryVerificationScheduler:
             )
             if job is None:
                 break
+            if not self._runtime_allows(runtime_generation):
+                self._release_verification_job(job, current=current)
+                break
             try:
-                self._process(job, current=current)
+                self._process(
+                    job,
+                    current=current,
+                    runtime_generation=runtime_generation,
+                )
             except Exception as exc:
                 logger.warning(
                     "Agent 下载后媒体库复核任务恢复 type=%s",
                     type(exc).__name__,
                 )
-                self._recover_claimed_job(job, current=current)
+                if self._runtime_allows(runtime_generation):
+                    self._recover_claimed_job(job, current=current)
+                else:
+                    self._release_verification_job(job, current=current)
             processed += 1
         for _ in range(max(1, min(int(limit), 10))):
-            if self.dispatch_notification_once() == 0:
+            if (
+                not self._runtime_allows(runtime_generation)
+                or self.dispatch_notification_once(
+                    runtime_generation=runtime_generation
+                ) == 0
+            ):
                 break
         return processed
 
@@ -177,11 +229,17 @@ class DownloadLibraryVerificationScheduler:
         if total:
             logger.info("Agent 持久任务历史已清理 rows=%s", total)
 
-    def _process(self, job, *, current: str) -> None:
+    def _process(self, job, *, current: str, runtime_generation: int) -> None:
         request_id = int(job["request_id"])
         attempts = max(0, int(job["attempts"] or 0))
         result = str(job["result"] or "")
+        if not self._runtime_allows(runtime_generation):
+            self._release_verification_job(job, current=current)
+            return
         request = db.get_download_request(request_id)
+        if not self._runtime_allows(runtime_generation):
+            self._release_verification_job(job, current=current)
+            return
         if request is None:
             self._finish(
                 job,
@@ -205,6 +263,9 @@ class DownloadLibraryVerificationScheduler:
 
         record = self._record(job, target=target)
         status_result = build_recent_download_status(record, position=1)
+        if not self._runtime_allows(runtime_generation):
+            self._release_verification_job(job, current=current)
+            return
         status_data = status_result.data if isinstance(status_result.data, dict) else {}
         phase = str(status_data.get("phase") or "unknown")
         if phase in _ACTIVE_PHASES:
@@ -253,6 +314,9 @@ class DownloadLibraryVerificationScheduler:
         }
         if verification.library_name:
             arguments["library_name"] = verification.library_name
+        if not self._runtime_allows(runtime_generation):
+            self._release_verification_job(job, current=current)
+            return
         attempts += 1
         # 在调用媒体服务前先持久化尝试次数；即使进程中止，重启后的
         # running 恢复也不会绕过最大尝试预算。
@@ -290,6 +354,15 @@ class DownloadLibraryVerificationScheduler:
                 type(exc).__name__,
             )
             verification_result = "inconclusive"
+
+        if not self._runtime_allows(runtime_generation):
+            self._release_verification_job(
+                job,
+                current=current,
+                attempts=max(0, attempts - 1),
+                last_checked_at=job["last_checked_at"],
+            )
+            return
 
         if verification_result == "visible":
             self._finish(
@@ -437,9 +510,15 @@ class DownloadLibraryVerificationScheduler:
                 type(exc).__name__,
             )
 
-    def dispatch_notification_once(self) -> int:
+    def dispatch_notification_once(self, *, runtime_generation: int | None = None) -> int:
         """投递一条到期通知；失败进入持久退避，不影响核验终态。"""
+        generation_guard = (
+            current_agent_runtime_generation()
+            if runtime_generation is None else int(runtime_generation)
+        )
         with self._notification_gate:
+            if not self._runtime_allows(generation_guard):
+                return 0
             if not self._notifications_enabled():
                 db.discard_agent_download_verification_notifications()
                 return 0
@@ -455,6 +534,13 @@ class DownloadLibraryVerificationScheduler:
                 return 0
             notification_id = int(item["id"])
             generation = int(item["lease_generation"])
+            if not self._runtime_allows(generation_guard):
+                db.release_agent_download_verification_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    next_attempt_at=current,
+                )
+                return 0
             if not self._notifications_enabled():
                 db.discard_agent_download_verification_notification(
                     notification_id,
@@ -491,6 +577,13 @@ class DownloadLibraryVerificationScheduler:
                     error_type="AuthorizationRevoked",
                 )
                 return 1
+            if not self._runtime_allows(generation_guard):
+                db.release_agent_download_verification_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    next_attempt_at=current,
+                )
+                return 0
             try:
                 sent = bool(
                     self._terminal_notifier(
@@ -504,7 +597,14 @@ class DownloadLibraryVerificationScheduler:
                     "Agent 下载后媒体库复核通知失败 type=%s",
                     type(exc).__name__,
                 )
-                self._retry_notification(item, error_type=type(exc).__name__)
+                if self._runtime_allows(generation_guard):
+                    self._retry_notification(item, error_type=type(exc).__name__)
+                else:
+                    db.release_agent_download_verification_notification(
+                        notification_id,
+                        expected_lease_generation=generation,
+                        next_attempt_at=current,
+                    )
                 return 1
             if sent:
                 db.complete_agent_download_verification_notification(
@@ -513,7 +613,14 @@ class DownloadLibraryVerificationScheduler:
                     sent_at=current,
                 )
             else:
-                self._retry_notification(item, error_type="DeliveryFailed")
+                if self._runtime_allows(generation_guard):
+                    self._retry_notification(item, error_type="DeliveryFailed")
+                else:
+                    db.release_agent_download_verification_notification(
+                        notification_id,
+                        expected_lease_generation=generation,
+                        next_attempt_at=current,
+                    )
             return 1
 
     def _retry_notification(self, item, *, error_type: str) -> None:

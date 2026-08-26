@@ -2148,6 +2148,21 @@ def _run_schema_savepoint(
         raise
 
 
+def _execute_schema_script(conn: sqlite3.Connection, script: str) -> None:
+    """逐语句执行 schema，使外层 SAVEPOINT 能真正覆盖全部 DDL。"""
+    buffer = ""
+    for line in str(script or "").splitlines(keepends=True):
+        buffer += line
+        if not sqlite3.complete_statement(buffer):
+            continue
+        statement = buffer.strip()
+        buffer = ""
+        if statement:
+            conn.execute(statement)
+    if buffer.strip():
+        raise sqlite3.OperationalError("数据库 schema 包含不完整 SQL")
+
+
 def _database_has_user_schema(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master "
@@ -2294,7 +2309,10 @@ def init_db() -> None:
                 _migrate_agent_session_context_v2(connection)
 
             _run_schema_savepoint(conn, operation=prepare_legacy_schema)
-            conn.executescript(_SCHEMA)
+            _run_schema_savepoint(
+                conn,
+                operation=lambda connection: _execute_schema_script(connection, _SCHEMA),
+            )
             conn.execute(
                 "UPDATE agent_rate_limit_buckets SET expires_at="
                 "MAX(window_start + 120, ?) WHERE expires_at<=0",
@@ -2571,15 +2589,17 @@ def init_db() -> None:
             )
             conn.execute(
                 "UPDATE agent_download_verification_notification_outbox "
-                "SET status='retry_wait',lease_generation=lease_generation+1,"
-                "next_attempt_at=?,updated_at=? WHERE status='sending'",
-                (timestamp, timestamp),
+                "SET status='discarded',lease_generation=lease_generation+1,"
+                "payload_json='',last_error_type='DeliveryOutcomeUnknown',updated_at=? "
+                "WHERE status='sending'",
+                (timestamp,),
             )
             conn.execute(
                 "UPDATE agent_library_patrol_notification_outbox "
-                "SET status='retry_wait',lease_generation=lease_generation+1,"
-                "next_attempt_at=?,updated_at=? WHERE status='sending'",
-                (timestamp, timestamp),
+                "SET status='discarded',lease_generation=lease_generation+1,"
+                "payload_json='',last_error_type='DeliveryOutcomeUnknown',updated_at=? "
+                "WHERE status='sending'",
+                (timestamp,),
             )
             conn.execute(
                 "UPDATE rss_entries SET status='failed', processed=0, processed_at=NULL, "
@@ -3613,6 +3633,7 @@ from app.repositories.agent_download_verification import (  # noqa: E402
     finish_agent_download_verification,
     get_agent_download_verification,
     list_agent_download_verification_notifications,
+    release_agent_download_verification_notification,
     retry_agent_download_verification_notification,
     renew_agent_download_verification_lease,
     update_agent_download_verification,
@@ -3862,6 +3883,7 @@ from app.repositories.agent_jobs import (  # noqa: E402
     get_agent_job,
     is_agent_job_cancel_requested,
     list_agent_jobs,
+    release_agent_job_lease,
     renew_agent_job_lease,
 )
 

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from app import database as db
 from app.agent.models import ToolResult
+from app.agent.feature_gate import invalidate_agent_runtime_generation
 from app.agent.recent_download_submissions import (
     RecentDownloadSubmission,
     RecentDownloadVerification,
@@ -498,6 +499,97 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(scheduler.run_once(), 0)
         self.assertEqual(notifier.call_count, 1)
 
+    def test_runtime_invalidation_stops_remaining_verification_batch(self):
+        first_id = self._request("generation-batch-first")
+        second_id = self._request("generation-batch-second")
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE agent_download_verifications SET last_checked_at=?",
+                ("2026-08-03 11:59:00",),
+            )
+
+        def audit_then_disable(_arguments):
+            invalidate_agent_runtime_generation()
+            return _audit_visible(), 1
+
+        executor = Mock(side_effect=audit_then_disable)
+        scheduler = DownloadLibraryVerificationScheduler(
+            audit_executor=executor,
+            clock=self.clock,
+        )
+
+        self.assertEqual(scheduler.run_once(limit=2), 1)
+
+        first = db.get_agent_download_verification(first_id)
+        second = db.get_agent_download_verification(second_id)
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(first["attempts"], 0)
+        self.assertEqual(second["status"], "pending")
+        self.assertEqual(second["lease_generation"], 0)
+        executor.assert_called_once()
+
+    def test_stop_during_audit_releases_job_without_terminal_notification(self):
+        request_id = self._request("stop-during-audit", owner=_TG_OWNER)
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE agent_download_verifications SET last_checked_at=? WHERE request_id=?",
+                ("2026-08-03 11:59:00", request_id),
+            )
+        notifier = Mock(return_value=True)
+        scheduler = DownloadLibraryVerificationScheduler(
+            terminal_notifier=notifier,
+            clock=self.clock,
+        )
+
+        def audit_then_stop(_arguments):
+            scheduler.stop(timeout=0)
+            return _audit_visible(), 1
+
+        scheduler._audit_executor = Mock(side_effect=audit_then_stop)
+
+        self.assertEqual(scheduler.run_once(), 1)
+
+        row = db.get_agent_download_verification(request_id)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["attempts"], 0)
+        self.assertEqual(db.list_agent_download_verification_notifications(), [])
+        notifier.assert_not_called()
+
+    def test_stop_during_failed_notification_releases_without_retry_budget(self):
+        request_id = self._request("stop-during-notify", owner=_TG_OWNER)
+        job = db.claim_due_agent_download_verification(
+            current_time="2026-08-03 12:00:00"
+        )
+        scheduler = DownloadLibraryVerificationScheduler(
+            audit_executor=Mock(),
+            clock=self.clock,
+        )
+        scheduler._finish(
+            job,
+            status="attention",
+            result="missing",
+            attempts=1,
+            current="2026-08-03 12:00:00",
+        )
+
+        def notify_then_stop(**_payload):
+            scheduler.stop(timeout=0)
+            return False
+
+        scheduler._terminal_notifier = Mock(side_effect=notify_then_stop)
+        scheduler._notification_enabled_override = True
+        with patch(
+            "app.modules.agent_download_verification_scheduler."
+            "telegram_owner_route_is_currently_authorized",
+            return_value=True,
+        ):
+            self.assertEqual(scheduler.dispatch_notification_once(), 1)
+
+        item = db.list_agent_download_verification_notifications()[0]
+        self.assertEqual(item["status"], "retry_wait")
+        self.assertEqual(item["attempts"], 0)
+        self.assertEqual(item["last_error_type"], "")
+
     def test_missing_retries_then_visible(self):
         request_id = self._request("retry-auto-verify")
         executor = Mock(side_effect=[(_audit_missing(), 2), (_audit_visible(), 2)])
@@ -651,7 +743,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(queued[0]["payload_json"], "")
         self.assertEqual(queued[0]["last_error_type"], "InvalidRoute")
         notifier.assert_not_called()
-    def test_stale_sending_notification_is_reclaimed_after_restart(self):
+    def test_stale_sending_notification_is_discarded_after_unknown_delivery(self):
         request_id = self._request("notify-restart-auto-verify", owner=_TG_OWNER)
         job = db.claim_due_agent_download_verification(
             current_time="2026-08-03 12:00:00"
@@ -680,21 +772,15 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
             )
 
         self.clock.value = datetime(2026, 8, 3, 12, 6, 0)
-        self.assertEqual(scheduler.dispatch_notification_once(), 1)
-        scheduler._terminal_notifier.assert_called_once_with(
-            owner=_TG_OWNER,
-            chat_id=_TG_CHAT_ID,
-            title="The Show",
-            season=2,
-            episode=3,
-            status="attention",
-            result="missing",
-            attempts=2,
+        self.assertEqual(scheduler.dispatch_notification_once(), 0)
+        scheduler._terminal_notifier.assert_not_called()
+        discarded = db.list_agent_download_verification_notifications()[0]
+        self.assertEqual(discarded["status"], "discarded")
+        self.assertEqual(discarded["payload_json"], "")
+        self.assertEqual(discarded["last_error_type"], "DeliveryOutcomeUnknown")
+        self.assertGreater(
+            int(discarded["lease_generation"]), int(claimed["lease_generation"])
         )
-        sent = db.list_agent_download_verification_notifications()[0]
-        self.assertEqual(sent["status"], "sent")
-        self.assertEqual(sent["payload_json"], "")
-        self.assertGreater(int(sent["lease_generation"]), int(claimed["lease_generation"]))
 
     def test_pre_audit_exception_is_rescheduled_and_secret_is_not_logged(self):
         request_id = self._request("exception-auto-verify", phase="downloading")

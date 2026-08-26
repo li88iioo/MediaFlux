@@ -33,16 +33,16 @@
 <div class="download-layout">
     <section class="card card-pad download-panel">
         <div class="dl-tab-header">
-            <div class="dl-tab-bar">
-                <button type="button" class="dl-tab-btn active" id="tabTasksBtn" onclick="switchDlTab('tasks')">
+            <div class="dl-tab-bar" role="tablist" aria-label="下载视图">
+                <button type="button" class="dl-tab-btn active" id="tabTasksBtn" role="tab" aria-selected="true" aria-controls="viewTasks" tabindex="0" data-download-tab="tasks" onclick="switchDlTab('tasks')">
                     <i data-lucide="zap"></i><span>实时任务</span>
                     <span class="dl-tab-badge" id="tabTasksBadge">0</span>
                 </button>
-                <button type="button" class="dl-tab-btn" id="tabIssuesBtn" onclick="switchDlTab('issues')">
+                <button type="button" class="dl-tab-btn" id="tabIssuesBtn" role="tab" aria-selected="false" aria-controls="viewIssues" tabindex="-1" data-download-tab="issues" onclick="switchDlTab('issues')">
                     <i data-lucide="circle-alert"></i><span>待处理</span>
                     <span class="dl-tab-badge" id="tabIssuesBadge">0</span>
                 </button>
-                <button type="button" class="dl-tab-btn" id="tabLogsBtn" onclick="switchDlTab('logs')">
+                <button type="button" class="dl-tab-btn" id="tabLogsBtn" role="tab" aria-selected="false" aria-controls="viewLogs" tabindex="-1" data-download-tab="logs" onclick="switchDlTab('logs')">
                     <i data-lucide="history"></i><span>下载日志</span>
                     <span class="dl-tab-badge" id="tabLogsBadge">0</span>
                 </button>
@@ -59,7 +59,7 @@
         </div>
 
         <!-- 实时任务 Tab 视图 -->
-        <div id="viewTasks">
+        <div id="viewTasks" role="tabpanel" aria-labelledby="tabTasksBtn">
             <div class="qb-task-toolbar" id="qbTaskToolbar" aria-label="qBittorrent 批量任务操作">
                 <label class="qb-select-all" for="qbSelectAll">
                     <input id="qbSelectAll" type="checkbox" aria-label="全选实时任务">
@@ -89,7 +89,7 @@
         </div>
 
         <!-- 下载及后处理异常 Tab 视图 -->
-        <div id="viewIssues" style="display:none;">
+        <div id="viewIssues" role="tabpanel" aria-labelledby="tabIssuesBtn" hidden>
             <div class="download-batch-toolbar" id="issueBatchToolbar" aria-label="待处理批量操作">
                 <label class="download-batch-select-all" for="issueSelectAll">
                     <input id="issueSelectAll" type="checkbox" aria-label="全选本页待处理请求">
@@ -127,7 +127,7 @@
         </div>
 
         <!-- 下载日志 Tab 视图 -->
-        <div id="viewLogs" style="display:none;">
+        <div id="viewLogs" role="tabpanel" aria-labelledby="tabLogsBtn" hidden>
             <div class="download-batch-toolbar" id="logBatchToolbar" aria-label="下载日志批量操作">
                 <label class="download-batch-select-all" for="logSelectAll">
                     <input id="logSelectAll" type="checkbox" aria-label="全选本页下载日志">
@@ -173,5 +173,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/downloads.js') }}?v=20260820a"></script>
+<script src="{{ url_for('static', path='js/downloads.js') }}?v=20260826a"></script>
 {% endblock %}

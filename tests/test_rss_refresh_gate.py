@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+import socket
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+import httpx
 
 from app import database as db
 from app.bot import handlers
@@ -16,6 +18,8 @@ from app.modules.rss import (
     MikanParser,
     RSSEngine,
     rss_subscription_refresh_revision,
+    validate_rss_source_url,
+    validate_rss_source_urls,
 )
 from app.modules.rss_scheduler import RSSScheduler
 from tests.support import IsolatedDatabaseTestCase
@@ -270,7 +274,7 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
 
     def test_parser_logs_do_not_expose_private_feed_url_or_exception(self):
         private_url = "https://secret.invalid/rss?passkey=RSS_SECRET"
-        with patch("app.modules.rss.requests.get", side_effect=RuntimeError(
+        with patch("app.modules.rss._fetch_rss_payload", side_effect=RuntimeError(
             "failed https://secret.invalid/rss?passkey=RSS_SECRET"
         )), self.assertLogs("app.modules.rss", level="ERROR") as captured:
             self.assertEqual(MikanParser().parse(private_url), [])
@@ -281,27 +285,80 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             self.assertNotIn(secret, serialized)
 
     def test_parser_uses_bounded_http_timeouts(self):
-        response = Mock()
-        response.__enter__ = Mock(return_value=response)
-        response.__exit__ = Mock(return_value=False)
-        response.raise_for_status = Mock()
-        response.iter_content = Mock(return_value=[b"<rss><channel></channel></rss>"])
-        response.headers = {"content-type": "application/rss+xml"}
-        response.url = "https://example.invalid/feed"
+        observed = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed["url"] = str(request.url)
+            observed["host"] = request.headers.get("Host")
+            observed["sni"] = request.extensions.get("sni_hostname")
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/rss+xml"},
+                content=b"<rss><channel></channel></rss>",
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        source_url = "https://example.invalid/feed"
         parsed = SimpleNamespace(bozo=False, entries=[])
 
-        with patch("app.modules.rss.requests.get", return_value=response) as get, patch(
+        with patch(
+            "app.modules.rss.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+        ), patch("app.modules.rss.httpx.Client", return_value=client) as client_factory, patch(
             "app.modules.rss.feedparser.parse", return_value=parsed
         ) as parse:
-            self.assertEqual(MikanParser().parse(response.url), [])
+            self.assertEqual(MikanParser().parse(source_url), [])
 
-        get.assert_called_once_with(
-            response.url,
-            headers={"User-Agent": MikanParser.USER_AGENT},
-            timeout=(10, 30),
-            stream=True,
-        )
+        options = client_factory.call_args.kwargs
+        self.assertEqual(options["timeout"].connect, 10)
+        self.assertEqual(options["timeout"].read, 30)
+        self.assertFalse(options["follow_redirects"])
+        self.assertFalse(options["trust_env"])
+        self.assertEqual(options["headers"]["User-Agent"], MikanParser.USER_AGENT)
+        self.assertEqual(observed["url"], "https://93.184.216.34/feed")
+        self.assertEqual(observed["host"], "example.invalid")
+        self.assertEqual(observed["sni"], "example.invalid")
         parse.assert_called_once()
+
+    def test_source_validation_rejects_http_private_hosts_credentials_and_oversized_lists(self):
+        rejected = (
+            "http://example.com/feed",
+            "https://127.0.0.1/feed",
+            "https://user:secret@example.com/feed",
+            "https://example.com/feed#private",
+            "https://example.com:8443/feed",
+        )
+        for url in rejected:
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                validate_rss_source_url(url)
+
+        with self.assertRaisesRegex(ValueError, "最多配置 20"):
+            validate_rss_source_urls("\n".join(
+                f"https://example.com/feed/{index}" for index in range(21)
+            ))
+
+    def test_parser_revalidates_redirect_target_before_following(self):
+        requests_seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_seen.append(str(request.url))
+            return httpx.Response(
+                302,
+                headers={"Location": "https://127.0.0.1/private-feed"},
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        source_url = "https://example.invalid/feed"
+
+        with patch(
+            "app.modules.rss.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+        ), patch("app.modules.rss.httpx.Client", return_value=client):
+            parser = MikanParser()
+            self.assertEqual(parser.parse(source_url), [])
+
+        self.assertEqual(parser.last_error_code, "fetch_failed")
+        self.assertEqual(requests_seen, ["https://93.184.216.34/feed"])
 
     def test_auto_download_preserves_unknown_outcome_summary(self):
         sid = self._subscription("auto-unknown")

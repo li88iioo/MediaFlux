@@ -9,21 +9,24 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 import secrets
+import socket
 import threading
 import unicodedata
-from urllib.parse import unquote, urlsplit
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import unquote, urljoin, urlsplit
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 import feedparser
-import requests
+import httpx
 
 from app import database as db
-from app.config import get, get_bool
+from app.config import get, get_bool, get_many
 from app.logger import get_logger
 from app.modules.media_identity import build_media_key, parse_episode_label
 from app.indexers.providers.base import magnet_infohash
@@ -37,6 +40,138 @@ _RSS_REFRESHING_SUBSCRIPTIONS: set[int] = set()
 _RSS_CONNECT_TIMEOUT_SECONDS = 10
 _RSS_READ_TIMEOUT_SECONDS = 30
 _RSS_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_RSS_MAX_SOURCE_URLS = 20
+_RSS_MAX_SOURCE_URL_LENGTH = 2048
+_RSS_MAX_SOURCE_TOTAL_LENGTH = 16 * 1024
+_RSS_MAX_REDIRECTS = 3
+
+
+def validate_rss_source_url(value: str, *, resolve: bool = False) -> str:
+    """校验 RSS 上游边界；网络请求前必须启用公网 DNS 校验。"""
+    normalized = str(value or "").strip()
+    if not normalized or len(normalized) > _RSS_MAX_SOURCE_URL_LENGTH:
+        raise ValueError("RSS URL 长度无效")
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or (parsed.port or 443) != 443
+    ):
+        raise ValueError("RSS URL 仅支持不含凭据和片段的 HTTPS 地址")
+    host = parsed.hostname.rstrip(".").lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
+        raise ValueError("RSS URL 不允许访问本机或内网地址")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and not literal.is_global:
+        raise ValueError("RSS URL 不允许访问本机或内网地址")
+    if resolve:
+        _resolve_public_rss_addresses(host)
+    return normalized
+
+
+def _resolve_public_rss_addresses(
+    host: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """解析并返回稳定排序的公网地址；调用方必须把连接固定到返回值。"""
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    try:
+        addresses = {
+            literal
+        } if literal is not None else {
+            ipaddress.ip_address(record[4][0].split("%", 1)[0])
+            for record in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        }
+    except (OSError, socket.gaierror, IndexError, TypeError, ValueError) as exc:
+        raise ValueError("RSS URL 域名解析失败") from exc
+    if not addresses or any(address is None or not address.is_global for address in addresses):
+        raise ValueError("RSS URL 不允许访问本机或内网地址")
+    return sorted(
+        (address for address in addresses if address is not None),
+        key=lambda address: (address.version, str(address)),
+    )
+
+
+def _pinned_rss_request_target(url: str) -> tuple[str, httpx.URL, dict[str, str], dict]:
+    """返回逻辑 URL 与固定公网 IP 的实际请求参数，消除 DNS 重绑定窗口。"""
+    logical_url = validate_rss_source_url(url)
+    parsed = httpx.URL(logical_url)
+    host = str(parsed.host or "").rstrip(".").lower()
+    address = _resolve_public_rss_addresses(host)[0]
+    request_url = parsed.copy_with(host=str(address))
+    return logical_url, request_url, {"Host": host}, {"sni_hostname": host}
+
+
+def _fetch_rss_payload(url: str, *, user_agent: str) -> tuple[bytes, dict[str, str]]:
+    """通过固定地址 transport 拉取 RSS；每个重定向跳点都重新校验并固定。"""
+    current_url = validate_rss_source_url(url)
+    timeout = httpx.Timeout(
+        _RSS_READ_TIMEOUT_SECONDS,
+        connect=_RSS_CONNECT_TIMEOUT_SECONDS,
+    )
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+        headers={"User-Agent": user_agent},
+    ) as client:
+        for redirect_count in range(_RSS_MAX_REDIRECTS + 1):
+            logical_url, request_url, request_headers, extensions = (
+                _pinned_rss_request_target(current_url)
+            )
+            with client.stream(
+                "GET",
+                request_url,
+                headers=request_headers,
+                extensions=extensions,
+            ) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = str(response.headers.get("Location") or "").strip()
+                    if not location or redirect_count >= _RSS_MAX_REDIRECTS:
+                        raise ValueError("RSS 重定向无效或超过上限")
+                    current_url = validate_rss_source_url(
+                        urljoin(logical_url, location)
+                    )
+                    continue
+                response.raise_for_status()
+                declared_size = response.headers.get("Content-Length")
+                if declared_size:
+                    try:
+                        declared_bytes = int(declared_size)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("RSS 响应长度无效") from exc
+                    if declared_bytes < 0 or declared_bytes > _RSS_MAX_RESPONSE_BYTES:
+                        raise ValueError("RSS 响应体过大")
+                payload = bytearray()
+                for chunk in response.iter_bytes():
+                    if not chunk:
+                        continue
+                    payload.extend(chunk)
+                    if len(payload) > _RSS_MAX_RESPONSE_BYTES:
+                        raise ValueError("RSS 响应体过大")
+                headers = {str(key): str(value) for key, value in response.headers.items()}
+                headers.setdefault("content-location", logical_url)
+                return bytes(payload), headers
+    raise ValueError("RSS 重定向超过上限")
+
+
+def validate_rss_source_urls(value: str) -> str:
+    """规范化订阅 URL 列表并限制单订阅的网络工作量。"""
+    raw = str(value or "").strip()
+    if not raw or len(raw) > _RSS_MAX_SOURCE_TOTAL_LENGTH:
+        raise ValueError("RSS URL 列表为空或过长")
+    urls = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not urls or len(urls) > _RSS_MAX_SOURCE_URLS:
+        raise ValueError(f"每个订阅最多配置 {_RSS_MAX_SOURCE_URLS} 个 RSS URL")
+    return "\n".join(validate_rss_source_url(url) for url in urls)
 
 
 def rss_subscription_refresh_revision(subscription) -> str:
@@ -82,14 +217,19 @@ def _release_rss_refresh(sub_id: int) -> None:
 
 def capture_rss_qb_runtime_config() -> tuple[dict, str]:
     """冻结一次 RSS → qB 提交所需的运行时配置。"""
+    keys = (
+        "QB_URL", "QB_USERNAME", "QB_PASSWORD", "QB_API_KEY",
+        "RSS_QB_CATEGORY", "RSS_QB_SAVE_PATH", "RSS_DOWNLOAD_METHOD",
+    )
+    values = get_many(keys, {"RSS_DOWNLOAD_METHOD": "qb"})
     runtime = {
-        "url": str(get("QB_URL", "") or "").strip(),
-        "username": str(get("QB_USERNAME", "") or ""),
-        "password": str(get("QB_PASSWORD", "") or ""),
-        "api_key": str(get("QB_API_KEY", "") or ""),
-        "category": str(get("RSS_QB_CATEGORY", "") or ""),
-        "default_save_path": str(get("RSS_QB_SAVE_PATH", "") or ""),
-        "default_method": str(get("RSS_DOWNLOAD_METHOD", "qb") or "qb").strip().lower(),
+        "url": str(values["QB_URL"] or "").strip(),
+        "username": str(values["QB_USERNAME"] or ""),
+        "password": str(values["QB_PASSWORD"] or ""),
+        "api_key": str(values["QB_API_KEY"] or ""),
+        "category": str(values["RSS_QB_CATEGORY"] or ""),
+        "default_save_path": str(values["RSS_QB_SAVE_PATH"] or ""),
+        "default_method": str(values["RSS_DOWNLOAD_METHOD"] or "qb").strip().lower(),
         "timeout": 10,
     }
     if not runtime["url"]:
@@ -138,22 +278,10 @@ class MikanParser:
         """拉取并解析一个 mikan RSS 源，返回条目列表。"""
         self.last_error_code = ""
         try:
-            with requests.get(
+            payload, response_headers = _fetch_rss_payload(
                 url,
-                headers={"User-Agent": self.USER_AGENT},
-                timeout=(_RSS_CONNECT_TIMEOUT_SECONDS, _RSS_READ_TIMEOUT_SECONDS),
-                stream=True,
-            ) as response:
-                response.raise_for_status()
-                payload = bytearray()
-                for chunk in response.iter_content(chunk_size=64 * 1024):
-                    if not chunk:
-                        continue
-                    payload.extend(chunk)
-                    if len(payload) > _RSS_MAX_RESPONSE_BYTES:
-                        raise ValueError("RSS 响应体过大")
-                response_headers = dict(response.headers)
-                response_headers.setdefault("content-location", response.url)
+                user_agent=self.USER_AGENT,
+            )
             feed = feedparser.parse(bytes(payload), response_headers=response_headers)
         except Exception as exc:
             self.last_error_code = "fetch_failed"
@@ -830,18 +958,61 @@ class RSSEngine:
         )
 
     def download_many(self, entry_ids: list[int]) -> dict:
-        ids = list(dict.fromkeys(int(item) for item in entry_ids))[:100]
+        ids = list(dict.fromkeys(int(item) for item in entry_ids))[:20]
         entries = [db.get_rss_entry(entry_id) for entry_id in ids]
-        client, hashes, snapshot_error = self._qb_snapshot(entries)
+        _client, hashes, snapshot_error = self._qb_snapshot(entries)
         succeeded: list[dict] = []
         existing: list[dict] = []
         unverified: list[dict] = []
         failed: list[dict] = []
-        for entry_id, entry in zip(ids, entries):
-            result = self._download_entry(
-                entry, qb_client=client, known_hashes=hashes,
-                snapshot_error=snapshot_error,
+        jobs = list(enumerate(zip(ids, entries)))
+        groups: dict[str, list[tuple[int, tuple[int, object]]]] = {}
+        for position, job in jobs:
+            _entry_id, entry = job
+            torrent_url = self._entry_torrent_url(entry) if entry else ""
+            group_key = (
+                self._submission_claim_key(torrent_url)
+                if torrent_url else f"missing:{position}"
             )
+            groups.setdefault(group_key, []).append((position, job))
+
+        def submit_group(
+            group: list[tuple[int, tuple[int, object]]],
+        ) -> list[tuple[int, int, dict]]:
+            # requests.Session 不保证跨线程安全；每个提交创建独立客户端。
+            # 相同资源必须在同一 worker 内顺序执行，确保首个已知失败释放
+            # claim 后同批次下一条可继续，而成功/未知结果仍能阻止重复提交。
+            group_hashes = set(hashes)
+            outcomes: list[tuple[int, int, dict]] = []
+            for position, (entry_id, entry) in group:
+                outcomes.append((
+                    position,
+                    entry_id,
+                    self._download_entry(
+                        entry,
+                        qb_client=None,
+                        known_hashes=group_hashes,
+                        snapshot_error=snapshot_error,
+                    ),
+                ))
+            return outcomes
+
+        grouped_jobs = list(groups.values())
+        worker_count = min(4, len(grouped_jobs))
+        if worker_count > 1:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="rss-download",
+            ) as executor:
+                grouped_outcomes = list(executor.map(submit_group, grouped_jobs))
+        else:
+            grouped_outcomes = [submit_group(group) for group in grouped_jobs]
+        outcomes = sorted(
+            (item for group in grouped_outcomes for item in group),
+            key=lambda item: item[0],
+        )
+
+        for _position, entry_id, result in outcomes:
             item = {
                 "id": entry_id,
                 "method": result.get("method"),

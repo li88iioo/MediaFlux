@@ -1793,7 +1793,10 @@ class STRMScheduler:
         plan = plan_refresh_targets(
             changed_paths or [],
             changed_dirs or [],
-            media_roots=[strm_root, str(Path(strm_root) / STRM_SUBDIR)] if strm_root else [],
+            # STRM_ROOT 是用户挂载根，真正由同步器拥有且可安全收敛的边界是
+            # 光鸭云盘子目录。双层根会允许兄弟媒体库折叠到共同父目录，随后
+            # Jellyfin/Emby 无法匹配任何独立媒体库。
+            media_roots=[str(Path(strm_root) / STRM_SUBDIR)] if strm_root else [],
         )
         if plan.reason:
             logger.info("媒体库精准刷新降级 reason=%s", plan.reason)

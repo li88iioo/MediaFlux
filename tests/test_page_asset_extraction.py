@@ -53,6 +53,25 @@ class PageAssetExtractionTests(unittest.TestCase):
         self.assertLess(motion, condition_end)
         self.assertLess(condition_end, app)
 
+    def test_download_tabs_expose_accessible_roles_and_stable_panels(self) -> None:
+        template = Path("app/templates/downloads.html").read_text(encoding="utf-8")
+        script = Path("app/static/js/downloads.js").read_text(encoding="utf-8")
+
+        self.assertIn('role="tablist"', template)
+        self.assertEqual(template.count('role="tab"'), 3)
+        self.assertEqual(template.count('role="tabpanel"'), 3)
+        self.assertIn("event.key==='ArrowRight'", script)
+        self.assertIn("qbDisplaySignature", script)
+
+    def test_recent_media_async_update_replaces_one_stable_result_plane(self) -> None:
+        template = Path("app/templates/media_recent.html").read_text(encoding="utf-8")
+
+        self.assertEqual(template.count("data-media-recent-results"), 3)
+        self.assertIn("currentResults.replaceWith(nextResults)", template)
+        self.assertIn("currentReset.classList.toggle('is-hidden'", template)
+        self.assertIn("currentReset.setAttribute('aria-hidden'", template)
+        self.assertNotIn("currentShell.replaceWith", template)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -106,6 +106,12 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertFalse(notifier.send("兼容布尔接口"))
 
     def test_send_result_uses_cover_and_falls_back_to_text(self):
+        class TelegramPhotoRejected(RuntimeError):
+            result_json = {
+                "error_code": 400,
+                "description": "Bad Request: failed to get HTTP URL content",
+            }
+
         bot = FakeBot()
         self._install_bot(bot, "test-chat")
 
@@ -119,7 +125,7 @@ class NotificationSendingTests(unittest.TestCase):
         )])
         self.assertEqual(bot.messages, [])
 
-        fallback = FakeBot(photo_error=RuntimeError("image unavailable"))
+        fallback = FakeBot(photo_error=TelegramPhotoRejected("image unavailable"))
         self._install_bot(fallback, "test-chat")
         result = notifier.send_result(
             "<b>整理完成</b>", image_url="https://image.example/missing.jpg",
@@ -210,11 +216,17 @@ class NotificationSendingTests(unittest.TestCase):
 
     def test_send_event_falls_back_to_text_when_photo_send_fails(self):
         """若图片异常导致通知丢失而非回退文本，本测试必须失败。"""
+        class TelegramPhotoRejected(RuntimeError):
+            result_json = {
+                "error_code": 400,
+                "description": "Bad Request: failed to get HTTP URL content",
+            }
+
         event_type = getattr(notifier, "NotificationEvent", None)
         self.assertIsNotNone(event_type, "NotificationEvent 尚未实现")
         send_event = getattr(notifier, "send_event", None)
         self.assertIsNotNone(send_event, "send_event 尚未实现")
-        bot = FakeBot(photo_error=RuntimeError("photo unavailable"))
+        bot = FakeBot(photo_error=TelegramPhotoRejected("photo unavailable"))
         self._install_bot(bot, "200")
         event = event_type(
             title="整理完成",
@@ -225,6 +237,17 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertTrue(send_event(event))
         self.assertEqual(bot.photos, [])
         self.assertEqual(bot.messages, [("200", "<b>✅ 整理完成</b>\n<b>📄 文件：</b>1 个")])
+
+    def test_unknown_photo_delivery_does_not_fallback_to_duplicate_text(self):
+        bot = FakeBot(photo_error=TimeoutError("delivery outcome unknown"))
+        self._install_bot(bot, "201")
+
+        result = notifier.send_result(
+            "<b>整理完成</b>", image_url="https://image.example/poster.jpg",
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(bot.messages, [])
 
     def test_photo_success_does_not_retry_full_text_when_continuation_fails(self):
         """若图片已成功后续发失败又重发全文，可能造成首段重复。"""

@@ -134,7 +134,9 @@ class STRMMetadataWorker:
                     if interval_ms:
                         self._stop_event.wait(interval_ms / 1000.0)
                     continue
-                self._flush_media_refresh(force=True)
+                # 空闲轮询遵守配置的刷新间隔；force 仅用于进程退出前的最后
+                # 一次提交，避免永久路径失配时每 5 秒重复枚举媒体库。
+                self._flush_media_refresh(force=False)
                 self._wake_event.wait(timeout=5.0)
                 self._wake_event.clear()
         finally:
@@ -254,7 +256,8 @@ class STRMMetadataWorker:
             if settled == "completed":
                 path = str(result.get("path") or "")
                 if path:
-                    self._changed_paths.append(path)
+                    if path not in self._changed_paths:
+                        self._changed_paths.append(path)
                 with self._state_lock:
                     self._consecutive_failures = 0
                     self._last_error_type = ""

@@ -12,6 +12,7 @@ let downloadIssueRequestSerial = 0;
 let hasLoadedDownloadLogs = false;
 let hasLoadedDownloadIssues = false;
 let currentQbTasks = [];
+let currentQbDisplaySignature = '';
 let currentIssueIds = [];
 let currentLogIds = [];
 const selectedQbHashes = new Set();
@@ -36,12 +37,14 @@ function switchDlTab(tabName, syncUrl=true) {
     const isTasks = tabName === 'tasks';
     const isIssues = tabName === 'issues';
     const isLogs = tabName === 'logs';
-    document.getElementById('tabTasksBtn').classList.toggle('active', isTasks);
-    document.getElementById('tabIssuesBtn').classList.toggle('active', isIssues);
-    document.getElementById('tabLogsBtn').classList.toggle('active', isLogs);
-    document.getElementById('viewTasks').style.display = isTasks ? 'block' : 'none';
-    document.getElementById('viewIssues').style.display = isIssues ? 'block' : 'none';
-    document.getElementById('viewLogs').style.display = isLogs ? 'block' : 'none';
+    [['tasks',isTasks],['issues',isIssues],['logs',isLogs]].forEach(([name,active])=>{
+        const button=document.querySelector(`[data-download-tab="${name}"]`);
+        const panel=document.getElementById(`view${name[0].toUpperCase()}${name.slice(1)}`);
+        button?.classList.toggle('active',active);
+        button?.setAttribute('aria-selected',active?'true':'false');
+        if(button)button.tabIndex=active?0:-1;
+        if(panel)panel.hidden=!active;
+    });
     document.getElementById('dlLogsFilters').style.display = isLogs ? 'grid' : 'none';
     if(isIssues&&!hasLoadedDownloadIssues)loadIssues(downloadIssuePage);
     if(isLogs&&!hasLoadedDownloadLogs)loadLogs(downloadLogPage);
@@ -51,6 +54,21 @@ function switchDlTab(tabName, syncUrl=true) {
         window.history.replaceState({},'',url);
     }
 }
+
+document.querySelector('.dl-tab-bar')?.addEventListener('keydown',event=>{
+    const tabs=[...document.querySelectorAll('[data-download-tab]')];
+    const current=tabs.indexOf(event.target.closest('[data-download-tab]'));
+    if(current<0)return;
+    let next=current;
+    if(event.key==='ArrowRight')next=(current+1)%tabs.length;
+    else if(event.key==='ArrowLeft')next=(current-1+tabs.length)%tabs.length;
+    else if(event.key==='Home')next=0;
+    else if(event.key==='End')next=tabs.length-1;
+    else return;
+    event.preventDefault();
+    tabs[next].focus();
+    switchDlTab(tabs[next].dataset.downloadTab);
+});
 
 function api(path, opts={}) { return fetch(path, {headers:{'Content-Type':'application/json'}, ...opts}); }
 async function readApiResponse(response) {
@@ -173,6 +191,11 @@ function renderQb(qb) {
     if(!qb.online) { document.getElementById('dlSpeed').textContent='—'; document.getElementById('upSpeed').textContent='上传 —'; }
     if(qb.transfer) { document.getElementById('dlSpeed').textContent=speed(qb.transfer.dl_info_speed); document.getElementById('upSpeed').textContent='上传 '+speed(qb.transfer.up_info_speed); }
     const body=document.getElementById('qbList');
+    const focused=document.activeElement?.closest?.('[data-qb-hash]');
+    const focusState=focused&&body.contains(focused)?{
+        hash:focused.dataset.qbHash||'',
+        key:document.activeElement?.dataset?.qbFocus||''
+    }:null;
     if(!taskCount) {
         selectedQbHashes.clear();
         if(qb.error_code==='not_configured') { body.innerHTML='<tr><td colspan="4"><div class="qb-empty-state"><strong>未连接到 qBittorrent</strong><span>配置下载器后即可查看实时任务和传输状态。</span><a class="jump-btn" href="/settings#downloads">前往 qB 配置</a></div></td></tr>'; syncQbSelectionControls(); return; }
@@ -194,16 +217,16 @@ function renderQb(qb) {
             <td class="dl-task-title-cell">
                 <div class="qb-task-title-layout">
                     <label class="qb-task-check" title="选择任务">
-                        <input type="checkbox" data-qb-select value="${attr(hash)}" aria-label="选择 ${attr(t.name||'任务')}" ${selected?'checked':''}>
+                        <input type="checkbox" data-qb-select data-qb-focus="select" value="${attr(hash)}" aria-label="选择 ${attr(t.name||'任务')}" ${selected?'checked':''}>
                     </label>
                     <div class="qb-task-copy">
                         <div class="dl-mobile-header-row">
                             <span class="status-pill ${stateClass}">${esc(stateNames[t.state]||t.state||'未知')}</span>
                             <div style="display:inline-flex;gap:4px;">
-                                <button class="rss-btn" type="button" style="padding:3px 8px;width:76px;height:26px;font-size:11px;justify-content:center;" title="${control.label}" ${controlAttrs}>
+                                <button class="rss-btn" data-qb-focus="control" type="button" style="padding:3px 8px;width:76px;height:26px;font-size:11px;justify-content:center;" title="${control.label}" ${controlAttrs}>
                                     <i data-lucide="${control.icon}" style="width:13px;height:13px;"></i><span>${control.label}</span>
                                 </button>
-                                <button class="rss-btn is-danger" type="button" style="padding:3px 7px;height:26px;" title="仅移除任务，不删除文件" onclick="qbDelete('${attr(hash)}')">
+                                <button class="rss-btn is-danger" data-qb-focus="delete" type="button" style="padding:3px 7px;height:26px;" title="仅移除任务，不删除文件" onclick="qbDelete('${attr(hash)}')">
                                     <i data-lucide="trash-2" style="width:13px;height:13px;"></i>
                                 </button>
                             </div>
@@ -234,10 +257,10 @@ function renderQb(qb) {
             </td>
             <td class="action-cell desktop-only-cell" style="text-align:right;">
                 <div style="display:inline-flex;gap:4px;justify-content:flex-end;">
-                    <button class="rss-btn" type="button" style="padding:3px 8px;width:76px;height:26px;font-size:11px;justify-content:center;" title="${control.label}" ${controlAttrs}>
+                    <button class="rss-btn" data-qb-focus="control" type="button" style="padding:3px 8px;width:76px;height:26px;font-size:11px;justify-content:center;" title="${control.label}" ${controlAttrs}>
                         <i data-lucide="${control.icon}" style="width:13px;height:13px;"></i><span>${control.label}</span>
                     </button>
-                    <button class="rss-btn is-danger" type="button" style="padding:3px 7px;height:26px;" title="仅移除任务，不删除文件" onclick="qbDelete('${attr(hash)}')">
+                    <button class="rss-btn is-danger" data-qb-focus="delete" type="button" style="padding:3px 7px;height:26px;" title="仅移除任务，不删除文件" onclick="qbDelete('${attr(hash)}')">
                         <i data-lucide="trash-2" style="width:13px;height:13px;"></i>
                     </button>
                 </div>
@@ -246,6 +269,20 @@ function renderQb(qb) {
     }).join('');
     syncQbSelectionControls();
     window.renderLucideIcons?.(body);
+    if(focusState?.hash&&focusState.key){
+        body.querySelector(`[data-qb-hash="${CSS.escape(focusState.hash)}"] [data-qb-focus="${focusState.key}"]`)?.focus({preventScroll:true});
+    }
+}
+
+function qbDisplaySignature(qb){
+    return JSON.stringify({
+        online:!!qb.online,
+        error:String(qb.error||''),
+        errorCode:String(qb.error_code||''),
+        version:qb.version||null,
+        transfer:qb.transfer||null,
+        tasks:Array.isArray(qb.tasks)?qb.tasks:[]
+    });
 }
 
 function downloadLogSourceSvg(key) {
@@ -445,7 +482,12 @@ function loadOverview(manual=false) {
                 overviewQueuedManual=false;
                 try{
                     const data=await api('/api/downloads/overview').then(readApiResponse);
-                    renderQb(data.qb||{tasks:[],error:'读取失败'});
+                    const qb=data.qb||{tasks:[],error:'读取失败'};
+                    const signature=qbDisplaySignature(qb);
+                    if(signature!==currentQbDisplaySignature){
+                        renderQb(qb);
+                        currentQbDisplaySignature=signature;
+                    }
                     document.getElementById('lastRefresh').textContent=currentManual?'刚刚更新':'更新于 '+new Date().toLocaleTimeString();
                     succeeded=true;
                 }catch(error){

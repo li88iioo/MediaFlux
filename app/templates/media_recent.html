@@ -35,6 +35,7 @@
 {% endblock %}
 {% block content %}
 <div class="media-hub-shell">
+    <div data-media-recent-results>
     {% if search_error %}<section class="media-hub-notice is-error"><i data-lucide="circle-alert"></i><div><strong>筛选条件无效</strong><span>{{ search_error }}</span></div></section>{% endif %}
     {% for source in errors %}<section class="media-hub-notice is-warning"><i data-lucide="server-off"></i><div><strong>{{ source.server_name }} 暂时不可用</strong><span>{{ source.error }}</span></div></section>{% endfor %}
 
@@ -64,6 +65,7 @@
         <section class="media-hub-empty"><span><i data-lucide="inbox"></i></span><strong>没有符合条件的入库内容</strong><p>调整服务器、类型或关键词后重新筛选。</p></section>
         {% endif %}
     </section>
+    </div>
 </div>
 {% endblock %}
 
@@ -88,23 +90,30 @@
             const response=await fetch(url,{headers:{'X-Requested-With':'MediaFlux'},signal:requestController.signal});
             if(!response.ok) throw new Error(`筛选失败 (${response.status})`);
             const nextDocument=new DOMParser().parseFromString(await response.text(),'text/html');
-            const nextShell=nextDocument.querySelector('.media-recent-shell');
-            const currentShell=document.querySelector('.media-recent-shell');
-            if(!nextShell||!currentShell) throw new Error('筛选结果结构无效');
-            const stableHeight=Math.ceil(currentShell.getBoundingClientRect().height);
-            currentShell.style.minHeight=`${stableHeight}px`;
-            currentShell.classList.add('is-updating');
-            nextShell.style.minHeight=`${stableHeight}px`;
+            const nextResults=nextDocument.querySelector('[data-media-recent-results]');
+            const currentResults=document.querySelector('[data-media-recent-results]');
+            if(!nextResults||!currentResults) throw new Error('筛选结果结构无效');
+            const stableHeight=Math.ceil(currentResults.getBoundingClientRect().height);
+            currentResults.style.minHeight=`${stableHeight}px`;
+            currentResults.classList.add('is-updating');
+            nextResults.style.minHeight=`${stableHeight}px`;
             const applyResult=()=>{
-                currentShell.replaceWith(nextShell);
+                currentResults.replaceWith(nextResults);
                 const nextOverview=nextDocument.querySelector('.media-recent-overview-copy small');
                 const currentOverview=document.querySelector('.media-recent-overview-copy small');
                 if(nextOverview&&currentOverview) currentOverview.innerHTML=nextOverview.innerHTML;
+                const nextReset=nextDocument.querySelector('.media-hub-filter-reset');
+                const currentReset=form?.querySelector('.media-hub-filter-reset');
+                if(nextReset&&currentReset){
+                    currentReset.classList.toggle('is-hidden',nextReset.classList.contains('is-hidden'));
+                    currentReset.setAttribute('aria-hidden',nextReset.getAttribute('aria-hidden')||'false');
+                    currentReset.tabIndex=nextReset.hasAttribute('tabindex')?Number(nextReset.getAttribute('tabindex')):0;
+                }
                 history.replaceState({},'',url);
-                renderLucideIcons(nextShell);
+                renderLucideIcons(nextResults);
                 requestAnimationFrame(()=>requestAnimationFrame(()=>{
-                    nextShell.style.minHeight='';
-                    nextShell.classList.remove('is-updating');
+                    nextResults.style.minHeight='';
+                    nextResults.classList.remove('is-updating');
                 }));
             };
             const reduceMotion=matchMedia('(prefers-reduced-motion: reduce)').matches;

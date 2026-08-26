@@ -16,6 +16,10 @@ from app.agent.library_patrol_progress import (
 )
 from app.agent.library_patrol_status import build_persisted_patrol_projection
 from app.agent.models import ToolResult
+from app.agent.feature_gate import (
+    agent_runtime_generation_is_current,
+    current_agent_runtime_generation,
+)
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -80,6 +84,7 @@ class AgentJobsScheduler:
 
         if not is_agent_enabled():
             return 0
+        runtime_generation = current_agent_runtime_generation()
         current = self._now()
         stale_before = self._format(
             self._clock() - timedelta(seconds=_RUNNING_LEASE_SECONDS)
@@ -92,13 +97,17 @@ class AgentJobsScheduler:
         if job is None:
             return 0
         try:
-            self._process(job, current=current)
+            self._process(
+                job,
+                current=current,
+                runtime_generation=runtime_generation,
+            )
         except Exception as exc:
             logger.warning("Agent 长任务执行失败 type=%s", type(exc).__name__)
             self._retry(job, error_code=type(exc).__name__)
         return 1
 
-    def _process(self, job, *, current: str) -> None:
+    def _process(self, job, *, current: str, runtime_generation: int) -> None:
         job_id = str(job["job_id"])
         generation = int(job["lease_generation"])
         if bool(job["cancel_requested"]) or db.is_agent_job_cancel_requested(
@@ -121,6 +130,13 @@ class AgentJobsScheduler:
                 **arguments,
                 "after_tmdb_id": checkpoint["cursor"],
             })
+        if not agent_runtime_generation_is_current(runtime_generation):
+            db.release_agent_job_lease(
+                job_id,
+                expected_lease_generation=generation,
+                next_run_at=current,
+            )
+            return
         if not isinstance(result, ToolResult):
             raise TypeError("InvalidAgentJobResult")
         if not result.ok and result.status == "not_configured":

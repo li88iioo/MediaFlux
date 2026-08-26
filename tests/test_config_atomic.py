@@ -777,6 +777,33 @@ class ConfigAtomicWriteTests(unittest.TestCase):
 
         self.assertFalse(self.env_file.exists())
 
+    def test_get_many_uses_one_loaded_snapshot_and_preserves_defaults(self):
+        self.env_file.parent.mkdir(parents=True)
+        config.write_env_file(
+            self.env_file,
+            {"ENV_WEB_PASSPORT": "admin", "ENV_WEB_PASSWORD": "secret"},
+            replace=False,
+        )
+
+        values = config.get_many(
+            ("ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD", "MISSING", "MISSING"),
+            defaults={"MISSING": "fallback"},
+        )
+
+        self.assertEqual(values, {
+            "ENV_WEB_PASSPORT": "admin",
+            "ENV_WEB_PASSWORD": "secret",
+            "MISSING": "fallback",
+        })
+
+    def test_get_many_treats_empty_runtime_override_like_single_get(self):
+        self.env_file.parent.mkdir(parents=True)
+        config.write_env_file(self.env_file, {"SAFE_VALUE": "stored"}, replace=False)
+        os.environ["SAFE_VALUE"] = ""
+
+        self.assertEqual(config.get_many(("SAFE_VALUE",))["SAFE_VALUE"], "stored")
+        self.assertEqual(config.get("SAFE_VALUE"), "stored")
+
 
 
 if __name__ == "__main__":

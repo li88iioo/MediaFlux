@@ -355,10 +355,10 @@ def claim_due_agent_library_patrol_notification(
         if stale_before:
             conn.execute(
                 "UPDATE agent_library_patrol_notification_outbox "
-                "SET status='retry_wait',lease_generation=lease_generation+1,"
-                "next_attempt_at=?,updated_at=? "
+                "SET status='discarded',lease_generation=lease_generation+1,"
+                "payload_json='',last_error_type='DeliveryOutcomeUnknown',updated_at=? "
                 "WHERE status='sending' AND updated_at<=?",
-                (timestamp, timestamp, str(stale_before)),
+                (timestamp, str(stale_before)),
             )
         row = conn.execute(
             "SELECT id FROM agent_library_patrol_notification_outbox "

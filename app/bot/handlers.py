@@ -933,6 +933,8 @@ def _set_command_menu(bot, telebot) -> bool:
             ]
         )
     except Exception as exc:
+        if _command_menu_bot_id == id(bot):
+            _command_menu_bot_id = None
         logger.warning("设置命令菜单失败 type=%s", type(exc).__name__)
         return False
     _command_menu_bot_id = id(bot)
@@ -949,7 +951,15 @@ def _refresh_command_menu_worker() -> None:
             if bot is not None:
                 import telebot
 
-                _set_command_menu(bot, telebot)
+                for attempt, delay in enumerate((0.0, 1.0, 3.0), start=1):
+                    if delay and _command_menu_refresh_requested.wait(delay):
+                        break
+                    if _set_command_menu(bot, telebot):
+                        break
+                    if attempt < 3:
+                        logger.info(
+                            "Telegram 命令菜单将在后台重试 attempt=%s", attempt + 1
+                        )
             with _command_menu_refresh_lock:
                 if _command_menu_refresh_requested.is_set():
                     continue

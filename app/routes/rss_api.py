@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, Query, Request
 from app import database as db
 from app.logger import get_logger
 from app.modules.media_identity import normalize_tmdb_id
-from app.modules.rss import RSSEngine
+from app.modules.rss import RSSEngine, validate_rss_source_urls
 from app.web import api_error, api_response, require_api_login
 
 logger = get_logger(__name__)
@@ -100,6 +100,10 @@ def create_sub(request: Request, data: dict = Body(...)):
         return api_error(media_error, 400)
     if not name or not urls:
         return api_error("名称和 URL 必填", 400)
+    try:
+        urls = validate_rss_source_urls(urls)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
     sub_id = db.add_rss_subscription(
         name=name,
         urls=urls,
@@ -137,6 +141,11 @@ def update_sub(sid: int, request: Request, data: dict = Body(...)):
         fields["download_method"] = str(fields["download_method"] or "").strip().lower()
         if fields["download_method"] not in ("", "qb", "guangya"):
             return api_error("下载目标无效", 400)
+    if "urls" in fields:
+        try:
+            fields["urls"] = validate_rss_source_urls(str(fields["urls"] or ""))
+        except ValueError as exc:
+            return api_error(str(exc), 400)
     if "enabled" in data:
         fields["enabled"] = 1 if data["enabled"] else 0
     media_keys = {"media_tmdb_id", "media_default_season", "skip_existing_episodes"}
@@ -247,8 +256,8 @@ def batch_download_entries(request: Request, data: dict = Body(...)):
         ids = list(dict.fromkeys(int(item) for item in raw_ids))
     except (TypeError, ValueError):
         return api_error("entry_ids 包含无效值", 400)
-    if not ids or len(ids) > 100:
-        return api_error("每次请选择 1 至 100 个条目", 400)
+    if not ids or len(ids) > 20:
+        return api_error("每次请选择 1 至 20 个条目", 400)
     result = RSSEngine().download_many(ids)
     return api_response({"success": True, "result": result})
 

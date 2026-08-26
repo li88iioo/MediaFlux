@@ -1611,6 +1611,69 @@ class MediaSubscriptionService:
         safe_ttl = max(45, ttl - 15)
         return (datetime.now() + timedelta(seconds=safe_ttl)).strftime("%Y-%m-%d %H:%M:%S")
 
+    async def _candidate_still_missing(self, subscription: Any, candidate: Any) -> bool:
+        """在产生外部下载副作用前，以当前媒体库库存复核候选。"""
+        media_type = str(subscription["media_type"] or "").strip().lower()
+        tmdb_id = str(subscription["tmdb_id"] or "").strip()
+        if media_type == "movie":
+            sources = await asyncio.to_thread(
+                inspect_media_identity_sources, tmdb_id, "movie"
+            )
+            if not sources:
+                # 未配置媒体服务器时维持原有手动下载能力；只有存在库存来源时
+                # 才执行提交前二次校验，避免把“无法校验”误当成系统故障。
+                return True
+            complete, reason = self._inventory_complete(sources, identity=True)
+            if not complete:
+                raise MediaSubscriptionError(
+                    reason or "媒体库库存暂时无法确认",
+                    status_code=503,
+                    code="inventory_unavailable",
+                )
+            return not any(
+                bool(source.get("present"))
+                for source in sources
+                if source.get("status") == "ready"
+            )
+
+        if media_type != "tv":
+            raise MediaSubscriptionError(
+                "媒体订阅类型无效", status_code=409, code="unavailable"
+            )
+        try:
+            season = int(candidate["season"])
+            episode = int(candidate["episode"])
+        except (TypeError, ValueError) as exc:
+            raise MediaSubscriptionError(
+                "候选集号无效", status_code=409, code="unavailable"
+            ) from exc
+        sources = await asyncio.to_thread(
+            inspect_series_episode_sources,
+            str(subscription["title"] or ""),
+            tmdb_id=tmdb_id,
+            max_episodes=2000,
+            include_specials=bool(subscription["include_specials"]),
+        )
+        if not sources:
+            return True
+        complete, reason = self._inventory_complete(sources)
+        if not complete:
+            raise MediaSubscriptionError(
+                reason or "媒体库库存暂时无法确认",
+                status_code=503,
+                code="inventory_unavailable",
+            )
+        present = any(
+            (season, episode) in {
+                (int(item[0]), int(item[1]))
+                for item in source.get("episodes", [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            }
+            for source in sources
+            if source.get("status") == "ready"
+        )
+        return not present
+
     async def download_candidate(
         self,
         candidate_id: int,
@@ -1636,6 +1699,13 @@ class MediaSubscriptionService:
         elif cancel_event is not None and cancel_event.is_set():
             raise MediaSubscriptionError(
                 "应用正在停止，下载提交已取消", status_code=409, code="cancelled"
+            )
+        if not await self._candidate_still_missing(subscription, candidate):
+            db.update_media_subscription_candidate(int(candidate["id"]), status="expired")
+            raise MediaSubscriptionError(
+                "该媒体已入库，候选已失效",
+                status_code=409,
+                code="already_present",
             )
         admission_id = db.claim_media_download_admission(
             media_key=str(candidate["media_key"]), tmdb_id=str(subscription["tmdb_id"]),

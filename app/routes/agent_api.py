@@ -109,7 +109,11 @@ from app.agent.state_commit import (
     AgentStateCommitBuffer,
     defer_agent_state_commits,
 )
-from app.agent.feature_gate import is_agent_enabled
+from app.agent.feature_gate import (
+    agent_runtime_generation_is_current,
+    current_agent_runtime_generation,
+    is_agent_enabled,
+)
 from app.agent.llm_router import (
     begin_llm_request_budget,
     normalize_streamed_answer,
@@ -570,9 +574,12 @@ async def _stream_query_events(
     session_id: str | None,
     history_generation: int | None,
     operation: AgentOperationLease,
+    runtime_generation: int | None = None,
 ) -> AsyncIterator[bytes]:
     """流式执行 Agent 查询，并只允许当前操作发布与落库。"""
     coordinator = get_agent_operation_coordinator()
+    if runtime_generation is None:
+        runtime_generation = current_agent_runtime_generation()
     state_buffer = AgentStateCommitBuffer(owner=operation.owner)
     llm_budget_token = begin_llm_request_budget(llm_owner)
 
@@ -590,6 +597,8 @@ async def _stream_query_events(
     ) -> bytes | None:
         # 只在进程内锁中完成“当前请求”判定与事件快照生成。真正向 ASGI
         # yield 必须发生在锁外，否则慢客户端会阻塞同会话的取消/重置。
+        if not agent_runtime_generation_is_current(runtime_generation):
+            return None
         published, event = coordinator.publish_if_current(
             operation,
             lambda: _ndjson_event(
@@ -635,7 +644,10 @@ async def _stream_query_events(
                 if query_task in done:
                     response = query_task.result()
                     break
-                if not coordinator.is_current(operation):
+                if (
+                    not coordinator.is_current(operation)
+                    or not agent_runtime_generation_is_current(runtime_generation)
+                ):
                     query_task.add_done_callback(consume_detached_query)
                     yield cancelled_event()
                     return
@@ -1174,6 +1186,7 @@ def query(request: Request, data: Any = Body(default=None)):
         streaming = bool(data.get("stream"))
         service = get_agent_service()
         coordinator = get_agent_operation_coordinator()
+        runtime_generation = current_agent_runtime_generation()
         operation, confirmation_epoch = coordinator.begin_with_context(
             owner=owner,
             operation_id=request_key,
@@ -1192,6 +1205,7 @@ def query(request: Request, data: Any = Body(default=None)):
                     session_id=session_key,
                     history_generation=history_generation,
                     operation=operation,
+                    runtime_generation=runtime_generation,
                 ),
                 media_type="application/x-ndjson",
                 headers={
@@ -1208,6 +1222,8 @@ def query(request: Request, data: Any = Body(default=None)):
             try:
                 with defer_agent_state_commits(state_buffer):
                     response = service.query(message, **query_kwargs)
+                if not agent_runtime_generation_is_current(runtime_generation):
+                    return api_error("Media Agent 已关闭，本次结果未保存", 409)
             except (AgentInputError, AgentToolError):
                 if not coordinator.is_current(operation):
                     return api_error("本次请求已被更新操作取代", 409)

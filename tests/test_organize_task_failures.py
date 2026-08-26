@@ -403,16 +403,28 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
         ), patch("app.modules.organize_tasks.db.add_task_run", return_value=88), patch(
             "app.modules.organize_tasks.db.finish_task_run"
-        ) as finish:
+        ) as finish, patch(
+            "app.modules.organize_tasks.db.update_download_request"
+        ) as update_request, patch(
+            "app.modules.organize_tasks.Organizer.trigger_post_actions"
+        ), patch(
+            "app.modules.organize_tasks.Organizer.notify_task_results", return_value=False
+        ):
             result = manager.start(
                 [{"id": "source", "name": "源目录"}],
                 OrganizeRules(target_dir_id="target", link_strm=True),
+                download_request_ids=[91],
             )
 
         self.assertTrue(result["ok"])
         self.assertEqual(manager.task_status()["status"], "partial")
         finish.assert_called_once()
         self.assertEqual(finish.call_args.args[1], "partial")
+        final_update = update_request.call_args_list[-1]
+        self.assertEqual(final_update.args[0], 91)
+        self.assertEqual(final_update.kwargs["organize_started"], -1)
+        self.assertEqual(final_update.kwargs["organize_status"], "partial")
+        self.assertIn("人工处理", final_update.kwargs["organize_error"])
 
 
     def test_audit_failure_persists_partial_state(self):

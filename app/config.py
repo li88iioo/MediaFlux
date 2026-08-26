@@ -148,6 +148,19 @@ def get(key: str, default: str = "") -> str:
     return default
 
 
+def get_many(
+    keys: Iterator[str] | list[str] | tuple[str, ...],
+    defaults: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """在同一运行时配置快照中读取多个键，避免热更新期间混用新旧值。"""
+    normalized = tuple(dict.fromkeys(str(key) for key in keys))
+    fallback = {str(key): str(value) for key, value in dict(defaults or {}).items()}
+    with _lock:
+        # 复用单键读取语义，避免两套优先级规则随时间漂移；外层 RLock
+        # 保证由 MediaFlux 发起的热更新不能插入多键读取中间。
+        return {key: get(key, fallback.get(key, "")) for key in normalized}
+
+
 def get_int(key: str, default: int = 0) -> int:
     try:
         return int(get(key, str(default)) or default)
@@ -883,7 +896,8 @@ def all_items() -> dict[str, str]:
 # ===== 常用配置便捷访问 =====
 def web_credentials() -> tuple[str, str]:
     """返回实际配置的 Web 凭据；缺失或空值保持 fail-closed。"""
-    return get("ENV_WEB_PASSPORT", "").strip(), get("ENV_WEB_PASSWORD", "")
+    values = get_many(("ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD"))
+    return values["ENV_WEB_PASSPORT"].strip(), values["ENV_WEB_PASSWORD"]
 
 
 def flask_port() -> int:

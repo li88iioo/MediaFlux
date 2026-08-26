@@ -156,7 +156,11 @@ class DownloadTracker:
         gy_status = str(row["gy_status"] or "")
 
         matched_qb_task = None
-        if qb_status in {"submitted", "downloading", "outcome_unknown"}:
+        local_import_pending = str(
+            self._row_value(row, "local_import_status", "") or ""
+        ) in {"", "pending"}
+        tracking_completed_qb = qb_status == "completed" and local_import_pending
+        if qb_status in {"submitted", "downloading", "outcome_unknown"} or tracking_completed_qb:
             task = self._match_qb(row, qb_tasks) if qb_available else None
             matched_qb_task = task
             if task:
@@ -164,26 +168,37 @@ class DownloadTracker:
                 state = str(task.state or "").strip().lower()
                 updates["qb_task_id"] = task.hash
                 updates["qb_task_missing_since"] = None
-                if state in _QB_FAILED_STATES:
-                    updates["qb_status"] = "failed"
-                else:
-                    updates["qb_status"] = (
-                        "completed"
-                        if is_qb_torrent_complete(state, progress)
-                        else "downloading"
+                if not tracking_completed_qb:
+                    if state in _QB_FAILED_STATES:
+                        updates["qb_status"] = "failed"
+                    else:
+                        updates["qb_status"] = (
+                            "completed"
+                            if is_qb_torrent_complete(state, progress)
+                            else "downloading"
+                        )
+                    self._update_backend_log(
+                        request_id, "qb", updates["qb_status"], progress, task.hash
                     )
-                self._update_backend_log(request_id, "qb", updates["qb_status"], progress, task.hash)
-            elif qb_available and str(self._row_value(row, "qb_task_id", "") or ""):
+            elif (
+                not tracking_completed_qb
+                and qb_available
+                and str(self._row_value(row, "qb_task_id", "") or "")
+            ):
                 missing_since = self._row_value(row, "qb_task_missing_since", "")
                 if not missing_since:
                     updates["qb_task_missing_since"] = db.now()
                 elif self._missing_expired(missing_since):
                     updates["qb_status"] = "manual_review"
                     updates["error"] = "qB 后端任务长时间未找到，请核对下载器后人工处理"
-            elif qb_status == "outcome_unknown" and qb_available:
+            elif not tracking_completed_qb and qb_status == "outcome_unknown" and qb_available:
                 updates["qb_status"] = "manual_review"
                 updates["error"] = "qB 提交结果未知且无法提取任务标识，请人工核对下载器"
-            elif qb_available and self._qb_submission_has_no_stable_identity(row):
+            elif (
+                not tracking_completed_qb
+                and qb_available
+                and self._qb_submission_has_no_stable_identity(row)
+            ):
                 updates["qb_status"] = "manual_review"
                 updates["error"] = (
                     "qB 已接收直链任务，但当前下载器接口未返回可跟踪任务标识；"

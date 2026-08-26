@@ -25,7 +25,12 @@ from app.agent.async_bridge import run_awaitable_sync
 from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.conversation_history import get_agent_conversation_history_repository
 from app.agent.confirmation_contract import sanitize_confirmation_contract
-from app.agent.feature_gate import is_agent_enabled
+from app.agent.feature_gate import (
+    agent_runtime_generation_is_current,
+    current_agent_runtime_generation,
+    invalidate_agent_runtime_generation,
+    is_agent_enabled,
+)
 from app.agent.media_case import media_case_stage_for_tool
 from app.agent.llm_router import (
     begin_llm_request_budget,
@@ -1583,16 +1588,19 @@ def _publish_telegram_io_if_current(
     coordinator: Any,
     operation: Any,
     callback: Callable[[], Any],
+    *,
+    is_allowed: Callable[[], bool] | None = None,
 ) -> tuple[bool, Any | None]:
     """在不持有 owner 生命周期锁的前提下执行一次 Telegram I/O。
 
     外部网络调用无法可靠中断，因此发送前后都检查租约。新消息和 reset 可以在
     请求阻塞期间立即撤销旧租约；旧请求返回后不得继续写历史或发送后续内容。
     """
-    if not coordinator.is_current(operation):
+    allowed = is_allowed or (lambda: True)
+    if not coordinator.is_current(operation) or not allowed():
         return False, None
     result = callback()
-    return coordinator.is_current(operation), result
+    return coordinator.is_current(operation) and allowed(), result
 
 
 def _trace_operation_id(operation: Any) -> str:
@@ -2551,6 +2559,7 @@ def _apply_agent_control_action(action_name: str, *, owner: str) -> str:
             try:
                 from app.modules.agent_runtime import request_agent_runtime_reconcile
 
+                invalidate_agent_runtime_generation()
                 request_agent_runtime_reconcile()
             except Exception as exc:
                 logger.warning(
@@ -3201,6 +3210,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
 
     service = get_agent_service()
     coordinator = get_agent_operation_coordinator()
+    runtime_generation = current_agent_runtime_generation()
 
     def initialize_query() -> int | None:
         # 新消息是同一 Telegram 身份的最新意图；旧确认/资源按钮必须与
@@ -3213,6 +3223,24 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         operation_id=f"tg_{event_key[:32]}",
         initialize=initialize_query,
     )
+
+    def operation_is_current() -> bool:
+        return bool(
+            coordinator.is_current(operation)
+            and agent_runtime_generation_is_current(runtime_generation)
+            and telegram_agent_access(chat_id, user_id) == "allowed"
+        )
+
+    def publish_if_current(
+        callback: Callable[[], Any],
+    ) -> tuple[bool, Any | None]:
+        return _publish_telegram_io_if_current(
+            coordinator,
+            operation,
+            callback,
+            is_allowed=operation_is_current,
+        )
+
     state_buffer = AgentStateCommitBuffer(owner=owner)
     llm_budget_token = begin_llm_request_budget(owner)
     stream_target = None
@@ -3220,7 +3248,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
     typing_heartbeat = _TelegramTypingHeartbeat(
         bot,
         message_chat_id,
-        is_current=lambda: coordinator.is_current(operation),
+        is_current=operation_is_current,
         message_thread_id=message_thread_id,
         interval_seconds=_TELEGRAM_TYPING_INTERVAL_SECONDS,
         timeout_seconds=_TELEGRAM_TYPING_TIMEOUT_SECONDS,
@@ -3229,10 +3257,8 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         typing_heartbeat.start()
         # Telegram 调用属于不可控外部 I/O，不能占用 owner 生命周期锁；否则
         # 草稿接口卡顿会同时卡住新消息抢占与 /agent_reset。
-        allowed, stream_target = _publish_telegram_io_if_current(
-            coordinator,
-            operation,
-            lambda: _begin_agent_stream(bot, telebot, message),
+        allowed, stream_target = publish_if_current(
+            lambda: _begin_agent_stream(bot, telebot, message)
         )
         if not allowed:
             _delete_stale_telegram_delivery(bot, stream_target)
@@ -3261,7 +3287,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             query_kwargs["present"] = False
         with defer_agent_state_commits(state_buffer):
             response = service.query(user_message, **query_kwargs)
-        if not coordinator.is_current(operation):
+        if not operation_is_current():
             raise AgentOperationCancelled("Telegram Agent 操作已失效")
 
         streamed = False
@@ -3278,10 +3304,8 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                         telebot,
                         stream_target,
                         source,
-                        is_current=lambda: coordinator.is_current(operation),
-                        publish=lambda callback: _publish_telegram_io_if_current(
-                            coordinator, operation, callback
-                        ),
+                        is_current=operation_is_current,
+                        publish=publish_if_current,
                     )
                 )
                 if interruption_kind is not None:
@@ -3318,9 +3342,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                             bot, message, rendered, parse_mode="HTML"
                         )
 
-                    allowed, publish_result = _publish_telegram_io_if_current(
-                        coordinator, operation, publish_interruption
-                    )
+                    allowed, publish_result = publish_if_current(publish_interruption)
                     if not allowed and isinstance(
                         publish_result, _TelegramPublishResult
                     ):
@@ -3402,6 +3424,8 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
 
         # 只在 owner 临界区内构造短期 action token；真正的 Telegram 网络调用
         # 放在锁外。若发送期间被新请求取代，发送后的检查会阻止历史落库。
+        if not operation_is_current():
+            raise AgentOperationCancelled("Telegram Agent 操作已失效")
         allowed, prepared_output = coordinator.publish_if_current(
             operation, prepare_final_output
         )
@@ -3428,9 +3452,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                 parse_mode="HTML",
             )
 
-        allowed, publish_result = _publish_telegram_io_if_current(
-            coordinator, operation, publish_final_message
-        )
+        allowed, publish_result = publish_if_current(publish_final_message)
         if not allowed and isinstance(publish_result, _TelegramPublishResult):
             _delete_stale_telegram_delivery(bot, publish_result.delivery)
         if allowed:
@@ -3466,9 +3488,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                 return result
             return _reply_agent_message(bot, message, rendered)
 
-        allowed, publish_result = _publish_telegram_io_if_current(
-            coordinator, operation, publish_tool_error
-        )
+        allowed, publish_result = publish_if_current(publish_tool_error)
         if not allowed and isinstance(publish_result, _TelegramPublishResult):
             _delete_stale_telegram_delivery(bot, publish_result.delivery)
         if allowed:
@@ -3489,9 +3509,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                 return result
             return _reply_agent_message(bot, message, rendered)
 
-        allowed, publish_result = _publish_telegram_io_if_current(
-            coordinator, operation, publish_error
-        )
+        allowed, publish_result = publish_if_current(publish_error)
         if not allowed and isinstance(publish_result, _TelegramPublishResult):
             _delete_stale_telegram_delivery(bot, publish_result.delivery)
         if allowed:

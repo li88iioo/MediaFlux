@@ -362,9 +362,16 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
             current_time="2026-08-03 12:00:00",
             stale_before="2026-08-03 11:58:00",
         )
-        self.assertIsNotNone(recovered)
-        self.assertEqual(recovered["result_revision"], 7)
-        self.assertEqual(recovered["status"], "sending")
+        self.assertIsNone(recovered)
+        rows_by_revision = {
+            int(row["result_revision"]): row
+            for row in db.list_agent_library_patrol_notifications()
+        }
+        self.assertEqual(rows_by_revision[7]["status"], "discarded")
+        self.assertEqual(
+            rows_by_revision[7]["last_error_type"], "DeliveryOutcomeUnknown"
+        )
+        self.assertEqual(rows_by_revision[7]["payload_json"], "")
 
     def test_init_recovers_interrupted_notification_sender(self):
         with db.get_conn() as conn:
@@ -380,8 +387,9 @@ class AgentLibraryPatrolDatabaseTests(IsolatedDatabaseTestCase):
         db.init_db()
 
         row = db.list_agent_library_patrol_notifications()[0]
-        self.assertEqual(row["status"], "retry_wait")
+        self.assertEqual(row["status"], "discarded")
         self.assertEqual(row["lease_generation"], 2)
+        self.assertEqual(row["last_error_type"], "DeliveryOutcomeUnknown")
 
     def test_init_recovers_interrupted_running_patrol(self):
         db.ensure_agent_library_patrol(next_run_at="2026-08-03 12:00:00")

@@ -395,6 +395,32 @@ def complete_agent_job(
         return cur.rowcount == 1
 
 
+def release_agent_job_lease(
+    job_id: str,
+    *,
+    expected_lease_generation: int,
+    next_run_at: str,
+    summary: str = "等待 Media Agent 重新开启",
+) -> bool:
+    """总开关切换时释放运行租约，不消费重试预算或提交旧批次结果。"""
+    safe_id = _safe_job_id(job_id)
+    timestamp = now()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE agent_jobs SET status='pending',lease_generation=lease_generation+1,"
+            "next_run_at=?,summary=?,error_code='',updated_at=? WHERE job_id=? "
+            "AND status='running' AND lease_generation=? AND cancel_requested=0",
+            (
+                str(next_run_at or timestamp),
+                _safe_summary(summary),
+                timestamp,
+                safe_id,
+                max(0, int(expected_lease_generation)),
+            ),
+        )
+        return cur.rowcount == 1
+
+
 def fail_or_retry_agent_job(
     job_id: str,
     *,

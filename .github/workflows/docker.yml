@@ -504,6 +504,7 @@ jobs:
           mkdir -p "$RELEASE_ASSETS"
           cp "$RUNNER_TEMP/BUILD-INFO.json" "$RELEASE_ASSETS/BUILD-INFO.json"
           export RELEASE_ASSETS
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$VERSION_REF")"
           python - <<'PY'
           import importlib.util, os
           from pathlib import Path

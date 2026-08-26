@@ -5298,7 +5298,7 @@ def create_proxy_app(
             return JSONResponse({"error": "媒体反代实例已停用"}, status_code=503)
 
         if _request_uses_exoplayer(request):
-            logger.info(
+            logger.debug(
                 "media_proxy_native_request_diag instance=%s client=%s method=%s "
                 "path=%s host=%s media_source=%s play_session=%s auth=%s",
                 instance_id,
@@ -5362,7 +5362,7 @@ def create_proxy_app(
                 )
                 if dynamic_allowed:
                     return await guangya_redirect(instance, request, dynamic_file_id)
-            logger.info(
+            logger.debug(
                 "media_proxy_stream_fallback_diag instance=%s item=%s "
                 "source=%s auth=%s play_session=%s device=%s capability=%s "
                 "resolution=%s binding=%s dynamic=%s grant=%s query_keys=%s",

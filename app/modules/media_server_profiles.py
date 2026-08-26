@@ -58,14 +58,15 @@ def _profile(source: str) -> MediaServerProfile:
         server_type, label, url_key, credential_key, enabled_key, user_key = _PROFILE_KEYS[source]
     except KeyError as exc:
         raise ValueError("媒体服务器来源无效") from exc
+    values = config.get_many((url_key, credential_key, enabled_key, user_key))
     return MediaServerProfile(
         source=source,
         server_type=server_type,
         label=label,
-        url=str(config.get(url_key, "") or "").strip(),
-        credential=str(config.get(credential_key, "") or "").strip(),
-        enabled=config.get_bool(enabled_key, False),
-        user_id=str(config.get(user_key, "") or "").strip(),
+        url=str(values[url_key] or "").strip(),
+        credential=str(values[credential_key] or "").strip(),
+        enabled=str(values[enabled_key] or "").strip().lower() in {"1", "true", "yes", "on", "y"},
+        user_id=str(values[user_key] or "").strip(),
     )
 
 

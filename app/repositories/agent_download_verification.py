@@ -226,10 +226,10 @@ def claim_due_agent_download_verification_notification(
         if stale_before:
             conn.execute(
                 "UPDATE agent_download_verification_notification_outbox "
-                "SET status='retry_wait',lease_generation=lease_generation+1,"
-                "next_attempt_at=?,updated_at=? "
+                "SET status='discarded',lease_generation=lease_generation+1,"
+                "payload_json='',last_error_type='DeliveryOutcomeUnknown',updated_at=? "
                 "WHERE status='sending' AND updated_at<=?",
-                (timestamp, timestamp, str(stale_before)),
+                (timestamp, str(stale_before)),
             )
         row = conn.execute(
             "SELECT id FROM agent_download_verification_notification_outbox "
@@ -268,6 +268,27 @@ def complete_agent_download_verification_notification(
             "WHERE id=? AND status='sending' AND lease_generation=?",
             (
                 timestamp, timestamp, int(notification_id),
+                max(0, int(expected_lease_generation)),
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def release_agent_download_verification_notification(
+    notification_id: int,
+    *,
+    expected_lease_generation: int,
+    next_attempt_at: str | None = None,
+) -> bool:
+    """无损释放尚未发送的通知租约；关闭 Agent 不消耗重试预算。"""
+    timestamp = now()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE agent_download_verification_notification_outbox "
+            "SET status='retry_wait',next_attempt_at=?,last_error_type='',updated_at=? "
+            "WHERE id=? AND status='sending' AND lease_generation=?",
+            (
+                str(next_attempt_at or timestamp), timestamp, int(notification_id),
                 max(0, int(expected_lease_generation)),
             ),
         )
