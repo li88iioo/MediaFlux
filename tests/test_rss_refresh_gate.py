@@ -997,13 +997,24 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
         self.assertTrue(any("本地下载整理已确认" in row[2] for row in bot.edits))
 
     def test_all_organize_runs_cloud_then_local_and_finishes_once(self):
+        from app.modules.organize import OrganizeRules
+
         progress = Mock()
         order = []
-        cloud_state = {"status": "completed", "stats": {"moved": 2}}
+        rules = OrganizeRules()
+        cloud_state = {
+            "status": "completed",
+            "stats": {
+                "moved": 0,
+                "need_confirm": 1,
+                "confirmation_groups": [{"identity": "待确认动画"}],
+            },
+        }
         local_summary = {
             "completed": 1, "requires_manual": 0, "failed": 0,
             "moved_items": 3, "source_errors": [],
         }
+        progress.finish.side_effect = lambda _text: order.append("summary")
         with patch(
             "app.bot.handlers._run_guangya_organize_stage",
             side_effect=lambda *args, **kwargs: (order.append("cloud"), cloud_state)[1],
@@ -1013,6 +1024,11 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
         ), patch(
             "app.bot.handlers.render_event", return_value="combined-result",
         ), patch(
+            "app.modules.organize.OrganizeRules.from_config", return_value=rules,
+        ), patch(
+            "app.modules.organize.Organizer.notify_task_confirmations",
+            side_effect=lambda *args, **kwargs: order.append("confirmations") or True,
+        ) as notify_confirmations, patch(
             "app.bot.handlers.send",
         ) as send:
             handlers._organize_running = True
@@ -1021,11 +1037,41 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
                 100, [{"id": "source-id", "name": "动画"}], "target-id", progress,
             )
 
-        self.assertEqual(order, ["cloud", "local"])
+        self.assertEqual(order, ["cloud", "local", "summary", "confirmations"])
         progress.finish.assert_called_once_with("combined-result")
+        notify_confirmations.assert_called_once_with(
+            cloud_state["stats"],
+            rules,
+            source_name="1 个源目录",
+            chat_id="100",
+        )
         send.assert_not_called()
         self.assertFalse(handlers._organize_running)
         self.assertFalse(handlers._local_organize_running)
+
+    def test_all_organize_marks_cloud_confirmation_as_attention(self):
+        event = handlers._all_organize_event(
+            {
+                "status": "completed",
+                "stats": {
+                    "moved": 0,
+                    "need_confirm": 1,
+                    "failed": 0,
+                },
+            },
+            {
+                "completed": 5,
+                "requires_manual": 0,
+                "failed": 0,
+                "moved_items": 5,
+                "source_errors": [],
+            },
+        )
+
+        self.assertEqual(event.title, "全部整理部分完成")
+        self.assertEqual(dict(event.fields)["状态"], "需要处理")
+        self.assertIn("若未收到", str(event.footer))
+        self.assertIn("Web", str(event.footer))
 
     def test_sync_and_organize_commands_require_owner_bound_confirmation(self):
         from app.modules.telegram_write_confirmations import (

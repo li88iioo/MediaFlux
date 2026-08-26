@@ -260,6 +260,39 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertIn("已按媒体合并为 1 组", delivered[0])
         self.assertIn("仅发送 1 张候选卡", delivered[0])
 
+    def test_confirmation_only_delivery_skips_task_summary(self) -> None:
+        with patch(
+            "app.modules.organize_notification_outbox.deliver_organize_notification",
+        ) as deliver_summary, patch(
+            "app.notifier.send_event", return_value=True,
+        ) as send_event:
+            delivered = Organizer.notify_task_confirmations(
+                _stats_with_confirmation(),
+                OrganizeRules(),
+                source_name="来源目录",
+                chat_id="100",
+            )
+
+        self.assertTrue(delivered)
+        deliver_summary.assert_not_called()
+        send_event.assert_called_once()
+        event = send_event.call_args.args[0]
+        self.assertEqual(event.title, "⚠️ 待确认媒体 1/1")
+        self.assertTrue(event.actions)
+
+    def test_confirmation_only_delivery_is_noop_without_actionable_groups(self) -> None:
+        stats = self._completed_stats([])
+        with patch("app.notifier.send_event") as send_event:
+            delivered = Organizer.notify_task_confirmations(
+                stats,
+                OrganizeRules(),
+                source_name="来源目录",
+                chat_id="100",
+            )
+
+        self.assertTrue(delivered)
+        send_event.assert_not_called()
+
     def test_confirmation_card_delivery_failure_keeps_terminal_fallback_visible(self) -> None:
         with patch(
             "app.notifier.send_result", return_value=TelegramSendResult(ok=True)

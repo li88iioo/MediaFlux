@@ -2948,12 +2948,19 @@ def _local_organize_event(summary: dict) -> NotificationEvent:
 def _all_organize_event(cloud_state: dict, local_summary: dict) -> NotificationEvent:
     cloud_status = str(cloud_state.get("status") or "failed")
     cloud_stats = cloud_state.get("stats") if isinstance(cloud_state.get("stats"), dict) else {}
+    cloud_need_confirm = int(cloud_stats.get("need_confirm", 0) or 0)
+    cloud_failed = int(cloud_stats.get("failed", 0) or 0)
+    cloud_skipped = int(cloud_stats.get("skipped", 0) or 0)
+    cloud_scan_incomplete = bool(
+        cloud_stats.get("scan_errors")
+        or cloud_stats.get("scan_limited")
+        or cloud_stats.get("scan_complete") is False
+    )
     local_attention = bool(
         int(local_summary.get("requires_manual", 0) or 0)
         or int(local_summary.get("failed", 0) or 0)
         or local_summary.get("source_errors")
     )
-    attention = cloud_status not in {"completed"} or local_attention
     lines: list[str] = []
     cloud_error = str(cloud_state.get("error") or "").strip()
     if cloud_error:
@@ -2965,6 +2972,24 @@ def _all_organize_event(cloud_state: dict, local_summary: dict) -> NotificationE
     strm_text = "未触发"
     if strm:
         strm_text = "已触发" if strm.get("ok") else str(strm.get("error") or "未完成")[:120]
+    strm_attention = bool(
+        strm and not strm.get("ok") and not strm.get("skipped")
+    )
+    attention = bool(
+        cloud_status != "completed"
+        or cloud_need_confirm
+        or cloud_failed
+        or cloud_skipped
+        or cloud_scan_incomplete
+        or strm_attention
+        or local_attention
+    )
+    footer = "全部整理按“光鸭云盘 → 本地下载”顺序执行。"
+    if cloud_need_confirm:
+        footer += (
+            "\n\n光鸭待确认项目将继续发送候选卡；"
+            "若未收到，请前往 Web 待确认队列继续处理。"
+        )
     return NotificationEvent(
         "全部整理部分完成" if attention else "全部整理完成",
         field_emojis=False,
@@ -2987,7 +3012,7 @@ def _all_organize_event(cloud_state: dict, local_summary: dict) -> NotificationE
             ("本地归档", f"{int(local_summary.get('moved_items', 0) or 0):,} 个文件"),
         ),
         lines=tuple(lines),
-        footer="全部整理按“光鸭云盘 → 本地下载”顺序执行。",
+        footer=footer,
     )
 
 
@@ -3087,6 +3112,26 @@ def _do_organize_all(
             progress.finish(render_event(event))
         else:
             send(event, chat_id=str(chat_id))
+        cloud_stats = (
+            cloud_state.get("stats")
+            if isinstance(cloud_state.get("stats"), dict)
+            else {}
+        )
+        if cloud_stats.get("confirmation_groups"):
+            try:
+                from app.modules.organize import OrganizeRules, Organizer
+
+                Organizer.notify_task_confirmations(
+                    cloud_stats,
+                    OrganizeRules.from_config(dst),
+                    source_name=f"{len(sources)} 个源目录",
+                    chat_id=str(chat_id),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Telegram 全部整理待确认通知失败 type=%s",
+                    type(exc).__name__,
+                )
     except Exception as exc:
         logger.error("Telegram 全部整理失败 type=%s", type(exc).__name__)
         if progress is not None:

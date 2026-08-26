@@ -2503,13 +2503,10 @@ class Organizer:
         if not rules.notify_enabled or not rules.library_notify:
             return False
         try:
-            from app.modules.organize_confirmations import confirmation_event
             from app.notifier import (
                 NotificationEvent,
                 build_media_events,
                 render_event,
-                send as send_text,
-                send_event,
             )
 
             counts = {
@@ -2533,69 +2530,9 @@ class Organizer:
                 "⏹️ 光鸭整理已停止"
                 if stopped else ("⚠️ 光鸭整理部分完成" if attention else "✅ 光鸭整理完成")
             )
-            raw_groups = [
-                item for item in (stats.get("confirmation_groups") or [])
-                if isinstance(item, dict)
-            ]
-            groups: list[dict] = []
-            actionable_file_keys: set[str] = set()
-            for group_index, group in enumerate(raw_groups):
-                valid_candidates = [
-                    dict(item) for item in (group.get("candidates") or [])
-                    if isinstance(item, dict)
-                    and str(item.get("tmdb_id") or "").strip()
-                    and str(item.get("media_type") or "") in {"movie", "tv"}
-                ]
-                raw_files = list(group.get("files") or [])
-                raw_companions = list(group.get("companions") or [])
-                source_parent_id = str(
-                    group.get("source_parent_id") or "0"
-                )
-
-                def valid_snapshot(item: object, *, require_scope: bool) -> bool:
-                    if not isinstance(item, dict):
-                        return False
-                    if not str(item.get("file_id") or "").strip():
-                        return False
-                    if not str(item.get("name") or "").strip():
-                        return False
-                    parent_id = str(item.get("parent_id") or "0")
-                    if require_scope and parent_id != source_parent_id:
-                        return False
-                    try:
-                        return int(item.get("size") or 0) >= 0
-                    except (TypeError, ValueError):
-                        return False
-
-                valid_files = [
-                    dict(item) for item in raw_files
-                    if valid_snapshot(item, require_scope=True)
-                ]
-                valid_companions = [
-                    dict(item) for item in raw_companions
-                    if valid_snapshot(item, require_scope=False)
-                ]
-                if (
-                    not valid_candidates
-                    or not valid_files
-                    or len(valid_files) != len(raw_files)
-                    or len(valid_companions) != len(raw_companions)
-                ):
-                    continue
-                sanitized_group = {
-                    **group,
-                    "files": valid_files,
-                    "companions": valid_companions,
-                    "candidates": valid_candidates,
-                }
-                groups.append(sanitized_group)
-                for file_index, file in enumerate(valid_files):
-                    file_id = str(file.get("file_id") or "").strip()
-                    actionable_file_keys.add(
-                        f"id:{file_id}"
-                        if file_id else f"row:{group_index}:{file_index}"
-                    )
-            actionable_confirmation_count = len(actionable_file_keys)
+            groups, actionable_confirmation_count = (
+                Organizer._validated_task_confirmation_groups(stats)
+            )
             summary = NotificationEvent(
                 title,
                 fields=(
@@ -2640,44 +2577,162 @@ class Organizer:
                 **delivery_kwargs,
             ))
 
-            confirmation_failures = 0
-            for index, group in enumerate(groups, start=1):
-                group_source = str(group.get("source_name") or source_name)
-                scope = str(group.get("directory") or "/")
-                if group_source and scope != "/":
-                    scope = f"{group_source}/{scope}"
-                elif group_source:
-                    scope = group_source
+            confirmations_sent = Organizer._deliver_task_confirmation_groups(
+                groups,
+                rules,
+                source_name=source_name,
+                chat_id=chat_id,
+            )
+            return bool(summary_sent and confirmations_sent)
+        except Exception as exc:
+            logger.warning("整理任务汇总通知失败 type=%s", type(exc).__name__)
+            return False
+
+    @staticmethod
+    def _validated_task_confirmation_groups(
+        stats: dict,
+    ) -> tuple[list[dict], int]:
+        """校验确认快照，避免生成无法安全重跑的 Telegram 操作按钮。"""
+        raw_groups = [
+            item for item in (stats.get("confirmation_groups") or [])
+            if isinstance(item, dict)
+        ]
+        groups: list[dict] = []
+        actionable_file_keys: set[str] = set()
+        for group_index, group in enumerate(raw_groups):
+            valid_candidates = [
+                dict(item) for item in (group.get("candidates") or [])
+                if isinstance(item, dict)
+                and str(item.get("tmdb_id") or "").strip()
+                and str(item.get("media_type") or "") in {"movie", "tv"}
+            ]
+            raw_files = list(group.get("files") or [])
+            raw_companions = list(group.get("companions") or [])
+            source_parent_id = str(group.get("source_parent_id") or "0")
+
+            def valid_snapshot(item: object, *, require_scope: bool) -> bool:
+                if not isinstance(item, dict):
+                    return False
+                if not str(item.get("file_id") or "").strip():
+                    return False
+                if not str(item.get("name") or "").strip():
+                    return False
+                parent_id = str(item.get("parent_id") or "0")
+                if require_scope and parent_id != source_parent_id:
+                    return False
                 try:
-                    delivered = bool(send_event(confirmation_event(
-                        f"⚠️ 待确认媒体 {index}/{len(groups)}",
-                        {
-                            "媒体": str(group.get("identity") or "待确认媒体"),
-                            "剧集": Organizer._confirmation_scope_summary(group),
-                            "来源": scope,
-                        },
-                        group,
-                        rules,
-                        source_name=group_source,
-                        chat_id=chat_id,
-                    ), chat_id=chat_id or None))
-                except Exception as exc:
-                    delivered = False
-                    logger.warning(
-                        "整理待确认卡发送失败 index=%s type=%s",
-                        index,
-                        type(exc).__name__,
-                    )
-                if not delivered:
-                    confirmation_failures += 1
-            if confirmation_failures:
+                    return int(item.get("size") or 0) >= 0
+                except (TypeError, ValueError):
+                    return False
+
+            valid_files = [
+                dict(item) for item in raw_files
+                if valid_snapshot(item, require_scope=True)
+            ]
+            valid_companions = [
+                dict(item) for item in raw_companions
+                if valid_snapshot(item, require_scope=False)
+            ]
+            if (
+                not valid_candidates
+                or not valid_files
+                or len(valid_files) != len(raw_files)
+                or len(valid_companions) != len(raw_companions)
+            ):
+                continue
+            groups.append({
+                **group,
+                "files": valid_files,
+                "companions": valid_companions,
+                "candidates": valid_candidates,
+            })
+            for file_index, file in enumerate(valid_files):
+                file_id = str(file.get("file_id") or "").strip()
+                actionable_file_keys.add(
+                    f"id:{file_id}"
+                    if file_id else f"row:{group_index}:{file_index}"
+                )
+        return groups, len(actionable_file_keys)
+
+    @staticmethod
+    def _deliver_task_confirmation_groups(
+        groups: list[dict],
+        rules: OrganizeRules,
+        *,
+        source_name: str = "",
+        chat_id: str = "",
+    ) -> bool:
+        """发送独立候选卡；失败时保留已持久化任务并给出 Web 回退。"""
+        if not groups:
+            return True
+        from app.modules.organize_confirmations import confirmation_event
+        from app.notifier import send as send_text, send_event
+
+        confirmation_failures = 0
+        for index, group in enumerate(groups, start=1):
+            group_source = str(group.get("source_name") or source_name)
+            scope = str(group.get("directory") or "/")
+            if group_source and scope != "/":
+                scope = f"{group_source}/{scope}"
+            elif group_source:
+                scope = group_source
+            try:
+                delivered = bool(send_event(confirmation_event(
+                    f"⚠️ 待确认媒体 {index}/{len(groups)}",
+                    {
+                        "媒体": str(group.get("identity") or "待确认媒体"),
+                        "剧集": Organizer._confirmation_scope_summary(group),
+                        "来源": scope,
+                    },
+                    group,
+                    rules,
+                    source_name=group_source,
+                    chat_id=chat_id,
+                ), chat_id=chat_id or None))
+            except Exception as exc:
+                delivered = False
+                logger.warning(
+                    "整理待确认卡发送失败 index=%s type=%s",
+                    index,
+                    type(exc).__name__,
+                )
+            if not delivered:
+                confirmation_failures += 1
+        if confirmation_failures:
+            try:
                 send_text(
                     "⚠️ 有待确认候选未能发送到 Telegram，请前往 Web 的待确认队列继续处理。",
                     chat_id=chat_id or None,
                 )
-            return bool(summary_sent and confirmation_failures == 0)
+            except Exception as exc:
+                logger.warning(
+                    "整理待确认卡回退提示发送失败 type=%s",
+                    type(exc).__name__,
+                )
+        return confirmation_failures == 0
+
+    @staticmethod
+    def notify_task_confirmations(
+        stats: dict,
+        rules: OrganizeRules,
+        source_name: str = "",
+        chat_id: str = "",
+    ) -> bool:
+        """只发送待确认候选卡，不重复发送任务汇总或媒体入库卡。"""
+        if not rules.notify_enabled or not rules.library_notify:
+            return False
+        try:
+            groups, _actionable_count = (
+                Organizer._validated_task_confirmation_groups(stats)
+            )
+            return Organizer._deliver_task_confirmation_groups(
+                groups,
+                rules,
+                source_name=source_name,
+                chat_id=chat_id,
+            )
         except Exception as exc:
-            logger.warning("整理任务汇总通知失败 type=%s", type(exc).__name__)
+            logger.warning("整理待确认通知失败 type=%s", type(exc).__name__)
             return False
 
     @staticmethod
