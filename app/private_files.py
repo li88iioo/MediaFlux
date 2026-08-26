@@ -68,6 +68,10 @@ def protect_private_file(path: str | os.PathLike[str]) -> bool:
         return False
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
         return False
+    # 数据库每次连接收尾都会做 best-effort 权限核对。已经是 0600 时直接
+    # 接受，避免高频连接反复 open/fchmod 同一个主库与 WAL/SHM 文件。
+    if stat.S_IMODE(metadata.st_mode) == _PRIVATE_MODE:
+        return True
 
     flags = os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)

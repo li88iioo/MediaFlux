@@ -397,6 +397,25 @@ def complete_agent_library_patrol_notification(
         return cur.rowcount == 1
 
 
+def release_agent_library_patrol_notification(
+    notification_id: int, *, expected_lease_generation: int,
+    next_attempt_at: str | None = None,
+) -> bool:
+    """无损释放尚未发送的通知租约；关闭 Agent 不消耗重试预算。"""
+    timestamp = now()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE agent_library_patrol_notification_outbox "
+            "SET status='retry_wait',next_attempt_at=?,last_error_type='',updated_at=? "
+            "WHERE id=? AND status='sending' AND lease_generation=?",
+            (
+                str(next_attempt_at or timestamp), timestamp, int(notification_id),
+                max(0, int(expected_lease_generation)),
+            ),
+        )
+        return cur.rowcount == 1
+
+
 def retry_agent_library_patrol_notification(
     notification_id: int, *, expected_lease_generation: int,
     next_attempt_at: str, error_type: str = "",

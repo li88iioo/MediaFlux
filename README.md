@@ -36,7 +36,7 @@
 
 1. **工具链断裂与 API 异常**：早先一直使用 NASTool 进行追番与媒体整理，但在 qBittorrent 升级到 5.2 之后，因底层 API 变动经常抛出异常，自动化流水线频频断流。
 2. **大容量上云的契机**：后来发现了性价比极高的光鸭云盘（108 元 500TB），便将本地占满机械硬盘的影视库全量搬迁至云端。但随之而来的问题是：如何让 Jellyfin / Emby 在不消耗本地服务器 CPU 转码和出口下行带宽的情况下，高速、稳定地直接播放云端影视？
-3. **前人项目的启发与局限**：在探索云盘流转方案时，发现了优秀的开源项目 [TgtoDrive](https://github.com/walkingddd/TgtoDrive)（特别致敬原作者的开源探索！）；同时光鸭云盘官方 Python 客户端 [guangyaclient (DDSRem-Dev/guangyaclient)](https://github.com/DDSRem-Dev/guangyaclient) 为底层的稳定通讯提供了关键基石。但在后续深入使用中，把 Jellyfin 升级到12.X版本后，遇到了一些 API 不兼容与整理流转方面的断层。
+3. **前人项目的启发与局限**：在探索云盘流转方案时，发现了优秀的开源项目 [TgtoDrive](https://github.com/walkingddd/TgtoDrive)（特别致敬原作者的开源探索！）；同时光鸭云盘Python 客户端 [guangyaclient (DDSRem-Dev/guangyaclient)](https://github.com/DDSRem-Dev/guangyaclient) 为底层的稳定通讯提供了关键基石。但在后续深入使用中，把 Jellyfin 升级到12.X版本后，遇到了一些 API 不兼容与整理流转方面的断层。
 
 面对这一连串割裂的痛点，与其在各个工具的修补缝合中反复折腾，不如从零构建一套现代化、高可用、且对本地与云端均具备事务保障的完整流转体系。
 

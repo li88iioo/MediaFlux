@@ -574,7 +574,7 @@ async function refreshSub(id,trigger){
 }
 
 async function autoDl(id,trigger){
-    const confirmed=await appConfirm({title:'自动下载待处理条目',message:'将刷新订阅，并把全部符合规则的待处理条目提交到已配置的下载后端。',confirmText:'刷新并下载'});if(!confirmed)return;
+    const confirmed=await appConfirm({title:'自动下载待处理条目',message:'将刷新订阅，并按时间倒序提交本轮最多 100 条待处理内容；剩余条目保留到下一轮。',confirmText:'刷新并下载'});if(!confirmed)return;
     if(trigger?.disabled)return;setRssButtonBusy(trigger,true,'处理中');
     try{
         const d=await rssApiJSON('/api/rss/subscriptions/'+id+'/auto',{method:'POST'});
@@ -584,17 +584,18 @@ async function autoDl(id,trigger){
         const unverified=Number(r.unverified)||0;
         const failed=Number(r.failed)||0;
         const outcomeUnknown=Number(r.outcome_unknown_count)||0;
+        const deferred=Number(r.deferred)||0;
         const libraryUnavailable=r.refresh.library_check&&Number(r.refresh.library_check.ready||0)===0;
         const bindingBypassed=Boolean(r.refresh.media_binding_bypassed);
         const bypassDetail=String(r.refresh.binding_bypass_reason||'')==='mixed_feed'
             ?`检测到 ${Number(r.refresh.detected_series_count)||2} 个剧目，已跳过 TMDB 绑定和已有剧集过滤`
             :'无法确认所有条目属于同一剧目，已保留条目并跳过 TMDB 绑定和已有剧集过滤';
-        const warning=failed>0||outcomeUnknown>0||unverified>0||libraryUnavailable||bindingBypassed;
+        const warning=failed>0||outcomeUnknown>0||unverified>0||deferred>0||libraryUnavailable||bindingBypassed;
         const filtered=Number(r.refresh.library_skipped||0)+Number(r.refresh.semantic_duplicates||0);
         await appAlert({
             type:failed&&(added+existing+unverified===0)?'error':warning?'warning':'success',
-            title:outcomeUnknown?'自动下载结果待核对':failed?'自动下载部分失败':bindingBypassed?'自动下载完成，已有剧集过滤已跳过':libraryUnavailable?'自动下载完成，库存核对未完成':unverified?'自动下载待核验':'自动下载完成',
-            message:`刷新：拉取 ${r.refresh.total} 条，新增 ${r.refresh.new} 条${filtered?`，精确过滤 ${filtered} 条`:''}\n下载：新增提交 ${added} 条 · qB 已存在 ${existing} 条 · 待核验 ${unverified} 条 · 失败 ${failed} 条${outcomeUnknown?`\n其中 ${outcomeUnknown} 条提交结果未知，请先检查下载器状态，勿直接重复提交`:''}${bindingBypassed?`\n${bypassDetail}`:libraryUnavailable?'\n媒体服务器暂不可核对，本次未按库存过滤':''}`
+            title:outcomeUnknown?'自动下载结果待核对':failed?'自动下载部分失败':deferred?'本轮自动下载完成':bindingBypassed?'自动下载完成，已有剧集过滤已跳过':libraryUnavailable?'自动下载完成，库存核对未完成':unverified?'自动下载待核验':'自动下载完成',
+            message:`刷新：拉取 ${r.refresh.total} 条，新增 ${r.refresh.new} 条${filtered?`，精确过滤 ${filtered} 条`:''}\n下载：新增提交 ${added} 条 · qB 已存在 ${existing} 条 · 待核验 ${unverified} 条 · 失败 ${failed} 条${deferred?`\n剩余 ${deferred} 条保留待处理，将在下一轮继续`:''}${outcomeUnknown?`\n其中 ${outcomeUnknown} 条提交结果未知，请先检查下载器状态，勿直接重复提交`:''}${bindingBypassed?`\n${bypassDetail}`:libraryUnavailable?'\n媒体服务器暂不可核对，本次未按库存过滤':''}`
         });
         await loadEntries();
     }catch(error){await appAlert({type:'error',title:'自动下载失败',message:error.message||'请求失败，请检查网络和服务状态。'});}

@@ -29,6 +29,7 @@ _RUNTIME_TICKS_PER_MINUTE = 600_000_000
 _MAX_RUNTIME_MINUTES = 525_600
 _MEDIA_ITEM_PAGE_SIZE = 5_000
 _MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH = 100_000
+_MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY = 64
 
 
 class MediaLibraryEnumerationTooLarge(RuntimeError):
@@ -699,19 +700,18 @@ class MediaServerClient:
 
     def _deepest_item_for_path(
         self, items: list[dict[str, Any]], target: str,
-    ) -> str:
-        """返回覆盖目标路径的最深已存在 Item；找不到时返回空串。"""
-        best_id = ""
+    ) -> dict[str, Any] | None:
+        """返回覆盖目标路径的最深已存在 Item；避免命中后再次线性扫描。"""
+        best_item: dict[str, Any] | None = None
         best_length = -1
         for item in items:
             item_path = self._normalize_media_path(item.get("Path"))
             if not item_path:
                 continue
-            if media_server_path_is_within(target, item_path):
-                if len(item_path) > best_length:
-                    best_length = len(item_path)
-                    best_id = str(item.get("Id") or "").strip()
-        return best_id
+            if media_server_path_is_within(target, item_path) and len(item_path) > best_length:
+                best_length = len(item_path)
+                best_item = item
+        return best_item
 
     def _finish_unlocatable_refresh(
         self, result: dict[str, Any], reason: str, *, allow_global: bool = True,
@@ -886,50 +886,57 @@ class MediaServerClient:
         library_fallbacks: list[str] = []
         failed_item_listings: set[str] = set()
         oversized_item_listings: set[str] = set()
+        dense_target_libraries: set[str] = set()
+        targets_by_library: dict[str, list[tuple[str, str]]] = {}
         for target, (library_id, library_location) in library_for_target.items():
-            if library_id not in items_by_library:
-                try:
-                    items_by_library[library_id] = self._library_items_with_paths(library_id)
-                except MediaLibraryEnumerationTooLarge:
-                    logger.info(
-                        "[%s] 媒体库 %s 超过精准枚举上限，降级为库级刷新",
-                        self.display_name, library_id,
-                    )
-                    items_by_library[library_id] = []
-                    oversized_item_listings.add(library_id)
-                except Exception as exc:
-                    logger.warning(
-                        "[%s] 读取媒体库 %s 条目失败，已安全跳过该库刷新: %s",
-                        self.display_name, library_id, exc,
-                    )
-                    items_by_library[library_id] = []
-                    failed_item_listings.add(library_id)
-            if library_id in oversized_item_listings:
+            targets_by_library.setdefault(library_id, []).append(
+                (target, library_location)
+            )
+
+        for library_id, library_targets in targets_by_library.items():
+            # 精准刷新适合少量变更；元数据大批落盘时逐目标扫描整个库反而
+            # 比一次库级刷新昂贵。超过固定阈值直接降级，复杂度保持有界。
+            if len(library_targets) > _MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY:
+                dense_target_libraries.add(library_id)
                 library_fallbacks.append(library_id)
                 continue
-            if library_id in failed_item_listings:
-                continue
-            items = items_by_library[library_id]
-            item_id = self._deepest_item_for_path(items, target)
-            if not item_id:
+            try:
+                items = self._library_items_with_paths(library_id)
+                items_by_library[library_id] = items
+            except MediaLibraryEnumerationTooLarge:
+                logger.info(
+                    "[%s] 媒体库 %s 超过精准枚举上限，降级为库级刷新",
+                    self.display_name, library_id,
+                )
+                oversized_item_listings.add(library_id)
                 library_fallbacks.append(library_id)
                 continue
-            matched_item = next(
-                (item for item in items if str(item.get("Id") or "").strip() == item_id),
-                None,
-            )
-            item_path = self._normalize_media_path(
-                matched_item.get("Path") if isinstance(matched_item, dict) else ""
-            )
-            if (
-                item_path
-                and self._media_path_key(item_path) == self._media_path_key(library_location)
-            ):
-                # Jellyfin 可能返回一个覆盖物理媒体库根目录的 Folder Item；
-                # 它的 ID 不等于 VirtualFolder ItemId，但刷新范围仍是库级。
-                library_fallbacks.append(item_id)
-            else:
-                item_ids.append(item_id)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] 读取媒体库 %s 条目失败，已安全跳过该库刷新: %s",
+                    self.display_name, library_id, exc,
+                )
+                failed_item_listings.add(library_id)
+                continue
+
+            for target, library_location in library_targets:
+                matched_item = self._deepest_item_for_path(items, target)
+                item_id = str(
+                    matched_item.get("Id") if isinstance(matched_item, dict) else ""
+                ).strip()
+                if not item_id:
+                    library_fallbacks.append(library_id)
+                    continue
+                item_path = self._normalize_media_path(matched_item.get("Path"))
+                if (
+                    item_path
+                    and self._media_path_key(item_path)
+                    == self._media_path_key(library_location)
+                ):
+                    # Jellyfin 可能返回覆盖物理库根的 Folder Item；其刷新范围仍为库级。
+                    library_fallbacks.append(item_id)
+                else:
+                    item_ids.append(item_id)
 
         refreshed = list(dict.fromkeys(item_ids))
         libraries = [
@@ -975,6 +982,10 @@ class MediaServerClient:
         if oversized_item_listings:
             reasons.append(
                 f"{len(oversized_item_listings)} 个大库已降级为媒体库刷新"
+            )
+        if dense_target_libraries:
+            reasons.append(
+                f"{len(dense_target_libraries)} 个多变更媒体库已合并为库级刷新"
             )
         if failed_item_listings:
             reasons.append(

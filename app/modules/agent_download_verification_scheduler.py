@@ -10,6 +10,8 @@ from app import database as db
 from app.agent.episode_audit import invalidate_episode_audit_cache
 from app.agent.models import ToolResult
 from app.agent.feature_gate import (
+    AgentRuntimeDisabled,
+    agent_runtime_effect_admission,
     agent_runtime_generation_is_current,
     current_agent_runtime_generation,
 )
@@ -24,10 +26,12 @@ from app.agent.recent_download_submissions import (
     build_recent_download_status,
 )
 from app.logger import get_logger
+from app.notifier import TelegramSendResult
 from app.modules.agent_download_verification_notifications import (
     dump_download_verification_payload,
     load_download_verification_payload,
     notify_download_verification_terminal,
+    notify_download_verification_terminal_result,
 )
 
 logger = get_logger(__name__)
@@ -58,10 +62,10 @@ class DownloadLibraryVerificationScheduler:
         interval: float = 30.0,
         max_attempts: int = 5,
         clock: Callable[[], datetime] | None = None,
-        terminal_notifier: Callable[..., bool] | None = None,
+        terminal_notifier: Callable[..., object] | None = None,
     ) -> None:
         self._audit_executor = audit_executor or self._default_audit_executor
-        self._terminal_notifier = terminal_notifier or notify_download_verification_terminal
+        self._terminal_notifier = terminal_notifier or notify_download_verification_terminal_result
         self._notification_enabled_override = terminal_notifier is not None
         self.interval = max(0.1, float(interval))
         self.max_attempts = max(1, min(int(max_attempts), len(_RETRY_DELAYS)))
@@ -96,6 +100,9 @@ class DownloadLibraryVerificationScheduler:
         return stopped
 
     def reload(self) -> None:
+        with self._notification_gate:
+            if not self._notifications_enabled():
+                db.discard_agent_download_verification_notifications()
         self._wake_event.set()
 
     def status(self) -> dict[str, object]:
@@ -585,13 +592,34 @@ class DownloadLibraryVerificationScheduler:
                 )
                 return 0
             try:
-                sent = bool(
-                    self._terminal_notifier(
+                with agent_runtime_effect_admission(generation_guard):
+                    if not self._runtime_allows(generation_guard):
+                        db.release_agent_download_verification_notification(
+                            notification_id,
+                            expected_lease_generation=generation,
+                            next_attempt_at=current,
+                        )
+                        return 0
+                    raw_result = self._terminal_notifier(
                         owner=owner,
                         chat_id=chat_id,
                         **payload,
                     )
+                result = (
+                    raw_result if isinstance(raw_result, TelegramSendResult)
+                    else TelegramSendResult(
+                        ok=bool(raw_result),
+                        error="" if raw_result else "DeliveryFailed",
+                        status_code=500 if raw_result is False else 0,
+                    )
                 )
+            except AgentRuntimeDisabled:
+                db.release_agent_download_verification_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    next_attempt_at=current,
+                )
+                return 0
             except Exception as exc:
                 logger.warning(
                     "Agent 下载后媒体库复核通知失败 type=%s",
@@ -606,15 +634,33 @@ class DownloadLibraryVerificationScheduler:
                         next_attempt_at=current,
                     )
                 return 1
-            if sent:
+            if result.ok:
                 db.complete_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
                     sent_at=current,
                 )
+            elif result.outcome_unknown:
+                db.discard_agent_download_verification_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    error_type="DeliveryOutcomeUnknown",
+                )
+            elif result.error in {
+                "NotificationsDisabled", "AuthorizationRevoked", "InvalidRoute",
+            }:
+                db.discard_agent_download_verification_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    error_type=result.error,
+                )
             else:
                 if self._runtime_allows(generation_guard):
-                    self._retry_notification(item, error_type="DeliveryFailed")
+                    self._retry_notification(
+                        item,
+                        error_type="DeliveryFailed",
+                        delay_override=result.retry_after_seconds,
+                    )
                 else:
                     db.release_agent_download_verification_notification(
                         notification_id,
@@ -623,7 +669,9 @@ class DownloadLibraryVerificationScheduler:
                     )
             return 1
 
-    def _retry_notification(self, item, *, error_type: str) -> None:
+    def _retry_notification(
+        self, item, *, error_type: str, delay_override: int = 0,
+    ) -> None:
         attempts = max(0, int(item["attempts"] or 0))
         if attempts + 1 >= _NOTIFICATION_MAX_ATTEMPTS:
             db.discard_agent_download_verification_notification(
@@ -632,7 +680,7 @@ class DownloadLibraryVerificationScheduler:
                 error_type=error_type,
             )
             return
-        delay = _NOTIFICATION_RETRY_DELAYS[
+        delay = max(0, int(delay_override or 0)) or _NOTIFICATION_RETRY_DELAYS[
             min(attempts, len(_NOTIFICATION_RETRY_DELAYS) - 1)
         ]
         db.retry_agent_download_verification_notification(

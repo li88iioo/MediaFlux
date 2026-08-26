@@ -26,8 +26,10 @@ class TabLazyLoadingTests(unittest.TestCase):
         self.assertNotIn("\nloadSubs();\nloadEntries();\n", self.rss)
 
     def test_download_logs_and_issues_wait_for_their_tabs(self) -> None:
-        self.assertIn("if(isIssues&&!hasLoadedDownloadIssues)loadIssues", self.downloads)
-        self.assertIn("if(isLogs&&!hasLoadedDownloadLogs)loadLogs", self.downloads)
+        self.assertIn("if(isIssues&&!hasLoadedDownloadIssues){", self.downloads)
+        self.assertIn("loadIssues(downloadIssuePage).then", self.downloads)
+        self.assertIn("if(isLogs&&!hasLoadedDownloadLogs){", self.downloads)
+        self.assertIn("loadLogs(downloadLogPage).then", self.downloads)
         self.assertNotIn("syncOverviewPolling();loadLogs(1)", self.downloads)
         self.assertNotIn("if(normalizedDownloadView!=='issues')loadIssues(1)", self.downloads)
 

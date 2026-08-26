@@ -319,13 +319,39 @@ class AgentSettingsUiTests(unittest.TestCase):
             "app.modules.agent_runtime.request_agent_runtime_reconcile"
         ) as reconcile, patch(
             "app.bot.handlers.request_command_menu_refresh"
-        ) as refresh_menu:
+        ) as refresh_menu, patch(
+            "app.agent.feature_gate.invalidate_agent_runtime_generation"
+        ) as invalidate:
             response = save_config(request, {"TG_AGENT_ENABLED": "0"})
 
         self.assertEqual(response, {"success": True})
         restart.assert_not_called()
         reconcile.assert_not_called()
         refresh_menu.assert_called_once_with()
+        invalidate.assert_not_called()
+
+    def test_download_verification_notification_toggle_reloads_scheduler(self):
+        request = self._request()
+        scheduler = MagicMock()
+
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": (
+                "1" if key == "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED" else default
+            ),
+        ), patch("app.routes.api.config.set_and_save"), patch(
+            "app.services.clear_dashboard_cache"
+        ), patch(
+            "app.modules.agent_download_verification_scheduler."
+            "get_download_library_verification_scheduler",
+            return_value=scheduler,
+        ):
+            response = save_config(
+                request, {"AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED": "0"}
+            )
+
+        self.assertEqual(response, {"success": True})
+        scheduler.reload.assert_called_once_with()
 
     def test_secret_can_be_replaced_or_explicitly_cleared_without_reveal(self):
         with patch("app.routes.api.config.set_and_save") as persist, patch(

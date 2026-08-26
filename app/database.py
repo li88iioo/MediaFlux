@@ -3862,6 +3862,7 @@ from app.repositories.agent_library_patrol import (  # noqa: E402
     ensure_agent_library_patrol,
     get_agent_library_patrol,
     list_agent_library_patrol_notifications,
+    release_agent_library_patrol_notification,
     reschedule_agent_library_patrol,
     retry_agent_library_patrol_cycle,
     retry_agent_library_patrol_notification,

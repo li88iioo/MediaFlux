@@ -1279,8 +1279,22 @@ def save_config(request: Request, data: Any = Body(default=None)):
         return {"success": True}
 
     persist_started = time.perf_counter()
+    agent_transition_changed = bool(
+        {"AGENT_ENABLED", "TG_AGENT_ENABLED"} & persisted_updates.keys()
+    )
     try:
-        config.set_and_save(persisted_updates)
+        if agent_transition_changed:
+            from app.agent.feature_gate import (
+                agent_runtime_transition,
+                invalidate_agent_runtime_generation,
+            )
+
+            with agent_runtime_transition():
+                config.set_and_save(persisted_updates)
+                if "AGENT_ENABLED" in persisted_updates:
+                    invalidate_agent_runtime_generation()
+        else:
+            config.set_and_save(persisted_updates)
     except (config.AtomicPublishError, OSError) as exc:
         return config_write_api_error(
             exc,
@@ -1417,9 +1431,6 @@ def save_config(request: Request, data: Any = Body(default=None)):
             )
     if "AGENT_ENABLED" in changed_keys:
         try:
-            from app.agent.feature_gate import invalidate_agent_runtime_generation
-
-            invalidate_agent_runtime_generation()
             if background_services_enabled:
                 from app.modules.agent_runtime import request_agent_runtime_reconcile
 
@@ -1446,6 +1457,10 @@ def save_config(request: Request, data: Any = Body(default=None)):
     organize_keys = {key for key in updates if key.startswith("GY_ORGANIZE_")}
     agent_patrol_keys = {
         key for key in updates if key.startswith("AGENT_LIBRARY_PATROL_")
+    }
+    agent_download_verification_keys = {
+        key for key in persisted_updates
+        if key.startswith("AGENT_DOWNLOAD_VERIFICATION_")
     }
     if strm_keys:
         try:
@@ -1491,6 +1506,18 @@ def save_config(request: Request, data: Any = Body(default=None)):
             )
         finally:
             patrol_reload_ms = max(1, round((time.perf_counter() - patrol_reload_started) * 1000))
+    if agent_download_verification_keys:
+        try:
+            from app.modules.agent_download_verification_scheduler import (
+                get_download_library_verification_scheduler,
+            )
+
+            get_download_library_verification_scheduler().reload()
+        except Exception as exc:
+            logger.warning(
+                "Agent 下载后媒体库复核配置热加载失败 type=%s",
+                type(exc).__name__,
+            )
     total_ms = max(1, round((time.perf_counter() - request_started) * 1000))
     logger.info(
         "配置保存完成 changed=%s persist_ms=%s bot_restart_ms=%s patrol_reload_ms=%s total_ms=%s",

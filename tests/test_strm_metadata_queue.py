@@ -443,7 +443,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
             "app.modules.scheduler.STRMScheduler._refresh_media_servers",
             return_value={"Jellyfin": True},
         ) as refresh:
-            worker._flush_media_refresh(force=True)
+            worker._flush_media_refresh(force=False)
 
         refresh.assert_called_once()
         self.assertEqual(refresh.call_args.kwargs["changed_paths"], [path])

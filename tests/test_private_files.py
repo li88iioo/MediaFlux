@@ -7,8 +7,10 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.logger import _WindowsSafeTimedRotatingFileHandler
+from app import private_files
 from app.private_files import protect_private_file, protect_sqlite_files
 
 
@@ -26,6 +28,20 @@ class PrivateFilePermissionTests(unittest.TestCase):
 
             self.assertTrue(protect_private_file(path))
             self.assertEqual(self._mode(path), 0o600)
+
+    def test_already_private_file_does_not_reopen_or_fchmod(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "private.db"
+            path.write_text("private", encoding="utf-8")
+            path.chmod(0o600)
+
+            with patch.object(private_files.os, "open") as open_file, patch.object(
+                private_files.os, "fchmod"
+            ) as fchmod:
+                self.assertTrue(protect_private_file(path))
+
+            open_file.assert_not_called()
+            fchmod.assert_not_called()
 
     def test_symlink_and_directory_are_not_modified(self):
         with tempfile.TemporaryDirectory() as root:

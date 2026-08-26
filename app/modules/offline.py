@@ -625,7 +625,14 @@ def submit_offline_selection(url: str, selected_indexes: list[int] | None,
                 task_type=decision.protocol,
             )
         except Exception as exc:
-            return {**base, "error": f"光鸭任务创建失败: {exc}"}
+            # 旧式 HTTP/ED2K 接口没有可复核的文件树；请求一旦发出，连接异常
+            # 无法证明上游未创建任务。标记为结果未知，阻止调用方立即重复提交。
+            return {
+                **base,
+                "error": f"光鸭任务创建结果待核对: {exc}",
+                "outcome_unknown": True,
+                "review_required": True,
+            }
         if isinstance(created, dict):
             ok = bool(created.get("ok"))
             task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]

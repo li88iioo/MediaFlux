@@ -157,12 +157,24 @@ class NotificationEvent:
 
 @dataclass(frozen=True)
 class TelegramSendResult:
-    """一次文本投递的结构化结果，供持久 Outbox 决定退避窗口。"""
+    """一次投递的结构化结果，供持久 Outbox 区分失败与结果未知。"""
 
     ok: bool
     retry_after_seconds: int = 0
     error: str = ""
     status_code: int = 0
+    partially_delivered: bool = False
+
+    @property
+    def outcome_unknown(self) -> bool:
+        """网络中断、超时或部分投递后无法安全重放。"""
+        return (
+            not self.ok
+            and (
+                self.partially_delivered
+                or int(self.status_code or 0) in {0, 408}
+            )
+        )
 
 
 
@@ -639,6 +651,32 @@ def _send_text(bot, target: str, text: str, *, reply_markup=None) -> bool:
     return True
 
 
+def _partial_delivery(result: TelegramSendResult) -> TelegramSendResult:
+    return TelegramSendResult(
+        ok=False,
+        retry_after_seconds=result.retry_after_seconds,
+        error=result.error,
+        status_code=result.status_code,
+        partially_delivered=True,
+    )
+
+
+def _send_text_result(bot, target: str, text: str, *, reply_markup=None) -> TelegramSendResult:
+    chunks = split_message(text)
+    sent = 0
+    try:
+        for index, chunk in enumerate(chunks):
+            kwargs = {
+                "reply_markup": reply_markup
+            } if reply_markup is not None and index == len(chunks) - 1 else {}
+            bot.send_message(target, chunk, **kwargs)
+            sent += 1
+        return TelegramSendResult(ok=True)
+    except Exception as exc:
+        result = _telegram_send_error(exc)
+        return _partial_delivery(result) if sent else result
+
+
 def _telegram_send_error(exc: Exception) -> TelegramSendResult:
     """提取 Telegram 错误码与 retry_after，并避免把 Bot Token 写入日志。"""
     result_json = getattr(exc, "result_json", None)
@@ -689,35 +727,46 @@ def send_result(
     target = str(chat_id or _chat_id or "").strip()
     if not bot or not target:
         _log_notification_fallback(text)
-        return TelegramSendResult(ok=False, error="Telegram Bot 或 Chat ID 未配置")
+        return TelegramSendResult(
+            ok=False, error="Telegram Bot 或 Chat ID 未配置", status_code=503,
+        )
+    image = str(image_url or "").strip()
+    if not image:
+        result = _send_text_result(bot, target, text)
+        if not result.ok:
+            logger.error(
+                "Telegram 发送失败 status=%s retry_after=%s error=%s",
+                result.status_code or "-", result.retry_after_seconds or "-",
+                result.error,
+            )
+        return result
+
+    chunks = split_message(text, _CAPTION_LIMIT)
     try:
-        image = str(image_url or "").strip()
-        if image:
-            chunks = split_message(text, _CAPTION_LIMIT)
-            try:
-                bot.send_photo(target, image, caption=chunks[0])
-            except Exception as exc:
-                result = _telegram_send_error(exc)
-                if not _photo_failure_allows_text_fallback(result):
-                    logger.warning(
-                        "Telegram 结果封面发送结果未知，停止文本回退 "
-                        "type=%s status=%s",
-                        type(exc).__name__, result.status_code or "-",
-                    )
-                    return result
-                logger.warning(
-                    "Telegram 明确拒绝结果封面，回退文本 type=%s status=%s",
-                    type(exc).__name__, result.status_code,
-                )
-                return TelegramSendResult(ok=bool(_send_text(bot, target, text)))
-            for chunk in chunks[1:]:
-                bot.send_message(target, chunk)
-            return TelegramSendResult(ok=True)
-        return TelegramSendResult(ok=bool(_send_text(bot, target, text)))
+        bot.send_photo(target, image, caption=chunks[0])
     except Exception as exc:
         result = _telegram_send_error(exc)
+        if not _photo_failure_allows_text_fallback(result):
+            logger.warning(
+                "Telegram 结果封面发送结果未知，停止文本回退 "
+                "type=%s status=%s",
+                type(exc).__name__, result.status_code or "-",
+            )
+            return result
+        logger.warning(
+            "Telegram 明确拒绝结果封面，回退文本 type=%s status=%s",
+            type(exc).__name__, result.status_code,
+        )
+        return _send_text_result(bot, target, text)
+
+    try:
+        for chunk in chunks[1:]:
+            bot.send_message(target, chunk)
+        return TelegramSendResult(ok=True)
+    except Exception as exc:
+        result = _partial_delivery(_telegram_send_error(exc))
         logger.error(
-            "Telegram 发送失败 type=%s status=%s retry_after=%s error=%s",
+            "Telegram 结果续发失败 type=%s status=%s retry_after=%s error=%s",
             type(exc).__name__, result.status_code or "-",
             result.retry_after_seconds or "-", result.error,
         )
@@ -770,26 +819,39 @@ def edit_event(
         return False
 
 
-def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
-    """发送结构化事件；图片失败时自动回退完整文本通知。"""
+def send_event_result(
+    event: NotificationEvent, chat_id: Optional[str] = None,
+) -> TelegramSendResult:
+    """发送结构化事件，并保留可重试/结果未知语义。"""
     bot = get_bot()
     target = str(chat_id or _chat_id or "").strip()
     text = render_event(event)
     if not bot or not target:
         _log_notification_fallback(text)
-        return False
+        return TelegramSendResult(
+            ok=False,
+            error="Telegram Bot 或 Chat ID 未配置",
+            status_code=503,
+        )
     image_url = str(event.image_url or "").strip()
     reply_markup = _event_markup(event)
     if not image_url:
-        try:
-            return _send_text(bot, target, text, reply_markup=reply_markup)
-        except Exception as exc:
-            logger.error("Telegram 发送失败 type=%s", type(exc).__name__)
-            return False
+        result = _send_text_result(
+            bot, target, text, reply_markup=reply_markup,
+        )
+        if not result.ok:
+            logger.error(
+                "Telegram 发送失败 error=%s status=%s retry_after=%s",
+                result.error or "DeliveryFailed", result.status_code or "-",
+                result.retry_after_seconds or "-",
+            )
+        return result
 
     caption_chunks = split_message(text, _CAPTION_LIMIT)
     try:
-        photo_kwargs = {"reply_markup": reply_markup} if reply_markup is not None and len(caption_chunks) == 1 else {}
+        photo_kwargs = {
+            "reply_markup": reply_markup
+        } if reply_markup is not None and len(caption_chunks) == 1 else {}
         bot.send_photo(target, image_url, caption=caption_chunks[0], **photo_kwargs)
     except Exception as exc:
         result = _telegram_send_error(exc)
@@ -798,24 +860,39 @@ def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
                 "Telegram 图片发送结果未知，停止文本回退 type=%s status=%s",
                 type(exc).__name__, result.status_code or "-",
             )
-            return False
+            return result
         logger.warning(
             "Telegram 明确拒绝图片，回退文本 type=%s status=%s",
             type(exc).__name__, result.status_code,
         )
-        try:
-            return _send_text(bot, target, text, reply_markup=reply_markup)
-        except Exception as fallback_exc:
-            logger.error("Telegram 文本回退失败 type=%s", type(fallback_exc).__name__)
-            return False
+        result = _send_text_result(
+            bot, target, text, reply_markup=reply_markup,
+        )
+        if not result.ok:
+            logger.error(
+                "Telegram 文本回退失败 error=%s status=%s",
+                result.error or "DeliveryFailed", result.status_code or "-",
+            )
+        return result
     try:
         for index, chunk in enumerate(caption_chunks[1:]):
-            kwargs = {"reply_markup": reply_markup} if reply_markup is not None and index == len(caption_chunks) - 2 else {}
+            kwargs = {
+                "reply_markup": reply_markup
+            } if reply_markup is not None and index == len(caption_chunks) - 2 else {}
             bot.send_message(target, chunk, **kwargs)
-        return True
+        return TelegramSendResult(ok=True)
     except Exception as exc:
-        logger.error("Telegram 图片通知续发失败 type=%s", type(exc).__name__)
-        return False
+        result = _partial_delivery(_telegram_send_error(exc))
+        logger.error(
+            "Telegram 图片通知续发失败 type=%s status=%s",
+            type(exc).__name__, result.status_code or "-",
+        )
+        return result
+
+
+def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
+    """兼容既有调用者的布尔接口。"""
+    return bool(send_event_result(event, chat_id=chat_id).ok)
 
 
 def notify_gcid_import_started(*, task_id: int, file_count: int, total_size: int,

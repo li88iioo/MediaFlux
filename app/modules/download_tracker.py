@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from app import database as db
 from app.clients.guangya import GuangYaClient
-from app.clients.qbittorrent import QBittorrentClient, is_qb_torrent_complete
+from app.clients.qbittorrent import QBittorrentClient, TorrentTask, is_qb_torrent_complete
 from app.config import get
 from app.logger import get_logger, log_throttled
 from app.modules.naming import sanitize_name
@@ -281,8 +281,11 @@ class DownloadTracker:
 
         effective_qb = updates.get("qb_status", qb_status)
         effective_gy = updates.get("gy_status", gy_status)
-        if effective_qb == "completed" and matched_qb_task is None and qb_available:
-            matched_qb_task = self._match_qb(row, qb_tasks)
+        if effective_qb == "completed" and matched_qb_task is None:
+            if qb_available:
+                matched_qb_task = self._match_qb(row, qb_tasks)
+            if matched_qb_task is None:
+                matched_qb_task = self._persisted_qb_import_task(row)
         statuses = [status for status in (effective_qb, effective_gy) if status]
         # successor 只接管用户明确重提的后端；旧请求仍需跟踪另一个活动后端，
         # 但不得再把审计根状态从 resubmitted 改回 downloading/completed。
@@ -338,6 +341,30 @@ class DownloadTracker:
             if self._staging_ready_for_organize(row):
                 self._start_organize(row)
         self._notify_completion(row, effective_qb, effective_gy, updates)
+
+
+    @classmethod
+    def _persisted_qb_import_task(cls, row) -> TorrentTask | None:
+        """qB 自动删种后，继续用已持久化的完成路径重试本地入库。"""
+        content_path = str(cls._row_value(row, "qb_content_path", "") or "").strip()
+        if not content_path:
+            return None
+        return TorrentTask(
+            hash=str(cls._row_value(row, "qb_task_id", "") or ""),
+            name=str(cls._row_value(row, "title", "") or ""),
+            progress=1.0,
+            state="completed",
+            save_path="",
+            content_path=content_path,
+            size=0,
+            downloaded=0,
+            dlspeed=0,
+            upspeed=0,
+            eta=0,
+            ratio=0.0,
+            category="",
+            added_on=0,
+        )
 
     def _start_local_import(self, row, task) -> None:
         # 新来源配置优先走持久化调度器；此处只上报完成事件，不执行文件写入。

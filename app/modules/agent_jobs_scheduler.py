@@ -104,7 +104,14 @@ class AgentJobsScheduler:
             )
         except Exception as exc:
             logger.warning("Agent 长任务执行失败 type=%s", type(exc).__name__)
-            self._retry(job, error_code=type(exc).__name__)
+            if agent_runtime_generation_is_current(runtime_generation):
+                self._retry(job, error_code=type(exc).__name__)
+            else:
+                db.release_agent_job_lease(
+                    str(job["job_id"]),
+                    expected_lease_generation=int(job["lease_generation"]),
+                    next_run_at=current,
+                )
         return 1
 
     def _process(self, job, *, current: str, runtime_generation: int) -> None:

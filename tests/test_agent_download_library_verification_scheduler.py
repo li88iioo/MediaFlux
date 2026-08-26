@@ -22,6 +22,7 @@ from app.modules.agent_download_verification_scheduler import (
 from app.modules.agent_download_verification_notifications import (
     dump_download_verification_payload,
 )
+from app.notifier import TelegramSendResult
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -781,6 +782,54 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertGreater(
             int(discarded["lease_generation"]), int(claimed["lease_generation"])
         )
+
+    def test_delivery_outcome_unknown_is_discarded_without_duplicate_retry(self):
+        self._request("notify-unknown-auto-verify", owner=_TG_OWNER)
+        job = db.claim_due_agent_download_verification(
+            current_time="2026-08-03 12:00:00"
+        )
+        scheduler = DownloadLibraryVerificationScheduler(
+            audit_executor=Mock(),
+            terminal_notifier=Mock(return_value=TelegramSendResult(
+                ok=False, error="timeout", status_code=0,
+            )),
+            clock=self.clock,
+        )
+        scheduler._finish(
+            job,
+            status="attention",
+            result="missing",
+            attempts=2,
+            current="2026-08-03 12:00:00",
+        )
+
+        self.assertEqual(scheduler.dispatch_notification_once(), 1)
+        notification = db.list_agent_download_verification_notifications()[0]
+        self.assertEqual(notification["status"], "discarded")
+        self.assertEqual(notification["attempts"], 0)
+        self.assertEqual(notification["payload_json"], "")
+        self.assertEqual(notification["last_error_type"], "DeliveryOutcomeUnknown")
+
+    def test_reload_discards_notification_backlog_when_notifications_disabled(self):
+        self._request("notify-disabled-reload", owner=_TG_OWNER)
+        job = db.claim_due_agent_download_verification(
+            current_time="2026-08-03 12:00:00"
+        )
+        scheduler = DownloadLibraryVerificationScheduler(
+            audit_executor=Mock(), terminal_notifier=Mock(), clock=self.clock,
+        )
+        scheduler._finish(
+            job, status="attention", result="missing", attempts=2,
+            current="2026-08-03 12:00:00",
+        )
+
+        scheduler._notification_enabled_override = False
+        with patch("app.config.get_bool", return_value=False):
+            scheduler.reload()
+
+        notification = db.list_agent_download_verification_notifications()[0]
+        self.assertEqual(notification["status"], "discarded")
+        self.assertEqual(notification["payload_json"], "")
 
     def test_pre_audit_exception_is_rescheduled_and_secret_is_not_logged(self):
         request_id = self._request("exception-auto-verify", phase="downloading")

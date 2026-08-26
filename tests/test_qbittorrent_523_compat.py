@@ -277,6 +277,31 @@ class QBittorrent523CompletionTests(unittest.TestCase):
         if update.called:
             self.assertNotIn("qb_status", update.call_args.kwargs)
 
+    def test_completed_request_uses_persisted_path_after_qb_auto_deletes_task(self):
+        tracker = DownloadTracker()
+        row = {
+            **self._row(),
+            "qb_status": "completed",
+            "local_import_status": "pending",
+            "qb_content_path": "/downloads/Demo/Demo.mkv",
+        }
+        with patch.object(tracker, "_update_backend_log"), patch.object(
+            tracker, "_start_local_import"
+        ) as start_import, patch.object(
+            tracker, "_notify_completion"
+        ), patch(
+            "app.modules.download_tracker.db.update_download_request_and_sync_media_admission"
+        ):
+            tracker._update_request(
+                row, [], [], qb_available=False, gy_available=False,
+            )
+
+        start_import.assert_called_once()
+        imported_row, task = start_import.call_args.args
+        self.assertIs(imported_row, row)
+        self.assertEqual(task.content_path, "/downloads/Demo/Demo.mkv")
+        self.assertEqual(task.progress, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

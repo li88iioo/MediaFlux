@@ -112,7 +112,14 @@ class FixedHostHttpClient:
             # 部分站点边缘节点（如 1lou 的 CDN）TCP 握手存在间歇性丢包，
             # 首连即卡满超时。retries 只重试连接建立阶段，请求一旦发出
             # 不会重放，对非幂等语义安全。
-            transport = httpx.AsyncHTTPTransport(retries=2)
+            transport = httpx.AsyncHTTPTransport(
+                retries=2,
+                # 多逻辑 Host 固定到同一 IP 时禁止跨 Host/SNI 复用；单 Host
+                # 客户端可安全复用 TLS 连接，避免每次搜索重新握手。
+                limits=httpx.Limits(max_keepalive_connections=0)
+                if self.pin_resolved_address and len(self.allowed_hosts) > 1
+                else httpx.Limits(),
+            )
         # 单次尝试用一半预算：服务层以 timeout_seconds 为总信封，只有单次
         # 尝试更短，读超时后的 GET 整请求重试才有机会在信封内完成。
         per_attempt_seconds = max(2.0, float(timeout_seconds) / 2)
@@ -461,6 +468,7 @@ class BrowserImpersonatingHttpClient:
         request_headers.setdefault("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
         try:
             from curl_cffi.const import CurlOpt
+            from curl_cffi.curl import CURL_WRITEFUNC_ERROR
         except ImportError as exc:  # pragma: no cover - 默认 session 已要求 curl_cffi
             raise RuntimeError("curl_cffi is required for browser indexer transport") from exc
         if not hasattr(self._session, "curl_options"):
@@ -473,32 +481,69 @@ class BrowserImpersonatingHttpClient:
         self._session.curl_options[CurlOpt.RESOLVE] = [
             f"{connect_host}:443:{connect_address}"
         ]
+        body = bytearray()
+        overflow = False
+
+        def collect(chunk: bytes) -> int:
+            nonlocal overflow
+            if not chunk:
+                return 0
+            if len(body) + len(chunk) > self.max_response_bytes:
+                overflow = True
+                # CFFI callback 不得抛 Python 异常，否则会向 stderr 打印
+                # “Exception ignored from cffi callback”。返回 libcurl 的写入
+                # 中止 sentinel，再由调用边界翻译为领域异常。
+                return CURL_WRITEFUNC_ERROR
+            body.extend(chunk)
+            return len(chunk)
+
         try:
-            response = self._session.get(
-                str(request_url),
-                params=params,
-                headers=request_headers,
-                impersonate="chrome",
-                timeout=self.timeout_seconds,
-                allow_redirects=False,
-            )
+            try:
+                response = self._session.get(
+                    str(request_url),
+                    params=params,
+                    headers=request_headers,
+                    impersonate="chrome",
+                    timeout=self.timeout_seconds,
+                    allow_redirects=False,
+                    content_callback=collect,
+                )
+                if overflow:
+                    raise IndexerResponseTooLarge(
+                        f"response size exceeds {self.max_response_bytes}"
+                    )
+            except Exception as exc:
+                if overflow:
+                    raise IndexerResponseTooLarge(
+                        f"response size exceeds {self.max_response_bytes}"
+                    ) from exc
+                raise
         finally:
             if previous_resolve is None:
                 self._session.curl_options.pop(CurlOpt.RESOLVE, None)
             else:
                 self._session.curl_options[CurlOpt.RESOLVE] = previous_resolve
         response_headers = {str(key).lower(): str(value) for key, value in dict(response.headers or {}).items()}
-        body = bytes(response.content or b"")
+        bounded_body = bytes(body)
+        # 测试替身或旧 curl_cffi 若未调用 content_callback，仍保持兼容；
+        # 正常生产路径由 callback 在接收过程中实施硬上限。
+        if not bounded_body:
+            fallback_body = bytes(getattr(response, "content", b"") or b"")
+            if len(fallback_body) > self.max_response_bytes:
+                raise IndexerResponseTooLarge(
+                    f"response size exceeds {self.max_response_bytes}"
+                )
+            bounded_body = fallback_body
         declared_size = FixedHostHttpClient._content_length(response_headers.get("content-length"))
         if declared_size is not None and declared_size > self.max_response_bytes:
             raise IndexerResponseTooLarge(f"declared response size {declared_size}")
-        if len(body) > self.max_response_bytes:
+        if len(bounded_body) > self.max_response_bytes:
             raise IndexerResponseTooLarge(f"response size exceeds {self.max_response_bytes}")
         return IndexerHttpResponse(
             url=str(logical_url),
             status_code=int(response.status_code),
             headers=response_headers,
-            body=body,
+            body=bounded_body,
         )
 
     def _validated_addresses(

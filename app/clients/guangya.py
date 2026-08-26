@@ -47,6 +47,7 @@ _LAST_LOGGED_TOKEN_FINGERPRINT = ""
 
 
 _READ_METRICS_MAX_LATENCY_SAMPLES = 1024
+_DEFAULT_DIRECTORY_ITEM_LIMIT = 100_000
 
 
 @dataclass
@@ -1260,13 +1261,21 @@ class GuangYaClient:
         parent_id: str = "0",
         *,
         should_stop: Callable[[], bool] | None = None,
+        max_items: int | None = None,
     ) -> Iterator[GuangYaFile]:
-        """逐页迭代目录，允许长扫描在分页边界及时停止。"""
+        """逐页迭代目录，并由调用方预算限制条目数而非固定页数。"""
         page_size = 200
-        max_pages = 500
         normalized_parent = parent_id if parent_id != "0" else None
         seen_ids: set[str] = set()
-        for page in range(max_pages):
+        yielded = 0
+        page = 0
+        # 保留历史 500 页（约 10 万项）熔断作为所有普通目录读取的默认边界；
+        # STRM 等已审计调用方可通过 max_items 传入更严格的本轮预算。
+        item_limit = (
+            _DEFAULT_DIRECTORY_ITEM_LIMIT
+            if max_items is None else max(1, int(max_items))
+        )
+        while True:
             if should_stop and should_stop():
                 return
             res = self._call_read(
@@ -1286,15 +1295,20 @@ class GuangYaClient:
                 item = _to_file(raw_item, parent_id)
                 if item.file_id and item.file_id in seen_ids:
                     continue
+                if item_limit is not None and yielded >= item_limit:
+                    raise RuntimeError(
+                        f"光鸭目录项目超过调用方安全上限 {item_limit}，已停止读取"
+                    )
                 if item.file_id:
                     seen_ids.add(item.file_id)
                 yield item
+                yielded += 1
                 new_count += 1
             if len(items) < page_size:
                 return
             if new_count == 0:
                 raise RuntimeError("光鸭目录分页未推进，已停止读取以避免返回不完整目录")
-        raise RuntimeError("光鸭目录项目过多，超过安全分页上限")
+            page += 1
 
     def list_dir(self, parent_id: str = "0") -> list[GuangYaFile]:
         """完整读取目录全部分页，适合需要完整快照的调用方。"""

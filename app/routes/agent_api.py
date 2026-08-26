@@ -90,6 +90,7 @@ from app.agent.orchestrator import (
     safe_policy_request,
 )
 from app.agent.rate_limit import agent_rate_limiter, allow_agent_tool
+from app.agent.feature_gate import AgentRuntimeDisabled, agent_runtime_admission
 from app.agent.registry import AgentToolError
 from app.agent.result_projection import (
     project_agent_result_for_user,
@@ -1557,10 +1558,11 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
             # 确认后的写操作已经越过可撤销边界。将受控执行和历史落库放在
             # 同一个 owner 终态窗口内，使 reset/delete 只能排在其前或其后，
             # 不会先返回后再出现迟到副作用；HTTP 响应发送仍发生在窗口外。
-            published, response = coordinator.finalize_if_current(
-                operation,
-                execute_confirmed_action,
-            )
+            with agent_runtime_admission():
+                published, response = coordinator.finalize_if_current(
+                    operation,
+                    execute_confirmed_action,
+                )
             if not published or response is None:
                 return api_error("会话状态已变化，请重新生成确认请求", 409)
         finally:
@@ -1575,6 +1577,8 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
             response,
             409 if result.get("status") in conflict_statuses else 503,
         )
+    except AgentRuntimeDisabled as exc:
+        return api_error(str(exc), 409)
     except AgentToolError as exc:
         return _agent_error(exc)
 

@@ -9,7 +9,7 @@ from app.agent.owner_routes import (
     parse_telegram_owner_route,
     telegram_owner_route_is_currently_authorized,
 )
-from app.notifier import NotificationEvent, send_event
+from app.notifier import NotificationEvent, TelegramSendResult, send_event, send_event_result
 
 send = send_event
 
@@ -113,10 +113,25 @@ def build_download_verification_event(
     )
 
 
+def notify_download_verification_terminal_result(
+    *, owner: str, chat_id: str, **payload
+) -> TelegramSendResult:
+    """向 owner 绑定 chat 投递终态通知，并保留结果未知语义。"""
+    if not config.get_bool("AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED", True):
+        return TelegramSendResult(False, error="NotificationsDisabled", status_code=503)
+    route = parse_telegram_owner_route(owner)
+    target = str(chat_id or "").strip()
+    if route is None or not target or route.chat_id != target:
+        return TelegramSendResult(False, error="InvalidRoute", status_code=403)
+    if not telegram_owner_route_is_currently_authorized(route, chat_id=target):
+        return TelegramSendResult(False, error="AuthorizationRevoked", status_code=403)
+    return send_event_result(build_download_verification_event(**payload), chat_id=target)
+
+
 def notify_download_verification_terminal(
     *, owner: str, chat_id: str, **payload
 ) -> bool:
-    """仅向持久化且与 owner 绑定的 Telegram chat 投递终态通知。"""
+    """兼容既有调用者与测试替身的布尔接口。"""
     if not config.get_bool("AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED", True):
         return False
     route = parse_telegram_owner_route(owner)

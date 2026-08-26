@@ -46,8 +46,14 @@ function switchDlTab(tabName, syncUrl=true) {
         if(panel)panel.hidden=!active;
     });
     document.getElementById('dlLogsFilters').style.display = isLogs ? 'grid' : 'none';
-    if(isIssues&&!hasLoadedDownloadIssues)loadIssues(downloadIssuePage);
-    if(isLogs&&!hasLoadedDownloadLogs)loadLogs(downloadLogPage);
+    if(isIssues&&!hasLoadedDownloadIssues){
+        announceDownloadTab('正在加载待处理请求');
+        loadIssues(downloadIssuePage).then(ok=>announceDownloadTab(ok?'待处理请求已加载':'待处理请求加载失败'));
+    }
+    if(isLogs&&!hasLoadedDownloadLogs){
+        announceDownloadTab('正在加载下载日志');
+        loadLogs(downloadLogPage).then(ok=>announceDownloadTab(ok?'下载日志已加载':'下载日志加载失败'));
+    }
     if(syncUrl){
         const url=new URL(window.location.href);
         if(isTasks)url.searchParams.delete('view');else url.searchParams.set('view',tabName);
@@ -66,9 +72,15 @@ document.querySelector('.dl-tab-bar')?.addEventListener('keydown',event=>{
     else if(event.key==='End')next=tabs.length-1;
     else return;
     event.preventDefault();
+    // 方向键仅移动焦点；Enter/Space 由原生 button click 激活，避免慢面板
+    // 在键盘浏览时被意外加载。
     tabs[next].focus();
-    switchDlTab(tabs[next].dataset.downloadTab);
 });
+
+function announceDownloadTab(message){
+    const status=document.getElementById('downloadTabStatus');
+    if(status)status.textContent=String(message||'');
+}
 
 function api(path, opts={}) { return fetch(path, {headers:{'Content-Type':'application/json'}, ...opts}); }
 async function readApiResponse(response) {
@@ -177,19 +189,52 @@ function syncLogSelectionControls() {
     });
 }
 
-function renderQb(qb) {
-    const incomingTasks=Array.isArray(qb.tasks)?qb.tasks:[];
-    const keepPreviousTasks=qb.error_code==='connection_failed'&&currentQbTasks.length>0&&!incomingTasks.length;
-    if(!keepPreviousTasks)currentQbTasks=incomingTasks;
-    const taskCount=currentQbTasks.length;
+function updateQbSummary(qb, taskCount=currentQbTasks.length) {
     const qbCountEl=document.getElementById('qbCount');
     if(window.MFAnim && qbCountEl) window.MFAnim.countUp(qbCountEl, taskCount);
     else if(qbCountEl) qbCountEl.textContent = taskCount;
     document.getElementById('tabTasksBadge').textContent = taskCount;
     document.getElementById('qbStatus').textContent = qb.online ? (qb.version?.app||'在线') : (qb.error||'离线');
     setOnline(document.getElementById('qbDot'), qb.online);
-    if(!qb.online) { document.getElementById('dlSpeed').textContent='—'; document.getElementById('upSpeed').textContent='上传 —'; }
-    if(qb.transfer) { document.getElementById('dlSpeed').textContent=speed(qb.transfer.dl_info_speed); document.getElementById('upSpeed').textContent='上传 '+speed(qb.transfer.up_info_speed); }
+    if(!qb.online) {
+        document.getElementById('dlSpeed').textContent='—';
+        document.getElementById('upSpeed').textContent='上传 —';
+    }
+    if(qb.transfer) {
+        document.getElementById('dlSpeed').textContent=speed(qb.transfer.dl_info_speed);
+        document.getElementById('upSpeed').textContent='上传 '+speed(qb.transfer.up_info_speed);
+    }
+}
+
+function updateQbLiveRows(qb){
+    const incomingTasks=Array.isArray(qb.tasks)?qb.tasks:[];
+    const keepPreviousTasks=qb.error_code==='connection_failed'&&currentQbTasks.length>0&&!incomingTasks.length;
+    if(!keepPreviousTasks)currentQbTasks=incomingTasks;
+    updateQbSummary(qb,currentQbTasks.length);
+    currentQbTasks.forEach(task=>{
+        const hash=String(task.hash||'').trim().toLowerCase();
+        const row=document.querySelector(`[data-qb-hash="${CSS.escape(hash)}"]`);
+        if(!row)return;
+        const progress=pct(task.progress);
+        row.querySelector('[data-qb-progress-fill]')?.style.setProperty('width',`${progress}%`);
+        const percent=row.querySelector('[data-qb-progress-percent]');
+        if(percent)percent.textContent=`${progress.toFixed(1)}%`;
+        const downloaded=row.querySelector('[data-qb-downloaded]');
+        if(downloaded)downloaded.textContent=`${bytes(task.downloaded)} / ${bytes(task.size)}`;
+        const taskSpeed=row.querySelector('[data-qb-speed]');
+        if(taskSpeed)taskSpeed.textContent=`↓ ${speed(task.dlspeed)}`;
+        const taskEta=row.querySelector('[data-qb-eta]');
+        if(taskEta)taskEta.textContent=`ETA ${eta(task.eta)}`;
+    });
+    syncQbSelectionControls();
+}
+
+function renderQb(qb) {
+    const incomingTasks=Array.isArray(qb.tasks)?qb.tasks:[];
+    const keepPreviousTasks=qb.error_code==='connection_failed'&&currentQbTasks.length>0&&!incomingTasks.length;
+    if(!keepPreviousTasks)currentQbTasks=incomingTasks;
+    const taskCount=currentQbTasks.length;
+    updateQbSummary(qb,taskCount);
     const body=document.getElementById('qbList');
     const focused=document.activeElement?.closest?.('[data-qb-hash]');
     const focusState=focused&&body.contains(focused)?{
@@ -242,13 +287,13 @@ function renderQb(qb) {
             <td class="progress-cell" style="min-width: 180px;">
                 <div class="dl-progress-bar-wrap">
                     <div class="dl-progress-track">
-                        <div class="dl-progress-fill ${stateClass}" style="width:${p}%"></div>
+                        <div class="dl-progress-fill ${stateClass}" data-qb-progress-fill style="width:${p}%"></div>
                     </div>
                     <div class="dl-progress-meta">
-                        <span style="font-weight:600;color:var(--text-primary);">${p.toFixed(1)}%</span>
-                        <span>${bytes(t.downloaded)} / ${bytes(t.size)}</span>
-                        <span>↓ ${speed(t.dlspeed)}</span>
-                        <span>ETA ${eta(t.eta)}</span>
+                        <span data-qb-progress-percent style="font-weight:600;color:var(--text-primary);">${p.toFixed(1)}%</span>
+                        <span data-qb-downloaded>${bytes(t.downloaded)} / ${bytes(t.size)}</span>
+                        <span data-qb-speed>↓ ${speed(t.dlspeed)}</span>
+                        <span data-qb-eta>ETA ${eta(t.eta)}</span>
                     </div>
                 </div>
             </td>
@@ -275,13 +320,21 @@ function renderQb(qb) {
 }
 
 function qbDisplaySignature(qb){
+    const incoming=Array.isArray(qb.tasks)?qb.tasks:[];
+    const tasks=(qb.error_code==='connection_failed'&&currentQbTasks.length&&!incoming.length)
+        ? currentQbTasks : incoming;
     return JSON.stringify({
         online:!!qb.online,
         error:String(qb.error||''),
         errorCode:String(qb.error_code||''),
-        version:qb.version||null,
-        transfer:qb.transfer||null,
-        tasks:Array.isArray(qb.tasks)?qb.tasks:[]
+        tasks:tasks.map(task=>({
+            hash:String(task.hash||'').trim().toLowerCase(),
+            name:String(task.name||''),
+            savePath:String(task.save_path||''),
+            category:String(task.category||''),
+            state:String(task.state||''),
+            size:Number(task.size)||0,
+        })),
     });
 }
 
@@ -487,6 +540,8 @@ function loadOverview(manual=false) {
                     if(signature!==currentQbDisplaySignature){
                         renderQb(qb);
                         currentQbDisplaySignature=signature;
+                    }else{
+                        updateQbLiveRows(qb);
                     }
                     document.getElementById('lastRefresh').textContent=currentManual?'刚刚更新':'更新于 '+new Date().toLocaleTimeString();
                     succeeded=true;

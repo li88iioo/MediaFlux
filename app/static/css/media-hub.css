@@ -1214,7 +1214,7 @@
     }
 }
 
-@media (max-width: 700px) {
+@media (max-width: 760px) {
     .media-hub-page .media-hub-topbar {
         gap: 8px;
         padding-inline: 10px;
@@ -1557,7 +1557,7 @@
     }
 }
 
-@media (max-width: 700px) {
+@media (max-width: 760px) {
     .media-hub-page.media-recent-page {
         --dashboard-topbar-h: 146px;
     }

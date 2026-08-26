@@ -9,7 +9,9 @@ from typing import Any
 
 from app.agent.library_patrol_status import validate_persisted_patrol_projection
 from app.config import get
-from app.notifier import NotificationAction, NotificationEvent, send_event
+from app.notifier import (
+    NotificationAction, NotificationEvent, TelegramSendResult, send_event, send_event_result,
+)
 
 _FINGERPRINT_SCHEMA_VERSION = 1
 _MAX_PAYLOAD_BYTES = 32_768
@@ -126,8 +128,16 @@ def _patrol_actions_configured() -> bool:
     )
 
 
+def send_library_patrol_notification_result(projection: Any) -> TelegramSendResult:
+    """发送安全结构化通知，并保留结果未知语义。"""
+    event = build_library_patrol_event(projection)
+    if event.actions and not _patrol_actions_configured():
+        event = replace(event, actions=())
+    return send_event_result(event)
+
+
 def send_library_patrol_notification(projection: Any) -> bool:
-    """发送安全结构化通知；Agent 不可操作时省略误导性的快捷按钮。"""
+    """兼容既有调用者与测试替身的布尔接口。"""
     event = build_library_patrol_event(projection)
     if event.actions and not _patrol_actions_configured():
         event = replace(event, actions=())

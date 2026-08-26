@@ -47,7 +47,11 @@ class FakeCurlSession:
         recorded = dict(kwargs)
         recorded["curl_options"] = dict(getattr(self, "curl_options", {}))
         self.calls.append((url, recorded))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        callback = kwargs.get("content_callback")
+        if callback is not None:
+            callback(response.content)
+        return response
 
     def close(self):
         self.closed = True
@@ -115,6 +119,28 @@ class IndexerHttpTests(unittest.IsolatedAsyncioTestCase):
             timeout_seconds=1,
         )
         return self.client
+
+    async def test_pinned_single_host_keeps_pool_but_multi_host_disables_reuse(self):
+        single = FixedHostHttpClient(
+            allowed_hosts={"nyaa.si"},
+            resolver=PUBLIC_DNS,
+            pin_resolved_address=True,
+        )
+        multi = FixedHostHttpClient(
+            allowed_hosts={"nyaa.si", "sukebei.nyaa.si"},
+            resolver=PUBLIC_DNS,
+            pin_resolved_address=True,
+        )
+        try:
+            self.assertGreater(
+                single._client._transport._pool._max_keepalive_connections, 0
+            )
+            self.assertEqual(
+                multi._client._transport._pool._max_keepalive_connections, 0
+            )
+        finally:
+            await single.aclose()
+            await multi.aclose()
 
     async def test_rejects_non_https_off_host_credentials_and_private_dns(self):
         client = self.make_client(lambda request: httpx.Response(200, content=b"ok"))
@@ -199,6 +225,19 @@ class IndexerHttpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(CurlOpt.RESOLVE, session.curl_options)
         self.assertEqual(response.body, b"ok")
+
+    async def test_browser_client_stops_oversized_body_during_receive(self):
+        session = FakeCurlSession([FakeCurlResponse(content=b"12345")])
+        client = BrowserImpersonatingHttpClient(
+            allowed_hosts={"www.example.com"},
+            resolver=PUBLIC_DNS,
+            session_factory=lambda: session,
+            max_response_bytes=4,
+        )
+        self.client = client
+
+        with self.assertRaises(IndexerResponseTooLarge):
+            await client.get("https://www.example.com/search/demo")
 
     async def test_browser_client_rejects_unregistered_sni_host(self):
         with self.assertRaisesRegex(ValueError, "sni_host"):

@@ -124,6 +124,66 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         self.assertEqual(recovered.refresh(sid), {"total": 0, "new": 0, "skipped": 0})
         recovered.parser.parse.assert_called_once()
 
+    def test_auto_download_consumes_all_pending_entries_in_bounded_batches(self):
+        engine = RSSEngine()
+        engine.refresh = Mock(return_value={"total": 25, "new": 25, "skipped": 0})
+        engine.download_many = Mock(side_effect=lambda ids: {
+            "total": len(ids),
+            "succeeded": [{"id": item} for item in ids],
+            "existing": [],
+            "unverified": [],
+            "failed": [],
+            "success_count": len(ids),
+            "existing_count": 0,
+            "unverified_count": 0,
+            "failure_count": 0,
+            "outcome_unknown_count": 0,
+            "review_required": False,
+        })
+        rows = [{"id": item, "title": f"Episode {item}"} for item in range(1, 26)]
+
+        with patch(
+            "app.modules.rss.db.list_rss_entries", return_value=rows,
+        ), patch(
+            "app.modules.rss.db.get_rss_subscription",
+            return_value={"exclude_keywords": ""},
+        ), patch(
+            "app.modules.rss.db.skip_pending_rss_entries", return_value=0,
+        ):
+            result = engine.auto_download(7)
+
+        self.assertEqual(
+            [call.args[0] for call in engine.download_many.call_args_list],
+            [list(range(1, 21)), list(range(21, 26))],
+        )
+        self.assertEqual(result["downloaded"], 25)
+        self.assertEqual(result["failed"], 0)
+
+    def test_auto_download_defers_backlog_beyond_one_round_budget(self):
+        engine = RSSEngine()
+        engine.refresh = Mock(return_value={"total": 105, "new": 105, "skipped": 0})
+        engine.download_many = Mock(side_effect=lambda ids: {
+            "total": len(ids), "succeeded": list(ids), "existing": [],
+            "unverified": [], "failed": [], "success_count": len(ids),
+            "existing_count": 0, "unverified_count": 0, "failure_count": 0,
+            "outcome_unknown_count": 0, "review_required": False,
+        })
+        rows = [{"id": item, "title": f"Episode {item}"} for item in range(1, 106)]
+
+        with patch(
+            "app.modules.rss.db.list_rss_entries", return_value=rows,
+        ), patch(
+            "app.modules.rss.db.get_rss_subscription",
+            return_value={"exclude_keywords": ""},
+        ), patch(
+            "app.modules.rss.db.skip_pending_rss_entries", return_value=0,
+        ):
+            result = engine.auto_download(7)
+
+        self.assertEqual(result["downloaded"], 100)
+        self.assertEqual(result["deferred"], 5)
+        self.assertEqual(engine.download_many.call_count, 5)
+
     def test_all_failed_sources_do_not_advance_last_refresh_time(self):
         sid = self._subscription("all-failed")
         db.update_rss_subscription(sid, {

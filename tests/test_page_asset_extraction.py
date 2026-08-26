@@ -62,6 +62,10 @@ class PageAssetExtractionTests(unittest.TestCase):
         self.assertEqual(template.count('role="tabpanel"'), 3)
         self.assertIn("event.key==='ArrowRight'", script)
         self.assertIn("qbDisplaySignature", script)
+        self.assertIn("updateQbLiveRows", script)
+        self.assertIn('data-qb-progress-fill', script)
+        self.assertIn('id="downloadTabStatus"', template)
+        self.assertNotIn("transfer:qb.transfer", script)
 
     def test_recent_media_async_update_replaces_one_stable_result_plane(self) -> None:
         template = Path("app/templates/media_recent.html").read_text(encoding="utf-8")

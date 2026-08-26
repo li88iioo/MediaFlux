@@ -908,6 +908,33 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
             }],
         )
 
+    def test_legacy_create_connection_error_is_marked_outcome_unknown(self):
+        submit_selection = getattr(offline, "submit_offline_selection", None)
+        self.assertIsNotNone(submit_selection)
+        client = FakeSelectionClient({
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "resourceType": "http",
+                "resourceName": "direct-download.iso",
+                "url": "https://example.invalid/direct-download.iso",
+                "size": 2147483648,
+            },
+        })
+        client.add_offline_task = Mock(side_effect=TimeoutError("upstream timeout"))
+
+        result = submit_selection(
+            "https://example.invalid/direct-download.iso",
+            selected_indexes=[],
+            client=client,
+            rules=self.rules,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["outcome_unknown"])
+        self.assertTrue(result["review_required"])
+        self.assertIn("待核对", result["error"])
+
     def test_submit_magnet_without_file_tree_does_not_fall_back_to_whole_task(self):
         submit_selection = getattr(offline, "submit_offline_selection", None)
         self.assertIsNotNone(submit_selection)

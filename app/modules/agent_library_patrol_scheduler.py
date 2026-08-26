@@ -9,6 +9,8 @@ from typing import Callable
 
 from app import config, database as db
 from app.agent.feature_gate import (
+    AgentRuntimeDisabled,
+    agent_runtime_effect_admission,
     agent_runtime_generation_is_current,
     current_agent_runtime_generation,
 )
@@ -22,10 +24,11 @@ from app.agent.library_patrol_progress import (
 from app.modules.agent_library_patrol_notifications import (
     build_patrol_result_fingerprint,
     load_patrol_notification_payload,
-    send_library_patrol_notification,
+    send_library_patrol_notification_result,
     serialize_patrol_notification_payload,
 )
 from app.logger import get_logger
+from app.notifier import TelegramSendResult
 
 logger = get_logger(__name__)
 
@@ -34,6 +37,7 @@ _RUNNING_LEASE_SECONDS = 5 * 60
 _RETRY_DELAYS = (15 * 60, 60 * 60)
 _NOTIFICATION_LEASE_SECONDS = 2 * 60
 _NOTIFICATION_RETRY_DELAYS = (60, 5 * 60, 30 * 60, 6 * 60 * 60, 24 * 60 * 60)
+_NOTIFICATION_MAX_ATTEMPTS = len(_NOTIFICATION_RETRY_DELAYS)
 _ALLOWED_OUTCOMES = {
     "updates_available",
     "up_to_date",
@@ -50,13 +54,13 @@ class AgentLibraryPatrolScheduler:
         self,
         *,
         audit_executor: Callable[[dict], tuple[ToolResult, int]] | None = None,
-        notification_sender: Callable[[dict], bool] | None = None,
+        notification_sender: Callable[[dict], object] | None = None,
         interval: float = 30.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._audit_executor = audit_executor or self._default_audit_executor
         self._notification_sender = (
-            notification_sender or send_library_patrol_notification
+            notification_sender or send_library_patrol_notification_result
         )
         self.interval = max(0.1, float(interval))
         self._clock = clock or datetime.now
@@ -127,6 +131,7 @@ class AgentLibraryPatrolScheduler:
     def run_once(self) -> int:
         if not self._enabled():
             return 0
+        runtime_generation = current_agent_runtime_generation()
         current = self._now()
         db.ensure_agent_library_patrol(next_run_at=current)
         stale_before = self._format(
@@ -149,11 +154,17 @@ class AgentLibraryPatrolScheduler:
             self._process(
                 job,
                 current=current,
-                runtime_generation=current_agent_runtime_generation(),
+                runtime_generation=runtime_generation,
             )
         except Exception as exc:
             logger.warning("Agent 全库缺集巡检失败 type=%s", type(exc).__name__)
-            self._complete_failure(job, current=current, error_type=type(exc).__name__)
+            if self._runtime_allows(runtime_generation):
+                self._complete_failure(job, current=current, error_type=type(exc).__name__)
+            else:
+                db.cancel_agent_library_patrol_lease(
+                    next_run_at=current,
+                    expected_lease_generation=int(job["lease_generation"]),
+                )
         return 1
 
     def _process(self, job, *, current: str, runtime_generation: int) -> None:
@@ -314,9 +325,15 @@ class AgentLibraryPatrolScheduler:
         if not updated:
             logger.info("Agent 全库缺集巡检失败结果已被更新租约丢弃")
 
-    def dispatch_notification_once(self) -> int:
-        """发送一条到期 outbox；失败只更新重试状态，不影响巡检结果。"""
+    def dispatch_notification_once(self, *, runtime_generation: int | None = None) -> int:
+        """发送一条到期 outbox；关闭 Agent 或代次变化时无损释放。"""
+        generation_guard = (
+            current_agent_runtime_generation()
+            if runtime_generation is None else int(runtime_generation)
+        )
         with self._notification_gate:
+            if not self._runtime_allows(generation_guard):
+                return 0
             if not self._notifications_enabled():
                 db.discard_agent_library_patrol_notifications()
                 return 0
@@ -332,8 +349,13 @@ class AgentLibraryPatrolScheduler:
                 return 0
             notification_id = int(item["id"])
             generation = int(item["lease_generation"])
-            # claim 与 sender 之间再次读取配置，覆盖外部配置更新或测试替身
-            # 在领取瞬间关闭通知的情况。
+            if not self._runtime_allows(generation_guard):
+                db.release_agent_library_patrol_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    next_attempt_at=current,
+                )
+                return 0
             if not self._notifications_enabled():
                 db.discard_agent_library_patrol_notification(
                     notification_id,
@@ -351,26 +373,82 @@ class AgentLibraryPatrolScheduler:
                 )
                 return 1
             try:
-                sent = bool(self._notification_sender(projection))
-                if sent:
-                    db.complete_agent_library_patrol_notification(
-                        notification_id,
-                        expected_lease_generation=generation,
-                        sent_at=current,
+                with agent_runtime_effect_admission(generation_guard):
+                    if not self._runtime_allows(generation_guard):
+                        db.release_agent_library_patrol_notification(
+                            notification_id,
+                            expected_lease_generation=generation,
+                            next_attempt_at=current,
+                        )
+                        return 0
+                    raw_result = self._notification_sender(projection)
+                result = (
+                    raw_result if isinstance(raw_result, TelegramSendResult)
+                    else TelegramSendResult(
+                        ok=bool(raw_result),
+                        error="" if raw_result else "DeliveryFailed",
+                        status_code=500 if raw_result is False else 0,
                     )
-                else:
-                    self._retry_notification(item, error_type="DeliveryFailed")
+                )
+            except AgentRuntimeDisabled:
+                db.release_agent_library_patrol_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    next_attempt_at=current,
+                )
+                return 0
             except Exception as exc:
                 logger.warning(
                     "Agent 全库缺集巡检通知发送失败 type=%s",
                     type(exc).__name__,
                 )
-                self._retry_notification(item, error_type=type(exc).__name__)
+                if self._runtime_allows(generation_guard):
+                    self._retry_notification(item, error_type=type(exc).__name__)
+                else:
+                    db.release_agent_library_patrol_notification(
+                        notification_id,
+                        expected_lease_generation=generation,
+                        next_attempt_at=current,
+                    )
+                return 1
+            if result.ok:
+                db.complete_agent_library_patrol_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    sent_at=current,
+                )
+            elif result.outcome_unknown:
+                db.discard_agent_library_patrol_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    error_type="DeliveryOutcomeUnknown",
+                )
+            elif self._runtime_allows(generation_guard):
+                self._retry_notification(
+                    item,
+                    error_type="DeliveryFailed",
+                    delay_override=result.retry_after_seconds,
+                )
+            else:
+                db.release_agent_library_patrol_notification(
+                    notification_id,
+                    expected_lease_generation=generation,
+                    next_attempt_at=current,
+                )
             return 1
 
-    def _retry_notification(self, item, *, error_type: str) -> None:
+    def _retry_notification(
+        self, item, *, error_type: str, delay_override: int = 0,
+    ) -> None:
         attempts = max(0, int(item["attempts"] or 0))
-        delay = _NOTIFICATION_RETRY_DELAYS[
+        if attempts + 1 >= _NOTIFICATION_MAX_ATTEMPTS:
+            db.discard_agent_library_patrol_notification(
+                int(item["id"]),
+                expected_lease_generation=int(item["lease_generation"]),
+                error_type=error_type,
+            )
+            return
+        delay = max(0, int(delay_override or 0)) or _NOTIFICATION_RETRY_DELAYS[
             min(attempts, len(_NOTIFICATION_RETRY_DELAYS) - 1)
         ]
         db.retry_agent_library_patrol_notification(
@@ -378,6 +456,12 @@ class AgentLibraryPatrolScheduler:
             expected_lease_generation=int(item["lease_generation"]),
             next_attempt_at=self._after(delay),
             error_type=error_type,
+        )
+
+    def _runtime_allows(self, generation: int) -> bool:
+        return (
+            not self._stop_event.is_set()
+            and agent_runtime_generation_is_current(generation)
         )
 
     @staticmethod
@@ -418,9 +502,12 @@ class AgentLibraryPatrolScheduler:
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                runtime_generation = current_agent_runtime_generation()
                 self.run_once()
                 for _index in range(3):
-                    if self.dispatch_notification_once() == 0:
+                    if self.dispatch_notification_once(
+                        runtime_generation=runtime_generation
+                    ) == 0:
                         break
             except Exception as exc:
                 logger.warning("Agent 全库缺集巡检轮询失败 type=%s", type(exc).__name__)

@@ -26,7 +26,10 @@ from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.conversation_history import get_agent_conversation_history_repository
 from app.agent.confirmation_contract import sanitize_confirmation_contract
 from app.agent.feature_gate import (
+    AgentRuntimeDisabled,
+    agent_runtime_admission,
     agent_runtime_generation_is_current,
+    agent_runtime_transition,
     current_agent_runtime_generation,
     invalidate_agent_runtime_generation,
     is_agent_enabled,
@@ -2552,14 +2555,17 @@ def _agent_control_updates(action_name: str) -> dict[str, str]:
 def _apply_agent_control_action(action_name: str, *, owner: str) -> str:
     from app import config
 
-    updates = _agent_control_updates(action_name)
+    with agent_runtime_transition():
+        updates = _agent_control_updates(action_name)
+        if updates:
+            config.set_and_save(updates)
+            if "AGENT_ENABLED" in updates:
+                invalidate_agent_runtime_generation()
     if updates:
-        config.set_and_save(updates)
         if "AGENT_ENABLED" in updates:
             try:
                 from app.modules.agent_runtime import request_agent_runtime_reconcile
 
-                invalidate_agent_runtime_generation()
                 request_agent_runtime_reconcile()
             except Exception as exc:
                 logger.warning(
@@ -3651,7 +3657,7 @@ def handle_agent_patrol_callback(
             prepare_output=prepare_output,
             state_buffer=state_buffer,
         )
-    except (AgentToolError, ValueError):
+    except (AgentRuntimeDisabled, AgentToolError, ValueError):
         if operation is not None and not coordinator.is_current(operation):
             if not callback_answered:
                 bot.answer_callback_query(
@@ -3869,12 +3875,19 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                             history_message = "准备提交所选资源"
                             fallback_summary = "资源提交已完成预检，等待确认。"
                     else:
-                        response = service.confirm(
-                            action["confirmation_id"],
-                            owner=owner,
-                            request_id=_trace_operation_id(operation),
-                            session_id=_telegram_history_identity(owner)[1],
-                        )
+                        with agent_runtime_admission(
+                            require_telegram=True,
+                            agent_enabled_check=is_agent_enabled,
+                            telegram_enabled_check=lambda: _enabled(
+                                get("TG_AGENT_ENABLED", "0")
+                            ),
+                        ):
+                            response = service.confirm(
+                                action["confirmation_id"],
+                                owner=owner,
+                                request_id=_trace_operation_id(operation),
+                                session_id=_telegram_history_identity(owner)[1],
+                            )
                         confirmed_action_completed = True
                         text = render_agent_response(response)
                         markup = None

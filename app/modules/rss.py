@@ -15,6 +15,7 @@ import re
 import secrets
 import socket
 import threading
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urljoin, urlsplit
@@ -44,6 +45,10 @@ _RSS_MAX_SOURCE_URLS = 20
 _RSS_MAX_SOURCE_URL_LENGTH = 2048
 _RSS_MAX_SOURCE_TOTAL_LENGTH = 16 * 1024
 _RSS_MAX_REDIRECTS = 3
+_RSS_REFRESH_DEADLINE_SECONDS = 90.0
+_RSS_DOWNLOAD_BATCH_SIZE = 20
+_RSS_AUTO_DOWNLOAD_MAX_ENTRIES = 100
+_RSS_AUTO_DOWNLOAD_DEADLINE_SECONDS = 120.0
 
 
 def validate_rss_source_url(value: str, *, resolve: bool = False) -> str:
@@ -110,28 +115,44 @@ def _pinned_rss_request_target(url: str) -> tuple[str, httpx.URL, dict[str, str]
     return logical_url, request_url, {"Host": host}, {"sni_hostname": host}
 
 
-def _fetch_rss_payload(url: str, *, user_agent: str) -> tuple[bytes, dict[str, str]]:
-    """通过固定地址 transport 拉取 RSS；每个重定向跳点都重新校验并固定。"""
+def _fetch_rss_payload(
+    url: str, *, user_agent: str, timeout_seconds: float | None = None,
+) -> tuple[bytes, dict[str, str]]:
+    """通过固定地址 transport 拉取 RSS，并遵守调用方的剩余总预算。"""
     current_url = validate_rss_source_url(url)
-    timeout = httpx.Timeout(
-        _RSS_READ_TIMEOUT_SECONDS,
-        connect=_RSS_CONNECT_TIMEOUT_SECONDS,
+    budget = max(
+        0.1,
+        float(timeout_seconds)
+        if timeout_seconds is not None else float(_RSS_READ_TIMEOUT_SECONDS),
     )
+    deadline = time.monotonic() + budget
     with httpx.Client(
-        timeout=timeout,
+        timeout=httpx.Timeout(
+            _RSS_READ_TIMEOUT_SECONDS,
+            connect=_RSS_CONNECT_TIMEOUT_SECONDS,
+        ),
         follow_redirects=False,
         trust_env=False,
         headers={"User-Agent": user_agent},
+        limits=httpx.Limits(max_keepalive_connections=0),
     ) as client:
         for redirect_count in range(_RSS_MAX_REDIRECTS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("RSS 刷新超过本轮时间预算")
             logical_url, request_url, request_headers, extensions = (
                 _pinned_rss_request_target(current_url)
+            )
+            attempt_timeout = httpx.Timeout(
+                min(float(_RSS_READ_TIMEOUT_SECONDS), remaining),
+                connect=min(float(_RSS_CONNECT_TIMEOUT_SECONDS), remaining),
             )
             with client.stream(
                 "GET",
                 request_url,
                 headers=request_headers,
                 extensions=extensions,
+                timeout=attempt_timeout,
             ) as response:
                 if response.status_code in {301, 302, 303, 307, 308}:
                     location = str(response.headers.get("Location") or "").strip()
@@ -152,6 +173,8 @@ def _fetch_rss_payload(url: str, *, user_agent: str) -> tuple[bytes, dict[str, s
                         raise ValueError("RSS 响应体过大")
                 payload = bytearray()
                 for chunk in response.iter_bytes():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("RSS 刷新超过本轮时间预算")
                     if not chunk:
                         continue
                     payload.extend(chunk)
@@ -273,14 +296,21 @@ class MikanParser:
 
     def __init__(self) -> None:
         self.last_error_code = ""
+        self._refresh_timeout_seconds: float | None = None
 
-    def parse(self, url: str) -> list[RSSEntry]:
+    def parse(
+        self, url: str, *, timeout_seconds: float | None = None,
+    ) -> list[RSSEntry]:
         """拉取并解析一个 mikan RSS 源，返回条目列表。"""
         self.last_error_code = ""
         try:
             payload, response_headers = _fetch_rss_payload(
                 url,
                 user_agent=self.USER_AGENT,
+                timeout_seconds=(
+                    timeout_seconds
+                    if timeout_seconds is not None else self._refresh_timeout_seconds
+                ),
             )
             feed = feedparser.parse(bytes(payload), response_headers=response_headers)
         except Exception as exc:
@@ -507,8 +537,19 @@ class RSSEngine:
             library_check = {"sources": 0, "ready": 0, "unavailable": 0, "truncated": 0}
             failed_sources = 0
             parsed_entries: list[RSSEntry] = []
-            for url in urls:
-                entries = self.parser.parse(url)
+            refresh_deadline = time.monotonic() + _RSS_REFRESH_DEADLINE_SECONDS
+            for index, url in enumerate(urls):
+                remaining = refresh_deadline - time.monotonic()
+                if remaining <= 0:
+                    failed_sources += len(urls) - index
+                    break
+                if isinstance(self.parser, MikanParser):
+                    self.parser._refresh_timeout_seconds = remaining
+                try:
+                    entries = self.parser.parse(url)
+                finally:
+                    if isinstance(self.parser, MikanParser):
+                        self.parser._refresh_timeout_seconds = None
                 parser_error = getattr(self.parser, "last_error_code", "")
                 if isinstance(parser_error, str) and parser_error:
                     failed_sources += 1
@@ -958,7 +999,7 @@ class RSSEngine:
         )
 
     def download_many(self, entry_ids: list[int]) -> dict:
-        ids = list(dict.fromkeys(int(item) for item in entry_ids))[:20]
+        ids = list(dict.fromkeys(int(item) for item in entry_ids))[:_RSS_DOWNLOAD_BATCH_SIZE]
         entries = [db.get_rss_entry(entry_id) for entry_id in ids]
         _client, hashes, snapshot_error = self._qb_snapshot(entries)
         succeeded: list[dict] = []
@@ -1256,12 +1297,42 @@ class RSSEngine:
             excluded_ids, "命中当前订阅排除关键词"
         )
         excluded = set(excluded_ids)
-        ids = [int(row["id"]) for row in rows if int(row["id"]) not in excluded]
-        result = self.download_many(ids) if ids else {
-            "success_count": 0, "existing_count": 0,
-            "unverified_count": 0, "failure_count": 0,
-            "outcome_unknown_count": 0, "review_required": False,
+        pending_ids = [
+            int(row["id"]) for row in rows if int(row["id"]) not in excluded
+        ]
+        ids = pending_ids[:_RSS_AUTO_DOWNLOAD_MAX_ENTRIES]
+        deadline = time.monotonic() + _RSS_AUTO_DOWNLOAD_DEADLINE_SECONDS
+        result = {
+            "total": 0,
+            "succeeded": [],
+            "existing": [],
+            "unverified": [],
+            "failed": [],
+            "success_count": 0,
+            "existing_count": 0,
+            "unverified_count": 0,
+            "failure_count": 0,
+            "outcome_unknown_count": 0,
+            "review_required": False,
         }
+        # download_many 是面向 Web/TG 批量操作的受控接口，单次最多 20 条；
+        # 自动订阅必须消费本轮全部 pending，不能把 API 上限误当成业务上限。
+        processed = 0
+        for offset in range(0, len(ids), _RSS_DOWNLOAD_BATCH_SIZE):
+            if time.monotonic() >= deadline:
+                break
+            batch = self.download_many(ids[offset:offset + _RSS_DOWNLOAD_BATCH_SIZE])
+            processed += len(ids[offset:offset + _RSS_DOWNLOAD_BATCH_SIZE])
+            for key in ("succeeded", "existing", "unverified", "failed"):
+                result[key].extend(batch.get(key) or [])
+            for key in (
+                "total", "success_count", "existing_count", "unverified_count",
+                "failure_count", "outcome_unknown_count",
+            ):
+                result[key] += max(0, int(batch.get(key) or 0))
+            result["review_required"] = bool(result["review_required"]) or bool(
+                batch.get("review_required")
+            )
         outcome_unknown_count = max(
             0, int(result.get("outcome_unknown_count") or 0)
         )
@@ -1275,6 +1346,7 @@ class RSSEngine:
             "review_required": bool(result.get("review_required"))
             or outcome_unknown_count > 0,
             "filtered": filtered,
+            "deferred": max(0, len(pending_ids) - processed),
         }
 
     # ===== 推送实现 =====

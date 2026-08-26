@@ -42,7 +42,7 @@ class STRMMetadataWorker:
         self._completed_session = 0
         self._failed_session = 0
         self._changed_paths: list[str] = []
-        self._last_refresh_at = time.monotonic()
+        self._last_refresh_at = 0.0
         self._refresh_retry_pending = False
 
     def start(self) -> None:

@@ -6,10 +6,15 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from app.agent.async_bridge import AsyncBridgeUnavailable, run_awaitable_sync
 from app.agent.feature_gate import (
+    AgentRuntimeDisabled,
+    agent_runtime_admission,
+    agent_runtime_effect_admission,
     agent_runtime_generation_is_current,
+    agent_runtime_transition,
     current_agent_runtime_generation,
     invalidate_agent_runtime_generation,
 )
@@ -178,6 +183,70 @@ class AgentRuntimeGenerationTests(unittest.TestCase):
         self.assertGreater(current, previous)
         self.assertFalse(agent_runtime_generation_is_current(previous))
         self.assertTrue(agent_runtime_generation_is_current(current))
+
+    def test_runtime_transition_waits_for_admitted_confirmation(self):
+        admitted = threading.Event()
+        release = threading.Event()
+        transitioned = threading.Event()
+
+        def confirm() -> None:
+            with agent_runtime_admission():
+                admitted.set()
+                self.assertTrue(release.wait(2))
+
+        def disable() -> None:
+            with agent_runtime_transition():
+                transitioned.set()
+
+        with patch("app.agent.feature_gate.config.get_bool", return_value=True):
+            confirm_thread = threading.Thread(target=confirm)
+            transition_thread = threading.Thread(target=disable)
+            confirm_thread.start()
+            self.assertTrue(admitted.wait(1))
+            transition_thread.start()
+            self.assertFalse(transitioned.wait(0.1))
+            release.set()
+            confirm_thread.join(2)
+            transition_thread.join(2)
+
+        self.assertFalse(confirm_thread.is_alive())
+        self.assertFalse(transition_thread.is_alive())
+        self.assertTrue(transitioned.is_set())
+
+    def test_runtime_admission_rejects_after_disable_transition(self):
+        with patch("app.agent.feature_gate.config.get_bool", return_value=False):
+            with self.assertRaises(AgentRuntimeDisabled):
+                with agent_runtime_admission():
+                    self.fail("disabled Agent must not admit a confirmation")
+
+    def test_runtime_transition_waits_for_started_external_effect(self):
+        generation = current_agent_runtime_generation()
+        effect_started = threading.Event()
+        release = threading.Event()
+        transition_finished = threading.Event()
+
+        def external_effect() -> None:
+            with agent_runtime_effect_admission(generation):
+                effect_started.set()
+                self.assertTrue(release.wait(2))
+
+        def disable() -> None:
+            with agent_runtime_transition():
+                invalidate_agent_runtime_generation()
+            transition_finished.set()
+
+        effect_thread = threading.Thread(target=external_effect)
+        transition_thread = threading.Thread(target=disable)
+        effect_thread.start()
+        self.assertTrue(effect_started.wait(1))
+        transition_thread.start()
+        self.assertFalse(transition_finished.wait(0.1))
+        release.set()
+        effect_thread.join(2)
+        transition_thread.join(2)
+
+        self.assertTrue(transition_finished.is_set())
+        self.assertFalse(agent_runtime_generation_is_current(generation))
 
 
 if __name__ == "__main__":

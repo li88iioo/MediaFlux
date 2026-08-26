@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
@@ -293,6 +293,44 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 ])
 
                 self.assertEqual(recorder.refreshed, ["season-a1"])
+
+    def test_many_targets_in_one_library_coalesce_before_item_enumeration(self):
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), _items())
+                client._library_items_with_paths = Mock(
+                    side_effect=AssertionError("dense target set must not enumerate items")
+                )
+
+                result = client.refresh_for_paths([
+                    f"{ROOT}/剧集/作品 {index}/Season 01"
+                    for index in range(65)
+                ])
+
+                client._library_items_with_paths.assert_not_called()
+                self.assertTrue(result["ok"])
+                self.assertEqual(recorder.refreshed, ["lib-tv"])
+                self.assertEqual(result["scope"], "library")
+                self.assertIn("多变更媒体库", result["fallback"])
+
+    def test_many_targets_strict_mode_skips_instead_of_library_refresh(self):
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), _items())
+
+                result = client.refresh_for_paths(
+                    [
+                        f"{ROOT}/剧集/作品 {index}/Season 01"
+                        for index in range(65)
+                    ],
+                    allowed_library_ids=("lib-tv",),
+                    allow_library_fallback=False,
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["skipped"])
+                self.assertEqual(result["scope"], "skipped")
+                self.assertEqual(recorder.refreshed, [])
 
     def test_changes_in_different_libraries_refresh_their_own_items(self):
         for label, client in self._clients():

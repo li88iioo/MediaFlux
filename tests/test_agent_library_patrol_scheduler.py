@@ -15,6 +15,7 @@ from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.tools import build_tool_registry
 from app.routes.api import save_config
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
+from app.notifier import TelegramSendResult
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -789,6 +790,24 @@ class AgentLibraryPatrolSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(notification["attempts"], 1)
         self.assertEqual(notification["next_attempt_at"], "2026-08-03 12:01:00")
         self.assertEqual(notification["last_error_type"], "DeliveryFailed")
+
+    def test_delivery_outcome_unknown_is_discarded_without_duplicate_retry(self):
+        scheduler = AgentLibraryPatrolScheduler(
+            audit_executor=Mock(return_value=(_patrol_result(), 10)),
+            notification_sender=Mock(return_value=TelegramSendResult(
+                ok=False, error="timeout", status_code=0,
+            )),
+            clock=self.clock,
+        )
+        with self._config(notify=True):
+            scheduler.run_once()
+            self.assertEqual(scheduler.dispatch_notification_once(), 1)
+
+        notification = db.list_agent_library_patrol_notifications()[0]
+        self.assertEqual(notification["status"], "discarded")
+        self.assertEqual(notification["attempts"], 0)
+        self.assertEqual(notification["payload_json"], "")
+        self.assertEqual(notification["last_error_type"], "DeliveryOutcomeUnknown")
 
     def test_notification_disable_discards_backlog(self):
         scheduler = AgentLibraryPatrolScheduler(

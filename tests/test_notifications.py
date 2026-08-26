@@ -263,6 +263,29 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertEqual(len(bot.photos), 1)
         self.assertEqual(bot.message_attempts, 1)
 
+    def test_partial_text_delivery_is_marked_unsafe_to_retry(self):
+        class FailSecondMessageBot(FakeBot):
+            def send_message(self, chat_id: str, text: str, **_kwargs) -> None:
+                self.message_attempts += 1
+                if self.message_attempts == 2:
+                    error = RuntimeError("rate limited after first chunk")
+                    error.result_json = {"error_code": 429, "description": "retry later"}
+                    raise error
+                self.messages.append((chat_id, text))
+
+        bot = FailSecondMessageBot()
+        self._install_bot(bot, "251")
+        result = notifier.send_event_result(notifier.NotificationEvent(
+            title="超长文本通知",
+            lines=("A" * 5000,),
+        ))
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.partially_delivered)
+        self.assertTrue(result.outcome_unknown)
+        self.assertEqual(result.status_code, 429)
+        self.assertEqual(len(bot.messages), 1)
+
     def test_legacy_send_splits_at_natural_line_boundaries(self):
         """若长消息再次按固定字符切断自然行，本测试必须失败。"""
         bot = FakeBot()

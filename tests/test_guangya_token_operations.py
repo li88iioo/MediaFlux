@@ -337,6 +337,36 @@ class GuangYaTokenClientTests(unittest.TestCase):
             [(0, 200)],
         )
 
+    def test_iter_dir_enforces_caller_item_budget_across_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory)
+            with patch(
+                "app.clients.guangya._load_raw",
+                return_value=_PagedDirectoryRawClient,
+            ):
+                client = GuangYaClient(token_file=token_file)
+                with self.assertRaisesRegex(RuntimeError, "安全上限 200"):
+                    list(client.iter_dir("anime-root", max_items=200))
+                raw = client.raw
+
+        self.assertEqual(
+            [(call["page"], call["page_size"]) for call in raw.fs_calls],
+            [(0, 200), (1, 200)],
+        )
+
+    def test_list_dir_retains_default_total_item_fuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory)
+            with patch(
+                "app.clients.guangya._load_raw",
+                return_value=_PagedDirectoryRawClient,
+            ), patch(
+                "app.clients.guangya._DEFAULT_DIRECTORY_ITEM_LIMIT", 200,
+            ):
+                client = GuangYaClient(token_file=token_file)
+                with self.assertRaisesRegex(RuntimeError, "安全上限 200"):
+                    client.list_dir("anime-root")
+
     def test_create_dir_forbids_provider_side_duplicate_name_suffixes(self):
         with tempfile.TemporaryDirectory() as directory:
             token_file = self._token_file(directory)

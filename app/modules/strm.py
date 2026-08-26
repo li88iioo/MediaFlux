@@ -11,6 +11,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -41,6 +42,29 @@ from app.modules.process_lock import CrossProcessLock
 from app.modules.strm_notifications import append_change, relative_change
 
 logger = get_logger(__name__)
+
+
+def _iter_client_dir(
+    client,
+    dir_id: str,
+    *,
+    should_stop: Callable[[], bool] | None,
+    max_items: int,
+):
+    """兼容旧客户端替身，同时把生产扫描预算下推到分页层。"""
+    iter_dir = getattr(client, "iter_dir", None)
+    if not callable(iter_dir):
+        return iter(client.list_dir(dir_id))
+    kwargs = {"should_stop": should_stop}
+    try:
+        parameters = inspect.signature(iter_dir).parameters.values()
+        if any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters) or any(
+            item.name == "max_items" for item in parameters
+        ):
+            kwargs["max_items"] = max(1, int(max_items))
+    except (TypeError, ValueError):
+        kwargs["max_items"] = max(1, int(max_items))
+    return iter_dir(dir_id, **kwargs)
 
 # 全局元数据下载 Session 与连接池，复用 TCP 连接以避免 Windows 端口耗尽
 _METADATA_SESSION: requests.Session | None = None
@@ -1809,6 +1833,10 @@ def _sync_strm_impl(
     scan_deadline = scan_started + scan_deadline_seconds
     scan_abort = threading.Event()
     scan_deadline_hit = threading.Event()
+    scan_entry_budget_hit = threading.Event()
+    scan_entry_budget_lock = threading.Lock()
+    scan_entry_budget_probe_lock = threading.Lock()
+    scan_entry_budget_used = 0
     active_scan_workers = 0
     active_scan_workers_lock = threading.Lock()
 
@@ -1825,7 +1853,7 @@ def _sync_strm_impl(
         stats["clean_skipped"] = True
 
     def page_scan_stop_requested() -> bool:
-        if scan_abort.is_set():
+        if scan_abort.is_set() or scan_entry_budget_hit.is_set():
             return True
         if should_stop and should_stop():
             return True
@@ -1848,7 +1876,7 @@ def _sync_strm_impl(
         visited_dir_ids: set[str] = set()
 
         def list_directory(dir_id: str) -> list[GuangYaFile]:
-            nonlocal active_scan_workers
+            nonlocal active_scan_workers, scan_entry_budget_used
             if scan_abort.is_set():
                 return []
             with active_scan_workers_lock:
@@ -1857,13 +1885,45 @@ def _sync_strm_impl(
                     int(stats["scan_workers_peak"]), active_scan_workers
                 )
             try:
-                iter_dir = getattr(client, "iter_dir", None)
-                files = (
-                    iter_dir(dir_id, should_stop=page_scan_stop_requested)
-                    if callable(iter_dir)
-                    else iter(client.list_dir(dir_id))
-                )
-                return list(files)
+                files = iter(_iter_client_dir(
+                    client,
+                    dir_id,
+                    should_stop=page_scan_stop_requested,
+                    max_items=max_entries,
+                ))
+                collected: list[GuangYaFile] = []
+                while True:
+                    # 在读取下一个远端条目前原子预留全局配额；空迭代器会
+                    # 归还预留。并发 worker 的总读取量因此不会成倍越界。
+                    with scan_entry_budget_lock:
+                        at_limit = scan_entry_budget_used >= max_entries
+                        if not at_limit:
+                            scan_entry_budget_used += 1
+                    if at_limit:
+                        # 只允许一个 worker 做无配额 lookahead，用来区分
+                        # “恰好等于上限”与“确实还有更多条目”。最多额外读取
+                        # 一个条目，不会随 scan_workers 成倍放大。
+                        with scan_entry_budget_probe_lock:
+                            if scan_entry_budget_hit.is_set():
+                                break
+                            try:
+                                next(files)
+                            except StopIteration:
+                                break
+                            scan_entry_budget_hit.set()
+                        break
+                    try:
+                        item = next(files)
+                    except StopIteration:
+                        with scan_entry_budget_lock:
+                            scan_entry_budget_used -= 1
+                        break
+                    except BaseException:
+                        with scan_entry_budget_lock:
+                            scan_entry_budget_used -= 1
+                        raise
+                    collected.append(item)
+                return collected
             finally:
                 with active_scan_workers_lock:
                     active_scan_workers -= 1
@@ -1928,6 +1988,10 @@ def _sync_strm_impl(
                         abort_scan()
                         break
 
+                    if scan_entry_budget_hit.is_set():
+                        abort_scan("entries", "云端目录条目超过扫描上限")
+                        break
+
                     if scan_deadline_hit.is_set() or time.monotonic() > scan_deadline:
                         abort_scan("deadline", "云端目录扫描超过总时限")
                         break
@@ -1989,6 +2053,9 @@ def _sync_strm_impl(
                     future.cancel()
         if scan_deadline_hit.is_set() and not stats["stopped"]:
             mark_scan_incomplete("deadline", "云端目录扫描超过总时限")
+        stats["scan_entries"] = max(
+            int(stats["scan_entries"]), int(scan_entry_budget_used)
+        )
 
     progress.emit("scan", 0, 1, "扫描云端目录")
     begin_metrics = getattr(client, "begin_read_metrics", None)
@@ -2898,11 +2965,11 @@ def _locate_retry_files(
                         return True
                     return False
 
-                iter_dir = getattr(client, "iter_dir", None)
-                items = (
-                    iter_dir(dir_id, should_stop=page_scan_stop_requested)
-                    if callable(iter_dir)
-                    else iter(client.list_dir(dir_id))
+                items = _iter_client_dir(
+                    client,
+                    dir_id,
+                    should_stop=page_scan_stop_requested,
+                    max_items=max_entries - entries,
                 )
                 child_dirs: list[tuple[str, tuple[str, ...]]] = []
                 items = iter(items)
@@ -3385,12 +3452,12 @@ def clean_empty_strm_dirs(
     empty_dirs = 0
     removed_dir_paths: list[str] = []
     stopped = False
-    directories = sorted(
-        (path for path in root.rglob("*") if path.is_dir()),
-        key=lambda path: len(path.parts),
-        reverse=True,
-    )
-    for directory in directories:
+    # os.walk(topdown=False) 原生提供后序遍历，避免先物化并排序整个目录树；
+    # 百万级目录下内存保持常量级，停止请求也能在每个目录边界生效。
+    for current, _dirs, _files in os.walk(root, topdown=False):
+        directory = Path(current)
+        if directory == root:
+            continue
         if should_stop and should_stop():
             stopped = True
             break

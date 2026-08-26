@@ -128,7 +128,7 @@ class MediaHubPageContractTests(InitializedWebTestCase):
             "grid-template-columns: repeat(7, minmax(0, 1fr))",
             "aspect-ratio: 2 / 3",
             "@media (max-width: 1100px)",
-            "@media (max-width: 700px)",
+            "@media (max-width: 760px)",
             "@media (prefers-reduced-motion: reduce)",
         ):
             self.assertIn(contract, styles)
@@ -246,7 +246,7 @@ class MediaHubPageContractTests(InitializedWebTestCase):
         self.assertIn('name="server"', response.text)
         self.assertIn('name="type"', response.text)
         self.assertIn('name="q"', response.text)
-        self.assertIn("/static/css/media-hub.css?v=20260818c", response.text)
+        self.assertIn("/static/css/media-hub.css?v=20260826a", response.text)
         self.assertIn("dashboard-page media-hub-page", response.text)
         self.assertIn('class="media-recent-shell"', response.text)
         self.assertIn('class="media-recent-toolbar"', response.text)
@@ -348,7 +348,7 @@ class MediaHubPageContractTests(InitializedWebTestCase):
         self.assertNotIn("/discovery?q=", response.text)
         self.assertIn("打开媒体库", response.text)
         self.assertNotIn("媒体档案", response.text)
-        self.assertIn("/static/css/media-hub.css?v=20260818c", response.text)
+        self.assertIn("/static/css/media-hub.css?v=20260826a", response.text)
         self.assertRegex(
             response.text,
             re.compile(r'<div class="global-top-primary">.*<div class="global-top-context">', re.S),

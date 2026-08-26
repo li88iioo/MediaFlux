@@ -52,6 +52,31 @@ class _FailingConcurrentTreeClient(_ConcurrentTreeClient):
         return super().iter_dir(dir_id, should_stop=should_stop)
 
 
+class _BudgetTreeClient:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.yielded = 0
+
+    def iter_dir(self, dir_id: str, *, should_stop=None, max_items=None):
+        count = 4 if dir_id == "root" else 20
+
+        def rows():
+            for index in range(count):
+                if should_stop and should_stop():
+                    return
+                with self.lock:
+                    self.yielded += 1
+                if dir_id == "root":
+                    yield GuangYaFile(f"dir-{index}", f"目录 {index}", True)
+                else:
+                    yield GuangYaFile(
+                        f"{dir_id}-file-{index}", f"Episode {index}.mkv", False,
+                        100, f"etag-{index}", dir_id,
+                    )
+
+        return rows()
+
+
 class StrmDirectoryConcurrencyTests(unittest.TestCase):
     def test_full_scan_reaches_fifteen_directory_workers(self):
         client = _ConcurrentTreeClient(15)
@@ -117,6 +142,25 @@ class StrmDirectoryConcurrencyTests(unittest.TestCase):
         self.assertEqual(stats["scan_limit_reason"], "deadline")
         self.assertTrue(stats["clean_skipped"])
         cleanup.assert_not_called()
+
+    def test_global_entry_budget_is_not_multiplied_by_directory_workers(self):
+        client = _BudgetTreeClient()
+        with patch(
+            "app.modules.strm._scan_limits", return_value=(100, 10, 100, 60)
+        ), patch("app.modules.strm.db.list_strm_index", return_value=[]):
+            stats = sync_strm(
+                "root",
+                "http://media.invalid",
+                "/tmp/mediaflux-strm-budget",
+                client=client,
+                clean_invalid=False,
+                scan_workers=4,
+            )
+
+        self.assertTrue(stats["scan_incomplete"])
+        self.assertEqual(stats["scan_limit_reason"], "entries")
+        self.assertEqual(stats["scan_entries"], 10)
+        self.assertLessEqual(client.yielded, 11)
 
 
 class GuangYaReadMetricsTests(unittest.TestCase):
