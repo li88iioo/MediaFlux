@@ -174,6 +174,34 @@ _FOLLOWUP_DOMAIN_ANCHORS = (
     "strm", "整理", "光鸭", "云盘", "配置", "设置", "资源站", "索引器", "资源",
     "本地媒体", "自动化", "调度", "telegram", "通知", "系统简报", "整体状态",
 )
+
+_PRESENTATION_FEEDBACK_SUBJECTS = (
+    "输出", "回复", "回答", "消息", "内容", "排版", "格式", "显示",
+)
+_PRESENTATION_FEEDBACK_ISSUES = (
+    "紧凑", "太挤", "挤在一起", "挤成一行", "一整行", "没有换行", "没换行",
+    "不换行", "没有排版", "没排版", "文本墙", "难读", "不好读", "看不清",
+    "行距太小", "分段显示", "分段输出", "逐项换行", "每项换行", "加空行",
+)
+_PRESENTATION_FEEDBACK_LAYOUT_ACTIONS = (
+    "优化", "调整", "改一下", "改下", "分段", "换行", "空行",
+)
+
+
+def is_presentation_feedback_message(message: str) -> bool:
+    """识别用户对 Agent/TG 回复可读性的反馈，避免被“为什么”误判为业务追问。"""
+    normalized = re.sub(
+        r"[\s，。！？!?、；;：:]+", "", unicodedata.normalize("NFKC", str(message or "")).casefold()
+    )
+    if not normalized or not any(
+        token in normalized for token in _PRESENTATION_FEEDBACK_SUBJECTS
+    ):
+        return False
+    if any(token in normalized for token in _PRESENTATION_FEEDBACK_ISSUES):
+        return True
+    return "排版" in normalized and any(
+        token in normalized for token in _PRESENTATION_FEEDBACK_LAYOUT_ACTIONS
+    )
 _BROAD_FOLLOWUP_TOOLS = frozenset({
     "workspace.briefing", "workspace.health", "workspace.next_actions", "workspace.todo",
     "agent.read_plan",
@@ -182,6 +210,8 @@ _BROAD_FOLLOWUP_TOOLS = frozenset({
 
 def _is_ambiguous_followup(message: str) -> bool:
     normalized = re.sub(r"[\s，。！？!?、；;：:]+", "", message.casefold())
+    if is_presentation_feedback_message(normalized):
+        return False
     if any(token in normalized for token in _FOLLOWUP_DOMAIN_ANCHORS):
         return False
     if re.search(r"第\d+(?:个|项|条)?(?:任务|结果|记录)", normalized):
@@ -7214,6 +7244,13 @@ class AgentOrchestrator:
                     return response
                 return self._present_tool_response(
                     message, response, owner=llm_rate_owner or owner
+                )
+            if is_presentation_feedback_message(message):
+                return self._conversation_response(
+                    "确实是排版问题，不是你的 Telegram 客户端有问题。"
+                    "之前富消息把普通换行当成了空白，段落、列表和资源候选因此被挤在一起。\n\n"
+                    "现在会按“结论 → 关键点 → 操作提示”分段显示；列表逐项换行，"
+                    "资源候选之间也会保留间距。"
                 )
             local_conversation = self._local_conversation(message)
             if local_conversation is not None:

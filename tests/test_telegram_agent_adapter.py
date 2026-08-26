@@ -26,6 +26,7 @@ from app.bot.agent_adapter import (
     _safe_callback_history_response,
     _resource_candidates,
     _stream_preview_html,
+    _telegram_rich_html,
     _truncate_telegram_html,
     handle_agent_callback,
     handle_agent_control_action,
@@ -647,6 +648,33 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("可修改后发送", text)
         self.assertNotIn("<b>依据</b>", text)
         self.assertNotIn("（library）", text)
+
+    def test_rich_message_html_preserves_paragraphs_lists_and_line_breaks(self):
+        source = (
+            "<b>候选资源 · 第 1/3 页</b>\n\n"
+            "<b>1.</b> 示例资源\n"
+            "   来源：Nyaa · 体积：684.9 MiB\n\n"
+            "<b>接下来可以</b>\n"
+            "• 检查下载队列\n"
+            "• 查看媒体库"
+        )
+
+        rendered = _telegram_rich_html(source)
+
+        self.assertIn("<h3>候选资源 · 第 1/3 页</h3>", rendered)
+        self.assertIn(
+            "<p><b>1.</b> 示例资源<br>来源：Nyaa · 体积：684.9 MiB</p>",
+            rendered,
+        )
+        self.assertIn("<h3>接下来可以</h3>", rendered)
+        self.assertIn(
+            "<ul><li>检查下载队列</li><li>查看媒体库</li></ul>", rendered
+        )
+        self.assertNotIn("\n", rendered)
+
+    def test_rich_thinking_block_is_not_double_wrapped(self):
+        thinking = "<tg-thinking>正在理解请求…</tg-thinking>"
+        self.assertEqual(_telegram_rich_html(thinking), thinking)
 
     def test_failed_narrative_keeps_the_deterministic_error(self):
         text = render_agent_response({
@@ -3484,6 +3512,10 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         text = bot.replies[0][1]
         markup = bot.replies[0][2]["reply_markup"]
         self.assertIn("候选资源", text)
+        self.assertIn("来源：Nyaa", text)
+        self.assertIn("体积：1.2 GB", text)
+        self.assertIn("\n\n<b>2.</b>", text)
+        self.assertIn("提交前还会显示预检并再次确认", text)
         self.assertIn("示例资源一", text)
         self.assertIn("示例资源二", text)
         self.assertIn("[链接已隐藏]", text)

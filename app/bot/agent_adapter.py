@@ -1251,9 +1251,73 @@ def _rich_message(telebot: Any, html_text: str) -> Any | None:
     if not callable(input_rich_message):
         return None
     try:
-        return input_rich_message(html=html_text)
+        return input_rich_message(html=_telegram_rich_html(html_text))
     except Exception:
         return None
+
+
+_RICH_STANDALONE_HEADING_RE = re.compile(r"^<b>(.+)</b>$", re.DOTALL)
+_RICH_BULLET_RE = re.compile(r"^\s*•\s+(.+)$", re.DOTALL)
+_RICH_BLOCK_RE = re.compile(
+    r"^\s*</?(?:p|h[1-6]|ul|ol|li|blockquote|pre|tg-thinking)\b",
+    re.IGNORECASE,
+)
+
+
+def _telegram_rich_html(value: object) -> str:
+    """把 sendMessage 风格换行转换为 Rich Message 的块级 HTML。
+
+    ``InputRichMessage.html`` 按 HTML 规则处理空白，普通 ``\n`` 不会自动成为
+    Telegram 段落。若直接把旧的 sendMessage HTML 传进去，标题、列表和资源候选
+    会在客户端挤成一行。这里仅处理本模块已经转义和白名单化的受控 HTML。
+    """
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    if _RICH_BLOCK_RE.match(text):
+        return text
+
+    blocks: list[str] = []
+    paragraph: list[str] = []
+    bullets: list[str] = []
+
+    def flush_paragraph() -> None:
+        if not paragraph:
+            return
+        lines = [line.strip() for line in paragraph if line.strip()]
+        paragraph.clear()
+        if not lines:
+            return
+        if len(lines) == 1:
+            heading = _RICH_STANDALONE_HEADING_RE.fullmatch(lines[0])
+            if heading:
+                blocks.append(f"<h3>{heading.group(1)}</h3>")
+                return
+        blocks.append(f"<p>{'<br>'.join(lines)}</p>")
+
+    def flush_bullets() -> None:
+        if not bullets:
+            return
+        blocks.append("<ul>" + "".join(f"<li>{item}</li>" for item in bullets) + "</ul>")
+        bullets.clear()
+
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            flush_paragraph()
+            flush_bullets()
+            continue
+        bullet = _RICH_BULLET_RE.fullmatch(line)
+        if bullet:
+            flush_paragraph()
+            bullets.append(bullet.group(1).strip())
+            continue
+        flush_bullets()
+        paragraph.append(line)
+
+    flush_paragraph()
+    flush_bullets()
+    return "".join(blocks)
 
 
 def _begin_agent_stream(
@@ -2076,26 +2140,26 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
         display.get("error") or result.get("error"), limit=500
     )
     if confirmation:
-        lines: list[str] = ["<b>需要你确认</b>", body]
+        lines: list[str] = ["<b>需要你确认</b>", "", body]
     elif status in {"clarification_required", "selection_required"}:
         # 补充信息并不是失败，不用错误标题制造不必要的挫败感。
         lines = [body]
     elif explicit_public_status and (
         public_key == "unavailable" or public_tone == "error"
     ):
-        lines = [f"<b>{public_label or '暂时无法完成'}</b>", body]
+        lines = [f"<b>{public_label or '暂时无法完成'}</b>", "", body]
         if error and error != body and error not in body:
             lines.extend(["", error])
     elif explicit_public_status and (
         public_key == "attention" or public_tone == "warning"
     ):
-        lines = [f"<b>{public_label or '需要留意'}</b>", body]
+        lines = [f"<b>{public_label or '需要留意'}</b>", "", body]
         if error and error != body and error not in body:
             lines.extend(["", error])
     elif explicit_public_status and public_key == "in_progress" and public_label:
-        lines = [f"<b>{public_label}</b>", body]
+        lines = [f"<b>{public_label}</b>", "", body]
     elif not ok:
-        lines = ["<b>没能完成这次请求</b>", body]
+        lines = ["<b>没能完成这次请求</b>", "", body]
         if error and error != body and error not in body:
             lines.extend(["", error])
     else:
@@ -3160,18 +3224,21 @@ def _render_resource_candidates(
     summary = _public_multiline_html(
         display.get("summary") or result.get("summary"),
         limit=900,
-        promote_first=True,
+        promote_first=False,
     )
     heading = "<b>候选资源</b>"
     if total_pages > 1:
-        heading += f"（第 {page_number + 1}/{total_pages} 页）"
+        heading = f"<b>候选资源 · 第 {page_number + 1}/{total_pages} 页</b>"
     lines = [summary or "已找到可下载资源。", "", heading]
     for position, candidate in enumerate(page_candidates, start=page_start + 1):
         if position > page_start + 1:
             lines.append("")
-        metadata = " · ".join(
-            value for value in (candidate["site"], candidate["size"]) if value
-        )
+        metadata_parts = []
+        if candidate["site"]:
+            metadata_parts.append(f"来源：{candidate['site']}")
+        if candidate["size"]:
+            metadata_parts.append(f"体积：{candidate['size']}")
+        metadata = " · ".join(metadata_parts)
         episode = candidate.get("episode")
         prefix = f"{episode} · " if episode else ""
         lines.append(f"<b>{position}.</b> {prefix}{candidate['title']}")
@@ -3182,7 +3249,7 @@ def _render_resource_candidates(
             lines.append(f"   推荐依据：{explanation}")
     lines.extend([
         "",
-        "选择下方按钮即可；真正提交前还会再次确认。",
+        "请用下方按钮选择下载目标。提交前还会显示预检并再次确认。",
     ])
     return _truncate_telegram_html("\n".join(lines))
 

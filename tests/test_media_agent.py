@@ -11,6 +11,7 @@ from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentInputError,
     AgentOrchestrator,
+    is_presentation_feedback_message,
     is_library_series_episode_count_and_audit_message,
     is_library_series_episode_count_message,
     normalize_agent_message,
@@ -194,6 +195,26 @@ class AgentCoreTests(unittest.TestCase):
         self.assertIsNone(response["tool_call"])
         self.assertIn("想关注哪一部分", response["result"]["summary"])
         self.assertNotRegex(response["result"]["summary"], r"[a-z_]+\.[a-z_]+")
+
+    def test_presentation_feedback_is_answered_directly_instead_of_being_misrouted(self):
+        message = "为什么输出的格式这么紧凑没有排版"
+
+        self.assertTrue(is_presentation_feedback_message(message))
+        response = AgentOrchestrator(ToolRegistry()).query(message)
+
+        self.assertEqual(response["mode"], "conversation")
+        self.assertIsNone(response["tool_call"])
+        self.assertIn("确实是排版问题", response["result"]["summary"])
+        self.assertIn("\n\n", response["result"]["summary"])
+        self.assertNotIn("检查下载队列里的异常", response["result"]["suggestions"])
+
+        for normal_request in (
+            "显示订阅列表",
+            "查看内容列表",
+            "为什么这个资源没集数",
+        ):
+            with self.subTest(normal_request=normal_request):
+                self.assertFalse(is_presentation_feedback_message(normal_request))
 
 
 class AgentToolTests(unittest.TestCase):
