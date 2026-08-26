@@ -1298,6 +1298,13 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
                 6,
             ),
             (
+                "Grand Example Animation Ⅱ - 05 [1080p][WEB-DL].mkv",
+                "",
+                "Grand Example Animation",
+                2,
+                5,
+            ),
+            (
                 "[SFSub] Otonari no Tenshi-sama 2 - 01 [1080p].mkv",
                 "/动漫/[SFSub] Otonari no Tenshi-sama 2 Vol1",
                 "Otonari no Tenshi sama",
@@ -1314,6 +1321,42 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
                 self.assertEqual((context.season, context.episode), (season, episode))
                 self.assertEqual(parsed["title"], title)
                 self.assertEqual((parsed["season"], parsed["episode"]), (season, episode))
+
+    def test_unicode_roman_season_before_cjk_subtitle_is_shared_position_evidence(self):
+        scraper = self.recognition_module()
+        parser = scraper.TMDBScraper()
+        filename = (
+            "[ANi] Clevatess Ⅱ－魔獸之王與虛假的勇者傳承－ - 08 "
+            "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+        )
+
+        context = scraper.extract_recognition_context(
+            filename, "/media/downloads/下载"
+        )
+        parsed = _parse_fields(parser, filename)
+
+        self.assertEqual(context.normalized_title, "Clevatess")
+        self.assertEqual((context.season, context.episode), (2, 8))
+        self.assertIn(
+            "Clevatess Ⅱ－魔獸之王與虛假的勇者傳承－",
+            context.title_variants,
+        )
+        self.assertEqual((parsed["season"], parsed["episode"]), (2, 8))
+        self.assertEqual(
+            scraper.parse_release_position(filename),
+            {"season": 2, "episode": 8, "episode_end": None},
+        )
+
+        identity = scraper.extract_recognition_context(
+            "Lupin Ⅲ - 08 [1080P][WEB-DL].mkv", ""
+        )
+        self.assertEqual(identity.normalized_title, "Lupin Ⅲ")
+        self.assertEqual((identity.season, identity.episode), (None, 8))
+        subtitled_identity = scraper.extract_recognition_context(
+            "Lupin Ⅲ－峰不二子的谎言－ - 08 [1080P][WEB-DL].mkv", ""
+        )
+        self.assertEqual(subtitled_identity.season, None)
+        self.assertEqual(subtitled_identity.episode, 8)
 
     def test_bracket_episode_keeps_title_identity_x_but_parses_roman_second_season(self):
         scraper = self.recognition_module()

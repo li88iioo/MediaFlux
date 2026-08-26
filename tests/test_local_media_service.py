@@ -53,6 +53,33 @@ class FakeScraper:
         return []
 
 
+class SharedPositionFakeScraper(FakeScraper):
+    """固定媒体身份，但复用正式共享季集解析器。"""
+
+    def parse_media(self, filename: str, parent_path: str = "", match=None):
+        from app.modules.scraper import extract_recognition_context
+
+        context = extract_recognition_context(filename, parent_path)
+        return release_parse_result(
+            {
+                "season": context.season,
+                "episode": context.episode,
+                "title": context.normalized_title,
+                "year": "",
+                "type": self.result.media_type,
+            },
+            filename=filename,
+            parent_path=parent_path,
+        )
+
+    def get_detail(self, tmdb_id: str, media_type: str):
+        return {
+            "genres": [{"id": 16}],
+            "origin_country": ["JP"],
+            "first_air_date": "2025-01-01",
+        }
+
+
 class LocalMediaServiceTests(IsolatedDatabaseTestCase):
     def setUp(self):
         super().setUp()
@@ -399,6 +426,52 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertEqual(preview["matches"][0]["episode"], 7)
             self.assertIn("S02E07", preview["plans"][0]["target_name"])
             self.assertEqual(Path(preview["plans"][0]["target_path"]).parent.name, "Season 2")
+
+    def test_local_preview_uses_shared_unicode_roman_season_parser(self):
+        from app.modules.organize import OrganizeRules
+
+        filename = (
+            "[ANi] Clevatess Ⅱ－魔獸之王與虛假的勇者傳承－ - 08 "
+            "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+        )
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "unicode-roman-downloads"
+            target_root = root / "unicode-roman-anime"
+            source_root.mkdir()
+            target_root.mkdir()
+            episode = source_root / filename
+            episode.write_bytes(b"video")
+            source_id = self._source(source_root, target_root, "anime")
+            service = LocalMediaService(scraper=SharedPositionFakeScraper(MatchResult(
+                tmdb_id="258348",
+                title="克雷瓦提斯-魔兽之王与婴儿与尸之勇者-",
+                year="2025",
+                media_type="tv",
+                confidence=1.0,
+                status="matched",
+            )))
+
+            inspection = service.inspect_source("admin", source_id, episode)
+            rules = OrganizeRules(
+                region_split=False,
+                year_split=False,
+                naming_scope="both",
+            )
+            with patch(
+                "app.modules.local_media_service.OrganizeRules.from_config",
+                return_value=rules,
+            ):
+                preview = service.preview("admin", inspection["inspection_id"])
+
+        self.assertEqual(
+            (inspection["parsed_season"], inspection["parsed_episode"]),
+            (2, 8),
+        )
+        self.assertEqual(preview["status"], "planned")
+        target = Path(preview["plans"][0]["target_path"])
+        self.assertEqual(target.parent.name, "Season 2")
+        self.assertIn("S02E08", target.name)
 
     def test_single_tv_file_episode_override_defaults_to_season_one(self):
         with tempfile.TemporaryDirectory() as root_raw:

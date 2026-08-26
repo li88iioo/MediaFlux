@@ -358,7 +358,8 @@ _ORDINAL_ATTACK_SEASON_TOKEN = re.compile(
 )
 _IMPLICIT_SEASON_EPISODE_TOKEN = re.compile(
     r"(?ix)(?<![A-Za-z0-9])"
-    r"(?P<season>20|1[0-9]|[2-9]|VIII|VII|VI|IV|III|II|IX|V|X)"
+    r"(?P<season>20|1[0-9]|[2-9]|VIII|VII|VI|IV|III|II|IX|V|X|"
+    r"Ⅷ|Ⅶ|Ⅵ|Ⅳ|Ⅲ|Ⅱ|Ⅸ|Ⅴ|Ⅹ)"
     r"(?![A-Za-z0-9])"
     r"(?=\s*(?:[-_.]+\s*)+(?:e(?:p(?:isode)?)?[ ._-]*)?"
     r"\d{1,4}(?:v\d+)?(?=\s*(?:[\[【(（]|$)))"
@@ -368,10 +369,26 @@ _IMPLICIT_SEASON_EPISODE_TOKEN = re.compile(
 # 严格的“后续仍有技术标签”要求，避免把普通作品名末尾的罗马数字误当季号。
 _IMPLICIT_SEASON_BRACKET_EPISODE_TOKEN = re.compile(
     r"(?ix)(?<![A-Za-z0-9])"
-    r"(?P<season>20|1[0-9]|[2-9]|VIII|VII|VI|IV|III|II|IX|V|X)"
+    r"(?P<season>20|1[0-9]|[2-9]|VIII|VII|VI|IV|III|II|IX|V|X|"
+    r"Ⅷ|Ⅶ|Ⅵ|Ⅳ|Ⅲ|Ⅱ|Ⅸ|Ⅴ|Ⅹ)"
     r"(?![A-Za-z0-9])"
     r"(?=\s*[\[【(（]\s*\d{1,4}(?:v\d+)?\s*[\]】)）]"
     r"\s*[\[【(（])"
+)
+# 部分动画续季会使用 Unicode 兼容罗马数字，并在季号后附带由全角横线
+# 包裹的正式副标题，例如 ``Clevatess Ⅱ－副标题－ - 08 [1080P]``。
+# 该结构无法命中普通的 ``Title II - 08`` 规则；这里要求完整的 CJK
+# 副标题、明确单集号和发布技术证据，避免把 ``Lupin Ⅲ - 08`` 一类作品
+# 身份中的罗马数字直接解释为季号。
+_IMPLICIT_CJK_SUBTITLE_SEASON_EPISODE_TOKEN = re.compile(
+    r"(?ix)(?<![A-Za-z0-9])"
+    r"(?P<season>Ⅱ)"
+    r"(?![A-Za-z0-9])"
+    r"(?P<subtitle>\s*(?P<subtitle_sep>[－—–])\s*"
+    r"[\u3040-\u30ff\u3400-\u9fff][^\[\]()（）\r\n]{3,118}?"
+    r"(?P=subtitle_sep))"
+    r"(?=\s+(?:[-_.]+\s*)+(?:e(?:p(?:isode)?)?[ ._-]*)?"
+    r"\d{1,4}(?:v\d+)?(?=\s*(?:[\[【(（]|$)))"
 )
 # ``[Yami Shibai 17][06][1080p]`` 同时存在两种合理解释：作品名
 # 可能就叫 ``Yami Shibai 17``，也可能是基础标题的第 17 季。该模式不能在
@@ -386,7 +403,8 @@ _AMBIGUOUS_ENCLOSED_HIGH_SEASON_EPISODE_TOKEN = re.compile(
 )
 _IMPLICIT_SEASON_VOLUME_TOKEN = re.compile(
     r"(?ix)(?<![A-Za-z0-9])"
-    r"(?P<season>20|1[0-9]|[2-9]|VIII|VII|VI|IV|III|II|IX|V|X)"
+    r"(?P<season>20|1[0-9]|[2-9]|VIII|VII|VI|IV|III|II|IX|V|X|"
+    r"Ⅷ|Ⅶ|Ⅵ|Ⅳ|Ⅲ|Ⅱ|Ⅸ|Ⅴ|Ⅹ)"
     r"(?![A-Za-z0-9])"
     r"(?P<volume>\s+(?:vol(?:ume)?)[ ._-]*\d{1,2})"
     r"(?=\s*(?:[\[【(（]|$))"
@@ -982,6 +1000,15 @@ _ROMAN_SEASON_NUMBERS = {
     "VIII": 8,
     "IX": 9,
     "X": 10,
+    "Ⅱ": 2,
+    "Ⅲ": 3,
+    "Ⅳ": 4,
+    "Ⅴ": 5,
+    "Ⅵ": 6,
+    "Ⅶ": 7,
+    "Ⅷ": 8,
+    "Ⅸ": 9,
+    "Ⅹ": 10,
 }
 
 
@@ -995,6 +1022,24 @@ def _implicit_season_body_is_safe(value: str) -> bool:
     # 对短标题宁可保留人工确认；避免把 ``86``、``Part 2`` 等正式标题
     # 成分误判成季号。正式片名尾部的罗马数字还需由发布结构证据约束。
     return cjk_count >= 4 or len(latin_tokens) >= 3
+
+
+def _implicit_cjk_subtitle_season_is_safe(
+    source: str, match: re.Match[str],
+) -> bool:
+    """校验 ``短标题 Ⅱ－长 CJK 副标题－ - 集号`` 的窄例外。"""
+    body = re.sub(
+        r"\s+", " ", str(source or "")[:match.start("season")]
+    ).strip(" ._-—–－:：")
+    if not body or _AMBIGUOUS_SEQUEL_PREDECESSOR.search(body):
+        return False
+    body_cjk = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", body))
+    body_latin = re.findall(r"[A-Za-z][A-Za-z0-9']*", body)
+    subtitle = str(match.groupdict().get("subtitle") or "")
+    subtitle_cjk = len(
+        re.findall(r"[\u3040-\u30ff\u3400-\u9fff]", subtitle)
+    )
+    return bool((body_cjk >= 2 or body_latin) and subtitle_cjk >= 4)
 
 
 def _implicit_season_has_release_evidence(
@@ -1027,12 +1072,20 @@ def _implicit_season_hint(
     matches = [
         *(_IMPLICIT_SEASON_EPISODE_TOKEN.finditer(source)),
         *(_IMPLICIT_SEASON_BRACKET_EPISODE_TOKEN.finditer(source)),
+        *(_IMPLICIT_CJK_SUBTITLE_SEASON_EPISODE_TOKEN.finditer(source)),
         *(_IMPLICIT_SEASON_VOLUME_TOKEN.finditer(source)),
         *(_ROMAJI_SECOND_SEASON_EPISODE_TOKEN.finditer(source)),
         *(_PUNCTUATED_NUMERIC_SEASON_EPISODE_TOKEN.finditer(source)),
     ]
     for match in sorted(matches, key=lambda item: item.start("season"), reverse=True):
-        if not _implicit_season_body_is_safe(source[:match.start("season")]):
+        has_cjk_subtitle = bool(match.groupdict().get("subtitle"))
+        if has_cjk_subtitle:
+            body_is_safe = _implicit_cjk_subtitle_season_is_safe(source, match)
+        else:
+            body_is_safe = _implicit_season_body_is_safe(
+                source[:match.start("season")]
+            )
+        if not body_is_safe:
             continue
         if not _implicit_season_has_release_evidence(source, match):
             continue
@@ -1050,7 +1103,9 @@ def _implicit_season_hint(
         )
         if season is None or not 2 <= season <= 20:
             continue
-        if match.groupdict().get("volume"):
+        if match.groupdict().get("subtitle"):
+            end = match.end("subtitle")
+        elif match.groupdict().get("volume"):
             end = match.end("volume")
         elif match.groupdict().get("marker"):
             end = match.end("marker")

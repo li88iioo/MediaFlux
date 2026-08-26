@@ -406,6 +406,52 @@ class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
         )
         self.assertTrue(all(plan.action == "move" for plan in plans))
 
+    def test_guangya_plan_uses_shared_unicode_roman_season_parser(self):
+        filename = (
+            "[ANi] Clevatess Ⅱ－魔獸之王與虛假的勇者傳承－ - 08 "
+            "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+        )
+        episode = GuangYaFile(
+            "e8", filename, False, 1024, "etag-8", "source",
+        )
+        client = _TreeClient(
+            {"source": [episode], "archive": []},
+            {
+                "source": GuangYaFile("source", "下载", True, parent_id="0"),
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        scraper = TMDBScraper()
+        scraper.match = Mock(return_value=MatchResult(
+            tmdb_id="258348",
+            external_id="258348",
+            provider="tmdb",
+            title="克雷瓦提斯-魔兽之王与婴儿与尸之勇者-",
+            year="2025",
+            media_type="tv",
+            confidence=1.0,
+            status="matched",
+            matched_by="search",
+        ))
+        scraper.get_detail = Mock(return_value={
+            "genres": [{"id": 16}],
+            "origin_country": ["JP"],
+            "seasons": [
+                {"season_number": 1, "episode_count": 12},
+                {"season_number": 2, "episode_count": 12},
+            ],
+        })
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True,
+        )
+
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(len(plans), 1)
+        self.assertEqual((plans[0].season, plans[0].episode), (2, 8))
+        self.assertTrue(plans[0].target_path.endswith("/Season 2"))
+        self.assertIn("S02E08", plans[0].new_name)
+
     def test_build_plans_preserves_verified_absolute_episode_mapping(self):
         show = GuangYaFile("show", "One Piece", True, parent_id="source")
         episode = GuangYaFile(
