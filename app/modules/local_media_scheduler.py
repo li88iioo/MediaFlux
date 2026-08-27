@@ -298,12 +298,78 @@ class LocalMediaScheduler:
                 oldest_id = next(iter(self._captured_task_results))
                 self._captured_task_results.pop(oldest_id, None)
 
+    def _rebuild_manual_review_result(self, task) -> dict[str, object] | None:
+        """为已存在的待确认任务重建只读预览，供 TG 再次生成候选卡。"""
+        try:
+            inspection = self.service.inspect_task(self.owner, int(task.id))
+            preview = self.service.preview(
+                self.owner,
+                str(inspection.get("inspection_id") or ""),
+                str(getattr(task, "tmdb_id", "") or ""),
+                str(getattr(task, "media_type", "") or ""),
+                rules_snapshot=str(getattr(task, "rules_snapshot", "") or ""),
+                automatic=True,
+                season_override=getattr(task, "season_override", None),
+                episode_override=getattr(task, "episode_override", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "本地媒体待确认预览恢复失败 task=%s type=%s",
+                getattr(task, "id", ""),
+                type(exc).__name__,
+            )
+            return None
+
+        review_preview = dict(preview)
+        if str(review_preview.get("status") or "") == "planned":
+            matches = [
+                dict(item) for item in (review_preview.get("matches") or [])
+                if isinstance(item, dict)
+            ]
+            candidates: list[dict[str, object]] = []
+            seen: set[tuple[str, str]] = set()
+            for match in matches:
+                tmdb_id = str(match.get("tmdb_id") or "").strip()
+                media_type = str(match.get("media_type") or "").strip().lower()
+                key = (tmdb_id, media_type)
+                if not tmdb_id or media_type not in {"movie", "tv"} or key in seen:
+                    continue
+                seen.add(key)
+                candidate = dict(match)
+                candidate["score"] = candidate.get("confidence", 0.0)
+                candidates.append(candidate)
+            review_preview.update({
+                "status": "requires_manual",
+                "reason": str(getattr(task, "error", "") or "媒体识别结果需要人工确认"),
+                "candidate": candidates[0] if candidates else {},
+                "candidates": candidates,
+                "files": [
+                    {"name": str(item.get("source_name") or "")}
+                    for item in matches if str(item.get("source_name") or "")
+                ],
+                "snapshot_digest": str(
+                    review_preview.get("digest") or inspection.get("digest") or ""
+                ),
+            })
+        return {
+            "status": "requires_manual",
+            "task_id": int(task.id),
+            "preview": review_preview,
+        }
+
     def take_captured_task_result(self, task_id: int) -> dict[str, object] | None:
-        """消费 TG 手动批次的任务结果；其他扫描任务不会进入该缓存。"""
+        """消费 TG 手动批次结果；复用待确认任务时按需恢复候选预览。"""
         normalized_id = int(task_id)
         with self._guard:
+            was_captured = normalized_id in self._capture_result_task_ids
             self._capture_result_task_ids.discard(normalized_id)
-            return self._captured_task_results.pop(normalized_id, None)
+            captured = self._captured_task_results.pop(normalized_id, None)
+        if captured is not None or not was_captured:
+            return captured
+        task = db.get_local_media_task(normalized_id, owner=self.owner)
+        if task is None or str(task.status) != "requires_manual":
+            return None
+        return self._rebuild_manual_review_result(task)
 
     @staticmethod
     def _is_manual_scan_task(task) -> bool:

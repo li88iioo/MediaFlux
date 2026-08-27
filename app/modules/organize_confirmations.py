@@ -956,6 +956,14 @@ def _execute_local_media_confirmation(
                         status="failed",
                         error=message,
                     )
+                    current = db.get_local_media_task(task_id, owner=current.owner)
+                if current is not None and current.status == "failed":
+                    db.update_download_request_for_local_media_task(
+                        task_id,
+                        "failed",
+                        error=message,
+                        resolve_manual=True,
+                    )
             except Exception:
                 logger.warning(
                     "本地媒体确认失败状态保存异常 task=%s", task_id, exc_info=True

@@ -247,6 +247,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             "AGENT_LLM_API_KEY": "llm-deployment-secret",
             "AGENT_LLM_MODEL": "deployment-model",
             "AGENT_LIBRARY_PATROL_ENABLED": "1",
+            "DOWNLOAD_TORRENT_RETENTION_DAYS": "30",
             "GY_STRM_BASE_URL": "http://mediaflux.internal:1258",
         }
         with patch(
@@ -266,13 +267,14 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertEqual(payload["AGENT_LLM_MODEL"], "deployment-model")
         self.assertEqual(payload["AGENT_LIBRARY_PATROL_ENABLED"], "1")
         self.assertEqual(payload["GY_STRM_BASE_URL"], "http://mediaflux.internal:1258")
-        self.assertEqual(payload["DOWNLOAD_TORRENT_RETENTION_DAYS"], "0")
+        self.assertEqual(payload["DOWNLOAD_TORRENT_RETENTION_DAYS"], "30")
         self.assertEqual(
             payload["__managed_fields"],
             [
                 "AGENT_LIBRARY_PATROL_ENABLED",
                 "AGENT_LLM_API_KEY",
                 "AGENT_LLM_MODEL",
+                "DOWNLOAD_TORRENT_RETENTION_DAYS",
                 "GY_STRM_BASE_URL",
                 "TAVILY_API_KEY",
             ],

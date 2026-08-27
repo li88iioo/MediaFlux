@@ -103,7 +103,7 @@ _MEDIA_SERVER_PROFILE_KEYS = {
 }
 _CONFIG_UI_MANAGED_KEYS = (
     _AGENT_SETTINGS_MANAGED_KEYS
-    | {"GY_STRM_BASE_URL"}
+    | {"DOWNLOAD_TORRENT_RETENTION_DAYS", "GY_STRM_BASE_URL"}
     | _MEDIA_SERVER_REFRESH_KEYS
     | _MEDIA_SERVER_PROFILE_KEYS
 )
@@ -891,11 +891,19 @@ def get_config(request: Request):
             "DOUBAN_FRODO_API_KEY", "DOUBAN_FRODO_API_SECRET",
         } | _FIXED_ORGANIZE_NAMING_KEYS)
     }
+    managed_fields = sorted(
+        key for key in _CONFIG_UI_MANAGED_KEYS
+        if config.has_external_override(key)
+    )
+    managed_field_set = set(managed_fields)
     # 运行目录只作为缺省值展示；用户保存的 STRM_ROOT（包括显式空值）仍优先。
     items.setdefault("STRM_ROOT", config.get("STRM_ROOT", ""))
+    retention_key = "DOWNLOAD_TORRENT_RETENTION_DAYS"
+    retention_default = str(DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS)
     items.setdefault(
-        "DOWNLOAD_TORRENT_RETENTION_DAYS",
-        str(DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS),
+        retention_key,
+        config.get(retention_key, retention_default)
+        if retention_key in managed_field_set else retention_default,
     )
     # 旧版整单降级开关已停用；即使数据库仍有历史值也不再暴露给前端。
     items.pop("OFFLINE_MAGNET_UNVERIFIED_FALLBACK", None)
@@ -905,10 +913,6 @@ def get_config(request: Request):
     items["OFFLINE_ALLOWED_EXTS"] = ",".join(
         normalize_video_extensions(str(items.get("OFFLINE_ALLOWED_EXTS") or ""))
     ) or DEFAULT_MEDIA_EXTS_CSV
-    managed_fields = sorted(
-        key for key in _CONFIG_UI_MANAGED_KEYS
-        if config.has_external_override(key)
-    )
     for key in managed_fields:
         items[key] = config.get(key, _AGENT_SETTINGS_DEFAULTS.get(key, ""))
     redacted = redact_config(items)

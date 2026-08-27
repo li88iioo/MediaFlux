@@ -187,15 +187,30 @@ _PRESENTATION_FEEDBACK_ISSUES = (
 _PRESENTATION_FEEDBACK_LAYOUT_ACTIONS = (
     "优化", "调整", "改一下", "改下", "分段", "换行", "空行",
 )
+_PRESENTATION_FEEDBACK_EXPLICIT_CONTEXT = (
+    "agent", "telegram", "tg", "机器人", "回复", "回答", "消息",
+)
+_PRESENTATION_FEEDBACK_BUSINESS_ANCHORS = tuple(
+    token for token in _FOLLOWUP_DOMAIN_ANCHORS
+    if token not in {"telegram", "通知"}
+)
 
 
 def is_presentation_feedback_message(message: str) -> bool:
-    """识别用户对 Agent/TG 回复可读性的反馈，避免被“为什么”误判为业务追问。"""
+    """识别 Agent/TG 回复排版反馈，同时避免吞掉页面或业务内容问题。"""
     normalized = re.sub(
         r"[\s，。！？!?、；;：:]+", "", unicodedata.normalize("NFKC", str(message or "")).casefold()
     )
     if not normalized or not any(
         token in normalized for token in _PRESENTATION_FEEDBACK_SUBJECTS
+    ):
+        return False
+    explicit_context = any(
+        token in normalized for token in _PRESENTATION_FEEDBACK_EXPLICIT_CONTEXT
+    )
+    if (
+        not explicit_context
+        and any(token in normalized for token in _PRESENTATION_FEEDBACK_BUSINESS_ANCHORS)
     ):
         return False
     if any(token in normalized for token in _PRESENTATION_FEEDBACK_ISSUES):

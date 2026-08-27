@@ -1096,6 +1096,52 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         self.assertEqual(delivery["status"], "sent")
         self.assertIn("本地媒体确认整理完成", str(delivery["event_json"]))
 
+    def test_local_confirmation_failure_settles_linked_download_request(self):
+        request_id, _created = db.create_download_request(
+            "local-confirmation-failure", "magnet", title="Movie.2026"
+        )
+        self.assertTrue(db.link_download_request_to_local_media_task(
+            request_id, self.task_id, "/downloads/Movie.2026.mkv"
+        ))
+        db.update_download_request_for_local_media_task(
+            self.task_id, "requires_manual", error="匹配置信度不足"
+        )
+        actions = self._actions()
+        token = actions[0].callback_data.split(":")[1]
+        callbacks = []
+        manager = SimpleNamespace(
+            start_operation=lambda _name, _reference, callback: (
+                callbacks.append(callback) or {"ok": True, "task_id": "worker-1"}
+            )
+        )
+        scheduler = SimpleNamespace(
+            service=SimpleNamespace(
+                inspect_source=lambda *_args: {"digest": "digest-1"},
+                execute_task=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("归档写入失败")
+                ),
+            ),
+            qb_factory=lambda: self.fail("无 qB 任务时不应创建客户端"),
+        )
+        with patch(
+            "app.modules.organize_tasks.get_organize_manager", return_value=manager
+        ), patch(
+            "app.modules.local_media_scheduler.get_local_media_scheduler",
+            return_value=scheduler,
+        ), patch(
+            "app.modules.organize_confirmations.send_event", return_value=True
+        ):
+            start_confirmation(token, 0, chat_id="100")
+            with self.assertRaisesRegex(RuntimeError, "归档写入失败"):
+                callbacks[0]()
+
+        task = db.get_local_media_task(self.task_id, owner="admin")
+        request = db.get_download_request(request_id)
+        self.assertEqual(task.status, "failed")
+        self.assertEqual(request["local_import_status"], "failed")
+        self.assertIn("归档写入失败", request["local_import_error"] or "")
+        self.assertEqual(db.get_organize_confirmation(token)["status"], "failed")
+
     def test_changed_local_snapshot_fails_without_claiming_task(self):
         actions = self._actions()
         token = actions[0].callback_data.split(":")[1]

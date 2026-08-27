@@ -566,6 +566,72 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(captured["preview"]["candidate"]["tmdb_id"], "1")
         self.assertIsNone(scheduler.take_captured_task_result(task_id))
 
+    def test_reused_manual_review_rebuilds_preview_for_telegram_card(self):
+        class RecoverableReviewService:
+            @staticmethod
+            def inspect_task(owner, task_id):
+                self.assertEqual(owner, "admin")
+                self.assertGreater(task_id, 0)
+                return {"inspection_id": "inspection-1", "digest": "digest-1"}
+
+            @staticmethod
+            def preview(owner, inspection_id, tmdb_id, media_type, **kwargs):
+                self.assertEqual(owner, "admin")
+                self.assertEqual(inspection_id, "inspection-1")
+                self.assertEqual(tmdb_id, "")
+                self.assertEqual(media_type, "")
+                self.assertTrue(kwargs["automatic"])
+                return {
+                    "status": "requires_manual",
+                    "reason": "匹配置信度不足",
+                    "snapshot_digest": "digest-1",
+                    "rules_snapshot": "{}",
+                    "files": [{"name": "Movie.mkv"}],
+                    "candidate": {
+                        "tmdb_id": "1", "media_type": "movie",
+                        "title": "候选电影", "provider": "tmdb",
+                    },
+                    "candidates": [{
+                        "tmdb_id": "1", "media_type": "movie",
+                        "title": "候选电影", "provider": "tmdb",
+                    }],
+                }
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "downloads"
+            target_root = root / "library"
+            source_root.mkdir()
+            target_root.mkdir()
+            movie = source_root / "Movie.mkv"
+            movie.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="已有下载", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), enabled=False, scan_enabled=False,
+                stable_seconds=0, owner="admin",
+            )
+            db.upsert_local_library_target(
+                source_id, "default", str(target_root), owner="admin",
+            )
+            task_id = db.create_local_media_task(
+                source_id, "", str(movie), owner="admin", trigger="scan",
+            )
+            db.update_local_media_task(
+                task_id, owner="admin", status="requires_manual",
+                snapshot_digest="digest-1", error="匹配置信度不足",
+            )
+            scheduler = LocalMediaScheduler(service=RecoverableReviewService())
+
+            batch = scheduler.enqueue_manual_scan_candidates(
+                silent=True, capture_results=True,
+            )
+            captured = scheduler.take_captured_task_result(task_id)
+
+        self.assertEqual(batch["task_ids"], [task_id])
+        self.assertEqual(captured["status"], "requires_manual")
+        self.assertEqual(captured["preview"]["candidate"]["tmdb_id"], "1")
+        self.assertIsNone(scheduler.take_captured_task_result(task_id))
+
     def test_manual_scan_filters_non_media_files_and_directories(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)

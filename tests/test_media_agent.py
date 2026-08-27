@@ -212,9 +212,18 @@ class AgentCoreTests(unittest.TestCase):
             "显示订阅列表",
             "查看内容列表",
             "为什么这个资源没集数",
+            "下载页面显示内容太挤了，怎么调整",
+            "媒体库的内容没有换行，怎么看",
         ):
             with self.subTest(normal_request=normal_request):
                 self.assertFalse(is_presentation_feedback_message(normal_request))
+
+        for feedback in (
+            "Telegram 回复挤在一起",
+            "Agent 输出没有换行",
+        ):
+            with self.subTest(feedback=feedback):
+                self.assertTrue(is_presentation_feedback_message(feedback))
 
 
 class AgentToolTests(unittest.TestCase):
