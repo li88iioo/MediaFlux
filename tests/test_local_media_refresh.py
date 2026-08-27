@@ -58,23 +58,14 @@ class LocalMediaRefreshTests(TestCase):
         request.assert_called_once_with("/Library/VirtualFolders")
 
     def test_unbound_refresh_batches_paths_and_isolates_provider_failures(self):
-        jellyfin = Mock()
-        jellyfin.refresh_for_paths.side_effect = RuntimeError("temporary")
-        emby = Mock()
-        emby.refresh_for_paths.return_value = {"ok": True, "fallback": ""}
         with patch(
-            "app.modules.local_media_service.get_bool",
-            side_effect=lambda key: key in {"JELLYFIN_ENABLED", "EMBY_ENABLED"},
-        ), patch(
-            "app.clients.jellyfin.JellyfinClient", return_value=jellyfin,
-        ), patch(
-            "app.clients.emby.EmbyClient", return_value=emby,
-        ):
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "failed", "Emby": "queued"},
+        ) as enqueue:
             warnings = LocalMediaService._refresh_paths({"/media/B", "/media/A"})
 
-        jellyfin.refresh_for_paths.assert_called_once_with(["/media/A", "/media/B"])
-        emby.refresh_for_paths.assert_called_once_with(["/media/A", "/media/B"])
-        self.assertTrue(any("Jellyfin 刷新失败" in item for item in warnings))
+        enqueue.assert_called_once_with(["/media/A", "/media/B"])
+        self.assertTrue(any("Jellyfin 刷新入队失败" in item for item in warnings))
         self.assertFalse(any("Emby" in item for item in warnings))
 
     def test_bound_target_refreshes_only_selected_library(self):
@@ -95,13 +86,19 @@ class LocalMediaRefreshTests(TestCase):
             "app.modules.media_server_profiles.list_configured_profiles", return_value=[profile]
         ), patch("app.clients.jellyfin.JellyfinClient", return_value=client), patch.object(
             LocalMediaService, "_refresh_paths", return_value=[]
-        ) as fallback:
+        ) as fallback, patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "queued"},
+        ) as enqueue:
             warnings = LocalMediaService._refresh_plans(plans)
         self.assertEqual(warnings, [])
         client.list_virtual_folders.assert_called_once_with()
-        client.refresh_for_paths.assert_called_once_with(
-            ["/media/Movies/Film"], allowed_library_ids=("movies",),
+        enqueue.assert_called_once_with(
+            ["/media/Movies/Film"],
+            providers=("jellyfin",),
+            allowed_library_ids=("movies",),
         )
+        client.refresh_for_paths.assert_not_called()
         client.refresh_library.assert_not_called()
         fallback.assert_not_called()
 
@@ -125,14 +122,19 @@ class LocalMediaRefreshTests(TestCase):
         with patch(
             "app.modules.media_server_profiles.list_configured_profiles",
             return_value=[profile],
-        ), patch("app.clients.jellyfin.JellyfinClient", return_value=client):
+        ), patch("app.clients.jellyfin.JellyfinClient", return_value=client), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "queued"},
+        ) as enqueue:
             warnings = LocalMediaService._refresh_plans(plans)
 
         self.assertEqual(warnings, [])
-        client.refresh_for_paths.assert_called_once_with(
+        enqueue.assert_called_once_with(
             ["//NAS/Video/Anime/作品/Season 1"],
+            providers=("jellyfin",),
             allowed_library_ids=("anime",),
         )
+        client.refresh_for_paths.assert_not_called()
 
     def test_bound_target_with_mismatched_library_name_is_safely_skipped(self):
         profile = SimpleNamespace(

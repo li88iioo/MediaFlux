@@ -284,8 +284,10 @@ def start_background_services() -> None:
     from app.modules.local_media_scheduler import get_local_media_scheduler
     from app.modules.organize_confirmations import start_confirmation_dispatcher
     from app.modules.agent_runtime import resume_agent_runtime
+    from app.modules.media_refresh_coordinator import get_media_refresh_coordinator
 
     resume_agent_runtime()
+    get_media_refresh_coordinator().start()
     get_organize_manager().resume()
     start_confirmation_dispatcher()
     get_scheduler().start()
@@ -320,6 +322,7 @@ def stop_background_services() -> bool:
     confirmation_dispatcher_stopped = True
     organize_drained = True
     strm_workers_stopped = True
+    media_refresh_stopped = True
     # 先关闭整理准入，避免迟到的 TG 回调或调度器在关机窗口提交新任务。
     from app.modules.organize_tasks import get_organize_manager
 
@@ -436,6 +439,15 @@ def stop_background_services() -> bool:
     except Exception as exc:
         strm_workers_stopped = False
         logger.warning("停止 STRM 调度器失败 type=%s", type(exc).__name__)
+    try:
+        from app.modules.media_refresh_coordinator import get_media_refresh_coordinator
+
+        media_refresh_stopped = bool(get_media_refresh_coordinator().stop())
+        if not media_refresh_stopped:
+            logger.warning("停止媒体库刷新合并器超时，持久队列将在下次启动恢复")
+    except Exception as exc:
+        media_refresh_stopped = False
+        logger.warning("停止媒体库刷新合并器失败 type=%s", type(exc).__name__)
     return all((
         bot_workers_stopped,
         download_tracker_stopped,
@@ -449,6 +461,7 @@ def stop_background_services() -> bool:
         confirmation_dispatcher_stopped,
         organize_drained,
         strm_workers_stopped,
+        media_refresh_stopped,
     ))
 
 

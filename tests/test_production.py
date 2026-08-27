@@ -2164,7 +2164,13 @@ class MediaRefreshTests(unittest.TestCase):
         self.assertTrue(client.refresh_library("library-id"))
         self.assertIn("/Items/library-id/Refresh", client._session.post.call_args.args[0])
         call = client._session.post.call_args
-        self.assertEqual(call.kwargs["params"], {"metadataRefreshMode": "FullRefresh"})
+        self.assertEqual(call.kwargs["params"], {
+            "metadataRefreshMode": "Default",
+            "imageRefreshMode": "None",
+            "replaceAllMetadata": "false",
+            "replaceAllImages": "false",
+            "regenerateTrickplay": "false",
+        })
         self.assertIn("MediaBrowser Token", call.kwargs["headers"]["Authorization"])
 
     def test_emby_refresh_for_path_matches_virtual_folder(self):

@@ -402,8 +402,8 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
                 "STRM_METADATA_REFRESH_INTERVAL_SECONDS": 300,
             }.get(key, default),
         ), patch(
-            "app.modules.scheduler.STRMScheduler._refresh_media_servers",
-            side_effect=[{"Jellyfin": False}, {"Jellyfin": True}],
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            side_effect=[{"Jellyfin": "failed"}, {"Jellyfin": "queued"}],
         ) as refresh:
             worker._flush_media_refresh(force=True)
             self.assertEqual(worker._changed_paths, [
@@ -416,9 +416,10 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(refresh.call_count, 2)
         self.assertEqual(
-            refresh.call_args_list[0].kwargs["changed_paths"],
+            refresh.call_args_list[0].args[0],
             ["/strm/Movie/Movie.nfo"],
         )
+        self.assertTrue(refresh.call_args_list[0].kwargs["immediate"])
         self.assertEqual(worker._changed_paths, [])
         self.assertFalse(worker._refresh_retry_pending)
 
@@ -440,8 +441,8 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         worker = STRMMetadataWorker()
 
         with patch(
-            "app.modules.scheduler.STRMScheduler._refresh_media_servers",
-            return_value={"Jellyfin": True},
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "queued"},
         ) as refresh, patch(
             "app.modules.strm_metadata_worker.time.monotonic",
             return_value=120.0,
@@ -449,5 +450,6 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
             worker._flush_media_refresh(force=False)
 
         refresh.assert_called_once()
-        self.assertEqual(refresh.call_args.kwargs["changed_paths"], [path])
+        self.assertEqual(refresh.call_args.args[0], [path])
+        self.assertFalse(refresh.call_args.kwargs["immediate"])
         self.assertEqual(db.count_strm_metadata_refresh_paths(), 0)

@@ -332,17 +332,24 @@ class EmbyClient(MediaServerClient):
         return int(data.get("TotalRecordCount", 0) or 0)
 
     def refresh_library(self, library_id: str) -> bool:
+        """轻量刷新 Item/Folder/媒体库；自动流程不强制重抓全部元数据。"""
         try:
             resp = self._session.post(
                 f"{self.url}/Items/{library_id}/Refresh",
                 headers=self._headers(),
-                params={"Recursive": "true", "MetadataRefreshMode": "FullRefresh"},
+                params={
+                    "Recursive": "true",
+                    "MetadataRefreshMode": "Default",
+                    "ImageRefreshMode": "None",
+                    "ReplaceAllMetadata": "false",
+                    "ReplaceAllImages": "false",
+                },
                 timeout=15,
             )
             resp.raise_for_status()
             return True
         except Exception as e:
-            logger.error("Emby 刷新媒体库失败 library=%s type=%s", library_id, type(e).__name__)
+            logger.error("Emby 刷新目标失败 target=%s type=%s", library_id, type(e).__name__)
             return False
 
     @staticmethod
@@ -354,7 +361,7 @@ class EmbyClient(MediaServerClient):
         return bool(self.refresh_for_paths([media_path]).get("ok"))
 
     def refresh_all(self) -> bool:
-        """全局刷新媒体库（POST /Library/Refresh）。整理入库后触发。"""
+        """显式全局刷新兼容入口；自动整理链路不会调用该接口。"""
         try:
             resp = self._session.post(
                 f"{self.url}/Library/Refresh",

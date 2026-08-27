@@ -318,12 +318,17 @@ class OrganizeSchedulerTests(unittest.TestCase):
         patrol = MagicMock()
         jobs = MagicMock()
         local_media = MagicMock()
+        media_refresh = MagicMock()
+        media_refresh.stop.return_value = True
         with patch("app.modules.scheduler.get_scheduler", return_value=strm), patch(
             "app.modules.rss_scheduler.get_rss_scheduler", return_value=rss
         ), patch(
             "app.modules.organize_scheduler.get_organize_scheduler", return_value=organize
         ), patch(
             "app.modules.local_media_scheduler.get_local_media_scheduler", return_value=local_media
+        ), patch(
+            "app.modules.media_refresh_coordinator.get_media_refresh_coordinator",
+            return_value=media_refresh,
         ), patch(
             "app.modules.download_tracker.get_download_tracker", return_value=downloads
         ), patch(
@@ -349,6 +354,8 @@ class OrganizeSchedulerTests(unittest.TestCase):
         organize.stop.assert_called_once_with()
         local_media.start.assert_called_once_with()
         local_media.stop.assert_called_once_with()
+        media_refresh.start.assert_called_once_with()
+        media_refresh.stop.assert_called_once_with()
         verification.start.assert_called_once_with()
         verification.stop.assert_called_once_with()
         patrol.start.assert_called_once_with()

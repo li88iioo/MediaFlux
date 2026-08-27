@@ -58,6 +58,7 @@ def build_local_media_event(
             refresh_status = "failed" if any("刷新失败" in item or "未刷新媒体库" in item for item in warnings) else "completed"
         refresh_label = {
             "completed": "完成",
+            "queued": "已排队（合并刷新）",
             "failed": "失败（需处理）",
             "skipped": "未启用",
         }.get(refresh_status, "状态未知")

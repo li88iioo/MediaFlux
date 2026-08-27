@@ -6,7 +6,7 @@
 规则：
 - 同一目录内的多个文件只产生一个刷新目标。
 - 祖先目录已入选时，其后代目录不再单独刷新。
-- 同一父目录下多个兄弟目录同时变化时收敛到父目录，但绝不越过媒体根。
+- 不提前把不同作品的兄弟目录收敛为库根；最终由媒体服务器 Item ID 去重。
 """
 from __future__ import annotations
 
@@ -104,8 +104,9 @@ def plan_refresh_targets(
     if not unique:
         return RefreshPlan(reason="本轮没有可定位的变化目录")
 
-    collapsed = _collapse_siblings(unique, boundary)
-    compressed = _drop_descendants(collapsed)
+    # 兄弟目录可能是不同电影/剧集；过早折叠会把本可精准刷新的两个作品
+    # 放大成物理根扫描。相同 Series 的多季变化由客户端解析 Item ID 后去重。
+    compressed = _drop_descendants(unique)
     ordered = sorted(compressed)
     if len(ordered) <= max_targets:
         return RefreshPlan(targets=tuple(ordered), batch_size=max_targets)
@@ -120,24 +121,6 @@ def plan_refresh_targets(
         reason=f"刷新目标较多，将分 {batch_count} 批执行",
         batch_size=max_targets,
     )
-
-
-def _collapse_siblings(paths: list[str], boundary: _Boundary) -> list[str]:
-    """同一父目录下多个目录同时变化时收敛到父目录，减少重复刷新。"""
-    parents: dict[str, set[str]] = {}
-    for path in paths:
-        parent = str(PurePosixPath(path).parent)
-        if parent in {".", "/"} or not boundary.allows(parent):
-            continue
-        parents.setdefault(parent, set()).add(path)
-    collapsed: list[str] = []
-    replaced: set[str] = set()
-    for parent, children in parents.items():
-        if len(children) < 2:
-            continue
-        collapsed.append(parent)
-        replaced.update(children)
-    return [*(item for item in paths if item not in replaced), *collapsed]
 
 
 def _drop_descendants(paths: list[str]) -> list[str]:

@@ -20,11 +20,8 @@ from typing import Optional
 from croniter import croniter
 
 from app import database as db
-from app.clients.emby import EmbyClient
-from app.clients.jellyfin import JellyfinClient
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, log_throttled
-from app.modules.media_server_path_mapping import configured_media_server_refresh_options
 from app.modules.strm import (
     DEFAULT_METADATA_EXTS, DEFAULT_VIDEO_EXTS, STRM_OPERATION_LOCK, STRM_SUBDIR,
     clean_empty_strm_dirs, clean_retired_strm_sources, configured_strm_source_plans,
@@ -1599,7 +1596,7 @@ class STRMScheduler:
                 "generated", "metadata_generated", "cleaned",
                 "metadata_cleaned"
             ))
-            self._set_progress("refresh", 0, 1, "刷新媒体库")
+            self._set_progress("refresh", 0, 1, "提交媒体库刷新")
             refresh_started = monotonic()
             media_refresh = self._refresh_media_servers(
                 emby_enabled=options.get("emby_refresh_override"),
@@ -1609,11 +1606,12 @@ class STRMScheduler:
                 has_changes=has_changes,
                 changed_paths=list(stats.get("changed_strm_paths") or []),
                 changed_dirs=list(stats.get("changed_dirs") or []),
+                immediate=trigger_type in {"manual", "telegram"},
             )
             stats["refresh_elapsed_seconds"] = round(
                 max(0.0, monotonic() - refresh_started), 3
             )
-            self._set_progress("refresh", 1, 1, "刷新媒体库")
+            self._set_progress("refresh", 1, 1, "媒体库刷新已提交")
             self._set_progress("complete", 1, 1, "同步完成")
             elapsed = round((datetime.now() - started).total_seconds(), 1)
             result = {
@@ -1631,7 +1629,7 @@ class STRMScheduler:
                 int(stats.get("failed", 0) or 0)
                 or int(stats.get("metadata_failed", 0) or 0)
                 or stats.get("clean_skipped")
-                or any(value is False for value in media_refresh.values())
+                or any(value in {False, "failed"} for value in media_refresh.values())
             )
             terminal_status = "partial" if partial else "completed"
             db.finish_task_run(
@@ -1773,12 +1771,15 @@ class STRMScheduler:
         }
 
     @staticmethod
-    def _refresh_media_servers(emby_enabled: bool | None = None,
-                               has_changes: bool = True,
-                               changed_paths: list[str] | None = None,
-                               changed_dirs: list[str] | None = None,
-                               media_server_refresh_enabled: bool | None = None) -> dict:
-        """有 STRM 增量时刷新媒体库；整理联动开关同时控制 Jellyfin/Emby。"""
+    def _refresh_media_servers(
+        emby_enabled: bool | None = None,
+        has_changes: bool = True,
+        changed_paths: list[str] | None = None,
+        changed_dirs: list[str] | None = None,
+        media_server_refresh_enabled: bool | None = None,
+        immediate: bool = False,
+    ) -> dict[str, str]:
+        """把本轮 STRM 变化持久加入统一刷新队列。"""
         if not has_changes:
             logger.debug("STRM 本轮无增量变化，跳过媒体库刷新")
             return {}
@@ -1793,13 +1794,10 @@ class STRMScheduler:
         plan = plan_refresh_targets(
             changed_paths or [],
             changed_dirs or [],
-            # STRM_ROOT 是用户挂载根，真正由同步器拥有且可安全收敛的边界是
-            # 光鸭云盘子目录。双层根会允许兄弟媒体库折叠到共同父目录，随后
-            # Jellyfin/Emby 无法匹配任何独立媒体库。
             media_roots=[str(Path(strm_root) / STRM_SUBDIR)] if strm_root else [],
         )
         if plan.reason:
-            logger.info("媒体库精准刷新降级 reason=%s", plan.reason)
+            logger.info("媒体库精准刷新规划 reason=%s", plan.reason)
         if not plan.has_targets:
             logger.info(
                 "本轮变化没有安全的媒体库刷新目标，跳过媒体库刷新 reason=%s",
@@ -1807,46 +1805,19 @@ class STRMScheduler:
             )
             return {}
 
-        def refresh(client) -> bool:
-            # refresh_for_paths 会先枚举媒体库并建立路径映射；在调度层分批会让
-            # 同一大库被重复完整枚举。一次传入全部已收敛目标，由客户端内部
-            # 对最终 Item 请求去重，网络复杂度从 O(批次×库大小) 降为 O(库大小)。
-            outcome = client.refresh_for_paths(list(plan.targets))
-            scope = str(outcome.get("scope") or "unknown")
-            log = logger.warning if scope in {"global", "skipped"} else logger.info
-            log(
-                "%s 刷新结果 scope=%s ok=%s requested=%s mapped=%s "
-                "matched=%s unmatched=%s ambiguous=%s items=%s libraries=%s reason=%s",
-                client.display_name,
-                scope,
-                bool(outcome.get("ok")),
-                int(outcome.get("requested", 0) or 0),
-                int(outcome.get("mapped", 0) or 0),
-                int(outcome.get("matched", 0) or 0),
-                int(outcome.get("unmatched", 0) or 0),
-                int(outcome.get("ambiguous", 0) or 0),
-                len(outcome.get("items") or []),
-                len(outcome.get("libraries") or []),
-                outcome.get("fallback") or "-",
-            )
-            return bool(outcome.get("ok"))
+        from app.modules.media_refresh_coordinator import enqueue_media_refresh_paths
 
-        results: dict[str, bool] = {}
-        if get_bool("JELLYFIN_ENABLED") and get("JELLYFIN_URL") and get("JELLYFIN_API_KEY"):
-            results["Jellyfin"] = refresh(JellyfinClient(
-                get("JELLYFIN_URL"), get("JELLYFIN_API_KEY"),
-                **configured_media_server_refresh_options("jellyfin"),
-            ))
-        allow_emby = True if emby_enabled is None else bool(emby_enabled)
-        if allow_emby and get_bool("EMBY_ENABLED") and get("EMBY_URL") and get("EMBY_TOKEN"):
-            results["Emby"] = refresh(EmbyClient(
-                get("EMBY_URL"), get("EMBY_TOKEN"),
-                **configured_media_server_refresh_options("emby"),
-            ))
-        if any(results.values()):
-            from app.services import clear_dashboard_cache
-
-            clear_dashboard_cache()
+        results = enqueue_media_refresh_paths(
+            list(plan.targets),
+            immediate=bool(immediate),
+            allow_emby=True if emby_enabled is None else bool(emby_enabled),
+        )
+        logger.info(
+            "媒体库刷新已提交统一队列 immediate=%s targets=%s providers=%s",
+            bool(immediate),
+            len(plan.targets),
+            ",".join(f"{name}:{status}" for name, status in results.items()) or "none",
+        )
         return results
 
     @staticmethod
@@ -1866,6 +1837,7 @@ class STRMScheduler:
             int(stats.get("failed", 0) or 0) > 0
             or int(stats.get("metadata_failed", 0) or 0) > 0
             or bool(stats.get("clean_skipped"))
+            or any(value in {False, "failed"} for value in refresh.values())
         )
         names = [str(item.get("name") or item.get("id") or "未命名") for item in sources]
         source_text = f"{len(sources)} 个"
@@ -1873,8 +1845,17 @@ class STRMScheduler:
             source_text += " · " + "、".join(names[:3])
             if len(names) > 3:
                 source_text += f" 等 {len(names)} 个"
+        def refresh_label(value: object) -> str:
+            if value == "queued":
+                return "已排队"
+            if value == "skipped":
+                return "已跳过"
+            if value is True:
+                return "✅"
+            return "❌"
+
         refresh_text = " / ".join(
-            f"{name} {'✅' if ok else '❌'}" for name, ok in refresh.items()
+            f"{name} {refresh_label(status)}" for name, status in refresh.items()
         ) or "未启用或本轮无变化"
         fields = (
             ("触发方式", STRMScheduler._trigger_label(trigger_type)),
@@ -1918,7 +1899,7 @@ class STRMScheduler:
                 f"生成 {float(stats.get('generate_elapsed_seconds', 0) or 0):.1f}s · "
                 f"元数据 {float(stats.get('metadata_elapsed_seconds', 0) or 0):.1f}s · "
                 f"清理 {float(stats.get('cleanup_elapsed_seconds', 0) or 0):.1f}s · "
-                f"刷新 {float(stats.get('refresh_elapsed_seconds', 0) or 0):.1f}s"
+                f"刷新提交 {float(stats.get('refresh_elapsed_seconds', 0) or 0):.1f}s"
             )),
             ("总耗时", f"{elapsed} 秒"),
         )
@@ -1977,7 +1958,7 @@ class STRMScheduler:
                 int(stats.get("failed", 0) or 0)
                 or int(stats.get("metadata_failed", 0) or 0)
                 or stats.get("clean_skipped")
-                or any(value is False for value in refresh.values())
+                or any(value in {False, "failed"} for value in refresh.values())
             )
             event = NotificationEvent(
                 "⚠️ STRM 同步部分完成" if partial else "✅ STRM 同步完成",

@@ -565,13 +565,13 @@ class StrmDetailedNotificationTests(IsolatedDatabaseTestCase):
         event = STRMScheduler._build_success_event(
             stats={
                 "directories": 3, "total": 8, "generated": 2, "skipped": 6,
-                "failed": 1, "metadata_generated": 4, "metadata_skipped": 2,
+                "failed": 0, "metadata_generated": 4, "metadata_skipped": 2,
                 "metadata_failed": 0, "metadata_cleaned": 1, "cleaned": 2,
                 "empty_dirs_cleaned": 1, "scan_elapsed_seconds": 1.2,
                 "metadata_elapsed_seconds": 0.8,
                 "error_samples": ["电影/坏目录：连接超时"],
             },
-            refresh={"Emby": True, "Jellyfin": False},
+            refresh={"Emby": "queued", "Jellyfin": "failed"},
             elapsed=2.4,
             trigger_type="organize",
             sources=[{"id": "source-1", "name": "电影", "stats": {}}],
@@ -583,7 +583,7 @@ class StrmDetailedNotificationTests(IsolatedDatabaseTestCase):
         for text in ("同步来源", "扫描范围", "STRM 变化", "元数据", "清理", "媒体库刷新", "总耗时"):
             self.assertIn(text, rendered)
         self.assertIn("电影/坏目录：连接超时", rendered)
-        self.assertIn("Emby ✅", rendered)
+        self.assertIn("Emby 已排队", rendered)
         self.assertIn("Jellyfin ❌", rendered)
 
 

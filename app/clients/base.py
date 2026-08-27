@@ -10,6 +10,7 @@ import logging
 import math
 import re
 import time
+from pathlib import PurePosixPath
 from typing import Any, Optional
 
 import requests
@@ -33,7 +34,7 @@ _MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY = 64
 
 
 class MediaLibraryEnumerationTooLarge(RuntimeError):
-    """媒体库过大，无法安全枚举到单条 Item；调用方可降级为库级刷新。"""
+    """媒体库过大，无法安全枚举单条 Item；调用方应优先收敛到物理根。"""
 
 
 def runtime_ticks_to_minutes(value: Any) -> int:
@@ -152,6 +153,14 @@ class DashboardData:
     server_product: str = ""
     server_version: str = ""
     partial_errors: list[str] = field(default_factory=list)
+
+
+def _dedupe_texts(values: object) -> list[str]:
+    return list(dict.fromkeys(
+        str(item or "").strip()
+        for item in (values or ())
+        if str(item or "").strip()
+    ))
 
 
 class MediaServerClient:
@@ -621,6 +630,58 @@ class MediaServerClient:
         except Exception:
             return ""
 
+    def _library_root_items_with_paths(
+        self, library_id: str, *, locations: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        """分页查找虚拟媒体库对应的物理根 Folder。
+
+        Jellyfin 多路径媒体库不会把物理根作为直属子项返回，因此必须递归查询
+        Folder 后按虚拟库 Location 精确过滤；找到全部目标根后立即停止。
+        """
+        wanted = {
+            self._media_path_key(item) for item in locations
+            if self._media_path_key(item)
+        }
+        found: dict[str, dict[str, Any]] = {}
+        start_index = 0
+        page_size = 5000
+        cap = 20000
+        while start_index < cap:
+            data = self._request(
+                "/Items",
+                params={
+                    "ParentId": str(library_id),
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Folder",
+                    "Fields": "Path",
+                    "StartIndex": start_index,
+                    "Limit": page_size,
+                },
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("Items"), list):
+                raise RuntimeError("媒体库物理根响应格式异常")
+            rows = data["Items"]
+            if len(rows) > page_size or any(not isinstance(item, dict) for item in rows):
+                raise RuntimeError("媒体库物理根响应无效")
+            for item in rows:
+                item_id = str(item.get("Id") or "").strip()
+                key = self._media_path_key(item.get("Path"))
+                if not item_id or not key:
+                    continue
+                if not wanted or key in wanted:
+                    found[key] = item
+            if wanted and wanted.issubset(found):
+                return list(found.values())
+            try:
+                total = int(data.get("TotalRecordCount") or 0)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError("媒体库物理根总数无效") from exc
+            next_index = start_index + len(rows)
+            if not rows or next_index >= total:
+                return list(found.values())
+            start_index = next_index
+        raise MediaLibraryEnumerationTooLarge("媒体库 Folder 超过物理根定位安全上限")
+
     def _library_items_with_paths(self, library_id: str) -> list[dict[str, Any]]:
         """完整分页列出库内可定位 Item；无法证明完整时失败关闭。"""
         collected: list[dict[str, Any]] = []
@@ -634,7 +695,7 @@ class MediaServerClient:
                     "ParentId": str(library_id),
                     "Recursive": "true",
                     "IncludeItemTypes": "Series,Season,Movie,Folder,BoxSet",
-                    "Fields": "Path",
+                    "Fields": "Path,SeriesId",
                     "StartIndex": start_index,
                     "Limit": _MEDIA_ITEM_PAGE_SIZE,
                 },
@@ -698,27 +759,85 @@ class MediaServerClient:
             f"媒体库条目超过精准刷新安全上限 {_MAX_MEDIA_ITEMS_FOR_PRECISE_REFRESH}"
         )
 
-    def _deepest_item_for_path(
+    @staticmethod
+    def _media_path_parent(path: str) -> str:
+        normalized = str(path or "").rstrip("/")
+        if not normalized:
+            return ""
+        parent = str(PurePosixPath(normalized).parent)
+        return "" if parent in {".", "/"} else parent
+
+    def _preferred_item_for_path(
         self, items: list[dict[str, Any]], target: str,
     ) -> dict[str, Any] | None:
-        """返回覆盖目标路径的最深已存在 Item；避免命中后再次线性扫描。"""
-        best_item: dict[str, Any] | None = None
-        best_length = -1
+        """定位覆盖变化路径的 Item；电视剧统一提升到 Series。
+
+        Jellyfin 的 Movie.Path 通常指向具体 ``.strm``/视频文件，而刷新计划
+        使用其父目录，因此电影额外允许“目标目录包含 Movie 文件”的匹配。
+        """
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        by_id: dict[str, dict[str, Any]] = {}
         for item in items:
+            item_id = str(item.get("Id") or "").strip()
+            if item_id:
+                by_id[item_id] = item
             item_path = self._normalize_media_path(item.get("Path"))
             if not item_path:
                 continue
-            if media_server_path_is_within(target, item_path) and len(item_path) > best_length:
-                best_length = len(item_path)
-                best_item = item
-        return best_item
+            item_type = str(item.get("Type") or "").strip().casefold()
+            covers = media_server_path_is_within(target, item_path)
+            movie_child = bool(
+                item_type == "movie"
+                and self._media_path_key(self._media_path_parent(item_path))
+                == self._media_path_key(target)
+            )
+            if covers or movie_child:
+                candidates.append((len(item_path), item))
+        if not candidates:
+            return None
+
+        def typed_candidates(item_type: str) -> list[tuple[int, dict[str, Any]]]:
+            return [
+                (length, item)
+                for length, item in candidates
+                if str(item.get("Type") or "").strip().casefold() == item_type
+            ]
+
+        # Movie.Path 往往是目标目录下的文件；电影优先于同路径树中的 Folder。
+        movie_candidates = typed_candidates("movie")
+        if movie_candidates:
+            return max(movie_candidates, key=lambda entry: entry[0])[1]
+
+        # 电视剧无论变化落在剧目录还是季目录，都只刷新一次 Series。
+        season_candidates = typed_candidates("season")
+        series_candidates = typed_candidates("series")
+        if season_candidates:
+            _length, season = max(season_candidates, key=lambda entry: entry[0])
+            series_id = str(season.get("SeriesId") or "").strip()
+            linked = by_id.get(series_id)
+            if (
+                linked is not None
+                and str(linked.get("Type") or "").strip().casefold() == "series"
+            ):
+                return linked
+        if series_candidates:
+            return max(series_candidates, key=lambda entry: entry[0])[1]
+        if season_candidates:
+            return max(season_candidates, key=lambda entry: entry[0])[1]
+        return max(candidates, key=lambda entry: entry[0])[1]
 
     def _finish_unlocatable_refresh(
         self, result: dict[str, Any], reason: str, *, allow_global: bool = True,
+        permit_global_fallback: bool = False, retryable: bool = False,
     ) -> dict[str, Any]:
-        """定位失败时默认安全跳过；仅显式允许且未受库约束时才全局扫描。"""
+        """定位失败时默认安全跳过；自动链路绝不隐式全局扫描。"""
         result["fallback"] = reason
-        if allow_global and self.allow_global_refresh_fallback:
+        result["retryable"] = bool(retryable)
+        if (
+            allow_global
+            and permit_global_fallback
+            and self.allow_global_refresh_fallback
+        ):
             logger.warning(
                 "[%s] %s，配置允许回退全局刷新", self.display_name, reason
             )
@@ -740,12 +859,28 @@ class MediaServerClient:
         *,
         allowed_library_ids: tuple[str, ...] = (),
         allow_library_fallback: bool = True,
+        allow_global_fallback: bool | None = None,
+        skip_item_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
-        """按真实变化路径刷新最深父 Item，可约束媒体库并禁止库级降级。"""
+        """按变化路径执行最小范围刷新。
+
+        已存在剧集统一提升到 Series；全新作品优先刷新对应物理根 Folder；
+        只有无法获得物理根 Item 时才退到虚拟媒体库。自动调用方默认禁止全局
+        ``/Library/Refresh``。
+        """
         allowed_ids = {
             str(item or "").strip() for item in allowed_library_ids or ()
             if str(item or "").strip()
         }
+        skipped_ids = {
+            str(item or "").strip() for item in skip_item_ids or ()
+            if str(item or "").strip()
+        }
+        permit_global_fallback = (
+            self.allow_global_refresh_fallback
+            if allow_global_fallback is None
+            else bool(allow_global_fallback)
+        )
         mapping_rows: list[dict[str, Any]] = []
         mapped_targets: list[str] = []
         for raw_path in paths or []:
@@ -772,6 +907,7 @@ class MediaServerClient:
         result: dict[str, Any] = {
             "ok": False,
             "items": [],
+            "folders": [],
             "libraries": [],
             "fallback": "",
             "requested": len(targets),
@@ -783,6 +919,9 @@ class MediaServerClient:
             "scope": "none",
             "endpoints": [],
             "skipped": False,
+            "retryable": False,
+            "deduplicated": 0,
+            "succeeded_target_ids": [],
             "allowed_libraries": sorted(allowed_ids),
         }
         if not targets:
@@ -797,7 +936,11 @@ class MediaServerClient:
         except Exception as exc:
             logger.warning("[%s] 读取媒体库目录失败: %s", self.display_name, exc)
             return self._finish_unlocatable_refresh(
-                result, "媒体库目录读取失败", allow_global=not allowed_ids,
+                result,
+                "媒体库目录读取失败",
+                allow_global=not allowed_ids,
+                permit_global_fallback=permit_global_fallback,
+                retryable=True,
             )
         if allowed_ids:
             folders = [
@@ -805,20 +948,7 @@ class MediaServerClient:
                 if str(folder.get("id") or "").strip() in allowed_ids
             ]
 
-        normalized_locations: list[tuple[str, str]] = []
-        for folder in folders:
-            library_id = str(folder.get("id") or "").strip()
-            if not library_id:
-                continue
-            for raw_location in folder.get("locations", []):
-                location = self._normalize_media_path(raw_location)
-                if not location:
-                    continue
-                normalized_locations.append((library_id, location))
-
-        source_for_target = {
-            row["target"]: row["source"] for row in mapping_rows
-        }
+        source_for_target = {row["target"]: row["source"] for row in mapping_rows}
         library_for_target: dict[str, tuple[str, str]] = {}
         unmatched_targets: list[str] = []
         ambiguous_targets = 0
@@ -828,16 +958,10 @@ class MediaServerClient:
                 library_id = str(folder.get("id") or "").strip()
                 if not library_id:
                     continue
-                locations = [
-                    self._normalize_media_path(item)
-                    for item in folder.get("locations", [])
-                ]
-                for location in locations:
-                    if not location:
-                        continue
-                    if not media_server_path_is_within(target, location):
-                        continue
-                    direct_matches.append((len(location), library_id, location))
+                for raw_location in folder.get("locations", []):
+                    location = self._normalize_media_path(raw_location)
+                    if location and media_server_path_is_within(target, location):
+                        direct_matches.append((len(location), library_id, location))
             if direct_matches:
                 longest = max(length for length, _library_id, _location in direct_matches)
                 winners = {
@@ -848,16 +972,12 @@ class MediaServerClient:
                 if len(winners) == 1:
                     library_for_target[target] = next(iter(winners))
                     continue
-                unmatched_targets.append(source_for_target.get(target, target))
                 ambiguous_targets += 1
-                continue
-
             unmatched_targets.append(source_for_target.get(target, target))
 
         result["matched"] = len(library_for_target)
         result["unmatched"] = len(unmatched_targets)
         result["ambiguous"] = ambiguous_targets
-        result["mapped"] = sum(1 for row in mapping_rows if row["applied"])
         if not library_for_target:
             if ambiguous_targets and ambiguous_targets == len(unmatched_targets):
                 reason = "变化路径匹配多个媒体库，无法唯一定位"
@@ -866,131 +986,258 @@ class MediaServerClient:
             else:
                 reason = "变化路径未匹配任何媒体库"
             if ambiguous_targets:
-                # 歧义不是普通的“未定位”：即使管理员允许未匹配路径回退
-                # 全局扫描，也不能用一次整库刷新掩盖错误路由。
                 result["fallback"] = reason
                 result["scope"] = "skipped"
                 result["skipped"] = True
-                result["ok"] = False
                 logger.warning(
                     "[%s] %s，已安全跳过；歧义目标禁止回退全局刷新",
                     self.display_name, reason,
                 )
                 return result
             return self._finish_unlocatable_refresh(
-                result, reason, allow_global=not allowed_ids,
+                result,
+                reason,
+                allow_global=not allowed_ids,
+                permit_global_fallback=permit_global_fallback,
             )
 
-        items_by_library: dict[str, list[dict[str, Any]]] = {}
-        item_ids: list[str] = []
-        library_fallbacks: list[str] = []
-        failed_item_listings: set[str] = set()
-        oversized_item_listings: set[str] = set()
-        dense_target_libraries: set[str] = set()
         targets_by_library: dict[str, list[tuple[str, str]]] = {}
         for target, (library_id, library_location) in library_for_target.items():
             targets_by_library.setdefault(library_id, []).append(
                 (target, library_location)
             )
 
-        for library_id, library_targets in targets_by_library.items():
-            # 精准刷新适合少量变更；元数据大批落盘时逐目标扫描整个库反而
-            # 比一次库级刷新昂贵。超过固定阈值直接降级，复杂度保持有界。
-            if len(library_targets) > _MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY:
+        item_targets: dict[str, dict[str, Any]] = {}
+        folder_targets: dict[str, dict[str, Any]] = {}
+        library_targets: set[str] = set()
+        failed_item_listings: set[str] = set()
+        oversized_item_listings: set[str] = set()
+        dense_target_libraries: set[str] = set()
+
+        for library_id, library_targets_for_id in targets_by_library.items():
+            if len(library_targets_for_id) > _MAX_PRECISE_REFRESH_TARGETS_PER_LIBRARY:
                 dense_target_libraries.add(library_id)
-                library_fallbacks.append(library_id)
+                try:
+                    root_rows = self._library_root_items_with_paths(
+                        library_id,
+                        locations=tuple(dict.fromkeys(
+                            location for _target, location in library_targets_for_id
+                        )),
+                    )
+                except Exception:
+                    root_rows = []
+                root_items = {
+                    self._media_path_key(item.get("Path")): item
+                    for item in root_rows
+                    if self._media_path_key(item.get("Path"))
+                }
+                for _target, library_location in library_targets_for_id:
+                    root_item = root_items.get(self._media_path_key(library_location))
+                    root_id = str(
+                        root_item.get("Id") if isinstance(root_item, dict) else ""
+                    ).strip()
+                    if root_id:
+                        folder_targets[root_id] = {
+                            "library_id": library_id,
+                            "path": library_location,
+                        }
+                    else:
+                        library_targets.add(library_id)
                 continue
             try:
                 items = self._library_items_with_paths(library_id)
-                items_by_library[library_id] = items
             except MediaLibraryEnumerationTooLarge:
                 logger.info(
-                    "[%s] 媒体库 %s 超过精准枚举上限，降级为库级刷新",
+                    "[%s] 媒体库 %s 超过精准枚举上限，改为定位物理根目录",
                     self.display_name, library_id,
                 )
                 oversized_item_listings.add(library_id)
-                library_fallbacks.append(library_id)
+                try:
+                    root_rows = self._library_root_items_with_paths(
+                        library_id,
+                        locations=tuple(dict.fromkeys(
+                            location for _target, location in library_targets_for_id
+                        )),
+                    )
+                except Exception:
+                    root_rows = []
+                root_items = {
+                    self._media_path_key(item.get("Path")): item
+                    for item in root_rows
+                    if self._media_path_key(item.get("Path"))
+                }
+                for _target, library_location in library_targets_for_id:
+                    root_item = root_items.get(self._media_path_key(library_location))
+                    root_id = str(
+                        root_item.get("Id") if isinstance(root_item, dict) else ""
+                    ).strip()
+                    if root_id:
+                        folder_targets[root_id] = {
+                            "library_id": library_id,
+                            "path": library_location,
+                        }
+                    else:
+                        library_targets.add(library_id)
                 continue
             except Exception as exc:
                 logger.warning(
-                    "[%s] 读取媒体库 %s 条目失败，已安全跳过该库刷新: %s",
+                    "[%s] 读取媒体库 %s 条目失败，将保留刷新请求重试: %s",
                     self.display_name, library_id, exc,
                 )
                 failed_item_listings.add(library_id)
                 continue
 
-            for target, library_location in library_targets:
-                matched_item = self._deepest_item_for_path(items, target)
+            root_items: dict[str, dict[str, Any]] = {}
+            for item in items:
+                if str(item.get("Type") or "").strip().casefold() != "folder":
+                    continue
+                item_path = self._normalize_media_path(item.get("Path"))
+                item_id = str(item.get("Id") or "").strip()
+                if item_path and item_id:
+                    root_items[self._media_path_key(item_path)] = item
+
+            for target, library_location in library_targets_for_id:
+                matched_item = self._preferred_item_for_path(items, target)
                 item_id = str(
                     matched_item.get("Id") if isinstance(matched_item, dict) else ""
                 ).strip()
                 if not item_id:
-                    library_fallbacks.append(library_id)
+                    root_item = root_items.get(self._media_path_key(library_location))
+                    root_id = str(
+                        root_item.get("Id") if isinstance(root_item, dict) else ""
+                    ).strip()
+                    if root_id:
+                        folder_targets[root_id] = {
+                            "library_id": library_id,
+                            "path": library_location,
+                        }
+                    else:
+                        library_targets.add(library_id)
                     continue
                 item_path = self._normalize_media_path(matched_item.get("Path"))
+                item_type = str(matched_item.get("Type") or "").strip().casefold()
                 if (
-                    item_path
+                    item_type == "folder"
                     and self._media_path_key(item_path)
                     == self._media_path_key(library_location)
                 ):
-                    # Jellyfin 可能返回覆盖物理库根的 Folder Item；其刷新范围仍为库级。
-                    library_fallbacks.append(item_id)
+                    folder_targets[item_id] = {
+                        "library_id": library_id,
+                        "path": library_location,
+                    }
                 else:
-                    item_ids.append(item_id)
+                    entry = item_targets.setdefault(item_id, {
+                        "library_id": library_id,
+                        "paths": [],
+                        "type": item_type or "item",
+                    })
+                    entry["paths"] = _dedupe_texts([*entry["paths"], target])
 
-        refreshed = list(dict.fromkeys(item_ids))
-        libraries = [
-            item for item in dict.fromkeys(library_fallbacks) if item not in refreshed
+        # 虚拟库扫描覆盖该库内所有更窄目标；物理根 Folder 扫描覆盖同根下条目。
+        if library_targets:
+            item_targets = {
+                item_id: entry for item_id, entry in item_targets.items()
+                if str(entry.get("library_id") or "") not in library_targets
+            }
+            folder_targets = {
+                item_id: entry for item_id, entry in folder_targets.items()
+                if str(entry.get("library_id") or "") not in library_targets
+            }
+        for folder_id, folder_entry in list(folder_targets.items()):
+            root_path = str(folder_entry.get("path") or "")
+            library_id = str(folder_entry.get("library_id") or "")
+            for item_id, item_entry in list(item_targets.items()):
+                if str(item_entry.get("library_id") or "") != library_id:
+                    continue
+                changed = [str(path) for path in item_entry.get("paths") or []]
+                if changed and all(
+                    media_server_path_is_within(path, root_path) for path in changed
+                ):
+                    item_targets.pop(item_id, None)
+
+        item_ids = list(item_targets)
+        folder_ids = [item for item in folder_targets if item not in item_targets]
+        library_ids = [
+            item for item in sorted(library_targets)
+            if item not in item_targets and item not in folder_targets
         ]
-        if libraries and not allow_library_fallback:
+        broad_ids = [*folder_ids, *library_ids]
+        if broad_ids and not allow_library_fallback:
             result["fallback"] = (
-                f"{len(libraries)} 个目标只能定位到媒体库，严格模式已安全跳过"
+                f"{len(broad_ids)} 个目标只能定位到物理根或媒体库，严格模式已安全跳过"
             )
             result["scope"] = "skipped"
             result["skipped"] = True
-            result["ok"] = False
             return result
-        if not refreshed and not libraries:
+
+        requested_ids = [*item_ids, *folder_ids, *library_ids]
+        deduplicated_ids = [item for item in requested_ids if item in skipped_ids]
+        result["deduplicated"] = len(deduplicated_ids)
+        item_ids = [item for item in item_ids if item not in skipped_ids]
+        folder_ids = [item for item in folder_ids if item not in skipped_ids]
+        library_ids = [item for item in library_ids if item not in skipped_ids]
+
+        if not item_ids and not folder_ids and not library_ids:
             if failed_item_listings:
                 result["fallback"] = (
-                    f"{len(failed_item_listings)} 个媒体库条目读取失败，已安全跳过刷新"
+                    f"{len(failed_item_listings)} 个媒体库条目读取失败，刷新请求将重试"
                 )
                 result["scope"] = "skipped"
                 result["skipped"] = True
-                result["ok"] = False
+                result["retryable"] = True
+                return result
+            if deduplicated_ids:
+                result["fallback"] = f"{len(deduplicated_ids)} 个刷新目标处于去重窗口"
+                result["scope"] = "deduplicated"
+                result["skipped"] = True
+                result["ok"] = not unmatched_targets
                 return result
             return self._finish_unlocatable_refresh(
-                result, "无法定位任何刷新目标", allow_global=not allowed_ids,
+                result,
+                "无法定位任何刷新目标",
+                allow_global=not allowed_ids,
+                permit_global_fallback=permit_global_fallback,
             )
 
-        outcomes = [self.refresh_library(item) for item in (*refreshed, *libraries)]
-        result["items"] = refreshed
-        result["libraries"] = libraries
-        result["endpoints"] = [
-            f"/Items/{item}/Refresh" for item in (*refreshed, *libraries)
-        ]
-        if refreshed and libraries:
+        ordered_ids = [*item_ids, *folder_ids, *library_ids]
+        outcomes: list[bool] = []
+        succeeded_ids: list[str] = []
+        for item_id in ordered_ids:
+            ok = bool(self.refresh_library(item_id))
+            outcomes.append(ok)
+            if ok:
+                succeeded_ids.append(item_id)
+
+        result["items"] = item_ids
+        result["folders"] = folder_ids
+        result["libraries"] = library_ids
+        result["succeeded_target_ids"] = succeeded_ids
+        result["endpoints"] = [f"/Items/{item}/Refresh" for item in ordered_ids]
+        active_scopes = sum(bool(group) for group in (item_ids, folder_ids, library_ids))
+        if active_scopes > 1:
             result["scope"] = "mixed"
-        elif refreshed:
+        elif item_ids:
             result["scope"] = "item"
+        elif folder_ids:
+            result["scope"] = "folder"
         else:
             result["scope"] = "library"
 
         reasons: list[str] = []
-        if libraries:
-            reasons.append("部分目标仅能定位到媒体库，已按媒体库刷新")
+        if folder_ids:
+            reasons.append("新作品已按对应物理根目录扫描")
+        if library_ids:
+            reasons.append("部分目标未找到物理根 Item，已按所属媒体库扫描")
         if oversized_item_listings:
-            reasons.append(
-                f"{len(oversized_item_listings)} 个大库已降级为媒体库刷新"
-            )
+            reasons.append(f"{len(oversized_item_listings)} 个大库已收敛为根目录或媒体库刷新")
         if dense_target_libraries:
             reasons.append(
-                f"{len(dense_target_libraries)} 个多变更媒体库已合并为库级刷新"
+                f"{len(dense_target_libraries)} 个多变更媒体库已合并为根目录扫描"
             )
         if failed_item_listings:
-            reasons.append(
-                f"{len(failed_item_listings)} 个媒体库条目读取失败，已安全跳过"
-            )
+            reasons.append(f"{len(failed_item_listings)} 个媒体库条目读取失败，将重试")
+        if deduplicated_ids:
+            reasons.append(f"{len(deduplicated_ids)} 个目标已在去重窗口内跳过")
         if ambiguous_targets:
             reasons.append(f"{ambiguous_targets} 个变化路径匹配多个媒体库，已安全跳过")
         unmatched_without_ambiguity = len(unmatched_targets) - ambiguous_targets
@@ -998,7 +1245,11 @@ class MediaServerClient:
             reasons.append(
                 f"{unmatched_without_ambiguity} 个变化路径未匹配媒体库，已安全跳过"
             )
+        failed_endpoints = len(outcomes) - len(succeeded_ids)
+        if failed_endpoints:
+            reasons.append(f"{failed_endpoints} 个刷新请求失败，将重试")
         result["fallback"] = "；".join(reasons)
+        result["retryable"] = bool(failed_item_listings or failed_endpoints)
         result["ok"] = (
             bool(outcomes) and all(outcomes)
             and not unmatched_targets and not failed_item_listings

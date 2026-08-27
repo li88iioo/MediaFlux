@@ -410,16 +410,15 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         ), patch(
             "app.modules.scheduler.get",
             side_effect=lambda key, default="": values.get(key, default),
-        ), patch("app.modules.scheduler.JellyfinClient") as jellyfin_cls, patch(
-            "app.services.clear_dashboard_cache"
-        ) as clear_cache:
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths"
+        ) as enqueue:
             result = STRMScheduler._refresh_media_servers(
                 emby_enabled=False, has_changes=True
             )
 
         self.assertEqual(result, {})
-        jellyfin_cls.assert_not_called()
-        clear_cache.assert_not_called()
+        enqueue.assert_not_called()
 
     def test_queue_change_merge_keeps_latest_snapshot_per_file(self):
         merged = _merge_organize_changes(

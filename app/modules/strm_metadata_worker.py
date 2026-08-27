@@ -345,21 +345,21 @@ class STRMMetadataWorker:
             return
         self._last_refresh_at = now_mono
         try:
-            from app.modules.scheduler import STRMScheduler
-
-            results = STRMScheduler._refresh_media_servers(
-                has_changes=True,
-                changed_paths=paths,
-                changed_dirs=[],
+            from app.modules.media_refresh_coordinator import (
+                enqueue_media_refresh_paths,
             )
+
+            results = enqueue_media_refresh_paths(paths, immediate=bool(force))
         except Exception:
             self._refresh_retry_pending = True
-            logger.exception("STRM 元数据落盘后的媒体库刷新失败，将保留变更稍后重试")
+            logger.exception("STRM 元数据落盘后的媒体库刷新入队失败，将保留变更稍后重试")
             return
-        if results and not all(bool(value) for value in results.values()):
+        if any(value == "failed" for value in results.values()):
             self._refresh_retry_pending = True
-            logger.warning("STRM 元数据已落盘，但媒体库刷新未全部成功，将稍后重试")
+            logger.warning("STRM 元数据已落盘，但媒体库刷新未全部入队，将稍后重试")
             return
+        # 统一刷新队列已持久接管这些路径；后续媒体服务器失败只重试刷新，
+        # 不再让元数据 worker 重复提交同一变化。
         db.acknowledge_strm_metadata_refresh_paths(durable_paths)
         self._changed_paths = [path for path in self._changed_paths if path not in paths]
         self._refresh_retry_pending = False

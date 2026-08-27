@@ -708,51 +708,19 @@ class LocalMediaService:
             "_retained_paths": [str(path) for path in sorted(retained_sample_paths)],
         }
 
-
     @staticmethod
     def _refresh_paths(paths: set[str]) -> list[str]:
-        """兼容未绑定目标：逐服务器、逐路径隔离失败，避免一处异常中断整批刷新。"""
-        warnings: list[str] = []
-        providers: list[tuple[str, Any]] = []
-        if get_bool("JELLYFIN_ENABLED"):
-            try:
-                from app.clients.jellyfin import JellyfinClient
-                providers.append((
-                    "Jellyfin",
-                    JellyfinClient(
-                        get("JELLYFIN_URL"),
-                        get("JELLYFIN_API_KEY"),
-                        **configured_media_server_refresh_options("jellyfin"),
-                    ),
-                ))
-            except Exception as exc:
-                warnings.append(f"Jellyfin 客户端初始化失败: {exc}")
-        if get_bool("EMBY_ENABLED"):
-            try:
-                from app.clients.emby import EmbyClient
-                providers.append((
-                    "Emby",
-                    EmbyClient(
-                        get("EMBY_URL"),
-                        get("EMBY_TOKEN"),
-                        **configured_media_server_refresh_options("emby"),
-                    ),
-                ))
-            except Exception as exc:
-                warnings.append(f"Emby 客户端初始化失败: {exc}")
+        """未绑定目标也只持久入队；实际刷新由统一合并器执行。"""
+        from app.modules.media_refresh_coordinator import enqueue_media_refresh_paths
 
-        for label, client in providers:
-            try:
-                refresher = getattr(client, "refresh_for_paths", None)
-                if not callable(refresher):
-                    warnings.append(f"{label} 不支持安全的批量路径刷新，已跳过")
-                    continue
-                outcome = refresher(sorted(paths))
-                if not outcome.get("ok"):
-                    reason = str(outcome.get("fallback") or "刷新请求失败")
-                    warnings.append(f"{label} 刷新未完成: {reason}")
-            except Exception as exc:
-                warnings.append(f"{label} 刷新失败: {exc}")
+        try:
+            results = enqueue_media_refresh_paths(sorted(paths))
+        except Exception as exc:
+            return [f"媒体库刷新入队失败: {exc}"]
+        warnings: list[str] = []
+        for label, status in results.items():
+            if status == "failed":
+                warnings.append(f"{label} 刷新入队失败")
         return warnings
 
     @staticmethod
@@ -867,21 +835,27 @@ class LocalMediaService:
                     selected = matches[0]
 
                 resolved_id = str(selected.get("id") or "").strip()
-                refresher = getattr(client, "refresh_for_paths", None)
-                if not callable(refresher):
-                    warnings.append(f"{profile.label} 不支持安全的路径刷新，已跳过: {label}")
-                    continue
-                outcome = refresher(
-                    sorted(paths), allowed_library_ids=(resolved_id,),
+                from app.modules.media_refresh_coordinator import (
+                    enqueue_media_refresh_paths,
                 )
-                if not isinstance(outcome, dict) or not outcome.get("ok"):
-                    reason = (
-                        str(outcome.get("fallback") or "刷新请求失败")
-                        if isinstance(outcome, dict) else "刷新响应格式异常"
-                    )
-                    warnings.append(f"{profile.label} 刷新未完成 {label}: {reason}")
+
+                queued = enqueue_media_refresh_paths(
+                    sorted(paths),
+                    providers=(provider,),
+                    allowed_library_ids=(resolved_id,),
+                )
+                queue_label = "Jellyfin" if provider == "jellyfin" else "Emby"
+                if queued.get(queue_label) != "queued":
+                    warnings.append(f"{profile.label} 刷新入队失败 {label}")
             except Exception as exc:
                 warnings.append(f"{profile.label} 刷新失败 {label}: {exc}")
+        for client in clients.values():
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         return warnings
 
     def execute_task(self, owner: str, task_id: int, *, qb_client=None) -> dict[str, Any]:
@@ -990,7 +964,7 @@ class LocalMediaService:
             if rules.emby_refresh:
                 refresh_warnings = self._refresh_plans(executable_plans)
                 warnings.extend(refresh_warnings)
-                media_refresh_status = "failed" if refresh_warnings else "completed"
+                media_refresh_status = "failed" if refresh_warnings else "queued"
             final_status = (
                 "requires_manual" if result.status == "requires_manual" else "completed"
             )

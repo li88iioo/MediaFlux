@@ -10,6 +10,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
+from app.clients.base import MediaLibraryEnumerationTooLarge
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.modules.media_refresh import MAX_REFRESH_TARGETS, plan_refresh_targets
@@ -42,7 +43,7 @@ class RefreshTargetPlanningTests(unittest.TestCase):
             f"{ROOT}/电影/作品 B", f"{ROOT}/剧集/作品 A/Season 01",
         ]))
 
-    def test_sibling_seasons_collapse_to_the_show_directory(self):
+    def test_sibling_seasons_remain_precise_until_item_id_dedupe(self):
         plan = plan_refresh_targets(
             [
                 f"{ROOT}/剧集/作品 A/Season 01/E01.strm",
@@ -51,7 +52,24 @@ class RefreshTargetPlanningTests(unittest.TestCase):
             media_roots=[ROOT],
         )
 
-        self.assertEqual(plan.targets, (f"{ROOT}/剧集/作品 A",))
+        self.assertEqual(plan.targets, (
+            f"{ROOT}/剧集/作品 A/Season 01",
+            f"{ROOT}/剧集/作品 A/Season 02",
+        ))
+
+    def test_sibling_movies_never_collapse_to_library_root(self):
+        plan = plan_refresh_targets(
+            [
+                f"{ROOT}/电影/作品 A/A.strm",
+                f"{ROOT}/电影/作品 B/B.strm",
+            ],
+            media_roots=[ROOT],
+        )
+
+        self.assertEqual(plan.targets, (
+            f"{ROOT}/电影/作品 A",
+            f"{ROOT}/电影/作品 B",
+        ))
 
     def test_descendants_of_a_selected_ancestor_are_dropped(self):
         plan = plan_refresh_targets(
@@ -117,6 +135,7 @@ class _RefreshRecorder:
         self.refresh_all_calls = 0
         client.list_virtual_folders = lambda: self.folders
         client._library_items_with_paths = self._library_items
+        client._library_root_items_with_paths = self._library_roots
         client.refresh_library = self._refresh_library
         client.refresh_all = self._refresh_all
 
@@ -124,6 +143,19 @@ class _RefreshRecorder:
         if self.items_error:
             raise RuntimeError("接口失败")
         return self.items.get(str(library_id), [])
+
+    def _library_roots(
+        self, library_id: str, *, locations: tuple[str, ...] = (),
+    ) -> list[dict]:
+        wanted = {self.client._media_path_key(item) for item in locations}
+        return [
+            item for item in self.items.get(str(library_id), [])
+            if str(item.get("Type") or "").casefold() == "folder"
+            and (
+                not wanted
+                or self.client._media_path_key(item.get("Path")) in wanted
+            )
+        ]
 
     def _refresh_library(self, library_id: str) -> bool:
         self.refreshed.append(str(library_id))
@@ -281,6 +313,118 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["fallback"], "")
                 self.assertEqual(result["scope"], "item")
                 self.assertEqual(result["endpoints"], ["/Items/season-a1/Refresh"])
+
+    def test_existing_season_is_promoted_to_series_refresh(self):
+        items = {"lib-tv": [
+            {"Id": "root-tv", "Type": "Folder", "Path": f"{ROOT}/剧集"},
+            {"Id": "series-a", "Type": "Series", "Path": f"{ROOT}/剧集/作品 A"},
+            {
+                "Id": "season-a1", "Type": "Season", "SeriesId": "series-a",
+                "Path": f"{ROOT}/剧集/作品 A/Season 01",
+            },
+        ]}
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), items)
+
+                result = client.refresh_for_paths([
+                    f"{ROOT}/剧集/作品 A/Season 01",
+                ])
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(recorder.refreshed, ["series-a"])
+                self.assertEqual(result["items"], ["series-a"])
+
+    def test_existing_series_wins_over_folder_at_same_season_path(self):
+        items = {"lib-tv": [
+            {"Id": "root-tv", "Type": "Folder", "Path": f"{ROOT}/剧集"},
+            {"Id": "series-a", "Type": "Series", "Path": f"{ROOT}/剧集/作品 A"},
+            {
+                "Id": "season-folder", "Type": "Folder",
+                "Path": f"{ROOT}/剧集/作品 A/Season 01",
+            },
+        ]}
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), items)
+
+                result = client.refresh_for_paths([
+                    f"{ROOT}/剧集/作品 A/Season 01",
+                ])
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(recorder.refreshed, ["series-a"])
+
+    def test_new_show_root_scan_suppresses_existing_series_in_same_root(self):
+        items = {"lib-tv": [
+            {"Id": "root-tv", "Type": "Folder", "Path": f"{ROOT}/剧集"},
+            {"Id": "series-a", "Type": "Series", "Path": f"{ROOT}/剧集/作品 A"},
+            {
+                "Id": "season-a1", "Type": "Season", "SeriesId": "series-a",
+                "Path": f"{ROOT}/剧集/作品 A/Season 01",
+            },
+        ]}
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), items)
+
+                result = client.refresh_for_paths([
+                    f"{ROOT}/剧集/作品 A/Season 01",
+                    f"{ROOT}/剧集/全新作品/Season 01",
+                ])
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(recorder.refreshed, ["root-tv"])
+                self.assertEqual(result["items"], [])
+                self.assertEqual(result["folders"], ["root-tv"])
+                self.assertEqual(result["scope"], "folder")
+
+    def test_existing_movie_file_is_matched_from_changed_parent_directory(self):
+        items = {"lib-movie": [
+            {"Id": "root-movies", "Type": "Folder", "Path": f"{ROOT}/电影"},
+            {
+                "Id": "movie-a", "Type": "Movie",
+                "Path": f"{ROOT}/电影/作品 A/作品 A.strm",
+            },
+        ]}
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), items)
+
+                result = client.refresh_for_paths([f"{ROOT}/电影/作品 A"])
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(recorder.refreshed, ["movie-a"])
+                self.assertEqual(result["scope"], "item")
+
+    def test_automatic_caller_can_forbid_configured_global_fallback(self):
+        client = JellyfinClient(
+            "http://jf", "token", allow_global_refresh_fallback=True,
+        )
+        recorder = _RefreshRecorder(client, _folders(), _items())
+
+        result = client.refresh_for_paths(
+            ["/outside/library"], allow_global_fallback=False,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["scope"], "skipped")
+        self.assertEqual(recorder.refresh_all_calls, 0)
+
+    def test_recent_target_id_is_resolved_but_not_refreshed_again(self):
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), _items())
+
+                result = client.refresh_for_paths(
+                    [f"{ROOT}/剧集/作品 A/Season 01"],
+                    skip_item_ids=("season-a1",),
+                )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["scope"], "deduplicated")
+                self.assertEqual(result["deduplicated"], 1)
+                self.assertEqual(recorder.refreshed, [])
 
     def test_same_item_is_refreshed_once_per_round(self):
         for label, client in self._clients():
@@ -440,6 +584,26 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["scope"], "library")
                 self.assertEqual(recorder.refreshed, ["lib-tv"])
                 self.assertEqual(recorder.refresh_all_calls, 0)
+
+    def test_oversized_library_prefers_physical_root_over_virtual_library(self):
+        items = {"lib-tv": [{
+            "Id": "root-tv", "Type": "Folder", "Path": f"{ROOT}/剧集",
+        }]}
+        for label, client in self._clients():
+            with self.subTest(server=label):
+                recorder = _RefreshRecorder(client, _folders(), items)
+                client._library_items_with_paths = Mock(
+                    side_effect=MediaLibraryEnumerationTooLarge("too large")
+                )
+
+                result = client.refresh_for_paths([
+                    f"{ROOT}/剧集/全新作品/Season 01",
+                ])
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["scope"], "folder")
+                self.assertEqual(recorder.refreshed, ["root-tv"])
+                self.assertEqual(result["libraries"], [])
 
     def test_paths_outside_every_library_are_safely_skipped(self):
         for label, client in self._clients():
@@ -710,7 +874,7 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertEqual(result["matched"], 1)
                 self.assertEqual(result["unmatched"], 1)
 
-    def test_library_root_folder_is_reported_as_library_scope(self):
+    def test_library_root_folder_is_reported_as_folder_scope(self):
         items = {"lib-movie": [{
             "Id": "physical-root", "Type": "Folder",
             "Path": f"{ROOT}/电影",
@@ -724,8 +888,9 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(recorder.refreshed, ["physical-root"])
                 self.assertEqual(result["items"], [])
-                self.assertEqual(result["libraries"], ["physical-root"])
-                self.assertEqual(result["scope"], "library")
+                self.assertEqual(result["folders"], ["physical-root"])
+                self.assertEqual(result["libraries"], [])
+                self.assertEqual(result["scope"], "folder")
 
     def test_empty_path_list_is_a_safe_noop(self):
         for label, client in self._clients():
@@ -745,79 +910,81 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 
 
 class SchedulerRefreshWiringTests(unittest.TestCase):
-    """调度器把本轮真实变化路径交给精准刷新。"""
+    """调度器只规划变化路径并提交统一持久刷新队列。"""
 
-    def test_changed_paths_drive_precise_refresh(self):
+    @staticmethod
+    def _settings():
+        return {"STRM_ROOT": "/data/strm"}
+
+    def test_changed_paths_are_queued_after_precise_planning(self):
         from app.modules.scheduler import STRMScheduler
 
-        calls: list[list[str]] = []
-
-        class _Client:
-            display_name = "Jellyfin"
-
-            def refresh_for_paths(self, paths):
-                calls.append(list(paths))
-                return {"ok": True, "items": ["season-a1"], "libraries": [], "fallback": ""}
-
-            def refresh_for_path(self, _path):
-                raise AssertionError("有可定位目标时不得退回媒体库级刷新")
-
-        settings = {
-            "JELLYFIN_ENABLED": True, "EMBY_ENABLED": False,
-            "JELLYFIN_URL": "http://jf", "JELLYFIN_API_KEY": "token",
-            "STRM_ROOT": "/data/strm",
-        }
-        with patch("app.modules.scheduler.get", side_effect=lambda key, default="": settings.get(key, default)), \
-                patch("app.modules.scheduler.get_bool", side_effect=lambda key, default=False: bool(settings.get(key, default))), \
-                patch("app.modules.scheduler.JellyfinClient", return_value=_Client()), \
-                patch("app.services.clear_dashboard_cache"):
+        settings = self._settings()
+        with patch(
+            "app.modules.scheduler.get",
+            side_effect=lambda key, default="": settings.get(key, default),
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "queued"},
+        ) as enqueue:
             results = STRMScheduler._refresh_media_servers(
                 has_changes=True,
                 changed_paths=[f"{ROOT}/剧集/作品 A/Season 01/E01.strm"],
                 changed_dirs=[],
             )
 
-        self.assertEqual(results, {"Jellyfin": True})
-        self.assertEqual(calls, [[f"{ROOT}/剧集/作品 A/Season 01"]])
+        self.assertEqual(results, {"Jellyfin": "queued"})
+        enqueue.assert_called_once_with(
+            [f"{ROOT}/剧集/作品 A/Season 01"],
+            immediate=False,
+            allow_emby=True,
+        )
+
+    def test_manual_refresh_is_queued_without_quiet_window(self):
+        from app.modules.scheduler import STRMScheduler
+
+        settings = self._settings()
+        with patch(
+            "app.modules.scheduler.get",
+            side_effect=lambda key, default="": settings.get(key, default),
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "queued"},
+        ) as enqueue:
+            STRMScheduler._refresh_media_servers(
+                has_changes=True,
+                changed_dirs=[f"{ROOT}/剧集/作品 A"],
+                immediate=True,
+            )
+
+        self.assertTrue(enqueue.call_args.kwargs["immediate"])
 
     def test_legacy_emby_override_only_disables_emby(self):
         from app.modules.scheduler import STRMScheduler
 
-        jellyfin = unittest.mock.Mock()
-        jellyfin.display_name = "Jellyfin"
-        jellyfin.refresh_for_paths.return_value = {
-            "ok": True, "items": ["season"], "libraries": [], "fallback": "",
-            "scope": "item", "requested": 1, "mapped": 0, "matched": 1,
-            "unmatched": 0,
-        }
-        emby = unittest.mock.Mock()
-        settings = {
-            "JELLYFIN_ENABLED": True, "EMBY_ENABLED": True,
-            "JELLYFIN_URL": "http://jf", "JELLYFIN_API_KEY": "token",
-            "EMBY_URL": "http://emby", "EMBY_TOKEN": "token",
-            "STRM_ROOT": "/data/strm",
-        }
-        with patch("app.modules.scheduler.get", side_effect=lambda key, default="": settings.get(key, default)), \
-                patch("app.modules.scheduler.get_bool", side_effect=lambda key, default=False: bool(settings.get(key, default))), \
-                patch("app.modules.scheduler.JellyfinClient", return_value=jellyfin), \
-                patch("app.modules.scheduler.EmbyClient", return_value=emby), \
-                patch("app.services.clear_dashboard_cache"):
-            result = STRMScheduler._refresh_media_servers(
+        settings = self._settings()
+        with patch(
+            "app.modules.scheduler.get",
+            side_effect=lambda key, default="": settings.get(key, default),
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "queued"},
+        ) as enqueue:
+            results = STRMScheduler._refresh_media_servers(
                 emby_enabled=False,
                 has_changes=True,
-                changed_paths=[f"{ROOT}/剧集/作品 A/Season 01/E01.strm"],
+                changed_dirs=[f"{ROOT}/剧集/作品 A"],
             )
 
-        self.assertEqual(result, {"Jellyfin": True})
-        jellyfin.refresh_for_paths.assert_called_once()
-        emby.refresh_for_paths.assert_not_called()
+        self.assertEqual(results, {"Jellyfin": "queued"})
+        self.assertFalse(enqueue.call_args.kwargs["allow_emby"])
 
-    def test_unified_refresh_override_disables_both_servers(self):
+    def test_unified_refresh_override_disables_queueing(self):
         from app.modules.scheduler import STRMScheduler
 
-        with patch("app.modules.scheduler.JellyfinClient") as jellyfin, patch(
-            "app.modules.scheduler.EmbyClient"
-        ) as emby:
+        with patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+        ) as enqueue:
             result = STRMScheduler._refresh_media_servers(
                 media_server_refresh_enabled=False,
                 has_changes=True,
@@ -825,113 +992,69 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             )
 
         self.assertEqual(result, {})
-        jellyfin.assert_not_called()
-        emby.assert_not_called()
+        enqueue.assert_not_called()
 
-    def test_no_locatable_target_skips_refresh_instead_of_refreshing_everything(self):
+    def test_no_locatable_target_skips_queueing(self):
         from app.modules.scheduler import STRMScheduler
 
-        used: list[str] = []
-
-        class _Client:
-            display_name = "Jellyfin"
-
-            def refresh_for_paths(self, _paths):
-                raise AssertionError("没有可定位目标时不得调用精准刷新")
-
-            def refresh_for_path(self, path):
-                used.append(str(path))
-                raise AssertionError("没有安全目标时不得退回根目录刷新")
-
-        settings = {
-            "JELLYFIN_ENABLED": True, "EMBY_ENABLED": False,
-            "JELLYFIN_URL": "http://jf", "JELLYFIN_API_KEY": "token",
-            "STRM_ROOT": "/data/strm",
-        }
-        with patch("app.modules.scheduler.get", side_effect=lambda key, default="": settings.get(key, default)), \
-                patch("app.modules.scheduler.get_bool", side_effect=lambda key, default=False: bool(settings.get(key, default))), \
-                patch("app.modules.scheduler.JellyfinClient", return_value=_Client()), \
-                patch("app.services.clear_dashboard_cache"):
+        settings = self._settings()
+        with patch(
+            "app.modules.scheduler.get",
+            side_effect=lambda key, default="": settings.get(key, default),
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+        ) as enqueue:
             results = STRMScheduler._refresh_media_servers(
                 has_changes=True, changed_paths=[], changed_dirs=[],
             )
 
         self.assertEqual(results, {})
-        self.assertEqual(used, [])
+        enqueue.assert_not_called()
 
-    def test_many_targets_share_one_media_library_enumeration(self):
+    def test_many_targets_are_submitted_in_one_queue_operation(self):
         from app.modules.scheduler import STRMScheduler
 
-        calls: list[list[str]] = []
-
-        class _Client:
-            display_name = "Jellyfin"
-
-            def refresh_for_paths(self, paths):
-                calls.append(list(paths))
-                return {"ok": True, "items": [], "libraries": [], "fallback": ""}
-
-        settings = {
-            "JELLYFIN_ENABLED": True, "EMBY_ENABLED": False,
-            "JELLYFIN_URL": "http://jf", "JELLYFIN_API_KEY": "token",
-            "STRM_ROOT": "/data/strm",
-        }
+        settings = self._settings()
         changed_dirs = [
             f"{ROOT}/剧集/作品 {index}/Season 01"
             for index in range(MAX_REFRESH_TARGETS + 5)
         ]
-        with patch("app.modules.scheduler.get", side_effect=lambda key, default="": settings.get(key, default)), \
-                patch("app.modules.scheduler.get_bool", side_effect=lambda key, default=False: bool(settings.get(key, default))), \
-                patch("app.modules.scheduler.JellyfinClient", return_value=_Client()), \
-                patch("app.services.clear_dashboard_cache"):
+        with patch(
+            "app.modules.scheduler.get",
+            side_effect=lambda key, default="": settings.get(key, default),
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "queued"},
+        ) as enqueue:
             results = STRMScheduler._refresh_media_servers(
                 has_changes=True, changed_paths=[], changed_dirs=changed_dirs,
             )
 
-        self.assertEqual(results, {"Jellyfin": True})
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(sorted(calls[0]), sorted(changed_dirs))
+        self.assertEqual(results, {"Jellyfin": "queued"})
+        self.assertEqual(enqueue.call_count, 1)
+        self.assertEqual(sorted(enqueue.call_args.args[0]), sorted(changed_dirs))
 
-    def test_refresh_failure_is_reported(self):
+    def test_queue_failure_is_reported(self):
         from app.modules.scheduler import STRMScheduler
 
-        calls = 0
-
-        class _Client:
-            display_name = "Jellyfin"
-
-            def refresh_for_paths(self, _paths):
-                nonlocal calls
-                calls += 1
-                return {"ok": False, "items": [], "libraries": [], "fallback": ""}
-
-        settings = {
-            "JELLYFIN_ENABLED": True, "EMBY_ENABLED": False,
-            "JELLYFIN_URL": "http://jf", "JELLYFIN_API_KEY": "token",
-            "STRM_ROOT": "/data/strm",
-        }
-        changed_dirs = [
-            f"{ROOT}/剧集/作品 {index}/Season 01"
-            for index in range(MAX_REFRESH_TARGETS + 1)
-        ]
-        with patch("app.modules.scheduler.get", side_effect=lambda key, default="": settings.get(key, default)), \
-                patch("app.modules.scheduler.get_bool", side_effect=lambda key, default=False: bool(settings.get(key, default))), \
-                patch("app.modules.scheduler.JellyfinClient", return_value=_Client()), \
-                patch("app.services.clear_dashboard_cache"):
+        settings = self._settings()
+        with patch(
+            "app.modules.scheduler.get",
+            side_effect=lambda key, default="": settings.get(key, default),
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            return_value={"Jellyfin": "failed"},
+        ):
             results = STRMScheduler._refresh_media_servers(
-                has_changes=True, changed_paths=[], changed_dirs=changed_dirs,
+                has_changes=True, changed_dirs=[f"{ROOT}/剧集/作品 A"],
             )
 
-        self.assertEqual(calls, 1)
-        self.assertEqual(results, {"Jellyfin": False})
-        self.assertEqual(results, {"Jellyfin": False})
+        self.assertEqual(results, {"Jellyfin": "failed"})
 
     def test_no_changes_skips_refresh_entirely(self):
         from app.modules.scheduler import STRMScheduler
 
-        self.assertEqual(
-            STRMScheduler._refresh_media_servers(has_changes=False), {}
-        )
+        self.assertEqual(STRMScheduler._refresh_media_servers(has_changes=False), {})
 
 
 if __name__ == "__main__":
