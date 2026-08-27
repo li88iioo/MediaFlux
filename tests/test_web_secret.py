@@ -111,7 +111,7 @@ class WebSecretTests(unittest.TestCase):
 
         self.assertTrue(self.config._read_env_file(self.paths.env_file)["WEB_SECRET_KEY"])
 
-    def test_existing_production_install_without_secret_fails_closed(self):
+    def test_existing_production_install_without_secret_generates_and_persists_one(self):
         self.paths.config_dir.mkdir(parents=True)
         self.paths.env_file.write_text(
             "MEDIAFLUX_INITIALIZED=1\n"
@@ -122,8 +122,10 @@ class WebSecretTests(unittest.TestCase):
         self._reload_modules()
         from app.main import create_app
 
-        with self.assertRaisesRegex(RuntimeError, "WEB_SECRET_KEY"):
-            create_app()
+        create_app()
+
+        values = self.config._read_env_file(self.paths.env_file)
+        self.assertGreaterEqual(len(values["WEB_SECRET_KEY"]), 32)
 
     def test_external_secret_is_used_for_session_and_discovery_signing(self):
         os.environ["WEB_SECRET_KEY"] = "external-secret"

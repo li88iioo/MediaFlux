@@ -19,7 +19,7 @@ Thumbs.db
 db/
 .env
 .env.*
-!.env.example
+!.env.development.example
 *.log
 *.db
 *.db-wal

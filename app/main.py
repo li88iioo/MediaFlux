@@ -256,7 +256,7 @@ def _secret_key() -> str:
         raise RuntimeError("生产模式禁止使用默认 Web 密码")
     if not configured_secret:
         config.set_and_save({"WEB_SECRET_KEY": secret_key})
-        logger.warning("开发模式旧安装未配置 WEB_SECRET_KEY，已原子持久化新的会话密钥")
+        logger.info("安装未配置 WEB_SECRET_KEY，已自动生成并持久化会话密钥")
     return secret_key
 
 

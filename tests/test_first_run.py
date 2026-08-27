@@ -40,6 +40,8 @@ class FirstRunTests(unittest.TestCase):
                 "MEDIAFLUX_TEST_DB_PATH",
                 "WEB_SECRET_KEY",
                 "APP_ENV",
+                "MEDIAFLUX_CONTAINER",
+                "MEDIAFLUX_ALLOW_REMOTE_SETUP",
             )
         }
         for key in self.environment:
@@ -161,6 +163,22 @@ class FirstRunTests(unittest.TestCase):
                 os.environ.pop("ENV_WEB_PASSWORD", None)
                 self.paths.env_file.unlink(missing_ok=True)
                 self.paths.database_path.unlink(missing_ok=True)
+
+    def test_remote_first_run_binding_requires_explicit_opt_in(self):
+        self._reload_runtime_modules()
+
+        with self.assertRaises(self.first_run.UnsafeFirstRunBindingError):
+            self.first_run.resolve_bind_host("0.0.0.0")
+
+        os.environ["MEDIAFLUX_ALLOW_REMOTE_SETUP"] = "1"
+        self.assertEqual(self.first_run.resolve_bind_host("0.0.0.0"), "0.0.0.0")
+
+    def test_official_container_defaults_fresh_setup_to_all_interfaces(self):
+        os.environ["MEDIAFLUX_CONTAINER"] = "1"
+        self._reload_runtime_modules()
+
+        self.assertEqual(self.first_run.resolve_bind_host(None), "0.0.0.0")
+        self.assertEqual(self.first_run.resolve_bind_host("0.0.0.0"), "0.0.0.0")
 
     def test_only_explicitly_initialized_credentials_skip_setup(self):
         self.paths.config_dir.mkdir(parents=True, exist_ok=True)

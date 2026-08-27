@@ -112,7 +112,7 @@ services:
       # 媒体反代实例示例端口；必须与页面中的实例监听端口一致
       - "0.0.0.0:18096:18096"
     volumes:
-      - ./mediaflux-data:/app/db
+      - ./data:/app/db
       - /mnt/media/strm-data:/data/strm
 
   jellyfin:

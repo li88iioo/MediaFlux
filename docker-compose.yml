@@ -1,38 +1,22 @@
 services:
   mediaflux:
-    image: "${MEDIAFLUX_IMAGE:-ghcr.io/li88iioo/mediaflux:latest}"
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: "ghcr.io/li88iioo/mediaflux:latest"
     container_name: mediaflux
     restart: unless-stopped
     stop_grace_period: 60s
-    ports:
-      - "${MEDIAFLUX_PUBLISH_HOST:-127.0.0.1}:${WEB_PORT:-1258}:1258"
-    environment:
-      APP_ENV: "production"
-      WEB_HOST: "0.0.0.0"
-      WEB_PORT: "1258"
-      WEB_DEBUG: "0"
-      MEDIAFLUX_INITIALIZED: "1"
-      WEB_SECRET_KEY: "${WEB_SECRET_KEY:?set WEB_SECRET_KEY in .env}"
-      ENV_WEB_PASSPORT: "${ENV_WEB_PASSPORT:?set ENV_WEB_PASSPORT in .env}"
-      ENV_WEB_PASSWORD: "${ENV_WEB_PASSWORD:?set ENV_WEB_PASSWORD in .env}"
-      SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-0}"
-      AGENT_METRICS_SCRAPE_KEY: "${AGENT_METRICS_SCRAPE_KEY:-}"
-      LOCAL_MEDIA_BROWSE_ROOTS: "${LOCAL_MEDIA_BROWSE_ROOTS:-/media/downloads,/media/library}"
+
+    # host 模式会直接开放 Web 1258 和页面中配置的媒体反代端口。
+    network_mode: host
+
+    # 如需桥接端口：删除 network_mode，并取消下面注释。
+    # ports:
+    #   - "0.0.0.0:111:1258"
+    #   - "0.0.0.0:222:18096"
+    # 第二条右侧端口必须与页面中的媒体反代监听端口一致。
+
     volumes:
-      - ./db:/app/db
-      - ${STRM_HOST_PATH:-./strm-data}:/data/strm
-      - ${MEDIA_DOWNLOADS_HOST_PATH:-./media-downloads}:/media/downloads
-      - ${MEDIA_LIBRARY_HOST_PATH:-./media-library}:/media/library
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1258/readyz', timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      start_period: 20s
-      retries: 3
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+      - "./data:/app/db"
+      - "./strm:/data/strm"
+      # 按宿主机实际目录修改下面两行左侧路径。
+      - "./downloads:/media/downloads"
+      - "./library:/media/library"

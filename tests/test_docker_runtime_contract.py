@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from pathlib import Path
 
 import yaml
+from dotenv import dotenv_values
 
 from app.runtime_paths import RuntimePaths
 
@@ -20,7 +22,22 @@ class DockerRuntimeContractTests(unittest.TestCase):
         cls.dockerfile = (cls.ROOT / "Dockerfile").read_text(encoding="utf-8")
         cls.compose_text = (cls.ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         cls.compose = yaml.safe_load(cls.compose_text)
-        cls.env_example = (cls.ROOT / ".env.example").read_text(encoding="utf-8")
+        cls.dev_compose = yaml.safe_load(
+            (cls.ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8")
+        )
+        cls.dev_env_example = (
+            cls.ROOT / ".env.development.example"
+        ).read_text(encoding="utf-8")
+        cls.development_env = {
+            key: value
+            for key, value in dotenv_values(
+                cls.ROOT / ".env.development.example"
+            ).items()
+            if value is not None
+        }
+        cls.entrypoint = (
+            cls.ROOT / "packaging" / "scripts" / "docker-entrypoint.sh"
+        ).read_text(encoding="utf-8")
         cls.dockerignore = (cls.ROOT / ".dockerignore").read_text(encoding="utf-8")
         cls.workflow = (
             cls.ROOT / ".github" / "workflows" / "docker.yml"
@@ -96,135 +113,85 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertIn("127.0.0.1:1258/readyz", self.dockerfile)
         self.assertNotIn("/healthz", self.dockerfile)
         self.assertNotIn("flask_port", self.dockerfile)
+        self.assertNotIn("healthcheck", self.compose["services"]["mediaflux"])
 
-        healthcheck = self.compose["services"]["mediaflux"]["healthcheck"]["test"]
-        self.assertEqual(healthcheck[:2], ["CMD", "python"])
-        self.assertIn("127.0.0.1:1258/readyz", healthcheck[-1])
-        self.assertNotIn("/healthz", healthcheck[-1])
-        self.assertNotIn("flask_port", healthcheck[-1])
-
-    def test_compose_preserves_existing_port_and_volume_contracts(self) -> None:
+    def test_production_compose_is_single_file_and_first_run_ready(self) -> None:
         service = self.compose["services"]["mediaflux"]
         self.assertEqual(service["stop_grace_period"], "60s")
         self.assertEqual(
             service["image"],
-            "${MEDIAFLUX_IMAGE:-ghcr.io/li88iioo/mediaflux:latest}",
+            "ghcr.io/li88iioo/mediaflux:latest",
         )
+        self.assertNotIn("build", service)
+        self.assertNotIn("env_file", service)
+        self.assertNotIn("environment", service)
+        self.assertNotIn("ports", service)
+        self.assertEqual(service["network_mode"], "host")
+        self.assertEqual(
+            service["volumes"],
+            [
+                "./data:/app/db",
+                "./strm:/data/strm",
+                "./downloads:/media/downloads",
+                "./library:/media/library",
+            ],
+        )
+
+    def test_development_has_one_independent_compose_and_env(self) -> None:
+        service = self.dev_compose["services"]["mediaflux"]
+        self.assertEqual(service["image"], "${MEDIAFLUX_DEV_IMAGE}")
+        self.assertEqual(service["build"]["context"], ".")
+        self.assertEqual(service["build"]["dockerfile"], "Dockerfile")
+        self.assertEqual(service["env_file"], [".env.development"])
+        self.assertNotIn("environment", service)
+        self.assertEqual(self.development_env["APP_ENV"], "development")
+        self.assertNotIn("MEDIAFLUX_RUN_AS_ROOT", self.development_env)
+        self.assertNotIn("MEDIAFLUX_ALLOW_REMOTE_SETUP", self.development_env)
+        self.assertNotIn("WEB_PORT", self.development_env)
         self.assertEqual(
             service["ports"],
-            ["${MEDIAFLUX_PUBLISH_HOST:-127.0.0.1}:${WEB_PORT:-1258}:1258"],
+            ["${MEDIAFLUX_PUBLISH_PORT}:1258", "${MEDIA_PROXY_PORT}:18096"],
         )
         self.assertEqual(
             service["volumes"],
             [
-                "./db:/app/db",
-                "${STRM_HOST_PATH:-./strm-data}:/data/strm",
-                "${MEDIA_DOWNLOADS_HOST_PATH:-./media-downloads}:/media/downloads",
-                "${MEDIA_LIBRARY_HOST_PATH:-./media-library}:/media/library",
+                "${MEDIAFLUX_DATA_HOST_PATH}:/app/db",
+                "${STRM_HOST_PATH}:/data/strm",
+                "${MEDIA_DOWNLOADS_HOST_PATH}:/media/downloads",
+                "${MEDIA_LIBRARY_HOST_PATH}:/media/library",
             ],
         )
-        self.assertNotIn("env_file", service)
-        environment = service["environment"]
-        self.assertEqual(
-            set(environment),
-            {
-                "APP_ENV", "WEB_HOST", "WEB_DEBUG", "WEB_SECRET_KEY",
-                "MEDIAFLUX_INITIALIZED",
-                "WEB_PORT",
-                "ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD",
-                "SESSION_COOKIE_SECURE", "LOCAL_MEDIA_BROWSE_ROOTS",
-                "AGENT_METRICS_SCRAPE_KEY",
-            },
-        )
-        self.assertEqual(environment["APP_ENV"], "production")
-        self.assertEqual(environment["WEB_HOST"], "0.0.0.0")
-        self.assertEqual(environment["WEB_PORT"], "1258")
-        self.assertNotIn("STRM_ROOT", environment)
-        self.assertEqual(
-            environment["LOCAL_MEDIA_BROWSE_ROOTS"],
-            "${LOCAL_MEDIA_BROWSE_ROOTS:-/media/downloads,/media/library}",
-        )
-        self.assertEqual(
-            environment["WEB_SECRET_KEY"],
-            "${WEB_SECRET_KEY:?set WEB_SECRET_KEY in .env}",
-        )
-        self.assertEqual(
-            environment["ENV_WEB_PASSPORT"],
-            "${ENV_WEB_PASSPORT:?set ENV_WEB_PASSPORT in .env}",
-        )
-        self.assertEqual(
-            environment["ENV_WEB_PASSWORD"],
-            "${ENV_WEB_PASSWORD:?set ENV_WEB_PASSWORD in .env}",
-        )
-        self.assertEqual(
-            environment["SESSION_COOKIE_SECURE"],
-            "${SESSION_COOKIE_SECURE:-0}",
-        )
-        self.assertEqual(
-            environment["AGENT_METRICS_SCRAPE_KEY"],
-            "${AGENT_METRICS_SCRAPE_KEY:-}",
-        )
+        self.assertIn("MEDIAFLUX_DEV_IMAGE=mediaflux:dev", self.dev_env_example)
+        self.assertIn("STRM_HOST_PATH=./strm-data", self.dev_env_example)
+        self.assertIn("# ---------- 宿主机端口 ----------", self.dev_env_example)
+        self.assertIn("# MEDIAFLUX_RUN_AS_ROOT=0", self.dev_env_example)
 
-    def test_image_bundles_ffprobe_before_switching_to_non_root_user(self) -> None:
-        self.assertIn("apt-get install -y --no-install-recommends ffmpeg", self.dockerfile)
+        referenced = set(re.findall(r"\$\{([A-Z0-9_]+)\}", (self.ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8")))
+        self.assertEqual(referenced - self.development_env.keys(), set())
+
+    def test_image_entrypoint_defaults_to_nas_compatibility_and_supports_drop_privileges(self) -> None:
+        self.assertIn("apt-get install -y --no-install-recommends ffmpeg gosu", self.dockerfile)
         self.assertIn("MEDIAFLUX_FFPROBE=/usr/bin/ffprobe", self.dockerfile)
         self.assertIn("/usr/bin/ffprobe -version >/dev/null 2>&1", self.dockerfile)
-        self.assertLess(
-            self.dockerfile.index("apt-get install -y --no-install-recommends ffmpeg"),
-            self.dockerfile.index("USER mediaflux"),
-        )
+        self.assertIn("COPY packaging/scripts/docker-entrypoint.sh", self.dockerfile)
+        self.assertIn('ENTRYPOINT ["/usr/local/bin/mediaflux-entrypoint"]', self.dockerfile)
+        self.assertNotIn("USER mediaflux", self.dockerfile)
+        self.assertIn('exec gosu "$puid:$pgid" "$@"', self.entrypoint)
+        self.assertIn('chown -R "$puid:$pgid" /app/db', self.entrypoint)
+        self.assertIn('chown "$puid:$pgid" /data/strm', self.entrypoint)
+        self.assertNotIn("/media/downloads", self.entrypoint)
+        self.assertNotIn("/media/library", self.entrypoint)
+        self.assertIn("MEDIAFLUX_RUN_AS_ROOT", self.entrypoint)
+        self.assertIn("MEDIAFLUX_FIX_STRM_PERMISSIONS", self.entrypoint)
         self.assertIn("rm -rf /var/lib/apt/lists/*", self.dockerfile)
 
-    def test_compose_keeps_non_root_security_contract(self) -> None:
+    def test_production_deployment_requires_no_env_file(self) -> None:
+        self.assertFalse((self.ROOT / ".env.example").exists())
         service = self.compose["services"]["mediaflux"]
-        self.assertIn("USER mediaflux", self.dockerfile)
-        self.assertEqual(service["cap_drop"], ["ALL"])
-        self.assertIn("no-new-privileges:true", service["security_opt"])
-
-    def test_env_example_uses_safe_placeholders_and_explains_port_scope(self) -> None:
-        self.assertRegex(self.env_example, r"(?m)^WEB_SECRET_KEY=\s*$")
-        self.assertRegex(self.env_example, r"(?m)^ENV_WEB_PASSPORT=\s*$")
-        self.assertRegex(self.env_example, r"(?m)^ENV_WEB_PASSWORD=\s*$")
-        self.assertIn("留空时 Compose 会拒绝启动", self.env_example)
-        self.assertIn("secrets.token_urlsafe", self.env_example)
-        self.assertNotRegex(self.env_example, r"(?m)^ENV_WEB_PASSPORT=admin\s*$")
-        self.assertNotRegex(self.env_example, r"(?m)^ENV_WEB_PASSWORD=123456\s*$")
-        self.assertIn("AGENT_METRICS_SCRAPE_KEY=", self.env_example)
-        self.assertIn("MEDIAFLUX_PUBLISH_HOST=127.0.0.1", self.env_example)
-        self.assertIn("局域网访问时显式改为 0.0.0.0", self.env_example)
-        self.assertIn("WEB_PORT 只控制宿主机发布端口", self.env_example)
-        self.assertNotIn("MEDIAFLUX_CONTAINER_PORT", self.env_example)
-        self.assertIn("经 HTTPS 反向代理访问时必须设为 1", self.env_example)
-        self.assertIn("MEDIAFLUX_IMAGE=ghcr.io/li88iioo/mediaflux:latest", self.env_example)
-        self.assertIn("不要再从 Web 设置页修改", self.env_example)
-        self.assertIn("WEB_HOST=0.0.0.0", self.env_example)
-        self.assertIn("MEDIAFLUX_DATA_DIR=/app/db", self.env_example)
-        self.assertIn("MEDIAFLUX_CONFIG_DIR=/app/db", self.env_example)
-        self.assertIn("MEDIAFLUX_CACHE_DIR=/app/db/cache", self.env_example)
-        self.assertIn("MEDIAFLUX_LOG_DIR=/app/db/logs", self.env_example)
-        self.assertIn("MEDIAFLUX_STRM_DIR=/data/strm", self.env_example)
-        self.assertIn("MEDIA_DOWNLOADS_HOST_PATH=./media-downloads", self.env_example)
-        self.assertIn("MEDIA_LIBRARY_HOST_PATH=./media-library", self.env_example)
-        self.assertIn(
-            "LOCAL_MEDIA_BROWSE_ROOTS=/media/downloads,/media/library",
-            self.env_example,
-        )
-        self.assertIn("业务配置请在 Web「设置」页维护", self.env_example)
-        self.assertIn("./db/user.env", self.env_example)
-        for application_key in (
-            "AGENT_ENABLED",
-            "TG_BOT_TOKEN",
-            "TMDB_API_KEY",
-            "QB_URL",
-            "MEDIA_MOVIE_TEMPLATE",
-            "AGENT_LLM_API_KEY",
-            "TAVILY_API_KEY",
-        ):
-            self.assertNotRegex(
-                self.env_example, rf"(?m)^{application_key}=",
-            )
-        self.assertNotIn("${showTitle}", self.env_example)
-
+        self.assertNotIn("env_file", service)
+        self.assertNotIn("environment", service)
+        self.assertIn('"0.0.0.0:111:1258"', self.compose_text)
+        self.assertIn('"0.0.0.0:222:18096"', self.compose_text)
 
     def test_build_context_excludes_local_artifacts_and_agent_state(self) -> None:
         ignored = {
@@ -300,39 +267,9 @@ class DockerRuntimeContractTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIn(value, self.workflow)
 
-    def test_bare_container_cli_fails_closed_without_credentials(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="mediaflux-docker-contract-") as root:
-            root_path = Path(root)
-            data_dir = root_path / "db"
-            env = {
-                **os.environ,
-                "APP_ENV": "production",
-                "MEDIAFLUX_CONTAINER": "1",
-                "MEDIAFLUX_DATA_DIR": str(data_dir),
-                "MEDIAFLUX_CONFIG_DIR": str(data_dir),
-                "MEDIAFLUX_CACHE_DIR": str(data_dir / "cache"),
-                "MEDIAFLUX_LOG_DIR": str(data_dir / "logs"),
-                "MEDIAFLUX_STRM_DIR": str(root_path / "strm"),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
-            for key in ("ENV_WEB_PASSPORT", "ENV_WEB_PASSWORD", "WEB_SECRET_KEY"):
-                env.pop(key, None)
-
-            completed = subprocess.run(
-                [sys.executable, "mediaflux.py", "start"],
-                cwd=self.ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-
-        self.assertEqual(completed.returncode, 2)
-        self.assertIn("MediaFlux container refused to start", completed.stderr)
-        self.assertIn("ENV_WEB_PASSPORT", completed.stderr)
-        self.assertIn("ENV_WEB_PASSWORD", completed.stderr)
-        self.assertIn("WEB_SECRET_KEY", completed.stderr)
+    def test_official_container_defaults_cover_zero_env_first_run(self) -> None:
+        self.assertIn("MEDIAFLUX_CONTAINER=1", self.dockerfile)
+        self.assertIn('MEDIAFLUX_RUN_AS_ROOT:-1', self.entrypoint)
 
 
 if __name__ == "__main__":

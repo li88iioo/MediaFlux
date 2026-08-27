@@ -113,14 +113,25 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _remote_setup_allowed() -> bool:
+    enabled = {"1", "true", "yes", "on"}
+    explicit = os.getenv("MEDIAFLUX_ALLOW_REMOTE_SETUP", "").strip().lower()
+    if explicit:
+        return explicit in enabled
+    return os.getenv("MEDIAFLUX_CONTAINER", "").strip().lower() in enabled
+
+
 def resolve_bind_host(requested: str | None, *, initialized_default: str = "0.0.0.0") -> str:
-    """首次初始化只允许回环监听；WEB_HOST 不隐式授权远程 setup。"""
+    """源码首启仅监听回环；官方容器默认开放一次性 Web 初始化。"""
     if needs_initialization():
-        if requested and not _is_loopback_host(requested):
+        if requested and not _is_loopback_host(requested) and not _remote_setup_allowed():
             raise UnsafeFirstRunBindingError(
-                "首次初始化禁止监听非回环地址；请先在本机完成初始化"
+                "首次初始化禁止监听非回环地址；请先在本机完成初始化，"
+                "或显式设置 MEDIAFLUX_ALLOW_REMOTE_SETUP=1"
             )
-        return requested or "127.0.0.1"
+        if requested:
+            return requested
+        return initialized_default if _remote_setup_allowed() else "127.0.0.1"
     if requested:
         return requested
     return config.get("WEB_HOST", initialized_default) or initialized_default

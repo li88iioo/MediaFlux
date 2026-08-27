@@ -732,33 +732,28 @@ class CliRuntimeTests(unittest.TestCase):
                     cli_main.assert_called_once_with(expected_args)
 
 
-    def test_container_fresh_start_fails_closed_with_complete_environment_hint(self) -> None:
+    def test_container_fresh_start_opens_web_setup_without_credentials(self) -> None:
         import app.main
         from app import cli
 
-        stderr = io.StringIO()
         with patch.dict(
             os.environ,
             {"MEDIAFLUX_CONTAINER": "1"},
             clear=True,
         ), patch("app.modules.first_run.needs_initialization", return_value=True), patch(
-            "app.main.create_app"
-        ) as create_app, patch("app.cli.uvicorn.run") as run, redirect_stderr(stderr):
+            "app.main.create_app", return_value=object()
+        ) as create_app, patch("app.cli.uvicorn.run") as run:
             exit_code = cli._start(None, None, None)
 
-        self.assertNotEqual(exit_code, 0)
-        self.assertIn("MEDIAFLUX_INITIALIZED=1", stderr.getvalue())
-        self.assertIn("ENV_WEB_PASSPORT", stderr.getvalue())
-        self.assertIn("ENV_WEB_PASSWORD", stderr.getvalue())
-        self.assertIn("WEB_SECRET_KEY", stderr.getvalue())
-        create_app.assert_not_called()
-        run.assert_not_called()
+        self.assertEqual(exit_code, 0)
+        create_app.assert_called_once_with(start_background=True)
+        self.assertEqual(run.call_args.kwargs["host"], "0.0.0.0")
+        self.assertEqual(run.call_args.kwargs["workers"], 1)
 
-    def test_container_initialized_credentials_without_secret_fail_before_app_creation(self) -> None:
+    def test_container_preseeded_credentials_can_start_without_manual_secret(self) -> None:
         import app.main
         from app import cli
 
-        stderr = io.StringIO()
         with patch.dict(
             os.environ,
             {
@@ -768,16 +763,13 @@ class CliRuntimeTests(unittest.TestCase):
             },
             clear=True,
         ), patch("app.modules.first_run.needs_initialization", return_value=False), patch(
-            "app.config.get", return_value=""
-        ), patch(
-            "app.main.create_app"
-        ) as create_app, patch("app.cli.uvicorn.run") as run, redirect_stderr(stderr):
+            "app.main.create_app", return_value=object()
+        ) as create_app, patch("app.cli.uvicorn.run") as run:
             exit_code = cli._start(None, None, None)
 
-        self.assertNotEqual(exit_code, 0)
-        self.assertIn("WEB_SECRET_KEY", stderr.getvalue())
-        create_app.assert_not_called()
-        run.assert_not_called()
+        self.assertEqual(exit_code, 0)
+        create_app.assert_called_once_with(start_background=True)
+        run.assert_called_once()
 
     def test_dockerfile_marks_container_and_uses_fixed_internal_healthcheck(self) -> None:
         dockerfile = (self.PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")

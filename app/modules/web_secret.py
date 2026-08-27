@@ -28,15 +28,6 @@ def configured_web_secret() -> str:
     return config.get("WEB_SECRET_KEY", "").strip()
 
 
-def _is_production() -> bool:
-    return config.get("APP_ENV", "development").strip().lower() == "production"
-
-
-def _fresh_install() -> bool:
-    from app.modules.first_run import needs_initialization
-
-    return needs_initialization()
-
 
 def _validate_secret(value: str) -> str:
     secret = str(value or "").strip()
@@ -149,9 +140,6 @@ def get_web_secret() -> str:
     configured = configured_web_secret()
     if configured:
         return configured
-    if not _fresh_install() and _is_production():
-        raise WebSecretUnavailable("生产模式已初始化安装必须配置 WEB_SECRET_KEY")
-
     paths = get_runtime_paths()
     with _lock:
         cached = _process_secrets.get(paths)

@@ -109,29 +109,8 @@ def _start(host: str | None, port: int | None, data_dir: str | None) -> int:
     requested_host = host if host is not None else (external_host or None)
     from app.modules.first_run import (
         UnsafeFirstRunBindingError,
-        needs_initialization,
         resolve_bind_host,
     )
-
-    if os.getenv("MEDIAFLUX_CONTAINER", "").strip().lower() in {"1", "true", "yes", "on"}:
-        missing: list[str] = []
-        if needs_initialization():
-            missing.extend((
-                "MEDIAFLUX_INITIALIZED=1",
-                "ENV_WEB_PASSPORT",
-                "ENV_WEB_PASSWORD",
-                "WEB_SECRET_KEY",
-            ))
-        elif not config.get("WEB_SECRET_KEY"):
-            missing.append("WEB_SECRET_KEY")
-        if missing:
-            required = " ".join(dict.fromkeys(missing))
-            print(
-                "MediaFlux container refused to start without complete credentials. "
-                f"Set APP_ENV=production WEB_HOST=0.0.0.0 {required} and restart.",
-                file=sys.stderr,
-            )
-            return 2
 
     try:
         effective_host = resolve_bind_host(requested_host)

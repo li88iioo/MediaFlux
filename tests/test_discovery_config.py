@@ -350,10 +350,9 @@ class DiscoveryConfigTests(unittest.TestCase):
             "INDEXER_SUKEBEI_ENABLED": "0",
         })
 
-    def test_env_example_delegates_discovery_configuration_to_web_settings(self):
-        env_text = Path(".env.example").read_text(encoding="utf-8")
-        self.assertIn("业务配置请在 Web「设置」页维护", env_text)
-        self.assertIn("./db/user.env", env_text)
+    def test_deployment_templates_do_not_embed_discovery_configuration(self):
+        env_text = Path(".env.development.example").read_text(encoding="utf-8")
+        compose_text = Path("docker-compose.yml").read_text(encoding="utf-8")
         for key in (
             "DISCOVERY_ENABLED",
             "DISCOVERY_CACHE_TTL_SECONDS",
@@ -372,8 +371,9 @@ class DiscoveryConfigTests(unittest.TestCase):
             "BANGUMI_USER_AGENT",
         ):
             self.assertNotRegex(env_text, rf"(?m)^{key}=")
-        self.assertNotIn("********", env_text)
-        self.assertNotIn("123456789:test-dbcl2-value", env_text)
+            self.assertNotIn(key, compose_text)
+        self.assertNotIn("********", env_text + compose_text)
+        self.assertNotIn("123456789:test-dbcl2-value", env_text + compose_text)
 
     def test_settings_page_exposes_dbcl2_but_no_frodo_controls(self):
         html = (Path("app/templates/settings.html").read_text(encoding="utf-8") + Path("app/static/js/settings.js").read_text(encoding="utf-8"))

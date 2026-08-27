@@ -89,41 +89,21 @@ MediaFlux 提供开箱即用的 Docker 容器化部署与 Python 源码运行方
 
 ### 方式一：Docker Compose 部署（推荐）
 
-MediaFlux 专注于轻量、高性能的容器化架构，使用 FastAPI + uvloop 高性能异步网络栈。官方 Docker 镜像已内置 ffprobe，并通过 `MEDIAFLUX_FFPROBE=/usr/bin/ffprobe` 用于本地与云端媒体规格探测；若自定义镜像移除该工具，程序仍会降级为文件名规格，不会阻断整理。
 
-1. **获取 Compose 配置**：
-   ```bash
-   git clone https://github.com/li88iioo/MediaFlux.git
-   cd MediaFlux
-   cp .env.example .env
-   ```
+```bash
+mkdir -p mediaflux && cd mediaflux
+curl -fsSL https://raw.githubusercontent.com/li88iioo/MediaFlux/main/docker-compose.yml -o docker-compose.yml
+```
 
-2. **配置环境变量**：
-   编辑 `.env` 文件，生产环境必须设置强密码与随机 Secret：
-   ```dotenv
-   # 随机密钥生成: python3 -c "import secrets; print(secrets.token_urlsafe(48))"
-   WEB_SECRET_KEY=你的随机强密钥_至少32字节
-   MEDIAFLUX_INITIALIZED=1
-   ENV_WEB_PASSPORT=admin
-   ENV_WEB_PASSWORD=你的高强度管理员密码
+打开 `docker-compose.yml`，把下载目录和媒体库左侧路径改成宿主机实际路径，然后启动：
 
-   # 局域网访问设为 0.0.0.0，仅本机访问保持 127.0.0.1
-   MEDIAFLUX_PUBLISH_HOST=127.0.0.1
-   # WEB_PORT 仅为宿主机发布端口；容器内部固定使用 1258
-   WEB_PORT=1258
-   MEDIAFLUX_IMAGE=ghcr.io/li88iioo/mediaflux:latest
-   STRM_HOST_PATH=./strm-data
-   ```
+```bash
+docker compose up -d
+```
 
-3. **创建目录并启动**：
-   ```bash
-   mkdir -p db strm-data media-downloads media-library
-   sudo chown -R 10001:10001 db strm-data media-downloads media-library
-   docker compose pull
-   docker compose up -d --no-build
-   docker compose logs -f mediaflux
-   ```
-   > 提示：如需从本地源码构建镜像，执行 `docker compose up -d --build` 即可。
+浏览器访问 `http://服务器IP:1258/setup` 创建管理员。默认 host 网络会直接开放 Web `1258` 和页面中配置的媒体反代端口；无需 `.env`、专用用户、手动 Secret 或 `chown`。
+
+需要 bridge 端口映射、固定非 root UID/GID 或迁移备份时，请参阅 [部署指南](docs/部署指南.md)。开发环境在源码仓库中使用独立的 `docker-compose.dev.yml` 与 `.env.development`。
 
 ---
 
@@ -152,7 +132,7 @@ MediaFlux 严格隔离只读代码与持久化数据：
 
 | 部署方式 | 数据库文件 | 配置文件 (`user.env`) | 缓存目录 | 日志目录 | STRM 输出目录 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Docker 容器** | `/app/db/mediaflux.db` (映射 `./db`) | `/app/db/user.env` (映射 `./db`) | `/app/db/cache` | `/app/db/logs` | `/data/strm` (映射 `${STRM_HOST_PATH}`) |
+| **Docker 容器** | `./data/mediaflux.db` | `./data/user.env` | `./data/cache` | `./data/logs` | `./strm` |
 | **Python 源码** | `<repo>/db/mediaflux.db` | `<repo>/db/user.env` | `<repo>/db/cache` | `<repo>/db/logs` | `<repo>/strm-data` |
 
 ---

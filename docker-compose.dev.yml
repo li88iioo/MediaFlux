@@ -1,0 +1,34 @@
+# MediaFlux Docker 开发配置
+# 启动前复制 .env.development.example，并通过 --env-file 同时提供
+# Compose 插值变量和容器运行变量：
+# docker compose --env-file .env.development -f docker-compose.dev.yml up -d --build
+
+services:
+  mediaflux:
+    image: "${MEDIAFLUX_DEV_IMAGE}"
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 只写入开发镜像的构建元数据，不承载业务配置。
+      args:
+        VERSION_REF: "${VERSION_REF}"
+        GIT_SHA: "${GIT_SHA}"
+        TARGETARCH: "${TARGETARCH}"
+
+    container_name: mediaflux-dev
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+    # 传入 APP_ENV、WEB_HOST 和本地目录浏览范围等开发运行配置。
+    env_file:
+      - .env.development
+
+    ports:
+      - "${MEDIAFLUX_PUBLISH_PORT}:1258"
+      - "${MEDIA_PROXY_PORT}:18096"
+
+    volumes:
+      - "${MEDIAFLUX_DATA_HOST_PATH}:/app/db"
+      - "${STRM_HOST_PATH}:/data/strm"
+      - "${MEDIA_DOWNLOADS_HOST_PATH}:/media/downloads"
+      - "${MEDIA_LIBRARY_HOST_PATH}:/media/library"

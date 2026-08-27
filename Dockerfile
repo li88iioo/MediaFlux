@@ -32,8 +32,9 @@ WORKDIR /app
 
 # 本地与云端媒体规格探测依赖 ffprobe；Debian 的 ffmpeg 包同时提供该命令。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg gosu \
     && /usr/bin/ffprobe -version >/dev/null 2>&1 \
+    && gosu --version >/dev/null 2>&1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 mediaflux \
@@ -45,6 +46,7 @@ RUN pip install --no-cache-dir --require-hashes -r /app/requirements-release-run
 COPY app /app/app
 COPY --from=static-builder /out/ /app/app/static/
 COPY mediaflux.py /app/
+COPY packaging/scripts/docker-entrypoint.sh /usr/local/bin/mediaflux-entrypoint
 COPY packaging/scripts/generate_build_info.py /tmp/generate_build_info.py
 
 RUN case "${TARGETARCH:-amd64}" in \
@@ -62,13 +64,16 @@ RUN case "${TARGETARCH:-amd64}" in \
     && rm -f /tmp/generate_build_info.py
 
 RUN mkdir -p /app/db/cache /app/db/logs /data/strm \
-    && chown -R mediaflux:mediaflux /app/db /data/strm
+    && chown -R mediaflux:mediaflux /app/db /data/strm \
+    && chmod 0755 /usr/local/bin/mediaflux-entrypoint
 
-USER mediaflux
 EXPOSE 1258
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1258/readyz', timeout=3)"
+
+# 入口初始化 MediaFlux 自有目录；默认兼容 NAS 权限，也支持显式 PUID/PGID 降权。
+ENTRYPOINT ["/usr/local/bin/mediaflux-entrypoint"]
 
 # 后台调度器与 Telegram Bot 采用进程内单例，必须保持单 worker。
 CMD ["python", "mediaflux.py", "start"]
