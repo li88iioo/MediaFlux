@@ -2598,7 +2598,7 @@ _INDEXER_SITE_MUTATION_PATTERNS = (
     ),
     re.compile(
         _FEATURE_ACTION_PREFIX
-        + rf"(?:把|将)\s*(?P<sites>.+?)\s*(?:给我\s*)?"
+        + r"(?:把|将)\s*(?P<sites>.+?)\s*(?:给我\s*)?"
         + rf"(?P<verb>{_INDEXER_SITE_MUTATION_ACTION_PATTERN})"
         + _FEATURE_ACTION_SUFFIX
     ),
@@ -5306,7 +5306,7 @@ def _extract_search_query(message: str) -> str:
         rf"(?:在\s*)?{local_scope}\s*(?:能不能|能否|能|可以|可不可以)?\s*(?:找到|找得到|搜到|查到|检索到)\s*(.+?)(?:吗|呢)?$",
         rf"(?:在\s*)?{local_scope}\s*(.+?)\s*(?:是否存在|在不在)(?:吗|呢)?$",
         rf"(.+?)\s*(?:在不在|是否在|存在于|在)\s*{local_scope}\s*(?:吗|呢)?$",
-        rf"(.+?)\s*(?:是否存在|在不在)\s*(?:吗|呢)?$",
+        r"(.+?)\s*(?:是否存在|在不在)\s*(?:吗|呢)?$",
         r"(?:帮我)?(?:找一下|找找|搜索|查找|找(?!到|得到)|搜(?!索))\s*(?:一下\s*)?(?:电影|电视剧|剧集|动画|动漫|影片|片子)?\s*[:：]?\s*(.+)",
         r"(?:片名|剧名)\s*[:：]\s*(.+)",
         r"(?:媒体库里)?(?:有没有|有无)\s*(.+)",
@@ -7221,7 +7221,6 @@ class AgentOrchestrator:
                 conversation_context,
                 allow_structured_domain=trusted_conversation_context,
             )
-            previous_tool = str(rss_topic.get("tool_name") or "").strip()
             if (
                 _is_negated_rss_refresh_message(message)
                 and (

@@ -570,10 +570,19 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                 db.update_download_request(request_id, qb_status="completed", status="completed")
                 tracker = DownloadTracker()
                 scheduler = Mock()
-                scheduler.enqueue_completed_torrent.return_value = 77
+
+                def enqueue(_task, *, wake, request_id):
+                    self.assertFalse(wake)
+                    db.link_download_request_to_local_media_task(
+                        request_id, 77, "/downloads/Movie.mkv",
+                    )
+                    return 77
+
+                scheduler.enqueue_completed_torrent.side_effect = enqueue
+                linked_task = SimpleNamespace(id=77, status="waiting_stable", error="")
                 with patch(
                     "app.modules.local_media_scheduler.get_local_media_scheduler", return_value=scheduler
-                ):
+                ), patch("app.database.get_local_media_task", return_value=linked_task):
                     tracker._start_local_import({"id": request_id}, self._task("/downloads/Movie.mkv", "/downloads"))
                 row = db.get_download_request(request_id)
                 self.assertEqual(row["local_import_status"], "pending")
@@ -585,6 +594,58 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                 self.assertEqual(db.get_download_request(request_id)["local_import_status"], "completed")
                 self.assertEqual(db.list_active_download_requests(include_local_import=True), [])
 
+    def test_linked_terminal_task_is_reconciled_without_reprobing_moved_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                request_id, _ = db.create_download_request("linked-terminal", "magnet")
+                db.link_download_request_to_local_media_task(
+                    request_id, 77, "/downloads/Movie.mkv",
+                )
+                tracker = DownloadTracker()
+                scheduler = Mock()
+                linked_task = SimpleNamespace(
+                    id=77, status="completed", error="",
+                )
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ), patch("app.database.get_local_media_task", return_value=linked_task):
+                    tracker._start_local_import(
+                        db.get_download_request(request_id),
+                        self._task("/downloads/Movie.mkv", "/downloads"),
+                    )
+
+                request = db.get_download_request(request_id)
+                self.assertEqual(request["local_import_status"], "completed")
+                scheduler.enqueue_completed_torrent.assert_not_called()
+                scheduler.reload.assert_not_called()
+
+    def test_atomic_binding_conflict_becomes_visible_local_import_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                request_id, _ = db.create_download_request("binding-conflict", "magnet")
+                tracker = DownloadTracker()
+                scheduler = Mock()
+                scheduler.enqueue_completed_torrent.side_effect = ValueError(
+                    "相同 qB 任务对应的内容路径不一致"
+                )
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    tracker._start_local_import(
+                        db.get_download_request(request_id),
+                        self._task("/downloads/Movie.mkv", "/downloads"),
+                    )
+
+                request = db.get_download_request(request_id)
+                self.assertEqual(request["local_import_status"], "failed")
+                self.assertIn("内容路径不一致", request["local_import_error"])
+
     def test_retryable_local_media_probe_recovers_without_becoming_skipped(self):
         with tempfile.TemporaryDirectory() as root:
             test_db = Path(root) / "downloads.db"
@@ -594,15 +655,24 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                 db.update_download_request(request_id, qb_status="completed", status="completed")
                 tracker = DownloadTracker()
                 scheduler = Mock()
-                scheduler.enqueue_completed_torrent.side_effect = [
-                    LocalMediaProbeRetryable("扫描路径不存在: Movie.mkv"),
-                    77,
-                ]
+                attempts = iter(("retry", "linked"))
+
+                def enqueue(_task, *, wake, request_id):
+                    self.assertFalse(wake)
+                    if next(attempts) == "retry":
+                        raise LocalMediaProbeRetryable("扫描路径不存在: Movie.mkv")
+                    db.link_download_request_to_local_media_task(
+                        request_id, 77, "/downloads/Movie.mkv",
+                    )
+                    return 77
+
+                scheduler.enqueue_completed_torrent.side_effect = enqueue
                 task = self._task("/downloads/Movie.mkv", "/downloads")
+                linked_task = SimpleNamespace(id=77, status="waiting_stable", error="")
                 with patch(
                     "app.modules.local_media_scheduler.get_local_media_scheduler",
                     return_value=scheduler,
-                ):
+                ), patch("app.database.get_local_media_task", return_value=linked_task):
                     tracker._start_local_import(db.get_download_request(request_id), task)
                     waiting = db.get_download_request(request_id)
                     self.assertEqual(waiting["local_import_status"], "pending")
@@ -4132,7 +4202,6 @@ class SecurityTests(InitializedWebTestCase):
             "/rss": "订阅",
             "/guangya": "光鸭云盘",
             "/guangya/offline": "光鸭离线转存",
-            "/guangya/more": "更多",
             "/guangya/more": "更多",
             "/organize": "光鸭整理",
             "/guangya/strm": "光鸭 STRM 同步",

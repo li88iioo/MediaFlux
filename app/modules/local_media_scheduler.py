@@ -16,7 +16,6 @@ from app.modules.local_media_service import LocalMediaService
 from app.modules.local_media_candidates import discover_local_media_candidates
 from app.modules.local_media_notifications import notify_local_media_task
 from app.modules.local_path_mapping import (
-    LEGACY_SOURCE_PATH_ERROR,
     PathMapping,
     PathMappingError,
     assert_within,
@@ -110,7 +109,13 @@ class LocalMediaScheduler:
                 "interval_seconds": self.interval,
             }
 
-    def enqueue_completed_torrent(self, task: TorrentTask, *, wake: bool = True) -> int | None:
+    def enqueue_completed_torrent(
+        self,
+        task: TorrentTask,
+        *,
+        wake: bool = True,
+        request_id: int | None = None,
+    ) -> int | None:
         raw_path = str(task.content_path or "").strip()
         if not raw_path:
             return None
@@ -149,9 +154,15 @@ class LocalMediaScheduler:
             raise LocalMediaProbeRetryable(str(exc)) from exc
         if not contains_video:
             return None
-        task_id = db.create_local_media_task(
-            source.id, task.hash, str(local_path), owner=self.owner, trigger="qb_completed",
-        )
+        if request_id is None:
+            task_id = db.create_local_media_task(
+                source.id, task.hash, str(local_path), owner=self.owner,
+                trigger="qb_completed",
+            )
+        else:
+            task_id, _restarted = db.create_and_link_qb_local_media_task(
+                int(request_id), source.id, task.hash, str(local_path), owner=self.owner,
+            )
         if wake:
             self.reload()
         return task_id

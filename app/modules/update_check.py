@@ -64,20 +64,8 @@ def _is_newer(candidate: str, current: str) -> bool:
     return _version_sort_key(candidate) > _version_sort_key(current)
 
 
-def _normalize_arch(value: str) -> str:
-    normalized = (value or "").strip().lower()
-    return {
-        "amd64": "x86_64",
-        "x64": "x86_64",
-        "arm64": "aarch64",
-    }.get(normalized, normalized)
-
-
-def _preferred_suffixes(build: BuildInfo, machine: str) -> tuple[str, ...]:
-    arch = _normalize_arch(machine)
-    package = build.package.lower()
-    if package == "docker":
-        return (".tar.gz", ".zip")
+def _preferred_suffixes(_build: BuildInfo, _machine: str) -> tuple[str, ...]:
+    # GitHub release assets currently share the same archive formats for every build target.
     return (".tar.gz", ".zip")
 
 

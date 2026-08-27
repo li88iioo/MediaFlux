@@ -57,6 +57,30 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(scheduler.run_once(), 1)
             self.assertEqual(service.calls, [("admin", first, qb)])
 
+    def test_completed_torrent_request_is_bound_before_scheduler_wakeup(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            movie = root / "Movie.mkv"
+            movie.write_bytes(b"movie")
+            db.create_local_media_source(
+                name="atomic-link", qb_profile="configured:qb",
+                qb_path_prefix="/downloads", local_root=str(root),
+                stable_seconds=0, owner="admin",
+            )
+            request_id, _ = db.create_download_request("scheduler-atomic", "magnet")
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            task_id = scheduler.enqueue_completed_torrent(
+                self.torrent("/downloads/Movie.mkv", hash_value="scheduler-atomic"),
+                wake=False, request_id=request_id,
+            )
+
+            request = db.get_download_request(request_id)
+            self.assertEqual(request["local_import_status"], "pending")
+            self.assertEqual(request["local_import_target"], f"local-media-task:{task_id}")
+            self.assertEqual(request["qb_content_path"], str(movie))
+            self.assertTrue(request["local_import_started_at"])
+
     def test_completed_torrent_matching_legacy_source_requires_container_path_migration(self):
         db.create_local_media_source(
             name="legacy", qb_profile="configured:qb", qb_path_prefix=r"D:\Downloads",

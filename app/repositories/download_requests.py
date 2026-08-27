@@ -931,11 +931,17 @@ def link_download_request_to_local_media_task(
 ) -> bool:
     """仅把尚未进入终态的下载请求关联到本地媒体任务。"""
     with get_conn() as conn:
+        timestamp = now()
         cur = conn.execute(
             "UPDATE download_requests SET local_import_status='pending',local_import_target=?,"
-            "qb_content_path=?,local_import_error='',local_import_completed_at=NULL,updated_at=? "
+            "qb_content_path=?,local_import_error='',local_import_started_at="
+            "COALESCE(NULLIF(local_import_started_at,''),?),"
+            "local_import_completed_at=NULL,updated_at=? "
             "WHERE id=? AND COALESCE(local_import_status,'') IN ('','pending')",
-            (f"local-media-task:{int(task_id)}", str(content_path or ""), now(), int(request_id)),
+            (
+                f"local-media-task:{int(task_id)}", str(content_path or ""),
+                timestamp, timestamp, int(request_id),
+            ),
         )
         return cur.rowcount == 1
 

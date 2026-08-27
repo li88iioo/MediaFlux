@@ -69,6 +69,7 @@ def classify_cleanup_items(
     sample_max_bytes: int = 300 * 1024 * 1024,
 ) -> tuple[list[CleanupCandidate], list[LocalFileSnapshot]]:
     """返回（确定垃圾、保留文件），未知文件永远进入保留列表。"""
+    del primary_video_count  # 兼容旧调用；保守清理不根据视频数量扩大删除范围。
     cleanup: list[CleanupCandidate] = []
     retained: list[LocalFileSnapshot] = []
     for item in snapshots:

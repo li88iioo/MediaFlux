@@ -3611,7 +3611,6 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         if not operation_is_current():
             raise AgentOperationCancelled("Telegram Agent 操作已失效")
 
-        streamed = False
         if stream_target is not None and isinstance(response, dict):
             source = _stream_answer_source(
                 user_message,
@@ -3694,7 +3693,6 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                     return True
                 if emitted and answer:
                     response = _apply_streamed_answer(response, answer)
-                    streamed = True
 
         def prepare_final_output() -> tuple[str, Any]:
             confirmation = (

@@ -52,7 +52,7 @@ class AIRecognitionAttemptLease:
     def __enter__(self) -> "AIRecognitionAttemptLease":
         return self
 
-    def __exit__(self, exc_type, exc, traceback) -> None:
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
         self.release()
 
 

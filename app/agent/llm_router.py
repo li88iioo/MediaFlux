@@ -997,14 +997,14 @@ def _safe_media_context_for_llm(value: Any) -> dict[str, Any]:
     media_type = str(value.get("media_type") or "").strip().lower()
     if media_type in {"movie", "tv"}:
         result["media_type"] = media_type
-    for field, maximum_digits in (("tmdb_id", 10), ("bangumi_id", 10), ("douban_id", 20)):
-        identifier = str(value.get(field) or "").strip()
+    for key, maximum_digits in (("tmdb_id", 10), ("bangumi_id", 10), ("douban_id", 20)):
+        identifier = str(value.get(key) or "").strip()
         if identifier.isascii() and identifier.isdigit() and 1 <= len(identifier) <= maximum_digits:
-            result[field] = identifier
-    for field, maximum in (("season", 100), ("episode", 1000)):
-        coordinate = value.get(field)
+            result[key] = identifier
+    for key, maximum in (("season", 100), ("episode", 1000)):
+        coordinate = value.get(key)
         if isinstance(coordinate, int) and not isinstance(coordinate, bool) and 1 <= coordinate <= maximum:
-            result[field] = coordinate
+            result[key] = coordinate
     case_stage = normalize_media_case_stage(value.get("case_stage"))
     if case_stage:
         result["case_stage"] = case_stage

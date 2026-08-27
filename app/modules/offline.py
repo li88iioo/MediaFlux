@@ -421,7 +421,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             "ok": False, "decision": decision.as_dict(),
             "resolve_attempts": resolution.attempts,
             "selected_count": 0, "excluded_count": len(choices),
-            "error": f"资源中没有符合仅视频规则的文件" + (f"（{detail}）" if detail else ""),
+            "error": "资源中没有符合仅视频规则的文件" + (f"（{detail}）" if detail else ""),
         }
 
     staging_id = ""

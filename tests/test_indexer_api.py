@@ -1133,8 +1133,6 @@ class IndexerAPITests(unittest.TestCase):
             }
 
         async def scenario():
-            nonlocal ticks_during_dispatch
-
             async def ticker():
                 nonlocal ticks_during_dispatch
                 while not dispatch_finished.is_set():

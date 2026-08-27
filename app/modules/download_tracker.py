@@ -431,6 +431,29 @@ class DownloadTracker:
             added_on=0,
         )
 
+    @staticmethod
+    def _linked_local_media_task_id(row) -> int | None:
+        target = str(DownloadTracker._row_value(row, "local_import_target", "") or "")
+        prefix = "local-media-task:"
+        if not target.startswith(prefix):
+            return None
+        try:
+            task_id = int(target.removeprefix(prefix))
+        except (TypeError, ValueError):
+            return None
+        return task_id if task_id > 0 else None
+
+    @staticmethod
+    def _reconcile_linked_local_media_task(local_task) -> None:
+        """已关联请求只跟随任务状态，不再次探测已被移动的下载路径。"""
+        status = str(getattr(local_task, "status", "") or "")
+        if status in {"completed", "failed", "requires_manual"}:
+            db.update_download_request_for_local_media_task(
+                int(local_task.id),
+                status,
+                error=str(getattr(local_task, "error", "") or ""),
+            )
+
     def _start_local_import(self, row, task) -> None:
         # 新来源配置优先走持久化调度器；此处只上报完成事件，不执行文件写入。
         from app.modules.local_media_scheduler import (
@@ -440,20 +463,43 @@ class DownloadTracker:
         )
 
         scheduler = get_local_media_scheduler()
+        linked_task_id = self._linked_local_media_task_id(row)
+        if linked_task_id is not None:
+            linked_task = db.get_local_media_task(linked_task_id, owner="admin")
+            if linked_task is None:
+                self._record_local_import_configuration_failure(
+                    row, task, RuntimeError("已关联的本地整理任务不存在")
+                )
+                return
+            self._reconcile_linked_local_media_task(linked_task)
+            if str(linked_task.status) not in {"completed", "failed", "requires_manual"}:
+                scheduler.reload()
+            return
+
         try:
-            local_task_id = scheduler.enqueue_completed_torrent(task, wake=False)
+            local_task_id = scheduler.enqueue_completed_torrent(
+                task, wake=False, request_id=int(row["id"]),
+            )
         except LocalMediaSourceMigrationRequired as exc:
             self._record_local_import_configuration_failure(row, task, exc)
             return
         except LocalMediaProbeRetryable as exc:
             self._record_local_import_probe_retry(row, task, exc)
             return
+        except (LookupError, ValueError) as exc:
+            # 原子绑定可能因请求已进入终态、来源被删除或历史路径冲突而拒绝。
+            # 条件更新会保护并发终态；仍处于 pending 时则给出可见失败。
+            self._record_local_import_configuration_failure(row, task, exc)
+            return
         if local_task_id is not None:
-            linked = db.link_download_request_to_local_media_task(
-                int(row["id"]), local_task_id, str(getattr(task, "content_path", "") or ""),
-            )
-            if linked:
-                scheduler.reload()
+            scheduler.reload()
+            linked_task = db.get_local_media_task(local_task_id, owner="admin")
+            if linked_task is None:
+                self._record_local_import_configuration_failure(
+                    row, task, RuntimeError("新建的本地整理任务不存在")
+                )
+                return
+            self._reconcile_linked_local_media_task(linked_task)
             return
         content_path = str(getattr(task, "content_path", "") or "")
         db.mark_download_request_local_media_skipped(

@@ -5879,6 +5879,115 @@ def create_local_media_task(
         return int(cur.lastrowid)
 
 
+def create_and_link_qb_local_media_task(
+    request_id: int,
+    source_id: int,
+    qb_hash: str,
+    content_path: str,
+    *,
+    owner: str = "admin",
+) -> tuple[int, bool]:
+    """原子创建/复用 qB 本地整理任务并绑定下载请求。
+
+    返回 ``(task_id, restarted)``。新下载请求命中同 hash 的旧终态任务时，
+    会开启新的 attempt；已经绑定到该任务的请求只复用当前状态，避免跟踪器
+    在任务完成后再次把它重置为等待态。
+    """
+    import uuid
+
+    safe_owner = _local_media_owner(owner)
+    safe_path = str(content_path or "").strip()
+    normalized_hash = str(qb_hash or "").strip().lower()
+    if not safe_path:
+        raise ValueError("本地媒体任务路径不能为空")
+    if not normalized_hash:
+        raise ValueError("qB 任务标识不能为空")
+
+    timestamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        request_row = conn.execute(
+            "SELECT local_import_status,local_import_target FROM download_requests WHERE id=?",
+            (int(request_id),),
+        ).fetchone()
+        if request_row is None:
+            raise LookupError("下载请求不存在")
+        local_status = str(request_row["local_import_status"] or "")
+        if local_status not in {"", "pending"}:
+            raise ValueError("下载请求的本地入库状态已结束")
+
+        source = conn.execute(
+            "SELECT id FROM local_media_sources WHERE id=? AND owner=?",
+            (int(source_id), safe_owner),
+        ).fetchone()
+        if not source:
+            raise LookupError("本地媒体来源不存在")
+
+        existing = conn.execute(
+            "SELECT id,content_path,status FROM local_media_tasks "
+            "WHERE source_id=? AND qb_hash=? AND owner=?",
+            (int(source_id), normalized_hash, safe_owner),
+        ).fetchone()
+        restarted = False
+        if existing is None:
+            cur = conn.execute(
+                "INSERT INTO local_media_tasks("
+                "owner,source_id,qb_hash,content_path,trigger,status,operation_token,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,'waiting_stable',?,?,?)",
+                (
+                    safe_owner,
+                    int(source_id),
+                    normalized_hash,
+                    safe_path,
+                    "qb_completed",
+                    uuid.uuid4().hex,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            task_id = int(cur.lastrowid)
+        else:
+            task_id = int(existing["id"])
+            target = f"local-media-task:{task_id}"
+            already_linked = str(request_row["local_import_target"] or "") == target
+            terminal = str(existing["status"] or "") in {
+                "completed", "failed", "requires_manual",
+            }
+            path_changed = str(existing["content_path"] or "") != safe_path
+            if path_changed and (already_linked or not terminal):
+                raise ValueError("相同 qB 任务对应的内容路径不一致")
+            if not already_linked and terminal:
+                conn.execute(
+                    "UPDATE local_media_tasks SET content_path=?,trigger='qb_completed',"
+                    "status='waiting_stable',stable_since='',snapshot_digest='',rules_snapshot='',"
+                    "recognition_summary='',tmdb_id='',media_type='',season_override=NULL,"
+                    "episode_override=NULL,title='',year='',operation_token=?,error='',warning='',"
+                    "completed_at=NULL,version=version+1,updated_at=? WHERE id=? AND owner=?",
+                    (safe_path, uuid.uuid4().hex, timestamp, task_id, safe_owner),
+                )
+                conn.execute(
+                    "DELETE FROM local_media_task_items WHERE task_id=?",
+                    (task_id,),
+                )
+                restarted = True
+
+        target = f"local-media-task:{task_id}"
+        current_target = str(request_row["local_import_target"] or "")
+        if current_target and current_target != target:
+            raise ValueError("下载请求已绑定其他本地整理任务")
+        cur = conn.execute(
+            "UPDATE download_requests SET local_import_status='pending',local_import_target=?,"
+            "qb_content_path=?,local_import_error='',local_import_started_at="
+            "COALESCE(NULLIF(local_import_started_at,''),?),"
+            "local_import_completed_at=NULL,updated_at=? "
+            "WHERE id=? AND COALESCE(local_import_status,'') IN ('','pending')",
+            (target, safe_path, timestamp, timestamp, int(request_id)),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("下载请求的本地入库状态已变化")
+        return task_id, restarted
+
+
 def get_local_media_task(task_id: int, *, owner: str = "admin"):
     from app.modules.local_media_models import LocalMediaTask
 
@@ -6195,7 +6304,7 @@ def prepare_manual_local_media_task(
             cur = conn.execute(
                 "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',snapshot_digest='',"
                 "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
-                "season_override=?,episode_override=?,"
+                "season_override=?,episode_override=?,title='',year='',"
                 "operation_token=?,error='',warning='',completed_at=NULL,"
                 "version=version+1,updated_at=? WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
                 (str(rules_snapshot or ""), str(tmdb_id or "").strip(), normalized_type,
@@ -6203,6 +6312,10 @@ def prepare_manual_local_media_task(
             )
             if cur.rowcount != 1:
                 raise ValueError("任务状态已变化，请刷新后重试")
+            conn.execute(
+                "DELETE FROM local_media_task_items WHERE task_id=?",
+                (task_id,),
+            )
             return task_id
         if existing and existing["status"] != "completed":
             raise ValueError("该目录已有任务正在处理中")
@@ -6505,6 +6618,8 @@ def reset_local_media_task(
     season_override: int | None = None,
     episode_override: int | None = None,
 ) -> bool:
+    import uuid
+
     normalized_type = None if media_type is None else str(media_type or "").strip().lower()
     if normalized_type and normalized_type not in {"movie", "tv"}:
         raise ValueError("媒体类型必须是 movie 或 tv")
@@ -6522,10 +6637,11 @@ def reset_local_media_task(
         raise ValueError("电影任务不能指定季数或集数")
     assignments = [
         "status='waiting_stable'", "stable_since=''", "snapshot_digest=''",
-        "recognition_summary=''", "error=''", "warning=''", "completed_at=NULL",
+        "recognition_summary=''", "title=''", "year=''", "operation_token=?",
+        "error=''", "warning=''", "completed_at=NULL",
         "version=version+1", "updated_at=?",
     ]
-    params: list[object] = [now()]
+    params: list[object] = [uuid.uuid4().hex, now()]
     if tmdb_id is not None:
         assignments.append("tmdb_id=?")
         params.append(str(tmdb_id or "").strip())
@@ -6542,12 +6658,20 @@ def reset_local_media_task(
         params.append(episode_override)
     params.extend([int(task_id), _local_media_owner(owner)])
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             f"UPDATE local_media_tasks SET {', '.join(assignments)} "
             "WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
             params,
         )
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return False
+        # 新 attempt 不得继承旧计划，否则刷新范围和可见性核验会读到过期路径。
+        conn.execute(
+            "DELETE FROM local_media_task_items WHERE task_id=?",
+            (int(task_id),),
+        )
+        return True
 
 
 def claim_agent_action_lease(
@@ -6595,7 +6719,7 @@ def reset_local_media_task_if_current(
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
             "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',"
-            "snapshot_digest='',recognition_summary='',operation_token=?,"
+            "snapshot_digest='',recognition_summary='',title='',year='',operation_token=?,"
             "error='',warning='',completed_at=NULL,"
             "version=version+1,updated_at=? WHERE id=? AND owner=? AND version=? AND status=?",
             (

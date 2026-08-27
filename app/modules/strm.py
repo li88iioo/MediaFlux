@@ -1871,7 +1871,7 @@ def _sync_strm_impl(
         return False
 
     def scan_tree(initial_dir_id: str, initial_parts: tuple[str, ...]) -> None:
-        nonlocal scan_errors, active_scan_workers
+        nonlocal scan_errors
         pending_dirs = deque([(initial_dir_id, initial_parts)])
         visited_dir_ids: set[str] = set()
 

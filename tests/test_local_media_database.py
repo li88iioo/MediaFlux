@@ -63,6 +63,63 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             columns = {row[1] for row in conn.execute("PRAGMA table_info(local_media_sources)")}
         self.assertTrue({"smb_user", "smb_pass"}.issubset(columns))
 
+    def test_qb_task_link_is_atomic_and_new_request_restarts_terminal_attempt(self):
+        source_id = db.create_local_media_source(
+            name="qb-atomic", qb_profile="configured:qb", qb_path_prefix="/downloads",
+            local_root="/mnt/downloads", owner="admin",
+        )
+        first_request, _ = db.create_download_request("qb-atomic-first", "magnet")
+        task_id, restarted = db.create_and_link_qb_local_media_task(
+            first_request, source_id, "HASH-ATOMIC", "/mnt/downloads/Movie.mkv", owner="admin",
+        )
+        self.assertFalse(restarted)
+        first_download = db.get_download_request(first_request)
+        self.assertEqual(
+            first_download["local_import_target"], f"local-media-task:{task_id}",
+        )
+        self.assertTrue(first_download["local_import_started_at"])
+
+        first_attempt = db.get_local_media_task(task_id, owner="admin")
+        db.add_local_media_task_item(
+            task_id, "/mnt/downloads/Movie.mkv", "/mnt/library/Movie.mkv",
+            role="video", owner="admin",
+        )
+        db.update_local_media_task(
+            task_id, owner="admin", status="completed", completed_at=db.now(),
+        )
+        db.update_download_request_for_local_media_task(task_id, "completed")
+
+        second_request, _ = db.create_download_request("qb-atomic-second", "magnet")
+        reused_id, restarted = db.create_and_link_qb_local_media_task(
+            second_request, source_id, "hash-atomic",
+            "/mnt/downloads/readded/Movie.mkv", owner="admin",
+        )
+        self.assertEqual(reused_id, task_id)
+        self.assertTrue(restarted)
+        retried = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(retried.status, "waiting_stable")
+        self.assertEqual(retried.content_path, "/mnt/downloads/readded/Movie.mkv")
+        self.assertNotEqual(retried.operation_token, first_attempt.operation_token)
+        self.assertEqual(db.list_local_media_task_items(task_id, owner="admin"), [])
+        self.assertEqual(
+            db.get_download_request(second_request)["local_import_target"],
+            f"local-media-task:{task_id}",
+        )
+        self.assertEqual(
+            db.get_download_request(first_request)["local_import_status"], "completed",
+        )
+
+        db.update_local_media_task(
+            task_id, owner="admin", status="completed", completed_at=db.now(),
+        )
+        same_id, restarted = db.create_and_link_qb_local_media_task(
+            second_request, source_id, "hash-atomic",
+            "/mnt/downloads/readded/Movie.mkv", owner="admin",
+        )
+        self.assertEqual(same_id, task_id)
+        self.assertFalse(restarted)
+        self.assertEqual(db.get_local_media_task(task_id, owner="admin").status, "completed")
+
     def test_qb_hash_is_idempotent_and_owner_isolated(self):
         source_id = db.create_local_media_source(
             name="source-idempotent", qb_profile="qb", qb_path_prefix="/downloads",
@@ -182,13 +239,21 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         )
         task = db.get_local_media_task(task_id, owner="admin")
         self.assertEqual((task.season_override, task.episode_override), (2, 7))
+        db.add_local_media_task_item(
+            task_id, "/tmp/manual-position/Show.S01E07.mkv",
+            "/tmp/library/Show.S01E07.mkv", role="video", owner="admin",
+        )
         db.update_local_media_task(
-            task_id, owner="admin", status="requires_manual",
+            task_id, owner="admin", status="requires_manual", title="旧标题", year="2025",
             recognition_summary='{"schema_version":1,"media":[]}',
         )
+        previous_token = db.get_local_media_task(task_id, owner="admin").operation_token
         self.assertTrue(db.reset_local_media_task(task_id, owner="admin"))
         retried = db.get_local_media_task(task_id, owner="admin")
+        self.assertNotEqual(retried.operation_token, previous_token)
+        self.assertEqual(db.list_local_media_task_items(task_id, owner="admin"), [])
         self.assertEqual(retried.recognition_summary, "")
+        self.assertEqual((retried.title, retried.year), ("", ""))
         self.assertEqual(retried.tmdb_id, "42")
         self.assertEqual(retried.media_type, "tv")
         self.assertEqual((retried.season_override, retried.episode_override), (2, 7))
@@ -252,6 +317,35 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(claimed.status, "recognizing")
         self.assertEqual((claimed.tmdb_id, claimed.media_type), ("101", "movie"))
         self.assertEqual((claimed.title, claimed.year), ("电影甲", "2026"))
+
+    def test_prepare_manual_retry_clears_previous_attempt_items(self):
+        source_id = db.create_local_media_source(
+            name="manual-retry", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/manual-retry", owner="admin",
+        )
+        content_path = "/tmp/manual-retry/Movie.mkv"
+        task_id = db.prepare_manual_local_media_task(
+            source_id, content_path, owner="admin", tmdb_id="1", media_type="movie",
+        )
+        original = db.get_local_media_task(task_id, owner="admin")
+        db.add_local_media_task_item(
+            task_id, content_path, "/tmp/library/Movie.mkv", role="video", owner="admin",
+        )
+        db.update_local_media_task(
+            task_id, owner="admin", status="failed", error="move failed",
+            title="旧电影", year="2025",
+        )
+
+        reused_id = db.prepare_manual_local_media_task(
+            source_id, content_path, owner="admin", tmdb_id="2", media_type="movie",
+        )
+        retried = db.get_local_media_task(reused_id, owner="admin")
+        self.assertEqual(reused_id, task_id)
+        self.assertEqual(retried.status, "waiting_stable")
+        self.assertEqual(retried.tmdb_id, "2")
+        self.assertEqual((retried.title, retried.year), ("", ""))
+        self.assertNotEqual(retried.operation_token, original.operation_token)
+        self.assertEqual(db.list_local_media_task_items(task_id, owner="admin"), [])
 
     def test_manual_task_prepare_never_resets_an_active_task(self):
         source_id = db.create_local_media_source(

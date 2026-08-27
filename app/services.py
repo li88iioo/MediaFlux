@@ -203,7 +203,6 @@ def get_cached_dashboards_or_stubs() -> tuple[list[DashboardData], bool]:
     若已有热缓存，直接返回 (cached.boards, True)；
     若无缓存，快速返回已配置服务的骨架列表 (stubs, False)，让页面 0ms 秒开。
     """
-    global _dashboard_cache
     key = _dashboard_config_key()
     now = time.monotonic()
     with _dashboard_cache_lock:
