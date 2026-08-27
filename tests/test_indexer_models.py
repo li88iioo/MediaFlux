@@ -42,6 +42,9 @@ class IndexerModelTests(unittest.TestCase):
             ],
             year=2026,
             media_type="TV",
+            sort_mode="published_desc",
+            season=2,
+            episode=11,
             page=2,
         )
 
@@ -51,6 +54,9 @@ class IndexerModelTests(unittest.TestCase):
         self.assertEqual(request.aliases, ("Tefuda ga Oome no Victoria",))
         self.assertEqual(request.year, 2026)
         self.assertEqual(request.media_type, "tv")
+        self.assertEqual(request.sort_mode, "published_desc")
+        self.assertEqual(request.season, 2)
+        self.assertEqual(request.episode, 11)
         self.assertEqual(request.page, 2)
         self.assertEqual(
             request.cache_identity(),
@@ -61,6 +67,9 @@ class IndexerModelTests(unittest.TestCase):
                 ("Tefuda ga Oome no Victoria",),
                 2026,
                 "tv",
+                "published_desc",
+                2,
+                11,
             ),
         )
 
@@ -72,7 +81,13 @@ class IndexerModelTests(unittest.TestCase):
             {"title": "Demo", "aliases": ["x" * 121]},
             {"title": "Demo", "year": 1799},
             {"title": "Demo", "year": True},
+            {"title": "Demo", "year": 2026.5},
             {"title": "Demo", "media_type": "person"},
+            {"title": "Demo", "sort_mode": "random"},
+            {"title": "Demo", "season": 101},
+            {"title": "Demo", "season": 1.5},
+            {"title": "Demo", "episode": 0},
+            {"title": "Demo", "episode": "1.5"},
             {"title": "Demo", "page": 0},
         )
         for values in invalid_cases:

@@ -221,6 +221,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "english_title:",
             "aliases,",
             "media_type:",
+            "sort_mode: state.resourceSort",
             "method: 'POST'",
             "'Content-Type': 'application/json'",
             "JSON.stringify(searchPayload)",
@@ -359,7 +360,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             ),
         )
 
-    def test_resource_sorting_is_local_stable_and_exposes_episode_order(self):
+    def test_resource_sorting_is_stable_and_refreshes_server_side_candidate_window(self):
         for contract in (
             "const RESOURCE_SORT_OPTIONS",
             "['published_desc', '发布时间：新到旧']",
@@ -370,14 +371,16 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "function compareResourceResults",
             "function sortedResourceResults",
             "function setResourceSort",
+            "{resort: true}",
+            "排序刷新失败，现有结果已保留",
             "list.replaceChildren(...orderedRows)",
             "left.episode_end ?? left.episode",
             "right.episode_end ?? right.episode",
         ):
             self.assertIn(contract, self.script)
-        self.assertNotRegex(
+        self.assertRegex(
             self.script,
-            re.compile(r"function setResourceSort\([^)]*\)[\s\S]{0,700}(?:INDEXER_SEARCH_PATH|loadResources\()", re.S),
+            re.compile(r"async function setResourceSort\([^)]*\)[\s\S]{0,900}loadResources\(", re.S),
         )
         self.assertRegex(
             self.styles,

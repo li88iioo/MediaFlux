@@ -16,6 +16,7 @@ from app.indexers.errors import (
     IndexerValidationError,
 )
 from app.indexers.models import IndexerMediaSearchRequest
+from app.indexers.release import parse_indexer_release_position
 from app.indexers.runtime import get_indexer_service
 from app.modules.indexer_download import (
     DownloadRequestCreationError as _DownloadRequestCreationError,
@@ -25,7 +26,6 @@ from app.modules.indexer_download import (
     resubmit_indexer_download_request,
 )
 from app.modules.download_dispatcher import public_dispatch_summary
-from app.modules.scraper import parse_release_position
 from app.web import api_error, api_response, require_api_login
 
 
@@ -84,7 +84,7 @@ def _public_source_url(service, item) -> str | None:
 def _public_search_item(item, service=None) -> dict[str, Any]:
     payload = item.to_public_dict()
     payload["source_url"] = _public_source_url(service, item)
-    payload.update(parse_release_position(item.title))
+    payload.update(parse_indexer_release_position(item.title))
     return payload
 
 
@@ -202,6 +202,9 @@ def _media_request(payload: Any) -> tuple[IndexerMediaSearchRequest, list[str] |
         "aliases",
         "year",
         "media_type",
+        "sort_mode",
+        "season",
+        "episode",
         "page",
         "sites",
     }
@@ -228,6 +231,9 @@ def _media_request(payload: Any) -> tuple[IndexerMediaSearchRequest, list[str] |
         aliases=aliases,
         year=payload.get("year"),
         media_type=payload.get("media_type", ""),
+        sort_mode=payload.get("sort_mode", "relevance_desc"),
+        season=payload.get("season"),
+        episode=payload.get("episode"),
         page=payload.get("page", 1),
     )
     return request, site_ids or None
@@ -246,9 +252,10 @@ async def search(
     q: str = Query(default=""),
     page: int = Query(default=1),
     sites: str = Query(default=""),
+    sort: str = Query(default="relevance_desc"),
 ):
     require_api_login(request)
-    unknown = set(request.query_params.keys()) - {"q", "page", "sites"}
+    unknown = set(request.query_params.keys()) - {"q", "page", "sites", "sort"}
     if unknown:
         return api_error(f"未知查询参数: {', '.join(sorted(unknown))}", 400)
     if len(sites) > 128:
@@ -256,7 +263,7 @@ async def search(
     site_ids = [value.strip().lower() for value in sites.split(",") if value.strip()] or None
     service = get_indexer_service()
     try:
-        result = await service.search(q, page, site_ids)
+        result = await service.search(q, page, site_ids, sort_mode=sort)
     except IndexerError as exc:
         return _error_response(exc)
     return api_response(_search_payload(service, result))

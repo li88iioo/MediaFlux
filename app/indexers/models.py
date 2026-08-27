@@ -11,6 +11,14 @@ from .errors import IndexerValidationError
 _QUERY_WHITESPACE = re.compile(r"\s+")
 _DOWNLOAD_STATES = frozenset({"ready", "resolvable", "unavailable"})
 _DOWNLOAD_KINDS = frozenset({"magnet", "torrent"})
+_SORT_MODES = frozenset({
+    "published_desc",
+    "relevance_desc",
+    "episode_desc",
+    "seeders_desc",
+    "size_desc",
+    "size_asc",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +26,9 @@ class IndexerSearchRequest:
     query: str
     page: int = 1
     media_type: str = ""
+    sort_mode: str = "relevance_desc"
+    season: int | None = None
+    episode: int | None = None
 
     @classmethod
     def create(
@@ -26,11 +37,24 @@ class IndexerSearchRequest:
         page: int = 1,
         *,
         media_type: str = "",
+        sort_mode: str = "relevance_desc",
+        season: int | str | None = None,
+        episode: int | str | None = None,
     ) -> "IndexerSearchRequest":
         normalized = _normalize_search_text(query, required=True)
         normalized_media_type = _normalize_media_type(media_type)
+        normalized_sort_mode = _normalize_sort_mode(sort_mode)
+        normalized_season = _normalize_season(season)
+        normalized_episode = _normalize_episode(episode)
         _validate_page(page)
-        return cls(query=normalized, page=page, media_type=normalized_media_type)
+        return cls(
+            query=normalized,
+            page=page,
+            media_type=normalized_media_type,
+            sort_mode=normalized_sort_mode,
+            season=normalized_season,
+            episode=normalized_episode,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +66,9 @@ class IndexerMediaSearchRequest:
     year: int | None = None
     media_type: str = ""
     page: int = 1
+    sort_mode: str = "relevance_desc"
+    season: int | None = None
+    episode: int | None = None
 
     @classmethod
     def create(
@@ -54,6 +81,9 @@ class IndexerMediaSearchRequest:
         year: int | str | None = None,
         media_type: str = "",
         page: int = 1,
+        sort_mode: str = "relevance_desc",
+        season: int | str | None = None,
+        episode: int | str | None = None,
     ) -> "IndexerMediaSearchRequest":
         normalized_title = _normalize_search_text(title, required=True)
         normalized_original = _normalize_search_text(original_title)
@@ -77,6 +107,9 @@ class IndexerMediaSearchRequest:
             normalized_aliases.append(alias)
         normalized_year = _normalize_media_year(year)
         normalized_media_type = _normalize_media_type(media_type)
+        normalized_sort_mode = _normalize_sort_mode(sort_mode)
+        normalized_season = _normalize_season(season)
+        normalized_episode = _normalize_episode(episode)
         _validate_page(page)
         return cls(
             title=normalized_title,
@@ -86,9 +119,24 @@ class IndexerMediaSearchRequest:
             year=normalized_year,
             media_type=normalized_media_type,
             page=page,
+            sort_mode=normalized_sort_mode,
+            season=normalized_season,
+            episode=normalized_episode,
         )
 
-    def cache_identity(self) -> tuple[str, str, str, tuple[str, ...], int | None, str]:
+    def cache_identity(
+        self,
+    ) -> tuple[
+        str,
+        str,
+        str,
+        tuple[str, ...],
+        int | None,
+        str,
+        str,
+        int | None,
+        int | None,
+    ]:
         return (
             self.title,
             self.original_title,
@@ -96,6 +144,9 @@ class IndexerMediaSearchRequest:
             self.aliases,
             self.year,
             self.media_type,
+            self.sort_mode,
+            self.season,
+            self.episode,
         )
 
 
@@ -115,18 +166,61 @@ def _normalize_media_type(value: object) -> str:
     return normalized
 
 
+def _normalize_sort_mode(value: object) -> str:
+    normalized = str(value or "relevance_desc").strip().lower()
+    if normalized not in _SORT_MODES:
+        raise IndexerValidationError("invalid indexer sort mode")
+    return normalized
+
+
+def _normalize_season(value: int | str | None) -> int | None:
+    return _normalize_optional_integer(
+        value,
+        minimum=0,
+        maximum=100,
+        error_message="invalid season",
+    )
+
+
+def _normalize_episode(value: int | str | None) -> int | None:
+    return _normalize_optional_integer(
+        value,
+        minimum=1,
+        maximum=1000,
+        error_message="invalid episode",
+    )
+
+
 def _normalize_media_year(value: int | str | None) -> int | None:
+    return _normalize_optional_integer(
+        value,
+        minimum=1800,
+        maximum=2200,
+        error_message="invalid media year",
+    )
+
+
+def _normalize_optional_integer(
+    value: object,
+    *,
+    minimum: int,
+    maximum: int,
+    error_message: str,
+) -> int | None:
     if value is None or value == "":
         return None
-    if isinstance(value, bool):
-        raise IndexerValidationError("invalid media year")
-    try:
-        year = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise IndexerValidationError("invalid media year") from exc
-    if not 1800 <= year <= 2200:
-        raise IndexerValidationError("invalid media year")
-    return year
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise IndexerValidationError(error_message)
+    if isinstance(value, str):
+        normalized = unicodedata.normalize("NFKC", value).strip()
+        if not normalized.isdecimal():
+            raise IndexerValidationError(error_message)
+        parsed = int(normalized)
+    else:
+        parsed = value
+    if not minimum <= parsed <= maximum:
+        raise IndexerValidationError(error_message)
+    return parsed
 
 
 def _validate_page(page: int) -> None:

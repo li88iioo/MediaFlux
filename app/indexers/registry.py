@@ -47,6 +47,7 @@ def build_default_registry(
     *,
     http_clients: Mapping[str, object] | None = None,
     user_agent: str = "MediaFlux/1.0",
+    nyaa_endpoint_timeout_seconds: float = 4,
     btbtla_min_interval_seconds: float = 5,
     onelou_min_interval_seconds: float = 5,
     animetosho_min_interval_seconds: float = 1,
@@ -111,6 +112,7 @@ def build_default_registry(
                 http=nyaa_http,
                 default_enabled=True,
                 mirror_base_urls=("https://nyaa.net/",),
+                endpoint_timeout_seconds=nyaa_endpoint_timeout_seconds,
             ),
             "sukebei": NyaaAdapter(
                 site_id="sukebei",

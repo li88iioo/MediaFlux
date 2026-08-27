@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
 
@@ -23,6 +24,7 @@ _CATEGORIES = {
     "5": "Porn",
 }
 _INVALID_NUMBER = object()
+_TOKEN_SEPARATORS = re.compile(r"[^0-9a-z\u3400-\u9fff\u3040-\u30ff]+", re.IGNORECASE)
 
 
 class PirateBayAdapter(DirectResultAdapter):
@@ -62,20 +64,30 @@ class PirateBayAdapter(DirectResultAdapter):
         entries = self._parse_entries(response.body)
         if len(entries) == 1 and str(entries[0].get("id") or "") == "0":
             entries = []
-        query_tokens = request.query.lower().split()
+        query_tokens = _search_tokens(request.query)
         items = [
             item
             for entry in entries
-            if (item := self._to_item(entry, query_tokens)) is not None
+            if (item := self._to_item(entry, query_tokens, media_type=request.media_type)) is not None
         ]
         return IndexerPage(items=items, page=1, has_more=False, pagination_supported=False)
 
-    def _to_item(self, entry: dict, query_tokens: list[str]) -> IndexerItem | None:
+    def _to_item(
+        self,
+        entry: dict,
+        query_tokens: tuple[str, ...] | list[str],
+        *,
+        media_type: str = "",
+    ) -> IndexerItem | None:
         title = entry.get("name")
         if not isinstance(title, str):
             return None
         title = title.strip()
-        if not title or not all(token in title.lower() for token in query_tokens):
+        normalized_title = " ".join(_search_tokens(title))
+        if not title or not all(token in normalized_title for token in query_tokens):
+            return None
+        category_code = str(entry.get("category") or "")[:1]
+        if media_type in {"movie", "tv", "anime"} and category_code != "2":
             return None
         info_hash = entry.get("info_hash")
         if not isinstance(info_hash, str):
@@ -98,7 +110,7 @@ class PirateBayAdapter(DirectResultAdapter):
             site_id=self.site_id,
             site_name=self.site_name,
             title=title,
-            category=_CATEGORIES.get(str(entry.get("category") or "")[:1], "Other"),
+            category=_CATEGORIES.get(category_code, "Other"),
             size_bytes=size_bytes,
             seeders=seeders,
             leechers=leechers,
@@ -132,6 +144,11 @@ class PirateBayAdapter(DirectResultAdapter):
             raise IndexerUnavailable(f"The Pirate Bay returned HTTP {status_code}")
         if status_code != 200:
             raise IndexerInvalidResponse(f"The Pirate Bay returned HTTP {status_code}")
+
+
+def _search_tokens(value: object) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return tuple(token for token in _TOKEN_SEPARATORS.sub(" ", normalized).split() if token)
 
 
 def _integer(value) -> int | None | object:

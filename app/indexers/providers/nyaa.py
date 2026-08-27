@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import re
 from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
+import httpx
 
 from ..errors import (
     IndexerError,
     IndexerInvalidResponse,
     IndexerRateLimited,
     IndexerSecurityError,
+    IndexerTimeout,
     IndexerUnavailable,
 )
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
@@ -33,6 +36,7 @@ class NyaaAdapter(DirectResultAdapter):
         http,
         default_enabled: bool,
         mirror_base_urls: tuple[str, ...] = (),
+        endpoint_timeout_seconds: float | None = None,
     ):
         self.site_id = site_id
         self.site_name = site_name
@@ -42,17 +46,50 @@ class NyaaAdapter(DirectResultAdapter):
         # 主站可能按来源 IP 限流（nyaa.si 常见）；镜像与主站同引擎、
         # 布局仅有类名差异，主站限流/不可用时逐个回落。
         self.mirror_base_urls = tuple(mirror_base_urls)
+        self._base_urls = tuple(dict.fromkeys((self.base_url, *self.mirror_base_urls)))
+        self.endpoint_timeout_seconds = (
+            max(0.1, float(endpoint_timeout_seconds))
+            if endpoint_timeout_seconds is not None and len(self._base_urls) > 1
+            else None
+        )
+        # 最近成功的端点优先，避免主站已 429/卡顿时每次搜索仍先重复施压。
+        self._preferred_base_url = self.base_url
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
         last_error: IndexerError | None = None
-        for base_url in (self.base_url, *self.mirror_base_urls):
+        for base_url in self._ordered_base_urls():
             try:
-                return await self._search_base(base_url, request)
-            except (IndexerRateLimited, IndexerUnavailable) as exc:
+                operation = self._search_base(base_url, request)
+                page = (
+                    await asyncio.wait_for(operation, timeout=self.endpoint_timeout_seconds)
+                    if self.endpoint_timeout_seconds is not None
+                    else await operation
+                )
+            except asyncio.TimeoutError:
+                last_error = IndexerTimeout(f"Nyaa endpoint timed out: {base_url}")
+                continue
+            except httpx.TimeoutException:
+                last_error = IndexerTimeout(f"Nyaa endpoint timed out: {base_url}")
+                continue
+            except (
+                IndexerInvalidResponse,
+                IndexerRateLimited,
+                IndexerSecurityError,
+                IndexerUnavailable,
+            ) as exc:
                 last_error = exc
                 continue
-        assert last_error is not None
+            self._preferred_base_url = base_url
+            return page
+        if last_error is None:
+            raise IndexerUnavailable("Nyaa has no configured endpoint")
         raise last_error
+
+    def _ordered_base_urls(self) -> tuple[str, ...]:
+        preferred = self._preferred_base_url
+        if preferred not in self._base_urls:
+            return self._base_urls
+        return (preferred, *(base_url for base_url in self._base_urls if base_url != preferred))
 
     async def resolve(self, stored_result: IndexerItem) -> ResolvedDownload:
         if stored_result.site_id != self.site_id:
@@ -62,7 +99,7 @@ class NyaaAdapter(DirectResultAdapter):
         if stored_result.torrent_url:
             # 镜像返回的 torrent 直链落在镜像域名上，宿主校验覆盖全部注册域名。
             last_error: IndexerSecurityError | None = None
-            for base_url in (self.base_url, *self.mirror_base_urls):
+            for base_url in self._base_urls:
                 try:
                     safe_url = fixed_host_join(base_url, stored_result.torrent_url)
                 except IndexerSecurityError as exc:
@@ -106,8 +143,7 @@ class NyaaAdapter(DirectResultAdapter):
                 "f": "0",
                 "c": category,
                 "q": request.query,
-                "s": "seeders",
-                "o": "desc",
+                **_search_sort_params(getattr(request, "sort_mode", "relevance_desc")),
                 "p": str(request.page),
             },
         )
@@ -284,6 +320,18 @@ def _integer(value: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _search_sort_params(sort_mode: str) -> dict[str, str]:
+    mappings = {
+        "published_desc": ("id", "desc"),
+        "episode_desc": ("id", "desc"),
+        "seeders_desc": ("seeders", "desc"),
+        "size_desc": ("size", "desc"),
+        "size_asc": ("size", "asc"),
+    }
+    field, order = mappings.get(str(sort_mode or ""), ("seeders", "desc"))
+    return {"s": field, "o": order}
 
 
 def _page_number(href: str | None) -> int:

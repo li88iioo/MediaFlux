@@ -1327,6 +1327,7 @@
             aliases,
             year: detail.year || item.year || null,
             media_type: detail.media_type || item.media_type || '',
+            sort_mode: state.resourceSort,
             page,
         };
     }
@@ -1666,11 +1667,17 @@
         syncResourceHeadTitle();
     }
 
-    function setResourceSort(sort) {
+    async function setResourceSort(sort) {
         const next = RESOURCE_SORT_OPTIONS.some(([value]) => value === sort) ? sort : 'published_desc';
+        if (next === state.resourceSort) return;
         state.resourceSort = next;
+        // 先对现有结果即时重排，再重新请求第一页。服务端会按排序模式执行
+        // 每站点结果截断；仅做本地排序会永久遗漏截断前未进入当前页的候选。
         renderResourceResultsList(true);
         syncResourceControls();
+        const context = state.resourceSearchContext;
+        if (!context) return;
+        await loadResources(context.item, context.detail, context.detailRequestId, {resort: true});
     }
 
     function setActiveResourceSite(siteId) {
@@ -2597,7 +2604,9 @@
             sort.append(option);
         });
         sort.value = state.resourceSort;
-        sort.addEventListener('change', () => setResourceSort(sort.value));
+        sort.addEventListener('change', () => {
+            void setResourceSort(sort.value);
+        });
         sortLabel.append(sort);
         tools.append(sortLabel);
         head.append(copy, tools);
@@ -2654,9 +2663,10 @@
         const siteId = String(options.siteId || '');
         const merge = Boolean(options.merge && siteId);
         const append = Boolean(options.append);
+        const resort = Boolean(options.resort);
         const requestedPage = Math.max(1, Number.parseInt(options.page || 1, 10) || 1);
         const siteIds = asArray(options.siteIds).map((value) => String(value || '')).filter(Boolean);
-        const resourceSkeletonShownAt = !append && !merge ? Date.now() : 0;
+        const resourceSkeletonShownAt = !append && !merge && !resort ? Date.now() : 0;
         if (resourceSkeletonShownAt) list.replaceChildren(resourceLoadingRows());
         const searchPayload = resourceSearchPayload(item, detail, requestedPage);
         if (siteId) searchPayload.sites = [siteId];
@@ -2702,7 +2712,7 @@
             } else if (!append) {
                 state.resourceResults.clear();
                 state.resourceSourceOrder.clear();
-                state.activeResourceSiteId = '';
+                if (!resort) state.activeResourceSiteId = '';
                 state.resourceSubmitState.clear();
                 state.selectedResourceIds.clear();
             }
@@ -2735,6 +2745,10 @@
             if (!resourceSearchIsCurrent(resourceSearchRequestId, detailRequestId)) return false;
             if (append) {
                 renderResourceNotice({type: 'error', message: '更多资源加载失败，现有结果已保留'});
+                return false;
+            }
+            if (resort) {
+                renderResourceNotice({type: 'error', message: '排序刷新失败，现有结果已保留'});
                 return false;
             }
             if (merge) {

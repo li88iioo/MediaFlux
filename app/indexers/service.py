@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from time import perf_counter
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from time import perf_counter
 from typing import Callable, Iterable
 
 from app.logger import get_logger
@@ -31,6 +31,7 @@ from .models import (
 from .providers.base import magnet_infohash
 from .query_plan import build_site_queries
 from .ranking import annotate_clusters, rank_item
+from .release import parse_indexer_release_position
 from .registry import IndexerRegistry
 from .result_store import IndexerResultStore
 
@@ -116,11 +117,23 @@ class IndexerService:
         query: str,
         page: int = 1,
         site_ids: Iterable[str] | None = None,
+        *,
+        sort_mode: str = "relevance_desc",
     ) -> AggregatedIndexerResult:
-        request = IndexerSearchRequest.create(query, page)
+        request = IndexerSearchRequest.create(
+            query,
+            page,
+            sort_mode=sort_mode,
+        )
         selected = self._select_sites(site_ids)
         plans = {site_id: (request.query,) for site_id in selected}
-        cache_key = ("query", request.query, request.page, selected)
+        cache_key = (
+            "query",
+            request.query,
+            request.page,
+            request.sort_mode,
+            selected,
+        )
         return await self._search_plans(
             display_query=request.query,
             page=request.page,
@@ -128,6 +141,7 @@ class IndexerService:
             plans=plans,
             cache_key=cache_key,
             ranking_context=None,
+            sort_mode=request.sort_mode,
         )
 
     async def search_media(
@@ -148,6 +162,7 @@ class IndexerService:
             plans=plans,
             cache_key=cache_key,
             ranking_context=request,
+            sort_mode=request.sort_mode,
         )
 
     async def _search_plans(
@@ -159,6 +174,7 @@ class IndexerService:
         plans: dict[str, tuple[str, ...]],
         cache_key: tuple[object, ...],
         ranking_context: IndexerMediaSearchRequest | None,
+        sort_mode: str,
     ) -> AggregatedIndexerResult:
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -176,6 +192,7 @@ class IndexerService:
                     plans=plans,
                     cache_key=cache_key,
                     ranking_context=ranking_context,
+                    sort_mode=sort_mode,
                 ))
                 self._inflight[inflight_key] = task
 
@@ -213,15 +230,21 @@ class IndexerService:
         plans: dict[str, tuple[str, ...]],
         cache_key: tuple[object, ...],
         ranking_context: IndexerMediaSearchRequest | None,
+        sort_mode: str,
     ) -> AggregatedIndexerResult:
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
 
-        media_type = ranking_context.media_type if ranking_context is not None else ""
         tasks = {
             site_id: asyncio.create_task(
-                self._search_site_plan(site_id, plans[site_id], page, media_type=media_type)
+                self._search_site_plan(
+                    site_id,
+                    plans[site_id],
+                    page,
+                    ranking_context=ranking_context,
+                    sort_mode=sort_mode,
+                )
             )
             for site_id in selected
         }
@@ -253,7 +276,6 @@ class IndexerService:
         site_queries: dict[str, str] = {}
         site_attempt_counts: dict[str, int] = {}
         site_page_states: dict[str, IndexerSitePageState] = {}
-        seen_infohashes: set[str] = set()
         has_more = False
         for site_index, site_id in enumerate(selected):
             outcome = outcome_by_site.get(site_id)
@@ -275,6 +297,7 @@ class IndexerService:
             site_attempt_counts[site_id] = max(0, outcome.attempts)
             if outcome.error is not None:
                 errors.append(outcome.error)
+            if outcome.page is None:
                 site_page_states[site_id] = IndexerSitePageState(
                     pagination_supported=adapter_pagination_supported,
                     requested_page=page,
@@ -283,7 +306,10 @@ class IndexerService:
                 )
                 logger.warning(
                     "indexer.site_search site_id=%s outcome=%s duration_ms=%d attempts=%d item_count=0",
-                    site_id, outcome.error.code, outcome.duration_ms, outcome.attempts,
+                    site_id,
+                    outcome.error.code if outcome.error is not None else "invalid_response",
+                    outcome.duration_ms,
+                    outcome.attempts,
                 )
                 continue
             succeeded.append(site_id)
@@ -303,11 +329,6 @@ class IndexerService:
                     errors.append(self._public_error(site_id, IndexerInvalidResponse("provider returned mismatched site_id")))
                     continue
                 site_item_counts[site_id] += 1
-                infohash = magnet_infohash(candidate.magnet)
-                if infohash and infohash in seen_infohashes:
-                    continue
-                if infohash:
-                    seen_infohashes.add(infohash)
                 ranked = rank_item(
                     candidate,
                     media=ranking_context,
@@ -315,20 +336,19 @@ class IndexerService:
                     now=self._clock(),
                 )
                 candidates.append((site_index, provider_index, ranked))
-                site_visible_counts[site_id] += 1
             logger.info(
                 "indexer.site_search site_id=%s outcome=%s duration_ms=%d attempts=%d item_count=%d",
-                site_id, "success" if provider_items else "empty", outcome.duration_ms, outcome.attempts,
+                site_id,
+                "partial" if outcome.error is not None else ("success" if provider_items else "empty"),
+                outcome.duration_ms,
+                outcome.attempts,
                 site_item_counts[site_id],
             )
 
-        candidates.sort(key=lambda entry: (
-            -(entry[2].relevance_score or 0),
-            -(entry[2].seeders if entry[2].seeders is not None else -1),
-            -(entry[2].published_at.timestamp() if entry[2].published_at is not None else float("-inf")),
-            entry[0],
-            entry[1],
-        ))
+        candidates = self._deduplicate_candidates(candidates)
+        for _site_index, _provider_index, candidate in candidates:
+            site_visible_counts[candidate.site_id] += 1
+        candidates.sort(key=lambda entry: self._candidate_sort_key(entry, sort_mode))
         ranked_items = annotate_clusters([entry[2] for entry in candidates])
         items: list[IndexerItem] = []
         for candidate in ranked_items:
@@ -440,13 +460,122 @@ class IndexerService:
             raise IndexerValidationError("at least one enabled indexer site is required")
         return tuple(selected)
 
+    @staticmethod
+    def _published_timestamp(value: datetime | None) -> float:
+        if value is None:
+            return -1.0
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+
+    @classmethod
+    def _candidate_preference(
+        cls,
+        entry: tuple[int, int, IndexerItem],
+    ) -> tuple[object, ...]:
+        site_index, provider_index, item = entry
+        state_rank = {"ready": 2, "resolvable": 1}.get(item.download_state, 0)
+        actionable_rank = int(state_rank > 0)
+        published_value = cls._published_timestamp(item.published_at)
+        metadata_count = sum(
+            value is not None and value != ""
+            for value in (
+                item.size_bytes,
+                item.seeders,
+                item.leechers,
+                item.downloads,
+                item.published_at,
+                item.detail_url,
+                item.torrent_url,
+            )
+        )
+        return (
+            actionable_rank,
+            int(item.relevance_score or 0),
+            state_rank,
+            int(item.seeders if item.seeders is not None else -1),
+            published_value,
+            metadata_count,
+            -site_index,
+            -provider_index,
+        )
+
+    @classmethod
+    def _deduplicate_candidates(
+        cls,
+        candidates: list[tuple[int, int, IndexerItem]],
+    ) -> list[tuple[int, int, IndexerItem]]:
+        """Keep the most useful representation when multiple sites expose one infohash."""
+
+        output: list[tuple[int, int, IndexerItem]] = []
+        infohash_positions: dict[str, int] = {}
+        for entry in candidates:
+            infohash = magnet_infohash(entry[2].magnet)
+            if not infohash:
+                output.append(entry)
+                continue
+            existing_position = infohash_positions.get(infohash)
+            if existing_position is None:
+                infohash_positions[infohash] = len(output)
+                output.append(entry)
+                continue
+            existing = output[existing_position]
+            if cls._candidate_preference(entry) > cls._candidate_preference(existing):
+                output[existing_position] = entry
+        return output
+
+    @classmethod
+    def _candidate_sort_key(
+        cls,
+        entry: tuple[int, int, IndexerItem],
+        sort_mode: str,
+    ) -> tuple[object, ...]:
+        site_index, provider_index, item = entry
+        relevance = int(item.relevance_score or 0)
+        seeders = int(item.seeders if item.seeders is not None else -1)
+        size = item.size_bytes
+        published_value = cls._published_timestamp(item.published_at)
+        position = parse_indexer_release_position(item.title)
+        season = position.get("season")
+        episode = position.get("episode")
+        episode_end = position.get("episode_end") or episode
+        if "episode_exact" in item.match_reasons:
+            position_priority = 0
+        elif "episode_range" in item.match_reasons:
+            position_priority = 1
+        elif "season_match" in item.match_reasons:
+            position_priority = 2
+        elif "episode_conflict" in item.match_reasons:
+            position_priority = 4
+        else:
+            position_priority = 3
+        stable = (-relevance, -seeders, -published_value, site_index, provider_index)
+        if sort_mode == "published_desc":
+            return (position_priority, -published_value, -relevance, -seeders, site_index, provider_index)
+        if sort_mode == "episode_desc":
+            return (
+                position_priority,
+                -(season if season is not None else -1),
+                -(episode_end if episode_end is not None else -1),
+                -(episode if episode is not None else -1),
+                *stable,
+            )
+        if sort_mode == "seeders_desc":
+            return (position_priority, -seeders, -relevance, -published_value, site_index, provider_index)
+        if sort_mode == "size_desc":
+            return (position_priority, size is None, -(size if size is not None else 0), *stable)
+        if sort_mode == "size_asc":
+            return (position_priority, size is None, size if size is not None else 0, *stable)
+        return (position_priority, *stable)
+
     async def _search_site_plan(
         self,
         site_id: str,
         queries: tuple[str, ...],
         page: int,
         *,
-        media_type: str = "",
+        ranking_context: IndexerMediaSearchRequest | None,
+        sort_mode: str,
     ) -> _ProviderOutcome:
         circuit_error = self._circuit_error(site_id)
         if circuit_error is not None:
@@ -456,27 +585,184 @@ class IndexerService:
                 query=queries[0] if queries else "",
                 attempts=0,
             )
+        adapter = self.registry.get(site_id)
+        timeout_overhead = getattr(adapter, "search_timeout_overhead_seconds", None)
+        overhead_seconds = float(timeout_overhead()) if callable(timeout_overhead) else 0.0
+        plan_budget_seconds = self.site_timeout_seconds + max(0.0, overhead_seconds)
+        plan_started = perf_counter()
         last_outcome: _ProviderOutcome | None = None
+        last_error: _ProviderOutcome | None = None
+        merged_items: list[IndexerItem] = []
+        contributed_query = ""
+        has_more = False
+        pagination_supported = bool(
+            getattr(getattr(adapter, "capabilities", None), "pagination_supported", False)
+        )
+        attempts_made = 0
+        duration_ms = 0
         for attempts, query in enumerate(queries, start=1):
+            remaining_seconds = plan_budget_seconds - (perf_counter() - plan_started)
+            if attempts > 1 and remaining_seconds <= 0:
+                break
+            attempts_made = attempts
+            media_type = ranking_context.media_type if ranking_context is not None else ""
+            season = ranking_context.season if ranking_context is not None else None
+            episode = ranking_context.episode if ranking_context is not None else None
             outcome = await self._search_site(
                 site_id,
-                IndexerSearchRequest.create(query, page, media_type=media_type),
+                IndexerSearchRequest.create(
+                    query,
+                    page,
+                    media_type=media_type,
+                    sort_mode=sort_mode,
+                    season=season,
+                    episode=episode,
+                ),
+                timeout_seconds=remaining_seconds if attempts > 1 else None,
             )
             outcome.query = query
             outcome.attempts = attempts
+            duration_ms += outcome.duration_ms
             if outcome.error is not None:
                 self._record_circuit_failure(site_id, code=outcome.error.code)
-                return outcome
+                last_error = outcome
+                break
             self._record_circuit_success(site_id)
-            if outcome.page is not None and outcome.page.items:
-                return outcome
             last_outcome = outcome
+            if outcome.page is None:
+                continue
+            has_more = has_more or bool(outcome.page.has_more)
+            pagination_supported = pagination_supported or bool(outcome.page.pagination_supported)
+            if outcome.page.items:
+                contributed_query = query
+                plan_items = [
+                    rank_item(
+                        item,
+                        media=ranking_context,
+                        fallback_query=query,
+                        now=self._clock(),
+                    )
+                    for item in outcome.page.items
+                ]
+                merged_items = self._merge_plan_items(merged_items, plan_items)
+                if self._site_plan_quality_satisfied(
+                    merged_items,
+                    media=ranking_context,
+                    fallback_query=query,
+                ):
+                    break
+        if merged_items:
+            ranked_items = [
+                rank_item(
+                    item,
+                    media=ranking_context,
+                    fallback_query=contributed_query or (queries[0] if queries else ""),
+                    now=self._clock(),
+                )
+                for item in merged_items
+            ]
+            ranked_entries = list(enumerate(ranked_items))
+            ranked_entries.sort(
+                key=lambda entry: self._candidate_sort_key(
+                    (0, entry[0], entry[1]),
+                    sort_mode,
+                )
+            )
+            ranked_items = [item for _provider_index, item in ranked_entries]
+            return _ProviderOutcome(
+                site_id=site_id,
+                page=IndexerPage(
+                    items=ranked_items[: self.max_results_per_site],
+                    page=page,
+                    has_more=has_more,
+                    pagination_supported=pagination_supported,
+                ),
+                query=contributed_query or (queries[0] if queries else ""),
+                attempts=attempts_made,
+                duration_ms=duration_ms,
+                error=last_error.error if last_error is not None else None,
+            )
+        if last_error is not None:
+            last_error.attempts = attempts_made
+            last_error.duration_ms = duration_ms
+            return last_error
         if last_outcome is not None:
+            last_outcome.attempts = attempts_made
+            last_outcome.duration_ms = duration_ms
             return last_outcome
         return _ProviderOutcome(
             site_id=site_id,
             error=self._public_error(site_id, IndexerValidationError("site query plan is empty")),
         )
+
+    @staticmethod
+    def _plan_item_keys(item: IndexerItem) -> tuple[tuple[str, str], ...]:
+        keys: list[tuple[str, str]] = []
+        infohash = magnet_infohash(item.magnet)
+        if infohash:
+            keys.append(("hash", infohash))
+        if item.detail_url:
+            keys.append(("url", item.detail_url))
+        if not keys:
+            keys.append(("title", " ".join(item.title.casefold().split())))
+        return tuple(keys)
+
+    @classmethod
+    def _merge_plan_items(
+        cls,
+        current: list[IndexerItem],
+        incoming: list[IndexerItem],
+    ) -> list[IndexerItem]:
+        output = list(current)
+        positions: dict[tuple[str, str], int] = {}
+        for position, item in enumerate(output):
+            for key in cls._plan_item_keys(item):
+                positions.setdefault(key, position)
+        for item in incoming:
+            keys = cls._plan_item_keys(item)
+            existing_position = next(
+                (positions[key] for key in keys if key in positions),
+                None,
+            )
+            if existing_position is not None:
+                existing = output[existing_position]
+                if cls._candidate_preference((0, 0, item)) > cls._candidate_preference(
+                    (0, 0, existing)
+                ):
+                    output[existing_position] = item
+                for key in keys:
+                    positions.setdefault(key, existing_position)
+                continue
+            position = len(output)
+            output.append(item)
+            for key in keys:
+                positions[key] = position
+        return output
+
+    @staticmethod
+    def _site_plan_quality_satisfied(
+        items: list[IndexerItem],
+        *,
+        media: IndexerMediaSearchRequest | None,
+        fallback_query: str,
+    ) -> bool:
+        if not items:
+            return False
+        if media is None:
+            return True
+        ranked = [
+            rank_item(item, media=media, fallback_query=fallback_query)
+            for item in items
+            if item.download_state in {"ready", "resolvable"}
+        ]
+        if media.episode is not None:
+            return any(
+                int(item.relevance_score or 0) >= 78
+                and "episode_exact" in item.match_reasons
+                for item in ranked
+            )
+        strong = [item for item in ranked if int(item.relevance_score or 0) >= 78]
+        return len(strong) >= 3 or any(int(item.relevance_score or 0) >= 80 for item in strong)
 
     def _circuit_error(self, site_id: str) -> IndexerProviderError | None:
         now = self._clock()
@@ -531,6 +817,8 @@ class IndexerService:
         self,
         site_id: str,
         request: IndexerSearchRequest,
+        *,
+        timeout_seconds: float | None = None,
     ) -> _ProviderOutcome:
         adapter = self.registry.get(site_id)
         started = perf_counter()
@@ -540,7 +828,12 @@ class IndexerService:
                 await wait_for_slot(request)
             timeout_overhead = getattr(adapter, "search_timeout_overhead_seconds", None)
             overhead_seconds = float(timeout_overhead()) if callable(timeout_overhead) else 0.0
-            provider_timeout_seconds = self.site_timeout_seconds + max(0.0, overhead_seconds)
+            default_timeout_seconds = self.site_timeout_seconds + max(0.0, overhead_seconds)
+            provider_timeout_seconds = (
+                default_timeout_seconds
+                if timeout_seconds is None
+                else max(0.001, min(default_timeout_seconds, float(timeout_seconds)))
+            )
             async with self._loop_semaphore():
                 page = await asyncio.wait_for(adapter.search(request), timeout=provider_timeout_seconds)
             if not isinstance(page, IndexerPage):

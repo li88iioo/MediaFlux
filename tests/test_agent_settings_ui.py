@@ -108,7 +108,6 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn('class="settings-telemetry-card"', downloads_panel)
         self.assertNotIn('data-key="DOWNLOAD_TORRENT_RETENTION_DAYS"', downloads_panel)
         self.assertNotIn('class="qb-connection-status"', downloads_panel)
-
         downloads_ui = (
             Path("app/templates/downloads.html").read_text(encoding="utf-8")
             + Path("app/static/js/downloads.js").read_text(encoding="utf-8")
@@ -134,6 +133,8 @@ class AgentSettingsUiTests(unittest.TestCase):
         telegram_panel = html[html.index('id="settings-panel-telegram"'):html.index('id="settings-panel-agent"')]
         discovery_panel = html[html.index('id="settings-panel-discovery"'):html.index('id="settings-panel-downloads"')]
         metadata_panel = html[html.index('id="settings-panel-metadata"'):html.index('id="settings-panel-discovery"')]
+        self.assertIn("1LOU Google 回退", discovery_panel)
+        self.assertNotIn("1LOU 优先使用 Google", html)
         self.assertIn("TMDB 候选召回模式", metadata_panel)
         self.assertIn("AI 线索可信门槛", metadata_panel)
         self.assertNotIn('data-key="TMDB_PREVIEW_CONFIRM"', metadata_panel)

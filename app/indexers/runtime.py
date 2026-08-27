@@ -334,8 +334,13 @@ def _user_agent() -> str:
 
 
 def build_indexer_service() -> IndexerService:
+    site_timeout_seconds = _bounded_int("INDEXER_SITE_TIMEOUT_SECONDS", 10, 2, 60)
+    # Nyaa 有主站和镜像两个端点；单端点预算必须显著短于总站点预算，
+    # 否则主站卡满后服务层会取消整个适配器，镜像永远没有执行机会。
+    nyaa_endpoint_timeout_seconds = max(0.5, min(4.0, site_timeout_seconds * 0.4))
     registry = build_default_registry(
         user_agent=_user_agent(),
+        nyaa_endpoint_timeout_seconds=nyaa_endpoint_timeout_seconds,
         btbtla_min_interval_seconds=_bounded_int(
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS", 5, 0, 60
         ),
@@ -356,7 +361,7 @@ def build_indexer_service() -> IndexerService:
             ttl_seconds=_bounded_int("INDEXER_RESULT_TTL_SECONDS", 600, 60, 3600),
             max_entries=10_000,
         ),
-        site_timeout_seconds=_bounded_int("INDEXER_SITE_TIMEOUT_SECONDS", 10, 2, 60),
+        site_timeout_seconds=site_timeout_seconds,
         total_timeout_seconds=_bounded_int("INDEXER_TOTAL_TIMEOUT_SECONDS", 15, 3, 120),
         max_results_per_site=_bounded_int("INDEXER_MAX_RESULTS_PER_SITE", 40, 1, 100),
         max_concurrency=_bounded_int("INDEXER_MAX_CONCURRENCY", 5, 1, 10),

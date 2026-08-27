@@ -79,6 +79,7 @@ ONELOU_API_JSON = """
    "create_date": 1720000000, "fid": 4, "username": "u", "posts": 1}
 ]}}
 """.encode()
+ONELOU_API_EMPTY = b'{"ok": 1, "data": {"hits": []}}'
 
 ONELOU_DETAIL_HTML = b'<a href="/attach-download-frieren.torrent">Frieren.torrent</a>'
 ONELOU_DETAIL_MAGNET_HTML = (
@@ -152,6 +153,31 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969%2Fannounce", item.magnet)
         self.assertIn("tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969", item.magnet)
         self.assertIn("tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce", item.magnet)
+
+    async def test_tpb_normalizes_query_punctuation_before_local_filtering(self):
+        payload = b'''[{"id":"1","name":"Dune Part Two 2024 2160p",\n          "info_hash":"0123456789ABCDEF0123456789ABCDEF01234567",\n          "size":"100","seeders":"1","leechers":"0","added":"1720000000","category":"201"}]'''
+        adapter = PirateBayAdapter(
+            http=FakeHttpClient(payload, content_type="application/json"),
+        )
+
+        page = await adapter.search(IndexerSearchRequest.create("Dune: Part Two"))
+
+        self.assertEqual([item.title for item in page.items], ["Dune Part Two 2024 2160p"])
+
+    async def test_tpb_filters_non_video_categories_for_media_searches(self):
+        payload = b'''[
+          {"id":"1","name":"Demo Movie Video","info_hash":"0123456789ABCDEF0123456789ABCDEF01234567",
+           "size":"100","seeders":"1","leechers":"0","added":"1720000000","category":"201"},
+          {"id":"2","name":"Demo Movie Game","info_hash":"89ABCDEF0123456789ABCDEF0123456789ABCDEF",
+           "size":"100","seeders":"1","leechers":"0","added":"1720000000","category":"401"}
+        ]'''
+        adapter = PirateBayAdapter(
+            http=FakeHttpClient(payload, content_type="application/json"),
+        )
+
+        page = await adapter.search(IndexerSearchRequest.create("Demo Movie", media_type="movie"))
+
+        self.assertEqual([item.title for item in page.items], ["Demo Movie Video"])
 
     async def test_tpb_treats_api_no_result_sentinel_as_empty_page(self):
         http = FakeHttpClient(b'[{"id":"0"}]', content_type="application/json")
@@ -377,6 +403,22 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(http.calls[0]["params"]["p"], "1")
         self.assertEqual(http.calls[0]["params"]["q"], "Frieren")
 
+    async def test_nyaa_maps_requested_sort_to_upstream_subset(self):
+        http = FakeHttpClient(NYAA_HTML)
+        adapter = NyaaAdapter(
+            site_id="nyaa",
+            site_name="Nyaa",
+            base_url="https://nyaa.si/",
+            http=http,
+            default_enabled=True,
+        )
+
+        await adapter.search(IndexerSearchRequest.create("Frieren", sort_mode="published_desc"))
+        await adapter.search(IndexerSearchRequest.create("Frieren", sort_mode="size_asc"))
+
+        self.assertEqual((http.calls[0]["params"]["s"], http.calls[0]["params"]["o"]), ("id", "desc"))
+        self.assertEqual((http.calls[1]["params"]["s"], http.calls[1]["params"]["o"]), ("size", "asc"))
+
     async def test_nyaa_ignores_comment_links_and_bad_rows(self):
         body = b"""
         <table class="torrent-list"><tbody>
@@ -427,7 +469,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
                     body=body,
                 )
 
-        http = ScriptedHttpClient([(429, b""), (200, NYAA_HTML)])
+        http = ScriptedHttpClient([(429, b""), (200, NYAA_HTML), (200, NYAA_HTML)])
         adapter = NyaaAdapter(
             site_id="nyaa",
             site_name="Nyaa",
@@ -446,8 +488,49 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         # 镜像返回的相对链接必须落在镜像域名上。
         self.assertEqual(page.items[0].detail_url, "https://nyaa.net/view/123")
 
+        await adapter.search(IndexerSearchRequest.create("Frieren 2", page=1))
+        self.assertEqual(len(http.calls), 3)
+        self.assertTrue(
+            http.calls[2]["url"].startswith("https://nyaa.net/"),
+            "最近成功的镜像应成为下一次搜索首选，避免重复请求已限流主站",
+        )
+
         resolved = await adapter.resolve(page.items[0])
         self.assertEqual(resolved.kind, "magnet")
+
+    async def test_nyaa_endpoint_timeout_still_leaves_budget_for_mirror(self):
+        class SlowPrimaryHttpClient:
+            def __init__(self):
+                self.calls = []
+
+            async def get(self, url, *, params=None, headers=None, max_redirects=3):
+                self.calls.append({"url": url, "params": dict(params or {})})
+                if url.startswith("https://nyaa.si/"):
+                    await asyncio.sleep(0.2)
+                return IndexerHttpResponse(
+                    url=url,
+                    status_code=200,
+                    headers={"content-type": "text/html; charset=utf-8"},
+                    body=NYAA_HTML,
+                )
+
+        http = SlowPrimaryHttpClient()
+        adapter = NyaaAdapter(
+            site_id="nyaa",
+            site_name="Nyaa",
+            base_url="https://nyaa.si/",
+            http=http,
+            default_enabled=True,
+            mirror_base_urls=("https://nyaa.net/",),
+            endpoint_timeout_seconds=0.01,
+        )
+
+        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
+
+        self.assertEqual(len(page.items), 1)
+        self.assertEqual(len(http.calls), 2)
+        self.assertTrue(http.calls[0]["url"].startswith("https://nyaa.si/"))
+        self.assertTrue(http.calls[1]["url"].startswith("https://nyaa.net/"))
 
     async def test_nyaa_mirror_torrent_url_resolves_against_mirror_host(self):
         adapter = NyaaAdapter(
@@ -845,6 +928,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page.has_more)
         self.assertEqual(len(http.calls), 1, "search must not visit thread pages")
         self.assertIn("/search/api/search.php", http.calls[0]["url"])
+        self.assertEqual(http.calls[0]["params"]["sort"], "newest")
         self.assertEqual(len(page.items), 1, "cloud-drive-only results stay filtered")
         item = page.items[0]
         self.assertEqual(item.title, "Frieren Complete 1080p")
@@ -882,7 +966,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(sleeps, [5.0])
 
-    async def test_onelou_uses_google_site_search_without_touching_native_api(self):
+    async def test_onelou_prefers_native_newest_results_without_touching_google(self):
         native_http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
         google_http = FakeHttpClient(ONELOU_GOOGLE_HTML)
         adapter = OneLouAdapter(
@@ -892,14 +976,14 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
 
         page = await adapter.search(IndexerSearchRequest.create("Frieren"))
 
-        self.assertEqual(native_http.calls, [])
-        self.assertEqual(len(google_http.calls), 1)
-        self.assertEqual(google_http.calls[0]["params"]["q"], "Frieren site:1lou.me")
+        self.assertEqual(len(native_http.calls), 1)
+        self.assertEqual(native_http.calls[0]["params"]["sort"], "newest")
+        self.assertEqual(google_http.calls, [])
         self.assertEqual([item.title for item in page.items], ["Frieren Complete 1080p"])
         self.assertEqual(page.items[0].detail_url, "https://www.1lou.me/thread-101.htm")
 
     async def test_onelou_google_respects_http_charset_over_conflicting_meta(self):
-        native_http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
+        native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
         google_http = FakeHttpClient(
             ONELOU_GOOGLE_CONFLICTING_META_HTML,
             content_type="text/html; charset=utf-8",
@@ -911,12 +995,12 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
 
         page = await adapter.search(IndexerSearchRequest.create("Frieren"))
 
-        self.assertEqual(native_http.calls, [])
+        self.assertEqual(len(native_http.calls), 1)
         self.assertEqual([item.title for item in page.items], ["Frieren Complete 1080p"])
 
-    async def test_onelou_google_rate_limit_falls_back_to_native(self):
-        native_http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
-        google_http = FakeHttpClient(b"slow down", status_code=429)
+    async def test_onelou_native_rate_limit_falls_back_to_google(self):
+        native_http = FakeHttpClient(b"slow down", status_code=429)
+        google_http = FakeHttpClient(ONELOU_GOOGLE_HTML)
         adapter = OneLouAdapter(
             http=native_http,
             google_search=GoogleSiteSearch(http=google_http),
@@ -926,10 +1010,10 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(page.items), 1)
         self.assertEqual(len(google_http.calls), 1)
-        self.assertEqual(len(native_http.calls), 1)
+        self.assertEqual(len(native_http.calls), 2)
 
-    async def test_onelou_google_interstitial_cools_down_and_falls_back_to_native(self):
-        native_http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
+    async def test_onelou_google_interstitial_cools_down_after_native_empty(self):
+        native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
         google_http = FakeHttpClient(ONELOU_GOOGLE_INTERSTITIAL)
         google = GoogleSiteSearch(http=google_http, cooldown_seconds=300)
         adapter = OneLouAdapter(http=native_http, google_search=google)
@@ -937,18 +1021,18 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         first = await adapter.search(IndexerSearchRequest.create("Frieren"))
         second = await adapter.search(IndexerSearchRequest.create("Frieren 2"))
 
-        self.assertEqual(len(first.items), 1)
-        self.assertEqual(len(second.items), 1)
+        self.assertEqual(first.items, [])
+        self.assertEqual(second.items, [])
         self.assertEqual(len(google_http.calls), 1, "Google failure should open a local cooldown")
         self.assertEqual(len(native_http.calls), 2)
 
-    async def test_onelou_google_timeout_falls_back_to_native_with_independent_budget(self):
+    async def test_onelou_google_timeout_returns_native_empty_with_independent_budget(self):
         class SlowGoogleHttp(FakeHttpClient):
             async def get(self, *args, **kwargs):
                 await asyncio.sleep(0.2)
                 return await super().get(*args, **kwargs)
 
-        native_http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
+        native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
         google_http = SlowGoogleHttp(ONELOU_GOOGLE_HTML)
         adapter = OneLouAdapter(
             http=native_http,
@@ -957,11 +1041,11 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
 
         page = await adapter.search(IndexerSearchRequest.create("Frieren"))
 
-        self.assertEqual(len(page.items), 1)
+        self.assertEqual(page.items, [])
         self.assertEqual(len(native_http.calls), 1)
 
     async def test_onelou_google_explicit_empty_result_does_not_open_cooldown(self):
-        native_http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
+        native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
         google_http = FakeHttpClient(ONELOU_GOOGLE_EMPTY_HTML)
         adapter = OneLouAdapter(
             http=native_http,
@@ -971,8 +1055,8 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         first = await adapter.search(IndexerSearchRequest.create("Frieren"))
         second = await adapter.search(IndexerSearchRequest.create("Frieren 2"))
 
-        self.assertEqual(len(first.items), 1)
-        self.assertEqual(len(second.items), 1)
+        self.assertEqual(first.items, [])
+        self.assertEqual(second.items, [])
         self.assertEqual(len(google_http.calls), 2, "valid empty pages must not disable Google")
         self.assertEqual(len(native_http.calls), 2)
 

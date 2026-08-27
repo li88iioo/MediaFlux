@@ -38,7 +38,9 @@ _THREAD_HREF = re.compile(r"thread-\d+\.htm")
 _SEARCH_API_PATH = "/search/api/search.php"
 _SEARCH_API_PARAMS = {
     "page": "1",
-    "sort": "relevance",
+    # 1LOU 的 relevance 只返回高相关旧帖子集，无法在服务层补回未返回的新帖；
+    # 因此所有本地排序模式都先取 newest 子集，再由聚合层做最终排序。
+    "sort": "newest",
     "scope": "全部",
     "type": "全部",
     "year": "全部",
@@ -106,7 +108,7 @@ class OneLouAdapter(IndexerAdapter):
             self._last_search_started = self._monotonic()
 
     def search_timeout_overhead_seconds(self) -> float:
-        # Google 是可选预检；失败后仍给 1LOU 原生链完整的站点超时预算。
+        # 原生链耗尽预算后仍为可选 Google 回退保留独立的短预算。
         return self.google_search.timeout_seconds if self.google_search is not None else 0.0
 
     def _join_known_host(self, candidate: str) -> str:
@@ -122,11 +124,28 @@ class OneLouAdapter(IndexerAdapter):
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
         if request.page > 1:
             return IndexerPage(items=[], page=request.page, has_more=False, pagination_supported=False)
+        native_error: IndexerError | None = None
+        try:
+            native_items = await self._search_native(request)
+        except IndexerError as exc:
+            native_error = exc
+        else:
+            if native_items:
+                return IndexerPage(
+                    items=native_items,
+                    page=1,
+                    has_more=False,
+                    pagination_supported=False,
+                )
+
+        # Google 仅作为原生 API 空结果/不可用时的补充；搜索引擎索引可能滞后，
+        # 不能再覆盖 1LOU 自身按发布时间返回的新帖。
         google_items = await self._search_google(request)
         if google_items:
             return IndexerPage(items=google_items, page=1, has_more=False, pagination_supported=False)
-        items = await self._search_native(request)
-        return IndexerPage(items=items, page=1, has_more=False, pagination_supported=False)
+        if native_error is not None:
+            raise native_error
+        return IndexerPage(items=[], page=1, has_more=False, pagination_supported=False)
 
     async def _search_google(self, request: IndexerSearchRequest) -> list[IndexerItem] | None:
         if self.google_search is None:

@@ -87,14 +87,16 @@ class FakeIndexerService:
         self.adapter = FakeAdapter(resolved or ResolvedDownload(kind="magnet", value=item.magnet))
         self.registry = FakeRegistry(self.adapter)
         self.search_calls = []
+        self.search_sort_modes = []
         self.media_search_calls = []
 
     async def resolve(self, result_id):
         item = self.result_store.get(result_id)
         return await self.adapter.resolve(item)
 
-    async def search(self, query, page, site_ids):
+    async def search(self, query, page, site_ids, *, sort_mode="relevance_desc"):
         self.search_calls.append((query, page, site_ids))
+        self.search_sort_modes.append(sort_mode)
         return AggregatedIndexerResult(
             query=query,
             page=page,
@@ -231,10 +233,23 @@ class IndexerAPITests(unittest.TestCase):
         self.assertEqual(search.status_code, 200)
         payload = search.json()
         self.assertEqual(service.search_calls, [("Demo", 1, ["nyaa"])])
+        self.assertEqual(service.search_sort_modes, ["relevance_desc"])
         self.assertEqual(payload["items"][0]["result_id"], "opaque-result")
         self.assertNotIn("magnet", payload["items"][0])
         self.assertNotIn("torrent_url", payload["items"][0])
         self.assertNotIn("detail_url", payload["items"][0])
+
+    def test_get_search_forwards_requested_sort_mode(self):
+        self.authenticate()
+        service = FakeIndexerService()
+
+        with patch("app.routes.indexers_api.get_indexer_service", return_value=service):
+            response = self.client.get(
+                "/api/indexers/search?q=Demo&page=1&sites=nyaa&sort=published_desc"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(service.search_sort_modes, ["published_desc"])
 
     def test_public_search_items_include_safe_season_episode_sort_fields(self):
         item = IndexerItem(
@@ -262,6 +277,9 @@ class IndexerAPITests(unittest.TestCase):
             "aliases": ["Tefuda ga Oome no Victoria"],
             "year": 2026,
             "media_type": "tv",
+            "sort_mode": "published_desc",
+            "season": 2,
+            "episode": 11,
             "page": 1,
             "sites": ["nyaa"],
         }
@@ -274,6 +292,9 @@ class IndexerAPITests(unittest.TestCase):
         self.assertIsInstance(request, IndexerMediaSearchRequest)
         self.assertEqual(request.title, "奇招百出的维多利亚")
         self.assertEqual(request.year, 2026)
+        self.assertEqual(request.sort_mode, "published_desc")
+        self.assertEqual(request.season, 2)
+        self.assertEqual(request.episode, 11)
         self.assertEqual(site_ids, ["nyaa"] )
         status = response.json()["site_statuses"][0]
         self.assertEqual(status["query"], "Tefuda ga Oome no Victoria")

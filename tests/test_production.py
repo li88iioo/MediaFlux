@@ -373,6 +373,17 @@ class MediaProxyTests(InitializedWebTestCase):
             self.assertEqual(head_response.status_code, 200)
             self.assertEqual(head_response.headers["content-length"], "10")
 
+    def test_local_file_response_uses_stable_matroska_content_type(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "video.mkv"
+            path.write_bytes(b"matroska")
+            request = SimpleNamespace(method="HEAD", headers={})
+
+            response = local_file_response(request, path)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["content-type"], "video/x-matroska")
+
     @staticmethod
     async def _stream_body(response) -> bytes:
         chunks = []

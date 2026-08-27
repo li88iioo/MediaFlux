@@ -117,11 +117,17 @@ class QueryAwareAdapter(FakeAdapter):
         self.items_by_query = {query: list(items) for query, items in items_by_query.items()}
         self.queries = []
         self.media_types = []
+        self.sort_modes = []
+        self.seasons = []
+        self.episodes = []
 
     async def search(self, request):
         self.calls += 1
         self.queries.append(request.query)
         self.media_types.append(request.media_type)
+        self.sort_modes.append(request.sort_mode)
+        self.seasons.append(request.season)
+        self.episodes.append(request.episode)
         return IndexerPage(
             items=list(self.items_by_query.get(request.query, [])),
             page=request.page,
@@ -130,13 +136,54 @@ class QueryAwareAdapter(FakeAdapter):
         )
 
 
-def item(site_id, title, *, magnet=None, seeders=0):
+class SlowQueryAwareAdapter(QueryAwareAdapter):
+    def __init__(self, site_id, items_by_query, *, delay):
+        super().__init__(site_id, items_by_query)
+        self.delay = delay
+
+    async def search(self, request):
+        self.calls += 1
+        self.queries.append(request.query)
+        self.media_types.append(request.media_type)
+        self.sort_modes.append(request.sort_mode)
+        self.seasons.append(request.season)
+        self.episodes.append(request.episode)
+        await asyncio.sleep(self.delay)
+        return IndexerPage(
+            items=list(self.items_by_query.get(request.query, [])),
+            page=request.page,
+            has_more=False,
+            pagination_supported=True,
+        )
+
+
+class PartiallyFailingQueryAdapter(QueryAwareAdapter):
+    def __init__(self, site_id, items_by_query, *, failing_query, error):
+        super().__init__(site_id, items_by_query)
+        self.failing_query = failing_query
+        self.query_error = error
+
+    async def search(self, request):
+        if request.query == self.failing_query:
+            self.calls += 1
+            self.queries.append(request.query)
+            self.media_types.append(request.media_type)
+            self.sort_modes.append(request.sort_mode)
+            self.seasons.append(request.season)
+            self.episodes.append(request.episode)
+            raise self.query_error
+        return await super().search(request)
+
+
+def item(site_id, title, *, magnet=None, seeders=0, published_at=None, size_bytes=None):
     return IndexerItem(
         site_id=site_id,
         site_name=site_id.upper(),
         title=title,
         magnet=magnet,
         seeders=seeders,
+        published_at=published_at,
+        size_bytes=size_bytes,
         download_state="ready" if magnet else "unavailable",
         download_kinds=("magnet",) if magnet else (),
     )
@@ -177,7 +224,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(entry.result_id for entry in result.items))
         self.assertEqual(self.store.get(result.items[0].result_id).title, "one")
 
-    async def test_media_search_uses_site_queries_and_stops_after_hit(self):
+    async def test_media_search_uses_site_queries_and_stops_after_quality_hit(self):
         media = IndexerMediaSearchRequest.create(
             title="奇招百出的维多利亚",
             original_title="手札が多めのビクトリア",
@@ -188,11 +235,19 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         nyaa = QueryAwareAdapter(
             "nyaa",
-            {"手札が多めのビクトリア": [item("nyaa", "Japanese hit")]},
+            {"手札が多めのビクトリア": [item(
+                "nyaa",
+                "手札が多めのビクトリア 2026 1080p",
+                magnet=f"magnet:?xt=urn:btih:{HASH}",
+            )]},
         )
         mikan = QueryAwareAdapter(
             "mikan",
-            {"奇招百出的维多利亚": [item("mikan", "Chinese hit")]},
+            {"奇招百出的维多利亚": [item(
+                "mikan",
+                "奇招百出的维多利亚 2026 1080p",
+                magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
+            )]},
         )
         service = self.service([nyaa, mikan])
 
@@ -205,13 +260,245 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mikan.queries, ["奇招百出的维多利亚"] )
         self.assertEqual(nyaa.media_types, ["tv", "tv"])
         self.assertEqual(mikan.media_types, ["tv"])
-        self.assertEqual([entry.title for entry in result.items], ["Japanese hit", "Chinese hit"] )
+        self.assertEqual(
+            [entry.title for entry in result.items],
+            ["手札が多めのビクトリア 2026 1080p", "奇招百出的维多利亚 2026 1080p"],
+        )
         self.assertEqual(
             result.site_queries,
             {"nyaa": "手札が多めのビクトリア", "mikan": "奇招百出的维多利亚"},
         )
         self.assertEqual(result.site_attempt_counts, {"nyaa": 2, "mikan": 1})
         self.assertEqual(result.query, "奇招百出的维多利亚")
+
+    async def test_low_quality_nonempty_alias_does_not_suppress_better_later_alias(self):
+        media = IndexerMediaSearchRequest.create(
+            title="本地标题",
+            original_title="原題",
+            aliases=["Romanized Alias", "English Alias"],
+            year=2026,
+            media_type="tv",
+        )
+        adapter = QueryAwareAdapter(
+            "nyaa",
+            {
+                "Romanized Alias": [item("nyaa", "Old unrelated upload")],
+                "原題": [item(
+                    "nyaa",
+                    "原題 2026 1080p",
+                    magnet=f"magnet:?xt=urn:btih:{HASH}",
+                )],
+            },
+        )
+        service = self.service([adapter])
+
+        result = await service.search_media(media, ("nyaa",))
+
+        self.assertEqual(adapter.queries, ["Romanized Alias", "原題"])
+        self.assertEqual(result.site_attempt_counts, {"nyaa": 2})
+        self.assertEqual(result.items[0].title, "原題 2026 1080p")
+        self.assertIn("Old unrelated upload", [entry.title for entry in result.items])
+
+    async def test_later_alias_failure_preserves_earlier_items_and_marks_partial(self):
+        media = IndexerMediaSearchRequest.create(
+            title="本地标题",
+            original_title="原題",
+            aliases=["Romanized Alias"],
+            year=2026,
+            media_type="tv",
+        )
+        earlier = item(
+            "nyaa",
+            "Old unrelated upload",
+            magnet=f"magnet:?xt=urn:btih:{HASH}",
+        )
+        adapter = PartiallyFailingQueryAdapter(
+            "nyaa",
+            {"Romanized Alias": [earlier]},
+            failing_query="原題",
+            error=IndexerUnavailable("alias failed"),
+        )
+        service = self.service([adapter])
+
+        result = await service.search_media(media, ("nyaa",))
+
+        self.assertEqual(adapter.queries, ["Romanized Alias", "原題"])
+        self.assertEqual([entry.title for entry in result.items], [earlier.title])
+        self.assertEqual(result.sites_succeeded, ("nyaa",))
+        self.assertTrue(result.partial)
+        self.assertEqual(result.errors[0].code, "unavailable")
+
+    async def test_episode_intent_is_propagated_and_exact_result_stops_plan(self):
+        media = IndexerMediaSearchRequest.create(
+            title="九门",
+            english_title="Mystic Nine",
+            year=2026,
+            media_type="tv",
+            sort_mode="published_desc",
+            season=2,
+            episode=30,
+        )
+        adapter = QueryAwareAdapter(
+            "1lou",
+            {
+                "九门 S02E30": [item(
+                    "1lou",
+                    "九门[第30集].Mystic.Nine.S02.2026.1080p",
+                    magnet=f"magnet:?xt=urn:btih:{HASH}",
+                )],
+            },
+        )
+        service = self.service([adapter])
+
+        result = await service.search_media(media, ("1lou",))
+
+        self.assertEqual(adapter.queries, ["九门 S02E30"])
+        self.assertEqual(adapter.sort_modes, ["published_desc"])
+        self.assertEqual(adapter.seasons, [2])
+        self.assertEqual(adapter.episodes, [30])
+        self.assertIn("episode_exact", result.items[0].match_reasons)
+
+    async def test_episode_range_does_not_suppress_later_exact_alias_result(self):
+        media = IndexerMediaSearchRequest.create(
+            title="九门",
+            year=2026,
+            media_type="tv",
+            sort_mode="published_desc",
+            season=2,
+            episode=30,
+        )
+        range_item = item(
+            "1lou",
+            "九门[第29-30集].Mystic.Nine.S02.2026.1080p",
+            magnet=f"magnet:?xt=urn:btih:{HASH}",
+        )
+        exact_item = item(
+            "1lou",
+            "九门[第30集].Mystic.Nine.S02.2026.1080p",
+            magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
+        )
+        adapter = QueryAwareAdapter(
+            "1lou",
+            {
+                "九门 S02E30": [range_item],
+                "九门 第2季 第30集": [exact_item],
+            },
+        )
+        service = self.service([adapter])
+
+        result = await service.search_media(media, ("1lou",))
+
+        self.assertEqual(adapter.queries, ["九门 S02E30", "九门 第2季 第30集"])
+        self.assertIn("episode_exact", result.items[0].match_reasons)
+        self.assertIn("episode_range", result.items[1].match_reasons)
+
+    async def test_aliases_share_one_site_budget_instead_of_each_getting_full_timeout(self):
+        media = IndexerMediaSearchRequest.create(
+            title="本地标题",
+            original_title="原題",
+            aliases=["Romanized Alias", "English Alias"],
+            media_type="tv",
+        )
+        adapter = SlowQueryAwareAdapter("nyaa", {}, delay=0.02)
+        service = self.service(
+            [adapter],
+            site_timeout_seconds=0.03,
+            total_timeout_seconds=0.2,
+        )
+
+        result = await service.search_media(media, ("nyaa",))
+
+        self.assertEqual(adapter.queries, ["Romanized Alias", "原題"])
+        self.assertTrue(result.partial)
+        self.assertEqual(result.errors[0].code, "timeout")
+
+    async def test_requested_sort_mode_controls_final_aggregate_order(self):
+        newer = item(
+            "nyaa",
+            "Demo newer",
+            magnet=f"magnet:?xt=urn:btih:{HASH}",
+            seeders=1,
+            published_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
+        )
+        older_popular = item(
+            "nyaa",
+            "Demo older",
+            magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
+            seeders=999,
+            published_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        service = self.service([FakeAdapter("nyaa", [older_popular, newer])])
+        media = IndexerMediaSearchRequest.create(
+            title="Demo",
+            media_type="tv",
+            sort_mode="published_desc",
+        )
+
+        result = await service.search_media(media, ("nyaa",))
+
+        self.assertEqual([entry.title for entry in result.items], ["Demo newer", "Demo older"])
+
+    async def test_alias_merge_applies_requested_sort_before_per_site_limit(self):
+        older_relevant = IndexerItem(
+            site_id="nyaa",
+            site_name="NYAA",
+            title="Target 2026",
+            published_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            download_state="unavailable",
+        )
+        newer_downloadable = item(
+            "nyaa",
+            "Target alternate 2025",
+            magnet=f"magnet:?xt=urn:btih:{HASH}",
+            published_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
+        )
+        adapter = QueryAwareAdapter(
+            "nyaa",
+            {
+                "Alias": [older_relevant],
+                "Target": [newer_downloadable],
+            },
+        )
+        service = self.service([adapter], max_results_per_site=1)
+        media = IndexerMediaSearchRequest.create(
+            title="Target",
+            aliases=["Alias"],
+            year=2026,
+            media_type="tv",
+            sort_mode="published_desc",
+        )
+
+        result = await service.search_media(media, ("nyaa",))
+
+        self.assertEqual(adapter.queries, ["Alias", "Target"])
+        self.assertEqual([entry.title for entry in result.items], [newer_downloadable.title])
+
+    async def test_episode_conflicts_stay_below_matching_ranges_even_when_newer(self):
+        conflict = item(
+            "1lou",
+            "九门[第30集].Mystic.Nine.S01.2026.1080p",
+            magnet=f"magnet:?xt=urn:btih:{HASH}",
+            published_at=datetime(2026, 8, 27, tzinfo=timezone.utc),
+        )
+        matching = item(
+            "1lou",
+            "九门[第29-30集].Mystic.Nine.S02.2026.1080p",
+            magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
+            published_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
+        )
+        service = self.service([FakeAdapter("1lou", [conflict, matching])])
+        media = IndexerMediaSearchRequest.create(
+            title="九门",
+            year=2026,
+            media_type="tv",
+            sort_mode="published_desc",
+            season=2,
+            episode=30,
+        )
+
+        result = await service.search_media(media, ("1lou",))
+
+        self.assertEqual([entry.title for entry in result.items], [matching.title, conflict.title])
 
     async def test_btbtla_failure_is_marked_as_onelou_fallback_only_when_both_are_selected(self):
         btbtla = FakeAdapter("btbtla", error=IndexerUnavailable("tls failed"))
@@ -227,7 +514,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         isolated_result = await isolated.search("Demo", 1, ("btbtla",))
         self.assertEqual(isolated_result.site_fallbacks, {})
 
-    async def test_magnet_infohash_dedupe_is_case_insensitive_and_keeps_first_stable_result(self):
+    async def test_magnet_infohash_dedupe_keeps_the_richer_cross_site_result(self):
         first = item("nyaa", "first", magnet=f"magnet:?dn=one&xt=urn:btih:{HASH.upper()}", seeders=1)
         duplicate = item("mikan", "duplicate", magnet=f"magnet:?xt=urn:btih:{HASH}&dn=two", seeders=999)
         unique = item("mikan", "unique", magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef")
@@ -235,8 +522,64 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         result = await service.search("Frieren", 1, ("nyaa", "mikan"))
 
-        self.assertEqual([entry.title for entry in result.items], ["first", "unique"])
+        self.assertEqual([entry.title for entry in result.items], ["duplicate", "unique"])
         self.assertEqual(result.site_item_counts, {"nyaa": 1, "mikan": 2})
+        self.assertEqual(result.site_visible_counts, {"nyaa": 0, "mikan": 2})
+
+    def test_alias_merge_upgrades_duplicate_to_richer_downloadable_representation(self):
+        detail_url = "https://www.1lou.me/thread-123.htm"
+        first = IndexerItem(
+            site_id="1lou",
+            site_name="1LOU",
+            title="九门 第30集",
+            detail_url=detail_url,
+            download_state="resolvable",
+            download_kinds=("torrent",),
+        )
+        richer = IndexerItem(
+            site_id="1lou",
+            site_name="1LOU",
+            title="九门 第30集 S02E30",
+            detail_url=detail_url,
+            seeders=20,
+            magnet=f"magnet:?xt=urn:btih:{HASH}",
+            download_state="ready",
+            download_kinds=("magnet", "torrent"),
+        )
+
+        merged = IndexerService._merge_plan_items([first], [richer])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].title, richer.title)
+        self.assertEqual(merged[0].download_state, "ready")
+
+    def test_alias_merge_prefers_more_relevant_actionable_duplicate_over_ready_state(self):
+        detail_url = "https://www.1lou.me/thread-456.htm"
+        relevant = IndexerItem(
+            site_id="1lou",
+            site_name="1LOU",
+            title="九门 第29-30集 S02",
+            detail_url=detail_url,
+            relevance_score=96,
+            download_state="resolvable",
+            download_kinds=("torrent",),
+        )
+        less_relevant = IndexerItem(
+            site_id="1lou",
+            site_name="1LOU",
+            title="九门 第30集 S01",
+            detail_url=detail_url,
+            relevance_score=52,
+            magnet=f"magnet:?xt=urn:btih:{HASH}",
+            download_state="ready",
+            download_kinds=("magnet",),
+        )
+
+        merged = IndexerService._merge_plan_items([relevant], [less_relevant])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].title, relevant.title)
+        self.assertEqual(merged[0].download_state, "resolvable")
 
     async def test_provider_search_slot_wait_does_not_consume_site_timeout(self):
         adapter = SlotDelayedAdapter(

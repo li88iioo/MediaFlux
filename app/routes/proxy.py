@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import mimetypes
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
@@ -14,6 +13,7 @@ from app.modules.media_proxy import (
     PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
     SignedUrlCache,
     _parse_range,
+    media_content_type,
 )
 
 logger = get_logger(__name__)
@@ -105,10 +105,7 @@ def play_gy(
                     "Accept-Ranges": "bytes",
                     "Cache-Control": "no-store",
                     "ETag": response_etag,
-                    "Content-Type": (
-                        mimetypes.guess_type(filename)[0]
-                        or "application/octet-stream"
-                    ),
+                    "Content-Type": media_content_type(filename),
                     "Pragma": "no-cache",
                     "Referrer-Policy": "no-referrer",
                     "X-Content-Type-Options": "nosniff",

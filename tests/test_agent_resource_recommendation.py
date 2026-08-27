@@ -102,6 +102,18 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertEqual(ranked["download_plan"]["prepare_tool"], "indexer.submit_resource")
         self.assertEqual(ranked["download_plan"]["result_id"], "season-pack-id-0001")
 
+    def test_exact_episode_marker_wins_over_ambiguous_complete_tag(self):
+        ranked = rank_episode_search({"items": [
+            _item(
+                "exact-complete-id-01",
+                "示例剧 S02E03 Complete 1080p WEB-DL",
+                seeders=16,
+            )
+        ]}, season=2, episode=3)
+
+        self.assertEqual(ranked["items"][0]["quality"]["match"], "exact_episode")
+        self.assertEqual(ranked["recommendation"]["status"], "recommended")
+
     def test_multi_episode_range_is_review_only_instead_of_exact_match(self):
         ranked = rank_episode_search({"items": [
             _item(
@@ -118,6 +130,27 @@ class ResourceRecommendationTests(unittest.TestCase):
             for warning in ranked["items"][0]["quality"]["warnings"]
         ))
         self.assertFalse(ranked["download_plan"]["auto_submit"])
+
+    def test_chinese_episode_markers_bind_to_season_marker_elsewhere(self):
+        ranked = rank_episode_search({"items": [
+            _item(
+                "episode-pack-id-zh-01",
+                "九门[第29-30集][国语配音/中文字幕].Mystic.Nine.S02.1080p.WEB-DL",
+                seeders=24,
+            ),
+            _item(
+                "episode-conflict-zh",
+                "九门[第30集][国语音轨].Mystic.Nine.S01.2026.2160p",
+                seeders=30,
+            ),
+        ]}, season=2, episode=30)
+
+        self.assertEqual(ranked["items"][0]["quality"]["match"], "episode_pack")
+        conflict = next(
+            item for item in ranked["items"] if item["result_id"] == "episode-conflict-zh"
+        )
+        self.assertEqual(conflict["quality"]["match"], "conflict")
+        self.assertFalse(conflict["quality"]["eligible"])
 
     def test_unavailable_and_empty_results_have_no_selected_plan(self):
         unavailable = rank_episode_search({"items": [

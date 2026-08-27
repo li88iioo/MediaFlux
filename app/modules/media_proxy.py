@@ -45,6 +45,11 @@ from app.modules.media_proxy_safety import safe_media_name as _safe_media_name
 from app.modules.media_server_profiles import resolve_proxy_instance
 
 logger = get_logger(__name__)
+_MEDIA_MIME_OVERRIDES = {
+    # Python 3.14 changed the stdlib mapping to ``video/matroska``. Keep the
+    # long-standing value used by Jellyfin/Emby clients stable across runtimes.
+    ".mkv": "video/x-matroska",
+}
 _STREAM_RE = re.compile(r"^(?:/emby)?/Videos/([^/]+)/stream(?:\.[^/]+)?/?$", re.IGNORECASE)
 _VIDEO_ITEM_RE = re.compile(r"^(?:/emby)?/Videos/([^/]+)/", re.IGNORECASE)
 _PLAYBACK_INFO_RE = re.compile(r"^(?:/emby)?/Items/([^/]+)/PlaybackInfo/?$", re.IGNORECASE)
@@ -3778,7 +3783,7 @@ def local_file_response(request: Request, path: Path) -> Response:
         "Accept-Ranges": "bytes",
         "ETag": etag,
         "Last-Modified": formatdate(stat.st_mtime, usegmt=True),
-        "Content-Type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+        "Content-Type": media_content_type(path.name),
     }
     try:
         selected = _parse_range(request.headers.get("range", ""), size)
@@ -3811,6 +3816,15 @@ def local_file_response(request: Request, path: Path) -> Response:
         status_code=206,
         headers=headers,
         media_type=common["Content-Type"],
+    )
+
+
+def media_content_type(filename: str) -> str:
+    suffix = Path(str(filename or "")).suffix.casefold()
+    return (
+        _MEDIA_MIME_OVERRIDES.get(suffix)
+        or mimetypes.guess_type(str(filename or ""))[0]
+        or "application/octet-stream"
     )
 
 

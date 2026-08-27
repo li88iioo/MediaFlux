@@ -6,6 +6,7 @@ import re
 import unicodedata
 from typing import Any
 
+from app.indexers.release import parse_indexer_release_position
 from app.modules.scraper import TMDBScraper
 
 _MAX_ITEMS = 50
@@ -89,10 +90,44 @@ def _looks_like_season_pack(title: str, season: int) -> bool:
 def _episode_match(
     title: str, *, season: int, episode: int
 ) -> tuple[str, int, list[str], list[str]]:
+    parsed = parse_indexer_release_position(title)
+    parsed_season = parsed.get("season")
+    parsed_episode = parsed.get("episode")
+    parsed_end = parsed.get("episode_end") or parsed_episode
     positions = _episode_positions(title)
     ranges = _episode_ranges(title)
     target = (season, episode)
     label = f"S{season:02d}E{episode:02d}"
+    if parsed_season == season and parsed_episode is not None and parsed_end is not None:
+        if parsed_episode == episode and parsed_end == episode:
+            return "exact_episode", 220, [f"精确匹配 {label}"], []
+    if _looks_like_season_pack(title, season):
+        return (
+            "season_pack",
+            85,
+            [f"识别为第 {season} 季整季资源"],
+            ["整季包需人工核对文件清单"],
+        )
+    if parsed_season == season and parsed_episode is not None and parsed_end is not None:
+        if parsed_episode <= episode <= parsed_end:
+            return (
+                "episode_pack",
+                110,
+                [f"资源范围包含 {label}（E{parsed_episode:02d}-E{parsed_end:02d}）"],
+                ["多集资源需人工核对文件清单"],
+            )
+    if parsed_season is not None and parsed_season != season:
+        parsed_label = f"S{parsed_season:02d}"
+        if parsed_episode is not None:
+            parsed_label += f"E{parsed_episode:02d}"
+        return "conflict", -320, [], [f"季集标记与目标 {label} 冲突：{parsed_label}"]
+    if parsed_episode is not None and parsed_end is not None and not (
+        parsed_episode <= episode <= parsed_end
+    ):
+        parsed_label = f"E{parsed_episode:02d}"
+        if parsed_end != parsed_episode:
+            parsed_label += f"-E{parsed_end:02d}"
+        return "conflict", -320, [], [f"季集标记与目标 {label} 冲突：{parsed_label}"]
     matching_range = next((
         (start, end)
         for range_season, start, end in ranges
@@ -116,13 +151,6 @@ def _episode_match(
                 for s, start, end in ranges[:3]
             )
         return "conflict", -320, [], [f"季集标记与目标 {label} 冲突：{samples}"]
-    if _looks_like_season_pack(title, season):
-        return (
-            "season_pack",
-            85,
-            [f"识别为第 {season} 季整季资源"],
-            ["整季包需人工核对文件清单"],
-        )
     return "unknown", 20, [], [f"标题未明确标出 {label}，需人工复核"]
 
 

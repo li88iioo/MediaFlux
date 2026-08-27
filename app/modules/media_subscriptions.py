@@ -1310,11 +1310,14 @@ class MediaSubscriptionService:
         for target in targets:
             assert target.season is not None and target.episode is not None
             request = IndexerMediaSearchRequest.create(
-                title=f"{row['title']} S{target.season:02d}E{target.episode:02d}",
+                title=str(row["title"]),
                 original_title=original,
                 aliases=aliases,
                 year=row["year"],
                 media_type="tv",
+                sort_mode="published_desc",
+                season=target.season,
+                episode=target.episode,
             )
             try:
                 aggregated = await run_indexer_awaitable(
@@ -1476,11 +1479,14 @@ class MediaSubscriptionService:
             self._ensure_active_check(int(row["id"]), revision, cancel_event)
             assert target.season is not None and target.episode is not None
             request = IndexerMediaSearchRequest.create(
-                title=f"{row['title']} S{target.season:02d}E{target.episode:02d}",
+                title=str(row["title"]),
                 original_title=original,
                 aliases=aliases,
                 year=row["year"],
                 media_type="tv",
+                sort_mode="published_desc",
+                season=target.season,
+                episode=target.episode,
             )
             try:
                 aggregated = await run_indexer_awaitable(
