@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-08-27
+
+### Added
+- Media Agent 新增执行阶段进度事件与 Telegram 实时状态更新，并优化长回复的段落、列表及反馈识别，减少等待过程中的无响应感（[`b0209ae`](https://github.com/li88iioo/MediaFlux/commit/b0209ae)、[`0196d2b`](https://github.com/li88iioo/MediaFlux/commit/0196d2b)）。
+- 下载管理新增原始种子缓存保留策略；光鸭重新提交可从 qBittorrent 5.x 导出任务种子恢复文件树，降低历史资源因本地种子缺失而无法重试的概率（[`f56e59c`](https://github.com/li88iioo/MediaFlux/commit/f56e59c)）。
+
+### Changed
+- Docker 生产部署改为开箱即用的精简 Compose：默认 host 网络、首次启动 Web 初始化、自动创建持久化目录并兼容 NAS 权限；开发配置独立维护，仍可按需启用固定 UID/GID 与 bridge 端口映射（[`04cf206`](https://github.com/li88iioo/MediaFlux/commit/04cf206)）。
+
+### Fixed
+- 修复 Telegram“全部整理”与本地手动整理流程中确认卡缺失、确认结果未闭环、任务恢复及 Agent 路由异常的问题（[`b9e9822`](https://github.com/li88iioo/MediaFlux/commit/b9e9822)、[`ab8e23d`](https://github.com/li88iioo/MediaFlux/commit/ab8e23d)、[`2d9e0b9`](https://github.com/li88iioo/MediaFlux/commit/2d9e0b9)）。
+- 修复媒体标题使用 Unicode 罗马数字表达续作季数时无法正确识别的问题，并补齐目录身份缓存与识别链路回归覆盖（[`b16b7e2`](https://github.com/li88iioo/MediaFlux/commit/b16b7e2)）。
+- 修复下载请求、本地整理任务、调度器和终态回写之间的并发一致性问题；qB 完成任务现以事务方式创建或复用并绑定，避免重复重置、错误重跑与状态漂移（[`f105546`](https://github.com/li88iioo/MediaFlux/commit/f105546)）。
+
 ## [0.1.6] - 2026-08-26
 
 ### Added
@@ -138,7 +152,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/li88iioo/MediaFlux/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/li88iioo/MediaFlux/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/li88iioo/MediaFlux/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/li88iioo/MediaFlux/compare/v0.1.3...v0.1.4
