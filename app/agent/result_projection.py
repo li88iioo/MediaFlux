@@ -201,6 +201,13 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "strm.status": "STRM 同步状态",
     "strm.triage_failures": "STRM 失败分诊",
     "guangya.connection_status": "光鸭连接检查",
+    "guangya.directory.inspect": "光鸭目录观察",
+    "guangya.change_plan.preview": "光鸭声明式改名预览",
+    "guangya.change_plan.execute": "光鸭声明式改名执行",
+    "guangya.media_hygiene.preview": "光鸭媒体名称清理预览",
+    "guangya.media_hygiene.execute": "光鸭媒体名称清理",
+    "guangya.rename.preview": "光鸭重命名预览",
+    "guangya.rename.execute": "光鸭重命名执行",
     "guangya.directory_scrape.inspect": "光鸭刮削检查",
     "guangya.directory_scrape.search": "光鸭刮削匹配搜索",
     "guangya.directory_scrape.preview": "光鸭刮削预览",
@@ -209,6 +216,8 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "guangya.organize.schedule_policy": "光鸭定时整理策略",
     "guangya.organize.set_schedule_policy": "光鸭定时整理策略修改",
     "guangya.organize.clean_empty": "光鸭空目录清理",
+    "guangya.organize.cleanup.preview": "光鸭整理残留清理预览",
+    "guangya.organize.cleanup.execute": "光鸭整理残留清理",
     "guangya.organize.run_once": "光鸭整理任务",
     "guangya.organize.status": "光鸭整理状态",
     "guangya.organize.stop": "停止光鸭整理任务",
@@ -314,6 +323,25 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "generated": "已生成",
     "created": "已创建",
     "updated": "已更新",
+    "identified_video_count": "已识别视频",
+    "unidentified_video_count": "未识别视频",
+    "video_rename_count": "视频改名",
+    "companion_rename_count": "伴随文件改名",
+    "directory_rename_count": "目录改名",
+    "metadata_enriched_count": "MetaTube 补全",
+    "proposed_operation_count": "提议操作数量",
+    "observation_ref": "观察编号",
+    "object_ref": "对象引用",
+    "object_name": "名称",
+    "kind": "类型",
+    "extension": "扩展名",
+    "size": "大小（字节）",
+    "location": "相对位置",
+    "page": "页码",
+    "page_size": "每页数量",
+    "recursive": "递归读取",
+    "trigger_strm": "改名后核对 STRM",
+    "scope_count": "范围数量",
     "metadata_generated": "已生成元数据",
     "metadata_queued": "已排队元数据",
     "metadata_skipped": "已跳过元数据",
@@ -321,6 +349,13 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "cleaned": "已清理",
     "metadata_cleaned": "已清理元数据",
     "empty_dirs_cleaned": "已清理空目录",
+    "empty_dir_count": "真空目录",
+    "residual_dir_count": "垃圾残留目录",
+    "quarantine_file_count": "待隔离文件",
+    "preserved_dir_count": "安全保留目录",
+    "unsupported_empty_dir_count": "因 Provider 能力保留的空目录",
+    "sample_directories": "目录示例",
+    "quarantine_instead_of_delete": "非空目录仅隔离",
     "move": "移动",
     "skip": "跳过",
     "conflict": "冲突",
@@ -453,6 +488,14 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "scan_interval_minutes": "扫描间隔（分钟）",
     "stable_seconds": "文件稳定等待（秒）",
     "requested": "请求数量",
+    "rename_count": "预计重命名",
+    "conflict_count": "名称冲突",
+    "no_change_count": "无需变更",
+    "scanned_items": "扫描项目",
+    "scanned_dirs": "扫描目录",
+    "sample_changes": "名称变更示例",
+    "rollback_available": "支持回滚",
+    "cloud_write": "已执行云端写入",
     "reused": "复用已有任务",
     "requires_manual": "需要人工处理",
     "result": "结果",
@@ -609,9 +652,10 @@ _PUBLIC_TEXT_VALUE_KEYS = frozenset({
     "codec", "release_source", "resolution", "site_name", "size_text",
     "server", "server_label", "user_selection", "episode_title", "last_played",
     "preferred_server", "preferred_download_target", "local_date", "timezone",
-    "content_titles", "published_at", "created_at", "failure_code", "trigger_type", "started_at", "finished_at", "mode",
+    "content_titles", "published_at", "created_at", "failure_code", "trigger_type", "started_at", "finished_at", "mode", "sample_changes",
     "source_title", "candidate_title", "candidate_year", "suggested_query", "release_date", "overview", "manual_match_reason", "scope_type",
-    "skip_reason", "target",
+    "skip_reason", "target", "observation_ref", "object_ref", "object_name",
+    "kind", "extension", "location",
     "subscription_status", "stage", "route", "last_seen_at", "coverage",
 })
 _MAX_DEPTH = 4
@@ -887,6 +931,17 @@ def public_stream_readable_prefix_length(value: object) -> int:
     return boundary + 1 if boundary >= 0 else 0
 
 
+def sanitize_untrusted_filename(value: object, *, limit: int = 255) -> str:
+    """保留不可信文件名原貌，避免 dotted-title 被误当内部工具名。"""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = " ".join(text.replace("\r", " ").replace("\n", " ").split()).strip()
+    if not text or _CONTROL_RE.search(text) or contains_sensitive_credential(text):
+        return ""
+    text = _URI_RE.sub("[网址]", text)
+    text = _P2P_RE.sub("[链接]", text)
+    return text[: max(1, int(limit))].rstrip()
+
+
 def sanitize_public_text(value: object, *, limit: int = 600) -> str:
     """返回可展示/可发送给模型的文本；不安全文本直接舍弃。"""
     text = replace_internal_identifiers(value)
@@ -1055,6 +1110,8 @@ def _safe_value(
     if isinstance(value, float):
         return value if value == value and abs(value) != float("inf") else None
     if isinstance(value, str):
+        if source_key in {"object_name", "location"}:
+            return sanitize_untrusted_filename(value, limit=240) or None
         if source_key == "operation_ref":
             operation_ref = value.strip().upper()
             return operation_ref if re.fullmatch(

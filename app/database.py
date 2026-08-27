@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -1300,7 +1300,7 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_name_id ON task_runs(task_name, id DESC
 CREATE TABLE IF NOT EXISTS organize_operation_jobs (
     job_id TEXT PRIMARY KEY,
     job_kind TEXT NOT NULL
-        CHECK(job_kind IN ('agent_directory_scrape','directory_scrape')),
+        CHECK(job_kind IN ('agent_directory_scrape','agent_guangya_cleanup','agent_guangya_rename','directory_scrape')),
     owner_digest TEXT NOT NULL,
     operation TEXT NOT NULL,
     reference TEXT NOT NULL DEFAULT '',
@@ -1960,7 +1960,7 @@ def _migrate_organize_operation_jobs_v4(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS organize_operation_jobs ("
         "job_id TEXT PRIMARY KEY,"
         "job_kind TEXT NOT NULL CHECK(job_kind IN "
-        "('agent_directory_scrape','directory_scrape')),"
+        "('agent_directory_scrape','agent_guangya_cleanup','agent_guangya_rename','directory_scrape')),"
         "owner_digest TEXT NOT NULL,"
         "operation TEXT NOT NULL,reference TEXT NOT NULL DEFAULT '',"
         "payload_json TEXT NOT NULL DEFAULT '{}',payload_auth TEXT NOT NULL DEFAULT '',"
@@ -2121,6 +2121,83 @@ def _migrate_media_proxy_trusted_forwarders_v9(conn: sqlite3.Connection) -> None
         )
 
 
+def _migrate_agent_guangya_operation_jobs_v10(
+    conn: sqlite3.Connection,
+) -> None:
+    """一次扩展持久整理队列，承载 Agent 光鸭改名与残留清理任务。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='organize_operation_jobs'"
+    ).fetchone()
+    if row is None:
+        _migrate_organize_operation_jobs_v4(conn)
+        return
+    table_sql = str(row["sql"] or "")
+    if (
+        "agent_guangya_rename" in table_sql
+        and "agent_guangya_cleanup" in table_sql
+    ):
+        return
+    for index_name in (
+        "idx_organize_operation_jobs_pending",
+        "idx_organize_operation_jobs_updated",
+        "idx_organize_operation_jobs_owner_updated",
+        "idx_organize_operation_jobs_active_dedupe",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+    conn.execute(
+        "ALTER TABLE organize_operation_jobs "
+        "RENAME TO organize_operation_jobs_v9"
+    )
+    conn.execute(
+        "CREATE TABLE organize_operation_jobs ("
+        "job_id TEXT PRIMARY KEY,"
+        "job_kind TEXT NOT NULL CHECK(job_kind IN "
+        "('agent_directory_scrape','agent_guangya_cleanup',"
+        "'agent_guangya_rename','directory_scrape')),"
+        "owner_digest TEXT NOT NULL,"
+        "operation TEXT NOT NULL,reference TEXT NOT NULL DEFAULT '',"
+        "payload_json TEXT NOT NULL DEFAULT '{}',payload_auth TEXT NOT NULL DEFAULT '',"
+        "dedupe_digest TEXT NOT NULL,"
+        "status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN "
+        "('pending','running','completed','partial','failed','cancelled','manual_review')),"
+        "lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),"
+        "result_json TEXT NOT NULL DEFAULT '{}',error_code TEXT NOT NULL DEFAULT '',"
+        "error TEXT NOT NULL DEFAULT '',"
+        "cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),"
+        "expires_at REAL NOT NULL DEFAULT 0,purged_at TEXT,"
+        "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,started_at TEXT,finished_at TEXT"
+        ")"
+    )
+    columns = (
+        "job_id,job_kind,owner_digest,operation,reference,payload_json,payload_auth,"
+        "dedupe_digest,status,lease_generation,result_json,error_code,error,"
+        "cancel_requested,expires_at,purged_at,created_at,updated_at,started_at,finished_at"
+    )
+    conn.execute(
+        f"INSERT INTO organize_operation_jobs({columns}) "
+        f"SELECT {columns} FROM organize_operation_jobs_v9"
+    )
+    conn.execute("DROP TABLE organize_operation_jobs_v9")
+    conn.execute(
+        "CREATE INDEX idx_organize_operation_jobs_pending "
+        "ON organize_operation_jobs(status, created_at, job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_organize_operation_jobs_updated "
+        "ON organize_operation_jobs(updated_at DESC, job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_organize_operation_jobs_owner_updated "
+        "ON organize_operation_jobs(owner_digest, updated_at DESC, job_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_organize_operation_jobs_active_dedupe "
+        "ON organize_operation_jobs(owner_digest,dedupe_digest) "
+        "WHERE status IN ('pending','running')"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2131,6 +2208,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     6: _migrate_local_media_recognition_summary_v7,
     7: _migrate_local_library_target_server_path_v8,
     8: _migrate_media_proxy_trusted_forwarders_v9,
+    9: _migrate_agent_guangya_operation_jobs_v10,
 }
 
 

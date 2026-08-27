@@ -989,6 +989,40 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
                 "2026-07-28 12:00:00",
             )
 
+
+    def test_private_plan_cleanup_failures_are_isolated(self):
+        scheduler = DownloadLibraryVerificationScheduler(
+            audit_executor=Mock(),
+            clock=self.clock,
+        )
+        with (
+            patch(
+                "app.modules.guangya_rename.maintain_rename_plans",
+                side_effect=RuntimeError("rename cleanup failed"),
+            ) as rename_cleanup,
+            patch(
+                "app.modules.guangya_residual_cleanup.maintain_cleanup_plans",
+                return_value={"removed": 1, "remaining": 0, "bytes": 0},
+            ) as residual_cleanup,
+            patch(
+                "app.modules.guangya_workspace.maintain_workspace_observations",
+                return_value={"removed": 1, "remaining": 0, "bytes": 0},
+            ) as workspace_cleanup,
+            patch(
+                "app.modules.agent_download_verification_scheduler."
+                "db.purge_expired_agent_task_history",
+                return_value={
+                    "performed": True,
+                    "next_cleanup_at": "2026-08-04 12:00:00",
+                },
+            ) as purge,
+        ):
+            self.assertEqual(scheduler.run_once(), 0)
+        rename_cleanup.assert_called_once_with()
+        residual_cleanup.assert_called_once_with()
+        workspace_cleanup.assert_called_once_with()
+        purge.assert_called_once()
+
     def test_history_cleanup_failure_retries_after_five_minutes(self):
         scheduler = DownloadLibraryVerificationScheduler(
             audit_executor=Mock(),

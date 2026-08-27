@@ -62,6 +62,8 @@ def _operation_result_is_partial(result: object) -> bool:
         "empty_dir_cleanup_failed",
         "source_dir_cleanup_failed",
         "audit_failures",
+        "strm_trigger_failed",
+        "verification_failed",
         "stopped",
     ):
         value = stats.get(key)
@@ -978,6 +980,22 @@ class OrganizeTaskManager:
             )
 
             return execute_durable_directory_scrape_job(
+                payload, cancel_check=cancel_check
+            )
+        if kind == "agent_guangya_cleanup":
+            from app.agent.guangya_cleanup_actions import (
+                execute_durable_guangya_cleanup_job,
+            )
+
+            return execute_durable_guangya_cleanup_job(
+                payload, cancel_check=cancel_check
+            )
+        if kind == "agent_guangya_rename":
+            from app.agent.guangya_rename_actions import (
+                execute_durable_guangya_rename_job,
+            )
+
+            return execute_durable_guangya_rename_job(
                 payload, cancel_check=cancel_check
             )
         raise ValueError("不支持的持久化操作类型")

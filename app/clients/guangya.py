@@ -253,6 +253,74 @@ def _load_raw():
     return _RawClient
 
 
+class GuangYaWriteRejected(RuntimeError):
+    """Provider 以 HTTP 成功响应拒绝了云端写操作。"""
+
+    def __init__(self, operation: str, *, code: str = "", message: str = "") -> None:
+        self.operation = str(operation or "write")
+        self.code = str(code or "").strip()[:40]
+        self.public_message = str(message or "").strip()[:160]
+        detail = f" code={self.code}" if self.code else ""
+        super().__init__(f"光鸭写操作被拒绝 operation={self.operation}{detail}")
+
+
+def _validate_write_response(response, *, operation: str) -> None:
+    """识别光鸭在 HTTP 200 中返回的业务失败。
+
+    公开 SDK 的部分版本在成功时返回 ``None``，部分版本返回
+    ``{"msg": "success"}``。因此这里只拒绝能够确定为失败的结构，
+    最终成功仍须由调用方读取远端快照验证。
+    """
+    if response is None or not isinstance(response, dict):
+        return
+    payloads = [response]
+    data = response.get("data")
+    if isinstance(data, dict):
+        payloads.append(data)
+
+    success_codes = {"0", "200", "success", "ok"}
+    success_messages = {"success", "ok", "成功"}
+    codes: list[str] = []
+    messages: list[str] = []
+    success_flags: list[bool] = []
+    for payload in payloads:
+        raw_code = payload.get("code")
+        normalized_code = str(raw_code).strip() if raw_code not in (None, "") else ""
+        if normalized_code:
+            codes.append(normalized_code)
+        raw_message = payload.get("msg") or payload.get("message")
+        normalized_message = (
+            str(raw_message).strip() if raw_message not in (None, "") else ""
+        )
+        if normalized_message:
+            messages.append(normalized_message)
+        if isinstance(payload.get("success"), bool):
+            success_flags.append(bool(payload.get("success")))
+
+    failure_code = next(
+        (code for code in codes if code.casefold() not in success_codes), "",
+    )
+    failure_message = next(
+        (message for message in messages if message.casefold() not in success_messages),
+        messages[0] if messages else "",
+    )
+    if failure_code:
+        raise GuangYaWriteRejected(
+            operation, code=failure_code, message=failure_message,
+        )
+    if any(flag is False for flag in success_flags):
+        raise GuangYaWriteRejected(
+            operation, code=codes[0] if codes else "", message=failure_message,
+        )
+    has_explicit_success = bool(codes) or any(success_flags)
+    if messages and not has_explicit_success and all(
+        message.casefold() not in success_messages for message in messages
+    ):
+        raise GuangYaWriteRejected(
+            operation, code="", message=failure_message,
+        )
+
+
 @dataclass
 class GuangYaFile:
     file_id: str
@@ -1327,6 +1395,7 @@ class GuangYaClient:
             parent_id=None if parent_id == "0" else parent_id,
             fail_if_name_exist=True,
         )
+        _validate_write_response(res, operation="create_dir")
         fid = ""
         if isinstance(res, dict):
             data = res.get("data") or {}
@@ -1345,11 +1414,13 @@ class GuangYaClient:
         return _to_file(payload)
 
     def move(self, file_ids: list[str], parent_id: str) -> bool:
-        self.raw.fs_move(file_ids, None if parent_id == "0" else parent_id)
+        response = self.raw.fs_move(file_ids, None if parent_id == "0" else parent_id)
+        _validate_write_response(response, operation="move")
         return True
 
     def rename(self, file_id: str, new_name: str) -> bool:
-        self.raw.fs_rename(file_id, new_name)
+        response = self.raw.fs_rename(file_id, new_name)
+        _validate_write_response(response, operation="rename")
         return True
 
     def delete(self, file_ids: list[str]) -> bool:
@@ -1357,7 +1428,8 @@ class GuangYaClient:
         ids = list(dict.fromkeys(str(item).strip() for item in file_ids if str(item).strip()))
         if not ids:
             return True
-        self.raw.fs_delete(ids)
+        response = self.raw.fs_delete(ids)
+        _validate_write_response(response, operation="delete")
         return True
 
     @property

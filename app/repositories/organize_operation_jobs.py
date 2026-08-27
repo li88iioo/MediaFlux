@@ -7,7 +7,7 @@ import json
 import re
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -17,11 +17,18 @@ from app.repositories.agent_jobs import agent_job_owner_digest
 if TYPE_CHECKING:
     from types import ModuleType
 
-_ALLOWED_KINDS = {"agent_directory_scrape", "directory_scrape"}
+_ALLOWED_KINDS = {
+    "agent_directory_scrape", "agent_guangya_cleanup",
+    "agent_guangya_rename", "directory_scrape",
+}
 _TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled", "manual_review"}
 _MAX_JSON_BYTES = 131_072
 _MAX_TEXT = 240
 _MAX_TERMINAL_HISTORY_PER_OWNER = 64
+_MAX_TERMINAL_HISTORY_GLOBAL = 4_096
+_MAX_MANUAL_REVIEW_HISTORY_GLOBAL = 512
+_TERMINAL_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_MANUAL_REVIEW_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _MAX_ACTIVE_PER_OWNER = 4
 _MAX_ACTIVE_GLOBAL = 128
 _DEFAULT_TTL_SECONDS = 3_600
@@ -30,6 +37,9 @@ _ALLOWED_RESULT_STATS = {
     "metadata_moved", "stopped", "skipped", "conflict", "failed",
     "subtitle_moved", "subtitle_skipped", "replacement_cleanup_failed",
     "empty_dir_cleanup_failed", "source_dir_cleanup_failed", "audit_failures",
+    "strm_triggered", "strm_trigger_failed",
+    "quarantined", "empty_deleted", "verification_failed",
+    "precondition_failed",
 }
 
 
@@ -190,19 +200,51 @@ def _expire_pending(conn: sqlite3.Connection, current_epoch: float) -> int:
     return max(0, int(cur.rowcount or 0))
 
 
+def _delete_job_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> None:
+    if rows:
+        conn.executemany(
+            "DELETE FROM organize_operation_jobs WHERE job_id=?",
+            [(str(row["job_id"]),) for row in rows],
+        )
+
+
 def _trim_terminal_history(conn: sqlite3.Connection, owner_digest: str) -> None:
-    # manual_review 是结果未知的安全告警，不应被普通成功历史挤掉；由 TTL 清理兜底。
-    stale = conn.execute(
+    """限制终态任务历史，避免长期运行后数据库无界增长。"""
+    current = datetime.now()
+    terminal_cutoff = (
+        current - timedelta(seconds=_TERMINAL_RETENTION_SECONDS)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    manual_cutoff = (
+        current - timedelta(seconds=_MANUAL_REVIEW_RETENTION_SECONDS)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    conn.execute(
+        "DELETE FROM organize_operation_jobs WHERE status IN "
+        "('completed','partial','failed','cancelled') AND updated_at<?",
+        (terminal_cutoff,),
+    )
+    conn.execute(
+        "DELETE FROM organize_operation_jobs WHERE status='manual_review' AND updated_at<?",
+        (manual_cutoff,),
+    )
+
+    # 结果未知记录不会被普通成功历史挤掉，但自身也有独立全局上限与保留期。
+    _delete_job_rows(conn, conn.execute(
+        "SELECT job_id FROM organize_operation_jobs WHERE status='manual_review' "
+        "ORDER BY updated_at DESC,job_id DESC LIMIT -1 OFFSET ?",
+        (_MAX_MANUAL_REVIEW_HISTORY_GLOBAL,),
+    ).fetchall())
+    _delete_job_rows(conn, conn.execute(
         "SELECT job_id FROM organize_operation_jobs WHERE owner_digest=? "
         "AND status IN ('completed','partial','failed','cancelled') "
         "ORDER BY updated_at DESC,job_id DESC LIMIT -1 OFFSET ?",
         (owner_digest, _MAX_TERMINAL_HISTORY_PER_OWNER),
-    ).fetchall()
-    if stale:
-        conn.executemany(
-            "DELETE FROM organize_operation_jobs WHERE job_id=?",
-            [(str(row["job_id"]),) for row in stale],
-        )
+    ).fetchall())
+    _delete_job_rows(conn, conn.execute(
+        "SELECT job_id FROM organize_operation_jobs WHERE status IN "
+        "('completed','partial','failed','cancelled') "
+        "ORDER BY updated_at DESC,job_id DESC LIMIT -1 OFFSET ?",
+        (_MAX_TERMINAL_HISTORY_GLOBAL,),
+    ).fetchall())
 
 
 def enqueue_organize_operation_job(

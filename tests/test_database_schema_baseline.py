@@ -15,7 +15,7 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
-    def test_fresh_database_contains_complete_v9_schema(self) -> None:
+    def test_fresh_database_contains_complete_v10_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             task_columns = {
@@ -57,7 +57,6 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 )
             }
 
-        self.assertEqual(version, db.SCHEMA_VERSION)
         self.assertEqual(version, db.SCHEMA_VERSION)
         self.assertIn("rules_snapshot", task_columns)
         self.assertIn("recognition_summary", task_columns)

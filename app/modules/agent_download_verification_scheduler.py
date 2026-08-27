@@ -198,6 +198,39 @@ class DownloadLibraryVerificationScheduler:
         )
         cutoff = self._format(current - timedelta(days=_HISTORY_RETENTION_DAYS))
         next_cleanup = self._format(self._next_cleanup_at)
+        private_maintainers = (
+            (
+                "Agent 光鸭私有计划",
+                "app.modules.guangya_rename",
+                "maintain_rename_plans",
+            ),
+            (
+                "Agent 光鸭残留清理私有计划",
+                "app.modules.guangya_residual_cleanup",
+                "maintain_cleanup_plans",
+            ),
+            (
+                "Agent 光鸭观察快照",
+                "app.modules.guangya_workspace",
+                "maintain_workspace_observations",
+            ),
+        )
+        for label, module_name, function_name in private_maintainers:
+            try:
+                module = __import__(module_name, fromlist=[function_name])
+                cleanup = getattr(module, function_name)()
+                if int(cleanup.get("removed") or 0) > 0:
+                    logger.info(
+                        "%s已清理 plans=%s remaining=%s bytes=%s",
+                        label,
+                        int(cleanup.get("removed") or 0),
+                        int(cleanup.get("remaining") or 0),
+                        int(cleanup.get("bytes") or 0),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "%s清理失败 type=%s", label, type(exc).__name__
+                )
         try:
             deleted = db.purge_expired_agent_task_history(
                 current_time=self._format(current),

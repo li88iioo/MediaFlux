@@ -227,6 +227,24 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "会重新安排后续定时同步，不会立即启动或中断同步任务。",
         "reversibility": "可再次修改策略恢复；环境变量锁定的配置不会被覆盖。",
     },
+    "guangya.change_plan.execute": {
+        "action": "执行光鸭声明式改名",
+        "object": "最近目录观察中由不透明对象引用生成并通过验证的精确名称映射",
+        "impact": "只执行冻结计划中的 rename 操作；不会扩大观察范围、修改扩展名、移动或删除对象，并按预览配置决定是否核对 STRM。",
+        "reversibility": "私有清单保留原名称和对象快照，可作为手工恢复依据；执行前后均重新读取光鸭验证。",
+    },
+    "guangya.media_hygiene.execute": {
+        "action": "清理光鸭媒体名称",
+        "object": "最近预览冻结的域名污染目录、视频和唯一关联伴随文件",
+        "impact": "只应用预览中的名称映射；逐项写后验证，至少一个对象改名成功后自动触发 STRM 全量核对。",
+        "reversibility": "私有清单保留原名称与对象标识，可用于后续受控回滚；不会移动或删除媒体文件。",
+    },
+    "guangya.rename.execute": {
+        "action": "执行光鸭重命名",
+        "object": "当前会话最近冻结并排除重名冲突的云盘对象",
+        "impact": "只会应用预览中固定的旧名称到新名称映射；执行前重新核对凭据和文件快照，写入后逐项验证真实名称。",
+        "reversibility": "私有清单会保留 file_id、原目录和原名称，可用于后续受控回滚；本次不会移动或删除文件。",
+    },
     "guangya.organize.set_schedule_policy": {
         "action": "更新光鸭定时整理策略",
         "object": "定时整理的启用状态、计划表达式或任务通知",
@@ -250,6 +268,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "object": "当前正在运行的整理任务",
         "impact": "会协作停止后续文件处理，正在提交的单个操作可能先完成。",
         "reversibility": "停止后可重新启动；已经完成的移动不会自动回滚。",
+    },
+    "guangya.organize.cleanup.execute": {
+        "action": "清理光鸭整理残留",
+        "object": "最近预览冻结的真空目录和严格垃圾残留目录",
+        "impact": "真空目录会在双重复核后进入回收站；非空垃圾残留整体移动到 MediaFlux 隔离区，不会永久删除。",
+        "reversibility": "隔离目录可手工移回；空目录可从光鸭回收站恢复。来源根及含媒体元数据或未知文件的目录不会进入计划。",
     },
     "guangya.organize.clean_empty": {
         "action": "清理光鸭来源空目录",

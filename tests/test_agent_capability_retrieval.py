@@ -41,6 +41,33 @@ class AgentCapabilityRetrievalTests(unittest.TestCase):
         self.assertIn("indexer.search_resources", names)
         self.assertNotIn("web.search", names)
 
+    def test_media_hygiene_recalls_nsfw_filename_cleanup(self):
+        names = self._names("把 (xxx.com)-番号.mp4 这种垃圾标题清理掉并刷新 STRM")
+
+        self.assertIn("guangya.media_hygiene.preview", names)
+
+    def test_organize_cleanup_recalls_empty_and_image_only_residuals(self):
+        names = self._names("清理光鸭整理来源与执行空间的空媒体目录，剩下 a/xxx.png")
+
+        self.assertIn("guangya.organize.cleanup.preview", names)
+
+    def test_ambiguous_media_garbage_request_exposes_both_safe_previews(self):
+        names = self._names("帮我整理一下 a 目录媒体目录和媒体信息的垃圾信息")
+
+        self.assertIn("guangya.media_hygiene.preview", names)
+        self.assertIn("guangya.organize.cleanup.preview", names)
+
+    def test_guangya_directory_analysis_recalls_observation_and_declarative_plan(self):
+        names = self._names("看看光鸭 a 目录里面有哪些文件，分析文件名垃圾前缀")
+
+        self.assertIn("guangya.directory.inspect", names)
+        self.assertIn("guangya.change_plan.preview", names)
+
+    def test_followup_object_reference_recalls_declarative_plan(self):
+        names = self._names("根据刚才看到的对象引用生成精确改名计划")
+
+        self.assertIn("guangya.change_plan.preview", names)
+
     def test_episode_numbering_recalls_fact_sources_without_resource_takeover(self):
         profile = infer_media_intent("第三季第22集是多少集？")
         names = self._names("第三季第22集是多少集？")

@@ -25,6 +25,9 @@ _CONTEXT_TYPES = frozenset({
     "local_media_tasks",
     "discovery_mapping",
     "directory_scrape",
+    "guangya_rename",
+    "guangya_cleanup",
+    "guangya_workspace",
 })
 _SCHEMA_VERSION = 1
 _DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024

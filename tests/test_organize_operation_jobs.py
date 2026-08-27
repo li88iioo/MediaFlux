@@ -150,6 +150,54 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
         self.assertEqual(terminal["reference"], "")
         self.assertEqual(terminal["result_json"], '{}')
 
+    def test_old_manual_review_history_is_pruned_on_next_enqueue(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO organize_operation_jobs("
+                "job_id,job_kind,owner_digest,operation,dedupe_digest,status,"
+                "expires_at,created_at,updated_at) VALUES(?,?,?,?,?,'manual_review',?,?,?)",
+                (
+                    "f" * 32, "agent_guangya_cleanup", "legacy-owner",
+                    "旧清理任务", "legacy-dedupe", 0,
+                    "2000-01-01 00:00:00.000000",
+                    "2000-01-01 00:00:00.000000",
+                ),
+            )
+        self._enqueue(dedupe="owner:trigger-retention")
+        with db.get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS total FROM organize_operation_jobs "
+                "WHERE status='manual_review'"
+            ).fetchone()["total"]
+        self.assertEqual(count, 0)
+
+    def test_manual_review_history_has_a_global_capacity_bound(self) -> None:
+        timestamp = db.now()
+        with db.get_conn() as conn:
+            for index in range(3):
+                conn.execute(
+                    "INSERT INTO organize_operation_jobs("
+                    "job_id,job_kind,owner_digest,operation,dedupe_digest,status,"
+                    "expires_at,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,'manual_review',?,?,?)",
+                    (
+                        f"{index + 1:032x}", "agent_guangya_rename",
+                        f"owner-{index}", "待人工核对", f"dedupe-{index}",
+                        0, timestamp, timestamp,
+                    ),
+                )
+        with patch(
+            "app.repositories.organize_operation_jobs._MAX_MANUAL_REVIEW_HISTORY_GLOBAL",
+            2,
+        ):
+            self._enqueue(dedupe="owner:trigger-global-cap")
+        with db.get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) AS total FROM organize_operation_jobs "
+                "WHERE status='manual_review'"
+            ).fetchone()["total"]
+        self.assertEqual(count, 2)
+
     def test_per_owner_capacity_and_expired_confirmation(self) -> None:
         for index in range(4):
             self._enqueue(dedupe=f"owner:capacity:{index}")
