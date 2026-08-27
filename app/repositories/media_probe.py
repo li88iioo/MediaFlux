@@ -24,6 +24,7 @@ _MEDIA_PROFILE_FIELDS = frozenset({
     "audio_codec",
     "audio_channels",
     "source",
+    # 仅用于读取升级前的成功缓存；当前 MediaProfile 不再生成码率命名字段。
     "video_bitrate_bps",
     "overall_bitrate_bps",
     "bitrate_source",

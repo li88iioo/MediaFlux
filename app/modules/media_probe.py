@@ -82,8 +82,7 @@ def _run_ffprobe(
 ) -> subprocess.CompletedProcess:
     """运行 ffprobe，并允许整理任务在子进程执行期间及时取消。"""
     command = [
-        executable, "-v", "error", "-show_streams", "-show_format",
-        "-of", "json", url,
+        executable, "-v", "error", "-show_streams", "-of", "json", url,
     ]
     timeout_seconds = max(0.1, float(timeout))
     if cancel_event is None:
@@ -200,38 +199,12 @@ class MediaProfile:
     source: str = ""
     dolby_vision: bool | None = None
     atmos: bool | None = None
-    # 新增字段追加在历史字段之后，保持外部位置参数构造兼容。
-    video_bitrate_bps: int = 0
-    overall_bitrate_bps: int = 0
-    bitrate_source: str = ""
 
     def render(self) -> str:
         return ".".join(value for value in (
             self.source, self.resolution, self.dynamic_range, self.video_codec, self.bit_depth,
-            _render_bitrate(self.video_bitrate_bps or self.overall_bitrate_bps), self.fps,
-            self.audio_codec, self.audio_channels,
+            self.fps, self.audio_codec, self.audio_channels,
         ) if value)
-
-
-def _positive_int(value) -> int:
-    try:
-        parsed = int(float(str(value or "0").strip()))
-    except (TypeError, ValueError):
-        return 0
-    return parsed if parsed > 0 else 0
-
-
-def _render_bitrate(value: int) -> str:
-    bitrate = _positive_int(value)
-    if not bitrate:
-        return ""
-    mbps = bitrate / 1_000_000
-    if mbps >= 1:
-        text = f"{mbps:.1f}".rstrip("0").rstrip(".")
-        return f"{text}Mbps"
-    kbps = bitrate / 1_000
-    text = f"{kbps:.0f}"
-    return f"{text}Kbps"
 
 
 def infer_media_source(value: object) -> str:
@@ -343,13 +316,6 @@ def merge_media_profiles(
             if preferred.dolby_vision is not None else secondary.dolby_vision
         ),
         atmos=preferred.atmos if preferred.atmos is not None else secondary.atmos,
-        video_bitrate_bps=(
-            preferred.video_bitrate_bps or secondary.video_bitrate_bps
-        ),
-        overall_bitrate_bps=(
-            preferred.overall_bitrate_bps or secondary.overall_bitrate_bps
-        ),
-        bitrate_source=preferred.bitrate_source or secondary.bitrate_source,
     )
 
 
@@ -465,10 +431,6 @@ def parse_ffprobe_payload(payload: dict, *, source_hint: object = "") -> MediaPr
         channels = 0
     layout = str(audio.get("channel_layout") or "").lower()
     channel_text = "2.0" if channels == 2 or layout == "stereo" else "1.0" if channels == 1 else "5.1" if channels == 6 else "7.1" if channels == 8 else ""
-    format_info = payload.get("format") if isinstance(payload, dict) else {}
-    format_info = format_info if isinstance(format_info, dict) else {}
-    video_bitrate = _positive_int(video.get("bit_rate"))
-    overall_bitrate = _positive_int(format_info.get("bit_rate"))
     probed = MediaProfile(
         resolution=_resolution(video.get("width"), video.get("height")),
         dynamic_range=dynamic,
@@ -477,9 +439,6 @@ def parse_ffprobe_payload(payload: dict, *, source_hint: object = "") -> MediaPr
         fps=_fps(video.get("avg_frame_rate") or video.get("r_frame_rate")),
         audio_codec=audio_codec,
         audio_channels=channel_text,
-        video_bitrate_bps=video_bitrate,
-        overall_bitrate_bps=overall_bitrate,
-        bitrate_source="video_stream" if video_bitrate else ("container" if overall_bitrate else ""),
         dolby_vision=dolby_vision,
         atmos=atmos,
     )
@@ -495,6 +454,10 @@ def media_profile_from_cache(
         data = json.loads(payload)
         if not isinstance(data, dict) or data.get("_media_probe_cache") == "failure":
             return None
+        # 旧缓存可能带有已停止参与命名的码率字段；静默丢弃以避免升级后
+        # 重新探测整个媒体库，同时保证新缓存不再生成这些冗余数据。
+        for key in ("video_bitrate_bps", "overall_bitrate_bps", "bitrate_source"):
+            data.pop(key, None)
         profile = MediaProfile(**data)
         if source_hint is not None:
             # 来源/发布标签来自当前路径而非媒体比特流。内容指纹缓存可以跨

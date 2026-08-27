@@ -1071,6 +1071,15 @@ def _video_install_result(value: object, expected: Path) -> tuple[int, str]:
     return int(value or 0), fingerprint
 
 
+def _video_generation_is_update(
+    file_id: object,
+    expected: Path,
+    existing_by_id: dict[str, object],
+) -> bool:
+    """同一远端文件的内容修复或路径迁移都属于更新，而不是新建。"""
+    return expected.is_file() or str(file_id) in existing_by_id
+
+
 def _install_metadata_candidate(
     file: GuangYaFile,
     rel_dir: str,
@@ -1585,7 +1594,9 @@ def _sync_strm_incremental_impl(
                         )
                     stats["skipped"] += 1
                 else:
-                    existed_before = expected.is_file()
+                    is_update = _video_generation_is_update(
+                        file.file_id, expected, video_by_id
+                    )
                     install_result = _install_video_candidate(
                         file, rel_dir, expected, base_url, strm_root, video_key,
                         video_by_id, video_by_path,
@@ -1599,7 +1610,7 @@ def _sync_strm_incremental_impl(
                         installed_fingerprint,
                     )
                     stats["generated"] += 1
-                    stats["updated" if existed_before else "created"] += 1
+                    stats["updated" if is_update else "created"] += 1
                     _track_change(stats, "generated", expected, strm_root)
                 pending_resolutions["generate"].add(file_id)
             else:
@@ -2198,7 +2209,9 @@ def _sync_strm_impl(
                     )
                     continue
                 try:
-                    existed_before = expected.is_file()
+                    is_update = _video_generation_is_update(
+                        file.file_id, expected, existing_by_id
+                    )
                     install_result = _install_video_candidate(
                         file, rel_dir, expected, base_url, strm_root, source_key,
                         existing_by_id, existing_by_path,
@@ -2209,7 +2222,7 @@ def _sync_strm_impl(
                     stats["cleaned"] += cleaned
                     seen_ids.add(str(file.file_id))
                     stats["generated"] += 1
-                    stats["updated" if existed_before else "created"] += 1
+                    stats["updated" if is_update else "created"] += 1
                     pending_resolutions["generate"].add(str(file.file_id))
                     _track_change(stats, "generated", expected, strm_root)
                     _update_video_index_snapshot(

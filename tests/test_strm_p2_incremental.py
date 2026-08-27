@@ -165,6 +165,8 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
 
         self.assertFalse(stats["fallback_required"])
         self.assertEqual(stats["generated"], 1)
+        self.assertEqual(stats["created"], 0)
+        self.assertEqual(stats["updated"], 1)
         self.assertEqual(stats["cleaned"], 1)
         self.assertFalse(old_exists)
         self.assertTrue(new_exists)
@@ -207,6 +209,33 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["cleaned"], 1)
         self.assertFalse(old_exists)
         self.assertEqual([row["file_id"] for row in rows], ["new"])
+        self.assertEqual(len(new_files), 1)
+
+    def test_full_sync_same_file_id_rename_counts_as_update(self):
+        source_id = "full-rename"
+        source_key = f"guangya:{source_id}"
+        old = GuangYaFile("video", "Old.mkv", False, 100, "old-etag", source_id)
+        renamed = GuangYaFile("video", "New.mkv", False, 100, "new-etag", source_id)
+        client = _TreeClient({source_id: [renamed]})
+        with tempfile.TemporaryDirectory() as root:
+            old_path = generate_strm(old, "", "http://media.invalid", root)
+            db.upsert_strm_index(
+                source_key, old.file_id, old.etag, old.size, old.name,
+                str(old_path), self._fingerprint(old_path),
+            )
+
+            stats = sync_strm(
+                source_id, "http://media.invalid", root, client=client,
+                clean_empty_dirs=False,
+            )
+            new_files = list((Path(root) / STRM_SUBDIR).rglob("New.strm"))
+            old_exists = old_path.exists()
+
+        self.assertEqual(stats["generated"], 1)
+        self.assertEqual(stats["created"], 0)
+        self.assertEqual(stats["updated"], 1)
+        self.assertEqual(stats["cleaned"], 1)
+        self.assertFalse(old_exists)
         self.assertEqual(len(new_files), 1)
 
     def test_incremental_remote_snapshot_change_requests_full_fallback(self):

@@ -196,6 +196,37 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         ):
             self.assertEqual(_configured_roots(), [Path(root_raw).resolve()])
 
+    def test_root_container_default_browser_exposes_mounts_not_container_root(self):
+        from app.modules.local_directory_browser import _configured_roots
+
+        with (
+            tempfile.TemporaryDirectory() as first_raw,
+            tempfile.TemporaryDirectory() as second_raw,
+            tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as mountinfo,
+        ):
+            first = Path(first_raw).resolve()
+            second = Path(second_raw).resolve()
+            mountinfo.write(
+                "20 1 0:1 / / rw - overlay overlay rw\n"
+                f"21 20 0:2 / {first} rw - ext4 /dev/a rw\n"
+                f"22 20 0:3 / {second} rw - ext4 /dev/b rw\n"
+                "23 20 0:4 / /proc rw - proc proc rw\n"
+                "24 20 0:5 / /tmp rw - tmpfs tmpfs rw\n"
+            )
+            mountinfo.flush()
+            with patch.dict("os.environ", {"MEDIAFLUX_CONTAINER": "1"}), patch(
+                "app.modules.local_directory_browser.get", return_value=""
+            ), patch(
+                "app.modules.local_directory_browser._MOUNTINFO_PATH", Path(mountinfo.name)
+            ):
+                roots = _configured_roots()
+
+        self.assertEqual(
+            roots,
+            sorted([first, second], key=lambda item: str(item).casefold()),
+        )
+        self.assertNotIn(Path("/"), roots)
+
     def test_legacy_source_edit_requires_container_path_migration(self):
         token = self.login()
         headers = {"X-CSRF-Token": token}

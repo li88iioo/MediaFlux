@@ -189,7 +189,6 @@ class MediaProbeTests(unittest.TestCase):
 
         self.assertIs(profile.dolby_vision, True)
         self.assertIs(profile.atmos, False)
-        self.assertEqual(profile.video_bitrate_bps, 0)
 
     def test_cached_profile_recomputes_filename_derived_source(self):
         import json
@@ -208,8 +207,9 @@ class MediaProbeTests(unittest.TestCase):
         unlabeled = media_profile_from_cache(payload, source_hint="Movie.2026.2160p.mkv")
 
         self.assertEqual(renamed.source, "Remux")
-        self.assertEqual(renamed.video_bitrate_bps, 14_800_000)
+        self.assertEqual(renamed.render(), "Remux.2160p")
         self.assertEqual(unlabeled.source, "")
+        self.assertEqual(unlabeled.render(), "2160p")
 
     def test_ffprobe_payload_renders_trustworthy_profile(self):
         from app.modules.media_probe import parse_ffprobe_payload
@@ -219,7 +219,7 @@ class MediaProbeTests(unittest.TestCase):
         ]})
         self.assertEqual(profile.render(), "2160p.SDR.H.265.10-bit.25fps.AAC.2.0")
 
-    def test_ffprobe_payload_renders_inferred_source_and_real_video_bitrate(self):
+    def test_ffprobe_payload_ignores_bitrate_and_renders_inferred_source(self):
         from app.modules.media_probe import parse_ffprobe_payload
 
         profile = parse_ffprobe_payload({
@@ -239,15 +239,12 @@ class MediaProbeTests(unittest.TestCase):
         }, source_hint="Example.2026.2160p.WEB-DL.HEVC.mkv")
 
         self.assertEqual(profile.source, "WEB-DL")
-        self.assertEqual(profile.video_bitrate_bps, 14_800_000)
-        self.assertEqual(profile.overall_bitrate_bps, 16_000_000)
-        self.assertEqual(profile.bitrate_source, "video_stream")
         self.assertEqual(
             profile.render(),
-            "WEB-DL.2160p.SDR.H.265.10-bit.14.8Mbps.25fps.AAC.2.0",
+            "WEB-DL.2160p.SDR.H.265.10-bit.25fps.AAC.2.0",
         )
 
-    def test_container_bitrate_is_recorded_but_not_mislabeled_as_video_bitrate(self):
+    def test_container_bitrate_is_ignored_by_media_naming(self):
         from app.modules.media_probe import parse_ffprobe_payload
 
         profile = parse_ffprobe_payload({
@@ -259,10 +256,7 @@ class MediaProbeTests(unittest.TestCase):
         }, source_hint="Example.1080p.WEBRip.mkv")
 
         self.assertEqual(profile.source, "WEBRip")
-        self.assertEqual(profile.video_bitrate_bps, 0)
-        self.assertEqual(profile.overall_bitrate_bps, 8_000_000)
-        self.assertEqual(profile.bitrate_source, "container")
-        self.assertEqual(profile.render(), "WEBRip.1080p.H.264.8Mbps")
+        self.assertEqual(profile.render(), "WEBRip.1080p.H.264")
 
     def test_ffprobe_profile_merges_missing_fields_from_filename_evidence(self):
         from app.modules.media_probe import parse_ffprobe_payload

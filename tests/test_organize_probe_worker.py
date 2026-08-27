@@ -136,7 +136,7 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         worker._client = client
         profile = MediaProfile(
             resolution="1080p", video_codec="H.264", fps="23.976fps",
-            audio_codec="AAC", audio_channels="2.0", video_bitrate_bps=2_195_515,
+            audio_codec="AAC", audio_channels="2.0",
         )
 
         with patch("app.modules.media_probe.probe_media_profile", return_value=profile), patch(
@@ -146,7 +146,7 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
 
         expected = (
             "筋肉人：完美超人始祖篇.2024.S01E15-WEB-DL.1080p.H.264."
-            "2.2Mbps.23.976fps.AAC.2.0.mp4"
+            "23.976fps.AAC.2.0.mp4"
         )
         self.assertEqual(client.files["video-15"].name, expected)
         self.assertEqual(

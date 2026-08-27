@@ -11,10 +11,89 @@ from app.modules.local_path_mapping import (
 )
 
 VIRTUAL_ROOT = "__roots__"
+_MOUNTINFO_PATH = Path("/proc/self/mountinfo")
+_MOUNTINFO_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
+_CONTAINER_INTERNAL_ROOTS = tuple(Path(item) for item in (
+    "/app", "/boot", "/dev", "/etc", "/proc", "/root", "/run", "/sys",
+    "/usr", "/var",
+))
+_CONTAINER_FALLBACK_ROOTS = tuple(Path(item) for item in (
+    "/data/strm", "/media/downloads", "/media/library", "/mnt",
+))
+_NON_BUSINESS_FILESYSTEMS = frozenset({
+    "autofs", "binfmt_misc", "cgroup", "cgroup2", "configfs", "debugfs",
+    "devpts", "devtmpfs", "fusectl", "hugetlbfs", "mqueue", "overlay",
+    "proc", "pstore", "rpc_pipefs", "securityfs", "squashfs", "sysfs",
+    "tmpfs", "tracefs",
+})
+
+
+def _container_mode() -> bool:
+    return str(os.getenv("MEDIAFLUX_CONTAINER", "") or "").strip().lower() in {
+    "1", "true", "yes", "on",
+    }
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    return _MOUNTINFO_ESCAPE_RE.sub(
+        lambda matched: chr(int(matched.group(1), 8)), str(value or "")
+    )
+
+
+def _is_internal_container_path(path: Path) -> bool:
+    if path == Path("/"):
+        return True
+    return any(path == root or root in path.parents for root in _CONTAINER_INTERNAL_ROOTS)
+
+
+def _container_mount_roots() -> list[Path]:
+    """从 mountinfo 只提取真实目录挂载点，避免 root 进程暴露整个容器根。"""
+    try:
+        lines = _MOUNTINFO_PATH.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return []
+
+    candidates: list[Path] = []
+    for line in lines:
+        before, separator, after = line.partition(" - ")
+        fields = before.split()
+        after_fields = after.split()
+        if not separator or len(fields) < 5 or not after_fields:
+            continue
+        if after_fields[0].casefold() in _NON_BUSINESS_FILESYSTEMS:
+            continue
+        mount_point = Path(_decode_mountinfo_path(fields[4]))
+        if (
+            not mount_point.is_absolute()
+            or _is_internal_container_path(mount_point)
+            or not mount_point.is_dir()
+        ):
+            continue
+        candidates.append(mount_point)
+
+    selected: list[Path] = []
+    for candidate in sorted(
+        candidates, key=lambda item: (len(item.parts), str(item).casefold())
+    ):
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if any(root == resolved or root in resolved.parents for root in selected):
+            continue
+        selected.append(resolved)
+    return selected
 
 
 def _platform_roots() -> list[Path]:
-    """Docker 运行时只浏览容器内的 POSIX 文件系统。"""
+    """容器内默认只暴露业务挂载点；非容器开发环境保留 POSIX 根入口。"""
+    if _container_mode():
+        mounted = _container_mount_roots()
+        if mounted:
+            return mounted
+        return [root for root in _CONTAINER_FALLBACK_ROOTS if root.is_dir()]
     return [Path("/")]
 
 
