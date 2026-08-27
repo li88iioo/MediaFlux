@@ -21,6 +21,7 @@ from app.agent.llm_router import (
     _NativeLoopState,
     _native_context_text,
     _native_read_capabilities,
+    _native_read_only_subset,
     _parse_selection,
     _request_native_read_agent,
     _request_result_narrative,
@@ -182,6 +183,42 @@ def _chat_text_turn(text: str, *, usage: dict[str, int] | None = None) -> bytes:
     if usage is not None:
         payload["usage"] = usage
     return json_module.dumps(payload).encode()
+
+
+def _resource_search_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(ToolSpec(
+        name="indexer.search_resources",
+        description="搜索资源索引并返回安全候选",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 120},
+            },
+            "additionalProperties": False,
+        },
+        validator=lambda arguments: {"query": str(arguments["query"])},
+        handler=lambda _arguments: ToolResult(
+            True,
+            "success",
+            "找到 1 项可查看资源",
+            data={
+                "items": [{
+                    "result_id": "resource-result-0001",
+                    "title": "沧元图 S03E22 2160p",
+                    "site_id": "nyaa",
+                    "site_name": "Nyaa",
+                    "size_text": "731 MiB",
+                    "download_state": "ready",
+                    "download_kinds": ["magnet"],
+                }],
+            },
+        ),
+        llm_read=True,
+    ))
+    return registry
 
 
 def _read_registry(*, calls=None) -> ToolRegistry:
@@ -674,6 +711,25 @@ class AgentLLMSelectionTests(unittest.TestCase):
                 self.assertFalse(is_agent_action_request(message))
                 self.assertFalse(is_confirmation_planning_request(message))
 
+    def test_native_read_only_surface_only_narrows_initial_capabilities(self):
+        registry = _confirmation_registry()
+        initial = _native_read_capabilities(
+            registry,
+            "先检查状态，再开启网页搜索",
+            include_confirmations=True,
+        )
+
+        read_only = _native_read_only_subset(registry, initial)
+
+        initial_aliases = {item["name"] for item in initial}
+        read_aliases = {item["name"] for item in read_only}
+        self.assertTrue(read_aliases.issubset(initial_aliases))
+        self.assertIn(registry.native_alias_for("workspace.health"), read_aliases)
+        self.assertNotIn(
+            registry.native_alias_for("config.set_feature_state"),
+            read_aliases,
+        )
+
     def test_native_capabilities_cover_each_clause_of_compound_read_requests(self):
         registry = build_tool_registry()
 
@@ -694,6 +750,16 @@ class AgentLLMSelectionTests(unittest.TestCase):
         }
         self.assertIn("media.subscription_updates", resource_names)
         self.assertIn("indexer.search_resources", resource_names)
+
+        official_progress_names = {
+            registry.native_tool_name(item["name"])
+            for item in _native_read_capabilities(
+                registry, "沧元图 官方更新到多集啦？"
+            )
+        }
+        self.assertIn("web.search", official_progress_names)
+        self.assertIn("library.check_updates", official_progress_names)
+        self.assertIn("indexer.search_resources", official_progress_names)
 
         calendar_names = {
             registry.native_tool_name(item["name"])
@@ -2035,6 +2101,84 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertEqual(completed, [2, 1])
         self.assertEqual([call.call_id for call, _payload in outputs], ["call_slow", "call_fast"])
         self.assertEqual([item["arguments"]["n"] for item in state.tool_executions], [1, 2])
+
+    def test_native_read_parallel_safety_preserves_serial_barriers(self):
+        registry = ToolRegistry()
+        parameters = {
+            "type": "object",
+            "required": ["n"],
+            "properties": {"n": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        }
+        registry.register(ToolSpec(
+            name="demo.parallel_counter",
+            description="可并行读取演示计数",
+            risk=RiskLevel.READ,
+            parameters=parameters,
+            validator=lambda arguments: {"n": int(arguments["n"])},
+            handler=lambda arguments: ToolResult(
+                True, "ok", f"计数 {int(arguments['n'])}"
+            ),
+            llm_read=True,
+            native_alias="mf_parallel_counter",
+            llm_parallel_safe=True,
+        ))
+        registry.register(ToolSpec(
+            name="demo.serial_counter",
+            description="串行读取演示计数",
+            risk=RiskLevel.READ,
+            parameters=parameters,
+            validator=lambda arguments: {"n": int(arguments["n"])},
+            handler=lambda arguments: ToolResult(
+                True, "ok", f"计数 {int(arguments['n'])}"
+            ),
+            llm_read=True,
+            native_alias="mf_serial_counter",
+            llm_parallel_safe=False,
+        ))
+        turn = NativeToolTurn(
+            text="",
+            tool_calls=(
+                NativeToolCall("call_1", "mf_parallel_counter", {"n": 1}),
+                NativeToolCall("call_2", "mf_parallel_counter", {"n": 2}),
+                NativeToolCall("call_3", "mf_serial_counter", {"n": 3}),
+                NativeToolCall("call_4", "mf_parallel_counter", {"n": 4}),
+            ),
+        )
+        completed = []
+
+        def execute(name, arguments):
+            if arguments["n"] == 1:
+                time.sleep(0.05)
+            elif arguments["n"] == 2:
+                time.sleep(0.01)
+            completed.append(arguments["n"])
+            return {
+                "tool_call": {"name": name, "arguments": dict(arguments)},
+                "result": ToolResult(
+                    True, "ok", f"计数 {arguments['n']}"
+                ).to_dict(),
+            }
+
+        state = _NativeLoopState()
+        outputs = asyncio.run(_execute_native_tool_turn(
+            turn,
+            registry=registry,
+            execute_tool=execute,
+            state=state,
+            allowed_aliases=frozenset({"mf_parallel_counter", "mf_serial_counter"}),
+            allow_confirmations=False,
+        ))
+
+        self.assertEqual(completed, [2, 1, 3, 4])
+        self.assertEqual(
+            [call.call_id for call, _payload in outputs],
+            ["call_1", "call_2", "call_3", "call_4"],
+        )
+        self.assertEqual(
+            [item["arguments"]["n"] for item in state.tool_executions],
+            [1, 2, 3, 4],
+        )
 
     def test_native_read_agent_allows_final_text_on_sixth_provider_request(self):
         scripted = [
@@ -3577,6 +3721,163 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertEqual(recent[0], "agent.read_plan")
         self.assertEqual(len(recent[1]["steps"]), 2)
         presenter.assert_not_called()
+
+    def test_official_progress_fallback_does_not_treat_local_update_check_as_official(self):
+        agent = AgentOrchestrator(_resource_search_registry())
+        conversation_reply = LLMConversationReply(
+            "暂时无法联网核对官方进度，不能用本地资源标题代替官方结论。"
+        )
+
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ), patch(
+            "app.agent.orchestrator.answer_conversation",
+            return_value=conversation_reply,
+        ):
+            response = agent.query(
+                "沧元图 官方更新到多集啦？",
+                owner="web-session",
+            )
+
+        self.assertEqual(response["mode"], "conversation")
+        self.assertIsNone(response["tool_call"])
+        self.assertIn("不能用本地资源标题", response["result"]["summary"])
+
+    def test_informational_update_query_marks_resource_candidates_as_supporting(self):
+        registry = _resource_search_registry()
+
+        def run_native(_message, _registry, execute_tool, **_kwargs):
+            resource_response = execute_tool(
+                "indexer.search_resources", {"query": "沧元图"}
+            )
+            return LLMConversationReply(
+                answer=(
+                    "官方目前更新至第三季第 22 集。\n\n"
+                    "本地资源索引也已跟进到第 22 集。"
+                ),
+                tool_trace=(
+                    {"label": "网页搜索", "ok": True, "summary": "找到官方进度"},
+                    {"label": "资源搜索", "ok": True, "summary": "找到资源旁证"},
+                ),
+                tool_executions=(
+                    {
+                        "tool_name": "web.search",
+                        "arguments": {"query": "沧元图 官方 更新至 第几集"},
+                        "response": {
+                            "tool_call": {"name": "web.search", "elapsed_ms": 3},
+                            "result": ToolResult(
+                                True, "ok", "找到官方进度"
+                            ).to_dict(),
+                        },
+                    },
+                    {
+                        "tool_name": "indexer.search_resources",
+                        "arguments": {"query": "沧元图"},
+                        "response": resource_response,
+                    },
+                ),
+            )
+
+        response_orchestrator = AgentOrchestrator(registry)
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent",
+            side_effect=run_native,
+        ):
+            response = response_orchestrator.query(
+                "沧元图 官方更新到多集啦？",
+                owner="web-session",
+            )
+
+        self.assertEqual(response["mode"], "read_plan")
+        self.assertEqual(response["response_contract"], {
+            "task_kind": "informational",
+            "presentation": "narrative",
+            "resource_candidates": "supporting",
+        })
+        self.assertIsNone(
+            response_orchestrator.recent_resource_store.get(owner="web-session")
+        )
+        self.assertIn(
+            "官方目前更新至第三季第 22 集",
+            response["presentation"]["narrative"],
+        )
+
+    def test_explicit_native_resource_search_activates_candidate_context(self):
+        registry = _resource_search_registry()
+
+        def run_native(_message, _registry, execute_tool, **_kwargs):
+            resource_response = execute_tool(
+                "indexer.search_resources", {"query": "沧元图"}
+            )
+            return LLMConversationReply(
+                answer="找到可查看资源，请选择目标。",
+                tool_trace=(
+                    {"label": "资源搜索", "ok": True, "summary": "找到 1 项资源"},
+                ),
+                tool_executions=({
+                    "tool_name": "indexer.search_resources",
+                    "arguments": {"query": "沧元图"},
+                    "response": resource_response,
+                },),
+            )
+
+        orchestrator = AgentOrchestrator(registry)
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent",
+            side_effect=run_native,
+        ):
+            response = orchestrator.query(
+                "搜索一下沧元图最新资源",
+                owner="web-session",
+            )
+
+        self.assertEqual(response["response_contract"], {
+            "task_kind": "resource_search",
+            "presentation": "resource_candidates",
+            "resource_candidates": "primary",
+        })
+        snapshot = orchestrator.recent_resource_store.get(owner="web-session")
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["candidates"][0]["title"], "沧元图 S03E22 2160p")
+
+    def test_resource_availability_question_with_negated_download_stays_narrative(self):
+        registry = _resource_search_registry()
+
+        def run_native(_message, _registry, execute_tool, **_kwargs):
+            resource_response = execute_tool(
+                "indexer.search_resources", {"query": "沧元图"}
+            )
+            return LLMConversationReply(
+                answer="资源索引已经找到第 22 集，但没有提交下载。",
+                tool_trace=(
+                    {"label": "资源搜索", "ok": True, "summary": "找到 1 项资源"},
+                ),
+                tool_executions=({
+                    "tool_name": "indexer.search_resources",
+                    "arguments": {"query": "沧元图"},
+                    "response": resource_response,
+                },),
+            )
+
+        orchestrator = AgentOrchestrator(registry)
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent",
+            side_effect=run_native,
+        ):
+            response = orchestrator.query(
+                "只告诉我沧元图第22集有没有资源，不要下载",
+                owner="web-session",
+            )
+
+        self.assertEqual(response["response_contract"], {
+            "task_kind": "informational",
+            "presentation": "narrative",
+            "resource_candidates": "supporting",
+        })
+        self.assertIsNone(
+            orchestrator.recent_resource_store.get(owner="web-session")
+        )
+        self.assertIn("没有提交下载", response["presentation"]["narrative"])
 
     def test_native_subscription_plan_projects_mixed_followup_topics(self):
         orchestrator = AgentOrchestrator(ToolRegistry())

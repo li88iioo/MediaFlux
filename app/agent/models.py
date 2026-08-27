@@ -103,6 +103,15 @@ class ToolSpec:
     llm_read_plan: bool = False
     llm_confirmation: bool = False
     native_alias: str = ""
+    # 结果的主展示语义跟随工具定义，避免编排器和消息渠道维护工具名白名单。
+    result_presentation: str = "narrative"
+    stages_resource_candidates: bool = False
+    # 领域能力语义只参与模型候选召回与执行展示，不授予任何工具权限。
+    llm_domains: tuple[str, ...] = ()
+    llm_source_kind: str = "system_state"
+    llm_evidence_role: str = "primary"
+    llm_freshness: str = "snapshot"
+    llm_parallel_safe: bool = True
     # 只用于模型候选召回与能力说明，不参与权限、风险、确认或限流判定。
     llm_examples: tuple[str, ...] = ()
 
@@ -124,4 +133,11 @@ class ToolSpec:
         ]
         if examples:
             capability["examples"] = examples
+        capability["semantics"] = {
+            "domains": list(self.llm_domains),
+            "source_kind": self.llm_source_kind,
+            "evidence_role": self.llm_evidence_role,
+            "freshness": self.llm_freshness,
+            "parallel_safe": self.llm_parallel_safe,
+        }
         return capability

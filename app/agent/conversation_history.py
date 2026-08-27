@@ -19,11 +19,12 @@ from app.agent.conversation_summary import (
 )
 from app.modules.web_secret import get_web_secret
 from app.agent.media_case import media_case_stage_for_tool, normalize_media_case_stage
+from app.agent.media_facts import media_facts_match_context, validate_media_facts
 from app.sensitive_data import contains_sensitive_credential
 
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 _SCHEMA_VERSION = 1
-_SUMMARY_STORAGE_VERSION = 1
+_SUMMARY_STORAGE_VERSION = 2
 _UNSAFE_HISTORY_DETAIL = "[已隐藏敏感详情]"
 _SAFE_CONTEXT_DOMAINS = frozenset({"rss"})
 _SAFE_CONTEXT_TOPICS = frozenset({"rss", "media_subscription"})
@@ -82,6 +83,7 @@ class ConversationCompactionSnapshot:
     previous_summary: dict[str, Any] | None
     latest_media_context: dict[str, Any] | None
     messages: tuple[dict[str, Any], ...]
+    latest_media_facts: dict[str, Any] | None = None
 
 
 class SQLiteAgentConversationHistoryRepository:
@@ -334,7 +336,7 @@ class SQLiteAgentConversationHistoryRepository:
                     encoded=str(summary_row["payload"] or ""),
                     max_bytes=self.max_summary_payload_bytes,
                 )
-                normalized_summary, stored_media_context = (
+                normalized_summary, stored_media_context, stored_media_facts = (
                     self._stored_summary_projection(summary_data)
                 )
                 rendered = render_conversation_summary(normalized_summary)
@@ -342,6 +344,8 @@ class SQLiteAgentConversationHistoryRepository:
                     summary_entry = {"role": "summary", "text": rendered}
                     if stored_media_context:
                         summary_entry["media_context"] = stored_media_context
+                    if stored_media_facts:
+                        summary_entry["media_facts"] = stored_media_facts
                     through_message_id = int(summary_row["through_message_id"])
             compacted_assistant_rows: list[Any] = []
             if summary_entry is not None and through_message_id > 0:
@@ -360,17 +364,52 @@ class SQLiteAgentConversationHistoryRepository:
                 (conversation_id, through_message_id, bounded),
             ).fetchall()
 
-        if summary_entry is not None and not summary_entry.get("media_context"):
+        if summary_entry is not None and (
+            not summary_entry.get("media_context")
+            or not summary_entry.get("media_facts")
+        ):
             for row in compacted_assistant_rows:
                 entry = self._context_entry_from_row(
                     row,
                     principal_digest=principal_digest,
                     session_id=session_key,
                 )
-                media_context = entry.get("media_context") if entry else None
-                if isinstance(media_context, dict) and media_context:
+                if not entry:
+                    continue
+                media_context = entry.get("media_context")
+                if (
+                    not summary_entry.get("media_context")
+                    and isinstance(media_context, dict)
+                    and media_context
+                ):
                     summary_entry["media_context"] = media_context
+                media_facts = entry.get("media_facts")
+                if (
+                    not summary_entry.get("media_facts")
+                    and isinstance(media_facts, dict)
+                    and media_facts
+                    and (
+                        not summary_entry.get("media_context")
+                        or media_facts_match_context(
+                            media_facts, summary_entry.get("media_context")
+                        )
+                    )
+                ):
+                    summary_entry["media_facts"] = media_facts
+                    if not summary_entry.get("media_context"):
+                        summary_entry["media_context"] = dict(
+                            media_facts.get("identity") or {}
+                        )
+                if summary_entry.get("media_context") and summary_entry.get("media_facts"):
                     break
+            if (
+                summary_entry.get("media_context")
+                and summary_entry.get("media_facts")
+                and not media_facts_match_context(
+                    summary_entry["media_facts"], summary_entry["media_context"]
+                )
+            ):
+                summary_entry.pop("media_facts", None)
 
         context: list[dict[str, Any]] = []
         if summary_entry is not None:
@@ -441,13 +480,14 @@ class SQLiteAgentConversationHistoryRepository:
                     encoded=str(summary_row["payload"] or ""),
                     max_bytes=self.max_summary_payload_bytes,
                 )
-                previous_summary, previous_media_context = (
+                previous_summary, previous_media_context, previous_media_facts = (
                     self._stored_summary_projection(decoded)
                 )
                 if previous_summary is None:
                     return None
             else:
                 previous_media_context = {}
+                previous_media_facts = {}
             rows = conn.execute(
                 "SELECT id,role,payload,created_at FROM agent_conversation_messages "
                 "WHERE conversation_id=? AND id>? ORDER BY id ASC",
@@ -464,6 +504,7 @@ class SQLiteAgentConversationHistoryRepository:
         eligible = eligible[:chunk_limit]
         messages: list[dict[str, Any]] = []
         latest_media_context = dict(previous_media_context)
+        latest_media_facts = dict(previous_media_facts)
         for row in eligible:
             entry = self._context_entry_from_row(
                 row,
@@ -476,6 +517,20 @@ class SQLiteAgentConversationHistoryRepository:
             media_context = entry.get("media_context")
             if isinstance(media_context, dict) and media_context:
                 latest_media_context = dict(media_context)
+                if (
+                    latest_media_facts
+                    and not media_facts_match_context(
+                        latest_media_facts, latest_media_context
+                    )
+                ):
+                    latest_media_facts = {}
+            media_facts = entry.get("media_facts")
+            if isinstance(media_facts, dict) and media_facts:
+                fact_identity = media_facts.get("identity")
+                if not latest_media_context and isinstance(fact_identity, dict):
+                    latest_media_context = dict(fact_identity)
+                if media_facts_match_context(media_facts, latest_media_context):
+                    latest_media_facts = dict(media_facts)
         return ConversationCompactionSnapshot(
             conversation_id=conversation_id,
             expected_generation=int(generation_row["generation"]),
@@ -484,6 +539,7 @@ class SQLiteAgentConversationHistoryRepository:
             previous_summary=previous_summary,
             latest_media_context=latest_media_context or None,
             messages=tuple(messages),
+            latest_media_facts=latest_media_facts or None,
         )
 
     def store_compaction_summary(
@@ -549,6 +605,7 @@ class SQLiteAgentConversationHistoryRepository:
                     "storage_version": _SUMMARY_STORAGE_VERSION,
                     "summary": normalized,
                     "media_context": snapshot.latest_media_context or {},
+                    "media_facts": snapshot.latest_media_facts or {},
                 },
                 max_bytes=self.max_summary_payload_bytes,
             )
@@ -574,19 +631,46 @@ class SQLiteAgentConversationHistoryRepository:
 
     def _stored_summary_projection(
         self, value: Any
-    ) -> tuple[dict[str, Any] | None, dict[str, str]]:
-        """验证当前摘要载荷及其独立媒体身份锚点。"""
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"storage_version", "summary", "media_context"}
-            or value.get("storage_version") != _SUMMARY_STORAGE_VERSION
-        ):
-            return None, {}
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any]]:
+        """验证摘要载荷及独立的媒体身份、媒体事实锚点。"""
+        if not isinstance(value, dict):
+            return None, {}, {}
+        version = value.get("storage_version")
+        if version == 1:
+            if set(value) != {"storage_version", "summary", "media_context"}:
+                return None, {}, {}
+            raw_media_facts: Any = {}
+        elif version == _SUMMARY_STORAGE_VERSION:
+            if set(value) != {
+                "storage_version", "summary", "media_context", "media_facts"
+            }:
+                return None, {}, {}
+            raw_media_facts = value.get("media_facts")
+        else:
+            return None, {}, {}
         summary = normalize_conversation_summary(value.get("summary"))
         media_context = self._validated_media_context(value.get("media_context"))
+        media_facts = validate_media_facts(raw_media_facts)
         if summary is None or media_context is None:
-            return None, {}
-        return summary, media_context
+            return None, {}, {}
+        if raw_media_facts not in (None, {}) and not media_facts:
+            return None, {}, {}
+        if media_facts:
+            if not media_context:
+                derived_context = self._media_context_from_facts(media_facts)
+                media_context = derived_context or {}
+            elif not media_facts_match_context(media_facts, media_context):
+                media_facts = {}
+        return summary, media_context, media_facts
+
+    def _media_context_from_facts(self, facts: Any) -> dict[str, Any]:
+        validated = validate_media_facts(facts)
+        if not validated:
+            return {}
+        identity = dict(validated.get("identity") or {})
+        if identity.get("media_type") == "anime":
+            identity["media_type"] = "tv"
+        return self._validated_media_context(identity) or {}
 
     def _validated_media_context(
         self, value: Any
@@ -836,6 +920,9 @@ class SQLiteAgentConversationHistoryRepository:
                 data=data.get("tentative_media_context"),
                 status="empty",
             )
+            media_facts = validate_media_facts(data.get("media_facts"))
+            if media_facts and not media_context:
+                media_context = self._media_context_from_facts(media_facts)
             pending_selection = self._validated_pending_selection(
                 data.get("pending_selection")
             )
@@ -848,6 +935,8 @@ class SQLiteAgentConversationHistoryRepository:
                 entry["media_context"] = media_context
             if tentative_media_context:
                 entry["tentative_media_context"] = tentative_media_context
+            if media_facts:
+                entry["media_facts"] = media_facts
             if pending_selection is not None:
                 entry["pending_selection"] = pending_selection
             if pending_subscription is not None:
@@ -1097,6 +1186,16 @@ class SQLiteAgentConversationHistoryRepository:
             )
             if tentative_media_context:
                 projection["tentative_media_context"] = tentative_media_context
+        media_facts = validate_media_facts(response.get("media_facts"))
+        if media_facts:
+            projection["media_facts"] = media_facts
+            if not media_context:
+                derived_media_context = self._media_context_from_facts(
+                    media_facts
+                )
+                if derived_media_context:
+                    projection["media_context"] = derived_media_context
+                    projection.pop("tentative_media_context", None)
         result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
         if (
             tool_name == "indexer.submit_resource"
@@ -1225,6 +1324,7 @@ class SQLiteAgentConversationHistoryRepository:
             "pending_selection",
             "pending_subscription",
             "media_context",
+            "media_facts",
             "context_domains",
         ):
             if encode_or_none() is not None:

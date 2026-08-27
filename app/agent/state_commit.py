@@ -129,6 +129,9 @@ class AgentStateCommitBuffer:
 _ACTIVE_STATE_COMMIT_BUFFER: ContextVar[AgentStateCommitBuffer | None] = ContextVar(
     "agent_state_commit_buffer", default=None
 )
+_ACTIVE_RESOURCE_RESULT_IDS: ContextVar[dict[str, set[str]] | None] = ContextVar(
+    "agent_active_resource_result_ids", default=None
+)
 
 
 @contextmanager
@@ -148,6 +151,20 @@ def active_agent_state_commit_buffer() -> AgentStateCommitBuffer | None:
     return _ACTIVE_STATE_COMMIT_BUFFER.get()
 
 
+@contextmanager
+def isolate_agent_resource_results() -> Iterator[None]:
+    """让一次原生工具循环内的新资源句柄立即可见，但不提前持久化候选上下文。"""
+    current = _ACTIVE_RESOURCE_RESULT_IDS.get()
+    if current is not None:
+        yield
+        return
+    token = _ACTIVE_RESOURCE_RESULT_IDS.set({})
+    try:
+        yield
+    finally:
+        _ACTIVE_RESOURCE_RESULT_IDS.reset(token)
+
+
 def commit_or_defer_agent_state(action: Callable[[], None]) -> bool:
     """无协调器时保持即时写入；有缓冲区时延迟到终态发布窗口。"""
     buffer = _ACTIVE_STATE_COMMIT_BUFFER.get()
@@ -158,15 +175,30 @@ def commit_or_defer_agent_state(action: Callable[[], None]) -> bool:
 
 
 def stage_agent_resource_result_ids(*, owner: str, result_ids: set[str]) -> bool:
+    staged = False
     buffer = _ACTIVE_STATE_COMMIT_BUFFER.get()
-    if buffer is None:
-        return False
-    return buffer.stage_resource_result_ids(owner=owner, result_ids=result_ids)
+    if buffer is not None:
+        staged = buffer.stage_resource_result_ids(
+            owner=owner, result_ids=result_ids
+        ) or staged
+    active_ids = _ACTIVE_RESOURCE_RESULT_IDS.get()
+    owner_key = str(owner or "").strip()
+    if active_ids is not None and owner_key:
+        active_ids.setdefault(owner_key, set()).update(result_ids)
+        staged = True
+    return staged
 
 
 def active_agent_state_owns_resource(*, owner: str, result_id: str) -> bool:
     buffer = _ACTIVE_STATE_COMMIT_BUFFER.get()
+    active_ids = _ACTIVE_RESOURCE_RESULT_IDS.get()
     return bool(
-        buffer is not None
-        and buffer.owns_resource_result(owner=owner, result_id=result_id)
+        (
+            buffer is not None
+            and buffer.owns_resource_result(owner=owner, result_id=result_id)
+        )
+        or (
+            active_ids is not None
+            and result_id in active_ids.get(str(owner or "").strip(), set())
+        )
     )

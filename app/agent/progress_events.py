@@ -49,14 +49,29 @@ def emit_agent_progress(
     """尽力发布进度；监听器异常严格与 Agent 执行隔离。"""
 
     listener = _AGENT_PROGRESS_LISTENER.get()
-    if listener is None:
-        return
     event = AgentProgressEvent(
         phase=str(phase or "").strip()[:40],
         tool_name=str(tool_name or "").strip()[:120],
         ok=ok if isinstance(ok, bool) else None,
     )
     if not event.phase:
+        return
+    try:
+        from app.agent.turn_runtime import (
+            observe_agent_tool,
+            transition_agent_turn,
+        )
+
+        transition_agent_turn(event.phase)
+        if event.tool_name:
+            observe_agent_tool(
+                event.tool_name,
+                state=event.phase,
+                ok=event.ok,
+            )
+    except Exception:
+        pass
+    if listener is None:
         return
     try:
         listener(event)

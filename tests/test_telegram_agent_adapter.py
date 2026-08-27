@@ -745,13 +745,111 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         planning = bot.rich_drafts[0][2].html
         started = bot.rich_drafts[1][2].html
         finished = bot.rich_drafts[-1][2].html
-        self.assertIn("✅ 已理解请求", planning)
-        self.assertIn("正在分析请求并规划检查步骤", planning)
+        self.assertIn("✅ 已识别请求范围", planning)
+        self.assertIn("正在规划检查步骤", planning)
         self.assertIn("媒体追更实时更新检查", started)
         self.assertNotIn("media.subscription_updates", started)
         self.assertIn("✅ 媒体追更实时更新检查", finished)
         self.assertIn("正在整理回答", finished)
+        self.assertIn("⏱ 已用时", finished)
         self.assertIn("检查一下我关注的动漫有更新吗", finished)
+
+    def test_live_progress_tracks_parallel_sources_without_leaking_tool_names(self):
+        bot = _RichDraftBot()
+        message = _message("沧元图官方更新到多少集，本地和资源跟上了吗？")
+        target = _StreamMessage(
+            mode="rich_draft",
+            chat_id=100,
+            source_message_id=9,
+            draft_id=124,
+        )
+        now = [100.0]
+
+        def clock():
+            return now[0]
+
+        def publish(callback):
+            return True, callback()
+
+        progress = _TelegramAgentProgress(
+            bot,
+            _RichTelebot,
+            target,
+            message,
+            publish=publish,
+            clock=clock,
+            update_interval_seconds=0,
+        )
+        progress.handle(
+            AgentProgressEvent(phase="tool_start", tool_name="web.search")
+        )
+        now[0] += 1.2
+        progress.handle(
+            AgentProgressEvent(
+                phase="tool_start",
+                tool_name="library.check_updates",
+            )
+        )
+        parallel = bot.rich_drafts[-1][2].html
+        self.assertIn("正在并行核对 2 项信息", parallel)
+        self.assertIn("已用时 1.2 秒", parallel)
+        self.assertNotIn("web.search", parallel)
+        self.assertNotIn("library.check_updates", parallel)
+
+        now[0] += 0.8
+        progress.handle(
+            AgentProgressEvent(
+                phase="tool_finish",
+                tool_name="web.search",
+                ok=True,
+            )
+        )
+        remaining = bot.rich_drafts[-1][2].html
+        self.assertIn("✅ 网页搜索", remaining)
+        self.assertIn("正在检查:媒体更新检查", remaining)
+        self.assertNotIn("正在并行核对 2 项信息", remaining)
+        self.assertIn("已用时 2.0 秒", remaining)
+
+    def test_live_progress_counts_parallel_calls_to_the_same_tool(self):
+        bot = _RichDraftBot()
+        message = _message("分别核对两个官方页面")
+        target = _StreamMessage(
+            mode="rich_draft", chat_id=100, source_message_id=9, draft_id=125
+        )
+
+        progress = _TelegramAgentProgress(
+            bot,
+            _RichTelebot,
+            target,
+            message,
+            publish=lambda callback: (True, callback()),
+            update_interval_seconds=0,
+        )
+        progress.handle(
+            AgentProgressEvent(phase="tool_start", tool_name="web.search")
+        )
+        progress.handle(
+            AgentProgressEvent(phase="tool_start", tool_name="web.search")
+        )
+        self.assertIn("正在并行核对 2 项信息", bot.rich_drafts[-1][2].html)
+
+        progress.handle(
+            AgentProgressEvent(
+                phase="tool_finish", tool_name="web.search", ok=True
+            )
+        )
+        one_remaining = bot.rich_drafts[-1][2].html
+        self.assertIn("正在检查:网页搜索", one_remaining)
+        self.assertNotIn("✅ 网页搜索", one_remaining)
+
+        progress.handle(
+            AgentProgressEvent(
+                phase="tool_finish", tool_name="web.search", ok=True
+            )
+        )
+        finished = bot.rich_drafts[-1][2].html
+        self.assertIn("✅ 网页搜索", finished)
+        self.assertIn("正在分析检查结果", finished)
 
     def test_failed_narrative_keeps_the_deterministic_error(self):
         text = render_agent_response({
@@ -1466,6 +1564,44 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         text = _render_resource_candidates(response, candidates)
         self.assertIn("公开摘要", text)
         self.assertNotIn("模型说明", text)
+
+    def test_supporting_resource_candidates_do_not_replace_natural_answer(self):
+        candidates = [{
+            "result_id": "r1",
+            "site": "Nyaa",
+            "size": "731 MiB",
+            "episode": "",
+            "title": "沧元图 S03E22 2160p",
+        }]
+        response = {
+            "mode": "read_plan",
+            "response_contract": {
+                "task_kind": "informational",
+                "presentation": "narrative",
+                "resource_candidates": "supporting",
+            },
+            "result": {
+                "ok": True,
+                "status": "completed",
+                "summary": "综合检查完成：3 项正常",
+                "data": {"steps": []},
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": (
+                    "优酷官方目前更新至第三季第 22 集。\n\n"
+                    "本地资源索引也已跟进到第 22 集。"
+                ),
+            },
+        }
+
+        text = _render_resource_candidates(response, candidates)
+
+        self.assertIn("优酷官方目前更新至第三季第 22 集", text)
+        self.assertIn("本地资源索引也已跟进到第 22 集", text)
+        self.assertNotIn("候选资源", text)
+        self.assertNotIn("请选择下载目标", text)
 
     def test_selection_required_is_rendered_as_a_followup_not_a_failure(self):
         text = render_agent_response({

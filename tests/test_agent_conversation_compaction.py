@@ -229,6 +229,128 @@ class AgentConversationCompactionRepositoryTests(
         )
         self.assertNotIn("已找到资源", context[0]["text"])
 
+    def test_compaction_preserves_structured_media_facts_separately_from_candidates(self):
+        response = _media_response("沧元图", data={"title": "沧元图", "media_type": "tv"})
+        response["media_facts"] = {
+            "version": 1,
+            "identity": {"title": "沧元图", "media_type": "anime"},
+            "official_progress": {
+                "season": 3, "episode": 22, "absolute_episode": 83,
+                "as_of": "2026-08-22", "source": "web",
+            },
+            "season_counts": [
+                {"season": 1, "episodes": 26, "source": "web"},
+                {"season": 2, "episodes": 35, "source": "web"},
+            ],
+        }
+        self.assertTrue(self.repository.append_query_turn(
+            principal="browser-a",
+            session_id=SESSION_A,
+            message="沧元图官方更新到哪里了",
+            response=response,
+        ))
+        self._append_turns(5, start=1)
+        snapshot = self.repository.prepare_compaction(
+            principal="browser-a", session_id=SESSION_A
+        )
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(
+            snapshot.latest_media_facts["official_progress"]["absolute_episode"],
+            83,
+        )
+        self.assertTrue(self.repository.store_compaction_summary(
+            principal="browser-a",
+            session_id=SESSION_A,
+            snapshot=snapshot,
+            summary=_summary("继续核对沧元图"),
+        ))
+
+        context = self.repository.get_llm_context(
+            principal="browser-a", session_id=SESSION_A
+        )
+
+        self.assertEqual(
+            context[0]["media_facts"]["season_counts"][1],
+            {"season": 2, "episodes": 35, "source": "web"},
+        )
+        self.assertNotIn("candidates", repr(context[0]["media_facts"]))
+
+    def test_media_facts_identity_supplies_context_for_web_only_response(self):
+        response = {
+            "mode": "read_only",
+            "tool_call": {
+                "name": "web.search",
+                "arguments": {"query": "沧元图 优酷 官方更新"},
+            },
+            "result": {
+                "ok": True,
+                "status": "ok",
+                "summary": "已核对官方更新",
+                "data": {"results": []},
+                "error": "",
+                "suggestions": [],
+            },
+            "media_facts": {
+                "version": 1,
+                "identity": {"title": "沧元图", "media_type": "anime"},
+                "official_progress": {
+                    "season": 3, "episode": 22, "source": "web"
+                },
+            },
+        }
+        self.assertTrue(self.repository.append_query_turn(
+            principal="browser-a",
+            session_id=SESSION_A,
+            message="沧元图官方更新到哪里了",
+            response=response,
+        ))
+
+        context = self.repository.get_llm_context(
+            principal="browser-a", session_id=SESSION_A
+        )
+
+        self.assertEqual(context[-1]["media_context"]["title"], "沧元图")
+        self.assertEqual(
+            context[-1]["media_facts"]["official_progress"]["episode"], 22
+        )
+
+    def test_compaction_drops_facts_when_latest_media_identity_changes(self):
+        old_response = _media_response(
+            "沧元图", data={"title": "沧元图", "media_type": "tv"}
+        )
+        old_response["media_facts"] = {
+            "version": 1,
+            "identity": {"title": "沧元图", "media_type": "anime"},
+            "season_counts": [
+                {"season": 1, "episodes": 26, "source": "web"}
+            ],
+        }
+        self.assertTrue(self.repository.append_query_turn(
+            principal="browser-a",
+            session_id=SESSION_A,
+            message="沧元图更新到哪里了",
+            response=old_response,
+        ))
+        self.assertTrue(self.repository.append_query_turn(
+            principal="browser-a",
+            session_id=SESSION_A,
+            message="改查牧神记",
+            response=_media_response(
+                "牧神记", data={"title": "牧神记", "media_type": "tv"}
+            ),
+        ))
+        self._append_turns(5, start=1)
+
+        snapshot = self.repository.prepare_compaction(
+            principal="browser-a", session_id=SESSION_A
+        )
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.latest_media_context["title"], "牧神记")
+        self.assertIsNone(snapshot.latest_media_facts)
+
     def test_compaction_does_not_promote_failed_query_arguments_to_media_context(self):
         self.assertTrue(
             self.repository.append_query_turn(

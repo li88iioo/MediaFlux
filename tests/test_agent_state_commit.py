@@ -9,6 +9,7 @@ from app.agent.state_commit import (
     active_agent_state_owns_resource,
     commit_or_defer_agent_state,
     defer_agent_state_commits,
+    isolate_agent_resource_results,
     stage_agent_resource_result_ids,
 )
 
@@ -65,6 +66,22 @@ class AgentStateCommitBufferTests(unittest.TestCase):
         self.assertEqual(committed, [])
         self.assertEqual(buffer.commit(), 1)
         self.assertEqual(committed, ["thread"])
+
+    def test_isolated_resource_capability_is_owner_bound_and_scope_limited(self):
+        with isolate_agent_resource_results():
+            self.assertTrue(stage_agent_resource_result_ids(
+                owner="owner-a", result_ids={"resource-result-0002"}
+            ))
+            self.assertTrue(active_agent_state_owns_resource(
+                owner="owner-a", result_id="resource-result-0002"
+            ))
+            self.assertFalse(active_agent_state_owns_resource(
+                owner="owner-b", result_id="resource-result-0002"
+            ))
+
+        self.assertFalse(active_agent_state_owns_resource(
+            owner="owner-a", result_id="resource-result-0002"
+        ))
 
     def test_staged_resource_capability_is_owner_bound_and_revoked_on_discard(self):
         buffer = AgentStateCommitBuffer(owner="owner-a")

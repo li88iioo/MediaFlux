@@ -309,6 +309,8 @@ class RecentResourceSubmitIntentTests(unittest.TestCase):
             "发送刚才推荐的第 1 个到 qB 是什么意思？",
             "第三季21集是91集吗？",
             "第 2 个是不是第 91 集？",
+            "第三季第 19 集是多少集？",
+            "S03E19 是总第几集？",
         ):
             self.assertIsNone(
                 recent_resource_submit_request(message, allow_implicit=True), message
@@ -894,6 +896,118 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         self.assertEqual(preview_calls, [])
         self.assertEqual(execute_calls, [])
         conversation.assert_not_called()
+
+    def test_verified_episode_relation_still_gives_native_planner_first_refusal(self):
+        store = RecentResourceCandidateStore()
+        result = _single_result(_candidate(
+            "resource-result-0095",
+            title="[GM-Team][沧元图 第3季][The Demon Hunter III][2026][21][GB][4K]",
+        ))
+        result.data["verification"].update({
+            "title": "沧元图",
+            "season": 1,
+            "episode": 91,
+        })
+        store.capture(owner="session-a", result=result)
+        service, preview_calls, execute_calls, _ = self._agent(
+            recent_resource_store=store
+        )
+        planned = service._conversation_response(
+            "第一季和第二季的已确认集数相加后，S03E21 对应累计第 91 集。"
+        )
+        context = [{
+            "role": "assistant",
+            "text": "刚才核对了《沧元图》的更新进度。",
+            "media_context": {"title": "沧元图", "media_type": "tv"},
+        }]
+
+        with patch.object(
+            service, "_query_with_model_tools", return_value=planned
+        ) as model_route:
+            response = service.query(
+                "第三季第 21 集是多少集？",
+                owner="session-a",
+                conversation_context=context,
+                present=False,
+            )
+
+        self.assertEqual(response, planned)
+        self.assertTrue(model_route.called)
+        planner_context = model_route.call_args.kwargs["conversation_context"]
+        self.assertIn("第 3 季第 21 集", planner_context[-1]["text"])
+        self.assertIn("S01E91", planner_context[-1]["text"])
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+
+    def test_open_episode_number_question_uses_verified_absolute_episode(self):
+        store = RecentResourceCandidateStore()
+        result = _single_result(_candidate(
+            "resource-result-0093",
+            title="[GM-Team][沧元图 第3季][The Demon Hunter III][2026][21][GB][4K]",
+        ))
+        result.data["verification"].update({
+            "title": "沧元图",
+            "season": 1,
+            "episode": 91,
+        })
+        store.capture(owner="session-a", result=result)
+        service, preview_calls, execute_calls, _ = self._agent(
+            recent_resource_store=store
+        )
+
+        with patch(
+            "app.agent.orchestrator.answer_conversation",
+            side_effect=AssertionError("已核验的总集数换算不应交给模型猜测"),
+        ) as conversation:
+            response = service.query(
+                "第三季第 21 集是多少集？",
+                owner="session-a",
+                present=False,
+            )
+
+        self.assertEqual(response["mode"], "conversation")
+        self.assertIn("累计第 91 集", response["result"]["summary"])
+        self.assertIn("S03E21", response["result"]["summary"])
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
+        conversation.assert_not_called()
+
+    def test_unverified_open_episode_number_question_returns_to_tool_planner(self):
+        store = RecentResourceCandidateStore()
+        store.capture(
+            owner="session-a",
+            result=_generic_result(_candidate(
+                "generic-resource-0094",
+                title="[GM-Team][沧元图 第3季][2026][19][GB][4K]",
+            )),
+        )
+        service, preview_calls, execute_calls, _ = self._agent(
+            recent_resource_store=store
+        )
+        planned = service._conversation_response("需要核对前两季集数后再换算。")
+        context = [{
+            "role": "assistant",
+            "text": "刚才核对的是《沧元图》的官方更新进度。",
+            "media_context": {"title": "沧元图", "media_type": "tv"},
+        }]
+
+        with patch.object(
+            service, "_query_with_model_tools", return_value=planned
+        ) as model_route, patch(
+            "app.agent.orchestrator.answer_conversation",
+            side_effect=AssertionError("信息不足时应回到带工具的 Planner"),
+        ):
+            response = service.query(
+                "第三季第 19 集是多少集？",
+                owner="session-a",
+                conversation_context=context,
+                present=False,
+            )
+
+        self.assertEqual(response, planned)
+        self.assertTrue(model_route.called)
+        self.assertEqual(preview_calls, [])
+        self.assertEqual(execute_calls, [])
 
     def test_unresolved_resource_question_gives_llm_only_parsed_coordinates(self):
         store = RecentResourceCandidateStore()

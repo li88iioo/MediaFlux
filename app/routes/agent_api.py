@@ -92,6 +92,7 @@ from app.agent.orchestrator import (
 from app.agent.rate_limit import agent_rate_limiter, allow_agent_tool
 from app.agent.feature_gate import AgentRuntimeDisabled, agent_runtime_admission
 from app.agent.registry import AgentToolError
+from app.agent.response_contract import response_contract
 from app.agent.result_projection import (
     project_agent_result_for_user,
     project_public_guidance,
@@ -548,10 +549,12 @@ def _public_deterministic_fallback_response(
     safe_request_id = (
         request_id if _REQUEST_ID_PATTERN.fullmatch(str(request_id or "")) else ""
     )
+    safe_contract = response_contract(response)
     return {
         "request_id": safe_request_id,
         "mode": mode,
         "tool_call": safe_tool_call,
+        **({"response_contract": safe_contract} if safe_contract else {}),
         "result": {
             "ok": bool(result.get("ok")),
             "status": status,

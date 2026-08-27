@@ -20,9 +20,11 @@ from typing import Any, Iterable, Mapping, Sequence
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.agent.capability_retrieval import infer_media_intent
 from app.agent.confirmation import ConfirmationStore
 from app.agent.intents import match_read_intent
 from app.agent.llm_router import (
+    _native_read_capabilities,
     is_agent_action_request,
     is_confirmation_planning_request,
 )
@@ -37,6 +39,7 @@ from app.agent.orchestrator import (
     recent_resource_submit_request,
 )
 from app.agent.registry import ToolRegistry
+from app.agent.tools import build_tool_registry
 from app.sensitive_data import contains_sensitive_credential
 
 DEFAULT_FIXTURE = Path("tests/fixtures/agent_eval_cases.jsonl")
@@ -51,6 +54,7 @@ EVALUATORS = frozenset({
     "media_rating",
     "sensitive_input",
     "input_validation",
+    "capability_retrieval",
 })
 CATEGORIES = frozenset({
     "read",
@@ -239,6 +243,29 @@ def _validate_expected(case_id: str, evaluator: str, expected: Any) -> None:
             raise _schema_error(case_id, "资源续句 episode 无效")
         if expected.get("target") not in {None, "qb", "guangya", "both"}:
             raise _schema_error(case_id, "资源续句 target 无效")
+        return
+    if evaluator == "capability_retrieval":
+        required_keys = {
+            "required_tools", "forbidden_tools", "intent_domains", "presentation_hint"
+        }
+        if not isinstance(expected, Mapping) or set(expected) != required_keys:
+            raise _schema_error(case_id, "能力召回 expected 结构无效")
+        for key in ("required_tools", "forbidden_tools", "intent_domains"):
+            values = expected.get(key)
+            if (
+                not isinstance(values, list)
+                or len(values) > 20
+                or any(
+                    not isinstance(value, str)
+                    or not _SAFE_LABEL_RE.fullmatch(value.strip())
+                    for value in values
+                )
+            ):
+                raise _schema_error(case_id, f"能力召回 {key} 无效")
+        if expected.get("presentation_hint") not in {
+            "narrative", "resource_candidates"
+        }:
+            raise _schema_error(case_id, "能力召回 presentation_hint 无效")
         return
     if evaluator == "media_rating":
         if expected is None:
@@ -534,6 +561,41 @@ def _offline_route_projection(
     }
 
 
+_CAPABILITY_EVAL_REGISTRY: ToolRegistry | None = None
+
+
+def _capability_retrieval_projection(message: str) -> dict[str, Any]:
+    global _CAPABILITY_EVAL_REGISTRY
+    if _CAPABILITY_EVAL_REGISTRY is None:
+        _CAPABILITY_EVAL_REGISTRY = build_tool_registry()
+    registry = _CAPABILITY_EVAL_REGISTRY
+    selected = _native_read_capabilities(registry, message)
+    names = sorted({
+        name
+        for item in selected
+        if (name := registry.native_tool_name(str(item.get("name") or "")))
+    })
+    intent = infer_media_intent(message)
+    return {
+        "selected_tools": names,
+        "intent_domains": list(intent.domains),
+        "presentation_hint": intent.presentation_hint,
+    }
+
+
+def _capability_retrieval_matches(
+    expected: Mapping[str, Any], actual: Mapping[str, Any]
+) -> bool:
+    selected = set(actual.get("selected_tools") or [])
+    domains = set(actual.get("intent_domains") or [])
+    return bool(
+        set(expected.get("required_tools") or []).issubset(selected)
+        and selected.isdisjoint(expected.get("forbidden_tools") or [])
+        and set(expected.get("intent_domains") or []).issubset(domains)
+        and actual.get("presentation_hint") == expected.get("presentation_hint")
+    )
+
+
 def _confusion_kind(expected: Any, actual: Any, *, matched: bool) -> str:
     if matched:
         return "matched"
@@ -553,12 +615,16 @@ def _confusion_kind(expected: Any, actual: Any, *, matched: bool) -> str:
 
 def evaluate_agent_case(case: AgentEvalCase) -> AgentEvalOutcome:
     started = monotonic()
+    matched_override: bool | None = None
     if case.evaluator in _ROUTE_EVALUATORS:
         actual = _offline_route_projection(
             case.message,
             case.conversation_context,
             trusted_conversation_context=case.trusted_conversation_context,
         )
+    elif case.evaluator == "capability_retrieval":
+        actual = _capability_retrieval_projection(case.message)
+        matched_override = _capability_retrieval_matches(case.expected, actual)
     elif case.evaluator == "diagnostic_tool":
         actual = match_read_intent(case.message.casefold(), _DIAGNOSTIC_READ_INTENTS)
     elif case.evaluator == "action_intent":
@@ -591,7 +657,7 @@ def evaluate_agent_case(case: AgentEvalCase) -> AgentEvalOutcome:
             actual = True
     else:  # pragma: no cover - schema validation owns this branch
         raise ValueError(f"unsupported evaluator: {case.evaluator}")
-    matched = actual == case.expected
+    matched = matched_override if matched_override is not None else actual == case.expected
     elapsed_ms = max(0.0, (monotonic() - started) * 1000.0)
     return AgentEvalOutcome(
         case_id=case.case_id,

@@ -1,13 +1,15 @@
-"""确定性 Agent 编排器；后续 LLM 只能替换意图选择，不能绕过工具注册表。"""
+"""受控 Agent 编排器；LLM 主导只读认知，确定性边界守住写操作与确认。"""
 from __future__ import annotations
 
 from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import date
 import logging
 import re
 import secrets
 import sys
+import threading
 from time import monotonic
 import unicodedata
 from typing import Any, Callable
@@ -19,6 +21,7 @@ from app.agent.action_history import (
     record_confirmation_interrupted,
     record_confirmed_result,
 )
+from app.agent.capability_retrieval import infer_media_intent
 from app.agent.confirmation import (
     ConfirmationStore,
     SQLiteConfirmationStore,
@@ -29,8 +32,17 @@ from app.agent.confirmation_contract import (
     sanitize_confirmation_contract,
 )
 from app.agent.media_case import normalize_media_case_stage
+from app.agent.media_facts import absolute_episode_answer, derive_media_facts
 from app.agent.models import LLMToolDisposition, RiskLevel, ToolContext, ToolResult
 from app.agent.metrics import agent_metrics
+from app.agent.messages import (
+    AGENT_RATE_LIMITED,
+    CONFIRM_CHANGE_IN_AGENT,
+    CONFIRM_EXECUTION_IN_AGENT,
+    LOGIN_REQUIRED_ACTION,
+    LOGIN_REQUIRED_CONFIG_ACTION,
+    LOGIN_REQUIRED_RSS_REFRESH,
+)
 from app.agent.observability import (
     begin_trace_context,
     current_request_id,
@@ -89,13 +101,19 @@ from app.agent.rate_limit import allow_agent_tool
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.rss_reference import resolve_rss_subscription_name
 from app.agent import result_projection
+from app.agent.response_contract import attach_response_contract
 from app.agent.session_context import AgentSessionContextRepository
 from app.agent.state_commit import (
     active_agent_state_owns_resource,
     commit_or_defer_agent_state,
+    isolate_agent_resource_results,
     stage_agent_resource_result_ids,
 )
 from app.agent.workspace_next_actions import resolve_workspace_action_handoff
+from app.agent.turn_runtime import (
+    begin_agent_turn,
+    reset_agent_turn,
+)
 
 logger = logging.getLogger(__name__)
 _QUERY_CONFIRMATION_EPOCH: ContextVar[tuple[str, int] | None] = ContextVar(
@@ -104,21 +122,27 @@ _QUERY_CONFIRMATION_EPOCH: ContextVar[tuple[str, int] | None] = ContextVar(
 _QUERY_TOOL_RATE_IDENTITY: ContextVar[str] = ContextVar(
     "agent_query_tool_rate_identity", default=""
 )
-_LLM_FIRST_CONTEXT_MARKERS = (
-    "这部", "这集", "这个", "它", "刚才", "上一个", "继续", "重试",
-    "再来", "刷新一下", "搜索一下", "搜一下", "找一下", "查一下",
-    "打开它", "关闭它", "有多少", "缺不缺",
+
+
+@dataclass(slots=True)
+class _NativeResourceCapture:
+    """暂存原生工具循环中的资源结果，等待本轮语义角色确定。"""
+
+    results: list[ToolResult] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def add(self, result: ToolResult) -> None:
+        with self._lock:
+            self.results.append(deepcopy(result))
+
+    def latest(self) -> ToolResult | None:
+        with self._lock:
+            return deepcopy(self.results[-1]) if self.results else None
+
+
+_NATIVE_RESOURCE_CAPTURE: ContextVar[_NativeResourceCapture | None] = ContextVar(
+    "agent_native_resource_capture", default=None
 )
-def _should_try_contextual_model_first(
-    message: str, conversation_context: list[dict[str, Any]] | None
-) -> bool:
-    """识别应优先交给 Planner 理解的上下文型自然续句。"""
-    if not conversation_context:
-        return False
-    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
-    return any(marker in normalized for marker in _LLM_FIRST_CONTEXT_MARKERS)
-
-
 _CONFIRMATION_FALLBACK_NARRATIVE = (
     "操作尚未执行。预检已完成，请核对下面的影响范围；只有确认后系统才会执行。"
 )
@@ -443,7 +467,6 @@ _MEDIA_CONTEXT_TOOL_NAMES = frozenset({
     "discovery.add_watchlist",
     "indexer.search_resources",
 })
-
 
 def _latest_media_context(
     conversation_context: list[dict[str, Any]] | None,
@@ -790,6 +813,7 @@ _RECENT_RESOURCE_REJECT_TOKENS = (
 )
 _RECENT_RESOURCE_QUESTION_TOKENS = (
     "是不是", "是否", "对应", "相当于", "等于", "算不算", "对不对", "对得上",
+    "多少集", "几集", "第几集", "总第", "累计第", "全剧第", "全系列第",
 )
 _RECENT_DOWNLOAD_REFERENCES = ("刚才", "刚刚", "上次", "最近")
 _RECENT_DOWNLOAD_SCOPES = ("下载", "推送", "提交", "资源", "任务")
@@ -3625,6 +3649,21 @@ def _resource_title_coordinates(title: object) -> tuple[int, int] | None:
     return (season, episode) if 1 <= episode <= 1000 else None
 
 
+def _absolute_episode_conversion_coordinates(message: str) -> tuple[int, int] | None:
+    """识别“第 N 季第 M 集是总第几集”这类纯编号换算问题。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not normalized or any(
+        token in normalized for token in ("下载", "推送", "提交", "发送", "下到")
+    ):
+        return None
+    compact = re.sub(r"\s+", "", normalized)
+    if not any(token in compact for token in (
+        "多少集", "几集", "第几集", "总第", "累计第", "全剧第", "全系列第",
+    )):
+        return None
+    return _episode_coordinates(normalized)
+
+
 def _recent_resource_question_context(snapshot: dict[str, Any]) -> str:
     """构造只供 LLM 解释的数字关系；不传递外部资源站原始标题。"""
     candidates = snapshot.get("candidates") if isinstance(snapshot, dict) else None
@@ -3704,6 +3743,38 @@ def _recent_resource_relation_fallback(
         return (
             f"不是。这个候选标题是第 {season} 季第 {season_episode} 集，"
             f"但刚才搜索绑定的缺集目标是第 {target_episode} 集，不是第 {absolute_episode} 集。"
+        )
+    return ""
+
+
+def _recent_resource_absolute_episode_fallback(
+    message: str, snapshot: dict[str, Any]
+) -> str:
+    """仅用已核验的缺集目标回答开放式季度/总集数换算。"""
+    coordinates = _absolute_episode_conversion_coordinates(message)
+    if coordinates is None:
+        return ""
+    season, season_episode = coordinates
+    candidates = snapshot.get("candidates") if isinstance(snapshot, dict) else None
+    if not isinstance(candidates, list):
+        return ""
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if _resource_title_coordinates(candidate.get("title")) != coordinates:
+            continue
+        verification = candidate.get("_verification_context")
+        absolute_episode = (
+            verification.get("episode") if isinstance(verification, dict) else None
+        )
+        if not isinstance(absolute_episode, int) or isinstance(absolute_episode, bool):
+            return ""
+        if not 1 <= absolute_episode <= 1000:
+            return ""
+        return (
+            f"按刚才已经核验的资源上下文，第 {season} 季第 {season_episode} 集"
+            f"对应全剧累计第 {absolute_episode} 集。季度编号是 S{season:02d}E{season_episode:02d}，"
+            f"连续总集数编号是第 {absolute_episode} 集。"
         )
     return ""
 
@@ -4381,6 +4452,11 @@ def is_missing_season_resource_search_message(message: str) -> bool:
         and any(token in normalized for token in _MISSING_SEASON_RESOURCE_COMMAND_TOKENS)
         and is_indexer_resource_search_message(normalized)
     )
+
+
+def _resource_candidates_are_primary_for_message(message: str) -> bool:
+    """只有明确搜索、选择或下载资源时，候选卡才接管最终展示。"""
+    return infer_media_intent(message).presentation_hint == "resource_candidates"
 
 
 def _extract_missing_season_resource_args(message: str) -> dict[str, Any]:
@@ -5536,6 +5612,29 @@ def _is_negated_danger_action_message(message: str) -> bool:
     )
 
 
+def _is_pure_negated_danger_action_message(message: str) -> bool:
+    """仅纯撤回动作直接 no-op；同句仍有查询目标时继续只读检查。"""
+    if not _is_negated_danger_action_message(message):
+        return False
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"[，,。；;！？!?]+|(?:并且|同时|另外|然后)", message)
+        if clause.strip()
+    ]
+    negation_markers = ("不要", "别", "不许", "不准", "无需", "不用")
+    for clause in clauses:
+        if any(marker in clause for marker in negation_markers):
+            continue
+        profile = infer_media_intent(clause)
+        if profile.domains or re.search(
+            r"(?:告诉我|看看|查看|检查|查询|核对|有没有|有无|是否|为什么|原因|状态|进度)",
+            clause,
+            re.IGNORECASE,
+        ):
+            return False
+    return True
+
+
 def _is_confirmation_response(response: Any) -> bool:
     """响应侧防线：只读/否定请求不得接受任何确认票据。"""
     return bool(
@@ -5836,6 +5935,7 @@ class AgentOrchestrator:
             # “刚才的资源 / 重试 / 巡检”上下文。
             state_result = deepcopy(result)
             state_arguments = deepcopy(normalized_arguments)
+            native_resource_capture = _NATIVE_RESOURCE_CAPTURE.get()
             resource_result_ids = safe_resource_result_ids(state_result)
             if resource_result_ids:
                 stage_agent_resource_result_ids(
@@ -5859,15 +5959,17 @@ class AgentOrchestrator:
                     self.recent_patrol_store.capture(
                         owner=owner, result=state_result
                     )
-                if tool_name in {
-                    "library.search_missing_episode_resources",
-                    "library.search_missing_season_resources",
-                    "indexer.search_resources",
-                    "media.subscription_updates",
-                }:
-                    self.recent_resource_store.capture(
-                        owner=owner, result=state_result
-                    )
+                if (
+                    self.registry.stages_resource_candidates_for(tool_name)
+                ):
+                    if native_resource_capture is not None:
+                        # 原生只读循环可能只把资源索引当作旁证；等最终响应契约
+                        # 明确候选是主输出后，才允许激活跨轮下载上下文。
+                        native_resource_capture.add(state_result)
+                    else:
+                        self.recent_resource_store.capture(
+                            owner=owner, result=state_result
+                        )
                 if tool_name in {"discovery.search", "discovery.recommend"}:
                     self.recent_discovery_store.capture(
                         owner=owner, result=state_result
@@ -5915,7 +6017,7 @@ class AgentOrchestrator:
             and not allow_agent_tool(effective_rate_identity, tool_name)
         ):
             raise AgentToolError(
-                "Agent 请求过于频繁，请稍后重试",
+                AGENT_RATE_LIMITED,
                 code="rate_limited",
             )
 
@@ -5958,7 +6060,7 @@ class AgentOrchestrator:
             for tool_name, _ in normalized_steps:
                 if not allow_agent_tool(rate_identity, tool_name):
                     raise AgentToolError(
-                        "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                        AGENT_RATE_LIMITED, code="rate_limited"
                     )
 
         public_steps: list[dict[str, Any]] = []
@@ -6098,7 +6200,7 @@ class AgentOrchestrator:
             )
         if rate_identity and not allow_agent_tool(rate_identity, target_tool):
             raise AgentToolError(
-                "Agent 请求过于频繁，请稍后重试",
+                AGENT_RATE_LIMITED,
                 code="rate_limited",
             )
         return self.invoke(
@@ -6225,7 +6327,7 @@ class AgentOrchestrator:
     ) -> dict[str, Any]:
         if not owner:
             return self._unsupported(
-                "该动作需要在已登录会话中确认",
+                LOGIN_REQUIRED_ACTION,
                 ["请重新登录后先搜索缺集资源，再明确选择推荐项和下载目标。"],
             )
         snapshot = self.recent_resource_store.get(owner=owner)
@@ -6753,7 +6855,7 @@ class AgentOrchestrator:
         """为全部已配置订阅创建批量刷新确认；停用不限制手动刷新。"""
         if not owner:
             return self._unsupported(
-                "刷新 RSS 订阅需要在已登录会话中确认",
+                LOGIN_REQUIRED_RSS_REFRESH,
                 ["请登录后重试。"],
             )
         if not self._rss_subscriptions():
@@ -6800,7 +6902,7 @@ class AgentOrchestrator:
             subscription_id = int(subscriptions[0].get("subscription_number") or 0)
             if not owner:
                 return self._unsupported(
-                    "刷新 RSS 订阅需要在已登录会话中确认",
+                    LOGIN_REQUIRED_RSS_REFRESH,
                     ["请登录后重试。"],
                 )
             return self._prepare_single_rss_refresh(
@@ -6824,8 +6926,10 @@ class AgentOrchestrator:
         owner: str,
         conversation_context: list[dict[str, Any]] | None,
         trusted_context: bool = False,
+        allow_reads: bool = True,
+        allow_actions: bool = True,
     ) -> dict[str, Any] | None:
-        """让“列出列表 / 刷新一下”在刚讨论 RSS 时保持同一主题。"""
+        """让 RSS 指代续句保持主题，并允许读、写阶段分别调用。"""
         previous = _latest_rss_topic_context(
             conversation_context,
             allow_structured_domain=trusted_context,
@@ -6844,25 +6948,26 @@ class AgentOrchestrator:
             and any(domain != "rss" for domain in context_domains)
         )
         if (
-            mixed_subscription_context
+            allow_actions
+            and mixed_subscription_context
             and normalized in {"刷新", "刷新一下", "再刷新", "再刷新一下", "继续刷新"}
         ):
             return self._clarification_response(
                 "刚才同时检查了 RSS 与媒体追更。你想手动刷新 RSS，还是重新检查媒体订阅更新？",
                 ["刷新 RSS 订阅。", "检查媒体订阅更新。"],
             )
-        if normalized in {
+        if allow_reads and normalized in {
             "列出列表", "列出全部", "列出全部列表", "全部列表", "列表", "都有哪些", "有哪些",
         }:
             return self._invoke_query_read("rss.subscription_summaries", {}, owner=owner)
-        if normalized in {"近24小时下载几次", "近24小时下载了几次", "24小时下载几次"}:
+        if allow_reads and normalized in {"近24小时下载几次", "近24小时下载了几次", "24小时下载几次"}:
             return self._invoke_query_read("rss.recent_activity", {}, owner=owner)
-        if re.fullmatch(
+        if allow_actions and re.fullmatch(
             r"(?:(?:全部|所有)(?:rss)?(?:订阅)?刷新|刷新(?:一下)?(?:全部|所有)(?:rss)?(?:订阅)?)",
             normalized,
         ):
             return self._prepare_all_rss_refresh(owner=owner)
-        if normalized in {"刷新", "刷新一下", "再刷新", "再刷新一下", "继续刷新"}:
+        if allow_actions and normalized in {"刷新", "刷新一下", "再刷新", "再刷新一下", "继续刷新"}:
             return self._prepare_contextual_rss_refresh(owner=owner)
         previous_text = unicodedata.normalize(
             "NFKC", str(previous.get("text") or "")
@@ -6887,7 +6992,8 @@ class AgentOrchestrator:
             "不影响刷新" in normalized or "不影响手动刷新" in normalized
         )
         if (
-            refresh_unaffected
+            allow_actions
+            and refresh_unaffected
             and not other_domain
             and (
                 current_mentions_rss
@@ -6899,7 +7005,7 @@ class AgentOrchestrator:
         ):
             return self._prepare_contextual_rss_refresh(owner=owner)
         named = re.fullmatch(r"刷新(?:一下)?(.+?)(?:rss)?(?:订阅)?", normalized)
-        if named:
+        if allow_actions and named:
             name = _clean_rss_named_target(named.group(1))
             if name is None:
                 return self._prepare_contextual_rss_refresh(owner=owner)
@@ -6907,7 +7013,7 @@ class AgentOrchestrator:
             if resolution.status == "resolved" and resolution.subscription_id is not None:
                 if not owner:
                     return self._unsupported(
-                        "刷新 RSS 订阅需要在已登录会话中确认",
+                        LOGIN_REQUIRED_RSS_REFRESH,
                         ["请登录后重试。"],
                     )
                 return self._prepare_single_rss_refresh(
@@ -7159,10 +7265,18 @@ class AgentOrchestrator:
             owner=owner, request_id=request_id, session_id=session_id
         )
         query_started = monotonic()
+        turn_token = None
         try:
             message = normalize_agent_message(value)
+            turn_token = begin_agent_turn(
+                message=message,
+                owner=owner,
+                request_id=_trace_context.request_id,
+            )
             emit_agent_progress("routing")
         except Exception:
+            if turn_token is not None:
+                reset_agent_turn(turn_token)
             agent_metrics.record_query(
                 elapsed_ms=max(0, int((monotonic() - query_started) * 1000)),
                 ok=False,
@@ -7189,6 +7303,8 @@ class AgentOrchestrator:
                 _QUERY_CONFIRMATION_EPOCH.reset(confirmation_token)
             if llm_budget_token is not None:
                 reset_llm_request_budget(llm_budget_token)
+            if turn_token is not None:
+                reset_agent_turn(turn_token)
             agent_metrics.record_query(
                 elapsed_ms=max(0, int((monotonic() - query_started) * 1000)),
                 ok=False,
@@ -7208,8 +7324,8 @@ class AgentOrchestrator:
                     )
                     if owner
                     else self._unsupported(
-                        "该配置动作需要在已登录会话中确认",
-                        ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                        LOGIN_REQUIRED_CONFIG_ACTION,
+                        [CONFIRM_CHANGE_IN_AGENT],
                     )
                 )
                 if not present:
@@ -7235,27 +7351,13 @@ class AgentOrchestrator:
                 owner=owner,
                 conversation_context=conversation_context,
                 trusted_context=trusted_conversation_context,
+                allow_reads=False,
             )
             if rss_contextual is not None:
                 if not present:
                     return rss_contextual
                 return self._present_tool_response(
                     message, rss_contextual, owner=llm_rate_owner or owner
-                )
-            rating_request = contextual_media_rating_request(
-                message, conversation_context
-            )
-            if rating_request is not None and self.registry.has("discovery.lookup_rating"):
-                response = self._invoke_query_read(
-                    "discovery.lookup_rating",
-                    rating_request,
-                    owner=owner,
-                    rate_identity=query_tool_rate_identity,
-                )
-                if not present:
-                    return response
-                return self._present_tool_response(
-                    message, response, owner=llm_rate_owner or owner
                 )
             if is_recent_read_retry_message(message):
                 if not owner:
@@ -7315,88 +7417,28 @@ class AgentOrchestrator:
                         ),
                     )
                 return local_conversation
-            recent_resource_question = self._answer_recent_resource_question(
-                message,
-                owner=owner,
-                llm_owner=llm_rate_owner or owner,
-                conversation_context=conversation_context,
-            )
-            if recent_resource_question is not None:
-                return recent_resource_question
-            if _is_negated_danger_action_message(message):
+            model_conversation_context = conversation_context
+            if owner and _is_recent_resource_question(message):
+                recent_snapshot = self.recent_resource_store.get(owner=owner)
+                recent_evidence = _recent_resource_question_context(
+                    recent_snapshot or {}
+                )
+                if recent_evidence:
+                    model_conversation_context = list(conversation_context or [])
+                    model_conversation_context.append({
+                        "role": "assistant",
+                        "text": recent_evidence,
+                        "tool_name": "indexer.search_resources",
+                    })
+            if _is_pure_negated_danger_action_message(message):
                 return self._conversation_response("好，不会执行这项操作。")
-            # 指代型续句与显式引用消息优先交给统一 Planner。模型不可用、
-            # 无法可靠规划或安全门禁拒绝时，再回退到既有窄续句解析器。
-            contextual_model_attempted = False
-            danger_read_question = _is_danger_read_question(message)
+            # 写动作、危险域与 owner-scoped 候选仍由服务端确定性绑定；
+            # 其余读问题统一交给 _query_raw 中的原生 LLM 循环先处理。
             recent_resource_request = None
             if owner and self.recent_resource_store.get(owner=owner) is not None:
                 recent_resource_request = _recent_resource_pre_model_submit_request(
                     message, conversation_context
                 )
-            requires_deterministic_context_routing = bool(
-                _has_deterministic_media_subscription_binding(message)
-                or _has_deterministic_danger_intent(message)
-                or recent_resource_request is not None
-            )
-            if (
-                not requires_deterministic_context_routing
-                and (conversation_context or reply_context)
-                and (
-                    reply_context
-                    or _should_try_contextual_model_first(
-                        message, conversation_context
-                    )
-                )
-            ):
-                contextual_model_attempted = True
-                contextual_model = self._query_with_model_tools(
-                    message,
-                    owner=owner,
-                    llm_rate_owner=llm_rate_owner,
-                    llm_tool_rate_identity=llm_tool_rate_identity,
-                    conversation_context=conversation_context,
-                    read_only=(
-                        not is_agent_action_request(message)
-                        or danger_read_question
-                        or _is_cross_domain_rss_refresh_correction(
-                            message,
-                            conversation_context,
-                            allow_structured_domain=trusted_conversation_context,
-                        )
-                    ),
-                    **(
-                        {"reply_context": reply_context}
-                        if reply_context else {}
-                    ),
-                )
-                if contextual_model is not None and not (
-                    danger_read_question
-                    and _is_confirmation_response(contextual_model)
-                ):
-                    if not present:
-                        return contextual_model
-                    return self._present_tool_response(
-                        message,
-                        contextual_model,
-                        owner=llm_rate_owner or owner,
-                    )
-            if not requires_deterministic_context_routing:
-                continued = self._continue_narrow_followup(
-                    message,
-                    owner=llm_rate_owner or owner,
-                    conversation_context=conversation_context,
-                    reply_context=reply_context,
-                )
-                if continued is not None:
-                    return continued
-                clarification = self._clarify_ambiguous_followup(
-                    message,
-                    conversation_context=conversation_context,
-                    reply_context=reply_context,
-                )
-                if clarification is not None:
-                    return clarification
             # 最近资源候选属于已经建立的强上下文。像“第 2 个到光鸭”或
             # “下载 34 集到 qB”必须先进入确认流程，不能再次交给模型猜测。
             if recent_resource_request is not None:
@@ -7424,10 +7466,10 @@ class AgentOrchestrator:
                 llm_rate_owner=llm_rate_owner,
                 query_tool_rate_identity=query_tool_rate_identity,
                 llm_tool_rate_identity=llm_tool_rate_identity,
-                conversation_context=conversation_context,
+                conversation_context=model_conversation_context,
                 trusted_conversation_context=trusted_conversation_context,
                 reply_context=reply_context,
-                allow_model_routing=not contextual_model_attempted,
+                allow_model_routing=True,
             )
             if not present:
                 return response
@@ -7445,6 +7487,8 @@ class AgentOrchestrator:
                 elapsed_ms=max(0, int((monotonic() - query_started) * 1000)),
                 ok=sys.exc_info()[0] is None,
             )
+            if turn_token is not None:
+                reset_agent_turn(turn_token)
             end_trace_context(trace_token)
 
     def _aggregate_native_read_executions(
@@ -7598,7 +7642,7 @@ class AgentOrchestrator:
             )
             if rate_identity and not allow_agent_tool(rate_identity, tool_name):
                 raise AgentToolError(
-                    "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                    AGENT_RATE_LIMITED, code="rate_limited"
                 )
             if disposition is LLMToolDisposition.PREPARE_CONFIRMATION:
                 if read_only or not owner:
@@ -7639,7 +7683,7 @@ class AgentOrchestrator:
                     rate_identity, selection.tool_name
                 ):
                     raise AgentToolError(
-                        "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                        AGENT_RATE_LIMITED, code="rate_limited"
                     )
                 return self.prepare(
                     selection.tool_name,
@@ -7652,27 +7696,45 @@ class AgentOrchestrator:
                     rate_identity, selection.tool_name
                 ):
                     raise AgentToolError(
-                        "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                        AGENT_RATE_LIMITED, code="rate_limited"
                     )
                 return self.invoke(
                     selection.tool_name, normalized_arguments, owner=owner
                 )
             return None
 
-        native_reply = run_native_read_agent(
-            message,
-            self.registry,
-            _execute_native_tool,
-            owner=llm_rate_owner or owner,
-            reply_context=reply_context,
-            include_confirmations=bool(owner and not read_only and action_request),
-            **(
-                {"conversation_context": conversation_context}
-                if conversation_context else {}
-            ),
+        native_resource_capture = _NativeResourceCapture()
+        native_capture_token = _NATIVE_RESOURCE_CAPTURE.set(
+            native_resource_capture
         )
+        try:
+            with isolate_agent_resource_results():
+                native_reply = run_native_read_agent(
+                    message,
+                    self.registry,
+                    _execute_native_tool,
+                    owner=llm_rate_owner or owner,
+                    reply_context=reply_context,
+                    include_confirmations=bool(
+                        owner and not read_only and action_request
+                    ),
+                    **(
+                        {"conversation_context": conversation_context}
+                        if conversation_context else {}
+                    ),
+                )
+        finally:
+            _NATIVE_RESOURCE_CAPTURE.reset(native_capture_token)
 
         if native_reply is None:
+            # 原生认知循环已经优先尝试。对“怎么回事/关注一下”这类依赖
+            # 上下文的开放追问，不再交给旧单工具选择器猜测；由后置窄续句
+            # 解释或澄清，避免 broad briefing 被误路由成任意单工具。
+            if (
+                _is_ambiguous_followup(message)
+                and re.search(r"帮我.{0,6}(?:看看|看下|查看).{0,6}(?:这个|它)", message) is None
+            ):
+                return None
             # 复合只读请求交给后面的 JSON 计划回退，避免在原生循环失败后退化成
             # 只执行一个工具；明确动作和普通单目标请求可继续尝试统一选择器。
             if not action_request and is_compound_read_request(message):
@@ -7733,7 +7795,7 @@ class AgentOrchestrator:
                 return None
             if rate_identity and not allow_agent_tool(rate_identity, selection.tool_name):
                 raise AgentToolError(
-                    "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                    AGENT_RATE_LIMITED, code="rate_limited"
                 )
             return self.invoke(selection.tool_name, normalized_arguments, owner=owner)
 
@@ -7819,6 +7881,60 @@ class AgentOrchestrator:
         )
         if presentation:
             response["presentation"] = presentation
+        media_facts = derive_media_facts(
+            message=message,
+            answer=native_reply.answer,
+            executions=executions,
+            conversation_context=conversation_context,
+        )
+        if media_facts:
+            response["media_facts"] = media_facts
+
+        has_resource_candidates = any(
+            self.registry.has(str(execution.get("tool_name") or "").strip())
+            and self.registry.stages_resource_candidates_for(
+                str(execution.get("tool_name") or "").strip()
+            )
+            for execution in executions
+        )
+        primary_resource_candidates = bool(
+            has_resource_candidates
+            and _resource_candidates_are_primary_for_message(message)
+        )
+        if confirmation_execution is not None:
+            task_kind = "action"
+            presentation_kind = "confirmation"
+        elif primary_resource_candidates:
+            task_kind = "resource_search"
+            presentation_kind = "resource_candidates"
+        elif action_request:
+            task_kind = "action"
+            presentation_kind = "narrative"
+        else:
+            task_kind = "informational"
+            presentation_kind = "narrative"
+        resource_role = (
+            "primary"
+            if primary_resource_candidates
+            else ("supporting" if has_resource_candidates else "none")
+        )
+        attach_response_contract(
+            response,
+            task_kind=task_kind,
+            presentation=presentation_kind,
+            resource_candidates=resource_role,
+        )
+        if primary_resource_candidates and owner:
+            # 原生认知链中的候选工具先作为证据暂存；只有本轮最终明确为
+            # 资源搜索展示，才激活最新一份安全候选供后续选择。
+            def commit_primary_resource_candidates() -> None:
+                latest_resource_result = native_resource_capture.latest()
+                if latest_resource_result is not None:
+                    self.recent_resource_store.capture(
+                        owner=owner, result=latest_resource_result
+                    )
+
+            commit_or_defer_agent_state(commit_primary_resource_candidates)
         if trace:
             response["agent_trace"] = trace
         if not native_reply.completed:
@@ -8002,7 +8118,7 @@ class AgentOrchestrator:
                 query_tool_rate_identity, "indexer.search_resources"
             ):
                 raise AgentToolError(
-                    "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                    AGENT_RATE_LIMITED, code="rate_limited"
                 )
             return self.invoke(
                 "indexer.search_resources",
@@ -8092,7 +8208,7 @@ class AgentOrchestrator:
             if not owner:
                 return self._unsupported(
                     "本地媒体来源触发器启停需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(tool_name, arguments, owner=owner)
         if local_media_intents.is_local_media_source_trigger_control_message(message):
@@ -8172,7 +8288,7 @@ class AgentOrchestrator:
             if not owner:
                 return self._unsupported(
                     "该巡检策略动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "library.set_patrol_policy",
@@ -8203,7 +8319,7 @@ class AgentOrchestrator:
             if not owner:
                 return self._unsupported(
                     "该 STRM 调度策略动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "strm.set_schedule_policy",
@@ -8218,7 +8334,7 @@ class AgentOrchestrator:
             if not owner:
                 return self._unsupported(
                     "该光鸭定时整理策略动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "guangya.organize.set_schedule_policy",
@@ -8246,7 +8362,7 @@ class AgentOrchestrator:
             if not owner:
                 return self._unsupported(
                     "重新提交下载请求需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                    [CONFIRM_EXECUTION_IN_AGENT],
                 )
             return self.prepare(
                 "downloads.retry_submission",
@@ -8267,8 +8383,8 @@ class AgentOrchestrator:
         if download_control is not None:
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                    LOGIN_REQUIRED_ACTION,
+                    [CONFIRM_EXECUTION_IN_AGENT],
                 )
             tool_name, arguments = download_control
             return self.prepare(tool_name, arguments, owner=owner)
@@ -8382,8 +8498,8 @@ class AgentOrchestrator:
         if media_control_request is not None:
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                    LOGIN_REQUIRED_ACTION,
+                    [CONFIRM_EXECUTION_IN_AGENT],
                 )
             tool_name, arguments = media_control_request
             return self.prepare(tool_name, arguments, owner=owner)
@@ -8510,8 +8626,8 @@ class AgentOrchestrator:
         if rss_control_request is not None:
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                    LOGIN_REQUIRED_ACTION,
+                    [CONFIRM_EXECUTION_IN_AGENT],
                 )
             tool_name, arguments = rss_control_request
             return self.prepare(tool_name, arguments, owner=owner)
@@ -8522,8 +8638,8 @@ class AgentOrchestrator:
             if resolution.status == "resolved" and resolution.subscription_id is not None:
                 if not owner:
                     return self._unsupported(
-                        "该动作需要在已登录会话中确认",
-                        ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                        LOGIN_REQUIRED_ACTION,
+                        [CONFIRM_EXECUTION_IN_AGENT],
                     )
                 arguments = {
                     "subscription_id": resolution.subscription_id,
@@ -8569,8 +8685,8 @@ class AgentOrchestrator:
         if rss_refresh_request is not None:
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                    LOGIN_REQUIRED_ACTION,
+                    [CONFIRM_EXECUTION_IN_AGENT],
                 )
             return self._prepare_single_rss_refresh(
                 subscription_id=int(rss_refresh_request["subscription_id"]),
@@ -8582,8 +8698,8 @@ class AgentOrchestrator:
             if resolution.status == "resolved" and resolution.subscription_id is not None:
                 if not owner:
                     return self._unsupported(
-                        "该动作需要在已登录会话中确认",
-                        ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                        LOGIN_REQUIRED_ACTION,
+                        [CONFIRM_EXECUTION_IN_AGENT],
                     )
                 return self._prepare_single_rss_refresh(
                     subscription_id=resolution.subscription_id,
@@ -8612,8 +8728,8 @@ class AgentOrchestrator:
         if rss_download_request is not None:
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                    LOGIN_REQUIRED_ACTION,
+                    [CONFIRM_EXECUTION_IN_AGENT],
                 )
             return self.prepare("rss.submit_pending_to_qb", rss_download_request, owner=owner)
         if is_rss_pending_download_write_message(lower):
@@ -8626,8 +8742,8 @@ class AgentOrchestrator:
         if rss_retry_request is not None:
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                    LOGIN_REQUIRED_ACTION,
+                    [CONFIRM_EXECUTION_IN_AGENT],
                 )
             return self.prepare("rss.retry_failed_to_qb", rss_retry_request, owner=owner)
         if is_rss_failure_retry_write_message(lower):
@@ -8652,8 +8768,8 @@ class AgentOrchestrator:
         if retry_request is not None:
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在只读预检后确认执行。"],
+                    LOGIN_REQUIRED_ACTION,
+                    [CONFIRM_EXECUTION_IN_AGENT],
                 )
             return self.prepare("strm.retry_failures", retry_request, owner=owner)
         if is_strm_failure_write_message(lower):
@@ -8671,7 +8787,7 @@ class AgentOrchestrator:
         if _is_strm_run_action(lower):
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
+                    LOGIN_REQUIRED_ACTION,
                     ["请通过 Agent 页面重新提交，并在预检后确认执行。"],
                 )
             return self.prepare("strm.run_once", {}, owner=owner)
@@ -8706,14 +8822,14 @@ class AgentOrchestrator:
         if is_guangya_organize_stop_message(lower):
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
+                    LOGIN_REQUIRED_ACTION,
                     ["请通过 Agent 页面重新提交，并在停止影响预检后确认执行。"],
                 )
             return self.prepare("guangya.organize.stop", {}, owner=owner)
         if is_guangya_organize_clean_empty_message(lower):
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
+                    LOGIN_REQUIRED_ACTION,
                     ["请通过 Agent 页面重新提交，并在清理范围预检后确认执行。"],
                 )
             return self.prepare("guangya.organize.clean_empty", {}, owner=owner)
@@ -8722,7 +8838,7 @@ class AgentOrchestrator:
         if is_guangya_organize_run_message(lower):
             if not owner:
                 return self._unsupported(
-                    "该动作需要在已登录会话中确认",
+                    LOGIN_REQUIRED_ACTION,
                     ["请通过 Agent 页面重新提交，并在只读预览后确认执行。"],
                 )
             return self.prepare("guangya.organize.run_once", {}, owner=owner)
@@ -8823,7 +8939,7 @@ class AgentOrchestrator:
         message = normalize_agent_message(value)
         lower = message.casefold()
 
-        if _is_negated_danger_action_message(message):
+        if _is_pure_negated_danger_action_message(message):
             return self._conversation_response("好，不会执行这项操作。")
 
         if _is_unsupported_engineering_request(message):
@@ -8906,6 +9022,57 @@ class AgentOrchestrator:
                 danger_read_question and _is_confirmation_response(model_read)
             ):
                 return model_read
+
+        # 信息追问先由原生模型结合工具和安全上下文处理。仅在 Provider 不可用时，
+        # 才使用已经持久化的结构化媒体事实或最近候选中的核验关系。
+        media_fact_answer = absolute_episode_answer(message, conversation_context)
+        if media_fact_answer:
+            return self._conversation_response(media_fact_answer)
+
+        recent_resource_question = self._answer_recent_resource_question(
+            message, owner=owner
+        )
+        if recent_resource_question is not None:
+            return recent_resource_question
+
+        # 兼容性只读解析只在原生 LLM 循环没有可靠完成时运行。它们负责
+        # Provider 不可用场景，不再作为普通读请求的主路由器。
+        rss_contextual_read = self._rss_context_followup(
+            message,
+            owner=owner,
+            conversation_context=conversation_context,
+            trusted_context=trusted_conversation_context,
+            allow_actions=False,
+        )
+        if rss_contextual_read is not None:
+            return rss_contextual_read
+
+        rating_request = contextual_media_rating_request(
+            message, conversation_context
+        )
+        if rating_request is not None and self.registry.has("discovery.lookup_rating"):
+            return self._invoke_query_read(
+                "discovery.lookup_rating",
+                rating_request,
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+
+        continued = self._continue_narrow_followup(
+            message,
+            owner=llm_rate_owner or owner,
+            conversation_context=conversation_context,
+            reply_context=reply_context,
+        )
+        if continued is not None:
+            return continued
+        clarification = self._clarify_ambiguous_followup(
+            message,
+            conversation_context=conversation_context,
+            reply_context=reply_context,
+        )
+        if clarification is not None:
+            return clarification
 
         history_request = agent_action_history_request(message)
         if history_request is not None:
@@ -8997,7 +9164,7 @@ class AgentOrchestrator:
                 query_tool_rate_identity, "workspace.next_actions"
             ):
                 raise AgentToolError(
-                    "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                    AGENT_RATE_LIMITED, code="rate_limited"
                 )
             return self.invoke("workspace.next_actions", {}, owner=owner)
         if is_workspace_briefing_message(lower):
@@ -9086,7 +9253,7 @@ class AgentOrchestrator:
             if not owner:
                 return self._unsupported(
                     "识别规则启停需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "recognition.set_rule_enabled",
@@ -9107,7 +9274,7 @@ class AgentOrchestrator:
             if not owner:
                 return self._unsupported(
                     "媒体反代启停需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "media_proxy.set_instance_enabled",
@@ -9183,8 +9350,8 @@ class AgentOrchestrator:
         ):
             if not owner:
                 return self._unsupported(
-                    "该配置动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    LOGIN_REQUIRED_CONFIG_ACTION,
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "config.set_feature_state", strm_metadata_request, owner=owner
@@ -9225,8 +9392,8 @@ class AgentOrchestrator:
                 )
             if not owner:
                 return self._unsupported(
-                    "该配置动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    LOGIN_REQUIRED_CONFIG_ACTION,
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "config.set_indexer_sites",
@@ -9243,8 +9410,8 @@ class AgentOrchestrator:
         if indexer_site_request is not None:
             if not owner:
                 return self._unsupported(
-                    "该配置动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    LOGIN_REQUIRED_CONFIG_ACTION,
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "config.set_indexer_sites",
@@ -9283,8 +9450,8 @@ class AgentOrchestrator:
                 )
             if not owner:
                 return self._unsupported(
-                    "该配置动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    LOGIN_REQUIRED_CONFIG_ACTION,
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "config.set_indexer_sites",
@@ -9304,16 +9471,16 @@ class AgentOrchestrator:
         if feature_request is not None:
             if not owner:
                 return self._unsupported(
-                    "该配置动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    LOGIN_REQUIRED_CONFIG_ACTION,
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare("config.set_feature_state", feature_request, owner=owner)
         safe_policy_update = safe_policy_request(lower)
         if safe_policy_update is not None:
             if not owner:
                 return self._unsupported(
-                    "该配置动作需要在已登录会话中确认",
-                    ["请通过 Agent 页面重新提交，并在预检后确认修改。"],
+                    LOGIN_REQUIRED_CONFIG_ACTION,
+                    [CONFIRM_CHANGE_IN_AGENT],
                 )
             return self.prepare(
                 "config.set_safe_policy",
@@ -9349,7 +9516,7 @@ class AgentOrchestrator:
                 query_tool_rate_identity, "web.search"
             ):
                 raise AgentToolError(
-                    "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                    AGENT_RATE_LIMITED, code="rate_limited"
                 )
             return self.invoke("web.search", {"query": query, "max_results": 5}, owner=owner)
 
@@ -9375,7 +9542,7 @@ class AgentOrchestrator:
                 query_tool_rate_identity, "indexer.search_resources"
             ):
                 raise AgentToolError(
-                    "Agent 请求过于频繁，请稍后重试", code="rate_limited"
+                    AGENT_RATE_LIMITED, code="rate_limited"
                 )
             return self.invoke(
                 "indexer.search_resources",
@@ -9508,38 +9675,17 @@ class AgentOrchestrator:
         message: str,
         *,
         owner: str,
-        llm_owner: str,
-        conversation_context: list[dict[str, Any]] | None,
     ) -> dict[str, Any] | None:
-        """把最近候选的解释性追问交给 LLM，而不是误入下载状态机。"""
+        """Provider 不可用时，仅回答最近快照已核验的编号关系。"""
         if not owner or not _is_recent_resource_question(message):
             return None
         snapshot = self.recent_resource_store.get(owner=owner)
         if not isinstance(snapshot, dict):
             return None
         fallback = _recent_resource_relation_fallback(message, snapshot)
-        if fallback:
-            return self._conversation_response(fallback)
-        safe_context = _recent_resource_question_context(snapshot)
-        if safe_context:
-            augmented_context = list(conversation_context or [])
-            augmented_context.append({"role": "assistant", "text": safe_context})
-            conversation = answer_conversation(
-                message,
-                owner=llm_owner,
-                conversation_context=augmented_context,
-            )
-            if conversation is not None:
-                return self._conversation_response(
-                    conversation.answer,
-                    conversation.suggestions,
-                    llm_usage=(
-                        conversation.usage.to_dict()
-                        if conversation.usage is not None
-                        else None
-                    ),
-                )
-        return None
+        if not fallback:
+            fallback = _recent_resource_absolute_episode_fallback(message, snapshot)
+        return self._conversation_response(fallback) if fallback else None
 
     @staticmethod
     def _local_conversation(message: str) -> dict[str, Any] | None:

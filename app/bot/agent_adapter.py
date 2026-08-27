@@ -63,6 +63,7 @@ from app.agent.progress_events import (
 )
 from app.agent.rate_limit import agent_rate_limiter, allow_agent_tool
 from app.agent.registry import AgentToolError
+from app.agent.response_contract import infer_response_contract, response_contract
 from app.agent.result_projection import (
     project_agent_result_for_user,
     project_public_guidance,
@@ -1351,6 +1352,7 @@ def _render_agent_progress_card(
     target_mode: str,
     active_label: str,
     completed_steps: tuple[str, ...] = (),
+    elapsed_seconds: float = 0.0,
 ) -> str:
     """渲染不暴露参数、路径和内部工具名的 Telegram 工作进度卡。"""
 
@@ -1360,6 +1362,10 @@ def _render_agent_progress_card(
         text
         for raw in completed_steps[-_TELEGRAM_PROGRESS_MAX_COMPLETED_STEPS :]
         if (text := _public_text(raw, limit=100))
+    )
+    elapsed = max(0.0, float(elapsed_seconds or 0.0))
+    elapsed_text = (
+        f"已用时 {elapsed:.1f} 秒" if elapsed < 10 else f"已用时 {int(elapsed)} 秒"
     )
     # Telegram 草稿接口没有 reply_parameters；富/文本草稿内模拟引用卡。
     # 可编辑占位本身已经 reply_to 原消息，因此不重复展示请求。
@@ -1374,6 +1380,7 @@ def _render_agent_progress_card(
         if completed:
             blocks.append(f"<p>{'<br>'.join(completed)}</p>")
         blocks.append(f"<tg-thinking>{active}</tg-thinking>")
+        blocks.append(f"<p><i>⏱ {elapsed_text}</i></p>")
         return "".join(blocks)
 
     lines: list[str] = []
@@ -1387,6 +1394,7 @@ def _render_agent_progress_card(
     if completed:
         lines.append("")
     lines.append(f"<i>{active}</i>")
+    lines.append(f"<i>⏱ {elapsed_text}</i>")
     return "\n".join(lines)
 
 
@@ -1412,18 +1420,21 @@ class _TelegramAgentProgress:
         self.clock = clock
         self.update_interval_seconds = max(0.0, float(update_interval_seconds))
         self._active = self.target is not None
-        self._active_label = "🧭 正在理解请求…"
+        self._active_label = "🧭 正在识别请求范围…"
         self._completed_steps: list[str] = []
+        self._active_tools: dict[str, dict[str, Any]] = {}
+        self._started_at = self.clock()
         self._last_rendered = (
             _render_agent_progress_card(
                 message,
                 target_mode=self.target.mode,
                 active_label=self._active_label,
+                elapsed_seconds=0.0,
             )
             if self.target is not None
             else ""
         )
-        self._last_update_at = self.clock()
+        self._last_update_at = self._started_at
         self._lock = threading.RLock()
 
     def handle(self, event: AgentProgressEvent) -> None:
@@ -1436,45 +1447,85 @@ class _TelegramAgentProgress:
             if not self._active or self.target is None:
                 return
             if phase == "routing":
-                self._active_label = "🧭 正在理解请求…"
+                self._active_label = "🧭 正在识别请求范围…"
             elif phase == "planning":
-                self._remember_completed("✅ 已理解请求")
-                self._active_label = "🧭 正在选择检查范围…"
+                self._remember_completed("✅ 已识别请求范围")
+                self._active_label = "🧭 正在选择需要核对的数据源…"
                 force = True
             elif phase == "model_wait":
-                self._remember_completed("✅ 已理解请求")
-                self._active_label = "🧭 正在分析请求并规划检查步骤…"
+                self._remember_completed("✅ 已识别请求范围")
+                self._active_label = "🧭 正在规划检查步骤…"
+                force = True
+            elif phase == "synthesizing":
+                self._active_tools.clear()
+                self._active_label = "✍️ 正在整理检查结论…"
                 force = True
             elif phase in {"tool_start", "preview_start"} and tool_name:
                 label = public_tool_label(tool_name)
-                self._active_label = (
-                    f"🛡️ 正在生成安全预检：{label}…"
-                    if phase == "preview_start"
-                    else f"🔎 正在检查：{label}…"
+                active = self._active_tools.setdefault(
+                    tool_name, {"label": label, "count": 0, "failed": False}
                 )
+                active["count"] = int(active.get("count") or 0) + 1
+                if phase == "preview_start":
+                    self._active_label = f"🛡️ 正在生成安全预检：{label}…"
+                else:
+                    self._set_active_tool_label()
                 force = True
             elif phase in {"tool_finish", "preview_finish"} and tool_name:
                 label = public_tool_label(tool_name)
                 ok = getattr(event, "ok", None) is not False
-                completed = (
-                    f"✅ {label}"
-                    if ok
-                    else f"⚠️ {label}未正常返回"
-                )
-                self._remember_completed(completed)
-                self._active_label = (
-                    "🛡️ 正在核对预检结果…"
-                    if phase == "preview_finish"
-                    else "🔎 正在核对检查结果…"
-                )
+                active = self._active_tools.get(tool_name)
+                finished = True
+                failed = not ok
+                if active is not None:
+                    active["failed"] = bool(active.get("failed")) or not ok
+                    remaining_count = max(
+                        0, int(active.get("count") or 0) - 1
+                    )
+                    active["count"] = remaining_count
+                    failed = bool(active.get("failed"))
+                    finished = remaining_count == 0
+                    if finished:
+                        self._active_tools.pop(tool_name, None)
+                if finished:
+                    self._remember_completed(
+                        f"⚠️ {label}未正常返回" if failed else f"✅ {label}"
+                    )
+                if self._active_tools:
+                    self._set_active_tool_label()
+                else:
+                    self._active_label = (
+                        "🛡️ 正在核对预检结果…"
+                        if phase == "preview_finish"
+                        else "🧭 正在分析检查结果…"
+                    )
             else:
                 return
         self._publish(force=force)
+
+    def _set_active_tool_label(self) -> None:
+        active_count = sum(
+            max(0, int(item.get("count") or 0))
+            for item in self._active_tools.values()
+        )
+        if active_count <= 0:
+            self._active_label = "🧭 正在分析检查结果…"
+            return
+        if active_count == 1:
+            remaining = next(
+                str(item.get("label") or "MediaFlux 检查")
+                for item in self._active_tools.values()
+                if int(item.get("count") or 0) > 0
+            )
+            self._active_label = f"🔎 正在检查：{remaining}…"
+            return
+        self._active_label = f"🔎 正在并行核对 {active_count} 项信息…"
 
     def mark_answering(self) -> None:
         with self._lock:
             if not self._active:
                 return
+            self._active_tools.clear()
             self._active_label = "✍️ 正在整理回答…"
         self._publish(force=True)
 
@@ -1514,6 +1565,7 @@ class _TelegramAgentProgress:
                 target_mode=target.mode,
                 active_label=self._active_label,
                 completed_steps=tuple(self._completed_steps),
+                elapsed_seconds=max(0.0, now - self._started_at),
             )
             if rendered == self._last_rendered:
                 return
@@ -3361,6 +3413,16 @@ def _resource_candidates(response: Any) -> list[dict[str, Any]]:
     return candidates
 
 
+def _resource_candidates_are_primary(response: Any) -> bool:
+    """渠道只消费集中式语义契约；兼容响应也在契约模块统一推导。"""
+    contract = infer_response_contract(response)
+    return contract.get("resource_candidates") == "primary"
+
+
+def _confirmation_is_primary(response: Any) -> bool:
+    return infer_response_contract(response).get("presentation") == "confirmation"
+
+
 def _resource_markup(
     telebot: Any,
     *,
@@ -3437,7 +3499,10 @@ def _resource_markup(
 def _render_resource_candidates(
     response: Any, candidates: list[dict[str, Any]], *, page: int = 0
 ) -> str:
-    if not candidates:
+    contract = response_contract(response)
+    if not candidates or (
+        contract and contract.get("resource_candidates") != "primary"
+    ):
         return render_agent_response(response)
 
     payload_page = _normalize_resource_page_payload(
@@ -3703,7 +3768,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             )
             markup = None
             rendered = render_agent_response(response)
-            if response.get("mode") == "confirmation_required" and confirmation:
+            if _confirmation_is_primary(response) and confirmation:
                 confirmation_id = str(confirmation.get("confirmation_id") or "").strip()
                 if confirmation_id:
                     contract = sanitize_confirmation_contract(confirmation.get("contract"))
@@ -3715,7 +3780,11 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                     )
                     rendered = render_agent_response(response, confirmation=True)
             else:
-                candidates = _resource_candidates(response)
+                candidates = (
+                    _resource_candidates(response)
+                    if _resource_candidates_are_primary(response)
+                    else []
+                )
                 if candidates:
                     markup = _resource_markup(
                         telebot,
@@ -4169,7 +4238,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                                 else ""
                             )
                             if (
-                                response.get("mode") != "confirmation_required"
+                                not _confirmation_is_primary(response)
                                 or not confirmation_id
                             ):
                                 raise ValueError("资源预检未返回确认票据")

@@ -14,6 +14,8 @@ from itertools import islice
 from typing import Any
 from urllib.parse import unquote
 
+from app.agent.response_contract import ensure_response_contract
+from app.agent.tool_semantics import RESOURCE_CANDIDATE_TOOLS
 from app.sensitive_data import contains_sensitive_credential
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -617,11 +619,6 @@ _MAX_MAPPING_ITEMS = 24
 _MAX_SEQUENCE_ITEMS = 16
 _MAX_PROJECTED_NODES = 96
 _MAX_REQUEST_BYTES = 10_240
-_RESOURCE_CANDIDATE_TOOL_NAMES = frozenset({
-    "indexer.search_resources",
-    "library.search_missing_episode_resources",
-    "library.search_missing_season_resources",
-})
 _RESOURCE_CANDIDATE_KEYS = frozenset({
     "items",
     "candidates",
@@ -1281,7 +1278,7 @@ def attach_public_display(response: dict[str, Any]) -> dict[str, Any]:
     result = response.get("result")
     if isinstance(result, dict):
         response["display"] = project_agent_result_for_user(result)
-    return response
+    return ensure_response_contract(response)
 
 
 def build_public_narrative_presentation(
@@ -1330,7 +1327,7 @@ def project_agent_response_for_llm(response: Mapping[str, Any]) -> dict[str, Any
             break
 
     data_source = result.get("data")
-    if tool_name in _RESOURCE_CANDIDATE_TOOL_NAMES:
+    if tool_name in RESOURCE_CANDIDATE_TOOLS:
         candidate_summaries = _resource_candidate_summaries(data_source)
         data_source = _without_resource_candidate_details(data_source)
         if candidate_summaries and isinstance(data_source, Mapping):

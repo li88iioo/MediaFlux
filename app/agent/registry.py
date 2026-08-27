@@ -21,12 +21,17 @@ from app.agent.models import (
     ToolSpec,
 )
 from app.agent.metrics import agent_metrics
+from app.agent.tool_semantics import (
+    default_result_presentation,
+    default_stages_resource_candidates,
+)
 from app.agent.observability import safe_exception_summary
 from app.logger import get_logger
 
 logger = get_logger(__name__)
 _NATIVE_ALIAS_RE = re.compile(r"^mf_[A-Za-z0-9_-]{1,61}$")
 _LLM_EXAMPLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_LLM_SEMANTIC_LABEL_RE = re.compile(r"^[a-z][a-z0-9_]{1,47}$")
 
 
 
@@ -67,6 +72,29 @@ class ToolRegistry:
             raise ValueError(f"LLM read tool must be confirmation-free READ: {name}")
         if spec.llm_read_plan and not spec.llm_read:
             raise ValueError(f"LLM plan tool must also be LLM readable: {name}")
+        if spec.result_presentation not in {"narrative", "resource_candidates"}:
+            raise ValueError(f"invalid tool result presentation: {name}")
+        if (
+            len(spec.llm_domains) > 8
+            or any(
+                not isinstance(domain, str)
+                or not _LLM_SEMANTIC_LABEL_RE.fullmatch(domain.strip())
+                for domain in spec.llm_domains
+            )
+        ):
+            raise ValueError(f"invalid LLM capability domains: {name}")
+        if not _LLM_SEMANTIC_LABEL_RE.fullmatch(
+            str(spec.llm_source_kind or "").strip()
+        ):
+            raise ValueError(f"invalid LLM capability source: {name}")
+        if spec.llm_evidence_role not in {"primary", "supporting"}:
+            raise ValueError(f"invalid LLM capability evidence role: {name}")
+        if spec.llm_freshness not in {
+            "realtime", "live", "snapshot", "cached", "derived", "historical"
+        }:
+            raise ValueError(f"invalid LLM capability freshness: {name}")
+        if not isinstance(spec.llm_parallel_safe, bool):
+            raise ValueError(f"invalid LLM capability parallel flag: {name}")
         if spec.llm_confirmation and (
             spec.risk is RiskLevel.READ
             or not spec.requires_confirmation
@@ -196,6 +224,25 @@ class ToolRegistry:
     def risk_for(self, name: str) -> RiskLevel:
         """返回已注册工具的风险等级，不暴露内部 ToolSpec。"""
         return self._get_spec(name).risk
+
+    def result_presentation_for(self, name: str) -> str:
+        """返回工具声明的结果展示语义，并兼容旧 ToolSpec。"""
+        spec = self._get_spec(name)
+        if spec.result_presentation != "narrative":
+            return spec.result_presentation
+        return default_result_presentation(spec.name)
+
+    def stages_resource_candidates_for(self, name: str) -> bool:
+        """返回工具是否产生可供本轮认知链使用的候选证据。"""
+        spec = self._get_spec(name)
+        return bool(
+            spec.stages_resource_candidates
+            or default_stages_resource_candidates(spec.name)
+        )
+
+    def llm_parallel_safe_for(self, name: str) -> bool:
+        """返回只读能力是否允许与本轮其他只读工具并行。"""
+        return bool(self._get_spec(name).llm_parallel_safe)
 
     def validate_read_call(
         self, name: str, arguments: dict[str, Any] | None = None

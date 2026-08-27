@@ -1559,6 +1559,10 @@ def build_tool_registry() -> ToolRegistry:
             "并对确认缺失项执行有界多站资源搜索；只返回下载建议，不提交 qBittorrent 或光鸭。"
         ),
         risk=RiskLevel.READ,
+        llm_domains=("subscriptions", "resource_search"),
+        llm_source_kind="system_state",
+        llm_freshness="live",
+        stages_resource_candidates=True,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         handler=inspect_media_subscription_updates,
         validator=media_subscription_updates_arguments,
@@ -2521,7 +2525,7 @@ def build_tool_registry() -> ToolRegistry:
         context_handler=search_directory_scrape,
         validator=directory_scrape_search_arguments,
         llm_read=True,
-        llm_examples=("给刚才的光鸭目录搜索匹配", "用沧元图搜索刮削候选"),
+        llm_examples=("给刚才的光鸭目录搜索匹配", "用刚才识别出的标题搜索刮削候选"),
     ))
     registry.register(ToolSpec(
         name="guangya.directory_scrape.preview",
@@ -2611,8 +2615,14 @@ def build_tool_registry() -> ToolRegistry:
     ))
     registry.register(ToolSpec(
         name="web.search",
-        description="通过受控 Tavily Provider 搜索公开网页；结果受固定主机、缓存、频率和每日额度限制。",
+        description=(
+            "通过受控 Tavily Provider 搜索公开网页；用于核对官方平台当前更新进度、最新播出信息"
+            "和其他时效性事实。结果受固定主机、缓存、频率和每日额度限制。"
+        ),
         risk=RiskLevel.READ,
+        llm_domains=("official_progress", "research"),
+        llm_source_kind="public_web",
+        llm_freshness="cached",
         parameters={
             "type": "object",
             "required": ["query"],
@@ -2630,12 +2640,17 @@ def build_tool_registry() -> ToolRegistry:
         llm_examples=(
             "搜索网上的最新消息",
             "联网查公开网页信息",
+            "核对某部动画官方最新更新到第几集",
+            "查询官方平台目前播到哪里",
         ),
     ))
     registry.register(ToolSpec(
         name="discovery.search",
         description="在已启用的 TMDB、豆瓣与 Bangumi 外部数据源中搜索影视元数据，不返回海报原始地址或配置值。",
         risk=RiskLevel.READ,
+        llm_domains=("discovery", "media_identity"),
+        llm_source_kind="metadata_catalog",
+        llm_freshness="live",
         parameters={
             "type": "object",
             "required": ["query"],
@@ -2669,6 +2684,9 @@ def build_tool_registry() -> ToolRegistry:
         name="discovery.lookup_rating",
         description="按明确影视名称、类型和年份查询豆瓣评分；优先使用豆瓣结构化数据，必要时受控检索并读取已验证的豆瓣条目页。",
         risk=RiskLevel.READ,
+        llm_domains=("rating", "discovery"),
+        llm_source_kind="metadata_catalog",
+        llm_freshness="live",
         parameters={
             "type": "object",
             "required": ["query"],
@@ -2860,8 +2878,17 @@ def build_tool_registry() -> ToolRegistry:
     ))
     registry.register(ToolSpec(
         name="indexer.search_resources",
-        description="在已启用的多站索引中搜索短期资源结果，只返回 opaque result_id 与公开元数据。",
+        description=(
+            "在已启用的多站索引中搜索短期资源结果，只返回 opaque result_id 与公开元数据。"
+            "可用于交叉核对连载资源跟进到哪一集，但资源标题只能作为旁证，不能证明官方播出进度。"
+        ),
         risk=RiskLevel.READ,
+        llm_domains=("resource_search", "official_progress"),
+        llm_source_kind="resource_index",
+        llm_evidence_role="supporting",
+        llm_freshness="realtime",
+        result_presentation="resource_candidates",
+        stages_resource_candidates=True,
         parameters={
             "type": "object",
             "required": ["title"],
@@ -2892,9 +2919,10 @@ def build_tool_registry() -> ToolRegistry:
         llm_examples=(
             "搜索《某片》的下载资源",
             "找种子或磁力资源",
-            "在资源站搜索资源",
             "帮我下载《某片》",
             "下载某部电视剧",
+            "核对某部连载动画的资源索引跟进到第几集",
+            "查看动画更新到第几集的资源索引旁证",
         ),
     ))
     registry.register(ToolSpec(
@@ -3018,6 +3046,9 @@ def build_tool_registry() -> ToolRegistry:
         name="library.search",
         description="在已配置的 Jellyfin / Emby 媒体库中搜索标题。",
         risk=RiskLevel.READ,
+        llm_domains=("library", "media_identity"),
+        llm_source_kind="local_library",
+        llm_freshness="live",
         parameters={
             "type": "object",
             "required": ["query"],
@@ -3040,6 +3071,11 @@ def build_tool_registry() -> ToolRegistry:
         name="library.search_missing_episode_resources",
         description="先确认指定季集属于已播缺集，再定向搜索多站资源；不会自动下载。",
         risk=RiskLevel.READ,
+        llm_domains=("resource_search", "library"),
+        llm_source_kind="resource_index",
+        llm_freshness="realtime",
+        result_presentation="resource_candidates",
+        stages_resource_candidates=True,
         parameters={
             "type": "object",
             "required": ["query", "season", "episode"],
@@ -3072,6 +3108,11 @@ def build_tool_registry() -> ToolRegistry:
         name="library.search_missing_season_resources",
         description="先完整核对指定季度，再按顺序搜索最多 3 个已播缺集的多站资源；不会自动下载。",
         risk=RiskLevel.READ,
+        llm_domains=("resource_search", "library"),
+        llm_source_kind="resource_index",
+        llm_freshness="realtime",
+        result_presentation="resource_candidates",
+        stages_resource_candidates=True,
         parameters={
             "type": "object",
             "required": ["query", "season"],
@@ -3123,8 +3164,15 @@ def build_tool_registry() -> ToolRegistry:
 
     registry.register(ToolSpec(
         name="library.check_updates",
-        description="核对某部媒体是否有更新；剧集比较 TMDB 已播普通集，电影核对本地存在性并提供需人工判断的资源站跟进。",
+        description=(
+            "核对某部媒体是否有更新；剧集比较 TMDB 已播普通集与 Jellyfin / Emby 本地收录，"
+            "电影核对本地存在性并提供需人工判断的资源站跟进。该结果用于本地/TMDB 对照，"
+            "不能替代官方平台的实时更新公告。"
+        ),
         risk=RiskLevel.READ,
+        llm_domains=("library", "official_progress"),
+        llm_source_kind="local_library",
+        llm_freshness="live",
         parameters={
             "type": "object",
             "required": ["query"],
@@ -3290,6 +3338,9 @@ def build_tool_registry() -> ToolRegistry:
         name="library.count_series_episodes",
         description="直接读取已配置 Jellyfin / Emby 中指定剧集的本地普通集数量与季度分布；不访问 TMDB，也不判断缺集。",
         risk=RiskLevel.READ,
+        llm_domains=("library", "episode_numbering"),
+        llm_source_kind="local_library",
+        llm_freshness="live",
         parameters={
             "type": "object",
             "required": ["query"],
