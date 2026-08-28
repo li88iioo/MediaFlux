@@ -95,18 +95,34 @@ class AgentPageTests(InitializedWebTestCase):
         )
         self.assertEqual(response.text.count("/static/css/agent.css"), 1)
         self.assertEqual(response.text.count("/static/js/agent.js"), 1)
-        self.assertIn("/static/css/agent.css?v=20260828a", response.text)
-        self.assertIn("/static/js/agent.js?v=20260828a", response.text)
+        self.assertIn("/static/css/agent.css?v=20260829d", response.text)
+        self.assertIn("/static/js/agent.js?v=20260829a", response.text)
         self.assertIn('id="agentResumeLatestSession"', response.text)
         self.assertIn("继续上次", response.text)
         self.assertNotRegex(response.text, re.compile(r"(?:API_KEY|PASSWORD|TOKEN)=", re.I))
-        self.assertIn('data-agent-draft="检查《剧名》有没有缺集"', response.text)
-        self.assertIn('data-agent-draft="检查电视剧《剧名》有没有更新"', response.text)
-        self.assertIn('data-agent-draft="在网上找《片名》"', response.text)
-        self.assertIn('data-agent-prompt="预览光鸭云盘整理计划"', response.text)
-        self.assertIn('data-agent-prompt="检查项目配置"', response.text)
+        self.assertIn('class="agent-console is-empty"', response.text)
+        self.assertIn('id="agentEmptyIntro"', response.text)
+        self.assertIn("今天想处理什么？", response.text)
+        self.assertIn('placeholder="询问 MediaFlux"', response.text)
+        self.assertIn('data-active-placeholder="继续描述或调整任务"', response.text)
+        self.assertNotIn("START HERE", response.text)
+        self.assertNotIn("data-agent-welcome", response.text)
+        self.assertNotIn("agent-message-system", response.text)
+        self.assertNotIn("常用任务", response.text)
+        self.assertNotIn("常用 Agent 任务", response.text)
+        self.assertNotIn('id="toggleAgentShortcuts"', response.text)
+        self.assertNotIn('id="agentShortcutsTimeline"', response.text)
+        self.assertNotIn('data-agent-prompt=', response.text)
+        self.assertNotIn('data-agent-draft=', response.text)
 
         styles = STYLES.read_text(encoding="utf-8")
+        self.assertNotIn(".agent-shortcuts-trigger", styles)
+        self.assertNotIn(".agent-shortcuts-timeline-popover", styles)
+        self.assertNotIn(".agent-timeline-task", styles)
+        self.assertIn(".agent-console.is-empty", styles)
+        self.assertIn(".agent-empty-intro", styles)
+        self.assertNotIn(".agent-message-system", styles)
+        self.assertNotIn(".agent-starter-grid", styles)
         self.assertIn("--agent-reading-width: 980px", styles)
         self.assertEqual(styles.count("var(--agent-reading-width, 980px)"), 3)
 
@@ -320,9 +336,10 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("const viewport = window.visualViewport", source)
         self.assertIn("--agent-viewport-height", source)
         self.assertIn("window.visualViewport.addEventListener('resize'", source)
-        self.assertIn('id="closeAgentShortcuts"', template)
-        self.assertIn("shortcutsClose?.focus({preventScroll: true})", source)
-        self.assertIn("toggleShortcutsTimeline(false, {restoreFocus: true})", source)
+        self.assertNotIn('id="closeAgentShortcuts"', template)
+        self.assertNotIn("shortcutsClose", source)
+        self.assertNotIn("toggleShortcutsTimeline", source)
+        self.assertNotIn("agentShortcutsTimeline", source)
         self.assertRegex(
             styles,
             re.compile(
@@ -408,7 +425,16 @@ class AgentPageTests(InitializedWebTestCase):
             source,
             re.compile(
                 r"\.agent-send,\s*\n\.agent-stop\s*\{[^}]*"
-                r"width:\s*44px[^}]*height:\s*44px[^}]*min-width:\s*44px",
+                r"width:\s*38px[^}]*height:\s*38px[^}]*min-width:\s*38px",
+                re.S,
+            ),
+        )
+        self.assertRegex(
+            source,
+            re.compile(
+                r"@media \(max-width:\s*680px\)[\s\S]*?"
+                r"\.agent-send,\s*\.agent-stop\s*\{[^}]*"
+                r"width:\s*44px[^}]*height:\s*44px",
                 re.S,
             ),
         )

@@ -53,8 +53,11 @@ class AgentBrowserTests(unittest.TestCase):
               <span id="agentSessionCount">0</span>
               <div class="agent-session-list" id="agentSessionList" aria-busy="true"></div>
               <p id="agentSessionStatus" role="status" aria-live="polite"></p>
-              <div id="agentTranscript"><article data-agent-welcome>欢迎</article></div>
-              <form id="agentComposer"><textarea id="agentPrompt"></textarea><span class="agent-submit-slot"><button id="agentSend" type="submit"><span>发送任务</span><i data-lucide="arrow-up"></i></button><button id="agentStop" type="button" hidden disabled><span>停止任务</span><i data-lucide="square"></i></button></span></form>
+              <section class="agent-console is-empty">
+                <div id="agentTranscript"></div>
+                <div class="agent-empty-intro" id="agentEmptyIntro"><h1>今天想处理什么？</h1></div>
+                <form id="agentComposer"><textarea id="agentPrompt" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务"></textarea><span class="agent-submit-slot"><button id="agentSend" type="submit"><span>发送任务</span><i data-lucide="arrow-up"></i></button><button id="agentStop" type="button" hidden disabled><span>停止任务</span><i data-lucide="square"></i></button></span></form>
+              </section>
             </section>
             </body></html>
         """)

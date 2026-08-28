@@ -3,6 +3,7 @@
     const page = document.querySelector('.agent-page');
     if (!page) return;
 
+    const consoleNode = page.querySelector('.agent-console');
     const transcript = document.getElementById('agentTranscript');
     const composer = document.getElementById('agentComposer');
     const promptInput = document.getElementById('agentPrompt');
@@ -21,7 +22,6 @@
     const AGENT_CANCEL_TIMEOUT_MS = 1500;
     const MAX_RENDERED_ITEMS = 8;
     const MAX_GENERIC_SECTIONS = 4;
-    const welcomeSnapshot = transcript.querySelector('[data-agent-welcome]')?.cloneNode(true);
     const confirmationTimers = new Map();
     let conversationGeneration = 0;
     let activeController = null;
@@ -182,6 +182,14 @@
         requestAnimationFrame(() => {
             transcript.scrollTop = transcript.scrollHeight;
         });
+    }
+
+    function syncConversationLayout() {
+        const isEmpty = !transcript.querySelector('.agent-message');
+        consoleNode?.classList.toggle('is-empty', isEmpty);
+        promptInput.placeholder = isEmpty
+            ? (promptInput.dataset.emptyPlaceholder || '询问 MediaFlux')
+            : (promptInput.dataset.activePlaceholder || '继续描述或调整任务');
     }
 
     function focusResult(element) {
@@ -1752,6 +1760,7 @@
         const view = createMessage('user', 'YOU', 'user-round');
         view.body.append(node('p', '', message));
         transcript.append(view.article);
+        syncConversationLayout();
         refreshIcons(view.article);
         if (window.MFAnim && typeof window.MFAnim.popIn === 'function') {
             window.MFAnim.popIn(view.article, { duration: 0.2, y: 8 });
@@ -1766,6 +1775,7 @@
         card.append(node('strong', '', '正在选择工具并核对数据…'), node('div', 'agent-pending-line'));
         view.body.append(card);
         transcript.append(view.article);
+        syncConversationLayout();
         refreshIcons(view.article);
         if (window.MFAnim && typeof window.MFAnim.popIn === 'function') {
             window.MFAnim.popIn(view.article, { duration: 0.2, y: 8 });
@@ -1855,6 +1865,7 @@
         if (!pendingNode?.isConnected) {
             const view = createMessage('assistant', label, iconName);
             transcript.append(view.article);
+            syncConversationLayout();
             return view;
         }
         const article = pendingNode;
@@ -2215,7 +2226,7 @@
         requestInFlight = busy;
         const showStop = Boolean(busy && stoppable && stopButton);
         sendButton.hidden = showStop;
-        sendButton.disabled = busy || confirmationInFlight || sessionResetInFlight;
+        syncSendAvailability();
         promptInput.disabled = busy || confirmationInFlight || sessionResetInFlight;
         sendButton.classList.toggle('is-busy', Boolean(busy && !showStop));
         sendButton.setAttribute('aria-busy', String(busy));
@@ -2226,7 +2237,7 @@
         }
         const iconNode = sendButton.querySelector('svg, i[data-lucide]');
         if (iconNode) {
-            const replacement = icon(busy && !showStop ? 'loader-circle' : 'send-horizontal');
+            const replacement = icon(busy && !showStop ? 'loader-circle' : 'arrow-up');
             iconNode.replaceWith(replacement);
             refreshIcons(sendButton);
         }
@@ -2268,7 +2279,7 @@
     function setConfirmationBusy(busy) {
         confirmationInFlight = busy;
         syncSessionLifecycleControls();
-        sendButton.disabled = busy || requestInFlight || sessionResetInFlight;
+        syncSendAvailability();
         promptInput.disabled = busy || requestInFlight || sessionResetInFlight;
         page.querySelectorAll('.agent-confirmation-card:not(.is-cancelled):not(.is-expired) .agent-confirmation-actions button')
             .forEach((button) => { button.disabled = busy || sessionResetInFlight; });
@@ -2277,7 +2288,7 @@
     function setSessionTransitionBusy(busy) {
         sessionResetInFlight = busy;
         syncSessionLifecycleControls();
-        sendButton.disabled = busy || requestInFlight || confirmationInFlight;
+        syncSendAvailability();
         promptInput.disabled = busy || requestInFlight || confirmationInFlight;
         page.querySelectorAll('.agent-confirmation-card:not(.is-cancelled):not(.is-expired) .agent-confirmation-actions button')
             .forEach((button) => { button.disabled = busy || confirmationInFlight; });
@@ -2294,9 +2305,22 @@
         });
     }
 
+    function syncSendAvailability() {
+        const hasPrompt = Boolean(promptInput.value.trim());
+        composer.classList.toggle('has-prompt', hasPrompt);
+        sendButton.disabled = requestInFlight || confirmationInFlight || sessionResetInFlight || !hasPrompt;
+        sendButton.title = hasPrompt ? '发送 (Enter)' : '输入内容后发送';
+    }
+
     function resizePrompt() {
         promptInput.style.height = 'auto';
+        if (!promptInput.value.trim()) {
+            promptInput.style.height = '';
+            syncSendAvailability();
+            return;
+        }
         promptInput.style.height = `${Math.min(promptInput.scrollHeight, 140)}px`;
+        syncSendAvailability();
     }
 
     async function stopActiveQuery({announceFailure = true} = {}) {
@@ -2859,8 +2883,8 @@
         clearAllConfirmationTimers();
         promptInput.value = '';
         resizePrompt();
-        transcript.replaceChildren(welcomeSnapshot ? welcomeSnapshot.cloneNode(true) : node('div'));
-        refreshIcons(transcript);
+        transcript.replaceChildren();
+        syncConversationLayout();
         transcript.scrollTop = 0;
     }
 
@@ -2947,6 +2971,7 @@
         } finally {
             restoringHistory = false;
         }
+        syncConversationLayout();
         refreshIcons(transcript);
         transcript.scrollTop = transcript.scrollHeight;
         window.queueMicrotask(() => {
@@ -3224,7 +3249,6 @@
             ? event.target.closest('[data-agent-prompt], [data-agent-draft]')
             : null;
         if (!trigger || requestInFlight || confirmationInFlight || sessionResetInFlight) return;
-        toggleShortcutsTimeline(false);
         const draft = trigger.dataset.agentDraft;
         if (draft) {
             promptInput.value = draft;
@@ -3237,46 +3261,6 @@
         promptInput.value = trigger.dataset.agentPrompt || '';
         resizePrompt();
         composer.requestSubmit();
-    });
-
-    const shortcutsTrigger = document.getElementById('toggleAgentShortcuts');
-    const shortcutsTimeline = document.getElementById('agentShortcutsTimeline');
-    const shortcutsClose = document.getElementById('closeAgentShortcuts');
-
-    function toggleShortcutsTimeline(open, {restoreFocus = false} = {}) {
-        if (!shortcutsTimeline) return;
-        const shouldOpen = open !== undefined ? open : shortcutsTimeline.hidden;
-        shortcutsTimeline.hidden = !shouldOpen;
-        shortcutsTrigger?.setAttribute('aria-expanded', String(shouldOpen));
-        if (shouldOpen) {
-            window.renderLucideIcons?.(shortcutsTimeline);
-            window.requestAnimationFrame(() => shortcutsClose?.focus({preventScroll: true}));
-        } else if (restoreFocus) {
-            shortcutsTrigger?.focus({preventScroll: true});
-        }
-    }
-
-    shortcutsTrigger?.addEventListener('click', (e) => {
-        e.stopPropagation();
-        toggleShortcutsTimeline();
-    });
-
-    shortcutsClose?.addEventListener('click', (e) => {
-        e.stopPropagation();
-        toggleShortcutsTimeline(false, {restoreFocus: true});
-    });
-
-    document.addEventListener('click', (e) => {
-        if (!shortcutsTimeline || shortcutsTimeline.hidden) return;
-        if (!shortcutsTimeline.contains(e.target) && !shortcutsTrigger?.contains(e.target)) {
-            toggleShortcutsTimeline(false);
-        }
-    });
-
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && shortcutsTimeline && !shortcutsTimeline.hidden) {
-            toggleShortcutsTimeline(false, {restoreFocus: true});
-        }
     });
 
     function syncVisualViewport() {
@@ -3303,6 +3287,7 @@
         syncVisualViewport();
     }
 
+    syncConversationLayout();
     resizePrompt();
     Promise.allSettled([loadCapabilities(), loadSessions()]);
 })();

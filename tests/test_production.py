@@ -4268,12 +4268,17 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn("max-width: 100%; animation: none;", css)
         self.assertIn(".agent-history-drawer::backdrop", css)
         self.assertIn(".agent-history-drawer[open] { display: flex;", css)
-        self.assertIn("flex-wrap: nowrap", css)
+        self.assertIn(".agent-console.is-empty", css)
+        self.assertIn(".agent-console.is-empty .agent-composer", css)
         self.assertIn(
-            ".agent-submit-slot { width: 44px; height: 44px; min-width: 44px; flex: 0 0 44px",
+            ".agent-submit-slot { width: 38px; height: 38px; min-width: 38px; flex: 0 0 38px",
             css,
         )
-        self.assertIn("max-width: 44px; display: inline-flex", css)
+        self.assertRegex(
+            css,
+            re.compile(r"max-width:\s*38px;[\s\S]*?display:\s*inline-flex", re.S),
+        )
+        self.assertIn(".agent-submit-slot { width: 44px; height: 44px; min-width: 44px; flex-basis: 44px; }", css)
         self.assertNotIn("show-rail", css)
         self.assertIn("historyRail.showModal()", script)
         self.assertIn("historyRail.close()", script)
