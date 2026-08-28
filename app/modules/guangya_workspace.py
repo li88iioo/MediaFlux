@@ -261,6 +261,12 @@ def _resolve_path(client: GuangYaClient, path: str) -> tuple[GuangYaFile, str]:
     return current, parent_path
 
 
+def resolve_workspace_path(client: GuangYaClient, path: object) -> GuangYaFile:
+    """只在服务端解析精确光鸭绝对路径；调用方不得向外返回对象 ID。"""
+    target, _parent_path = _resolve_path(client, _normalize_path(path))
+    return target
+
+
 def _extension(item: GuangYaFile) -> str:
     declared = str(item.extension or "").strip().lower().lstrip(".")
     if declared:

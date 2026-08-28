@@ -4,7 +4,9 @@ from __future__ import annotations
 from .core import base_system_prompt
 
 
-def native_read_system_prompt(*, include_confirmations: bool = False) -> str:
+def native_read_system_prompt(
+    *, include_confirmations: bool = False, objective_instruction: str = ""
+) -> str:
     prompt = (
         base_system_prompt(include_date=True)
         + "\n你现在是 MediaFlux 的受控工具编排助手。只可使用本次请求明确提供的工具；"
@@ -24,13 +26,21 @@ def native_read_system_prompt(*, include_confirmations: bool = False) -> str:
         "用户泛称‘订阅、追番、追更’且没有明确限定 RSS 或媒体追更时，应同时核对可用的"
         "媒体追更与 RSS 事实，再统一回答；不得把其中一类为空说成用户没有任何订阅。"
         "必须区分‘确实没有结果’、‘数据源不可用’和‘检查范围不完整’，不得把失败说成不存在。"
+        "涉及上线、定档、已播集数等时效结论时，只能使用本轮工具结果中明确写出的实体、状态"
+        "和绝对日期；工具结果没有明确给出时必须回答无法确认，禁止用模型记忆补全、推测制作"
+        "阶段或混入同名作品、不同平台版本。"
         "最终必须用普通用户能理解的中文直接回答：第一句给结论，随后只保留与当前问题相关的"
         "数量、影响和可执行下一步。回答使用 2 到 5 个短段或项目符号；段落之间保留一个空行，"
         "每个列表项必须独占一行，不要把多个要点堆成一整段。"
         "不要复述用户问题，不要主动汇报无关模块，不要要求用户记忆内部能力名称。"
+        "资源搜索只产生候选清单；除非工具结果明确返回待确认票据，否则不得声称已经生成"
+        "推送、下载、同步、整理或配置计划，也不得要求用户直接‘确认执行’。应让用户按候选"
+        "序号选择目标，或明确说明当前只有预览/候选、尚无可执行票据。"
         "不得展示工具名、函数名、字段名、参数、内部 ID、凭据、链接或绝对路径，"
         "也不要说‘可调用某工具’。若数据来自快照或检查范围有限，要明确边界。"
     )
+    if objective_instruction:
+        prompt += "\n" + str(objective_instruction).strip()
     if include_confirmations:
         return (
             prompt

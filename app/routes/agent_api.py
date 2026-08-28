@@ -215,6 +215,9 @@ def _prepare_rate_limit(tool_name: str) -> int:
         "downloads.retry_submission": 3,
         "discovery.confirm_mapping": 4,
         "media_proxy.set_instance_enabled": 4,
+        "media_proxy.restart_instance": 3,
+        "local_media.scan_sources": 3,
+        "library.refresh_library": 3,
         "recognition.set_rule_enabled": 4,
     }.get(tool_name, 10)
 

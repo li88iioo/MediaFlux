@@ -5940,6 +5940,56 @@ class MediaProxyManager:
         future.add_done_callback(self._report_reconcile_failure)
         return True
 
+    def request_restart(self, instance_id: int) -> bool:
+        """线程安全地请求重启一个已启用实例；仅表示是否成功排队。"""
+        loop = self._loop
+        if self._stopping or loop is None or loop.is_closed() or not loop.is_running():
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            self.restart_instance(int(instance_id)), loop
+        )
+        future.add_done_callback(self._report_reconcile_failure)
+        return True
+
+    async def restart_instance(self, instance_id: int) -> dict[str, Any]:
+        """强制重建一个实例运行时，不改动实例配置。"""
+        async with self._lock:
+            if self._stopping:
+                return {"restarted": False, "reason": "stopping"}
+            row = await asyncio.to_thread(
+                database.get_media_proxy_instance, int(instance_id)
+            )
+            if row is None or not int(row["enabled"] or 0):
+                return {"restarted": False, "reason": "not_enabled"}
+            try:
+                resolved = resolve_proxy_instance(row)
+            except ValueError as exc:
+                await asyncio.to_thread(
+                    database.update_media_proxy_instance,
+                    int(instance_id),
+                    {"status": "error", "last_error": str(exc)},
+                )
+                return {"restarted": False, "reason": "invalid_config"}
+            runtime = self._runtimes.pop(int(instance_id), None)
+            if runtime is not None:
+                await self._stop_runtime(runtime)
+            try:
+                replacement = await self._start_runtime(resolved)
+            except Exception as exc:
+                await asyncio.to_thread(
+                    database.update_media_proxy_instance,
+                    int(instance_id),
+                    {"status": "error", "last_error": str(exc)},
+                )
+                logger.warning(
+                    "媒体反代实例重启失败 id=%s type=%s",
+                    instance_id,
+                    type(exc).__name__,
+                )
+                return {"restarted": False, "reason": "start_failed"}
+            self._runtimes[int(instance_id)] = replacement
+            return {"restarted": True, "reason": ""}
+
     @staticmethod
     def _report_reconcile_failure(future) -> None:
         if future.cancelled():

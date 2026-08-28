@@ -12,6 +12,8 @@ from typing import Any, Callable
 from app.agent.confirmation import confirmation_context_fingerprint
 from app.agent.models import Evidence, ToolContext, ToolResult
 from app.agent.registry import AgentToolError
+from app.clients.guangya import GuangYaClient
+from app.modules.guangya_workspace import resolve_workspace_path
 from app.agent.result_projection import sanitize_public_text
 from app.agent.session_context import (
     AgentContextWriteGuard,
@@ -542,8 +544,16 @@ def directory_scrape_inspect_arguments(arguments: dict[str, Any]) -> dict[str, A
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
     keys = set(arguments)
-    if keys not in ({"directory_id"}, {"file_id"}):
-        raise AgentToolError("必须且只能提供 directory_id 或 file_id 其中一个")
+    if keys not in ({"directory_id"}, {"file_id"}, {"path"}):
+        raise AgentToolError("必须且只能提供 path、directory_id 或 file_id 其中一个")
+    if "path" in arguments:
+        path = str(arguments.get("path") or "").strip().replace("\\", "/")
+        if not path.startswith("/") or len(path) > 2048:
+            raise AgentToolError("path 必须是光鸭绝对路径")
+        parts = [part for part in path.split("/") if part]
+        if not parts or any(part in {".", ".."} for part in parts):
+            raise AgentToolError("path 不能是根目录或相对路径")
+        return {"path": "/" + "/".join(parts)}
     key = "directory_id" if "directory_id" in arguments else "file_id"
     value = str(arguments[key] or "").strip()
     if not _ID_RE.fullmatch(value) or (key == "directory_id" and value == "0"):
@@ -605,18 +615,34 @@ def inspect_directory_scrape(arguments: dict[str, Any], context: ToolContext) ->
     try:
         guard = _begin_flow(context.owner)
         service = get_directory_scrape_service()
+        resolved_arguments = dict(arguments)
+        if "path" in resolved_arguments:
+            client = GuangYaClient()
+            try:
+                target = resolve_workspace_path(
+                    client, resolved_arguments.pop("path")
+                )
+            finally:
+                client.close()
+            resolved_arguments = {
+                "directory_id" if target.is_dir else "file_id": str(target.file_id)
+            }
         payload = (
-            service.inspect(context.owner, arguments["directory_id"])
-            if "directory_id" in arguments
-            else service.inspect_file(context.owner, arguments["file_id"])
+            service.inspect(context.owner, resolved_arguments["directory_id"])
+            if "directory_id" in resolved_arguments
+            else service.inspect_file(context.owner, resolved_arguments["file_id"])
         )
     except Exception as exc:
         raise _public_error(exc) from exc
     counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
     flow = _Flow(
         owner=context.owner,
-        scope_type="directory" if "directory_id" in arguments else "file",
-        scope_id=str(arguments.get("directory_id") or arguments.get("file_id") or ""),
+        scope_type="directory" if "directory_id" in resolved_arguments else "file",
+        scope_id=str(
+            resolved_arguments.get("directory_id")
+            or resolved_arguments.get("file_id")
+            or ""
+        ),
         inspection_id=str(payload.get("inspection_id") or ""),
         candidates=[],
         updated_at=time.monotonic(),
@@ -631,7 +657,7 @@ def inspect_directory_scrape(arguments: dict[str, Any], context: ToolContext) ->
         "attention" if payload.get("requires_manual_match") else "completed",
         "光鸭刮削检查完成，可继续搜索匹配" if query else "光鸭刮削检查完成，需要手动提供搜索词",
         data={
-            "scope_type": "directory" if "directory_id" in arguments else "file",
+            "scope_type": "directory" if "directory_id" in resolved_arguments else "file",
             "media_type": str(payload.get("media_type") or "unknown"),
             "suggested_query": query,
             "season": payload.get("season"),

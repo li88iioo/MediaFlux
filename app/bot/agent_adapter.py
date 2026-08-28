@@ -1381,7 +1381,7 @@ def _render_agent_progress_card(
         if completed:
             blocks.append(f"<p>{'<br>'.join(completed)}</p>")
         blocks.append(f"<tg-thinking>{active}</tg-thinking>")
-        blocks.append(f"<p><i>⏱ {elapsed_text}</i></p>")
+        blocks.append(f"<p><i>· {elapsed_text}</i></p>")
         return "".join(blocks)
 
     lines: list[str] = []
@@ -1395,7 +1395,7 @@ def _render_agent_progress_card(
     if completed:
         lines.append("")
     lines.append(f"<i>{active}</i>")
-    lines.append(f"<i>⏱ {elapsed_text}</i>")
+    lines.append(f"<i>· {elapsed_text}</i>")
     return "\n".join(lines)
 
 
@@ -1421,7 +1421,7 @@ class _TelegramAgentProgress:
         self.clock = clock
         self.update_interval_seconds = max(0.0, float(update_interval_seconds))
         self._active = self.target is not None
-        self._active_label = "🧭 正在识别请求范围…"
+        self._active_label = "◌ 正在识别请求范围…"
         self._completed_steps: list[str] = []
         self._active_tools: dict[str, dict[str, Any]] = {}
         self._started_at = self.clock()
@@ -1448,18 +1448,18 @@ class _TelegramAgentProgress:
             if not self._active or self.target is None:
                 return
             if phase == "routing":
-                self._active_label = "🧭 正在识别请求范围…"
+                self._active_label = "◌ 正在识别请求范围…"
             elif phase == "planning":
-                self._remember_completed("✅ 已识别请求范围")
-                self._active_label = "🧭 正在选择需要核对的数据源…"
+                self._remember_completed("✓ 已识别请求范围")
+                self._active_label = "◌ 正在选择需要核对的数据源…"
                 force = True
             elif phase == "model_wait":
-                self._remember_completed("✅ 已识别请求范围")
-                self._active_label = "🧭 正在规划检查步骤…"
+                self._remember_completed("✓ 已识别请求范围")
+                self._active_label = "◌ 正在规划检查步骤…"
                 force = True
             elif phase == "synthesizing":
                 self._active_tools.clear()
-                self._active_label = "✍️ 正在整理检查结论…"
+                self._active_label = "◌ 正在整理检查结论…"
                 force = True
             elif phase in {"tool_start", "preview_start"} and tool_name:
                 label = public_tool_label(tool_name)
@@ -1468,7 +1468,7 @@ class _TelegramAgentProgress:
                 )
                 active["count"] = int(active.get("count") or 0) + 1
                 if phase == "preview_start":
-                    self._active_label = f"🛡️ 正在生成安全预检：{label}…"
+                    self._active_label = f"◌ 正在生成安全预检：{label}…"
                 else:
                     self._set_active_tool_label()
                 force = True
@@ -1490,15 +1490,15 @@ class _TelegramAgentProgress:
                         self._active_tools.pop(tool_name, None)
                 if finished:
                     self._remember_completed(
-                        f"⚠️ {label}未正常返回" if failed else f"✅ {label}"
+                        f"! {label}未正常返回" if failed else f"✓ {label}"
                     )
                 if self._active_tools:
                     self._set_active_tool_label()
                 else:
                     self._active_label = (
-                        "🛡️ 正在核对预检结果…"
+                        "◌ 正在核对预检结果…"
                         if phase == "preview_finish"
-                        else "🧭 正在分析检查结果…"
+                        else "◌ 正在分析检查结果…"
                     )
             else:
                 return
@@ -1510,7 +1510,7 @@ class _TelegramAgentProgress:
             for item in self._active_tools.values()
         )
         if active_count <= 0:
-            self._active_label = "🧭 正在分析检查结果…"
+            self._active_label = "◌ 正在分析检查结果…"
             return
         if active_count == 1:
             remaining = next(
@@ -1518,16 +1518,16 @@ class _TelegramAgentProgress:
                 for item in self._active_tools.values()
                 if int(item.get("count") or 0) > 0
             )
-            self._active_label = f"🔎 正在检查：{remaining}…"
+            self._active_label = f"◌ 正在检查：{remaining}…"
             return
-        self._active_label = f"🔎 正在并行核对 {active_count} 项信息…"
+        self._active_label = f"◌ 正在并行核对 {active_count} 项信息…"
 
     def mark_answering(self) -> None:
         with self._lock:
             if not self._active:
                 return
             self._active_tools.clear()
-            self._active_label = "✍️ 正在整理回答…"
+            self._active_label = "◌ 正在整理回答…"
         self._publish(force=True)
 
     def stop(self) -> None:
@@ -1538,11 +1538,11 @@ class _TelegramAgentProgress:
         label = str(value or "").strip()
         if not label:
             return
-        normalized = label.removeprefix("✅ ").removeprefix("⚠️ ")
+        normalized = label.removeprefix("✓ ").removeprefix("! ")
         self._completed_steps = [
             item
             for item in self._completed_steps
-            if item.removeprefix("✅ ").removeprefix("⚠️ ") != normalized
+            if item.removeprefix("✓ ").removeprefix("! ") != normalized
         ]
         self._completed_steps.append(label)
         if len(self._completed_steps) > _TELEGRAM_PROGRESS_MAX_COMPLETED_STEPS:
@@ -1607,7 +1607,7 @@ def _begin_agent_stream(
         _render_agent_progress_card(
             message,
             target_mode="rich_draft",
-            active_label="🧭 正在理解请求…",
+            active_label="◌ 正在理解请求…",
         ),
     )
     if callable(send_rich_draft) and callable(send_rich) and thinking is not None:
@@ -1640,7 +1640,7 @@ def _begin_agent_stream(
                 _render_agent_progress_card(
                     message,
                     target_mode="draft",
-                    active_label="🧭 正在理解请求…",
+                    active_label="◌ 正在理解请求…",
                 ),
                 parse_mode="HTML",
                 **draft_kwargs,
@@ -1675,7 +1675,7 @@ def _begin_agent_stream(
             _render_agent_progress_card(
                 message,
                 target_mode="edit",
-                active_label="🧭 正在理解请求…",
+                active_label="◌ 正在理解请求…",
             ),
             **kwargs,
         )

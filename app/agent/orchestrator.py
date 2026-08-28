@@ -25,7 +25,8 @@ from app.agent.action_history import (
     record_confirmation_interrupted,
     record_confirmed_result,
 )
-from app.agent.capability_retrieval import infer_media_intent
+from app.agent.capability_retrieval import capability_semantics, infer_media_intent
+from app.agent.objective_contract import infer_agent_objective
 from app.agent.confirmation import (
     ConfirmationStore,
     SQLiteConfirmationStore,
@@ -278,6 +279,19 @@ def _is_identity_question(message: str) -> bool:
     return _normalize_short_conversation_phrase(message) in _IDENTITY_QUESTION_PHRASES
 
 
+_ENGINEERING_GUIDANCE_RE = re.compile(
+    r"(?:怎么|怎样|如何|推荐|建议|教程|指南|方案|方式|说明).{0,24}"
+    r"(?:docker|compose|systemctl|部署|重启|回滚)|"
+    r"(?:docker|compose|systemctl|部署|重启|回滚).{0,24}"
+    r"(?:怎么|怎样|如何|推荐|建议|教程|指南|方案|方式|说明)",
+    re.IGNORECASE,
+)
+_ENGINEERING_EXECUTION_RE = re.compile(
+    r"(?:帮我|替我|给我|立即|现在就|直接|马上).{0,16}"
+    r"(?:重启|部署|回滚|执行|运行)|"
+    r"(?:重启|部署|回滚|执行|运行).{0,16}(?:一下|一次|吧)$",
+    re.IGNORECASE,
+)
 _UNSUPPORTED_ENGINEERING_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
     r"(?:修改|改写|修复|热修复|打补丁).{0,10}(?:代码|源码|程序)",
     r"(?:代码|源码|程序).{0,10}(?:修改|改写|热修复|打补丁)",
@@ -296,6 +310,11 @@ def _is_unsupported_engineering_request(message: str) -> bool:
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
     normalized = re.sub(r"《[^》]{1,160}》", "《媒体标题》", normalized)
     compact = re.sub(r"[\s，。！？!?、；;：:]+", "", normalized)
+    if (
+        _ENGINEERING_GUIDANCE_RE.search(compact)
+        and _ENGINEERING_EXECUTION_RE.search(compact) is None
+    ):
+        return False
     return bool(compact) and any(
         pattern.search(compact) for pattern in _UNSUPPORTED_ENGINEERING_PATTERNS
     )
@@ -824,6 +843,7 @@ _RECENT_DOWNLOAD_SCOPES = ("下载", "推送", "提交", "资源", "任务")
 _RECENT_DOWNLOAD_DOMAIN_REJECT_TOKENS = (
     "下载队列", "任务队列", "下载器", "qb 下载", "qb下载",
     "rss", "订阅", "strm",
+    "系统", "项目", "mediaflux", "运行任务", "失败任务", "后台任务",
     "光鸭整理", "云盘整理", "本地媒体", "qb 下载任务", "qb下载任务",
     "qbittorrent 下载任务", "怎么配置", "如何配置", "配置", "设置",
 )
@@ -3252,12 +3272,16 @@ def is_recognition_rule_control_message(message: str) -> bool:
     return wants_enable != wants_disable
 
 
-_MEDIA_PROXY_SCOPES = ("媒体反代", "媒体代理", "media proxy")
+_MEDIA_PROXY_SCOPES = (
+    "媒体反代", "媒体代理", "jellyfin反代", "jellyfin 反代",
+    "emby反代", "emby 反代", "media proxy",
+)
 _MEDIA_PROXY_ENABLE_INTENTS = ("启用", "开启", "打开")
 _MEDIA_PROXY_DISABLE_INTENTS = ("停用", "禁用", "关闭", "关掉")
 _MEDIA_PROXY_TEST_INTENTS = ("测试", "探测", "连通", "连接", "能用吗")
 _MEDIA_PROXY_STATUS_INTENTS = (
     "状态", "概览", "汇总", "摘要", "列表", "运行情况", "有几个", "多少个",
+    "正常吗", "是否正常", "是不是正常", "有问题吗", "失败", "异常", "诊断",
 )
 _MEDIA_PROXY_EDIT_REJECT_TOKENS = (
     "创建", "新增", "删除", "移除", "修改", "编辑", "地址", "端口", "路径", "密钥",
@@ -3273,7 +3297,7 @@ def _has_media_proxy_scope(message: str) -> bool:
 def _media_proxy_instance_numbers(message: str) -> list[int]:
     """仅提取紧邻“媒体反代/媒体代理”的公开实例序号。"""
     normalized = _normalize_intent_message(message)
-    scope_pattern = r"(?:媒体反代|媒体代理|media\s+proxy)"
+    scope_pattern = r"(?:媒体反代|媒体代理|jellyfin\s*反代|emby\s*反代|media\s+proxy)"
     patterns = (
         rf"{scope_pattern}\s*(?:实例)?\s*(?:第\s*)?(\d{{1,4}})\s*(?:号|个)?",
         rf"第\s*(\d{{1,4}})\s*(?:个|号)?\s*{scope_pattern}\s*(?:实例)?",
@@ -7551,6 +7575,7 @@ class AgentOrchestrator:
         owner: str,
         completed: bool,
         narrative_suggestions: tuple[str, ...],
+        message: str = "",
     ) -> dict[str, Any] | None:
         """把 Native 多工具执行投影为既有 read_plan 契约。"""
         if len(executions) < 2:
@@ -7560,7 +7585,12 @@ class AgentOrchestrator:
         replay_steps: list[tuple[str, dict[str, Any]]] = []
         suggestions: list[str] = []
         total_elapsed_ms = 0
+        objective = infer_agent_objective(message)
+        required_sources = set(objective.required_sources)
         succeeded = 0
+        required_source_successes: set[str] = set()
+        required_step_failures = 0
+        supporting_failed = 0
         for position, execution in enumerate(executions, start=1):
             tool_name = str(execution.get("tool_name") or "").strip()
             arguments = execution.get("arguments")
@@ -7596,8 +7626,26 @@ class AgentOrchestrator:
                 ).to_dict()
             else:
                 result = deepcopy(result)
+            semantics = capability_semantics(
+                self.registry.llm_capability_for(tool_name)
+                if self.registry.has(tool_name)
+                else {"name": tool_name}
+            )
+            source_kind = str(semantics.get("source_kind") or "")
+            objective_tools = frozenset(objective.allowed_tools)
+            is_required = (
+                not required_sources
+                or tool_name in objective_tools
+                or source_kind in required_sources
+            )
             if result.get("ok") is True:
                 succeeded += 1
+                if required_sources and source_kind in required_sources:
+                    required_source_successes.add(source_kind)
+            elif is_required:
+                required_step_failures += 1
+            else:
+                supporting_failed += 1
             for item in result.get("suggestions", []):
                 text = result_projection.sanitize_public_text(item, limit=240)
                 if text and text not in suggestions:
@@ -7615,12 +7663,29 @@ class AgentOrchestrator:
                 suggestions.append(text)
 
         failed = len(public_steps) - succeeded
-        fully_completed = completed and failed == 0
+        missing_required_sources = required_sources - required_source_successes
+        required_failed = (
+            len(missing_required_sources) + required_step_failures
+            if required_sources else failed
+        )
+        required_evidence_complete = (
+            not missing_required_sources and required_step_failures == 0
+            if required_sources else failed == 0
+        )
+        fully_completed = bool(completed and required_evidence_complete)
         if fully_completed:
-            summary = f"综合检查完成：{succeeded} 项正常"
+            summary = f"综合检查完成：{succeeded} 项已获得结果"
+            if supporting_failed:
+                summary += f"，{supporting_failed} 项辅助检查未返回"
             error = ""
+        elif required_failed:
+            summary = (
+                f"综合检查完成：{succeeded} 项已获得结果，"
+                f"{required_failed} 项关键检查需要关注"
+            )
+            error = "关键检查未能完整返回。"
         elif failed:
-            summary = f"综合检查完成：{succeeded} 项正常，{failed} 项需要关注"
+            summary = f"综合检查完成：{succeeded} 项已获得结果，{failed} 项需要关注"
             error = "部分检查未能正常完成。"
         else:
             summary = f"已保留 {succeeded} 项检查结果，但后续归纳未完整结束"
@@ -7634,6 +7699,8 @@ class AgentOrchestrator:
                 "step_count": len(public_steps),
                 "completed": succeeded,
                 "failed": failed,
+                "required_failed": required_failed,
+                "supporting_failed": supporting_failed,
                 "steps": public_steps,
             },
             suggestions=suggestions[:8],
@@ -7684,6 +7751,15 @@ class AgentOrchestrator:
         emit_agent_progress("model_wait")
         rate_identity = llm_tool_rate_identity or llm_rate_owner or owner
         action_request = is_agent_action_request(message)
+        objective = infer_agent_objective(message)
+        allow_confirmation_plans = bool(
+            owner
+            and not read_only
+            and (
+                action_request
+                or objective.task_kind in {"strm_source_sync", "organize_object"}
+            )
+        )
         model_conversation_context = self._append_action_plan_context(
             conversation_context,
             self._active_action_plan_context(owner=owner),
@@ -7772,7 +7848,7 @@ class AgentOrchestrator:
                     _execute_native_tool,
                     owner=llm_rate_owner or owner,
                     reply_context=reply_context,
-                    include_confirmations=bool(owner and not read_only),
+                    include_confirmations=allow_confirmation_plans,
                     **(
                         {"conversation_context": model_conversation_context}
                         if model_conversation_context else {}
@@ -7782,6 +7858,10 @@ class AgentOrchestrator:
             _NATIVE_RESOURCE_CAPTURE.reset(native_capture_token)
 
         if native_reply is None:
+            if objective.max_capabilities <= 0:
+                # 明确的说明/方案咨询应交给无工具对话回答，不能再回退到
+                # 旧单工具选择器并被“推荐”等词误路由到媒体发现能力。
+                return None
             # 原生认知循环已经优先尝试。对“怎么回事/关注一下”这类依赖
             # 上下文的开放追问，不再交给旧单工具选择器猜测；由后置窄续句
             # 解释或澄清，避免 broad briefing 被误路由成任意单工具。
@@ -7799,7 +7879,7 @@ class AgentOrchestrator:
                 selection = select_orchestration_tool(
                     message,
                     self.registry,
-                    owner=owner,
+                    owner=owner if allow_confirmation_plans else "",
                     rate_owner=llm_rate_owner or owner,
                     **(
                         {"conversation_context": model_conversation_context}
@@ -7894,6 +7974,7 @@ class AgentOrchestrator:
                 owner=owner,
                 completed=native_reply.completed,
                 narrative_suggestions=native_reply.suggestions,
+                message=message,
             )
         elif executions:
             raw_response = executions[0].get("response")
@@ -8839,6 +8920,11 @@ class AgentOrchestrator:
             )
         if is_strm_failure_triage_message(lower):
             return self._invoke_query_read("strm.triage_failures", {})
+        if infer_agent_objective(message).task_kind == "strm_source_catalog":
+            return self._invoke_query_read(
+                "strm.status", {}, owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
         if _is_strm_run_action(lower):
             if not owner:
                 return self._unsupported(
@@ -9004,6 +9090,31 @@ class AgentOrchestrator:
                 [
                     "如果是媒体流程异常，可以直接描述哪部媒体或哪个环节出了问题",
                     "例如：检查最近下载为什么还没有入库",
+                ],
+            )
+
+        initial_objective = infer_agent_objective(message)
+        if initial_objective.task_kind == "agent_control_guidance":
+            return self._conversation_response(
+                "Agent 开关由独立控制面管理。请发送 /agent 查看当前状态，再选择开启或关闭。",
+                ["传统整理、STRM、RSS、搜索与状态命令不受 Agent 开关影响。"],
+            )
+        if initial_objective.task_kind == "host_drive_guidance":
+            return self._conversation_response(
+                "我不能直接扫描宿主机的 C 盘或系统盘。MediaFlux 只能检查已经挂载到容器、"
+                "并配置为本地媒体来源的目录。",
+                [
+                    "提供已挂载目录的容器内路径",
+                    "先在 Docker volumes 中挂载目标目录，再添加为本地媒体来源",
+                ],
+            )
+        if initial_objective.task_kind == "library_sync_clarification":
+            return self._clarification_response(
+                "“同步媒体库”可能指不同动作，请先选一个范围，我不会替你猜测并执行。",
+                [
+                    "通知 Jellyfin / Emby 扫描媒体库",
+                    "同步 STRM 来源到本地",
+                    "刷新 RSS 或媒体追更",
                 ],
             )
 

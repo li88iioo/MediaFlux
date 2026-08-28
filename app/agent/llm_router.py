@@ -9,7 +9,7 @@ import secrets
 import unicodedata
 from collections.abc import Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from time import monotonic
 from typing import Any, AsyncIterator, Callable
 
@@ -20,6 +20,7 @@ from app.agent.metrics import agent_metrics
 from app.agent.capability_retrieval import (
     capability_intent_boost,
     capability_prompt_hint,
+    capability_semantics,
     ensure_source_coverage,
     infer_media_intent,
 )
@@ -51,6 +52,10 @@ from app.agent.token_budget import (
     resolve_context_window,
 )
 from app.agent.media_case import normalize_media_case_stage
+from app.agent.objective_contract import (
+    AgentObjectiveContract,
+    infer_agent_objective,
+)
 from app.agent.media_facts import media_facts_for_llm
 from app.agent.models import LLMToolDisposition, ToolResult
 from app.agent.registry import AgentToolError, ToolRegistry
@@ -113,6 +118,11 @@ _ACTION_STATUS_QUERY_PATTERNS = (
     re.compile(r"(?:当前|现在).{0,12}(?:状态|情况|是否|有没有|有无)"),
     re.compile(r"(?:查看|检查|查询).{0,24}(?:状态|进度|日志|记录|历史|结果)"),
     re.compile(
+        r"(?:有哪些|哪些|列出|查看|看看|显示).{0,20}"
+        r"(?:strm|同步).{0,16}(?:来源|目录)|"
+        r"(?:strm|同步).{0,16}(?:有哪些|哪些|来源列表|目录列表|可同步)"
+    ),
+    re.compile(
         r"(?:删除|移除|清理|刷新|同步|重试|提交|执行|整理).{0,24}"
         r"(?:了吗|了没|没有|状态|情况|进度)$"
     ),
@@ -167,8 +177,9 @@ def _looks_like_action_capability_query(value: str) -> bool:
 
 
 _ACTION_INTENT_RE = re.compile(
-    r"(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复|调整|修改|设置|改成|保存|取消|"
-    r"删除|移除|清理|刷新|同步|重试|推送|提交|立即执行|开始执行|运行一次|发送测试|测试通知)"
+    r"(?:开启|打开|启用|关闭|停用|禁用|暂停|恢复|调整|修改|设置|改成|改为|保存|取消|"
+    r"删除|移除|清理|刷新|同步|重试|推送|提交|重命名|改名|去掉|替换|"
+    r"立即执行|开始执行|运行一次|发送测试|测试通知)"
 )
 _NEGATED_ACTION_RE = re.compile(
     r"(?:不要|别|不许|不准|无需|不用)[^，,。；;！？!?]{0,24}"
@@ -178,6 +189,16 @@ _NEGATED_ACTION_RE = re.compile(
 )
 _DOWNLOAD_ACTION_RE = re.compile(
     r"(?:开始下载|下载第?\s*\d+|下载.{0,30}(?:到|至|进)\s*(?:qb|qbit|qbittorrent|光鸭))",
+    re.IGNORECASE,
+)
+_PROJECT_OPERATION_ACTION_RE = re.compile(
+    r"(?:通知|让)?\s*(?:jellyfin|emby).{0,20}(?:扫描|刷新).{0,16}(?:媒体库|库)|"
+    r"(?:扫描|刷新).{0,16}(?:jellyfin|emby).{0,20}(?:媒体库|库)|"
+    r"(?:扫描|开始扫描|立即扫描).{0,20}(?:本地媒体来源|本地来源)|"
+    r"(?:整理|归档).{0,40}(?:本地媒体|本地下载目录|下载目录|本机目录)|"
+    r"(?:整理|归档|刮削).{0,40}(?:光鸭|云盘|指定目录|这个目录|某个目录)|"
+    r"(?:立即|马上|开始|执行).{0,8}(?:巡检|扫描).{0,20}(?:媒体库|全库|全部剧集)|"
+    r"(?:重启|重新启动).{0,16}(?:媒体反代|反代实例|jellyfin反代|emby反代)",
     re.IGNORECASE,
 )
 _GUANGYA_ORGANIZE_ACTION_RE = re.compile(
@@ -192,7 +213,15 @@ _ORGANIZE_READ_MARKERS = (
 )
 _MEDIA_SUBSCRIPTION_CREATE_ACTION_RE = re.compile(
     r"(?:订阅|追更|加入追更|添加追更|创建订阅)\s*"
-    r"(?:第\s*\d{1,3}\s*(?:个|项|部|季)|这部|这个|它|[《「『\"'])",
+    r"(?:第\s*\d{1,3}\s*(?:个|项|部|季)|这部|这个|它|[《「『\"']|"
+    r"(?!状态|列表|源|更新|有哪些|哪些|策略)[^，。！？!?]{2,80}$)",
+    re.IGNORECASE,
+)
+_PLAN_ONLY_ACTION_RE = re.compile(
+    r"(?:只|仅|先).{0,4}(?:生成|查看|看看|看一下|给出|做|预览)"
+    r".{0,12}(?:计划|预览|方案)|"
+    r"(?:不要|别|先别|暂不|暂时不).{0,6}"
+    r"(?:执行|开始|整理|同步|移动|改名)",
     re.IGNORECASE,
 )
 _GENERIC_CONFIRMATION_EXCLUDED_RE = re.compile(
@@ -214,6 +243,7 @@ def is_agent_action_request(message: str) -> bool:
     if (
         not normalized
         or _NEGATED_ACTION_RE.search(normalized)
+        or _PLAN_ONLY_ACTION_RE.search(normalized)
         or _looks_like_action_status_query(normalized)
     ):
         return False
@@ -231,6 +261,7 @@ def is_agent_action_request(message: str) -> bool:
         _ACTION_INTENT_RE.search(normalized)
         or _DOWNLOAD_ACTION_RE.search(normalized)
         or _MEDIA_SUBSCRIPTION_CREATE_ACTION_RE.search(normalized)
+        or _PROJECT_OPERATION_ACTION_RE.search(normalized)
         or organize_action
     )
 
@@ -369,9 +400,12 @@ class LLMResultNarrative:
 class _NativeLoopState:
     """跨协议共享的受限 Agent turn 状态。"""
 
+    max_provider_requests: int = _NATIVE_MAX_PROVIDER_CALLS
+    max_tool_calls: int = _NATIVE_MAX_TOOL_CALLS
     provider_requests: int = 0
     total_tool_calls: int = 0
     seen_calls: set[str] = field(default_factory=set)
+    successful_source_kinds: set[str] = field(default_factory=set)
     public_trace: list[dict[str, Any]] = field(default_factory=list)
     tool_executions: list[dict[str, Any]] = field(default_factory=list)
     usage: ProviderUsage | None = None
@@ -385,7 +419,7 @@ class _NativeLoopState:
     ) -> bool:
         # Provider 调用上限跨协议共享：auto 的 Responses 探测也属于一次真实
         # 上游请求，不能在回退到 Chat Completions 后重新获得完整回合额度。
-        if self.provider_requests >= _NATIVE_MAX_PROVIDER_CALLS:
+        if self.provider_requests >= self.max_provider_requests:
             return False
         # 保持既有配额语义：首个 Provider 请求不消耗 fallback budget，
         # 后续回合及协议回退后的请求才检查共享配额。
@@ -415,6 +449,8 @@ class _NativeLoopState:
         tool_name: str,
         arguments: Mapping[str, Any],
         response_payload: dict[str, Any],
+        *,
+        source_kind: str = "",
     ) -> None:
         # 执行完成即提交最小公开轨迹。后续投影或 Provider 失败时，
         # partial reply 仍能保留事实，并阻止旧路由重复执行。
@@ -426,6 +462,13 @@ class _NativeLoopState:
             "arguments": dict(arguments),
             "response": response_payload,
         })
+        result = response_payload.get("result")
+        if (
+            isinstance(result, Mapping)
+            and result.get("ok") is True
+            and str(source_kind or "").strip()
+        ):
+            self.successful_source_kinds.add(str(source_kind).strip())
 
     def partial(self, reason: str) -> LLMConversationReply | None:
         return _native_partial_reply(
@@ -457,11 +500,12 @@ class _NativeProtocolState:
     protocol: str
     history: list[dict[str, Any]]
     tools: list[dict[str, Any]]
+    max_tool_rounds: int = _NATIVE_MAX_TOOL_ROUNDS
     tool_rounds: int = 0
 
     def reserve_tool_round(self) -> bool:
         self.tool_rounds += 1
-        return self.tool_rounds <= _NATIVE_MAX_TOOL_ROUNDS
+        return self.tool_rounds <= self.max_tool_rounds
 
 
 
@@ -1641,6 +1685,53 @@ def _native_context_text(
     return unicodedata.normalize("NFKC", " ".join(parts)).casefold()
 
 
+def _objective_with_entities(
+    objective: AgentObjectiveContract, entities: tuple[str, ...]
+) -> AgentObjectiveContract:
+    if objective.task_kind != "official_release_status":
+        return replace(objective, entity_terms=entities)
+    provider_budget = min(4, max(2, len(entities) + 1))
+    return replace(
+        objective,
+        entity_terms=entities,
+        max_provider_requests=provider_budget,
+        max_tool_rounds=max(1, provider_budget - 1),
+        max_tool_calls=max(1, min(3, len(entities) or 2)),
+    )
+
+
+def _resolved_agent_objective(
+    message: str,
+    conversation_context: list[dict[str, Any]] | None = None,
+    reply_context: dict[str, Any] | None = None,
+) -> AgentObjectiveContract:
+    """以当前消息确定任务，只从最近安全上下文补齐缺失的媒体实体。"""
+    objective = infer_agent_objective(message)
+    if objective.task_kind == "general" or objective.entity_terms:
+        return objective
+
+    safe_reply = _safe_reply_context_for_llm(reply_context)
+    if safe_reply:
+        media = safe_reply.get("media_context") or {}
+        title = sanitize_public_text(
+            media.get("title") or media.get("name") or media.get("media_title"),
+            limit=80,
+        )
+        if title:
+            return _objective_with_entities(objective, (title,))
+
+    for item in reversed(conversation_context or []):
+        if not isinstance(item, dict) or str(item.get("role") or "").lower() != "user":
+            continue
+        text = " ".join(str(item.get("text") or "").split()).strip()
+        if not text or contains_sensitive_credential(text):
+            continue
+        previous = infer_agent_objective(text)
+        if previous.entity_terms:
+            return _objective_with_entities(objective, previous.entity_terms)
+    return objective
+
+
 def _semantic_tokens(value: object) -> frozenset[str]:
     """生成稳定的中英文词项；不依赖外部分词器。"""
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
@@ -1857,6 +1948,45 @@ def _capability_prompt_description(
     return description[:limit]
 
 
+def _ensure_objective_source_coverage(
+    selected: list[dict[str, Any]],
+    eligible: list[dict[str, Any]],
+    objective: AgentObjectiveContract,
+    *,
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    """按本轮合同补齐必需数据源，不把辅助工具挤进目标能力面。"""
+    chosen = list(selected[:max_candidates])
+    chosen_names = {str(item.get("name") or "").strip() for item in chosen}
+    required = tuple(dict.fromkeys(objective.required_sources))
+    for source_kind in required:
+        if any(
+            capability_semantics(item)["source_kind"] == source_kind
+            for item in chosen
+        ):
+            continue
+        candidate = next((
+            item for item in eligible
+            if str(item.get("name") or "").strip() not in chosen_names
+            and capability_semantics(item)["source_kind"] == source_kind
+        ), None)
+        if candidate is None:
+            continue
+        if len(chosen) < max_candidates:
+            chosen.append(candidate)
+        else:
+            replace_at = next((
+                index for index in range(len(chosen) - 1, -1, -1)
+                if capability_semantics(chosen[index])["source_kind"] not in required
+            ), None)
+            if replace_at is None:
+                continue
+            chosen_names.discard(str(chosen[replace_at].get("name") or "").strip())
+            chosen[replace_at] = candidate
+        chosen_names.add(str(candidate.get("name") or "").strip())
+    return chosen
+
+
 def _native_read_capabilities(
     registry: ToolRegistry,
     message: str = "",
@@ -1869,12 +1999,33 @@ def _native_read_capabilities(
     context_text = _native_context_text(
         message, conversation_context, reply_context
     )
+    objective = _resolved_agent_objective(
+        message, conversation_context, reply_context
+    )
+    if objective.max_capabilities <= 0:
+        record_agent_capabilities(())
+        return []
+    eligible = orchestration_tool_capabilities(
+        registry, include_confirmations=include_confirmations
+    )
+    # 目标合同只约束完整的内置注册表。插件或测试可提供更小的独立注册表；
+    # 若合同工具并未完整注册，继续使用工具自身语义召回，避免前缀无关能力被清空。
+    if objective.allowed_tools and all(
+        registry.has(name) for name in objective.allowed_tools
+    ):
+        allowed = frozenset(objective.allowed_tools)
+        eligible = [
+            item for item in eligible
+            if str(item.get("name") or "").strip() in allowed
+        ]
+    max_candidates = min(_NATIVE_MAX_CAPABILITIES, objective.max_capabilities)
     selected = _rank_read_capabilities(
-        orchestration_tool_capabilities(
-            registry, include_confirmations=include_confirmations
-        ),
+        eligible,
         context_text,
-        max_candidates=_NATIVE_MAX_CAPABILITIES,
+        max_candidates=max_candidates,
+    )
+    selected = _ensure_objective_source_coverage(
+        selected, eligible, objective, max_candidates=max_candidates
     )
     record_agent_capabilities(
         str(item.get("name") or "").strip() for item in selected
@@ -1911,9 +2062,14 @@ def _native_read_only_subset(
     return selected
 
 
-def _native_read_system_prompt(*, include_confirmations: bool = False) -> str:
+def _native_read_system_prompt(
+    *, include_confirmations: bool = False, objective_instruction: str = ""
+) -> str:
     """兼容现有私有入口；提示策略集中在 prompts 包中。"""
-    return native_read_system_prompt(include_confirmations=include_confirmations)
+    return native_read_system_prompt(
+        include_confirmations=include_confirmations,
+        objective_instruction=objective_instruction,
+    )
 
 
 def _valid_native_answer(
@@ -2032,6 +2188,62 @@ def _native_tool_error_response(
     }
 
 
+def _normalized_identity_text(value: object) -> str:
+    return re.sub(
+        r"[^0-9a-z\u4e00-\u9fff]+",
+        "",
+        unicodedata.normalize("NFKC", str(value or "")).casefold(),
+    )
+
+
+def _validate_objective_tool_call(
+    objective: AgentObjectiveContract,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    *,
+    registry: ToolRegistry | None = None,
+) -> None:
+    """在注册表校验之后执行本轮目标与媒体身份连续性复核。"""
+    if objective.allowed_tools and tool_name not in objective.allowed_tools:
+        raise AgentToolError(
+            "该工具不属于用户当前明确目标", code="scope_mismatch"
+        )
+    semantics = capability_semantics(
+        registry.llm_capability_for(tool_name)
+        if registry is not None
+        else {"name": tool_name}
+    )
+    source_kind = str(semantics.get("source_kind") or "")
+    if source_kind in objective.forbidden_sources:
+        raise AgentToolError(
+            "该数据源不属于用户当前明确范围", code="scope_mismatch"
+        )
+
+    if objective.task_kind not in {
+        "series_update_audit", "series_missing_download_plan"
+    }:
+        return
+    anchors = tuple(
+        item for item in (
+            _normalized_identity_text(term) for term in objective.entity_terms
+        ) if len(item) >= 2
+    )
+    if not anchors or tool_name == "web.search":
+        return
+    raw_identity = next((
+        arguments.get(key)
+        for key in ("query", "title", "media_title", "name")
+        if str(arguments.get(key) or "").strip()
+    ), "")
+    if not raw_identity or str(arguments.get("tmdb_id") or "").strip():
+        return
+    identity = _normalized_identity_text(raw_identity)
+    if identity and not any(anchor in identity or identity in anchor for anchor in anchors):
+        raise AgentToolError(
+            "媒体名称与本轮已锁定目标不一致", code="identity_mismatch"
+        )
+
+
 def _native_tool_output(
     call: Any, response_payload: dict[str, Any]
 ) -> tuple[Any, str]:
@@ -2057,6 +2269,7 @@ async def _execute_native_tool_turn(
     state: _NativeLoopState,
     allowed_aliases: frozenset[str],
     allow_confirmations: bool,
+    objective: AgentObjectiveContract | None = None,
 ) -> list[tuple[Any, str]]:
     """并发执行独立只读调用；确认预检保持串行且结果严格保序。"""
     prepared: list[dict[str, Any]] = []
@@ -2082,6 +2295,10 @@ async def _execute_native_tool_turn(
             disposition, normalized_arguments = registry.validate_llm_orchestration_call(
                 tool_name, call.arguments
             )
+            if objective is not None:
+                _validate_objective_tool_call(
+                    objective, tool_name, normalized_arguments, registry=registry
+                )
         except AgentToolError as exc:
             if _native_tool_error_is_fatal(exc):
                 raise
@@ -2172,7 +2389,10 @@ async def _execute_native_tool_turn(
     # 这样既保留独立数据源并发，也不会把后置读取提前到有顺序约束的工具之前。
     parallel_batch: list[dict[str, Any]] = []
     for item in read_items:
-        if registry.llm_parallel_safe_for(item["tool_name"]):
+        if (
+            (objective is None or objective.parallel_reads)
+            and registry.llm_parallel_safe_for(item["tool_name"])
+        ):
             parallel_batch.append(item)
             continue
         await _flush_parallel_batch(parallel_batch)
@@ -2198,12 +2418,59 @@ async def _execute_native_tool_turn(
     for item in prepared:
         response_payload = item["payload"] or results[int(item["index"])]
         if item["executed"]:
+            semantics = capability_semantics(
+                registry.llm_capability_for(item["tool_name"])
+            )
             state.record_execution(
-                item["tool_name"], item["arguments"], response_payload
+                item["tool_name"],
+                item["arguments"],
+                response_payload,
+                source_kind=str(semantics.get("source_kind") or ""),
             )
         outputs.append(_native_tool_output(item["call"], response_payload))
         state.total_tool_calls += 1
     return outputs
+
+
+def _append_native_synthesis_instruction(
+    protocol: str, history: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """证据齐备后显式要求生成结论，兼容仍会沿用历史工具名的 Provider。"""
+    text = (
+        "本轮必需数据源已经全部成功返回。停止检索，不要再次调用任何工具；"
+        "请仅根据已有结果直接回答用户，并清楚区分已上线、已定档与待确认信息。"
+    )
+    updated = list(history)
+    if protocol == "responses":
+        updated.append({
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })
+    elif protocol == "chat_completions":
+        updated.append({"role": "user", "content": text})
+    else:
+        updated.append({
+            "role": "user",
+            "content": [{"type": "text", "text": text}],
+        })
+    return updated
+
+
+
+def _objective_evidence_is_complete(
+    objective: AgentObjectiveContract, state: _NativeLoopState
+) -> bool:
+    """已获得推荐所需证据后关闭工具面，避免模型重复检索拖慢答复。"""
+    required = {
+        str(item).strip()
+        for item in objective.required_sources
+        if str(item).strip()
+    }
+    return bool(
+        objective.task_kind == "media_recommendation"
+        and required
+        and required.issubset(state.successful_source_kinds)
+    )
 
 
 async def _request_native_read_agent(
@@ -2218,6 +2485,9 @@ async def _request_native_read_agent(
     fallback_budget: Callable[[], bool] | None = None,
 ) -> LLMConversationReply | None:
     provider = _provider()
+    objective = _resolved_agent_objective(
+        message, conversation_context, reply_context
+    )
     model = str(get("AGENT_LLM_MODEL", "") or "").strip()
     native_capabilities = _native_read_capabilities(
         registry,
@@ -2251,7 +2521,8 @@ async def _request_native_read_agent(
         pin_resolved_address=True,
     )
     system_prompt = _native_read_system_prompt(
-        include_confirmations=include_confirmations
+        include_confirmations=include_confirmations,
+        objective_instruction=objective.prompt_instruction(),
     )
     allowed_aliases = frozenset(
         str(item.get("name") or "").strip()
@@ -2264,7 +2535,10 @@ async def _request_native_read_agent(
     overall_started = monotonic()
     overall_timeout = min(60, max(timeout_seconds, timeout_seconds * 4))
     deadline = overall_started + overall_timeout
-    state = _NativeLoopState()
+    state = _NativeLoopState(
+        max_provider_requests=min(_NATIVE_MAX_PROVIDER_CALLS, objective.max_provider_requests),
+        max_tool_calls=min(_NATIVE_MAX_TOOL_CALLS, objective.max_tool_calls),
+    )
     last_protocol = configured_protocol
 
     async def _run() -> LLMConversationReply | None:
@@ -2312,9 +2586,10 @@ async def _request_native_read_agent(
                     user_content=fitted_user_content,
                 ),
                 tools=tools,
+                max_tool_rounds=min(_NATIVE_MAX_TOOL_ROUNDS, objective.max_tool_rounds),
             )
             fallback_to_next = False
-            for request_index in range(_NATIVE_MAX_PROVIDER_CALLS):
+            for request_index in range(state.max_provider_requests):
                 if not state.reserve_provider_request(fallback_budget):
                     logger.info(
                         "Agent LLM native event outcome=request_budget_exhausted protocol=%s",
@@ -2329,7 +2604,10 @@ async def _request_native_read_agent(
                     include_confirmations and not state.confirmation_prepared
                 )
                 request_tools = tools if confirmations_available else read_only_tools
-                if state.provider_requests >= _NATIVE_MAX_PROVIDER_CALLS:
+                if (
+                    state.provider_requests >= state.max_provider_requests
+                    or _objective_evidence_is_complete(objective, state)
+                ):
                     request_tools = []
                 request_body = native_tool_request_body(
                     protocol=protocol,
@@ -2429,7 +2707,7 @@ async def _request_native_read_agent(
 
                 # 最后一个全局 Provider 请求只允许返回最终文本；协议回退不会
                 # 重新获得一个可执行工具的末轮。
-                if state.provider_requests >= _NATIVE_MAX_PROVIDER_CALLS:
+                if state.provider_requests >= state.max_provider_requests:
                     logger.warning(
                         "Agent LLM native event outcome=round_limit protocol=%s", protocol
                     )
@@ -2438,7 +2716,7 @@ async def _request_native_read_agent(
                     return state.partial("tool_round_limit")
                 if (
                     state.total_tool_calls + len(turn.tool_calls)
-                    > _NATIVE_MAX_TOOL_CALLS
+                    > state.max_tool_calls
                 ):
                     logger.warning(
                         "Agent LLM native event outcome=tool_call_limit protocol=%s", protocol
@@ -2453,6 +2731,7 @@ async def _request_native_read_agent(
                     state=state,
                     allowed_aliases=allowed_aliases,
                     allow_confirmations=confirmations_available,
+                    objective=objective,
                 )
                 state.tools_ms += max(
                     0, int((monotonic() - tools_started) * 1000)
@@ -2460,6 +2739,10 @@ async def _request_native_read_agent(
                 protocol_state.history = append_native_tool_results(
                     protocol, protocol_state.history, turn, outputs
                 )
+                if _objective_evidence_is_complete(objective, state):
+                    protocol_state.history = _append_native_synthesis_instruction(
+                        protocol, protocol_state.history
+                    )
 
             if fallback_to_next:
                 continue

@@ -165,6 +165,48 @@ class TestStrmRoundCleanup:
         assert all(result["stats"]["clean_skipped"] is True for result in source_results)
         assert any("整轮扫描未完整" in str(item) for item in aggregate["error_samples"])
 
+    def test_scoped_round_never_retires_unselected_sources_or_sweeps_global_root(self):
+        scheduler = STRMScheduler()
+        sources = [{"id": "a", "name": "整理", "rel_prefix": "整理"}]
+        scheduler._source_runtime = [
+            {"id": "a", "name": "整理", "status": "pending", "completed": 0, "total": 0}
+        ]
+        source_stats = scheduler._empty_stats()
+        with patch(
+            "app.modules.scheduler.configured_strm_source_plans",
+            return_value=(sources, ""),
+        ), patch(
+            "app.modules.scheduler.sync_strm", return_value=source_stats,
+        ), patch(
+            "app.modules.scheduler.clean_retired_strm_sources",
+        ) as retire, patch(
+            "app.modules.scheduler.db.cancel_retired_strm_metadata_jobs",
+        ) as cancel_retired, patch(
+            "app.modules.scheduler.clean_empty_strm_dirs",
+            return_value={
+                "empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False,
+            },
+        ) as empty_cleanup:
+            aggregate, source_results, stopped = scheduler._run_full_sources(
+                sources,
+                base_url="http://media.invalid",
+                strm_root="/tmp/strm",
+                exts={"mkv"},
+                metadata_exts=set(),
+                threshold=0,
+                active_ids_complete=False,
+            )
+
+        assert not stopped
+        assert len(source_results) == 1
+        assert aggregate["retired_sources"] == 0
+        retire.assert_not_called()
+        cancel_retired.assert_not_called()
+        empty_cleanup.assert_called_once()
+        assert str(empty_cleanup.call_args.kwargs["owned_root"]).endswith(
+            "/光鸭云盘/整理"
+        )
+
     def test_source_local_dir_uses_same_single_component_sanitizing_as_strm_targets(self):
         from app.modules.scheduler import _source_local_dir
         from app.modules.strm import safe_path_component

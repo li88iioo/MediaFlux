@@ -690,14 +690,14 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         rendered = _render_agent_progress_card(
             message,
             target_mode="rich_draft",
-            active_label="🧭 正在理解请求…",
+            active_label="◌ 正在理解请求…",
         )
 
         self.assertIn("<blockquote><b>aXi Ba</b><br>", rendered)
         self.assertIn("[链接已隐藏]", rendered)
         self.assertIn("[凭据已隐藏]", rendered)
         self.assertIn("[路径已隐藏]", rendered)
-        self.assertIn("<tg-thinking>🧭 正在理解请求...</tg-thinking>", rendered)
+        self.assertIn("<tg-thinking>◌ 正在理解请求...</tg-thinking>", rendered)
         self.assertNotIn("private.example", rendered)
         self.assertNotIn("secret-value", rendered)
         self.assertNotIn("/root/private", rendered)
@@ -745,13 +745,13 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         planning = bot.rich_drafts[0][2].html
         started = bot.rich_drafts[1][2].html
         finished = bot.rich_drafts[-1][2].html
-        self.assertIn("✅ 已识别请求范围", planning)
+        self.assertIn("✓ 已识别请求范围", planning)
         self.assertIn("正在规划检查步骤", planning)
         self.assertIn("媒体追更实时更新检查", started)
         self.assertNotIn("media.subscription_updates", started)
-        self.assertIn("✅ 媒体追更实时更新检查", finished)
+        self.assertIn("✓ 媒体追更实时更新检查", finished)
         self.assertIn("正在整理回答", finished)
-        self.assertIn("⏱ 已用时", finished)
+        self.assertIn("· 已用时", finished)
         self.assertIn("检查一下我关注的动漫有更新吗", finished)
 
     def test_live_progress_tracks_parallel_sources_without_leaking_tool_names(self):
@@ -805,7 +805,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             )
         )
         remaining = bot.rich_drafts[-1][2].html
-        self.assertIn("✅ 网页搜索", remaining)
+        self.assertIn("✓ 网页搜索", remaining)
         self.assertIn("正在检查:媒体更新检查", remaining)
         self.assertNotIn("正在并行核对 2 项信息", remaining)
         self.assertIn("已用时 2.0 秒", remaining)
@@ -840,7 +840,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         )
         one_remaining = bot.rich_drafts[-1][2].html
         self.assertIn("正在检查:网页搜索", one_remaining)
-        self.assertNotIn("✅ 网页搜索", one_remaining)
+        self.assertNotIn("✓ 网页搜索", one_remaining)
 
         progress.handle(
             AgentProgressEvent(
@@ -848,7 +848,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             )
         )
         finished = bot.rich_drafts[-1][2].html
-        self.assertIn("✅ 网页搜索", finished)
+        self.assertIn("✓ 网页搜索", finished)
         self.assertIn("正在分析检查结果", finished)
 
     def test_failed_narrative_keeps_the_deterministic_error(self):

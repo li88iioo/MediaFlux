@@ -15,7 +15,9 @@ from app.discovery.search import DiscoverySearchResult, get_discovery_search_ser
 from app.discovery.service import get_discovery_service
 
 _ALLOWED_PROVIDERS = ("tmdb", "douban", "bangumi")
-_ALLOWED_ARGUMENTS = {"query", "page", "providers", "limit"}
+_ALLOWED_ARGUMENTS = {
+    "query", "page", "providers", "limit", "media_type", "year", "region", "genre"
+}
 _RECOMMEND_ARGUMENTS = {"provider", "media_type", "page", "limit"}
 _CALENDAR_ARGUMENTS = {"weekday", "page", "limit"}
 _RECOMMEND_PROVIDERS = {"tmdb", "douban"}
@@ -97,7 +99,68 @@ def search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         if not providers:
             raise AgentToolError("至少选择一个搜索来源")
 
-    return {"query": query, "page": page, "providers": providers, "limit": limit}
+    media_type = str(arguments.get("media_type") or "").strip().lower()
+    if media_type and media_type not in _RECOMMEND_MEDIA_TYPES:
+        raise AgentToolError("media_type 必须是 movie 或 tv")
+
+    year = str(arguments.get("year") or "").strip()
+    if year and not re.fullmatch(r"(?:19|20)[0-9]{2}", year):
+        raise AgentToolError("year 必须是 1900 到 2099 的四位年份")
+
+    region = _visible_text(arguments.get("region"), limit=24)
+    genre = _visible_text(arguments.get("genre"), limit=24)
+    if arguments.get("region") not in {None, ""} and not region:
+        raise AgentToolError("region 必须是可见文本")
+    if arguments.get("genre") not in {None, ""} and not genre:
+        raise AgentToolError("genre 必须是可见文本")
+
+    normalized = {
+        "query": query,
+        "page": page,
+        "providers": providers,
+        "limit": limit,
+    }
+    for key, value in (
+        ("media_type", media_type), ("year", year), ("region", region), ("genre", genre)
+    ):
+        if value:
+            normalized[key] = value
+    return normalized
+
+
+def _effective_search_query(normalized: dict[str, Any]) -> str:
+    """把结构化限制稳定投影到各供应商都能理解的关键词查询。"""
+    query = str(normalized["query"])
+    suffixes = [
+        str(normalized.get("year") or ""),
+        str(normalized.get("region") or ""),
+        str(normalized.get("genre") or ""),
+        {"movie": "电影", "tv": "剧集"}.get(str(normalized.get("media_type") or ""), ""),
+    ]
+    folded = unicodedata.normalize("NFKC", query).casefold()
+    additions = [item for item in suffixes if item and item.casefold() not in folded]
+    return " ".join((query, *additions)).strip()[:120]
+
+
+def _filter_search_result(
+    result: DiscoverySearchResult, normalized: dict[str, Any]
+) -> DiscoverySearchResult:
+    media_type = str(normalized.get("media_type") or "")
+    year = str(normalized.get("year") or "")
+    items = tuple(
+        card for card in result.items
+        if (not media_type or card.media_type == media_type)
+        and (not year or str(card.year or "").strip() == year)
+    )
+    return DiscoverySearchResult(
+        query=result.query,
+        page=result.page,
+        items=items,
+        has_more=result.has_more,
+        providers_attempted=result.providers_attempted,
+        providers_succeeded=result.providers_succeeded,
+        errors=result.errors,
+    )
 
 
 def recommend_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -204,9 +267,14 @@ def _public_error(raw: Any) -> dict[str, Any]:
     }
 
 
-def _result_payload(result: DiscoverySearchResult, *, limit: int) -> dict[str, Any]:
+def _result_payload(
+    result: DiscoverySearchResult,
+    *,
+    limit: int,
+    normalized: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     items = [_public_card(card) for card in result.items[:limit] if isinstance(card, MediaCard)]
-    return {
+    payload = {
         "query": _visible_text(result.query, limit=120),
         "page": result.page,
         "total": len(result.items),
@@ -221,6 +289,14 @@ def _result_payload(result: DiscoverySearchResult, *, limit: int) -> dict[str, A
         "errors": [_public_error(error) for error in result.errors],
         "items": items,
     }
+    if normalized is not None:
+        payload["requested_query"] = _visible_text(normalized.get("query"), limit=120)
+        payload["filters"] = {
+            key: str(normalized.get(key) or "")
+            for key in ("media_type", "year", "region", "genre")
+            if str(normalized.get(key) or "")
+        }
+    return payload
 
 
 def search_discovery(arguments: dict[str, Any]) -> ToolResult:
@@ -247,11 +323,13 @@ def search_discovery(arguments: dict[str, Any]) -> ToolResult:
         )
 
     try:
+        effective_query = _effective_search_query(normalized)
         result = get_discovery_search_service().search(
-            normalized["query"],
+            effective_query,
             normalized["page"],
             normalized["providers"],
         )
+        result = _filter_search_result(result, normalized)
     except ValueError as exc:
         raise AgentToolError(str(exc)) from exc
     except Exception:
@@ -275,7 +353,9 @@ def search_discovery(arguments: dict[str, Any]) -> ToolResult:
             error="外部影视数据源暂时不可用。",
         )
 
-    payload = _result_payload(result, limit=normalized["limit"])
+    payload = _result_payload(
+        result, limit=normalized["limit"], normalized=normalized
+    )
     succeeded = len(payload["providers_succeeded"])
     errors = len(payload["errors"])
     if not succeeded:

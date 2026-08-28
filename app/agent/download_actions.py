@@ -7,7 +7,7 @@ import re
 from typing import Any
 import unicodedata
 
-from app import config
+from app import config, database as db
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
 from app.clients.qbittorrent import QBittorrentClient, TorrentTask, TransferInfo
@@ -38,6 +38,82 @@ def download_diagnosis_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if extra:
         raise AgentToolError(f"不支持的工具参数：{', '.join(sorted(extra))}")
     return {}
+
+
+def download_request_summaries_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict) or not set(arguments).issubset({"scope", "limit"}):
+        raise AgentToolError("下载请求列表参数无效")
+    scope = str(arguments.get("scope") or "active").strip().lower()
+    if scope not in {"active", "attention", "recent"}:
+        raise AgentToolError("scope 仅支持 active、attention 或 recent")
+    limit = arguments.get("limit", 12)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 30:
+        raise AgentToolError("limit 必须是 1 到 30 的整数")
+    return {"scope": scope, "limit": limit}
+
+
+def _safe_request_status(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    return status if status in {
+        "pending", "submitting", "submitted", "accepted", "queued", "running",
+        "downloading", "completed", "success", "failed", "partial",
+        "manual_review", "requires_manual", "skipped", "cancelled",
+        "outcome_unknown", "not_started",
+    } else "unknown"
+
+
+def _safe_targets(value: Any) -> list[str]:
+    raw = str(value or "").strip().lower()
+    if raw == "both":
+        return ["qb", "guangya"]
+    normalized = re.sub(r"[+|/、，\s]+", ",", raw)
+    return list(dict.fromkeys(
+        item for item in (part.strip() for part in normalized.split(","))
+        if item in {"qb", "guangya"}
+    ))
+
+
+def summarize_download_requests(arguments: dict[str, Any]) -> ToolResult:
+    normalized = download_request_summaries_arguments(arguments)
+    scope = normalized["scope"]
+    limit = normalized["limit"]
+    if scope == "active":
+        rows = db.list_active_download_requests(limit=limit)
+    elif scope == "attention":
+        rows = db.list_download_requests_requiring_attention(limit=limit, offset=0)
+    else:
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM download_requests ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+
+    items = []
+    for row in rows:
+        items.append({
+            "request_number": int(row["id"]),
+            "title": _safe_title(row["title"]),
+            "kind": str(row["kind"] or "unknown")[:24],
+            "targets": _safe_targets(row["targets"]),
+            "status": _safe_request_status(row["status"]),
+            "qb_status": _safe_request_status(row["qb_status"]),
+            "guangya_status": _safe_request_status(row["gy_status"]),
+            "organize_status": _safe_request_status(row["organize_status"]),
+            "strm_status": _safe_request_status(row["strm_status"]),
+            "updated_at": str(row["updated_at"] or "")[:32],
+        })
+    label = {"active": "进行中", "attention": "待处理", "recent": "最近"}[scope]
+    return ToolResult(
+        ok=True,
+        status="success" if items else "empty",
+        summary=f"{label}下载请求 {len(items)} 项",
+        data={"scope": scope, "count": len(items), "items": items},
+        evidence=[Evidence(
+            "download_requests",
+            "读取 MediaFlux 下载请求的 qB、光鸭、整理与 STRM 阶段摘要；未返回链接、路径、哈希或云端任务标识。",
+            _now(),
+        )],
+        suggestions=[] if items else ["可切换 active、attention 或 recent 范围查看。"],
+    )
 
 
 def _bounded_int(value: Any, *, minimum: int = 0, maximum: int = 2**63 - 1) -> int:

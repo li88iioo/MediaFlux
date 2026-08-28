@@ -560,6 +560,7 @@ class STRMScheduler:
                 organize_changes: list[dict[str, object]] | None = None,
                 force_full: bool = False,
                 sync_mode: str = "auto",
+                selected_source_ids: list[str] | None = None,
                 chat_id: str = "",
                 debounce_seconds: float = 0.0) -> dict:
         """异步触发一次任务；整理联动在忙时合并排队，其余触发保持拒绝。"""
@@ -581,6 +582,11 @@ class STRMScheduler:
                 pending_is_persisted_queue = bool(
                     pending_snapshot.get("persisted_queue_only")
                 )
+            selected_ids = list(dict.fromkeys(
+                str(item or "").strip()
+                for item in (selected_source_ids or [])
+                if str(item or "").strip()
+            ))
             resolved_chat_id = str(chat_id or "").strip()
             notification_scope_enabled = bool(
                 notify_override is not False
@@ -599,6 +605,7 @@ class STRMScheduler:
                 "organize_changes": _merge_organize_changes(organize_changes),
                 "force_full": bool(force_full),
                 "sync_mode": normalized_mode,
+                "selected_source_ids": selected_ids,
                 "chat_ids": (
                     [resolved_chat_id]
                     if resolved_chat_id and notification_scope_enabled else []
@@ -1163,8 +1170,9 @@ class STRMScheduler:
         exts: set[str],
         metadata_exts: set[str],
         threshold: int,
+        active_ids_complete: bool = True,
     ) -> tuple[dict, list[dict], bool]:
-        """执行全量来源扫描，并在整轮安全后统一提交删除型清理。"""
+        """执行全量来源扫描；局部来源模式禁止把未选来源判为退役。"""
         aggregate = self._empty_stats()
         source_results: list[dict] = []
         _configured, source_error = configured_strm_source_plans()
@@ -1273,7 +1281,7 @@ class STRMScheduler:
                     f"已清理 {cleanup_index}/{len(source_results)} 个来源",
                 )
 
-        if round_cleanup_safe:
+        if round_cleanup_safe and active_ids_complete:
             self._set_progress("retirement", 0, 1, "清理已移除的 STRM 来源")
             try:
                 aggregate["metadata_queue_cancelled"] += int(
@@ -1338,8 +1346,13 @@ class STRMScheduler:
 
         cleanup_roots: list[Path] = []
         if round_cleanup_safe and strm_root:
-            cleanup_roots.append(Path(strm_root) / STRM_SUBDIR)
-        if round_cleanup_safe:
+            if active_ids_complete:
+                cleanup_roots.append(Path(strm_root) / STRM_SUBDIR)
+            else:
+                cleanup_roots.extend(
+                    Path(_source_local_dir(strm_root, source)) for source in sources
+                )
+        if round_cleanup_safe and active_ids_complete:
             cleanup_roots.extend(
                 Path(item) for item in retirement.get("empty_dir_roots", []) if str(item)
             )
@@ -1394,15 +1407,31 @@ class STRMScheduler:
             error = self.validate_config(auto_only=False)
             if error:
                 raise ValueError(error)
-            sources = self._source_dirs()
+            configured_sources = self._source_dirs()
+            selected_source_ids = {
+                str(item or "").strip()
+                for item in options.get("selected_source_ids", [])
+                if str(item or "").strip()
+            }
+            sources = (
+                [
+                    source for source in configured_sources
+                    if str(source.get("id") or "") in selected_source_ids
+                ]
+                if selected_source_ids else configured_sources
+            )
+            if selected_source_ids and len(sources) != len(selected_source_ids):
+                raise ValueError("选定的 STRM 来源已变化，请重新预检")
+            scoped_sources = bool(selected_source_ids)
             base_url = get("GY_STRM_BASE_URL").strip()
             strm_root = get("STRM_ROOT").strip()
             exts = self._video_exts()
             metadata_exts = self._metadata_exts()
             threshold = get_int("STRM_SKIP_THRESHOLD_MB", 0)
             logger.info(
-                "STRM 任务开始 trigger=%s sources=%s root=%s retirements=%s",
-                trigger_type, len(sources), strm_root, len(db.list_strm_retired_sources()),
+                "STRM 任务开始 trigger=%s sources=%s scoped=%s root=%s retirements=%s",
+                trigger_type, len(sources), scoped_sources, strm_root,
+                len(db.list_strm_retired_sources()),
             )
             aggregate = self._empty_stats()
             source_results = []
@@ -1513,6 +1542,7 @@ class STRMScheduler:
                             exts=exts,
                             metadata_exts=metadata_exts,
                             threshold=threshold,
+                            active_ids_complete=not scoped_sources,
                         )
                         # 增量阶段已经真实落盘的变化仍计入最终通知与刷新判断；
                         # 全量阶段负责重新核验和补齐，不重复累加扫描总量。
@@ -1547,6 +1577,7 @@ class STRMScheduler:
                     exts=exts,
                     metadata_exts=metadata_exts,
                     threshold=threshold,
+                    active_ids_complete=not scoped_sources,
                 )
 
             if stopped or self._stop_event.is_set():

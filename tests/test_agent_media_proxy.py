@@ -120,8 +120,14 @@ class AgentMediaProxyTests(IsolatedDatabaseTestCase):
             {"instance_number": 2},
         )
         self.assertTrue(is_media_proxy_status_summary_message("查看 media proxy 运行情况"))
+        self.assertTrue(is_media_proxy_status_summary_message("Jellyfin 反代是否正常"))
         self.assertTrue(is_media_proxy_control_message("启用媒体反代"))
+        self.assertTrue(is_media_proxy_control_message("关闭 Emby 反代"))
         self.assertTrue(is_media_proxy_test_request_message("测试媒体反代"))
+        self.assertEqual(
+            media_proxy_test_request("测试 Jellyfin 反代实例 2"),
+            {"instance_number": 2},
+        )
         for message in (
             "停用媒体反代",
             "停用媒体反代 1 和媒体反代 2",

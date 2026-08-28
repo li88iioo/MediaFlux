@@ -20,7 +20,12 @@ from app.agent.automation_actions import (
     automation_pipeline_arguments,
     diagnose_automation_pipeline,
 )
-from app.agent.download_actions import diagnose_download_queue, download_diagnosis_arguments
+from app.agent.download_actions import (
+    diagnose_download_queue,
+    download_diagnosis_arguments,
+    download_request_summaries_arguments,
+    summarize_download_requests,
+)
 from app.agent.download_control_actions import (
     delete_download_task,
     delete_download_task_confirmed,
@@ -43,6 +48,7 @@ from app.agent.pending_action_actions import (
     cancel_pending_action,
     pending_action_arguments,
 )
+from app.agent.feature_gate import is_agent_enabled
 from app.agent.missing_media_workflows import (
     list_missing_workflows,
     missing_workflow_arguments,
@@ -357,6 +363,12 @@ from app.agent.local_media_task_actions import (
     retry_local_media_task_confirmed,
     verify_local_media_task_library_visibility,
 )
+from app.agent.local_media_scan_actions import (
+    local_media_scan_arguments,
+    prepare_scan_local_media_sources,
+    scan_local_media_sources,
+    scan_local_media_sources_confirmed,
+)
 from app.agent.local_media_source_actions import (
     get_local_media_source_summary,
     list_local_media_source_summaries,
@@ -367,6 +379,12 @@ from app.agent.local_media_source_actions import (
     set_local_media_source_trigger_enabled,
     set_local_media_source_trigger_enabled_confirmed,
 )
+from app.agent.media_library_actions import (
+    media_library_refresh_arguments,
+    prepare_refresh_media_library,
+    refresh_media_library,
+    refresh_media_library_confirmed,
+)
 from app.agent.media_server_actions import (
     diagnose_media_servers,
     media_server_diagnosis_arguments,
@@ -374,9 +392,13 @@ from app.agent.media_server_actions import (
 from app.agent.media_proxy_actions import (
     media_proxy_enabled_arguments,
     media_proxy_failure_summary_arguments,
+    media_proxy_restart_arguments,
     media_proxy_status_arguments,
     media_proxy_test_arguments,
+    prepare_restart_media_proxy_instance,
     prepare_set_media_proxy_instance_enabled,
+    restart_media_proxy_instance,
+    restart_media_proxy_instance_confirmed,
     set_media_proxy_instance_enabled,
     set_media_proxy_instance_enabled_confirmed,
     summarize_media_proxy_playback_failures,
@@ -707,6 +729,59 @@ def diagnose_strm(_arguments: dict[str, Any]) -> ToolResult:
     )
 
 
+def strm_run_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        raise AgentToolError("工具参数必须是 JSON 对象")
+    extra = set(arguments) - {"source_names"}
+    if extra:
+        raise AgentToolError(f"不支持的工具参数：{', '.join(sorted(extra))}")
+    raw_names = arguments.get("source_names")
+    if raw_names is None or raw_names == []:
+        return {"source_names": []}
+    if not isinstance(raw_names, list) or len(raw_names) > 16:
+        raise AgentToolError("source_names 必须是 1 到 16 个来源名称")
+    names: list[str] = []
+    seen_names: set[str] = set()
+    for raw in raw_names:
+        if not isinstance(raw, str):
+            raise AgentToolError("STRM 来源名称必须是字符串")
+        name = unicodedata.normalize("NFKC", raw).strip()
+        if not name or len(name) > 80 or any(
+            unicodedata.category(char).startswith("C") for char in name
+        ):
+            raise AgentToolError("STRM 来源名称无效")
+        identity = name.casefold()
+        if identity not in seen_names:
+            names.append(name)
+            seen_names.add(identity)
+    return {"source_names": names}
+
+
+def _selected_strm_sources(arguments: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
+    from app.modules.strm import configured_strm_source_plans
+
+    normalized = strm_run_arguments(arguments)
+    requested = normalized["source_names"]
+    if not requested:
+        return [], ""
+    configured, error = configured_strm_source_plans()
+    if error:
+        return [], error
+    selected: list[dict[str, str]] = []
+    for requested_name in requested:
+        matches = [
+            source for source in configured
+            if unicodedata.normalize("NFKC", str(source.get("name") or "")).casefold()
+            == unicodedata.normalize("NFKC", requested_name).casefold()
+        ]
+        if not matches:
+            return [], f"未找到已配置的 STRM 来源：{requested_name}"
+        if len(matches) > 1:
+            return [], f"STRM 来源名称不唯一：{requested_name}"
+        selected.append(matches[0])
+    return selected, ""
+
+
 _STRM_CONFIRMATION_KEYS = (
     "GY_STRM_SOURCE_DIRS",
     "GY_STRM_BASE_URL",
@@ -720,17 +795,29 @@ _STRM_CONFIRMATION_KEYS = (
 )
 
 
-def _strm_confirmation_context(_arguments: dict[str, Any]) -> str:
-    """绑定本次确认时的 STRM 执行配置；摘要只保留在服务端。"""
+def _strm_confirmation_context(arguments: dict[str, Any]) -> str:
+    """绑定本次确认时的 STRM 执行配置与选定来源；摘要只保留在服务端。"""
+    selected, selection_error = _selected_strm_sources(arguments)
     payload = {key: config.get(key, "") for key in _STRM_CONFIRMATION_KEYS}
+    payload["selected_source_ids"] = [str(item.get("id") or "") for item in selected]
+    payload["selection_error"] = selection_error
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
-def preview_strm_run_once(_arguments: dict[str, Any]) -> ToolResult:
+def preview_strm_run_once(arguments: dict[str, Any]) -> ToolResult:
     """只做运行前检查，不启动任务。"""
     from app.modules.scheduler import get_scheduler
 
+    selected_sources, selection_error = _selected_strm_sources(arguments)
+    if selection_error:
+        return ToolResult(
+            ok=False,
+            status="not_configured",
+            summary="STRM 来源选择无效",
+            error=selection_error,
+            suggestions=["请使用设置页中已配置且名称唯一的 STRM 来源。"],
+        )
     scheduler = get_scheduler()
     if scheduler.validate_config(auto_only=False):
         return ToolResult(
@@ -752,12 +839,24 @@ def preview_strm_run_once(_arguments: dict[str, Any]) -> ToolResult:
     return ToolResult(
         ok=True,
         status="confirmation_required",
-        summary="确认后将启动一次 STRM 全量同步",
+        summary=(
+            "确认后将同步选定 STRM 来源"
+            if arguments.get("source_names")
+            else "确认后将启动一次 STRM 全量同步"
+        ),
         data={
             "action": "strm.run_once",
             "trigger": "manual",
+            **({
+                "source_count": len(selected_sources),
+                "source_names": [str(item.get("name") or "") for item in selected_sources],
+            } if arguments.get("source_names") else {}),
             "effects": [
-                "扫描当前配置的全部 STRM 来源",
+                (
+                    "仅扫描本次选定的 STRM 来源"
+                    if arguments.get("source_names")
+                    else "扫描当前配置的全部 STRM 来源"
+                ),
                 "按现有规则创建、更新或清理 STRM 与伴随元数据",
                 "根据现有配置执行通知和媒体库刷新",
             ],
@@ -767,10 +866,18 @@ def preview_strm_run_once(_arguments: dict[str, Any]) -> ToolResult:
     )
 
 
-def run_strm_once(_arguments: dict[str, Any]) -> ToolResult:
-    """确认后固定以 manual 触发一次 STRM 同步。"""
+def run_strm_once(arguments: dict[str, Any]) -> ToolResult:
+    """确认后固定以 manual 触发一次全部或指定来源 STRM 同步。"""
     from app.modules.scheduler import get_scheduler
 
+    selected_sources, selection_error = _selected_strm_sources(arguments)
+    if selection_error:
+        return ToolResult(
+            ok=False,
+            status="not_configured",
+            summary="STRM 来源选择已失效",
+            error=selection_error,
+        )
     scheduler = get_scheduler()
     if scheduler.validate_config(auto_only=False):
         return ToolResult(
@@ -779,7 +886,14 @@ def run_strm_once(_arguments: dict[str, Any]) -> ToolResult:
             summary="STRM 当前无法启动",
             error="相关配置无效，请重新检查后再发起确认。",
         )
-    triggered = scheduler.trigger("manual")
+    triggered = (
+        scheduler.trigger(
+            "manual",
+            selected_source_ids=[str(item.get("id") or "") for item in selected_sources],
+        )
+        if arguments.get("source_names")
+        else scheduler.trigger("manual")
+    )
     if not bool(triggered.get("ok")):
         return ToolResult(
             ok=False,
@@ -792,17 +906,31 @@ def run_strm_once(_arguments: dict[str, Any]) -> ToolResult:
         ok=True,
         status="accepted",
         summary="STRM 同步任务已提交",
-        data={"accepted": True, "trigger": "manual"},
+        data={
+            "accepted": True,
+            "trigger": "manual",
+            **({
+                "source_count": len(selected_sources),
+                "scoped": True,
+            } if arguments.get("source_names") else {}),
+        },
         evidence=[Evidence("strm_scheduler", "已通过一次性确认票据提交手动同步；未返回目录或运行详情。", _now())],
         suggestions=["可询问：查看 STRM 同步进度。"],
     )
 
 
 def strm_runtime_status(_arguments: dict[str, Any]) -> ToolResult:
-    """读取 STRM 调度器的脱敏运行快照。"""
+    """读取 STRM 调度器和可选择来源名称的脱敏运行快照。"""
     from app.modules.scheduler import get_scheduler
+    from app.modules.strm import configured_strm_source_plans
 
     raw = get_scheduler().status()
+    configured_sources, source_error = configured_strm_source_plans()
+    available_source_names = list(dict.fromkeys(
+        str(item.get("name") or "").strip()
+        for item in configured_sources
+        if str(item.get("name") or "").strip()
+    )) if not source_error else []
     running = bool(raw.get("running"))
     configured = not bool(raw.get("config_error"))
     progress = raw.get("progress") if isinstance(raw.get("progress"), dict) else {}
@@ -873,10 +1001,19 @@ def strm_runtime_status(_arguments: dict[str, Any]) -> ToolResult:
                 "total": total,
                 "percent": percent,
             },
-            "sources": {"total": sum(source_counts.values()), "by_status": source_counts},
+            "sources": {
+                "total": sum(source_counts.values()),
+                "by_status": source_counts,
+                "configured_total": len(available_source_names),
+                "available_names": available_source_names,
+            },
             "last_run": last_run,
         },
-        evidence=[Evidence("strm_scheduler", "读取 STRM 调度器脱敏快照；未返回目录、来源标识或错误正文。", _now())],
+        evidence=[Evidence(
+            "strm_scheduler",
+            "读取 STRM 调度器脱敏快照和可选择的来源显示名称；未返回目录、来源 ID 或错误正文。",
+            _now(),
+        )],
         suggestions=suggestions,
     )
 
@@ -1160,6 +1297,35 @@ def search_library(arguments: dict[str, Any]) -> ToolResult:
 def build_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ToolSpec(
+        name="agent.runtime_status",
+        description="只读返回 Media Agent 总开关、Telegram 接入和模型路由的当前启用状态，不返回令牌、密钥或供应商配置值。",
+        risk=RiskLevel.READ,
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        handler=lambda _arguments: ToolResult(
+            ok=True,
+            status="success",
+            summary="Media Agent 运行状态已读取",
+            data={
+                "agent_enabled": is_agent_enabled(),
+                "telegram_enabled": config.get_bool("TG_AGENT_ENABLED", False),
+                "model_routing_enabled": config.get_bool("AGENT_LLM_ENABLED", True),
+            },
+            evidence=[Evidence(
+                "agent_runtime",
+                "读取当前进程可见的非敏感 Agent 功能开关。",
+                _now(),
+            )],
+            suggestions=["如需调整 Telegram Agent，请发送 /agent。"],
+        ),
+        validator=_no_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        llm_domains=("agent", "system"),
+        llm_source_kind="system_state",
+        llm_freshness="live",
+        llm_examples=("Agent 现在开启了吗", "查看智能助手状态"),
+    ))
+    registry.register(ToolSpec(
         name="agent.cancel_pending_action",
         description=(
             "取消当前会话唯一一项尚未执行的行动计划；不会撤销已经执行的操作，"
@@ -1296,6 +1462,33 @@ def build_tool_registry() -> ToolRegistry:
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
+        name="local_media.scan_sources",
+        description="预检并确认后扫描全部或指定公开序号的已配置本地媒体来源，把发现的媒体加入整理队列；不接受任意路径。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "properties": {
+                "source_numbers": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 10000},
+                    "maxItems": 20,
+                },
+                "query": {"type": "string", "maxLength": 120},
+            },
+            "additionalProperties": False,
+        },
+        handler=scan_local_media_sources,
+        validator=local_media_scan_arguments,
+        requires_confirmation=True,
+        confirmation_preparer=prepare_scan_local_media_sources,
+        confirmed_handler=scan_local_media_sources_confirmed,
+        llm_confirmation=True,
+        llm_domains=("local_media", "organize"),
+        llm_source_kind="system_state",
+        llm_parallel_safe=False,
+        llm_examples=("扫描全部本地媒体来源", "扫描本地媒体来源 2"),
+    ))
+    registry.register(ToolSpec(
         name="local_media.review_queue_summary",
         description="只读汇总本地媒体待人工确认队列的数量、触发来源和等待时长，不返回标题、路径、任务标识或错误正文。",
         risk=RiskLevel.READ,
@@ -1428,6 +1621,31 @@ def build_tool_registry() -> ToolRegistry:
             "检查下载队列有没有异常",
             "qBittorrent 里有没有卡住的任务",
         ),
+    ))
+    registry.register(ToolSpec(
+        name="downloads.request_summaries",
+        description="只读列出 MediaFlux 统一下载请求在 qB、光鸭、整理与 STRM 各阶段的安全状态摘要，不返回链接、路径、哈希或云端任务标识。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["active", "attention", "recent"],
+                    "default": "active",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 12},
+            },
+            "additionalProperties": False,
+        },
+        handler=summarize_download_requests,
+        validator=download_request_summaries_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        llm_domains=("downloads", "jobs"),
+        llm_source_kind="system_state",
+        llm_freshness="live",
+        llm_examples=("查看光鸭离线任务", "列出最近的下载请求", "哪些下载请求需要处理"),
     ))
     download_task_parameters = {
         "type": "object",
@@ -2208,6 +2426,29 @@ def build_tool_registry() -> ToolRegistry:
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
+        name="media_proxy.restart_instance",
+        description="预检并确认后按公开序号强制重建一个已启用媒体反代实例的运行时；不修改实例配置。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["instance_number"],
+            "properties": {
+                "instance_number": {"type": "integer", "minimum": 1, "maximum": 10000},
+            },
+            "additionalProperties": False,
+        },
+        handler=restart_media_proxy_instance,
+        validator=media_proxy_restart_arguments,
+        requires_confirmation=True,
+        confirmation_preparer=prepare_restart_media_proxy_instance,
+        confirmed_handler=restart_media_proxy_instance_confirmed,
+        llm_confirmation=True,
+        llm_domains=("playback",),
+        llm_source_kind="system_state",
+        llm_parallel_safe=False,
+        llm_examples=("重启媒体反代实例 1", "重启 Jellyfin 反代实例 2"),
+    ))
+    registry.register(ToolSpec(
         name="recognition.set_rule_enabled",
         description="预检并在用户确认后，按明确规则类型和编号启用或停用一条识别规则；不会修改规则内容、映射、别名或优先级。",
         risk=RiskLevel.LOW_WRITE,
@@ -2435,23 +2676,46 @@ def build_tool_registry() -> ToolRegistry:
     ))
     registry.register(ToolSpec(
         name="strm.run_once",
-        description="预检并在用户确认后启动一次 STRM 全量同步，不接受执行参数。",
+        description=(
+            "预检并在用户确认后同步全部或指定的已配置 STRM 来源；"
+            "source_names 只能使用设置中名称唯一的来源，不接受目录或来源 ID。"
+        ),
         risk=RiskLevel.DANGER,
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        parameters={
+            "type": "object",
+            "properties": {
+                "source_names": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "uniqueItems": True,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                },
+            },
+            "additionalProperties": False,
+        },
         handler=run_strm_once,
-        validator=_no_arguments,
+        validator=strm_run_arguments,
         requires_confirmation=True,
         preview_handler=preview_strm_run_once,
         confirmation_context=_strm_confirmation_context,
         llm_confirmation=True,
+        llm_domains=("strm",),
+        llm_source_kind="system_state",
+        llm_parallel_safe=False,
         llm_examples=(
             "执行一次 STRM 完整同步",
             "现在同步 STRM",
+            "只同步整理这个 STRM 来源",
+            "同步整理和 NSFW，不同步其他来源",
         ),
     ))
     registry.register(ToolSpec(
         name="strm.status",
-        description="查看 STRM 当前运行进度、调度状态和最近结果，不返回目录或错误正文。",
+        description=(
+            "查看 STRM 当前运行进度、调度状态、最近结果和可选择的来源显示名称；"
+            "不返回目录、来源 ID 或错误正文。"
+        ),
         risk=RiskLevel.READ,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         handler=strm_runtime_status,
@@ -2928,22 +3192,37 @@ def build_tool_registry() -> ToolRegistry:
 
     registry.register(ToolSpec(
         name="guangya.directory_scrape.inspect",
-        description="按当前整理规则只读检查一个精确光鸭目录或视频文件，并在当前会话保存短期检查上下文；不返回对象 ID、文件名或路径。",
+        description=(
+            "按当前整理规则只读检查一个精确光鸭绝对路径、目录 ID 或视频文件 ID，"
+            "并在当前会话保存短期检查上下文；路径只在服务端解析，不向外返回对象 ID。"
+        ),
         risk=RiskLevel.READ,
         parameters={
             "type": "object",
             "properties": {
+                "path": {"type": "string", "minLength": 2, "maxLength": 2048},
                 "directory_id": {"type": "string", "minLength": 1, "maxLength": 180},
                 "file_id": {"type": "string", "minLength": 1, "maxLength": 180},
             },
-            "oneOf": [{"required": ["directory_id"]}, {"required": ["file_id"]}],
+            "oneOf": [
+                {"required": ["path"]},
+                {"required": ["directory_id"]},
+                {"required": ["file_id"]},
+            ],
             "additionalProperties": False,
         },
         handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=inspect_directory_scrape,
         validator=directory_scrape_inspect_arguments,
         llm_read=True,
-        llm_examples=("检查光鸭目录 123 是否能刮削", "检查光鸭文件 abc123"),
+        llm_domains=("organize", "media_identity", "cloud_files"),
+        llm_source_kind="system_state",
+        llm_parallel_safe=False,
+        llm_examples=(
+            "检查并整理光鸭 /待整理/某剧，只生成预览",
+            "检查光鸭目录 123 是否能刮削",
+            "检查光鸭文件 abc123",
+        ),
     ))
     registry.register(ToolSpec(
         name="guangya.directory_scrape.search",
@@ -2962,6 +3241,9 @@ def build_tool_registry() -> ToolRegistry:
         context_handler=search_directory_scrape,
         validator=directory_scrape_search_arguments,
         llm_read=True,
+        llm_domains=("organize", "media_identity", "discovery"),
+        llm_source_kind="metadata_catalog",
+        llm_parallel_safe=False,
         llm_examples=("给刚才的光鸭目录搜索匹配", "用刚才识别出的标题搜索刮削候选"),
     ))
     registry.register(ToolSpec(
@@ -2985,6 +3267,9 @@ def build_tool_registry() -> ToolRegistry:
         context_handler=preview_directory_scrape,
         validator=directory_scrape_preview_arguments,
         llm_read=True,
+        llm_domains=("organize", "media_identity"),
+        llm_source_kind="system_state",
+        llm_parallel_safe=False,
         llm_examples=("预览刚才第 1 个刮削候选",),
     ))
     registry.register(ToolSpec(
@@ -2998,6 +3283,9 @@ def build_tool_registry() -> ToolRegistry:
         context_confirmation_preparer=prepare_run_directory_scrape,
         context_confirmed_handler=run_directory_scrape_confirmed,
         llm_confirmation=True,
+        llm_domains=("organize", "media_identity"),
+        llm_source_kind="frozen_write_plan",
+        llm_parallel_safe=False,
         llm_examples=("执行刚才的光鸭刮削预览", "确认整理刚才检查的光鸭目录"),
     ))
 
@@ -3120,6 +3408,28 @@ def build_tool_registry() -> ToolRegistry:
                     "maxItems": 3,
                     "items": {"type": "string", "enum": ["tmdb", "douban", "bangumi"]},
                 },
+                "media_type": {
+                    "type": "string",
+                    "enum": ["movie", "tv"],
+                    "description": "用户明确要求电影或剧集时填写；服务端会再次过滤结果。",
+                },
+                "year": {
+                    "type": "string",
+                    "pattern": "^(?:19|20)[0-9]{2}$",
+                    "description": "用户明确给出的四位年份；不得自行猜测或替换。",
+                },
+                "region": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 24,
+                    "description": "用户明确给出的地区，例如欧美、日本、中国大陆。",
+                },
+                "genre": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 24,
+                    "description": "用户明确给出的题材，例如科幻、悬疑、喜剧。",
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
             },
             "additionalProperties": False,
@@ -3130,6 +3440,7 @@ def build_tool_registry() -> ToolRegistry:
         llm_examples=(
             "从 TMDB 或豆瓣搜索影视资料",
             "查一部电影的外部元数据",
+            "搜索 2026 年欧美科幻剧集",
         ),
     ))
     registry.register(ToolSpec(
@@ -3644,6 +3955,31 @@ def build_tool_registry() -> ToolRegistry:
             "检查《某剧》有没有更新",
             "这部剧最新播到哪里而本地有多少",
         ),
+    ))
+
+    registry.register(ToolSpec(
+        name="library.refresh_library",
+        description="预检并确认后按媒体服务器类型和唯一媒体库名称提交精准刷新；不接受 URL、路径或内部媒体库 ID。",
+        risk=RiskLevel.LOW_WRITE,
+        parameters={
+            "type": "object",
+            "required": ["provider", "library_name"],
+            "properties": {
+                "provider": {"type": "string", "enum": ["auto", "jellyfin", "emby"]},
+                "library_name": {"type": "string", "minLength": 1, "maxLength": 80},
+            },
+            "additionalProperties": False,
+        },
+        handler=refresh_media_library,
+        validator=media_library_refresh_arguments,
+        requires_confirmation=True,
+        confirmation_preparer=prepare_refresh_media_library,
+        confirmed_handler=refresh_media_library_confirmed,
+        llm_confirmation=True,
+        llm_domains=("library",),
+        llm_source_kind="local_library",
+        llm_parallel_safe=False,
+        llm_examples=("通知 Jellyfin 扫描动漫库", "刷新 Emby 的电影媒体库"),
     ))
 
     registry.register(ToolSpec(

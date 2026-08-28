@@ -155,6 +155,34 @@ class AgentResultProjectionTests(unittest.TestCase):
         ):
             self.assertNotIn(secret, serialized)
 
+    def test_projection_keeps_safe_strm_source_display_names(self):
+        projected = project_agent_response_for_llm({
+            "tool_call": {"name": "strm.status", "arguments": {}},
+            "result": {
+                "ok": True,
+                "status": "ready",
+                "summary": "STRM 当前空闲",
+                "data": {
+                    "configured": True,
+                    "sources": {
+                        "configured_total": 2,
+                        "available_names": ["整理", "NSFW"],
+                        "private_source_id": "source-secret",
+                    },
+                },
+                "evidence": [],
+                "suggestions": [],
+                "error": "",
+            },
+        })
+
+        self.assertIsNotNone(projected)
+        self.assertEqual(
+            projected["data"]["来源明细"],
+            {"已配置来源数量": 2, "可选来源": ["整理", "NSFW"]},
+        )
+        self.assertNotIn("source-secret", repr(projected))
+
     def test_projection_keeps_patrol_interval_hours(self):
         projected = project_agent_response_for_llm({
             "tool_call": {"name": "library.patrol_policy", "arguments": {}},

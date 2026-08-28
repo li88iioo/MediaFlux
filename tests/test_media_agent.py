@@ -321,7 +321,15 @@ class AgentToolTests(unittest.TestCase):
                 "error": secret,
             },
         }
-        with patch("app.modules.scheduler.get_scheduler", return_value=scheduler):
+        with patch(
+            "app.modules.scheduler.get_scheduler", return_value=scheduler
+        ), patch(
+            "app.modules.strm.configured_strm_source_plans",
+            return_value=([
+                {"id": "source-a", "name": "整理"},
+                {"id": "source-b", "name": "NSFW"},
+            ], ""),
+        ):
             result = strm_runtime_status({})
 
         self.assertTrue(result.ok)
@@ -330,7 +338,10 @@ class AgentToolTests(unittest.TestCase):
             "stage": "generate", "completed": 3, "total": 10, "percent": 30,
         })
         self.assertEqual(result.data["sources"], {
-            "total": 2, "by_status": {"completed": 1, "running": 1},
+            "total": 2,
+            "by_status": {"completed": 1, "running": 1},
+            "configured_total": 2,
+            "available_names": ["整理", "NSFW"],
         })
         self.assertNotIn(secret, str(result.to_dict()))
 

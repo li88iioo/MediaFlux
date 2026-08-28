@@ -1339,6 +1339,120 @@ class AgentLLMSelectionTests(unittest.TestCase):
             captured["bodies"][1]["messages"][-1]["role"], "tool"
         )
 
+    def test_native_recommendation_closes_tools_after_required_sources_succeed(self):
+        captured = {"bodies": [], "closed": False}
+        registry = ToolRegistry()
+        for name, source_kind in (
+            ("discovery.search", "metadata_catalog"),
+            ("web.search", "public_web"),
+        ):
+            registry.register(ToolSpec(
+                name=name,
+                description=f"读取 {source_kind}",
+                risk=RiskLevel.READ,
+                parameters={
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {"query": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+                validator=lambda arguments: {"query": str(arguments["query"])},
+                handler=lambda _arguments: ToolResult(True, "ok", "已取得结果"),
+                llm_read=True,
+                llm_source_kind=source_kind,
+            ))
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                captured["bodies"].append(json)
+                if len(captured["bodies"]) == 1:
+                    body = json_module.dumps({
+                        "choices": [{"message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_catalog",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mf_discovery_search",
+                                        "arguments": json_module.dumps({
+                                            "query": "2026 科幻剧集"
+                                        }),
+                                    },
+                                },
+                                {
+                                    "id": "call_web",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mf_web_search",
+                                        "arguments": json_module.dumps({
+                                            "query": "2026 科幻剧集 上线 定档"
+                                        }),
+                                    },
+                                },
+                            ],
+                        }}],
+                    }).encode()
+                else:
+                    body = json_module.dumps({
+                        "choices": [{"message": {
+                            "role": "assistant",
+                            "content": "已结合影视目录与公开信息完成推荐。",
+                        }}],
+                    }).encode()
+                return IndexerHttpResponse(
+                    url=url, status_code=200,
+                    headers={"content-type": "application/json"}, body=body,
+                )
+
+            async def aclose(self):
+                captured["closed"] = True
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+        }
+        executed = []
+
+        def execute_tool(name, arguments):
+            executed.append((name, dict(arguments)))
+            return {
+                "tool_call": {"name": name, "arguments": arguments},
+                "result": ToolResult(True, "ok", "已取得结果").to_dict(),
+            }
+
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ):
+            reply = asyncio.run(_request_native_read_agent(
+                "推荐几部 2026 科幻剧集",
+                registry,
+                execute_tool,
+                client_factory=FakeClient,
+                fallback_budget=lambda: True,
+            ))
+
+        self.assertIsNotNone(reply)
+        self.assertTrue(reply.completed)
+        self.assertEqual(len(captured["bodies"]), 2)
+        self.assertIn("tools", captured["bodies"][0])
+        self.assertNotIn("tools", captured["bodies"][1])
+        self.assertEqual(captured["bodies"][1]["messages"][-1]["role"], "user")
+        self.assertIn(
+            "停止检索", captured["bodies"][1]["messages"][-1]["content"]
+        )
+        self.assertEqual(
+            [name for name, _arguments in executed],
+            ["discovery.search", "web.search"],
+        )
+        self.assertTrue(captured["closed"])
+
     def test_native_agent_prepares_at_most_one_confirmation_without_execution(self):
         captured = {"bodies": [], "closed": False}
 
@@ -3565,6 +3679,30 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertEqual(calls, [])
         native_agent.assert_called_once()
         fallback_selector.assert_not_called()
+
+    def test_non_action_question_hides_confirmation_tools_from_model(self):
+        registry = _confirmation_registry()
+
+        def native(_message, selected_registry, _execute_tool, **kwargs):
+            self.assertIs(selected_registry, registry)
+            self.assertFalse(kwargs["include_confirmations"])
+            return None
+
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent", side_effect=native,
+        ), patch(
+            "app.agent.orchestrator.select_orchestration_tool", return_value=None,
+        ) as selector:
+            response = AgentOrchestrator(registry)._query_with_model_tools(
+                "这个日志值得看吗",
+                owner="web-session",
+                llm_rate_owner="",
+                llm_tool_rate_identity="web-session",
+                conversation_context=None,
+            )
+
+        self.assertIsNone(response)
+        self.assertEqual(selector.call_args.kwargs["owner"], "")
 
     def test_native_confirmation_replaces_premature_execution_claim(self):
         registry = _confirmation_registry()

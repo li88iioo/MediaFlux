@@ -176,6 +176,9 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "media_proxy.playback_failure_summary": "媒体反代播放故障摘要",
     "media_proxy.test_instance": "媒体反代连接测试",
     "media_proxy.set_instance_enabled": "媒体反代实例启停",
+    "media_proxy.restart_instance": "媒体反代实例重启",
+    "local_media.scan_sources": "本地媒体来源扫描",
+    "library.refresh_library": "媒体库精准刷新",
     "recognition.set_rule_enabled": "识别规则启停",
     "organize.audit_logs": "整理记录摘要",
     "rss.diagnose": "RSS 订阅诊断",
@@ -402,6 +405,7 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "attention_count": "需关注数量",
     "attention_total": "需关注总数",
     "available": "可用",
+    "available_names": "可选来源",
     "blocked": "受阻数量",
     "cached": "使用缓存",
     "candidate_summaries": "候选资源摘要",
@@ -410,6 +414,7 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "cancelled_admissions": "已取消的待提交任务",
     "cancelled_runs": "已取消的检查任务",
     "configured": "已配置",
+    "configured_total": "已配置来源数量",
     "cron": "计划表达式",
     "cron_valid": "计划表达式有效",
     "current_policy": "当前策略",
@@ -664,6 +669,7 @@ _PUBLIC_TEXT_VALUE_KEYS = frozenset({
     "skip_reason", "target", "observation_ref", "object_ref", "object_name",
     "kind", "extension", "location",
     "subscription_status", "stage", "route", "last_seen_at", "coverage",
+    "available_names",
 })
 _MAX_DEPTH = 4
 _MAX_MAPPING_ITEMS = 24

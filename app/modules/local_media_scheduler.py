@@ -6,6 +6,8 @@ import threading
 import time
 import uuid
 from datetime import datetime
+import re
+import unicodedata
 from pathlib import Path
 
 from app import database as db
@@ -37,6 +39,16 @@ class LocalMediaProbeRetryable(RuntimeError):
 
 class LocalMediaSourceMigrationRequired(RuntimeError):
     """qB 已命中遗留来源，但该来源必须迁移为 Docker 容器路径。"""
+
+
+def _candidate_search_key(value: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", normalized)
+
+
+def _candidate_matches_query(candidate: Path, query: str) -> bool:
+    query_key = _candidate_search_key(query)
+    return not query_key or query_key in _candidate_search_key(candidate.name)
 
 
 def _source_path_error(source) -> str:
@@ -209,6 +221,8 @@ class LocalMediaScheduler:
         *,
         silent: bool = False,
         capture_results: bool = False,
+        source_ids: set[int] | frozenset[int] | None = None,
+        candidate_query: str = "",
     ) -> dict[str, object]:
         """显式扫描全部本地来源，把已存在媒体作为手动任务加入队列。
 
@@ -217,7 +231,12 @@ class LocalMediaScheduler:
         """
         task_ids: list[int] = []
         source_results: list[dict[str, object]] = []
+        selected_source_ids = (
+            {int(item) for item in source_ids} if source_ids is not None else None
+        )
         for source in db.list_local_media_sources(owner=self.owner):
+            if selected_source_ids is not None and int(source.id) not in selected_source_ids:
+                continue
             source_error = _source_path_error(source)
             if source_error:
                 source_results.append({
@@ -241,6 +260,11 @@ class LocalMediaScheduler:
                 })
                 continue
             candidates, error = self._source_candidates(source)
+            if candidate_query:
+                candidates = [
+                    candidate for candidate in candidates
+                    if _candidate_matches_query(candidate, candidate_query)
+                ]
             if error:
                 source_results.append({
                     "id": source.id, "name": source.name, "candidates": 0,

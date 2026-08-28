@@ -193,6 +193,8 @@ class RecentDownloadStatusIntentTests(unittest.TestCase):
             "最近下载队列状态",
             "最近 RSS 失败任务状态",
             "最近 STRM 任务状态",
+            "检查系统运行状态和最近失败任务",
+            "查看项目最近后台任务状态",
         ):
             self.assertIsNone(recent_download_status_request(message), message)
 

@@ -21,6 +21,16 @@ class MediaIntentProfile:
     presentation_hint: str = "narrative"
 
 
+_RELEASE_STATUS_RE = re.compile(
+    r"(?:上线|开播|首播|播出|定档|能看|正片).{0,10}(?:了吗|没有|没|吗|时间|日期|状态)|"
+    r"(?:是否|有没有|有无|都|已经|现在|目前).{0,12}(?:上线|开播|首播|播出|定档|能看|正片)",
+    re.IGNORECASE,
+)
+_NON_MEDIA_RELEASE_RE = re.compile(
+    r"(?:服务|网站|实例|容器|应用|项目|接口|端口|镜像|版本|bot|agent|api)"
+    r".{0,16}(?:上线|发布|部署|启动)",
+    re.IGNORECASE,
+)
 _OFFICIAL_PROGRESS_RE = re.compile(
     r"(?:官方|优酷|腾讯视频|爱奇艺|哔哩哔哩|bilibili|播出|正片).{0,24}"
     r"(?:更新|更到|更新至|播到|播至|第几集|多少集|多集|哪里)|"
@@ -41,13 +51,19 @@ _LIBRARY_MARKERS = (
     "媒体库", "本地库", "jellyfin", "emby", "入库", "本地收录", "缺集", "漏集",
 )
 _DOMAIN_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("subscriptions", ("追更", "订阅", "rss")),
-    ("downloads", ("下载队列", "qbittorrent", "qb", "下载任务")),
-    ("organize", ("整理", "光鸭", "归档", "刮削")),
+    ("system", ("系统状态", "运行状态", "系统正常", "项目正常", "系统健康", "系统简报")),
+    ("jobs", ("正在运行", "运行中的任务", "后台任务", "任务进度", "任务状态")),
+    ("agent", ("agent", "智能助手", "能力列表", "操作历史")),
+    ("subscriptions", ("追更", "订阅", "rss", "mikan")),
+    ("downloads", ("下载队列", "qbittorrent", "qb", "下载任务", "离线任务", "离线下载")),
+    ("indexer", ("索引站", "资源站", "资源搜索", "搜索资源", "搜不到资源")),
+    ("local_media", ("本地媒体来源", "本地整理", "本地下载目录", "本机整理")),
+    ("organize", ("整理", "归档", "刮削", "光鸭整理")),
     ("strm", ("strm",)),
+    ("library", ("媒体库", "jellyfin", "emby", "缺几集", "有多少集", "入库")),
     ("rating", ("评分", "豆瓣分", "tmdb分", "bangumi分")),
-    ("discovery", ("推荐", "找电影", "找剧", "搜电影", "搜剧", "片荒")),
-    ("playback", ("播放失败", "无法播放", "媒体反代", "转码")),
+    ("discovery", ("推荐", "找电影", "找剧", "搜电影", "搜剧", "影视资料", "片荒")),
+    ("playback", ("播放失败", "无法播放", "媒体反代", "反代实例", "302", "转码")),
     ("recognition", ("识别规则", "识别错误", "tmdb识别", "错季")),
     ("config", ("配置", "开关", "设置", "启用", "禁用")),
 )
@@ -76,7 +92,11 @@ def infer_media_intent(value: object) -> MediaIntentProfile:
     preferred_sources: list[str] = []
     forbidden_sources: list[str] = []
 
-    official_progress = bool(_OFFICIAL_PROGRESS_RE.search(text)) or (
+    release_status = bool(
+        _RELEASE_STATUS_RE.search(text)
+        and not _NON_MEDIA_RELEASE_RE.search(text)
+    )
+    official_progress = release_status or bool(_OFFICIAL_PROGRESS_RE.search(text)) or (
         "官方" in text
         and any(marker in text for marker in ("播", "进度", "更新", "第几集", "多少集"))
     )
@@ -92,7 +112,13 @@ def infer_media_intent(value: object) -> MediaIntentProfile:
 
     if official_progress:
         domains.append("official_progress")
-        preferred_sources.extend(("public_web", "local_library", "resource_index"))
+        # 官方上线/播出事实默认只需要公开时效数据。只有用户明确询问
+        # 本地收录或资源跟进时，才把对应数据源加入本轮。
+        preferred_sources.append("public_web")
+        if local_library:
+            preferred_sources.append("local_library")
+        if resource_search:
+            preferred_sources.append("resource_index")
     if episode_numbering:
         domains.append("episode_numbering")
         preferred_sources.extend(("public_web", "local_library"))
@@ -107,8 +133,21 @@ def infer_media_intent(value: object) -> MediaIntentProfile:
         if any(marker in text for marker in markers):
             domains.append(domain)
 
+    # “光鸭”同时承载云端整理与离线下载。只有出现明确流程词时才绑定领域，
+    # 避免“查看光鸭离线任务”被整理工具淹没，也避免“整理光鸭目录”只召回下载。
+    if "光鸭" in text:
+        if any(marker in text for marker in ("离线", "下载", "推送", "磁力", "种子")):
+            domains.append("downloads")
+        if any(marker in text for marker in ("整理", "归档", "刮削", "目录", "清理", "改名")):
+            domains.append("organize")
+
     if "只查官方" in text or "只看官方" in text or "只要官方" in text:
         forbidden_sources.extend(("local_library", "resource_index"))
+    elif release_status:
+        if not local_library:
+            forbidden_sources.append("local_library")
+        if not resource_search:
+            forbidden_sources.append("resource_index")
     if "只查本地" in text or "只看本地" in text or "只查媒体库" in text:
         forbidden_sources.extend(("public_web", "resource_index"))
     if resource_negated:
@@ -179,16 +218,34 @@ def capability_semantics(capability: Mapping[str, Any]) -> dict[str, Any]:
             domains = ("library", "episode_numbering")
         elif name.startswith("library."):
             domains = ("library",)
+        elif name.startswith("workspace."):
+            domains = ("system", "jobs")
+        elif name.startswith("automation."):
+            domains = ("system", "downloads", "subscriptions", "organize", "strm")
+        elif name.startswith("local_media."):
+            domains = ("local_media", "organize", "library")
+        elif name.startswith("agent."):
+            domains = ("agent", "jobs")
         elif name.startswith("rss.") or name.startswith("media.subscription"):
             domains = ("subscriptions",)
+        elif name.startswith("media.continue_watching"):
+            domains = ("library", "playback")
+        elif name.startswith("media.preference") or name.startswith("media.set_preference"):
+            domains = ("config", "downloads", "library")
+        elif name.startswith("media.today"):
+            domains = ("system", "downloads", "subscriptions", "organize")
         elif name.startswith("downloads."):
             domains = ("downloads",)
+        elif name == "guangya.connection_status":
+            domains = ("downloads", "organize", "config")
         elif name.startswith("guangya.") or name.startswith("organize."):
             domains = ("organize",)
         elif name.startswith("strm."):
             domains = ("strm",)
         elif name.startswith("discovery."):
             domains = ("discovery",)
+        elif name.startswith("indexer."):
+            domains = ("indexer", "resource_search")
         elif name.startswith("media_proxy."):
             domains = ("playback",)
         elif name.startswith("recognition."):

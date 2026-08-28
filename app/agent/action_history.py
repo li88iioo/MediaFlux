@@ -43,7 +43,10 @@ _TOOL_LABELS = {
     "config.set_safe_policy": "安全策略修改",
     "telegram.send_test_notification": "Telegram 测试通知",
     "media_proxy.set_instance_enabled": "媒体反代实例启停",
+    "media_proxy.restart_instance": "媒体反代实例重启",
     "local_media.set_source_trigger_enabled": "本地媒体来源触发器启停",
+    "local_media.scan_sources": "本地媒体来源扫描",
+    "library.refresh_library": "媒体库精准刷新",
     "local_media.retry_task": "本地媒体任务重试",
     "local_media.refresh_task_library": "本地媒体任务精准刷新",
     "recognition.set_rule_enabled": "识别规则启停",
@@ -128,6 +131,16 @@ _SAFE_FIELDS = {
     "config.set_safe_policy": {"policy", "runtime_refreshed"},
     "telegram.send_test_notification": {"sent"},
     "media_proxy.set_instance_enabled": {"operation", "instance_number", "enabled", "affected", "runtime_refreshed"},
+    "media_proxy.restart_instance": {
+        "operation", "instance_number", "accepted", "cache_entries_cleared",
+    },
+    "local_media.scan_sources": {
+        "operation", "source_numbers", "scanned_sources", "candidates",
+        "queued_tasks", "runtime_started",
+    },
+    "library.refresh_library": {
+        "operation", "provider", "library", "refreshed",
+    },
     "local_media.set_source_trigger_enabled": {
         "operation", "source_number", "trigger", "enabled", "affected", "runtime_refreshed",
     },

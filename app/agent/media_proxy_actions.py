@@ -417,6 +417,106 @@ def set_media_proxy_instance_enabled_confirmed(
     )
 
 
+def media_proxy_restart_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict) or set(arguments) != {"instance_number"}:
+        raise AgentToolError(
+            "media_proxy.restart_instance 只接受 instance_number 参数"
+        )
+    instance_number = arguments.get("instance_number")
+    if isinstance(instance_number, bool) or not isinstance(instance_number, int):
+        raise AgentToolError("instance_number 必须是正整数")
+    if not 1 <= instance_number <= 10_000:
+        raise AgentToolError("instance_number 必须在 1 到 10000 之间")
+    return {"instance_number": instance_number}
+
+
+def prepare_restart_media_proxy_instance(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    normalized = media_proxy_restart_arguments(arguments)
+    instance_number = int(normalized["instance_number"])
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM media_proxy_instances ORDER BY id ASC"
+        ).fetchall()
+    try:
+        row = rows[instance_number - 1]
+    except IndexError:
+        raise AgentToolError("指定的媒体反代实例不存在", code="precondition_failed") from None
+    state = _snapshot(row, instance_number=instance_number)
+    if not bool(state["enabled"]):
+        raise AgentToolError("该媒体反代实例当前未启用", code="precondition_failed")
+    return ToolResult(
+        ok=True,
+        status="confirmation_required",
+        summary=f"确认后将重启媒体反代实例 {instance_number}",
+        data={
+            "instance_number": instance_number,
+            "effects": [
+                "只重建该实例的运行时，不修改地址、端口、上游或可信代理配置。",
+                "正在通过该实例播放的会话可能短暂中断。",
+                "实例会继续使用当前已保存配置启动。",
+            ],
+        },
+        evidence=[Evidence(
+            "media_proxy_configuration",
+            "已冻结实例启用状态与配置摘要；未展示地址、端口、路径或凭据。",
+            _now(),
+        )],
+    ), _fingerprint(state)
+
+
+def restart_media_proxy_instance(_arguments: dict[str, Any]) -> ToolResult:
+    raise AgentToolError("媒体反代实例重启需要确认", code="confirmation_required")
+
+
+def restart_media_proxy_instance_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    normalized = media_proxy_restart_arguments(arguments)
+    instance_number = int(normalized["instance_number"])
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM media_proxy_instances ORDER BY id ASC"
+        ).fetchall()
+    try:
+        row = rows[instance_number - 1]
+    except IndexError:
+        raise AgentToolError("实例列表已变化，请重新预检", code="confirmation_stale") from None
+    state = _snapshot(row, instance_number=instance_number)
+    if not secrets.compare_digest(_fingerprint(state), str(expected_context or "")):
+        raise AgentToolError("实例配置已变化，请重新预检", code="confirmation_stale")
+    if not bool(state["enabled"]):
+        raise AgentToolError("实例已停用，请重新预检", code="confirmation_stale")
+    internal_id = int(state["internal_id"])
+    cleared = clear_signed_url_cache(internal_id)
+    accepted = bool(get_media_proxy_manager().request_restart(internal_id))
+    return ToolResult(
+        ok=accepted,
+        status="accepted" if accepted else "unavailable",
+        summary=(
+            f"媒体反代实例 {instance_number} 已进入重启队列"
+            if accepted else f"媒体反代实例 {instance_number} 暂时无法热重启"
+        ),
+        data={
+            "operation": "restart",
+            "instance_number": instance_number,
+            "accepted": accepted,
+            "cache_entries_cleared": int(cleared),
+        },
+        evidence=[Evidence(
+            "media_proxy_runtime",
+            "已清理该实例短时直链缓存并请求重建运行时；未修改实例配置。",
+            _now(),
+        )],
+        suggestions=(
+            ["稍后可再次检查实例状态和连接延迟。"]
+            if accepted else ["请重启 MediaFlux 后再检查该实例。"]
+        ),
+        error="" if accepted else "媒体反代运行时当前未启动。",
+    )
+
+
 def media_proxy_failure_summary_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")

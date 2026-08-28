@@ -168,6 +168,10 @@ class ToolRegistry:
             or (include_confirmations and self._tools[name].llm_confirmation)
         ]
 
+    def llm_capability_for(self, name: str) -> dict[str, Any]:
+        """返回单个已注册工具的 LLM 语义投影。"""
+        return self._get_spec(name).llm_capability_dict()
+
     def llm_disposition_for(self, name: str) -> LLMToolDisposition:
         """由注册表而非模型决定工具可执行还是只能创建确认票据。"""
         spec = self._get_spec(name)

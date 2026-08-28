@@ -185,6 +185,24 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "启用会按已保存配置启动反代监听；停用可能中断正在通过该实例播放的媒体。不会修改或展示地址、端口、路径与凭据。",
         "reversibility": "可再次确认切换回原状态；已中断的播放会话不会自动恢复。",
     },
+    "media_proxy.restart_instance": {
+        "action": "重启媒体反代实例",
+        "object": "你按公开序号指定的已启用媒体反代实例",
+        "impact": "会清理该实例短时直链缓存并重建运行时，正在播放的会话可能短暂中断；不会修改实例配置。",
+        "reversibility": "运行时重建无法撤回，但实例仍使用原配置；失败时可重启 MediaFlux 恢复。",
+    },
+    "local_media.scan_sources": {
+        "action": "扫描本地媒体来源",
+        "object": "本次预检冻结的已配置本地媒体来源",
+        "impact": "会把发现的媒体加入本地整理队列；后续文件操作继续服从现有来源与归档规则。",
+        "reversibility": "扫描本身不修改文件；进入队列后的任务可在执行前通过来源控制停止后续接管。",
+    },
+    "library.refresh_library": {
+        "action": "刷新媒体库",
+        "object": "唯一匹配的已配置 Jellyfin 或 Emby 媒体库",
+        "impact": "媒体服务器会在后台扫描该媒体库并可能更新元数据；不会移动、覆盖或删除媒体文件。",
+        "reversibility": "刷新请求无法撤回，但不会改变 MediaFlux 的媒体库映射或文件内容。",
+    },
     "local_media.set_source_trigger_enabled": {
         "action": "切换本地媒体来源触发方式",
         "object": "你按公开序号指定的本地媒体来源触发器",
