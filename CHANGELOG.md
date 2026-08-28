@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-28
+
+### Added
+- Media Agent 升级为面向项目全链路的领域编排运行时：新增能力检索、媒体事实状态、统一响应契约与目标识别，可通过自然语言组合媒体检索、缺集检查、本地来源扫描、STRM 同步、媒体库刷新、反代诊断及下载分发，并对写操作统一生成可审计确认计划（[`ccc9f14`](https://github.com/li88iioo/MediaFlux/commit/ccc9f14)、[`c84825f`](https://github.com/li88iioo/MediaFlux/commit/c84825f)、[`c858c38`](https://github.com/li88iioo/MediaFlux/commit/c858c38)）。
+- 新增受控的光鸭媒体工作区，支持目录检查、残留垃圾识别、媒体名称清理、批量改名和变更计划预览；所有移动、回收与改名操作均经过冻结计划、用户确认、后端复核和结果审计（[`b0e75db`](https://github.com/li88iioo/MediaFlux/commit/b0e75db)）。
+- 索引检索新增规范化发布信息、分层查询计划、并发控制与质量排序，改善 Nyaa、OneLou、Pirate Bay、BTBTLA 等来源的搜索召回、镜像降级和候选资源排序（[`ade8236`](https://github.com/li88iioo/MediaFlux/commit/ade8236)）。
+
+### Changed
+- Jellyfin/Emby 精准刷新改为持久化合并队列：自动合并相邻变化路径、去重并发刷新，优先刷新 Series、Movie 或媒体库物理根，自动链路不再因定位失败隐式触发全库扫描（[`daf7659`](https://github.com/li88iioo/MediaFlux/commit/daf7659)）。
+- Agent 的 Telegram/Web 进度、确认卡、操作编号与部分成功结果采用统一投影，长任务可恢复已完成检查，并允许按来源或计划项精确执行而非固定处理全部对象（[`ccc9f14`](https://github.com/li88iioo/MediaFlux/commit/ccc9f14)、[`c84825f`](https://github.com/li88iioo/MediaFlux/commit/c84825f)）。
+
+### Fixed
+- 修复本地目录浏览无法正确进入部分挂载路径、整理媒体规格统计重复，以及增量 STRM 同步跳过数量不准确的问题（[`515e3f8`](https://github.com/li88iioo/MediaFlux/commit/515e3f8)）。
+- 修复 Agent 对 Telegram 状态查询、Jellyfin/Emby 反代别名、Agent 开关表达和“检查剧集更新后推送”等复合请求的误路由，并补齐确认门、限流、操作历史及结果投影的一致性（[`c858c38`](https://github.com/li88iioo/MediaFlux/commit/c858c38)）。
+
 ## [0.1.7] - 2026-08-27
 
 ### Added
@@ -152,7 +167,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/li88iioo/MediaFlux/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/li88iioo/MediaFlux/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/li88iioo/MediaFlux/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/li88iioo/MediaFlux/compare/v0.1.4...v0.1.5
