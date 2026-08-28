@@ -55,7 +55,7 @@ class AgentBrowserTests(unittest.TestCase):
               <p id="agentSessionStatus" role="status" aria-live="polite"></p>
               <section class="agent-console is-empty">
                 <div id="agentTranscript"></div>
-                <div class="agent-empty-intro" id="agentEmptyIntro"><h1>今天想处理什么？</h1></div>
+                <div class="agent-empty-intro" id="agentEmptyIntro"><p>直接描述你想处理的任务</p></div>
                 <form id="agentComposer"><textarea id="agentPrompt" data-empty-placeholder="询问 MediaFlux" data-active-placeholder="继续描述或调整任务"></textarea><span class="agent-submit-slot"><button id="agentSend" type="submit"><span>发送任务</span><i data-lucide="arrow-up"></i></button><button id="agentStop" type="button" hidden disabled><span>停止任务</span><i data-lucide="square"></i></button></span></form>
               </section>
             </section>

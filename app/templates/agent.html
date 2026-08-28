@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Media Agent - MediaFlux{% endblock %}
 {% block body_class %}agent-page-body{% endblock %}
-{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/agent.css') }}?v=20260829d">{% endblock %}
+{% block page_styles %}<link rel="stylesheet" href="{{ url_for('static', path='css/agent.css') }}?v=20260829e">{% endblock %}
 {% block workspace_bar %}
 <div class="agent-mobile-bar">
     <button class="icon-btn workspace-menu-btn" id="toggleSidebar" aria-label="菜单" title="打开导航"><i data-lucide="menu"></i></button>
@@ -17,7 +17,7 @@
             <div class="agent-transcript" id="agentTranscript" role="log" aria-live="off" aria-relevant="additions"></div>
 
             <div class="agent-empty-intro" id="agentEmptyIntro">
-                <h1>今天想处理什么？</h1>
+                <p>直接描述你想处理的任务</p>
             </div>
 
             <form class="agent-composer" id="agentComposer">
