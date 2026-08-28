@@ -1158,7 +1158,7 @@ class SQLiteAgentConversationHistoryRepository:
         )
         presentation_source = str(presentation.get("source") or "").strip().lower()
         if (
-            presentation_source in {"llm", "system"}
+            presentation_source in {"llm", "system", "native"}
             and presentation.get("kind") == "narrative"
         ):
             narrative = self._safe_optional_output_text(

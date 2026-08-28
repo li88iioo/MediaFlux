@@ -95,8 +95,8 @@ class AgentPageTests(InitializedWebTestCase):
         )
         self.assertEqual(response.text.count("/static/css/agent.css"), 1)
         self.assertEqual(response.text.count("/static/js/agent.js"), 1)
-        self.assertIn("/static/css/agent.css?v=20260822a", response.text)
-        self.assertIn("/static/js/agent.js?v=20260822a", response.text)
+        self.assertIn("/static/css/agent.css?v=20260828a", response.text)
+        self.assertIn("/static/js/agent.js?v=20260828a", response.text)
         self.assertIn('id="agentResumeLatestSession"', response.text)
         self.assertIn("继续上次", response.text)
         self.assertNotRegex(response.text, re.compile(r"(?:API_KEY|PASSWORD|TOKEN)=", re.I))
@@ -133,9 +133,10 @@ class AgentPageTests(InitializedWebTestCase):
 
         self.assertIn("function responseNotices", source)
         self.assertIn("function renderNotices", source)
-        self.assertIn("['llm', 'system'].includes(presentation?.source)", source)
+        self.assertIn("const PUBLIC_NARRATIVE_SOURCES = new Set(['llm', 'system', 'native'])", source)
+        self.assertIn("PUBLIC_NARRATIVE_SOURCES.has(presentation?.source)", source)
         self.assertIn("section.setAttribute('aria-label', '数据说明')", source)
-        self.assertIn("data.presentation_source === 'system' ? 'system' : 'llm'", source)
+        self.assertIn("PUBLIC_NARRATIVE_SOURCES.has(data.presentation_source)", source)
         self.assertIn("notices: Array.isArray(data.notices) ? data.notices : []", source)
         self.assertIn(".agent-notices", styles)
         self.assertIn(".agent-notices-copy p", styles)
@@ -143,6 +144,13 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertNotIn("dataset.agentPrompt", render_notices)
         self.assertNotIn("dataset.agentDraft", render_notices)
         self.assertNotIn("button", render_notices)
+
+    def test_agent_frontend_collapses_search_details_when_narrative_exists(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("const COLLAPSIBLE_NARRATIVE_DETAIL_TOOLS", source)
+        self.assertIn("renderResultDisclosure(specializedData, '查看核对明细')", source)
+        self.assertIn("narrative && COLLAPSIBLE_NARRATIVE_DETAIL_TOOLS.has(toolName)", source)
 
     def test_agent_frontend_renders_workspace_overview_and_draft_workflows(self):
         source = SCRIPT.read_text(encoding="utf-8")

@@ -872,6 +872,17 @@ _RECENT_DOWNLOAD_LIBRARY_REJECT_TOKENS = (
 )
 _DISCOVERY_TV_TOKENS = ("电视剧", "剧集", "连续剧", "电视节目", "剧荒", "追剧", "追番")
 _DISCOVERY_MOVIE_TOKENS = ("电影", "影片", "片荒")
+_DISCOVERY_TV_GENRE_RE = re.compile(
+    r"(?:科幻|悬疑|犯罪|历史|战争|爱情|奇幻|恐怖|动作|欧美|国产|美|英|日|韩)剧(?:集)?"
+)
+_DISCOVERY_FILTER_GENRES = (
+    "科幻", "悬疑", "喜剧", "动作", "恐怖", "爱情", "奇幻", "犯罪",
+    "战争", "历史", "音乐", "家庭", "冒险", "动画", "动漫", "纪录片", "综艺",
+)
+_DISCOVERY_FILTER_REGIONS = (
+    "中国大陆", "中国香港", "中国台湾", "欧美", "国产", "美国", "英国",
+    "日本", "韩国", "法国", "德国", "印度", "香港", "台湾", "中国",
+)
 _DISCOVERY_CONTEXTUAL_RECOMMEND_TOKENS = ("类似", "相似", "同类", "根据", "按照", "基于", "我喜欢", "适合我")
 _BANGUMI_CALENDAR_CONTENT_TOKENS = ("番剧", "新番", "动画", "bangumi", "bgm")
 _BANGUMI_CALENDAR_MARKERS = ("日历", "放送", "每日放送")
@@ -4144,16 +4155,65 @@ def _bangumi_calendar_arguments(message: str) -> dict[str, Any]:
     return arguments
 
 
+def _discovery_recommend_media_type(normalized: str) -> str:
+    if (
+        any(token in normalized for token in _DISCOVERY_TV_TOKENS)
+        or _DISCOVERY_TV_GENRE_RE.search(normalized)
+    ):
+        return "tv"
+    if any(token in normalized for token in _DISCOVERY_MOVIE_TOKENS):
+        return "movie"
+    return "movie"
+
+
 def _discovery_recommend_arguments(message: str) -> dict[str, Any]:
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
     provider = "douban" if "豆瓣" in normalized else "tmdb"
-    if any(token in normalized for token in _DISCOVERY_TV_TOKENS):
-        media_type = "tv"
-    elif any(token in normalized for token in _DISCOVERY_MOVIE_TOKENS):
-        media_type = "movie"
-    else:
-        media_type = "movie"
-    return {"provider": provider, "media_type": media_type, "page": 1, "limit": 10}
+    return {
+        "provider": provider,
+        "media_type": _discovery_recommend_media_type(normalized),
+        "page": 1,
+        "limit": 10,
+    }
+
+
+def _discovery_filtered_recommend_arguments(
+    message: str,
+) -> dict[str, Any] | None:
+    """将年份/地区/题材推荐稳定投影为带约束的聚合搜索。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    year_match = re.search(r"(?<![0-9])((?:19|20)[0-9]{2})(?![0-9])", normalized)
+    genre = next((token for token in _DISCOVERY_FILTER_GENRES if token in normalized), "")
+    region = next((token for token in _DISCOVERY_FILTER_REGIONS if token in normalized), "")
+    if year_match is None and not genre and not region:
+        return None
+
+    media_type = _discovery_recommend_media_type(normalized)
+    query_parts = [
+        year_match.group(1) if year_match else "",
+        region,
+        genre,
+    ]
+    query = " ".join(part for part in query_parts if part).strip()
+    if not query:
+        return None
+    arguments: dict[str, Any] = {
+        "query": query,
+        "page": 1,
+        "limit": 20,
+        "media_type": media_type,
+    }
+    if year_match:
+        arguments["year"] = year_match.group(1)
+    if region:
+        arguments["region"] = region
+    if genre:
+        arguments["genre"] = genre
+    if "豆瓣" in normalized:
+        arguments["providers"] = ["douban"]
+    elif "tmdb" in normalized:
+        arguments["providers"] = ["tmdb"]
+    return arguments
 
 
 def _extract_discovery_search_query(message: str) -> str:
@@ -9725,6 +9785,11 @@ class AgentOrchestrator:
                 ["可以问：推荐几部电影，或豆瓣推荐电视剧。"],
             )
         if is_discovery_recommend_message(lower):
+            filtered_arguments = _discovery_filtered_recommend_arguments(message)
+            if filtered_arguments is not None:
+                return self._invoke_query_read(
+                    "discovery.search", filtered_arguments, owner=owner
+                )
             return self._invoke_query_read(
                 "discovery.recommend", _discovery_recommend_arguments(message), owner=owner
             )

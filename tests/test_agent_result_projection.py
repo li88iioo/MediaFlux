@@ -620,6 +620,69 @@ class AgentResultProjectionTests(unittest.TestCase):
         )
         self.assertEqual(response["result"]["data"]["steps"][0]["tool_name"], "web.search")
 
+    def test_discovery_fallback_is_a_readable_media_list(self):
+        from app.agent.result_projection import attach_public_fallback_presentation
+
+        response = {
+            "mode": "read_only",
+            "tool_call": {"name": "discovery.recommend", "arguments": {}},
+            "result": {
+                "ok": True,
+                "status": "success",
+                "summary": "推荐列表返回 2 项内容",
+                "suggestions": [],
+                "data": {
+                    "media_type": "movie",
+                    "items": [
+                        {
+                            "title": "示例电影",
+                            "year": "2026",
+                            "release_date": "2026-08-01",
+                            "rating": 8.6,
+                        },
+                        {"title": "另一部电影", "year": "2025"},
+                    ],
+                },
+            },
+        }
+
+        projected = attach_public_fallback_presentation(response)
+
+        self.assertEqual(projected["presentation"]["source"], "system")
+        self.assertIn("为你整理了以下电影推荐", projected["presentation"]["narrative"])
+        self.assertIn("《示例电影》:2026 · 2026-08-01 · 评分 8.6", projected["presentation"]["narrative"])
+        self.assertIn("《另一部电影》:2025", projected["presentation"]["narrative"])
+        self.assertNotIn("items", projected["presentation"]["narrative"])
+
+    def test_unrecognized_presentation_source_is_replaced_by_public_fallback(self):
+        from app.agent.result_projection import attach_public_fallback_presentation
+
+        response = {
+            "mode": "read_only",
+            "tool_call": {"name": "discovery.search", "arguments": {}},
+            "result": {
+                "ok": True,
+                "status": "success",
+                "summary": "找到结果",
+                "suggestions": [],
+                "data": {
+                    "query": "2025 科幻",
+                    "media_type": "tv",
+                    "items": [{"title": "示例剧", "year": "2025"}],
+                },
+            },
+            "presentation": {
+                "source": "unknown",
+                "kind": "narrative",
+                "narrative": "不应直接信任。",
+            },
+        }
+
+        projected = attach_public_fallback_presentation(response)
+
+        self.assertEqual(projected["presentation"]["source"], "system")
+        self.assertIn("围绕“2025 科幻”找到以下剧集", projected["presentation"]["narrative"])
+
     def test_projection_requires_completed_tool_response(self):
         self.assertIsNone(project_agent_response_for_llm({}))
         self.assertIsNone(project_agent_response_for_llm({"tool_call": {}, "result": {}}))

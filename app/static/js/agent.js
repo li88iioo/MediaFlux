@@ -510,6 +510,10 @@
     const SEARCH_TOOLS = new Set([
         'workspace.search', 'library.search', 'discovery.search', 'indexer.search_resources',
     ]);
+    const PUBLIC_NARRATIVE_SOURCES = new Set(['llm', 'system', 'native']);
+    const COLLAPSIBLE_NARRATIVE_DETAIL_TOOLS = new Set([
+        'workspace.search', 'library.search', 'discovery.search', 'web.search',
+    ]);
     const SEARCH_SOURCE_LABELS = {
         library: '本地媒体', rss: 'RSS 订阅', downloads: '下载任务', organize: '整理任务',
         local_media: '本地媒体任务', discovery: '影视元数据', indexer: '资源站',
@@ -1635,7 +1639,7 @@
     }
 
     function renderNarrative(presentation) {
-        if (!['llm', 'system'].includes(presentation?.source) || presentation?.kind !== 'narrative') return null;
+        if (!PUBLIC_NARRATIVE_SOURCES.has(presentation?.source) || presentation?.kind !== 'narrative') return null;
         const narrative = String(presentation.narrative || '').trim();
         if (!narrative) return null;
         return renderTextBlocks(narrative, 'agent-narrative agent-rich-text', {promoteFirst: true});
@@ -1644,7 +1648,7 @@
     function responseInspectionTrace(payload) {
         const rawItems = Array.isArray(payload?.agent_trace) ? payload.agent_trace : [];
         const partial = payload?.agent_partial?.complete === false;
-        const attentionOnly = ['llm', 'system'].includes(payload?.presentation?.source)
+        const attentionOnly = PUBLIC_NARRATIVE_SOURCES.has(payload?.presentation?.source)
             && payload?.presentation?.kind === 'narrative';
         const projected = rawItems.flatMap((item) => {
             if (!item || typeof item !== 'object') return [];
@@ -1832,8 +1836,12 @@
             {attentionOnly: Boolean(narrative)},
         );
         const genericData = specializedData || hideRepeatedReadPlan ? null : renderData(display.details);
-        if (specializedData) card.append(specializedData);
-        else if (genericData) {
+        if (specializedData) {
+            const detail = narrative && COLLAPSIBLE_NARRATIVE_DETAIL_TOOLS.has(toolName)
+                ? renderResultDisclosure(specializedData, '查看核对明细')
+                : specializedData;
+            if (detail) card.append(detail);
+        } else if (genericData) {
             card.append(renderResultDisclosure(genericData));
         }
         const notices = renderNotices(payload);
@@ -2916,7 +2924,9 @@
                         guidance: Array.isArray(data.guidance) ? data.guidance : [],
                         notices: Array.isArray(data.notices) ? data.notices : [],
                         presentation: narrative ? {
-                            source: data.presentation_source === 'system' ? 'system' : 'llm',
+                            source: PUBLIC_NARRATIVE_SOURCES.has(data.presentation_source)
+                                ? data.presentation_source
+                                : 'llm',
                             kind: 'narrative',
                             narrative,
                             guidance: Array.isArray(data.guidance) ? data.guidance : [],

@@ -943,6 +943,25 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("底层摘要不应重复出现", text)
         self.assertNotIn("降级", text)
 
+    def test_native_narrative_renders_like_other_public_narratives(self):
+        text = render_agent_response({
+            "result": {
+                "ok": True,
+                "status": "success",
+                "summary": "底层摘要不应重复出现",
+                "suggestions": [],
+            },
+            "presentation": {
+                "version": 1,
+                "source": "native",
+                "kind": "narrative",
+                "narrative": "原生 Agent 已经整理好推荐结果。",
+            },
+        })
+
+        self.assertIn("原生 Agent 已经整理好推荐结果", text)
+        self.assertNotIn("底层摘要不应重复出现", text)
+
     def test_external_source_notice_is_static_and_not_a_followup_action(self):
         text = render_agent_response({
             "result": {

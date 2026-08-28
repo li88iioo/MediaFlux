@@ -399,7 +399,7 @@ def _public_session_projection(session: dict[str, Any]) -> dict[str, Any]:
                 public_data["notices"] = notices
             else:
                 public_data.pop("notices", None)
-            if public_data.get("presentation_source") not in {"llm", "system"}:
+            if public_data.get("presentation_source") not in {"llm", "system", "native"}:
                 public_data.pop("presentation_source", None)
         elif role == "user":
             public_data["text"] = _public_history_multiline_text(

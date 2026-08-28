@@ -220,6 +220,32 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         self.assertIn("第一段直接回答", context[-1]["text"])
         self.assertNotIn("底层工具摘要", context[-1]["text"])
 
+    def test_native_narrative_source_is_persisted_for_web_restore(self):
+        response = _response(summary="底层工具摘要")
+        response["presentation"] = {
+            "source": "native",
+            "kind": "narrative",
+            "narrative": "原生 Agent 已完成推荐整理。",
+        }
+
+        self.assertTrue(self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="推荐几部电影",
+            response=response,
+        ))
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        assistant = history["messages"][1]["data"]
+        self.assertEqual(assistant["presentation_source"], "native")
+        projected = _public_session_projection(history)
+        self.assertEqual(
+            projected["messages"][1]["data"]["presentation_source"],
+            "native",
+        )
+
     def test_system_fallback_narrative_is_persisted_and_restored(self):
         response = _response(summary="底层工具摘要")
         response["presentation"] = {

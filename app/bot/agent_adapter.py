@@ -2436,7 +2436,7 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
     if (
         isinstance(presentation, dict)
         and presentation.get("kind") == "narrative"
-        and presentation.get("source") in {"llm", "system"}
+        and presentation.get("source") in {"llm", "system", "native"}
     ):
         narrative = _public_multiline_html(
             presentation.get("narrative"),

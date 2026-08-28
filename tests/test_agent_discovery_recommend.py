@@ -191,6 +191,29 @@ class AgentDiscoveryRecommendTests(unittest.TestCase):
                     "elapsed_ms": response["tool_call"]["elapsed_ms"],
                 })
 
+        filtered = agent.query("2025 科幻剧推荐")
+        self.assertEqual(filtered["tool_call"]["name"], "discovery.search")
+        self.assertEqual(filtered["tool_call"]["arguments"], {
+            "query": "2025 科幻",
+            "page": 1,
+            "limit": 20,
+            "media_type": "tv",
+            "year": "2025",
+            "genre": "科幻",
+        })
+        self.assertEqual(
+            agent.query("2025 欧美悬疑电影推荐")["tool_call"]["arguments"],
+            {
+                "query": "2025 欧美 悬疑",
+                "page": 1,
+                "limit": 20,
+                "media_type": "movie",
+                "year": "2025",
+                "region": "欧美",
+                "genre": "悬疑",
+            },
+        )
+
         self.assertEqual(agent.query("在网上找《沙丘2》电影")["tool_call"]["name"], "discovery.search")
         self.assertEqual(
             agent.query("用 TMDB 搜索《黑镜》，推荐类似的")["tool_call"]["name"],

@@ -1412,6 +1412,67 @@ def _fallback_read_plan_narrative(result: Mapping[str, Any]) -> str:
     )
 
 
+def _fallback_discovery_narrative(
+    tool_name: str, result: Mapping[str, Any]
+) -> str:
+    """把影视推荐/搜索结果收敛成无需模型也可直接阅读的短列表。"""
+    if tool_name not in {"discovery.recommend", "discovery.search"}:
+        return ""
+    data = result.get("data") if isinstance(result.get("data"), Mapping) else {}
+    raw_items = data.get("items")
+    if not isinstance(raw_items, Sequence) or isinstance(
+        raw_items, (str, bytes, bytearray)
+    ):
+        return ""
+
+    lines: list[str] = []
+    media_type = sanitize_public_text(data.get("media_type"), limit=20)
+    for item in raw_items[:8]:
+        if not isinstance(item, Mapping):
+            continue
+        title = sanitize_public_text(
+            item.get("title") or item.get("标题"), limit=100
+        )
+        if not title:
+            continue
+        year = sanitize_public_text(item.get("year") or item.get("年份"), limit=8)
+        release_date = sanitize_public_text(
+            item.get("release_date") or item.get("上映日期"), limit=16
+        )
+        rating_value = item.get("rating")
+        if rating_value is None or rating_value == "":
+            rating_value = item.get("豆瓣评分")
+        rating = ""
+        try:
+            numeric_rating = float(rating_value)
+        except (TypeError, ValueError):
+            numeric_rating = 0.0
+        if numeric_rating > 0:
+            rating = f"评分 {numeric_rating:g}"
+        meta = " · ".join(value for value in (year, release_date, rating) if value)
+        lines.append(f"- 《{title}》" + (f"：{meta}" if meta else ""))
+
+    if not lines:
+        return ""
+    if media_type not in {"movie", "tv"}:
+        first = raw_items[0] if raw_items and isinstance(raw_items[0], Mapping) else {}
+        media_type = sanitize_public_text(
+            first.get("media_type") or first.get("媒体类型"), limit=20
+        )
+    label = "剧集" if media_type == "tv" else "电影"
+    if tool_name == "discovery.search":
+        query = sanitize_public_text(data.get("query"), limit=120)
+        intro = (
+            f"围绕“{query}”找到以下{label}:"
+            if query else f"找到以下{label}:"
+        )
+    else:
+        intro = f"为你整理了以下{label}推荐:"
+    return sanitize_public_multiline_text(
+        intro + "\n\n" + "\n".join(lines), limit=1400
+    )
+
+
 def build_public_fallback_presentation(
     response: Mapping[str, Any],
 ) -> dict[str, Any] | None:
@@ -1434,6 +1495,8 @@ def build_public_fallback_presentation(
     )
     if tool_name == "agent.read_plan" or mode == "read_plan":
         narrative = _fallback_read_plan_narrative(result)
+    if not narrative:
+        narrative = _fallback_discovery_narrative(tool_name, result)
     if not narrative:
         narrative = sanitize_public_multiline_text(
             display.get("summary") or display.get("error"), limit=1200
@@ -1463,6 +1526,8 @@ def attach_public_fallback_presentation(
     presentation = response.get("presentation")
     if (
         isinstance(presentation, Mapping)
+        and str(presentation.get("source") or "").strip().casefold()
+        in {"llm", "system", "native"}
         and presentation.get("kind") == "narrative"
         and sanitize_public_multiline_text(presentation.get("narrative"), limit=1800)
     ):
