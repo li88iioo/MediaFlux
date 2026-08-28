@@ -1788,7 +1788,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         refresh.assert_called_once_with()
         reconcile.assert_not_called()
         action_store.revoke_owner.assert_called_once_with(owner="tg:v1:100\x1f200")
-        self.assertIn("Telegram 接入：<b>已关闭</b>", bot.edits[-1][0])
+        self.assertIn("Telegram Agent 已关闭", bot.edits[-1][0])
+        self.assertIn("再次发送 /agent", bot.edits[-1][0])
+        self.assertIsNone(bot.edits[-1][3]["reply_markup"])
         self.assertEqual(bot.answers[-1][1], "Telegram Agent 已关闭")
 
     def test_agent_control_enable_all_updates_both_switches_and_reconciles(self):
@@ -1852,9 +1854,24 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         )
         refresh.assert_called_once_with()
         reconcile.assert_called_once_with()
-        self.assertIn("全局服务：<b>已开启</b>", bot.edits[-1][0])
-        self.assertIn("Telegram 接入：<b>已开启</b>", bot.edits[-1][0])
+        self.assertIn("Media Agent 已开启", bot.edits[-1][0])
+        self.assertIn("再次发送 /agent", bot.edits[-1][0])
+        self.assertIsNone(bot.edits[-1][3]["reply_markup"])
         self.assertEqual(bot.answers[-1][1], "Media Agent 已开启")
+
+        fresh_bot = _Bot()
+        with patch(
+            "app.bot.agent_adapter.is_agent_enabled", return_value=True
+        ), patch(
+            "app.bot.agent_adapter.get", side_effect=fake_get
+        ), patch("app.bot.agent_adapter.get_agent_service") as service:
+            handle_agent_guide(fresh_bot, _message("/agent"), _Telebot)
+        service.assert_not_called()
+        self.assertIn("Telegram 接入：<b>已开启</b>", fresh_bot.replies[0][1])
+        self.assertEqual(
+            [button.text for button in fresh_bot.replies[0][2]["reply_markup"].buttons],
+            ["关闭 Telegram Agent", "关闭全部 Media Agent"],
+        )
 
     def test_agent_control_global_close_requires_confirmation_and_reconciles(self):
         from app.modules.telegram_write_confirmations import (
@@ -1919,7 +1936,9 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         save.assert_called_once_with({"AGENT_ENABLED": "0"})
         refresh.assert_called_once_with()
         reconcile.assert_called_once_with()
-        self.assertIn("全局服务：<b>已关闭</b>", bot.edits[-1][0])
+        self.assertIn("Media Agent 已全部关闭", bot.edits[-1][0])
+        self.assertIn("再次发送 /agent", bot.edits[-1][0])
+        self.assertIsNone(bot.edits[-1][3]["reply_markup"])
         self.assertEqual(bot.answers[-1][1], "Media Agent 已全部关闭")
 
     def test_agent_reset_is_owner_scoped_and_fail_closed(self):
@@ -2759,10 +2778,10 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         )
         markup = bot.replies[0][2]["reply_markup"]
         self.assertEqual(len(markup.buttons), 2)
-        self.assertEqual(markup.buttons[0].text, "确认：提交资源下载")
+        self.assertEqual(markup.buttons[0].text, "执行")
         rendered = bot.replies[0][1]
         for expected in (
-            "需要你确认：提交资源下载",
+            "行动计划：提交资源下载",
             "范围",
             "你刚才选择的资源候选",
             "影响",
@@ -4938,7 +4957,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             self.assertEqual(len(confirmation_markup.buttons), 2)
             self.assertEqual(
                 confirmation_markup.buttons[0].text,
-                "确认：提交资源下载",
+                "执行",
             )
             self.assertIn("范围", bot.edits[0][0])
             self.assertIn("下载器连接正常", bot.edits[0][0])

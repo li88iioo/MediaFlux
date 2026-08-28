@@ -742,7 +742,24 @@ class AgentBrowserTests(unittest.TestCase):
             "mode": "confirmation_required",
             "tool_call": {"name": "indexer.submit_resource", "elapsed_ms": 5},
             "result": {"ok": True, "status": "ready", "summary": "资源提交预检已完成", "data": {}, "evidence": [], "suggestions": []},
-            "confirmation": {"confirmation_id": "confirm-demo", "risk": "danger", "expires_in": 120},
+            "confirmation": {"confirmation_id": "legacy-confirm-demo", "risk": "danger", "expires_in": 120},
+            "action_plan": {
+                "version": 1,
+                "plan_id": "plan-confirm-demo-123456",
+                "status": "awaiting_approval",
+                "title": "提交资源下载",
+                "target": "你刚才选择的资源候选",
+                "impact": "会向 qBittorrent 创建下载任务。",
+                "reversibility": "可在下载器中暂停或删除任务。",
+                "risk": "danger",
+                "preflight_at": "2026-08-28T12:00:00+08:00",
+                "preflight_summary": "下载器连接正常。",
+                "expires_in": 120,
+                "decisions": [
+                    {"id": "execute", "label": "执行"},
+                    {"id": "cancel", "label": "取消"},
+                ],
+            },
         })
         self.page.evaluate("payload => { window.__agentConfirmResponse = payload; }", {
             "request_id": "confirm-test",
@@ -757,6 +774,14 @@ class AgentBrowserTests(unittest.TestCase):
         self.assertIn("Black Mirror", self.page.locator(".agent-search-group").inner_text())
         action.click()
         self.page.locator(".agent-confirmation-card").wait_for()
+        self.assertIn("行动计划", self.page.locator(".agent-confirmation-head").inner_text())
+        self.assertIn("提交资源下载", self.page.locator(".agent-confirmation-card").inner_text())
+        self.assertEqual(
+            self.page.locator(".agent-confirmation-submit").inner_text(), "执行"
+        )
+        self.assertEqual(
+            self.page.locator(".agent-confirmation-cancel").inner_text(), "取消"
+        )
         calls = self.page.evaluate("window.__agentCalls")
         prepare_calls = [call for call in calls if "/prepare" in call["url"]]
         self.assertEqual(len(prepare_calls), 1)
@@ -780,10 +805,12 @@ class AgentBrowserTests(unittest.TestCase):
         calls = self.page.evaluate("window.__agentCalls")
         confirm_calls = [call for call in calls if call["url"].endswith("/actions/confirm")]
         self.assertEqual(len(confirm_calls), 1)
+        confirm_body = json.loads(confirm_calls[0]["body"])
         self.assertRegex(
-            json.loads(confirm_calls[0]["body"])["session_id"],
+            confirm_body["session_id"],
             r"^[A-Za-z0-9_-]{16,64}$",
         )
+        self.assertEqual(confirm_body["confirmation_id"], "plan-confirm-demo-123456")
         self.assertEqual(self.page.locator(".agent-confirmation-submit").count(), 0)
 
     def test_new_conversation_aborts_inflight_resource_prepare(self):
@@ -1080,7 +1107,7 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.wait_for_timeout(1250)
         during_height = actions.bounding_box()["height"]
         self.assertAlmostEqual(before_height, during_height, delta=1)
-        self.assertIn("写操作正在服务端受控执行", card.inner_text())
+        self.assertIn("服务端正在受控执行", card.inner_text())
         self.assertIn("新会话、切换和删除将在结束后恢复", execution.inner_text())
         self.assertTrue(self.page.locator("#agentNewSession").is_disabled())
         self.assertNotIn("未执行任何写操作", card.inner_text())

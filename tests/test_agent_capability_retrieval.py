@@ -51,6 +51,11 @@ class AgentCapabilityRetrievalTests(unittest.TestCase):
 
         self.assertIn("guangya.organize.cleanup.preview", names)
 
+    def test_cleanup_keep_followup_recalls_item_review_tool(self):
+        names = self._names("刚才的残留计划保留第 2 个，其他判断不变")
+
+        self.assertIn("guangya.organize.cleanup.classify", names)
+
     def test_ambiguous_media_garbage_request_exposes_both_safe_previews(self):
         names = self._names("帮我整理一下 a 目录媒体目录和媒体信息的垃圾信息")
 

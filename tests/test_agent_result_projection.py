@@ -177,6 +177,33 @@ class AgentResultProjectionTests(unittest.TestCase):
         self.assertIsNotNone(projected)
         self.assertEqual(projected["data"]["策略"]["巡检间隔（小时）"], 12)
 
+    def test_cleanup_review_projection_preserves_untrusted_filename_as_data(self):
+        projected = project_agent_response_for_llm({
+            "tool_call": {
+                "name": "guangya.organize.cleanup.preview",
+                "arguments": {},
+            },
+            "result": {
+                "ok": True,
+                "status": "selection_required",
+                "summary": "发现 1 个待复核候选",
+                "data": {
+                    "candidate_count": 1,
+                    "undecided_count": 1,
+                    "review_summaries": [
+                        "#1 [待复核] 目录「a」；文件：「xxx.png」"
+                    ],
+                },
+                "evidence": [],
+                "suggestions": [],
+                "error": "",
+            },
+        })
+        self.assertIsNotNone(projected)
+        self.assertTrue(projected["untrusted_content"])
+        self.assertIn("xxx.png", repr(projected["data"]["候选复核明细"]))
+        self.assertNotIn("内部检查", repr(projected["data"]))
+
     def test_public_business_statuses_survive_llm_projection_and_render_readably(self):
         labels = {
             "updates_available": "发现需要关注的内容",

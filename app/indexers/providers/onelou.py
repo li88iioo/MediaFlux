@@ -11,6 +11,7 @@ from urllib.parse import quote, urlsplit
 from bs4 import BeautifulSoup
 import httpx
 
+from ..concurrency import CrossLoopAsyncLock
 from ..errors import (
     IndexerError,
     IndexerInvalidResponse,
@@ -87,7 +88,7 @@ class OneLouAdapter(IndexerAdapter):
         self.min_interval_seconds = max(0.0, float(min_interval_seconds))
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleeper or asyncio.sleep
-        self._search_slot_lock = asyncio.Lock()
+        self._search_slot_lock = CrossLoopAsyncLock()
         self._last_search_started = 0.0
 
     def iter_http_clients(self) -> tuple[object, ...]:

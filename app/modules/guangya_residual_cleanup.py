@@ -10,6 +10,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,7 @@ _MAX_PLAN_BYTES = 16 * 1024 * 1024
 _MAX_SCANNED_ITEMS = 100_000
 _MAX_SCANNED_DIRS = 5_000
 _MAX_RESIDUAL_FILES = 32
+_MAX_REVIEW_FILES = 8
 _MAX_RESIDUAL_DIRS = 64
 _MAX_RESIDUAL_BYTES = 128 * 1024 * 1024
 _MAX_CANDIDATES = 500
@@ -92,7 +94,7 @@ class _TreeSummary:
             self.file_count > 0
             and not self.has_video
             and not self.has_unsafe
-            and self.file_count <= _MAX_RESIDUAL_FILES
+            and self.file_count <= _MAX_REVIEW_FILES
             and self.dir_count <= _MAX_RESIDUAL_DIRS
             and self.total_size <= _MAX_RESIDUAL_BYTES
         )
@@ -342,6 +344,11 @@ def confirm_cleanup_plan(
     payload = load_cleanup_plan(
         plan_id, owner=owner, expected_fingerprint=expected_fingerprint
     )
+    stats = dict(payload.get("stats") or {})
+    if max(0, int(stats.get("undecided_count") or 0)) > 0:
+        raise GuangYaCleanupPlanError("仍有候选尚未逐项复核，不能确认执行")
+    if not list(payload.get("residuals") or []) and not list(payload.get("empties") or []):
+        raise GuangYaCleanupPlanError("当前冻结计划没有需要执行的清理对象")
     current = time.time()
     payload.update({
         "status": "confirmed",
@@ -399,7 +406,8 @@ def _supports_guarded_empty_delete(client: Any) -> bool:
     return callable(getattr(client, "delete_empty_directory", None))
 
 
-def _is_strict_junk(item: GuangYaFile) -> bool:
+def _is_cleanup_review_candidate(item: GuangYaFile) -> bool:
+    """只判断文件是否可以交给 Agent 按文件名复核，不直接判定为垃圾。"""
     name = str(item.name or "")
     lowered = name.casefold()
     if lowered in _SYSTEM_JUNK:
@@ -486,10 +494,10 @@ def build_cleanup_plan(
     for source_index, source in enumerate(sources, start=1):
         source_id = str(source.get("id") or "").strip()
         source_name = str(source.get("name") or f"来源{source_index}")
-        queue: list[tuple[str, str]] = [(source_id, "/")]
+        queue = deque([(source_id, "/")])
         source_children[source_index] = []
         while queue:
-            parent_id, parent_path = queue.pop(0)
+            parent_id, parent_path = queue.popleft()
             items = client.list_dir(parent_id)
             for item in items:
                 scanned_items += 1
@@ -523,7 +531,7 @@ def build_cleanup_plan(
             summary.total_size += max(0, int(item.size or 0))
             if _extension(item) in video_exts:
                 summary.has_video = True
-            elif not _is_strict_junk(item):
+            elif not _is_cleanup_review_candidate(item):
                 summary.has_unsafe = True
         for child_id in node.children:
             child = summaries[child_id]
@@ -556,7 +564,7 @@ def build_cleanup_plan(
             else:
                 preserved_dirs += 1
             return
-        if summary.has_video or summary.has_unsafe:
+        if summary.has_video or summary.has_unsafe or node.files:
             preserved_dirs += 1
         for child_id in node.children:
             select(child_id, blocked=False)
@@ -565,22 +573,29 @@ def build_cleanup_plan(
         for node_id in child_ids:
             select(node_id)
 
-    if len(residual_ids) + len(empty_ids) > safe_max:
-        raise GuangYaCleanupPlanError(
-            f"清理候选超过本次上限 {safe_max} 个，请先缩小来源或提高上限"
-        )
-    residuals: list[dict[str, Any]] = []
-    quarantine_files = 0
+    deferred_candidate_count = max(0, len(residual_ids) - safe_max)
+    residual_ids = residual_ids[:safe_max]
+    empty_capacity = max(0, _MAX_CANDIDATES - len(residual_ids))
+    deferred_empty_dir_count = max(0, len(empty_ids) - empty_capacity)
+    empty_ids = empty_ids[:empty_capacity]
+    candidates: list[dict[str, Any]] = []
     for index, node_id in enumerate(residual_ids, start=1):
         node = nodes[node_id]
         tree = _collect_tree_entries(node_id, nodes)
-        quarantine_files += summaries[node_id].file_count
-        residuals.append({
+        candidates.append({
+            "candidate_number": index,
             "root": _snapshot(node.item),
             "tree": tree,
             "signature": _signature(tree),
             "container_name": f"{index:03d}-{_safe_public_name(node.item.name, '残留目录')}",
             "source_index": node.source_index,
+            "file_count": summaries[node_id].file_count,
+            "total_size": summaries[node_id].total_size,
+            "file_names": [
+                str(entry.get("name") or "")
+                for entry in tree
+                if not bool(entry.get("is_dir"))
+            ],
         })
     empties = [
         {"root": _snapshot(nodes[node_id].item), "depth": nodes[node_id].path.count("/")}
@@ -594,7 +609,9 @@ def build_cleanup_plan(
         "owner_digest": _owner_digest(owner),
         "credential_generation": int(client.credential_generation),
         "sources": [str(item.get("id") or "") for item in sources],
-        "residuals": residuals,
+        "candidates": candidates,
+        "candidate_decisions": {},
+        "residuals": [],
         "empties": empties,
     }
     fingerprint = hashlib.sha256(json.dumps(
@@ -617,15 +634,24 @@ def build_cleanup_plan(
             "scanned_items": scanned_items,
             "scanned_dirs": scanned_dirs,
             "empty_dir_count": len(empties),
-            "residual_dir_count": len(residuals),
-            "quarantine_file_count": quarantine_files,
+            "candidate_count": len(candidates),
+            "reviewed_count": 0,
+            "selected_count": 0,
+            "kept_count": 0,
+            "undecided_count": len(candidates),
+            "deferred_candidate_count": deferred_candidate_count,
+            "deferred_empty_dir_count": deferred_empty_dir_count,
+            "residual_dir_count": 0,
+            "quarantine_file_count": 0,
             "preserved_dir_count": preserved_dirs,
             "unsupported_empty_dir_count": unsupported_empty_dirs,
         },
         "samples": [
-            str(item["root"]["name"]) for item in residuals[:3]
+            str(item["root"]["name"]) for item in candidates[:3]
         ] + [str(item["root"]["name"]) for item in empties[:2]],
-        "residuals": residuals,
+        "candidates": candidates,
+        "candidate_decisions": {},
+        "residuals": [],
         "empties": empties,
     }
     _atomic_write(payload)
@@ -637,6 +663,143 @@ def build_cleanup_plan(
         discard_cleanup_plan(plan_id)
         raise GuangYaCleanupPlanError("私有残留清理计划空间已满，请稍后重试")
     return payload
+
+
+def revise_cleanup_plan(
+    plan_id: str,
+    *,
+    owner: str,
+    expected_fingerprint: str,
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """按候选编号更新私有冻结计划；未明确隔离的候选始终保留。"""
+    plan = load_cleanup_plan(
+        plan_id, owner=owner, expected_fingerprint=expected_fingerprint
+    )
+    if str(plan.get("status") or "preview") != "preview":
+        raise GuangYaCleanupPlanStale("残留清理计划已进入执行阶段，请重新预览")
+    candidates = [
+        dict(item) for item in list(plan.get("candidates") or [])
+        if isinstance(item, dict)
+    ]
+    by_number = {
+        int(item.get("candidate_number") or 0): item
+        for item in candidates
+        if int(item.get("candidate_number") or 0) > 0
+    }
+    if len(by_number) != len(candidates):
+        raise GuangYaCleanupPlanError("残留清理候选编号异常，请重新预览")
+
+    current_decisions = {
+        str(key): dict(value)
+        for key, value in dict(plan.get("candidate_decisions") or {}).items()
+        if isinstance(value, dict)
+    }
+    seen: set[int] = set()
+    for raw in decisions:
+        if not isinstance(raw, dict):
+            raise GuangYaCleanupPlanError("候选复核结果格式无效")
+        try:
+            number = int(raw.get("candidate_number") or 0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise GuangYaCleanupPlanError("候选编号必须是整数") from exc
+        if number not in by_number:
+            raise GuangYaCleanupPlanError(f"候选 #{number} 不存在或已过期")
+        if number in seen:
+            raise GuangYaCleanupPlanError(f"候选 #{number} 出现重复决定")
+        seen.add(number)
+        action = str(raw.get("action") or "").strip().casefold()
+        if action not in {"quarantine", "keep"}:
+            raise GuangYaCleanupPlanError(f"候选 #{number} 的处理决定无效")
+        reason = unicodedata.normalize("NFKC", str(raw.get("reason") or ""))
+        reason = " ".join(reason.split())[:160]
+        current_decisions[str(number)] = {
+            "action": action,
+            "reason": reason,
+        }
+
+    residuals: list[dict[str, Any]] = []
+    selected_file_count = 0
+    selected_numbers: list[int] = []
+    kept_numbers: list[int] = []
+    for number, candidate in sorted(by_number.items()):
+        decision = current_decisions.get(str(number)) or {}
+        action = str(decision.get("action") or "")
+        if action == "quarantine":
+            selected_numbers.append(number)
+            selected_file_count += max(0, int(candidate.get("file_count") or 0))
+            residuals.append({
+                key: candidate[key]
+                for key in (
+                    "candidate_number", "root", "tree", "signature",
+                    "container_name", "source_index", "file_count", "total_size",
+                )
+                if key in candidate
+            })
+        elif action == "keep":
+            kept_numbers.append(number)
+
+    reviewed_count = len(selected_numbers) + len(kept_numbers)
+    stats = dict(plan.get("stats") or {})
+    stats.update({
+        "candidate_count": len(candidates),
+        "reviewed_count": reviewed_count,
+        "selected_count": len(selected_numbers),
+        "kept_count": len(kept_numbers),
+        "undecided_count": max(0, len(candidates) - reviewed_count),
+        "residual_dir_count": len(residuals),
+        "quarantine_file_count": selected_file_count,
+    })
+
+    new_plan_id = uuid.uuid4().hex
+    current = time.time()
+    revised = {
+        key: value for key, value in plan.items()
+        if key not in {
+            "auth", "confirmed_at", "confirmed_at_epoch", "execute_until_epoch",
+            "execution", "updated_at",
+        }
+    }
+    revised.update({
+        "plan_id": new_plan_id,
+        "created_at": _now_iso(),
+        "created_at_epoch": current,
+        "expires_at_epoch": current + _PLAN_TTL_SECONDS,
+        "status": "preview",
+        "selection_revision": max(0, int(plan.get("selection_revision") or 0)) + 1,
+        "candidate_decisions": current_decisions,
+        "residuals": residuals,
+        "stats": stats,
+        "samples": [
+            str(item.get("root", {}).get("name") or "") for item in residuals[:3]
+        ] + [
+            str(item.get("root", {}).get("name") or "")
+            for item in list(plan.get("empties") or [])[:2]
+        ],
+        "batch_name": datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-")
+        + new_plan_id[:8],
+    })
+    fingerprint_payload = {
+        "owner_digest": revised.get("owner_digest"),
+        "credential_generation": revised.get("credential_generation"),
+        "sources": list(revised.get("source_ids") or []),
+        "candidates": candidates,
+        "candidate_decisions": current_decisions,
+        "residuals": residuals,
+        "empties": list(revised.get("empties") or []),
+    }
+    revised["fingerprint"] = hashlib.sha256(json.dumps(
+        fingerprint_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")).hexdigest()
+    _atomic_write(revised)
+    capacity = maintain_cleanup_plans()
+    if (
+        int(capacity.get("active") or 0) > _MAX_ACTIVE_PLANS + 1
+        or int(capacity.get("bytes") or 0) > _MAX_STORAGE_BYTES + _MAX_PLAN_BYTES
+    ):
+        discard_cleanup_plan(new_plan_id)
+        raise GuangYaCleanupPlanError("私有残留清理计划空间已满，请稍后重试")
+    return revised
 
 
 def _matches(item: GuangYaFile | None, snapshot: dict[str, Any]) -> bool:
@@ -657,9 +820,9 @@ def _rescan_tree(client: GuangYaClient, root: dict[str, Any]) -> list[dict[str, 
     if not _matches(current, root):
         raise GuangYaCleanupPlanStale("残留目录状态已变化，请重新预览")
     entries = [_snapshot(current)]
-    queue = [root_id]
+    queue = deque([root_id])
     while queue:
-        directory_id = queue.pop(0)
+        directory_id = queue.popleft()
         for item in client.list_dir(directory_id):
             entries.append(_snapshot(item))
             if item.is_dir:
@@ -686,6 +849,49 @@ def _find_unique_dir(client: GuangYaClient, parent_id: str, name: str) -> str:
     if len(matches) != 1 or (created and str(matches[0].file_id) != created):
         raise GuangYaCleanupPlanError("隔离目录创建后校验失败")
     return str(matches[0].file_id)
+
+
+def _validated_selected_residuals(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """复核逐项决定与执行清单完全一致，防止保留项进入写入阶段。"""
+    residuals = [
+        dict(item) for item in list(plan.get("residuals") or [])
+        if isinstance(item, dict)
+    ]
+    candidates = [
+        dict(item) for item in list(plan.get("candidates") or [])
+        if isinstance(item, dict)
+    ]
+    if not candidates:
+        return residuals  # 兼容升级前已经确认但尚未执行的旧计划。
+    decisions = dict(plan.get("candidate_decisions") or {})
+    by_number = {
+        int(item.get("candidate_number") or 0): item
+        for item in candidates
+        if int(item.get("candidate_number") or 0) > 0
+    }
+    if len(by_number) != len(candidates):
+        raise GuangYaCleanupPlanError("残留清理候选清单异常")
+    expected_numbers: set[int] = set()
+    for number in by_number:
+        action = str(dict(decisions.get(str(number)) or {}).get("action") or "")
+        if action == "quarantine":
+            expected_numbers.add(number)
+        elif action != "keep":
+            raise GuangYaCleanupPlanError("残留清理仍有候选未完成复核")
+    actual_numbers = {
+        int(item.get("candidate_number") or 0) for item in residuals
+    }
+    if expected_numbers != actual_numbers or len(actual_numbers) != len(residuals):
+        raise GuangYaCleanupPlanError("残留清理执行范围与逐项决定不一致")
+    for item in residuals:
+        number = int(item.get("candidate_number") or 0)
+        candidate = by_number[number]
+        for key in ("root", "tree", "signature", "source_index"):
+            if item.get(key) != candidate.get(key):
+                raise GuangYaCleanupPlanError(
+                    f"残留候选 #{number} 的冻结快照不一致"
+                )
+    return residuals
 
 
 def execute_cleanup_plan(
@@ -718,7 +924,7 @@ def execute_cleanup_plan(
     try:
         if not client.logged_in or int(client.credential_generation) != expected_generation:
             raise GuangYaCleanupPlanStale("光鸭登录凭据已变化，请重新预览")
-        residuals = list(plan.get("residuals") or [])
+        residuals = _validated_selected_residuals(plan)
         empties = list(plan.get("empties") or [])
         # 全批次预检在任何写入前完成。
         for item in residuals:

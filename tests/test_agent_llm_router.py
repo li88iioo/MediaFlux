@@ -43,6 +43,7 @@ from app.agent.llm_router import (
     select_orchestration_tool,
     select_read_tool,
 )
+from app.agent.confirmation import ConfirmationStore, SQLiteConfirmationStore
 from app.agent.models import (
     Evidence,
     LLMToolDisposition,
@@ -291,6 +292,7 @@ class AgentPublicNarrativeFormattingTests(unittest.TestCase):
 class AgentLLMSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         agent_rate_limiter.reset()
+        SQLiteConfirmationStore().reset()
 
     def test_parse_selection_requires_exact_allowlisted_shape(self):
         self.assertEqual(
@@ -447,6 +449,61 @@ class AgentLLMSelectionTests(unittest.TestCase):
             len(registry.native_aliases()),
             len(read_tools | confirmation_tools),
         )
+        self.assertTrue({
+            "downloads.delete_task",
+            "downloads.retry_submission",
+            "rss.delete_subscription",
+            "rss.submit_pending_to_qb",
+            "strm.retry_failures",
+            "strm.run_once",
+            "guangya.organize.run_once",
+            "guangya.organize.stop",
+            "guangya.organize.clean_empty",
+        }.issubset(confirmation_tools))
+        self.assertIn("agent.cancel_pending_action", read_tools)
+        self.assertNotIn("indexer.submit_resource", confirmation_tools)
+        self.assertNotIn("indexer.submit_resource_batch", confirmation_tools)
+        exposed_names = read_tools | confirmation_tools
+        self.assertFalse(any(
+            token in name.casefold()
+            for name in exposed_names
+            for token in ("shell", "terminal", "sql.execute", "exec_command")
+        ))
+
+    def test_pending_action_plan_context_reaches_model_without_execution_token(self):
+        registry = _confirmation_registry()
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "private-plan-context-123456"),
+        )
+        prepared = service.prepare(
+            "config.set_feature_state",
+            {"feature": "web_search", "enabled": True},
+            owner="web-session",
+        )
+        captured = {}
+
+        def native(_message, _registry, _executor, **kwargs):
+            captured.update(kwargs)
+            return LLMConversationReply("我会等待你的决定。")
+
+        query_epoch = service.begin_query_confirmation_epoch(owner="web-session")
+        with patch(
+            "app.agent.orchestrator.run_native_read_agent", side_effect=native
+        ):
+            response = service.query(
+                "这项计划会影响什么？",
+                owner="web-session",
+                confirmation_owner_generation=query_epoch,
+            )
+
+        self.assertEqual(response["mode"], "conversation")
+        context = captured["conversation_context"]
+        plan_text = context[-1]["text"]
+        self.assertIn("尚未执行", plan_text)
+        self.assertIn("切换项目功能状态", plan_text)
+        self.assertNotIn(prepared["action_plan"]["plan_id"], plan_text)
+        self.assertNotIn("config.set_feature_state", plan_text)
 
     def test_native_capabilities_only_expose_confirmation_tools_when_authorized(self):
         registry = _confirmation_registry()
@@ -479,7 +536,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
 
         async def fake_request(message, *args, **kwargs):
             self.assertEqual(kwargs["schema_name"], "mediaflux_agent_confirmation_route")
-            self.assertIn("只会据此生成一次用户确认票据", kwargs["routing_prompt"])
+            self.assertIn("只会据此生成一项一次性行动计划", kwargs["routing_prompt"])
             if "请开启网页搜索" in message:
                 return selection
             return None
@@ -2785,6 +2842,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
 class AgentLLMOrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
         agent_rate_limiter.reset()
+        SQLiteConfirmationStore().reset()
 
     def test_contextual_followup_tries_planner_before_legacy_clarification(self):
         registry = _read_registry()
@@ -2847,7 +2905,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertIs(response, planned)
         planner.assert_called_once()
         self.assertEqual(planner.call_args.kwargs["conversation_context"], context)
-        self.assertTrue(planner.call_args.kwargs["read_only"])
+        self.assertFalse(planner.call_args.kwargs["read_only"])
 
     def test_reply_anchor_is_forwarded_to_contextual_planner(self):
         registry = _read_registry()
@@ -3007,7 +3065,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         planner.assert_not_called()
         deterministic.assert_called_once()
 
-    def test_danger_organize_action_bypasses_planner_and_keeps_run_once_binding(self):
+    def test_danger_organize_action_uses_model_then_run_once_fallback(self):
         agent = AgentOrchestrator(ToolRegistry())
         fallback = {
             "mode": "confirmation_required",
@@ -3015,7 +3073,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             "result": ToolResult(True, "confirmation_required", "等待整理确认").to_dict(),
         }
         with patch.object(
-            agent, "_query_with_model_tools"
+            agent, "_query_with_model_tools", return_value=None
         ) as planner, patch.object(
             agent, "_handle_automation_and_missing_resource_requests",
             return_value=fallback,
@@ -3025,10 +3083,10 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             )
 
         self.assertIs(response, fallback)
-        planner.assert_not_called()
+        planner.assert_called_once()
         deterministic.assert_called_once()
 
-    def test_danger_domain_intents_never_enter_planner_even_when_incomplete(self):
+    def test_danger_domain_intents_try_model_before_legacy_fallback(self):
         cases = (
             ("停止光鸭整理", "_handle_automation_and_missing_resource_requests"),
             ("中止云盘整理", "_handle_automation_and_missing_resource_requests"),
@@ -3061,17 +3119,17 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
                     ).to_dict(),
                 }
                 with patch.object(
-                    agent, "_query_with_model_tools"
+                    agent, "_query_with_model_tools", return_value=None
                 ) as planner, patch.object(
                     agent, handler_name, return_value=fallback
                 ) as deterministic:
                     response = agent._query_raw(message, owner="web-session")
 
                 self.assertIs(response, fallback)
-                planner.assert_not_called()
+                planner.assert_called_once()
                 deterministic.assert_called_once()
 
-    def test_context_and_reply_routes_cannot_bypass_danger_planner_gate(self):
+    def test_danger_requests_use_model_planning_before_deterministic_fallback(self):
         cases = (
             (
                 "停止光鸭整理",
@@ -3114,7 +3172,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
                     ).to_dict(),
                 }
                 with patch.object(
-                    agent, "_query_with_model_tools"
+                    agent, "_query_with_model_tools", return_value=None
                 ) as planner, patch.object(
                     agent, handler_name, return_value=fallback
                 ) as deterministic:
@@ -3127,7 +3185,8 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
                     )
 
                 self.assertIs(response, fallback)
-                planner.assert_not_called()
+                planner.assert_called_once()
+                self.assertFalse(planner.call_args.kwargs["read_only"])
                 deterministic.assert_called_once()
 
     def test_negated_danger_actions_are_deterministic_noops(self):
@@ -3563,7 +3622,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         ), patch(
             "app.agent.orchestrator.select_read_tool", return_value=selection
         ), patch(
-            "app.agent.orchestrator.select_orchestration_tool"
+            "app.agent.orchestrator.select_orchestration_tool", return_value=None
         ) as orchestration_selector, patch(
             "app.agent.orchestrator.compose_tool_answer", return_value=None
         ):
@@ -3573,7 +3632,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(response["tool_call"]["name"], "workspace.health")
         self.assertEqual(calls, [{}])
-        orchestration_selector.assert_not_called()
+        orchestration_selector.assert_called_once()
 
     def test_native_multi_tool_reply_precedes_single_tool_selection_and_is_not_rewritten(self):
         registry = _read_registry()
@@ -4208,7 +4267,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             llm_rate_owner="",
             llm_tool_rate_identity="",
             conversation_context=None,
-            read_only=True,
+            read_only=False,
         )
 
     def test_llm_first_read_falls_back_to_deterministic_download_diagnosis(self):

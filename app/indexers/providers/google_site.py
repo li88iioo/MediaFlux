@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from bs4 import BeautifulSoup
 
+from ..concurrency import CrossLoopAsyncLock
 from ..errors import IndexerInvalidResponse, IndexerRateLimited, IndexerSecurityError, IndexerUnavailable
 from .base import fixed_host_join, require_html_response
 
@@ -55,7 +56,7 @@ class GoogleSiteSearch:
         self.timeout_seconds = max(0.1, float(timeout_seconds))
         self._monotonic = monotonic or time.monotonic
         self._disabled_until = 0.0
-        self._lock = asyncio.Lock()
+        self._lock = CrossLoopAsyncLock()
 
     async def search(
         self,

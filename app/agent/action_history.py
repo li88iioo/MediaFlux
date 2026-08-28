@@ -161,7 +161,7 @@ _SAFE_FIELDS = {
     "guangya.organize.clean_empty": {"cleaned", "failed", "source_count"},
     "guangya.organize.cleanup.execute": {
         "queued", "queue_position", "replayed", "empty_dir_count",
-        "residual_dir_count", "requires_manual",
+        "residual_dir_count", "selected_count", "kept_count", "requires_manual",
     },
     "guangya.organize.stop": {"accepted"},
     "indexer.submit_resource": {

@@ -104,6 +104,95 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
             ))
         self.assertEqual(outcomes, ["claimed", "confirmation_invalid"])
 
+    def test_non_replacement_issue_at_capacity_keeps_sqlite_bounded(self) -> None:
+        tokens = iter((
+            "persistent-capacity-owner-a-old",
+            "persistent-capacity-owner-a-new",
+        ))
+        ticks = iter((100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0))
+        store = SQLiteConfirmationStore(
+            max_entries=1,
+            clock=lambda: next(ticks),
+            token_factory=lambda: next(tokens),
+        )
+        previous = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "old"}
+        )
+        current = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "new"}
+        )
+
+        self.assertEqual(len(store.list_active_tickets(owner="owner-a")), 1)
+        with self.assertRaises(AgentToolError):
+            store.claim(owner="owner-a", confirmation_id=previous.confirmation_id)
+        self.assertEqual(
+            store.claim(
+                owner="owner-a", confirmation_id=current.confirmation_id
+            ).arguments,
+            {"id": "new"},
+        )
+
+    def test_replacing_ticket_at_capacity_preserves_other_owner(self) -> None:
+        tokens = iter((
+            "persistent-capacity-owner-b-1",
+            "persistent-capacity-owner-a-old",
+            "persistent-capacity-owner-a-new",
+        ))
+        ticks = iter((100.0, 101.0, 102.0, 103.0, 104.0, 105.0))
+        store = SQLiteConfirmationStore(
+            max_entries=2,
+            clock=lambda: next(ticks),
+            token_factory=lambda: next(tokens),
+        )
+        other = store.issue(
+            owner="owner-b", tool_name="write.test", arguments={"id": "b"}
+        )
+        previous = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "old"}
+        )
+        replacement = store.issue(
+            owner="owner-a",
+            tool_name="write.test",
+            arguments={"id": "new"},
+            replace_active_ticket=True,
+        )
+
+        self.assertEqual(
+            store.claim(owner="owner-b", confirmation_id=other.confirmation_id).arguments,
+            {"id": "b"},
+        )
+        with self.assertRaises(AgentToolError):
+            store.claim(owner="owner-a", confirmation_id=previous.confirmation_id)
+        self.assertEqual(
+            store.claim(
+                owner="owner-a", confirmation_id=replacement.confirmation_id
+            ).arguments,
+            {"id": "new"},
+        )
+
+    def test_owner_rotation_can_preserve_ticket_across_store_instances(self) -> None:
+        first = SQLiteConfirmationStore(
+            token_factory=lambda: "preserved-ticket-123456789"
+        )
+        ticket = first.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": 1}
+        )
+
+        revoked, generation = SQLiteConfirmationStore().rotate_owner(
+            owner="owner-a", preserve_active=True
+        )
+
+        self.assertEqual(revoked, 0)
+        active = SQLiteConfirmationStore().list_active_tickets(owner="owner-a")
+        self.assertEqual([item.confirmation_id for item in active], [ticket.confirmation_id])
+        self.assertEqual(active[0].owner_generation, generation)
+        self.assertEqual(
+            SQLiteConfirmationStore().claim(
+                owner="owner-a", confirmation_id=ticket.confirmation_id
+            ).arguments,
+            {"id": 1},
+        )
+
     def test_owner_rotation_revokes_tickets_across_instances(self) -> None:
         first = SQLiteConfirmationStore(
             token_factory=lambda: "rotated-ticket-1234567890"

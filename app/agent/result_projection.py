@@ -217,6 +217,7 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "guangya.organize.set_schedule_policy": "光鸭定时整理策略修改",
     "guangya.organize.clean_empty": "光鸭空目录清理",
     "guangya.organize.cleanup.preview": "光鸭整理残留清理预览",
+    "guangya.organize.cleanup.classify": "光鸭整理残留逐项复核",
     "guangya.organize.cleanup.execute": "光鸭整理残留清理",
     "guangya.organize.run_once": "光鸭整理任务",
     "guangya.organize.status": "光鸭整理状态",
@@ -354,7 +355,13 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "quarantine_file_count": "待隔离文件",
     "preserved_dir_count": "安全保留目录",
     "unsupported_empty_dir_count": "因 Provider 能力保留的空目录",
+    "reviewed_count": "已复核候选",
+    "kept_count": "明确保留候选",
+    "undecided_count": "待复核候选",
+    "deferred_candidate_count": "下批复核候选",
+    "deferred_empty_dir_count": "下批空目录",
     "sample_directories": "目录示例",
+    "review_summaries": "候选复核明细",
     "quarantine_instead_of_delete": "非空目录仅隔离",
     "move": "移动",
     "skip": "跳过",
@@ -652,7 +659,7 @@ _PUBLIC_TEXT_VALUE_KEYS = frozenset({
     "codec", "release_source", "resolution", "site_name", "size_text",
     "server", "server_label", "user_selection", "episode_title", "last_played",
     "preferred_server", "preferred_download_target", "local_date", "timezone",
-    "content_titles", "published_at", "created_at", "failure_code", "trigger_type", "started_at", "finished_at", "mode", "sample_changes",
+    "content_titles", "candidate_summaries", "review_summaries", "published_at", "created_at", "failure_code", "trigger_type", "started_at", "finished_at", "mode", "sample_changes",
     "source_title", "candidate_title", "candidate_year", "suggested_query", "release_date", "overview", "manual_match_reason", "scope_type",
     "skip_reason", "target", "observation_ref", "object_ref", "object_name",
     "kind", "extension", "location",
@@ -1112,6 +1119,8 @@ def _safe_value(
     if isinstance(value, str):
         if source_key in {"object_name", "location"}:
             return sanitize_untrusted_filename(value, limit=240) or None
+        if source_key in {"candidate_summaries", "review_summaries"}:
+            return sanitize_untrusted_filename(value, limit=520) or None
         if source_key == "operation_ref":
             operation_ref = value.strip().upper()
             return operation_ref if re.fullmatch(

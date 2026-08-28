@@ -215,7 +215,11 @@
     }
 
     async function discardStaleConfirmation(payload, sessionId) {
-        const confirmationId = String(payload?.confirmation?.confirmation_id || '');
+        const confirmationId = String(
+            payload?.action_plan?.plan_id
+            || payload?.confirmation?.confirmation_id
+            || '',
+        ).trim();
         if (confirmationId) await discardConfirmation(confirmationId, sessionId);
     }
 
@@ -1821,16 +1825,44 @@
         return {article, body};
     }
 
+    function confirmationPayloadFromActionPlan(payload) {
+        const legacy = payload?.confirmation && typeof payload.confirmation === 'object'
+            ? payload.confirmation
+            : {};
+        const plan = payload?.action_plan && typeof payload.action_plan === 'object'
+            ? payload.action_plan
+            : {};
+        const planId = String(plan.plan_id || '').trim();
+        if (!planId) return legacy;
+        return {
+            ...legacy,
+            confirmation_id: planId,
+            risk: String(plan.risk || legacy.risk || 'write'),
+            expires_in: Number(plan.expires_in || legacy.expires_in || 0),
+            contract: {
+                version: 1,
+                action: String(plan.title || '执行受控操作'),
+                object: String(plan.target || '当前预检选中的对象'),
+                impact: String(plan.impact || '执行后会应用预检通过的受控变更。'),
+                reversibility: String(plan.reversibility || '执行后可能需要手动撤销。'),
+                preflight_at: String(plan.preflight_at || ''),
+                preflight_summary: String(plan.preflight_summary || ''),
+                risk: String(plan.risk || legacy.risk || 'write'),
+            },
+        };
+    }
+
     function appendAssistantResponse(payload, pendingNode) {
         const keepPinned = transcriptIsNearBottom();
         const streamingCard = pendingNode?.querySelector?.('.agent-result-card.agent-streaming');
         const view = streamingCard
             ? {article: pendingNode, body: pendingNode.querySelector('.agent-message-body')}
             : reuseAssistantMessage(pendingNode, 'MEDIAFLUX AGENT', 'bot');
+        const confirmationPayload = confirmationPayloadFromActionPlan(payload);
         const confirmationRequired = payload?.mode === 'confirmation_required'
-            && payload.confirmation?.confirmation_id;
+            && confirmationPayload?.confirmation_id;
         const renderedCard = confirmationRequired
-            ? renderConfirmation(payload.confirmation, payload.tool_call, payload)
+            ? renderConfirmation(confirmationPayload, payload.tool_call, payload)
             : renderResultCard(payload);
         let resultCard = renderedCard;
         if (streamingCard) {
@@ -2210,7 +2242,7 @@
             .forEach((button) => { button.disabled = busy || confirmationInFlight; });
     }
 
-    function markVisibleConfirmationsRevoked(message = '会话已切换，原确认票据已撤销。') {
+    function markVisibleConfirmationsRevoked(message = '会话已切换，原行动计划已取消。') {
         page.querySelectorAll('.agent-confirmation-card:not(.is-cancelled):not(.is-expired)').forEach((card) => {
             clearConfirmationTimer(card);
             card.classList.add('is-cancelled');
@@ -2507,7 +2539,7 @@
         }
         const head = node('div', 'agent-confirmation-head');
         const title = node('div');
-        title.append(node('span', '', '写操作确认'), node('strong', '', action));
+        title.append(node('span', '', '行动计划'), node('strong', '', action));
         head.append(title, node('span', `agent-confirmation-risk is-${risk}`, riskLabels[risk] || '写入操作'));
         const expires = Number(confirmation.expires_in || 0);
         const expiryCopy = node('p', 'agent-confirmation-copy');
@@ -2516,8 +2548,8 @@
             'span',
             'agent-confirmation-countdown',
             expires > 0
-                ? `确认窗口剩余 ${expires} 秒，且只能使用一次。`
-                : '只有确认后才会执行写操作。',
+                ? `计划剩余 ${expires} 秒，只可执行一次。`
+                : '选择执行后才会应用写操作。',
         );
         card.append(head);
 
@@ -2558,25 +2590,25 @@
         expiryCopy.append(countdown);
         card.append(expiryCopy);
         const actions = node('div', 'agent-confirmation-actions');
-        const cancel = node('button', 'agent-confirmation-cancel', '取消本次操作');
+        const cancel = node('button', 'agent-confirmation-cancel', '取消');
         cancel.type = 'button';
-        const confirm = node('button', 'agent-confirmation-submit', '确认并执行');
+        const confirm = node('button', 'agent-confirmation-submit', '执行');
         confirm.type = 'button';
-        confirm.setAttribute('aria-label', `确认并执行：${action}`);
+        confirm.setAttribute('aria-label', `执行行动计划：${action}`);
         cancel.addEventListener('click', async () => {
             if (cancel.disabled || confirmationInFlight || sessionResetInFlight) return;
             clearConfirmationTimer(card);
             cancel.disabled = true;
             confirm.disabled = true;
-            const status = node('span', 'agent-result-meta', '正在撤销确认票据…');
+            const status = node('span', 'agent-result-meta', '正在取消行动计划…');
             actions.replaceChildren(status);
             focusResult(status);
             const discarded = await discardConfirmation(confirmationId);
             card.classList.add('is-cancelled');
             card.dataset.confirmationId = '';
             status.textContent = discarded
-                ? '已取消本次操作；服务端确认票据已撤销。'
-                : '已取消界面操作；票据未能立即撤销，将在短时间后自动失效。';
+                ? '已取消本次行动计划；没有执行写操作。'
+                : '取消请求未能立即送达；行动计划将在短时间后自动失效。';
         });
         confirm.addEventListener('click', () => confirmAction(confirmationId, card, confirm, cancel));
         actions.append(cancel, confirm);
@@ -2630,10 +2662,10 @@
                 await discardStaleConfirmation(payload);
                 return;
             }
-            if (payload?.mode !== 'confirmation_required' || !payload.confirmation?.confirmation_id) {
-                throw new Error('重新预检未返回有效确认票据');
+            if (payload?.mode !== 'confirmation_required' || !confirmationPayloadFromActionPlan(payload)?.confirmation_id) {
+                throw new Error('重新预检未返回有效行动计划');
             }
-            const replacement = renderConfirmation(payload.confirmation, payload.tool_call);
+            const replacement = renderConfirmation(confirmationPayloadFromActionPlan(payload), payload.tool_call, payload);
             card.replaceWith(replacement);
             focusResult(replacement);
         } catch (error) {
@@ -2653,7 +2685,7 @@
         const update = () => {
             const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
             if (remaining > 0) {
-                countdown.textContent = `确认窗口剩余 ${remaining} 秒，且只能使用一次。`;
+                countdown.textContent = `计划剩余 ${remaining} 秒，只可执行一次。`;
                 return;
             }
             clearConfirmationTimer(card);
@@ -2661,7 +2693,7 @@
             card.dataset.confirmationId = '';
             confirmButton.disabled = true;
             cancelButton.disabled = true;
-            countdown.textContent = '确认窗口已过期。请重新提交原任务生成新的预检。';
+            countdown.textContent = '行动计划已过期。请重新提交原任务生成新的预检。';
             renderReprepareAction(card, '票据已失效，未执行任何写操作。');
         };
         update();
@@ -2710,7 +2742,12 @@
         card.classList.add('is-cancelled');
         card.dataset.confirmationId = '';
         const actions = card.querySelector('.agent-confirmation-actions');
-        const status = node('span', 'agent-result-meta', '确认票据已消费，操作结果如下。');
+        const planFailed = payload?.action_plan?.status === 'failed';
+        const status = node(
+            'span',
+            'agent-result-meta',
+            planFailed ? '行动计划已处理，但操作未成功。' : '行动计划已执行，结果如下。',
+        );
         actions?.replaceChildren(status);
         const response = appendAssistantResponse(payload);
         focusResult(response?.querySelector('.agent-result-card') || status);
@@ -2724,7 +2761,7 @@
         cancelButton.disabled = true;
         setConfirmationBusy(true);
         const copy = card.querySelector('.agent-confirmation-copy');
-        if (copy) copy.textContent = '确认票据已消费；写操作正在服务端受控执行。';
+        if (copy) copy.textContent = '行动计划已领取；服务端正在受控执行。';
         renderConfirmationExecutionState(card);
         try {
             const payload = await fetchJSON('/api/agent/actions/confirm', {
@@ -2746,7 +2783,7 @@
                 clearConfirmationTimer(card);
                 card.classList.add('is-expired');
                 card.dataset.confirmationId = '';
-                renderReprepareAction(card, '确认票据已失效，请重新提交原任务生成新的预检。');
+                renderReprepareAction(card, '行动计划已失效，请重新提交原任务生成新的预检。');
                 focusResult(card.querySelector('.agent-confirmation-actions'));
                 return;
             }
@@ -2756,12 +2793,12 @@
             const status = node(
                 'span',
                 'agent-result-meta',
-                '确认结果未知。请先核对任务状态，勿重复提交；如需重试请重新生成预检。',
+                '行动计划结果未知。请先核对任务状态，勿重复提交；如需重试请重新生成预检。',
             );
             actions?.replaceChildren(status);
             const oldError = card.querySelector('.agent-result-error');
             oldError?.remove();
-            const errorMessage = node('p', 'agent-result-error', error?.message || '服务端确认结果未返回。');
+            const errorMessage = node('p', 'agent-result-error', error?.message || '服务端执行结果未返回。');
             card.append(errorMessage);
             focusResult(status);
         } finally {

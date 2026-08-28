@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from urllib.parse import parse_qs, urljoin, urlsplit
 
+from ..concurrency import CrossLoopAsyncLock
 from ..errors import IndexerInvalidResponse, IndexerSecurityError
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
 
@@ -64,7 +65,7 @@ class SearchRequestPacer:
         self.interval_seconds = max(0.0, float(interval_seconds))
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleeper or asyncio.sleep
-        self._lock = asyncio.Lock()
+        self._lock = CrossLoopAsyncLock()
         self._last_started: float | None = None
 
     async def wait(self) -> None:

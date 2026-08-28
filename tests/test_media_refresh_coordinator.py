@@ -7,6 +7,7 @@ from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes,
     clear_media_refresh_queue,
     complete_media_refresh,
+    defer_media_refresh,
     enqueue_media_refresh,
     fail_media_refresh,
     media_refresh_queue_status,
@@ -158,6 +159,40 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
             recent_media_refresh_target_ids("jellyfin", now_epoch=190), (),
         )
 
+    def test_deferred_refresh_preserves_inflight_and_pending_paths(self):
+        queued = enqueue_media_refresh(
+            "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
+        )
+        claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
+        enqueue_media_refresh(
+            "jellyfin", ["/media/B"], debounce_seconds=20, now_epoch=101,
+        )
+
+        self.assertTrue(defer_media_refresh(
+            queued["group_key"],
+            owner="worker",
+            lease_generation=claimed["lease_generation"],
+            delay_seconds=90,
+            reason="deduplicated",
+            refreshed_target_ids=("series-a",),
+            recent_ttl_seconds=90,
+            now_epoch=102,
+        ))
+
+        status = media_refresh_queue_status(now_epoch=102)
+        self.assertEqual(status["retry_wait"], 1)
+        self.assertEqual(status["paths"], 2)
+        self.assertEqual(
+            recent_media_refresh_target_ids("jellyfin", now_epoch=103),
+            ("series-a",),
+        )
+        self.assertEqual(
+            claim_due_media_refreshes(owner="worker", now_epoch=191), [],
+        )
+        retried = claim_due_media_refreshes(owner="worker", now_epoch=192)[0]
+        self.assertEqual(retried["paths"], ["/media/A", "/media/B"])
+        self.assertEqual(retried["attempts"], 0)
+
 
 class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
@@ -234,3 +269,59 @@ class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
         self.assertEqual(status["retry_wait"], 1)
         self.assertEqual(status["paths"], 1)
         self.assertEqual(recent_media_refresh_target_ids("jellyfin"), ("series-a",))
+
+    def test_deduplicated_target_is_deferred_instead_of_dropped(self):
+        enqueue_media_refresh(
+            "jellyfin", ["/media/new-episode"], debounce_seconds=0, now_epoch=100,
+        )
+        claimed = claim_due_media_refreshes(
+            owner="media-refresh-test", now_epoch=100,
+        )[0]
+        client = Mock(display_name="Jellyfin")
+        client.refresh_for_paths.return_value = {
+            "ok": True,
+            "scope": "deduplicated",
+            "requested": 1,
+            "items": [],
+            "folders": [],
+            "libraries": [],
+            "deduplicated": 1,
+            "retryable": False,
+            "succeeded_target_ids": [],
+            "fallback": "",
+        }
+        coordinator = MediaRefreshCoordinator()
+        coordinator._owner = "media-refresh-test"
+
+        with patch.object(coordinator, "_client_for", return_value=client), patch(
+            "app.modules.media_refresh_coordinator._recent_ttl_seconds",
+            return_value=90,
+        ):
+            coordinator._process_group(claimed)
+
+        status = media_refresh_queue_status()
+        self.assertEqual(status["retry_wait"], 1)
+        self.assertEqual(status["paths"], 1)
+        self.assertEqual(coordinator._completed_session, 0)
+        self.assertEqual(coordinator._failed_session, 0)
+
+    def test_disabled_provider_keeps_refresh_pending(self):
+        enqueue_media_refresh(
+            "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
+        )
+        claimed = claim_due_media_refreshes(
+            owner="media-refresh-test", now_epoch=100,
+        )[0]
+        coordinator = MediaRefreshCoordinator()
+        coordinator._owner = "media-refresh-test"
+
+        with patch.object(coordinator, "_client_for", return_value=None), patch(
+            "app.modules.media_refresh_coordinator._retry_seconds", return_value=30,
+        ):
+            coordinator._process_group(claimed)
+
+        status = media_refresh_queue_status()
+        self.assertEqual(status["retry_wait"], 1)
+        self.assertEqual(status["paths"], 1)
+        self.assertEqual(coordinator._failed_session, 1)
+        self.assertEqual(coordinator._last_error_type, "MediaServerUnavailable")

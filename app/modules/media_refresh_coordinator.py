@@ -18,6 +18,7 @@ from app.modules.process_lock import CrossProcessLock
 from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes,
     complete_media_refresh,
+    defer_media_refresh,
     enqueue_media_refresh,
     fail_media_refresh,
     media_refresh_queue_status,
@@ -262,15 +263,20 @@ class MediaRefreshCoordinator:
             client = self._client_for(provider)
             if client is None:
                 logger.warning(
-                    "媒体库刷新 provider 已停用或配置不完整，丢弃当前安全刷新请求 provider=%s",
+                    "媒体库刷新 provider 已停用或配置不完整，将保留任务等待配置恢复 provider=%s",
                     provider,
                 )
-                complete_media_refresh(
+                fail_media_refresh(
                     group_key,
                     owner=self._owner,
                     lease_generation=generation,
+                    error="媒体服务器已停用或配置不完整",
+                    retry_seconds=_retry_seconds(attempts),
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
+                with self._state_lock:
+                    self._failed_session += 1
+                    self._last_error_type = "MediaServerUnavailable"
                 return
             recent_ids = recent_media_refresh_target_ids(provider)
             outcome = client.refresh_for_paths(
@@ -307,6 +313,20 @@ class MediaRefreshCoordinator:
                 with self._state_lock:
                     self._failed_session += 1
                     self._last_error_type = "MediaRefreshRetryable"
+                return
+            deduplicated = int(outcome.get("deduplicated") or 0)
+            if deduplicated:
+                # 同一媒体目标刚刷新过时，新的变化路径仍可能包含随后入库的剧集。
+                # 等去重窗口结束后再校准一次，不能把这批路径直接确认丢弃。
+                defer_media_refresh(
+                    group_key,
+                    owner=self._owner,
+                    lease_generation=generation,
+                    delay_seconds=_recent_ttl_seconds(),
+                    reason=f"等待媒体库刷新去重窗口结束（{deduplicated} 项）",
+                    refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
+                    recent_ttl_seconds=_recent_ttl_seconds(),
+                )
                 return
             complete_media_refresh(
                 group_key,

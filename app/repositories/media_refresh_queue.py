@@ -326,6 +326,53 @@ def complete_media_refresh(
     return True
 
 
+def defer_media_refresh(
+    group_key: str,
+    *,
+    owner: str,
+    lease_generation: int,
+    delay_seconds: int,
+    reason: object = "",
+    refreshed_target_ids: object = (),
+    recent_ttl_seconds: int = 90,
+    now_epoch: float | None = None,
+) -> bool:
+    """不计失败次数地延后当前刷新，并保留执行中与新到达的全部路径。"""
+    now_value = float(time.time() if now_epoch is None else now_epoch)
+    database = _database()
+    with database.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state = _read_state(conn)
+        group = state["groups"].get(str(group_key or ""))
+        if not isinstance(group, dict):
+            return False
+        if (
+            str(group.get("status") or "") != "running"
+            or str(group.get("lease_owner") or "") != str(owner or "")
+            or int(group.get("lease_generation") or 0) != int(lease_generation)
+        ):
+            return False
+        provider = str(group.get("provider") or "")
+        ttl = max(0, int(recent_ttl_seconds or 0))
+        if ttl:
+            expiry = now_value + ttl
+            for item_id in _normalized_paths(refreshed_target_ids):
+                state["recent"][f"{provider}:{item_id}"] = expiry
+        group["pending_paths"] = _merge_paths(
+            group.get("inflight_paths"), group.get("pending_paths")
+        )
+        group["inflight_paths"] = []
+        group["status"] = "retry_wait"
+        group["due_at"] = now_value + max(1, int(delay_seconds or 1))
+        group["lease_owner"] = ""
+        group["lease_until"] = 0
+        group["last_error"] = " ".join(str(reason or "").split())[:300]
+        group["updated_at"] = now_value
+        _prune_recent(state, now_value)
+        _write_state(conn, state)
+    return True
+
+
 def fail_media_refresh(
     group_key: str,
     *,

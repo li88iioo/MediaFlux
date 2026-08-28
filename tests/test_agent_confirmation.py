@@ -11,7 +11,11 @@ from fastapi.testclient import TestClient
 from app.agent.confirmation import ConfirmationStore, confirmation_reply_intent
 from app.agent.confirmation_contract import build_confirmation_contract
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
-from app.agent.orchestrator import AgentOrchestrator, _is_strm_run_action
+from app.agent.orchestrator import (
+    AgentOrchestrator,
+    _QUERY_CONFIRMATION_EPOCH,
+    _is_strm_run_action,
+)
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.service import reset_agent_service_for_tests
 from app.agent.tools import build_tool_registry, preview_strm_run_once, run_strm_once
@@ -151,6 +155,121 @@ class ConfirmationStoreTests(unittest.TestCase):
                 tool_name="write.test",
                 arguments={},
                 expected_owner_generation=generation,
+            )
+        self.assertEqual(stale.exception.code, "confirmation_invalid")
+
+    def test_failed_token_generation_preserves_existing_ticket(self):
+        tokens = iter(("ticket-preserved-on-token-failure",) + ("",) * 8)
+        store = ConfirmationStore(
+            max_entries=1,
+            token_factory=lambda: next(tokens),
+        )
+        existing = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "old"}
+        )
+
+        with self.assertRaises(AgentToolError) as raised:
+            store.issue(
+                owner="owner-b", tool_name="write.test", arguments={"id": "new"}
+            )
+        self.assertEqual(raised.exception.code, "confirmation_unavailable")
+        self.assertEqual(
+            store.claim(
+                owner="owner-a", confirmation_id=existing.confirmation_id
+            ).arguments,
+            {"id": "old"},
+        )
+
+    def test_non_replacement_issue_at_capacity_evicts_oldest_same_owner_ticket(self):
+        tokens = iter((
+            "ticket-capacity-owner-a-old-1",
+            "ticket-capacity-owner-a-new-1",
+        ))
+        ticks = iter((100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0))
+        store = ConfirmationStore(
+            max_entries=1,
+            clock=lambda: next(ticks),
+            token_factory=lambda: next(tokens),
+        )
+        previous = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "old"}
+        )
+        current = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "new"}
+        )
+
+        self.assertEqual(len(store.list_active_tickets(owner="owner-a")), 1)
+        with self.assertRaises(AgentToolError):
+            store.claim(owner="owner-a", confirmation_id=previous.confirmation_id)
+        self.assertEqual(
+            store.claim(
+                owner="owner-a", confirmation_id=current.confirmation_id
+            ).arguments,
+            {"id": "new"},
+        )
+
+    def test_replacing_plan_at_capacity_does_not_evict_other_owner(self):
+        tokens = iter((
+            "ticket-capacity-owner-b-1234",
+            "ticket-capacity-owner-a-old-1",
+            "ticket-capacity-owner-a-new-1",
+        ))
+        now = iter((100.0, 101.0, 102.0, 103.0, 104.0, 105.0))
+        store = ConfirmationStore(
+            max_entries=2,
+            clock=lambda: next(now),
+            token_factory=lambda: next(tokens),
+        )
+        other = store.issue(
+            owner="owner-b", tool_name="write.test", arguments={"id": "b"}
+        )
+        previous = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "old"}
+        )
+        replacement = store.issue(
+            owner="owner-a",
+            tool_name="write.test",
+            arguments={"id": "new"},
+            replace_active_ticket=True,
+        )
+
+        self.assertEqual(
+            store.claim(owner="owner-b", confirmation_id=other.confirmation_id).arguments,
+            {"id": "b"},
+        )
+        with self.assertRaises(AgentToolError):
+            store.claim(owner="owner-a", confirmation_id=previous.confirmation_id)
+        self.assertEqual(
+            store.claim(
+                owner="owner-a", confirmation_id=replacement.confirmation_id
+            ).arguments,
+            {"id": "new"},
+        )
+
+    def test_rotate_owner_can_preserve_active_ticket_under_new_epoch(self):
+        store = ConfirmationStore(
+            token_factory=lambda: "ticket-preserved-query-123456"
+        )
+        ticket = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": 1}
+        )
+        original_epoch = ticket.owner_generation
+
+        revoked, current_epoch = store.rotate_owner(
+            owner="owner-a", preserve_active=True
+        )
+
+        self.assertEqual(revoked, 0)
+        self.assertNotEqual(current_epoch, original_epoch)
+        active = store.list_active_tickets(owner="owner-a")
+        self.assertEqual([item.confirmation_id for item in active], [ticket.confirmation_id])
+        self.assertEqual(active[0].owner_generation, current_epoch)
+        with self.assertRaises(AgentToolError) as stale:
+            store.issue(
+                owner="owner-a",
+                tool_name="write.test",
+                arguments={},
+                expected_owner_generation=original_epoch,
             )
         self.assertEqual(stale.exception.code, "confirmation_invalid")
 
@@ -550,6 +669,103 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             )
         self.assertEqual(late_discard.exception.code, "confirmation_invalid")
 
+    def test_new_action_plan_atomically_supersedes_previous_plan(self):
+        tokens = iter((
+            "ticket-single-plan-first-1234",
+            "ticket-single-plan-second-123",
+        ))
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="write.single-plan",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={
+                "type": "object",
+                "required": ["value"],
+                "properties": {"value": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            validator=lambda arguments: {"value": str(arguments["value"])},
+            preview_handler=lambda arguments: ToolResult(
+                True, "confirmation_required", f"preview {arguments['value']}"
+            ),
+            handler=lambda _arguments: ToolResult(True, "accepted", "done"),
+            requires_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry, ConfirmationStore(token_factory=lambda: next(tokens))
+        )
+        first = service.prepare(
+            "write.single-plan", {"value": "old"}, owner="owner-a"
+        )
+        replacement = service.prepare(
+            "write.single-plan", {"value": "new"}, owner="owner-a"
+        )
+
+        with self.assertRaises(AgentToolError):
+            service.confirm(first["action_plan"]["plan_id"], owner="owner-a")
+        active = service.confirmation_store.list_active_tickets(owner="owner-a")
+        self.assertEqual(
+            [item.confirmation_id for item in active],
+            [replacement["action_plan"]["plan_id"]],
+        )
+        self.assertEqual(active[0].arguments, {"value": "new"})
+
+    def test_current_query_can_cancel_then_prepare_replacement_plan(self):
+        tokens = iter((
+            "ticket-replace-plan-first-123",
+            "ticket-replace-plan-second-12",
+        ))
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="write.replace-plan",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={
+                "type": "object",
+                "required": ["value"],
+                "properties": {"value": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            validator=lambda arguments: {"value": str(arguments["value"])},
+            preview_handler=lambda arguments: ToolResult(
+                True, "confirmation_required", f"preview {arguments['value']}"
+            ),
+            handler=lambda _arguments: ToolResult(True, "accepted", "done"),
+            requires_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry, ConfirmationStore(token_factory=lambda: next(tokens))
+        )
+        first_epoch = service.begin_query_confirmation_epoch(owner="owner-a")
+        first = service.prepare(
+            "write.replace-plan",
+            {"value": "old"},
+            owner="owner-a",
+            expected_owner_generation=first_epoch,
+        )
+        replacement_epoch = service.begin_query_confirmation_epoch(owner="owner-a")
+        token = _QUERY_CONFIRMATION_EPOCH.set(("owner-a", replacement_epoch))
+        try:
+            self.assertTrue(service.discard_confirmation(
+                first["action_plan"]["plan_id"], owner="owner-a"
+            ))
+            replacement = service.prepare(
+                "write.replace-plan", {"value": "new"}, owner="owner-a"
+            )
+        finally:
+            _QUERY_CONFIRMATION_EPOCH.reset(token)
+
+        self.assertNotEqual(
+            replacement["action_plan"]["plan_id"],
+            first["action_plan"]["plan_id"],
+        )
+        active = service.confirmation_store.list_active_tickets(owner="owner-a")
+        self.assertEqual(
+            [item.confirmation_id for item in active],
+            [replacement["action_plan"]["plan_id"]],
+        )
+
     def test_orchestrator_consumes_ticket_before_failed_handler(self):
         calls = Mock()
         registry = ToolRegistry()
@@ -686,6 +902,12 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             body = prepared.json()
             self.assertEqual(body["mode"], "confirmation_required")
             confirmation_id = body["confirmation"]["confirmation_id"]
+            self.assertEqual(body["action_plan"]["plan_id"], confirmation_id)
+            self.assertEqual(body["action_plan"]["status"], "awaiting_approval")
+            self.assertEqual(
+                [item["label"] for item in body["action_plan"]["decisions"]],
+                ["执行", "取消"],
+            )
             scheduler.trigger.assert_not_called()
             self.assertNotIn("secret-source", prepared.text)
             self.assertNotIn("private-service", prepared.text)
@@ -700,10 +922,11 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 202, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "accepted")
+            self.assertEqual(confirmed.json()["action_plan"]["status"], "completed")
             self.assertNotIn("private", confirmed.text)
             scheduler.trigger.assert_called_once_with("manual")
 
@@ -849,6 +1072,7 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             {"confirmation_id": 1},
             {"confirmation_id": "short"},
             {"confirmation_id": "x" * 24, "arguments": {}},
+            {"plan_id": "x" * 24, "confirmation_id": "y" * 24},
         ):
             with self.subTest(payload=payload):
                 response = self.client.post("/api/agent/actions/confirm", headers=headers, json=payload)

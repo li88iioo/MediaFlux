@@ -12,6 +12,7 @@ import httpx
 
 from app.logger import get_logger
 
+from .concurrency import CrossLoopAsyncLock
 from .errors import IndexerInvalidResponse, IndexerResponseTooLarge, IndexerSecurityError
 
 Resolver = Callable[[str, int], list[tuple]]
@@ -401,7 +402,7 @@ class BrowserImpersonatingHttpClient:
         self._cookies = {str(key): str(value) for key, value in dict(cookies or {}).items() if str(key)}
         self._session_factory = session_factory or self._default_session_factory
         self._session = None
-        self._lock = asyncio.Lock()
+        self._lock = CrossLoopAsyncLock()
         self._warmed = False
 
     @staticmethod

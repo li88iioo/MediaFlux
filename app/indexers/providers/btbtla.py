@@ -10,6 +10,7 @@ from urllib.parse import quote, urlsplit
 
 from bs4 import BeautifulSoup
 
+from ..concurrency import CrossLoopAsyncLock
 from ..errors import (
     IndexerInvalidResponse,
     IndexerRateLimited,
@@ -56,7 +57,7 @@ class BTBtlaAdapter(IndexerAdapter):
         self.min_interval_seconds = max(0.0, float(min_interval_seconds))
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleeper or asyncio.sleep
-        self._request_lock = asyncio.Lock()
+        self._request_lock = CrossLoopAsyncLock()
         self._last_request_started: float | None = None
         self.max_detail_candidates = max(1, min(int(max_detail_candidates), 3))
         self.mirror_base_urls = tuple(

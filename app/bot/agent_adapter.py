@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app import database as db
+from app.agent.action_plan import sanitize_action_plan
 from app.agent.async_bridge import run_awaitable_sync
 from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.conversation_history import get_agent_conversation_history_repository
@@ -2493,26 +2494,39 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
             lines.append(f"• {item['label']}")
 
     if confirmation:
+        plan = sanitize_action_plan(payload.get("action_plan"))
         confirmation_payload = payload.get("confirmation")
         contract = sanitize_confirmation_contract(
             confirmation_payload.get("contract")
             if isinstance(confirmation_payload, dict)
             else {}
         )
-        if contract:
-            action = _public_text(contract.get("action"), limit=100)
-            if action:
-                lines[0] = f"<b>需要你确认：{action}</b>"
-            lines.extend([
-                "",
-                f"• <b>范围：</b>{_public_text(contract.get('object'), limit=160) or '当前预检选中的对象'}",
-                f"• <b>影响：</b>{_public_text(contract.get('impact'), limit=220) or '确认后会执行预检通过的写操作。'}",
-                f"• <b>撤销：</b>{_public_text(contract.get('reversibility'), limit=220) or '执行后可能需要手动撤销。'}",
-            ])
-            preview = _public_text(contract.get("preflight_summary"), limit=180)
-            if preview:
-                lines.append(f"• <b>预检：</b>{preview}")
-        lines.extend(["", "确认后才会执行，按钮 60 秒内有效。"])
+        action = _public_text(plan.get("title"), limit=100) or _public_text(
+            contract.get("action"), limit=100
+        )
+        target = _public_text(plan.get("target"), limit=160) or _public_text(
+            contract.get("object"), limit=160
+        )
+        impact = _public_text(plan.get("impact"), limit=220) or _public_text(
+            contract.get("impact"), limit=220
+        )
+        reversibility = _public_text(
+            plan.get("reversibility"), limit=220
+        ) or _public_text(contract.get("reversibility"), limit=220)
+        preview = _public_text(
+            plan.get("preflight_summary"), limit=180
+        ) or _public_text(contract.get("preflight_summary"), limit=180)
+        if action:
+            lines[0] = f"<b>行动计划：{action}</b>"
+        lines.extend([
+            "",
+            f"• <b>范围：</b>{target or '当前预检选中的对象'}",
+            f"• <b>影响：</b>{impact or '执行后会应用预检通过的受控变更。'}",
+            f"• <b>撤销：</b>{reversibility or '执行后可能需要手动撤销。'}",
+        ])
+        if preview:
+            lines.append(f"• <b>预检：</b>{preview}")
+        lines.extend(["", "尚未执行。请选择执行或取消，按钮 60 秒内有效。"])
 
     return _truncate_telegram_html("\n".join(lines))
 
@@ -2841,35 +2855,37 @@ def _agent_control_panel_markup(
     return markup
 
 
-def _edit_agent_control_panel(
+
+def _finish_agent_control_action(
     bot: Any,
     call: Any,
-    telebot_module: Any,
     *,
-    notice: str = "",
+    notice: str,
+    successful: bool,
 ) -> bool:
-    chat_id, user_id = _identity(call)
-    message = call.message
-    try:
-        markup = _agent_control_panel_markup(
-            telebot_module,
-            chat_id=chat_id,
-            user_id=user_id,
-        )
-    except Exception as exc:
-        logger.warning("刷新 Telegram Agent 控制按钮失败 type=%s", type(exc).__name__)
-        markup = None
+    """结束一次性控制快照；旧消息不再变成新的控制台。"""
+    headline = html.escape(str(notice or "操作已完成"), quote=False)
+    detail = (
+        "开关状态已经更新。"
+        if successful
+        else "本次没有修改开关状态。"
+    )
+    text = (
+        f"<b>{headline}</b>\n\n{detail}"
+        "\n再次发送 /agent 可查看当前状态或继续调整。"
+    )
     try:
         bot.edit_message_text(
-            _agent_control_panel_text(notice=notice),
-            message.chat.id,
-            message.message_id,
+            text,
+            call.message.chat.id,
+            call.message.message_id,
             parse_mode="HTML",
-            reply_markup=markup,
+            reply_markup=None,
         )
         return True
     except Exception as exc:
-        logger.info("刷新 Telegram Agent 控制面板失败 type=%s", type(exc).__name__)
+        logger.info("结束 Telegram Agent 控制快照失败 type=%s", type(exc).__name__)
+        _remove_callback_keyboard(bot, call.message)
         return False
 
 
@@ -2975,7 +2991,9 @@ def handle_agent_control_action(
     value = action.get("value") if isinstance(action.get("value"), dict) else {}
     action_name = str(value.get("action") or "")
     if decision == "cancel":
-        _edit_agent_control_panel(bot, call, telebot_module, notice="操作已取消")
+        _finish_agent_control_action(
+            bot, call, notice="操作已取消", successful=False
+        )
         bot.answer_callback_query(call.id, "操作已取消")
         return
     if decision == "preview" and action_name in {"enable_all", "disable_all"}:
@@ -3030,32 +3048,32 @@ def handle_agent_control_action(
         notice = _apply_agent_control_action(action_name, owner=owner)
     except ExternalConfigOverrideError:
         notice = "操作未完成：该开关由 Docker 或部署环境管理"
-        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        _finish_agent_control_action(bot, call, notice=notice, successful=False)
         bot.answer_callback_query(call.id, notice, show_alert=True)
         return
     except ConcurrentConfigUpdateError:
         notice = "操作未完成：配置刚被其他操作修改，请重试"
-        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        _finish_agent_control_action(bot, call, notice=notice, successful=False)
         bot.answer_callback_query(call.id, notice, show_alert=True)
         return
     except CorruptConfigFileError:
         notice = "操作未完成：user.env 无法安全读取"
-        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        _finish_agent_control_action(bot, call, notice=notice, successful=False)
         bot.answer_callback_query(call.id, notice, show_alert=True)
         return
     except ValueError as exc:
         notice = f"操作未完成：{str(exc)}"
-        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        _finish_agent_control_action(bot, call, notice=notice, successful=False)
         bot.answer_callback_query(call.id, notice, show_alert=True)
         return
     except Exception as exc:
         logger.warning("Telegram Agent 开关更新失败 type=%s", type(exc).__name__)
         notice = "操作未完成：配置保存失败，请稍后重试"
-        _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+        _finish_agent_control_action(bot, call, notice=notice, successful=False)
         bot.answer_callback_query(call.id, notice, show_alert=True)
         return
 
-    _edit_agent_control_panel(bot, call, telebot_module, notice=notice)
+    _finish_agent_control_action(bot, call, notice=notice, successful=True)
     bot.answer_callback_query(call.id, notice)
 
 
@@ -3136,7 +3154,6 @@ def _confirmation_markup(
     *,
     owner: str,
     confirmation_id: str,
-    action: str = "",
 ):
     store = get_telegram_agent_action_store()
     confirm_id = store.create(
@@ -3146,10 +3163,9 @@ def _confirmation_markup(
         owner=owner, confirmation_id=confirmation_id, action="cancel"
     )
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    action_label = sanitize_public_text(action, limit=24)
     markup.add(
         telebot.types.InlineKeyboardButton(
-            f"确认：{action_label}" if action_label else "确认执行",
+            "执行",
             callback_data=f"aga:{confirm_id}",
         ),
         telebot.types.InlineKeyboardButton(
@@ -3766,17 +3782,22 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                 and isinstance(response.get("confirmation"), dict)
                 else None
             )
+            action_plan = sanitize_action_plan(
+                response.get("action_plan") if isinstance(response, dict) else None
+            )
             markup = None
             rendered = render_agent_response(response)
-            if _confirmation_is_primary(response) and confirmation:
-                confirmation_id = str(confirmation.get("confirmation_id") or "").strip()
+            if _confirmation_is_primary(response) and (action_plan or confirmation):
+                confirmation_id = str(
+                    action_plan.get("plan_id")
+                    or (confirmation or {}).get("confirmation_id")
+                    or ""
+                ).strip()
                 if confirmation_id:
-                    contract = sanitize_confirmation_contract(confirmation.get("contract"))
                     markup = _confirmation_markup(
                         telebot,
                         owner=owner,
                         confirmation_id=confirmation_id,
-                        action=str(contract.get("action") or ""),
                     )
                     rendered = render_agent_response(response, confirmation=True)
             else:
@@ -4232,11 +4253,15 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                                 and isinstance(response.get("confirmation"), dict)
                                 else None
                             )
-                            confirmation_id = (
-                                str(confirmation.get("confirmation_id") or "").strip()
-                                if confirmation
-                                else ""
+                            action_plan = sanitize_action_plan(
+                                response.get("action_plan")
+                                if isinstance(response, dict) else None
                             )
+                            confirmation_id = str(
+                                action_plan.get("plan_id")
+                                or (confirmation or {}).get("confirmation_id")
+                                or ""
+                            ).strip()
                             if (
                                 not _confirmation_is_primary(response)
                                 or not confirmation_id
@@ -4248,12 +4273,6 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                                 telebot_module,
                                 owner=owner,
                                 confirmation_id=confirmation_id,
-                                action=str(
-                                    sanitize_confirmation_contract(
-                                        confirmation.get("contract")
-                                    ).get("action")
-                                    or ""
-                                ),
                             )
                             text = render_agent_response(response, confirmation=True)
                             history_message = "准备提交所选资源"

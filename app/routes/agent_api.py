@@ -227,6 +227,7 @@ def _agent_error(exc: AgentToolError):
         "confirmation_stale": 409,
         "confirmation_not_supported": 409,
         "confirmation_unavailable": 503,
+        "selection_required": 409,
         "precondition_failed": 409,
         "rate_limited": 429,
     }.get(exc.code, 400)
@@ -240,6 +241,14 @@ def _confirmation_id(value: Any) -> str:
     if not 16 <= len(token) <= 256 or not token.isascii() or any(ord(char) < 33 for char in token):
         raise AgentToolError("confirmation_id 无效")
     return token
+
+
+def _action_plan_id(data: dict[str, Any]) -> str:
+    """兼容旧 confirmation_id，并允许新客户端使用 plan_id。"""
+    keys = [key for key in ("plan_id", "confirmation_id") if key in data]
+    if len(keys) != 1:
+        raise AgentToolError("请求必须且只能包含 plan_id 或 confirmation_id 之一")
+    return _confirmation_id(data.get(keys[0]))
 
 
 def _session_id(value: Any) -> str:
@@ -1517,10 +1526,13 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
     require_api_login(request)
     if (
         not isinstance(data, dict)
-        or "confirmation_id" not in data
-        or not set(data).issubset({"confirmation_id", "session_id"})
+        or not set(data).issubset({"plan_id", "confirmation_id", "session_id"})
+        or len({"plan_id", "confirmation_id"}.intersection(data)) != 1
     ):
-        return api_error("请求必须包含 confirmation_id，且只能附带 session_id", 400)
+        return api_error(
+            "请求必须且只能包含 plan_id 或 confirmation_id 之一，并可附带 session_id",
+            400,
+        )
     try:
         owner = _agent_owner(request, data)
         session_key = (
@@ -1531,7 +1543,7 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
             if session_key is not None
             else None
         )
-        confirmation_id = _confirmation_id(data.get("confirmation_id"))
+        confirmation_id = _action_plan_id(data)
         _check_rate_limit(request, "action:confirm", limit=10)
         service = get_agent_service()
         coordinator = get_agent_operation_coordinator()
@@ -1591,13 +1603,16 @@ def discard_confirmation(request: Request, data: Any = Body(default=None)):
     require_api_login(request)
     if (
         not isinstance(data, dict)
-        or "confirmation_id" not in data
-        or not set(data).issubset({"confirmation_id", "session_id"})
+        or not set(data).issubset({"plan_id", "confirmation_id", "session_id"})
+        or len({"plan_id", "confirmation_id"}.intersection(data)) != 1
     ):
-        return api_error("请求必须包含 confirmation_id，且只能附带 session_id", 400)
+        return api_error(
+            "请求必须且只能包含 plan_id 或 confirmation_id 之一，并可附带 session_id",
+            400,
+        )
     try:
         owner = _agent_owner(request, data)
-        confirmation_id = _confirmation_id(data.get("confirmation_id"))
+        confirmation_id = _action_plan_id(data)
         _check_rate_limit(request, "action:discard", limit=20)
         discarded = get_agent_service().discard_confirmation(
             confirmation_id,

@@ -9,6 +9,7 @@ from unittest import mock
 
 from app.agent import guangya_cleanup_actions as actions
 from app.agent.models import RiskLevel, ToolContext
+from app.agent.registry import AgentToolError
 from app.agent.tools import build_tool_registry
 from app.clients.guangya import GuangYaFile
 from app.modules import guangya_residual_cleanup as cleanup
@@ -113,7 +114,7 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
         actions.reset_guangya_cleanup_context_for_tests()
         self.temp.cleanup()
 
-    def test_plan_keeps_media_metadata_but_selects_image_only_residual(self):
+    def test_plan_keeps_media_metadata_and_requires_filename_review(self):
         client = FakeCleanupClient()
         plan = cleanup.build_cleanup_plan(
             client,
@@ -122,10 +123,38 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
             max_candidates=20,
         )
         self.assertEqual(plan["stats"]["empty_dir_count"], 1)
-        self.assertEqual(plan["stats"]["residual_dir_count"], 1)
-        self.assertEqual(plan["stats"]["quarantine_file_count"], 1)
-        self.assertEqual(plan["residuals"][0]["root"]["name"], "a")
+        self.assertEqual(plan["stats"]["candidate_count"], 1)
+        self.assertEqual(plan["stats"]["undecided_count"], 1)
+        self.assertEqual(plan["stats"]["residual_dir_count"], 0)
+        self.assertEqual(plan["stats"]["quarantine_file_count"], 0)
+        self.assertEqual(plan["candidates"][0]["root"]["name"], "a")
+        self.assertEqual(plan["candidates"][0]["file_names"], ["xxx.png"])
         self.assertEqual(plan["empties"][0]["root"]["name"], "空目录")
+
+    def test_review_candidates_never_hide_unshown_file_names(self):
+        client = FakeCleanupClient()
+        client.directories["residual"] = [
+            GuangYaFile(
+                f"junk-{index}",
+                f"candidate-{index}.png",
+                False,
+                parent_id="residual",
+                size=10,
+                etag=f"junk-{index}",
+                extension="png",
+            )
+            for index in range(cleanup._MAX_REVIEW_FILES + 1)
+        ]
+        plan = cleanup.build_cleanup_plan(
+            client,
+            owner="owner",
+            sources=[{"id": "source", "name": "整理源"}],
+            max_candidates=20,
+        )
+        self.assertEqual(plan["stats"]["candidate_count"], 0)
+        self.assertEqual(plan["candidates"], [])
+        self.assertGreaterEqual(plan["stats"]["preserved_dir_count"], 1)
+        self.assertIsNotNone(client.file_info("residual"))
 
     def test_confirmed_execution_quarantines_residual_and_recycles_empty(self):
         client = FakeCleanupClient()
@@ -134,6 +163,15 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
             owner="owner",
             sources=[{"id": "source", "name": "整理源"}],
             max_candidates=20,
+        )
+        plan = cleanup.revise_cleanup_plan(
+            plan["plan_id"], owner="owner",
+            expected_fingerprint=plan["fingerprint"],
+            decisions=[{
+                "candidate_number": 1,
+                "action": "quarantine",
+                "reason": "随机图片名且目录内无媒体文件",
+            }],
         )
         cleanup.confirm_cleanup_plan(
             plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
@@ -180,6 +218,11 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
             client, owner="owner",
             sources=[{"id": "source", "name": "整理源"}], max_candidates=20,
         )
+        plan = cleanup.revise_cleanup_plan(
+            plan["plan_id"], owner="owner",
+            expected_fingerprint=plan["fingerprint"],
+            decisions=[{"candidate_number": 1, "action": "quarantine"}],
+        )
         cleanup.confirm_cleanup_plan(
             plan["plan_id"], owner="owner",
             expected_fingerprint=plan["fingerprint"],
@@ -220,6 +263,11 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
             client, owner="owner",
             sources=[{"id": "source", "name": "整理源"}], max_candidates=20,
         )
+        plan = cleanup.revise_cleanup_plan(
+            plan["plan_id"], owner="owner",
+            expected_fingerprint=plan["fingerprint"],
+            decisions=[{"candidate_number": 1, "action": "quarantine"}],
+        )
         cleanup.confirm_cleanup_plan(
             plan["plan_id"], owner="owner",
             expected_fingerprint=plan["fingerprint"],
@@ -242,6 +290,9 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
         context = ToolContext(owner="owner", session_id="session")
         with mock.patch.object(actions, "GuangYaClient", return_value=client):
             preview = actions.preview_guangya_cleanup({"max_candidates": 20}, context)
+            reviewed = actions.classify_guangya_cleanup_candidates({
+                "decisions": [{"candidate_number": 1, "action": "quarantine"}],
+            }, context)
             confirmation, fingerprint = actions.prepare_guangya_cleanup_confirmation({}, context)
             manager = mock.Mock()
             manager.start_durable_operation.return_value = {
@@ -253,13 +304,121 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
                 accepted = actions.execute_guangya_cleanup_confirmed(
                     {}, fingerprint, context
                 )
-        self.assertEqual(preview.status, "ready")
+        self.assertEqual(preview.status, "selection_required")
+        self.assertEqual(reviewed.status, "ready")
         self.assertEqual(confirmation.status, "confirmation_required")
         self.assertEqual(accepted.status, "accepted")
         self.assertEqual(
             manager.start_durable_operation.call_args.kwargs["job_kind"],
             "agent_guangya_cleanup",
         )
+
+    def test_agent_reviews_large_frozen_plan_in_rolling_batches(self):
+        client = FakeCleanupClient()
+        client.directories["source"] = []
+        for number in range(1, 19):
+            directory_id = f"residual-{number}"
+            client.directories["source"].append(
+                GuangYaFile(
+                    directory_id, f"残留-{number}", True,
+                    parent_id="source", etag=f"dir-{number}", updated_at=number,
+                )
+            )
+            client.directories[directory_id] = [
+                GuangYaFile(
+                    f"junk-{number}", f"ad-{number}.png", False,
+                    parent_id=directory_id, size=10,
+                    etag=f"junk-{number}", extension="png",
+                )
+            ]
+        context = ToolContext(owner="owner", session_id="session")
+        with mock.patch.object(actions, "GuangYaClient", return_value=client):
+            preview = actions.preview_guangya_cleanup({"max_candidates": 20}, context)
+            first_batch = actions.classify_guangya_cleanup_candidates({
+                "decisions": [
+                    {"candidate_number": number, "action": "keep"}
+                    for number in range(1, 17)
+                ],
+            }, context)
+            final = actions.classify_guangya_cleanup_candidates({
+                "decisions": [
+                    {"candidate_number": 17, "action": "quarantine"},
+                    {"candidate_number": 18, "action": "keep"},
+                ],
+            }, context)
+
+        self.assertEqual(preview.data["candidate_count"], 18)
+        self.assertEqual(len(preview.data["review_summaries"]), 16)
+        self.assertIn("#1 ", preview.data["review_summaries"][0])
+        self.assertEqual(first_batch.status, "selection_required")
+        self.assertEqual(first_batch.data["undecided_count"], 2)
+        self.assertEqual(len(first_batch.data["review_summaries"]), 2)
+        self.assertIn("#17 ", first_batch.data["review_summaries"][0])
+        self.assertIn("#18 ", first_batch.data["review_summaries"][1])
+        self.assertEqual(final.status, "ready")
+        self.assertEqual(final.data["selected_count"], 1)
+        self.assertEqual(final.data["kept_count"], 17)
+
+    def test_agent_cleanup_validators_cover_full_frozen_plan_range(self):
+        self.assertEqual(
+            actions.guangya_cleanup_preview_arguments({}),
+            {"max_candidates": 500},
+        )
+        self.assertEqual(
+            actions.guangya_cleanup_classify_arguments({
+                "decisions": [{"candidate_number": 500, "action": "keep"}],
+            })["decisions"][0]["candidate_number"],
+            500,
+        )
+        with self.assertRaisesRegex(AgentToolError, "冻结计划范围"):
+            actions.guangya_cleanup_classify_arguments({
+                "decisions": [{"candidate_number": 501, "action": "keep"}],
+            })
+
+    def test_persisted_preview_rejects_non_list_public_fields(self):
+        value = {key: 0 for key in actions._PREVIEW_KEYS}
+        value.update({
+            "sample_directories": [],
+            "review_summaries": "not-a-list",
+        })
+        self.assertIsNone(actions._safe_preview(value))
+
+    def test_unreviewed_candidate_cannot_enter_confirmation(self):
+        client = FakeCleanupClient()
+        context = ToolContext(owner="owner", session_id="session")
+        with mock.patch.object(actions, "GuangYaClient", return_value=client):
+            preview = actions.preview_guangya_cleanup({"max_candidates": 16}, context)
+            with self.assertRaisesRegex(AgentToolError, "尚未逐项复核"):
+                actions.prepare_guangya_cleanup_confirmation({}, context)
+        self.assertEqual(preview.data["undecided_count"], 1)
+
+    def test_keep_revision_invalidates_previous_confirmation_context(self):
+        client = FakeCleanupClient()
+        context = ToolContext(owner="owner", session_id="session")
+        with mock.patch.object(actions, "GuangYaClient", return_value=client):
+            actions.preview_guangya_cleanup({"max_candidates": 16}, context)
+            actions.classify_guangya_cleanup_candidates({
+                "decisions": [{"candidate_number": 1, "action": "quarantine"}],
+            }, context)
+            _confirmation, previous_context = actions.prepare_guangya_cleanup_confirmation(
+                {}, context
+            )
+            revised = actions.classify_guangya_cleanup_candidates({
+                "decisions": [{
+                    "candidate_number": 1,
+                    "action": "keep",
+                    "reason": "用户明确保留",
+                }],
+            }, context)
+            _confirmation, current_context = actions.prepare_guangya_cleanup_confirmation(
+                {}, context
+            )
+            with self.assertRaisesRegex(AgentToolError, "预览已变化"):
+                actions.execute_guangya_cleanup_confirmed({}, previous_context, context)
+        self.assertNotEqual(previous_context, current_context)
+        self.assertEqual(revised.data["selected_count"], 0)
+        self.assertEqual(revised.data["kept_count"], 1)
+        self.assertIn("xxx.png", repr(revised.data["review_summaries"]))
 
 
 
@@ -310,12 +469,57 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
             RiskLevel.READ.value,
         )
         self.assertEqual(
+            capabilities["guangya.organize.cleanup.classify"]["risk"],
+            RiskLevel.READ.value,
+        )
+        self.assertEqual(
             capabilities["guangya.organize.cleanup.execute"]["risk"],
             RiskLevel.DANGER.value,
         )
         self.assertTrue(
             capabilities["guangya.organize.cleanup.execute"]["requires_confirmation"]
         )
+
+    def test_user_keep_decision_overrides_previous_quarantine_selection(self):
+        client = FakeCleanupClient()
+        initial = cleanup.build_cleanup_plan(
+            client, owner="owner",
+            sources=[{"id": "source", "name": "整理源"}], max_candidates=20,
+        )
+        selected = cleanup.revise_cleanup_plan(
+            initial["plan_id"], owner="owner",
+            expected_fingerprint=initial["fingerprint"],
+            decisions=[{"candidate_number": 1, "action": "quarantine"}],
+        )
+        vetoed = cleanup.revise_cleanup_plan(
+            selected["plan_id"], owner="owner",
+            expected_fingerprint=selected["fingerprint"],
+            decisions=[{
+                "candidate_number": 1,
+                "action": "keep",
+                "reason": "用户明确要求保留",
+            }],
+        )
+        self.assertEqual(vetoed["stats"]["selected_count"], 0)
+        self.assertEqual(vetoed["stats"]["kept_count"], 1)
+        self.assertEqual(vetoed["stats"]["undecided_count"], 0)
+        self.assertEqual(vetoed["residuals"], [])
+        cleanup.confirm_cleanup_plan(
+            vetoed["plan_id"], owner="owner",
+            expected_fingerprint=vetoed["fingerprint"],
+        )
+        result = cleanup.execute_cleanup_plan(
+            {
+                "version": 1,
+                "plan_id": vetoed["plan_id"],
+                "plan_fingerprint": vetoed["fingerprint"],
+                "owner_digest": "owner-digest",
+                "credential_generation": 13,
+            },
+            client_factory=lambda: client,
+        )
+        self.assertEqual(result["stats"]["quarantined"], 0)
+        self.assertEqual(client.file_info("residual").parent_id, "source")
 
 
 if __name__ == "__main__":

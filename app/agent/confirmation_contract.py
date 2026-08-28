@@ -271,9 +271,9 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
     },
     "guangya.organize.cleanup.execute": {
         "action": "清理光鸭整理残留",
-        "object": "最近预览冻结的真空目录和严格垃圾残留目录",
-        "impact": "真空目录会在双重复核后进入回收站；非空垃圾残留整体移动到 MediaFlux 隔离区，不会永久删除。",
-        "reversibility": "隔离目录可手工移回；空目录可从光鸭回收站恢复。来源根及含媒体元数据或未知文件的目录不会进入计划。",
+        "object": "最近预览并逐项复核后的真空目录和残留目录",
+        "impact": "真空目录会在双重复核后进入回收站；仅明确选择隔离的非空残留目录会整体移动到 MediaFlux 隔离区。",
+        "reversibility": "隔离目录可手工移回；空目录可从光鸭回收站恢复。明确保留、未完成复核、含媒体元数据或快照变化的目录不会进入任务。",
     },
     "guangya.organize.clean_empty": {
         "action": "清理光鸭来源空目录",

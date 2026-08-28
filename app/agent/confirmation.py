@@ -102,6 +102,7 @@ class ConfirmationStore:
         followup_context: dict[str, Any] | None = None,
         confirmation_contract: dict[str, Any] | None = None,
         expected_owner_generation: int | None = None,
+        replace_active_ticket: bool = False,
     ) -> ConfirmationTicket:
         owner_key = str(owner or "").strip()
         if not owner_key:
@@ -118,10 +119,37 @@ class ConfirmationStore:
                     "会话已重置，请重新生成确认请求",
                     code="confirmation_invalid",
                 )
-            while len(self._tickets) >= self.max_entries:
-                oldest_id = min(self._tickets, key=lambda key: self._tickets[key].expires_at)
-                self._tickets.pop(oldest_id, None)
+            # 先生成唯一 ID，再执行容量淘汰；令牌源异常时必须原样保留
+            # 已存在票据，不能让一次失败的签发产生旁路状态变化。
             confirmation_id = self._new_unique_id_locked()
+            active_ticket_ids = [
+                key
+                for key, ticket in self._tickets.items()
+                if ticket.owner_generation == owner_generation
+                and secrets.compare_digest(ticket.owner, owner_key)
+            ]
+            replaced_count = len(active_ticket_ids) if replace_active_ticket else 0
+            protected_ticket_ids = (
+                frozenset(active_ticket_ids) if replace_active_ticket else frozenset()
+            )
+            overflow = max(
+                0, len(self._tickets) - replaced_count + 1 - self.max_entries
+            )
+            while overflow > 0:
+                removable_ids = [
+                    key for key in self._tickets if key not in protected_ticket_ids
+                ]
+                if not removable_ids:
+                    break
+                oldest_id = min(
+                    removable_ids,
+                    key=lambda key: self._tickets[key].expires_at,
+                )
+                self._tickets.pop(oldest_id, None)
+                overflow -= 1
+            if replace_active_ticket:
+                for key in active_ticket_ids:
+                    self._tickets.pop(key, None)
             ticket = ConfirmationTicket(
                 confirmation_id=confirmation_id,
                 owner=owner_key,
@@ -263,8 +291,10 @@ class ConfirmationStore:
             self._tickets.pop(ticket_id, None)
             return True
 
-    def rotate_owner(self, *, owner: str) -> tuple[int, int]:
-        """推进 owner epoch 并撤销其票据，返回 ``(数量, 新 epoch)``。"""
+    def rotate_owner(
+        self, *, owner: str, preserve_active: bool = False
+    ) -> tuple[int, int]:
+        """推进 owner epoch。默认撤销票据；查询抢占时可保留当前有效票据。"""
         owner_key = str(owner or "").strip()
         if not owner_key:
             raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
@@ -278,6 +308,21 @@ class ConfirmationStore:
                 for key, ticket in self._tickets.items()
                 if secrets.compare_digest(ticket.owner, owner_key)
             ]
+            if preserve_active:
+                for key in ticket_ids:
+                    ticket = self._tickets[key]
+                    self._tickets[key] = ConfirmationTicket(
+                        confirmation_id=ticket.confirmation_id,
+                        owner=ticket.owner,
+                        tool_name=ticket.tool_name,
+                        arguments=deepcopy(ticket.arguments),
+                        context_fingerprint=ticket.context_fingerprint,
+                        expires_at=ticket.expires_at,
+                        owner_generation=generation,
+                        followup_context=deepcopy(ticket.followup_context),
+                        confirmation_contract=deepcopy(ticket.confirmation_contract),
+                    )
+                return 0, generation
             for key in ticket_ids:
                 self._tickets.pop(key, None)
             return len(ticket_ids), generation
@@ -453,6 +498,7 @@ class SQLiteConfirmationStore(ConfirmationStore):
         followup_context: dict[str, Any] | None = None,
         confirmation_contract: dict[str, Any] | None = None,
         expected_owner_generation: int | None = None,
+        replace_active_ticket: bool = False,
     ) -> ConfirmationTicket:
         from app import database as db
         import sqlite3
@@ -481,14 +527,32 @@ class SQLiteConfirmationStore(ConfirmationStore):
             count = int(conn.execute(
                 "SELECT COUNT(*) FROM agent_confirmations"
             ).fetchone()[0] or 0)
-            overflow = max(0, count - (self.max_entries - 1))
+            replaced_count = 0
+            if replace_active_ticket:
+                replaced_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM agent_confirmations "
+                    "WHERE owner_digest=? AND owner_generation=?",
+                    (owner_digest, owner_generation),
+                ).fetchone()[0] or 0)
+            overflow = max(
+                0, count - replaced_count + 1 - self.max_entries
+            )
             if overflow > 0:
-                conn.execute(
-                    "DELETE FROM agent_confirmations WHERE confirmation_id IN ("
-                    "SELECT confirmation_id FROM agent_confirmations "
-                    "ORDER BY expires_at ASC, created_at ASC LIMIT ?)",
-                    (overflow,),
-                )
+                if replace_active_ticket:
+                    conn.execute(
+                        "DELETE FROM agent_confirmations WHERE confirmation_id IN ("
+                        "SELECT confirmation_id FROM agent_confirmations "
+                        "WHERE NOT (owner_digest=? AND owner_generation=?) "
+                        "ORDER BY expires_at ASC, created_at ASC LIMIT ?)",
+                        (owner_digest, owner_generation, overflow),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM agent_confirmations WHERE confirmation_id IN ("
+                        "SELECT confirmation_id FROM agent_confirmations "
+                        "ORDER BY expires_at ASC, created_at ASC LIMIT ?)",
+                        (overflow,),
+                    )
             confirmation_id = ""
             for _ in range(8):
                 candidate = str(self._token_factory() or "").strip()
@@ -517,6 +581,13 @@ class SQLiteConfirmationStore(ConfirmationStore):
                 except sqlite3.IntegrityError:
                     continue
                 confirmation_id = candidate
+                if replace_active_ticket:
+                    conn.execute(
+                        "DELETE FROM agent_confirmations "
+                        "WHERE owner_digest=? AND owner_generation=? "
+                        "AND confirmation_id<>?",
+                        (owner_digest, owner_generation, confirmation_id),
+                    )
                 break
             if not confirmation_id:
                 raise AgentToolError(
@@ -742,7 +813,9 @@ class SQLiteConfirmationStore(ConfirmationStore):
             )
             return deleted.rowcount == 1
 
-    def rotate_owner(self, *, owner: str) -> tuple[int, int]:
+    def rotate_owner(
+        self, *, owner: str, preserve_active: bool = False
+    ) -> tuple[int, int]:
         from app import database as db
 
         owner_key = str(owner or "").strip()
@@ -763,6 +836,13 @@ class SQLiteConfirmationStore(ConfirmationStore):
                 "updated_at=excluded.updated_at",
                 (owner_digest, generation, now, self._timestamp()),
             )
+            if preserve_active:
+                conn.execute(
+                    "UPDATE agent_confirmations SET owner_generation=? "
+                    "WHERE owner_digest=? AND expires_at>?",
+                    (generation, owner_digest, now),
+                )
+                return 0, generation
             deleted = conn.execute(
                 "DELETE FROM agent_confirmations WHERE owner_digest=?", (owner_digest,)
             )

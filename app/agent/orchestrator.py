@@ -15,6 +15,10 @@ import unicodedata
 from typing import Any, Callable
 
 from app import database as db
+from app.agent.action_plan import (
+    action_plan_model_context,
+    build_action_plan,
+)
 from app.agent.action_history import (
     record_confirmation_claimed,
     record_confirmation_error,
@@ -5646,45 +5650,6 @@ def _is_confirmation_response(response: Any) -> bool:
     )
 
 
-def _has_deterministic_danger_intent(message: str) -> bool:
-    """按领域意图阻断 DANGER 请求进入 Planner，包括参数不完整的命令。"""
-    normalized = _normalize_intent_message(message)
-    if not normalized or _is_danger_read_question(normalized):
-        return False
-
-    download_delete_intent = bool(
-        is_download_task_control_message(normalized)
-        and any(token in normalized for token in ("删除", "移除"))
-    )
-    rss_delete_intent = bool(
-        is_rss_subscription_control_write_message(normalized)
-        and any(token in normalized for token in ("删除", "移除"))
-    )
-    strm_run_intent = bool(
-        "strm" in normalized
-        and "同步" in normalized
-        and "元数据" not in normalized
-        and not any(
-            token in normalized
-            for token in ("状态", "进度", "怎么样", "完成了吗", "到哪", "定时", "计划")
-        )
-    )
-    organize_danger_intent = bool(
-        _has_organize_scope(normalized)
-        and not is_guangya_organize_preview_message(normalized)
-        and not is_guangya_organize_schedule_policy_summary_message(normalized)
-    )
-    return bool(
-        is_download_retry_submission_message(normalized)
-        or download_delete_intent
-        or rss_delete_intent
-        or is_rss_pending_download_write_message(normalized)
-        or is_rss_failure_retry_write_message(normalized)
-        or is_strm_failure_write_message(normalized)
-        or strm_run_intent
-        or organize_danger_intent
-    )
-
 
 class AgentOrchestrator:
     def __init__(self, registry: ToolRegistry, confirmation_store: ConfirmationStore | None = None,
@@ -5716,8 +5681,12 @@ class AgentOrchestrator:
         owner_key = str(owner or "").strip()
         if not owner_key:
             raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
-        _revoked, generation = self.confirmation_store.rotate_owner(owner=owner_key)
-        self._reconcile_missing_confirmations(owner_key, ())
+        _revoked, generation = self.confirmation_store.rotate_owner(
+            owner=owner_key, preserve_active=True
+        )
+        self._reconcile_missing_confirmations(
+            owner_key, self.confirmation_store.list_active_tickets(owner=owner_key)
+        )
         return generation
 
     def invalidate_query_confirmation_epoch(self, *, owner: str) -> int:
@@ -5774,6 +5743,64 @@ class AgentOrchestrator:
             "deleted_contexts": persisted,
         }
 
+    def _active_action_plan_context(self, *, owner: str) -> str:
+        """返回当前 owner 待确认计划的脱敏模型上下文。"""
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return ""
+        tickets = self.confirmation_store.list_active_tickets(owner=owner_key)
+        self._reconcile_missing_confirmations(owner_key, tickets)
+        if len(tickets) > 1:
+            return (
+                f"当前有 {len(tickets)} 项尚未执行的行动计划；对象不唯一。"
+                "只能让用户在对应计划卡片上执行或取消，不得猜测目标。"
+            )
+        if not tickets:
+            return ""
+        ticket = tickets[0]
+        plan = build_action_plan(
+            plan_id=ticket.confirmation_id,
+            confirmation_contract=ticket.confirmation_contract,
+            expires_in=self.confirmation_store.ttl_seconds,
+        )
+        return action_plan_model_context(plan)
+
+    @staticmethod
+    def _append_action_plan_context(
+        conversation_context: list[dict[str, Any]] | None,
+        plan_context: str,
+    ) -> list[dict[str, Any]] | None:
+        if not plan_context:
+            return conversation_context
+        context = [
+            deepcopy(item)
+            for item in (conversation_context or [])
+            if isinstance(item, dict)
+        ]
+        context.append({
+            "role": "assistant",
+            "text": plan_context,
+            "status": "confirmation_required",
+        })
+        return context
+
+    @staticmethod
+    def _attach_terminal_action_plan(
+        response: dict[str, Any],
+        *,
+        ticket: Any,
+        status: str,
+    ) -> dict[str, Any]:
+        plan = build_action_plan(
+            plan_id=ticket.confirmation_id,
+            confirmation_contract=ticket.confirmation_contract,
+            expires_in=0,
+            status=status,
+        )
+        if plan:
+            response["action_plan"] = plan
+        return response
+
     def discard_confirmation(self, confirmation_id: str, *, owner: str) -> bool:
         ticket = next(
             (
@@ -5788,9 +5815,18 @@ class AgentOrchestrator:
             confirmation_id=confirmation_id,
         )
         if discarded:
-            # 取消也是同一 owner 的最新受控意图；推进 epoch，阻止已被抢占的
-            # 后台 query 在取消后重新留下新的确认票据。
-            self.invalidate_query_confirmation_epoch(owner=owner)
+            # 查询开始时已独占最新 epoch。模型在同一轮先取消旧计划、再生成
+            # 替代计划时必须保留该 epoch；按钮/API 等查询外取消仍推进 epoch，
+            # 防止已经被抢占的后台查询重新留下计划。
+            query_epoch = _QUERY_CONFIRMATION_EPOCH.get()
+            owner_key = str(owner or "").strip()
+            in_current_query = (
+                query_epoch is not None
+                and owner_key
+                and secrets.compare_digest(query_epoch[0], owner_key)
+            )
+            if not in_current_query:
+                self.invalidate_query_confirmation_epoch(owner=owner_key)
             agent_metrics.record_confirmation("discarded")
             ref = workflow_ref_from_context(
                 ticket.followup_context if ticket is not None else None
@@ -5875,13 +5911,16 @@ class AgentOrchestrator:
             summary=f"已取消“{action}”，没有执行任何写操作。",
             suggestions=["需要时可以重新提交原任务生成新的预检。"],
         )
-        return self._response(
+        response = self._response(
             ticket.tool_name,
             {},
             result,
             0,
             mode="cancelled_action",
             request_id=request_id,
+        )
+        return self._attach_terminal_action_plan(
+            response, ticket=ticket, status="cancelled"
         )
 
     def capabilities(self) -> dict[str, Any]:
@@ -6818,6 +6857,7 @@ class AgentOrchestrator:
             followup_context=followup_context,
             confirmation_contract=confirmation_contract,
             expected_owner_generation=owner_generation,
+            replace_active_ticket=True,
         )
         agent_metrics.record_confirmation("issued")
         response = {
@@ -6832,6 +6872,11 @@ class AgentOrchestrator:
                 "expires_in": self.confirmation_store.ttl_seconds,
                 "contract": sanitize_confirmation_contract(ticket.confirmation_contract),
             },
+            "action_plan": build_action_plan(
+                plan_id=ticket.confirmation_id,
+                confirmation_contract=ticket.confirmation_contract,
+                expires_in=self.confirmation_store.ttl_seconds,
+            ),
         }
         guidance = result_projection.project_public_guidance(preview.suggestions)
         if guidance:
@@ -7228,7 +7273,10 @@ class AgentOrchestrator:
                         f"{public_result.summary}。{str(followup_result.get('summary') or '').strip()}"
                     ).strip("。")
                     followup["mode"] = "confirmed_action"
-                    return result_projection.attach_public_display(followup)
+                    followup = result_projection.attach_public_display(followup)
+                    return self._attach_terminal_action_plan(
+                        followup, ticket=ticket, status="completed"
+                    )
             if title and not web_runtime_ready:
                 suggestion = (
                     f"站点选择已经保存，但当前 Web 搜索服务尚未刷新；"
@@ -7236,13 +7284,18 @@ class AgentOrchestrator:
                 )
                 if suggestion not in public_result.suggestions:
                     public_result.suggestions.append(suggestion)
-        return self._response(
+        response = self._response(
             ticket.tool_name,
             {},
             public_result,
             elapsed_ms,
             mode="confirmed_action",
             request_id=trace_context.request_id,
+        )
+        return self._attach_terminal_action_plan(
+            response,
+            ticket=ticket,
+            status="completed" if public_result.ok else "failed",
         )
 
     def query(
@@ -7631,6 +7684,10 @@ class AgentOrchestrator:
         emit_agent_progress("model_wait")
         rate_identity = llm_tool_rate_identity or llm_rate_owner or owner
         action_request = is_agent_action_request(message)
+        model_conversation_context = self._append_action_plan_context(
+            conversation_context,
+            self._active_action_plan_context(owner=owner),
+        )
 
         def _execute_native_tool(
             tool_name: str, arguments: dict[str, Any]
@@ -7715,12 +7772,10 @@ class AgentOrchestrator:
                     _execute_native_tool,
                     owner=llm_rate_owner or owner,
                     reply_context=reply_context,
-                    include_confirmations=bool(
-                        owner and not read_only and action_request
-                    ),
+                    include_confirmations=bool(owner and not read_only),
                     **(
-                        {"conversation_context": conversation_context}
-                        if conversation_context else {}
+                        {"conversation_context": model_conversation_context}
+                        if model_conversation_context else {}
                     ),
                 )
         finally:
@@ -7747,8 +7802,8 @@ class AgentOrchestrator:
                     owner=owner,
                     rate_owner=llm_rate_owner or owner,
                     **(
-                        {"conversation_context": conversation_context}
-                        if conversation_context else {}
+                        {"conversation_context": model_conversation_context}
+                        if model_conversation_context else {}
                     ),
                     **(
                         {"reply_context": reply_context}
@@ -8988,14 +9043,14 @@ class AgentOrchestrator:
         has_deterministic_media_subscription_binding = (
             _has_deterministic_media_subscription_binding(message)
         )
-        has_deterministic_danger_action = _has_deterministic_danger_intent(message)
-        # 被确定性 DANGER 领域接管的请求，后置兼容选择器也不得再次交给模型。
-        model_routing_attempted = has_deterministic_danger_action
+        # 已认证会话默认由模型先理解当前目标；服务端注册表仍决定工具是只读
+        # 执行还是只能生成行动计划。仅保留需要服务端把媒体名称精确绑定到订阅
+        # 编号的路径，避免模型猜测对象；其余确定性解析器只作为 Provider 降级。
+        model_routing_attempted = has_deterministic_media_subscription_binding
         if (
             allow_model_routing
             and not has_resource_continuation
             and not has_deterministic_media_subscription_binding
-            and not has_deterministic_danger_action
         ):
             model_routing_attempted = True
             model_read = self._query_with_model_tools(
@@ -9005,7 +9060,7 @@ class AgentOrchestrator:
                 llm_tool_rate_identity=llm_tool_rate_identity,
                 conversation_context=conversation_context,
                 read_only=(
-                    not action_request
+                    not owner
                     or danger_read_question
                     or _is_cross_domain_rss_refresh_correction(
                         message,
