@@ -575,6 +575,125 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
             "Korean Audio", korean_audio.cleaned_components["noise_tokens"],
         )
 
+    def test_combined_dub_and_subtitle_bracket_is_removed_from_release_folder(self):
+        scraper = self.recognition_module()
+        folder = (
+            "【高清剧集网发布 www.BPHDTV.com】飞出个未来.第十二季"
+            "[全10集][国语配音+中文字幕].Futurama.S12.2024.1080p."
+            "DSNP.WEB-DL.DDP5.1.H264-ZeroTV"
+        )
+
+        self.assertTrue(scraper._is_bracket_noise("国语配音+中文字幕"))
+        self.assertFalse(scraper._is_bracket_noise("国语配音的故事"))
+        self.assertFalse(scraper._is_bracket_noise("中文配音"))
+
+        root_context = scraper.extract_recognition_context(folder, "/")
+        self.assertEqual(root_context.normalized_title, "飞出个未来 Futurama")
+        self.assertEqual(root_context.season, 12)
+        self.assertEqual(root_context.media_type, "tv")
+        self.assertIn(
+            "国语配音+中文字幕",
+            root_context.cleaned_components["noise_tokens"],
+        )
+
+        for category in ("电视剧", "动漫"):
+            with self.subTest(category=category):
+                child_context = scraper.extract_recognition_context(
+                    "01.mkv", f"/{category}/{folder}",
+                )
+                self.assertEqual(
+                    child_context.normalized_title, "飞出个未来 Futurama",
+                )
+                self.assertEqual(
+                    (child_context.media_type, child_context.season, child_context.episode),
+                    ("tv", 12, 1),
+                )
+                self.assertNotIn("国语配音", child_context.normalized_title)
+                self.assertNotIn("中文字幕", child_context.normalized_title)
+
+    def test_real_guangya_release_folder_metadata_does_not_pollute_titles(self):
+        scraper = self.recognition_module()
+        samples = (
+            (
+                "电视剧",
+                "【高清剧集网发布 www.PTHDTV.com】师兄太稳健[60帧率版本]"
+                "[高码版][第16-17集][国语配音+中文字幕].2026.2160p.HQ."
+                "WEB-DL.H265.HDR.60fps.AAC-BlackTV",
+                "师兄太稳健",
+            ),
+            (
+                "动漫",
+                "【高清剧集网发布 www.DDHDTV.com】辛普森一家 第十季[全23集]"
+                "[粤英多音轨+简繁英字幕].The.Simpsons.S10.1998.1080p."
+                "DSNP.WEB-DL.H264.DDP.5.1-ZeroTV",
+                "辛普森一家 The Simpsons",
+            ),
+            (
+                "电视剧",
+                "【高清剧集网发布 www.BBEGGE.com】入侵.第三季[全10集]"
+                "[简繁英字幕].Invasion.S03.2160p.Apple.TV+.WEB-DL.DDP.5.1."
+                "Atmos.HDR10+.H.265-BlackTV",
+                "入侵 Invasion",
+            ),
+            (
+                "电视剧",
+                "【高清剧集网发布 www.BBHDTV.com】地狱来的芳邻[全8集]"
+                "[简繁英字幕].The.Burbs.S01.1080p.HBOMax.WEB-DL.DDP.5.1."
+                "H.264-BlackTV",
+                "地狱来的芳邻 The Burbs",
+            ),
+            (
+                "动漫",
+                "【高清剧集网发布 www.DDHDTV.com】银河英雄传说 Die Neue These "
+                "邂逅[全12集][中文字幕].2018.1080p.BluRay.x264.DTS.3.1-ZeroTV",
+                "银河英雄传说 Die Neue These 邂逅",
+            ),
+            (
+                "动漫",
+                "【高清剧集网发布 www.DDHDTV.com】辛普森一家 第二十五季"
+                "[第01-22集][简繁英字幕].The.Simpsons.S25.2013.1080p."
+                "DSNP.WEB-DL.H264.DDP.5.1-ZeroTV",
+                "辛普森一家 The Simpsons",
+            ),
+            (
+                "电视剧",
+                "明日传奇.第一季全集.DCs.Legends.of.Tomorrow.S01E01-16."
+                "2016.HD1080P.X264.AAC.English.CHS-ENG.Mp4Ba",
+                "明日传奇 DCs Legends of Tomorrow",
+            ),
+            (
+                "电视剧",
+                "DCs.Legends.of.Tomorrow.S04.1080p.AMZN.WEBRip.DDP5.1."
+                "x264-QOQ[rartv]",
+                "DCs Legends of Tomorrow",
+            ),
+        )
+
+        for category, folder, expected_title in samples:
+            with self.subTest(folder=folder):
+                directory_context = scraper.extract_recognition_context(
+                    folder, f"/{category}",
+                )
+                child_context = scraper.extract_recognition_context(
+                    "01.mkv", f"/{category}/{folder}",
+                )
+                self.assertEqual(directory_context.normalized_title, expected_title)
+                self.assertEqual(child_context.normalized_title, expected_title)
+                self.assertEqual(child_context.media_type, "tv")
+
+    def test_release_language_name_requires_technical_and_language_code_context(self):
+        scraper = self.recognition_module()
+
+        technical = scraper.extract_recognition_context(
+            "Example.Show.S01E01.1080p.AAC.English.CHS-ENG.mkv", "",
+        )
+        formal_title = scraper.extract_recognition_context(
+            "The.English.S01E01.2022.1080p.WEB-DL.CHS.mkv", "",
+        )
+
+        self.assertEqual(technical.normalized_title, "Example Show")
+        self.assertEqual(formal_title.normalized_title, "The English")
+
     def test_explicit_quoted_release_wrapper_is_strict_source_title_evidence(self):
         scraper = self.recognition_module()
 
