@@ -1003,6 +1003,33 @@ body.agent-page-body::after { display: none; }
 .agent-config-diagnosis p { color: var(--text-secondary); font-size: 11px; line-height: 1.55; }
 .agent-config-diagnosis ul { display: grid; gap: 5px; margin: 2px 0 0; padding-left: 17px; font-size: 11px; line-height: 1.55; }
 .agent-config-diagnosis li::marker { color: var(--warning); }
+.agent-notices {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    align-items: flex-start;
+    gap: 10px;
+    margin-top: 14px;
+    padding: 10px 12px;
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--control-tint) 76%, transparent);
+    border: 1px solid var(--agent-line);
+    border-radius: 11px;
+}
+.agent-notices-mark {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    color: var(--text-muted);
+    background: var(--bg-card);
+    border: 1px solid var(--agent-line);
+    border-radius: 9px;
+}
+.agent-notices-mark svg { width: 13px; height: 13px; }
+.agent-notices-copy { min-width: 0; display: grid; gap: 3px; }
+.agent-notices-copy strong { color: var(--text-secondary); font-size: 10px; line-height: 1.4; }
+.agent-notices-copy p { margin: 0; color: var(--text-muted); font-size: 10px; line-height: 1.55; overflow-wrap: anywhere; }
 .agent-guidance { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--agent-line); }
 .agent-guidance h4 { margin-bottom: 9px; color: var(--text-muted); font-size: 10px; font-weight: 650; letter-spacing: .02em; }
 .agent-guidance-actions { display: flex; flex-wrap: wrap; gap: 8px; }

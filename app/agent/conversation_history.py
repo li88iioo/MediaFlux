@@ -1156,8 +1156,9 @@ class SQLiteAgentConversationHistoryRepository:
             if isinstance(response.get("presentation"), dict)
             else {}
         )
+        presentation_source = str(presentation.get("source") or "").strip().lower()
         if (
-            presentation.get("source") == "llm"
+            presentation_source in {"llm", "system"}
             and presentation.get("kind") == "narrative"
         ):
             narrative = self._safe_optional_output_text(
@@ -1165,6 +1166,24 @@ class SQLiteAgentConversationHistoryRepository:
             )
             if narrative:
                 projection["narrative"] = narrative
+                projection["presentation_source"] = presentation_source
+        notice_candidates: list[Any] = []
+        if isinstance(presentation.get("notices"), list):
+            notice_candidates.extend(presentation["notices"])
+        display = response.get("display") if isinstance(response.get("display"), dict) else {}
+        if isinstance(display.get("notices"), list):
+            notice_candidates.extend(display["notices"])
+        notices: list[str] = []
+        for item in notice_candidates:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            notice = self._safe_output_text(item, limit=220, label="notice")
+            if notice not in notices:
+                notices.append(notice)
+            if len(notices) >= 3:
+                break
+        if notices:
+            projection["notices"] = notices
         usage = self._validated_usage(response.get("llm_usage"))
         if usage is not None:
             projection["usage"] = usage
@@ -1293,13 +1312,14 @@ class SQLiteAgentConversationHistoryRepository:
         narrative = projection.pop("narrative", None)
 
         # 先让原有安全投影落入预算：建议从尾部裁剪，摘要最后才缩短。
-        suggestions = projection.get("suggestions")
-        if isinstance(suggestions, list):
-            while suggestions and encode_or_none() is None:
-                suggestions = suggestions[:-1]
-                projection["suggestions"] = suggestions
+        for list_key in ("suggestions", "notices"):
+            values = projection.get(list_key)
+            if isinstance(values, list):
+                while values and encode_or_none() is None:
+                    values = values[:-1]
+                    projection[list_key] = values
 
-        for optional_key in ("error", "usage"):
+        for optional_key in ("error", "usage", "presentation_source"):
             if encode_or_none() is not None:
                 break
             projection.pop(optional_key, None)

@@ -127,6 +127,23 @@ class AgentPageTests(InitializedWebTestCase):
             re.compile(r"@media \(max-width:\s*680px\)[\s\S]*\.agent-read-plan-step"),
         )
 
+    def test_agent_frontend_renders_notices_as_static_non_actionable_context(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        styles = STYLES.read_text(encoding="utf-8")
+
+        self.assertIn("function responseNotices", source)
+        self.assertIn("function renderNotices", source)
+        self.assertIn("['llm', 'system'].includes(presentation?.source)", source)
+        self.assertIn("section.setAttribute('aria-label', '数据说明')", source)
+        self.assertIn("data.presentation_source === 'system' ? 'system' : 'llm'", source)
+        self.assertIn("notices: Array.isArray(data.notices) ? data.notices : []", source)
+        self.assertIn(".agent-notices", styles)
+        self.assertIn(".agent-notices-copy p", styles)
+        render_notices = source.split("function renderNotices", 1)[1].split("function renderNarrative", 1)[0]
+        self.assertNotIn("dataset.agentPrompt", render_notices)
+        self.assertNotIn("dataset.agentDraft", render_notices)
+        self.assertNotIn("button", render_notices)
+
     def test_agent_frontend_renders_workspace_overview_and_draft_workflows(self):
         source = SCRIPT.read_text(encoding="utf-8")
         styles = STYLES.read_text(encoding="utf-8")

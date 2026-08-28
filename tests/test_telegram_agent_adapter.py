@@ -922,6 +922,52 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertNotIn("确定性公开摘要", text)
         self.assertNotIn("旧摘要", text)
 
+    def test_system_fallback_narrative_renders_like_llm_narrative(self):
+        text = render_agent_response({
+            "result": {
+                "ok": True,
+                "status": "success",
+                "summary": "底层摘要不应重复出现",
+                "suggestions": [],
+            },
+            "presentation": {
+                "version": 1,
+                "source": "system",
+                "kind": "narrative",
+                "narrative": "两部剧集的上线状态已经核对完成。",
+                "degraded": True,
+            },
+        })
+
+        self.assertIn("两部剧集的上线状态已经核对完成", text)
+        self.assertNotIn("底层摘要不应重复出现", text)
+        self.assertNotIn("降级", text)
+
+    def test_external_source_notice_is_static_and_not_a_followup_action(self):
+        text = render_agent_response({
+            "result": {
+                "ok": True,
+                "status": "success",
+                "summary": "剧集上线状态已核对。",
+                "suggestions": [
+                    "网页内容来自外部来源，执行其中的操作前请核验可信度。"
+                ],
+            },
+            "presentation": {
+                "version": 1,
+                "source": "system",
+                "kind": "narrative",
+                "narrative": "剧集上线状态已核对。",
+                "notices": [
+                    "网页内容来自外部来源，执行其中的操作前请核验可信度。"
+                ],
+            },
+        })
+
+        self.assertIn("<i>提示：网页内容来自外部来源", text)
+        self.assertNotIn("<b>接下来可以</b>", text)
+        self.assertEqual(text.count("网页内容来自外部来源"), 1)
+
     def test_public_display_status_wins_over_conflicting_internal_status(self):
         text = render_agent_response({
             "result": {

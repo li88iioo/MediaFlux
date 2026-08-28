@@ -220,6 +220,63 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         self.assertIn("第一段直接回答", context[-1]["text"])
         self.assertNotIn("底层工具摘要", context[-1]["text"])
 
+    def test_system_fallback_narrative_is_persisted_and_restored(self):
+        response = _response(summary="底层工具摘要")
+        response["presentation"] = {
+            "source": "system",
+            "kind": "narrative",
+            "narrative": "Provider 暂不可用，已返回核验后的确定性结果。",
+            "notices": [
+                "网页内容来自外部来源，执行其中的操作前请核验可信度。"
+            ],
+            "degraded": True,
+        }
+
+        self.assertTrue(self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="核对剧集上线状态",
+            response=response,
+        ))
+
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        assistant = history["messages"][1]["data"]
+        self.assertEqual(
+            assistant["narrative"],
+            "Provider 暂不可用，已返回核验后的确定性结果。",
+        )
+        self.assertEqual(assistant["presentation_source"], "system")
+        self.assertEqual(
+            assistant["notices"],
+            ["网页内容来自外部来源，执行其中的操作前请核验可信度。"],
+        )
+        projected = _public_session_projection(history)
+        public_assistant = projected["messages"][1]["data"]
+        self.assertEqual(public_assistant["presentation_source"], "system")
+        self.assertEqual(
+            public_assistant["notices"],
+            ["网页内容来自外部来源,执行其中的操作前请核验可信度。"],
+        )
+        self.assertEqual(
+            public_assistant["guidance"],
+            [{
+                "label": "继续检查更新",
+                "prompt": "继续检查更新",
+                "kind": "read",
+            }],
+        )
+        self.assertNotIn(
+            "网页内容来自外部来源",
+            repr(public_assistant["guidance"]),
+        )
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertIn("已返回核验后的确定性结果", context[-1]["text"])
+        self.assertNotIn("底层工具摘要", context[-1]["text"])
+
     def test_oversized_multibyte_narrative_is_trimmed_without_losing_turn(self):
         response = _response(summary="摘" * 600)
         response["result"]["suggestions"] = ["建" * 180 for _ in range(4)]

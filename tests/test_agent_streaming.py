@@ -304,8 +304,15 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         )
         final = events[-1]["payload"]
         self.assertEqual(final["result"]["summary"], "下载队列状态正常")
+        self.assertEqual(final["presentation"]["source"], "system")
+        self.assertEqual(final["presentation"]["narrative"], "下载队列状态正常")
+        self.assertTrue(final["presentation"]["degraded"])
         self.assertNotIn("当前已生成一部分", response.text)
         history.assert_called_once()
+        self.assertEqual(
+            history.call_args.kwargs["response"]["presentation"],
+            final["presentation"],
+        )
 
     def test_partial_stream_interruption_persists_public_prefix_and_tool_state(self):
         csrf = self._login()
@@ -398,6 +405,8 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         final_payload = events[-1]["payload"]
         self.assertEqual(final_payload["request_id"], events[-1]["request_id"])
         self.assertEqual(final_payload["result"]["summary"], "下载队列状态正常")
+        self.assertEqual(final_payload["presentation"]["source"], "system")
+        self.assertEqual(final_payload["presentation"]["narrative"], "下载队列状态正常")
         self.assertEqual(final_payload["result"]["data"], {"总数": 16})
         self.assertEqual(
             final_payload["tool_call"],
@@ -447,6 +456,14 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(
             events[-1]["payload"]["result"]["summary"],
+            "下载队列状态正常",
+        )
+        self.assertEqual(
+            events[-1]["payload"]["presentation"]["source"],
+            "system",
+        )
+        self.assertEqual(
+            events[-1]["payload"]["presentation"]["narrative"],
             "下载队列状态正常",
         )
         self.assertNotIn("内部检查", response.text)
@@ -594,7 +611,16 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
             [item["type"] for item in events],
             ["status", "status", "status", "final"],
         )
-        self.assertNotIn("presentation", events[-1]["payload"])
+        self.assertEqual(
+            events[-1]["payload"]["presentation"],
+            {
+                "version": 1,
+                "source": "system",
+                "kind": "narrative",
+                "narrative": "下载队列状态正常",
+                "degraded": True,
+            },
+        )
 
     def test_cancel_arriving_before_stream_prevents_query_and_history(self):
         csrf = self._login()

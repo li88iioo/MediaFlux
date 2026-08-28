@@ -1605,8 +1605,37 @@
         }).slice(0, 3);
     }
 
+    function responseNotices(payload) {
+        const candidates = [
+            ...(Array.isArray(payload?.presentation?.notices) ? payload.presentation.notices : []),
+            ...(Array.isArray(payload?.display?.notices) ? payload.display.notices : []),
+            ...(Array.isArray(payload?.notices) ? payload.notices : []),
+        ];
+        const seen = new Set();
+        return candidates.flatMap((item) => {
+            const text = String(item || '').trim().slice(0, 220);
+            if (!text || seen.has(text)) return [];
+            seen.add(text);
+            return [text];
+        }).slice(0, 3);
+    }
+
+    function renderNotices(payload) {
+        const notices = responseNotices(payload);
+        if (!notices.length) return null;
+        const section = node('aside', 'agent-notices');
+        section.setAttribute('aria-label', '数据说明');
+        const mark = node('span', 'agent-notices-mark');
+        mark.append(icon('info'));
+        const copy = node('div', 'agent-notices-copy');
+        copy.append(node('strong', '', '数据说明'));
+        notices.forEach((notice) => copy.append(node('p', '', notice)));
+        section.append(mark, copy);
+        return section;
+    }
+
     function renderNarrative(presentation) {
-        if (presentation?.source !== 'llm' || presentation?.kind !== 'narrative') return null;
+        if (!['llm', 'system'].includes(presentation?.source) || presentation?.kind !== 'narrative') return null;
         const narrative = String(presentation.narrative || '').trim();
         if (!narrative) return null;
         return renderTextBlocks(narrative, 'agent-narrative agent-rich-text', {promoteFirst: true});
@@ -1615,7 +1644,7 @@
     function responseInspectionTrace(payload) {
         const rawItems = Array.isArray(payload?.agent_trace) ? payload.agent_trace : [];
         const partial = payload?.agent_partial?.complete === false;
-        const attentionOnly = payload?.presentation?.source === 'llm'
+        const attentionOnly = ['llm', 'system'].includes(payload?.presentation?.source)
             && payload?.presentation?.kind === 'narrative';
         const projected = rawItems.flatMap((item) => {
             if (!item || typeof item !== 'object') return [];
@@ -1763,6 +1792,8 @@
             if (trace) card.append(trace);
             const state = renderNarrativeState(display, result);
             if (state) card.append(state);
+            const notices = renderNotices(payload);
+            if (notices) card.append(notices);
             const guidance = renderGuidance(payload);
             if (guidance) card.append(guidance);
             return card;
@@ -1805,6 +1836,8 @@
         else if (genericData) {
             card.append(renderResultDisclosure(genericData));
         }
+        const notices = renderNotices(payload);
+        if (notices) card.append(notices);
         const guidance = payload?.tool_call?.name === 'config.diagnose' ? null : renderGuidance(payload);
         if (guidance) card.append(guidance);
         return card;
@@ -2881,11 +2914,13 @@
                         mode: data.mode || 'read_only',
                         tool_call: {},
                         guidance: Array.isArray(data.guidance) ? data.guidance : [],
+                        notices: Array.isArray(data.notices) ? data.notices : [],
                         presentation: narrative ? {
-                            source: 'llm',
+                            source: data.presentation_source === 'system' ? 'system' : 'llm',
                             kind: 'narrative',
                             narrative,
                             guidance: Array.isArray(data.guidance) ? data.guidance : [],
+                            notices: Array.isArray(data.notices) ? data.notices : [],
                         } : undefined,
                         result: {
                             ok: data.ok === true,

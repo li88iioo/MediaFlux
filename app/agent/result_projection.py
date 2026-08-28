@@ -705,8 +705,10 @@ _INFORMATIONAL_GUIDANCE_MARKERS = (
     "不会自动", "不会立即", "不会触发", "不会删除", "不会回滚",
     "只代表", "只可使用一次", "每次请求会消耗", "结果仅按",
     "确认前请核对", "请由管理员", "请在部署环境", "请先在设置页",
-    "请先在网盘整理页面",
+    "请先在网盘整理页面", "网页内容来自外部来源", "外部内容仅供参考",
+    "公开信息仅供参考", "请核验可信度", "请以官方信息为准",
 )
+_INFORMATIONAL_GUIDANCE_KINDS = {"notice", "info", "advisory"}
 
 _PUBLIC_STATUS_LABELS: dict[str, str] = {
     "accepted": "已提交",
@@ -1055,31 +1057,41 @@ def _guidance_kind(prompt: str) -> str:
     return "draft"
 
 
+def _public_suggestion_prompt(item: object, *, limit: int = 180) -> str:
+    raw_prompt = item.get("prompt") if isinstance(item, Mapping) else item
+    prompt = sanitize_public_text(raw_prompt, limit=limit)
+    tool_detail_match = _GUIDANCE_TOOL_DETAIL_RE.match(prompt)
+    if tool_detail_match:
+        prompt = f"查看{tool_detail_match.group(1).strip()}详情"
+    return _GUIDANCE_PREFIX_RE.sub("", prompt).strip().strip("“”‘’\"'")
+
+
+def _public_suggestion_is_notice(item: object, prompt: str) -> bool:
+    raw_kind = (
+        str(item.get("kind") or "").strip().casefold()
+        if isinstance(item, Mapping)
+        else ""
+    )
+    return raw_kind in _INFORMATIONAL_GUIDANCE_KINDS or _is_informational_guidance(prompt)
+
+
 def project_public_guidance(
     items: object,
     *,
     force_kind: str | None = None,
     limit: int = 4,
 ) -> list[dict[str, str]]:
-    """把建议投影为网页/TG 可理解的下一步；未知与写入倾向默认只填入输入框。"""
+    """把建议投影为网页/TG 可理解的下一步；说明文字永远不会变成操作按钮。"""
     if not isinstance(items, Sequence) or isinstance(items, (str, bytes, bytearray)):
         return []
     projected: list[dict[str, str]] = []
     seen: set[str] = set()
     max_items = max(1, min(int(limit or 1), 6))
     for item in items:
-        raw_prompt = item.get("prompt") if isinstance(item, Mapping) else item
-        prompt = sanitize_public_text(raw_prompt, limit=180)
-        tool_detail_match = _GUIDANCE_TOOL_DETAIL_RE.match(prompt)
-        if tool_detail_match:
-            prompt = f"查看{tool_detail_match.group(1).strip()}详情"
-        prompt = _GUIDANCE_PREFIX_RE.sub("", prompt).strip().strip("“”‘’\"'")
-        if not prompt or prompt in seen:
+        prompt = _public_suggestion_prompt(item)
+        if not prompt or prompt in seen or _public_suggestion_is_notice(item, prompt):
             continue
-        explicit_item = isinstance(item, Mapping)
-        if not explicit_item and _is_informational_guidance(prompt):
-            continue
-        raw_kind = str(item.get("kind") or "") if explicit_item else ""
+        raw_kind = str(item.get("kind") or "") if isinstance(item, Mapping) else ""
         kind = force_kind or (raw_kind if raw_kind in {"read", "draft"} else _guidance_kind(prompt))
         # 只有明确只读语句才允许一键发送；强制 draft 可用于模型生成建议。
         if kind == "read" and _guidance_kind(prompt) != "read":
@@ -1093,6 +1105,26 @@ def project_public_guidance(
         if len(projected) >= max_items:
             break
     return projected
+
+
+def project_public_notices(items: object, *, limit: int = 3) -> list[str]:
+    """提取只读说明/数据边界，供 Web 与 Telegram 静态展示而不是再次发送。"""
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes, bytearray)):
+        return []
+    notices: list[str] = []
+    max_items = max(1, min(int(limit or 1), 4))
+    for item in items:
+        prompt = _public_suggestion_prompt(item, limit=220)
+        if (
+            not prompt
+            or prompt in notices
+            or not _public_suggestion_is_notice(item, prompt)
+        ):
+            continue
+        notices.append(prompt)
+        if len(notices) >= max_items:
+            break
+    return notices
 
 
 def _safe_key(value: object) -> tuple[str, str]:
@@ -1314,6 +1346,7 @@ def project_agent_result_for_user(result: Mapping[str, Any]) -> dict[str, Any]:
             "error": "",
             "details": {},
             "guidance": [],
+            "notices": [],
         }
 
     ok = bool(result.get("ok"))
@@ -1333,7 +1366,9 @@ def project_agent_result_for_user(result: Mapping[str, Any]) -> dict[str, Any]:
     details = _safe_value(
         result.get("data"), depth=0, budget=[_MAX_PROJECTED_NODES]
     )
-    guidance = project_public_guidance(result.get("suggestions"), limit=3)
+    suggestions = result.get("suggestions")
+    guidance = project_public_guidance(suggestions, limit=3)
+    notices = project_public_notices(suggestions, limit=3)
     return {
         "version": 1,
         "status": status,
@@ -1341,8 +1376,107 @@ def project_agent_result_for_user(result: Mapping[str, Any]) -> dict[str, Any]:
         "error": error if not ok else "",
         "details": details or {},
         "guidance": guidance,
+        "notices": notices,
     }
 
+
+
+def _fallback_read_plan_narrative(result: Mapping[str, Any]) -> str:
+    data = result.get("data") if isinstance(result.get("data"), Mapping) else {}
+    steps = data.get("steps") if isinstance(data.get("steps"), Sequence) else []
+    lines: list[str] = []
+    completed = 0
+    attention = 0
+    for step in steps[:4]:
+        if not isinstance(step, Mapping):
+            continue
+        step_result = (
+            step.get("result") if isinstance(step.get("result"), Mapping) else {}
+        )
+        summary = sanitize_public_text(step_result.get("summary"), limit=220)
+        if not summary:
+            continue
+        ok = step_result.get("ok") is True
+        completed += int(ok)
+        attention += int(not ok)
+        label = public_tool_label(str(step.get("tool_name") or ""))
+        lines.append(f"- {label}：{summary}")
+    if not lines:
+        return ""
+    if attention:
+        intro = f"本次核对已完成，{completed} 项得到结果，{attention} 项需要留意。"
+    else:
+        intro = f"本次核对已完成，{completed} 项检查都已返回结果。"
+    return sanitize_public_multiline_text(
+        intro + "\n\n" + "\n".join(lines), limit=1200
+    )
+
+
+def build_public_fallback_presentation(
+    response: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """在 Provider 叙述不可用时，用已脱敏事实生成 Web/TG 共用的自然降级答复。"""
+    if not isinstance(response, Mapping):
+        return None
+    mode = str(response.get("mode") or "").strip().casefold()
+    if mode in {"confirmation_required", "confirmed_action"}:
+        return None
+    result = response.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    display = project_agent_result_for_user(result)
+    narrative = ""
+    tool_call = response.get("tool_call")
+    tool_name = (
+        str(tool_call.get("name") or "").strip()
+        if isinstance(tool_call, Mapping)
+        else ""
+    )
+    if tool_name == "agent.read_plan" or mode == "read_plan":
+        narrative = _fallback_read_plan_narrative(result)
+    if not narrative:
+        narrative = sanitize_public_multiline_text(
+            display.get("summary") or display.get("error"), limit=1200
+        )
+    if not narrative:
+        return None
+    presentation: dict[str, Any] = {
+        "version": 1,
+        "source": "system",
+        "kind": "narrative",
+        "narrative": narrative,
+        "degraded": True,
+    }
+    guidance = display.get("guidance")
+    notices = display.get("notices")
+    if isinstance(guidance, list) and guidance:
+        presentation["guidance"] = guidance
+    if isinstance(notices, list) and notices:
+        presentation["notices"] = notices
+    return presentation
+
+
+def attach_public_fallback_presentation(
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    """仅在响应没有公开叙述时附加确定性 presentation，保留原始事实结构。"""
+    presentation = response.get("presentation")
+    if (
+        isinstance(presentation, Mapping)
+        and presentation.get("kind") == "narrative"
+        and sanitize_public_multiline_text(presentation.get("narrative"), limit=1800)
+    ):
+        return response
+    fallback = build_public_fallback_presentation(response)
+    if fallback is None:
+        return response
+    projected = dict(response)
+    projected["presentation"] = fallback
+    if not isinstance(projected.get("display"), Mapping):
+        result = projected.get("result")
+        if isinstance(result, Mapping):
+            projected["display"] = project_agent_result_for_user(result)
+    return ensure_response_contract(projected)
 
 
 def attach_public_display(response: dict[str, Any]) -> dict[str, Any]:
@@ -1372,8 +1506,11 @@ def build_public_narrative_presentation(
         force_kind="draft",
         limit=3,
     )
+    notices = project_public_notices(suggestions, limit=3)
     if guidance:
         presentation["guidance"] = guidance
+    if notices:
+        presentation["notices"] = notices
     return presentation
 
 def project_agent_response_for_llm(response: Mapping[str, Any]) -> dict[str, Any] | None:

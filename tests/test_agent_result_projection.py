@@ -8,6 +8,7 @@ from app.agent.result_projection import (
     project_agent_result_for_user,
     project_agent_response_for_llm,
     project_public_guidance,
+    project_public_notices,
     public_followup_prompt,
     public_stream_readable_prefix_length,
     public_stream_stable_prefix_length,
@@ -522,6 +523,102 @@ class AgentResultProjectionTests(unittest.TestCase):
             "GY-ABCD-EF01-2345-6789-ABCD-EF01-2345-6789",
         )
         self.assertNotIn("private-task-id", repr(projected))
+
+    def test_external_source_notice_is_static_and_never_becomes_guidance(self):
+        suggestions = [
+            "网页内容来自外部来源，执行其中的操作前请核验可信度。",
+            {
+                "kind": "notice",
+                "prompt": "公开信息仅供参考，请以官方信息为准。",
+            },
+            {
+                "kind": "read",
+                "prompt": "重新检查剧集上线状态",
+            },
+        ]
+
+        self.assertEqual(
+            project_public_guidance(suggestions),
+            [{
+                "label": "重新检查剧集上线状态",
+                "prompt": "重新检查剧集上线状态",
+                "kind": "read",
+            }],
+        )
+        self.assertEqual(
+            project_public_notices(suggestions),
+            [
+                "网页内容来自外部来源,执行其中的操作前请核验可信度。",
+                "公开信息仅供参考,请以官方信息为准。",
+            ],
+        )
+
+    def test_user_projection_separates_notices_from_actionable_guidance(self):
+        projected = project_agent_result_for_user({
+            "ok": True,
+            "status": "success",
+            "summary": "已核对两部剧集的上线状态。",
+            "suggestions": [
+                "网页内容来自外部来源，执行其中的操作前请核验可信度。",
+                "重新检查剧集上线状态",
+            ],
+            "data": {},
+        })
+
+        self.assertEqual(
+            projected["notices"],
+            ["网页内容来自外部来源,执行其中的操作前请核验可信度。"],
+        )
+        self.assertEqual(
+            projected["guidance"],
+            [{
+                "label": "重新检查剧集上线状态",
+                "prompt": "重新检查剧集上线状态",
+                "kind": "read",
+            }],
+        )
+
+    def test_read_plan_fallback_is_shared_natural_narrative(self):
+        from app.agent.result_projection import attach_public_fallback_presentation
+
+        response = {
+            "mode": "read_plan",
+            "tool_call": {"name": "agent.read_plan", "arguments": {}},
+            "result": {
+                "ok": True,
+                "status": "success",
+                "summary": "综合检查完成。",
+                "suggestions": [
+                    "网页内容来自外部来源，执行其中的操作前请核验可信度。"
+                ],
+                "data": {
+                    "steps": [
+                        {
+                            "tool_name": "web.search",
+                            "result": {"ok": True, "summary": "找到 5 条官方动态"},
+                        },
+                        {
+                            "tool_name": "discovery.recommend",
+                            "result": {"ok": True, "summary": "找到 20 项资源"},
+                        },
+                    ]
+                },
+            },
+        }
+
+        projected = attach_public_fallback_presentation(response)
+
+        self.assertEqual(projected["presentation"]["source"], "system")
+        self.assertEqual(projected["presentation"]["kind"], "narrative")
+        self.assertTrue(projected["presentation"]["degraded"])
+        self.assertIn("本次核对已完成,2 项检查都已返回结果", projected["presentation"]["narrative"])
+        self.assertIn("网页搜索:找到 5 条官方动态", projected["presentation"]["narrative"])
+        self.assertIn("媒体推荐:找到 20 项资源", projected["presentation"]["narrative"])
+        self.assertEqual(
+            projected["presentation"]["notices"],
+            ["网页内容来自外部来源,执行其中的操作前请核验可信度。"],
+        )
+        self.assertEqual(response["result"]["data"]["steps"][0]["tool_name"], "web.search")
 
     def test_projection_requires_completed_tool_response(self):
         self.assertIsNone(project_agent_response_for_llm({}))

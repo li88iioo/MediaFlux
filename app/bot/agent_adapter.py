@@ -66,8 +66,10 @@ from app.agent.rate_limit import agent_rate_limiter, allow_agent_tool
 from app.agent.registry import AgentToolError
 from app.agent.response_contract import infer_response_contract, response_contract
 from app.agent.result_projection import (
+    attach_public_fallback_presentation,
     project_agent_result_for_user,
     project_public_guidance,
+    project_public_notices,
     public_tool_label,
     replace_internal_identifiers,
     sanitize_public_multiline_text,
@@ -2146,6 +2148,28 @@ async def _consume_agent_stream(
         return partial, True, interruption_kind
 
 
+def _telegram_notices(response: dict[str, Any]) -> list[str]:
+    candidates: list[Any] = []
+    presentation = response.get("presentation")
+    if isinstance(presentation, dict) and isinstance(presentation.get("notices"), list):
+        candidates.extend(presentation["notices"])
+    display = response.get("display")
+    if isinstance(display, dict) and isinstance(display.get("notices"), list):
+        candidates.extend(display["notices"])
+    result = response.get("result")
+    if not candidates and isinstance(result, dict):
+        candidates.extend(project_public_notices(result.get("suggestions")))
+
+    notices: list[str] = []
+    for value in candidates:
+        text = sanitize_public_text(value, limit=220)
+        if text and text not in notices:
+            notices.append(text)
+        if len(notices) >= 3:
+            break
+    return notices
+
+
 def _telegram_guidance(response: dict[str, Any]) -> list[dict[str, str]]:
     candidates: list[Any] = []
     presentation = response.get("presentation")
@@ -2409,7 +2433,11 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
 
     presentation = payload.get("presentation")
     narrative = ""
-    if isinstance(presentation, dict) and presentation.get("source") == "llm":
+    if (
+        isinstance(presentation, dict)
+        and presentation.get("kind") == "narrative"
+        and presentation.get("source") in {"llm", "system"}
+    ):
         narrative = _public_multiline_html(
             presentation.get("narrative"),
             limit=_MAX_NARRATIVE_LENGTH,
@@ -2476,6 +2504,16 @@ def render_agent_response(response: Any, *, confirmation: bool = False) -> str:
                 "<b>需要留意</b>" if narrative else "<b>检查步骤</b>",
                 *safe_steps,
             ])
+
+    visible_html = "\n".join(lines)
+    visible_compact = _telegram_compact_visible_text(visible_html)
+    notices = [
+        notice
+        for notice in _telegram_notices(payload)
+        if _telegram_compact_visible_text(notice) not in visible_compact
+    ]
+    if notices:
+        lines.extend(["", "<i>提示：" + "；".join(notices) + "</i>"])
 
     guidance = _telegram_nonredundant_guidance(
         _telegram_guidance(payload), visible_html="\n".join(lines)
@@ -3772,8 +3810,11 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                                 bot, publish_result.delivery
                             )
                     return True
-                if emitted and answer:
+                if emitted and answer and interruption_kind is None:
                     response = _apply_streamed_answer(response, answer)
+
+        if isinstance(response, dict):
+            response = attach_public_fallback_presentation(response)
 
         def prepare_final_output() -> tuple[str, Any]:
             confirmation = (

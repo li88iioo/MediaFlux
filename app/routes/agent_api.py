@@ -94,8 +94,10 @@ from app.agent.feature_gate import AgentRuntimeDisabled, agent_runtime_admission
 from app.agent.registry import AgentToolError
 from app.agent.response_contract import response_contract
 from app.agent.result_projection import (
+    attach_public_fallback_presentation,
     project_agent_result_for_user,
     project_public_guidance,
+    project_public_notices,
     public_tool_label,
     sanitize_public_multiline_text,
     sanitize_public_text,
@@ -387,6 +389,18 @@ def _public_session_projection(session: dict[str, Any]) -> dict[str, Any]:
             guidance = project_public_guidance(suggestions)
             if guidance:
                 public_data["guidance"] = guidance
+            stored_notices = [
+                text
+                for value in (public_data.get("notices") or [])[:3]
+                if (text := _public_history_text(value, limit=220))
+            ]
+            notices = stored_notices or project_public_notices(suggestions)
+            if notices:
+                public_data["notices"] = notices
+            else:
+                public_data.pop("notices", None)
+            if public_data.get("presentation_source") not in {"llm", "system"}:
+                public_data.pop("presentation_source", None)
         elif role == "user":
             public_data["text"] = _public_history_multiline_text(
                 public_data.get("text"),
@@ -562,7 +576,7 @@ def _public_deterministic_fallback_response(
         request_id if _REQUEST_ID_PATTERN.fullmatch(str(request_id or "")) else ""
     )
     safe_contract = response_contract(response)
-    return {
+    projected = {
         "request_id": safe_request_id,
         "mode": mode,
         "tool_call": safe_tool_call,
@@ -578,6 +592,18 @@ def _public_deterministic_fallback_response(
         },
         "display": display,
     }
+    projected = attach_public_fallback_presentation(projected)
+    presentation = projected.get("presentation")
+    if isinstance(presentation, dict):
+        safe_presentation = dict(presentation)
+        guidance = display.get("guidance")
+        notices = display.get("notices")
+        if isinstance(guidance, list) and guidance:
+            safe_presentation["guidance"] = guidance
+        if isinstance(notices, list) and notices:
+            safe_presentation["notices"] = notices
+        projected["presentation"] = safe_presentation
+    return projected
 
 
 async def _stream_query_events(
@@ -849,7 +875,8 @@ async def _stream_query_events(
                         yield event
                     return
                 projector = PublicNarrativeProjector()
-                logger.warning("Agent LLM 流在首个公开文本前失败，回退确定性结果")
+                deterministic_public_fallback = True
+                logger.warning("Agent LLM 流在首个公开文本前失败，回退自然语言确定性结果")
             except Exception as exc:
                 if not coordinator.is_current(operation):
                     yield cancelled_event()
@@ -865,8 +892,9 @@ async def _stream_query_events(
                         yield event
                     return
                 projector = PublicNarrativeProjector()
+                deterministic_public_fallback = True
                 logger.warning(
-                    "Agent LLM 流在首个公开文本前失败 type=%s，回退确定性结果",
+                    "Agent LLM 流在首个公开文本前失败 type=%s，回退自然语言确定性结果",
                     type(exc).__name__,
                 )
 
@@ -888,6 +916,8 @@ async def _stream_query_events(
                 response,
                 request_id=operation.operation_id,
             )
+        else:
+            final_response = attach_public_fallback_presentation(final_response)
 
         if await request.is_disconnected():
             coordinator.cancel(
