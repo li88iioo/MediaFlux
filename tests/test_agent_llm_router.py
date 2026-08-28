@@ -1343,7 +1343,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
         captured = {"bodies": [], "closed": False}
         registry = ToolRegistry()
         for name, source_kind in (
-            ("discovery.search", "metadata_catalog"),
+            ("discovery.recommend", "metadata_catalog"),
             ("web.search", "public_web"),
         ):
             registry.register(ToolSpec(
@@ -1352,11 +1352,15 @@ class AgentLLMSelectionTests(unittest.TestCase):
                 risk=RiskLevel.READ,
                 parameters={
                     "type": "object",
-                    "required": ["query"],
-                    "properties": {"query": {"type": "string"}},
+                    "properties": {
+                        "provider": {"type": "string"},
+                        "media_type": {"type": "string"},
+                        "year": {"type": "string"},
+                        "genre": {"type": "string"},
+                    },
                     "additionalProperties": False,
                 },
-                validator=lambda arguments: {"query": str(arguments["query"])},
+                validator=lambda arguments: dict(arguments),
                 handler=lambda _arguments: ToolResult(True, "ok", "已取得结果"),
                 llm_read=True,
                 llm_source_kind=source_kind,
@@ -1378,9 +1382,12 @@ class AgentLLMSelectionTests(unittest.TestCase):
                                     "id": "call_catalog",
                                     "type": "function",
                                     "function": {
-                                        "name": "mf_discovery_search",
+                                        "name": "mf_discovery_recommend",
                                         "arguments": json_module.dumps({
-                                            "query": "2026 科幻剧集"
+                                            "provider": "tmdb",
+                                            "media_type": "tv",
+                                            "year": "2026",
+                                            "genre": "科幻",
                                         }),
                                     },
                                 },
@@ -1449,7 +1456,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
         )
         self.assertEqual(
             [name for name, _arguments in executed],
-            ["discovery.search", "web.search"],
+            ["discovery.recommend", "web.search"],
         )
         self.assertTrue(captured["closed"])
 

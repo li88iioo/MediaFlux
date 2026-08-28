@@ -15,6 +15,7 @@ from app.agent.result_projection import (
     public_tool_label,
     sanitize_public_multiline_text,
     sanitize_public_text,
+    smooth_sanitize_public_stream_text,
 )
 
 
@@ -290,6 +291,13 @@ class AgentResultProjectionTests(unittest.TestCase):
         self.assertEqual(
             sanitize_public_text("不要展示 probe_mode 和 reason_codes"),
             "不要展示 内部状态 和 内部状态",
+        )
+
+    def test_stream_sanitizer_preserves_safe_paragraphs_and_lists(self):
+        narrative = "推荐结果：\n\n- 《示例一》：已上线。\n- 《示例二》：待上映。"
+        self.assertEqual(smooth_sanitize_public_stream_text(narrative), narrative)
+        self.assertIsNone(
+            smooth_sanitize_public_stream_text("安全开头。\nBearer private-token")
         )
 
     def test_direct_public_text_safety_rejects_content_that_needs_rewriting(self):

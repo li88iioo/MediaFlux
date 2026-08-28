@@ -798,6 +798,7 @@ def _followup_intent(message: str) -> str | None:
 _RECENT_READ_RETRY_PHRASES = frozenset({
     "重试", "再试一次", "再查一次", "重新查询", "重新查",
     "继续查", "再查查", "刷新一下结果",
+    "继续完成未完成的检查", "稍后继续完成未完成的检查",
 })
 
 
@@ -882,6 +883,14 @@ _DISCOVERY_FILTER_GENRES = (
 _DISCOVERY_FILTER_REGIONS = (
     "中国大陆", "中国香港", "中国台湾", "欧美", "国产", "美国", "英国",
     "日本", "韩国", "法国", "德国", "印度", "香港", "台湾", "中国",
+)
+_DISCOVERY_REGION_ALIASES = (
+    ("美国", ("美剧", "美国剧")),
+    ("英国", ("英剧", "英国剧")),
+    ("日本", ("日剧", "日本剧")),
+    ("韩国", ("韩剧", "韩国剧")),
+    ("中国大陆", ("国产剧", "国产")),
+    ("欧美", ("欧美剧",)),
 )
 _DISCOVERY_CONTEXTUAL_RECOMMEND_TOKENS = ("类似", "相似", "同类", "根据", "按照", "基于", "我喜欢", "适合我")
 _BANGUMI_CALENDAR_CONTENT_TOKENS = ("番剧", "新番", "动画", "bangumi", "bgm")
@@ -4180,39 +4189,30 @@ def _discovery_recommend_arguments(message: str) -> dict[str, Any]:
 def _discovery_filtered_recommend_arguments(
     message: str,
 ) -> dict[str, Any] | None:
-    """将年份/地区/题材推荐稳定投影为带约束的聚合搜索。"""
+    """将年份、产地与题材投影为受控榜单筛选，而不是标题关键词搜索。"""
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
     year_match = re.search(r"(?<![0-9])((?:19|20)[0-9]{2})(?![0-9])", normalized)
     genre = next((token for token in _DISCOVERY_FILTER_GENRES if token in normalized), "")
     region = next((token for token in _DISCOVERY_FILTER_REGIONS if token in normalized), "")
+    if not region:
+        region = next(
+            (
+                canonical
+                for canonical, aliases in _DISCOVERY_REGION_ALIASES
+                if any(alias in normalized for alias in aliases)
+            ),
+            "",
+        )
     if year_match is None and not genre and not region:
         return None
 
-    media_type = _discovery_recommend_media_type(normalized)
-    query_parts = [
-        year_match.group(1) if year_match else "",
-        region,
-        genre,
-    ]
-    query = " ".join(part for part in query_parts if part).strip()
-    if not query:
-        return None
-    arguments: dict[str, Any] = {
-        "query": query,
-        "page": 1,
-        "limit": 20,
-        "media_type": media_type,
-    }
+    arguments = _discovery_recommend_arguments(message)
     if year_match:
         arguments["year"] = year_match.group(1)
     if region:
         arguments["region"] = region
     if genre:
         arguments["genre"] = genre
-    if "豆瓣" in normalized:
-        arguments["providers"] = ["douban"]
-    elif "tmdb" in normalized:
-        arguments["providers"] = ["tmdb"]
     return arguments
 
 
@@ -9788,7 +9788,7 @@ class AgentOrchestrator:
             filtered_arguments = _discovery_filtered_recommend_arguments(message)
             if filtered_arguments is not None:
                 return self._invoke_query_read(
-                    "discovery.search", filtered_arguments, owner=owner
+                    "discovery.recommend", filtered_arguments, owner=owner
                 )
             return self._invoke_query_read(
                 "discovery.recommend", _discovery_recommend_arguments(message), owner=owner

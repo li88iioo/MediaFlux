@@ -18,12 +18,44 @@ _ALLOWED_PROVIDERS = ("tmdb", "douban", "bangumi")
 _ALLOWED_ARGUMENTS = {
     "query", "page", "providers", "limit", "media_type", "year", "region", "genre"
 }
-_RECOMMEND_ARGUMENTS = {"provider", "media_type", "page", "limit"}
+_RECOMMEND_ARGUMENTS = {"provider", "media_type", "page", "limit", "year", "region", "genre"}
 _CALENDAR_ARGUMENTS = {"weekday", "page", "limit"}
 _RECOMMEND_PROVIDERS = {"tmdb", "douban"}
 _RECOMMEND_MEDIA_TYPES = {"movie", "tv"}
 _PROVIDER_STATUSES = {"healthy", "degraded", "disabled", "unavailable", "not_configured"}
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,180}$")
+
+_TMDB_MOVIE_GENRE_IDS = {
+    "动作": "28", "冒险": "12", "动画": "16", "动漫": "16", "喜剧": "35",
+    "犯罪": "80", "纪录片": "99", "剧情": "18", "家庭": "10751",
+    "奇幻": "14", "历史": "36", "恐怖": "27", "音乐": "10402",
+    "悬疑": "9648", "爱情": "10749", "科幻": "878", "惊悚": "53",
+    "战争": "10752",
+}
+_TMDB_TV_GENRE_IDS = {
+    "动作": "10759", "冒险": "10759", "动画": "16", "动漫": "16",
+    "喜剧": "35", "犯罪": "80", "纪录片": "99", "剧情": "18",
+    "家庭": "10751", "儿童": "10762", "悬疑": "9648", "科幻": "10765",
+    "奇幻": "10765", "战争": "10768", "历史": "10768",
+}
+_REGION_LANGUAGE_ALIASES = {
+    "欧美": "en", "美国": "en", "英国": "en", "美剧": "en", "英剧": "en",
+    "中国": "zh", "中国大陆": "zh", "国产": "zh", "国产剧": "zh",
+    "中国香港": "zh", "中国台湾": "zh", "香港": "zh", "台湾": "zh",
+    "日本": "ja", "日剧": "ja", "韩国": "ko", "韩剧": "ko",
+    "法国": "fr", "德国": "de", "印度": "hi",
+}
+_DOUBAN_TV_REGION_TAGS = {
+    "欧美": "美剧", "美国": "美剧", "美剧": "美剧",
+    "英国": "英剧", "英剧": "英剧",
+    "日本": "日剧", "日剧": "日剧",
+    "韩国": "韩剧", "韩剧": "韩剧",
+    "中国": "国产剧", "中国大陆": "国产剧", "国产": "国产剧", "国产剧": "国产剧",
+}
+_DOUBAN_MOVIE_GENRES = frozenset({
+    "喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "犯罪", "惊悚",
+    "冒险", "奇幻", "恐怖", "战争",
+})
 _ERROR_MESSAGES = {
     "timeout": "数据源请求超时",
     "rate_limited": "数据源请求受限",
@@ -186,12 +218,53 @@ def recommend_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
     page = _positive_int(arguments.get("page"), name="page", default=1, maximum=100)
     limit = _positive_int(arguments.get("limit"), name="limit", default=10, maximum=20)
-    return {
+    year = str(arguments.get("year") or "").strip()
+    if year and not re.fullmatch(r"(?:19|20)[0-9]{2}", year):
+        raise AgentToolError("year 必须是 1900 到 2099 的四位年份")
+    region = _visible_text(arguments.get("region"), limit=24)
+    genre = _visible_text(arguments.get("genre"), limit=24)
+    if arguments.get("region") not in {None, ""} and not region:
+        raise AgentToolError("region 必须是可见文本")
+    if arguments.get("genre") not in {None, ""} and not genre:
+        raise AgentToolError("genre 必须是可见文本")
+    normalized = {
         "provider": provider,
         "media_type": media_type,
         "page": page,
         "limit": limit,
     }
+    for key, value in (("year", year), ("region", region), ("genre", genre)):
+        if value:
+            normalized[key] = value
+    return normalized
+
+
+def _recommend_provider_filters(normalized: dict[str, Any]) -> dict[str, str]:
+    """把用户语义筛选转换为榜单 Provider 的受控参数。"""
+    provider = str(normalized["provider"])
+    media_type = str(normalized["media_type"])
+    year = str(normalized.get("year") or "")
+    region = str(normalized.get("region") or "")
+    genre = str(normalized.get("genre") or "")
+    filters: dict[str, str] = {}
+    if provider == "tmdb":
+        if year:
+            filters["primary_release_year" if media_type == "movie" else "first_air_date_year"] = year
+        language = _REGION_LANGUAGE_ALIASES.get(region, "")
+        if language:
+            filters["with_original_language"] = language
+        genre_ids = _TMDB_MOVIE_GENRE_IDS if media_type == "movie" else _TMDB_TV_GENRE_IDS
+        genre_id = genre_ids.get(genre, "")
+        if genre_id:
+            filters["with_genres"] = genre_id
+    elif media_type == "tv":
+        tag = _DOUBAN_TV_REGION_TAGS.get(region, "")
+        if tag:
+            filters["tags"] = tag
+    else:
+        if genre in _DOUBAN_MOVIE_GENRES:
+            filters["tags"] = genre
+    return filters
 
 
 def calendar_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -401,7 +474,12 @@ def search_discovery(arguments: dict[str, Any]) -> ToolResult:
 
 
 def _recommend_payload(normalized: dict[str, Any], page: DiscoveryPage) -> dict[str, Any]:
-    cards = [card for card in tuple(page.items or ()) if isinstance(card, MediaCard)]
+    requested_year = str(normalized.get("year") or "")
+    cards = [
+        card for card in tuple(page.items or ())
+        if isinstance(card, MediaCard)
+        and (not requested_year or str(card.year or "").strip() == requested_year)
+    ]
     limit = normalized["limit"]
     items = [_public_card(card) for card in cards[:limit]]
     health = getattr(page, "provider", None)
@@ -421,6 +499,11 @@ def _recommend_payload(normalized: dict[str, Any], page: DiscoveryPage) -> dict[
         "stale": bool(page.stale),
         "provider_status": health_status,
         "retry_after": retry_after,
+        "filters": {
+            key: normalized[key]
+            for key in ("year", "region", "genre")
+            if normalized.get(key)
+        },
         "items": items,
     }
 
@@ -439,6 +522,11 @@ def recommend_discovery(arguments: dict[str, Any]) -> ToolResult:
         "stale": False,
         "provider_status": "disabled",
         "retry_after": 0,
+        "filters": {
+            key: normalized[key]
+            for key in ("year", "region", "genre")
+            if normalized.get(key)
+        },
         "items": [],
     }
     if not config.get_bool("DISCOVERY_ENABLED", False):
@@ -459,7 +547,7 @@ def recommend_discovery(arguments: dict[str, Any]) -> ToolResult:
             category,
             normalized["media_type"],
             normalized["page"],
-            {},
+            _recommend_provider_filters(normalized),
         )
     except ValueError as exc:
         raise AgentToolError(str(exc)) from exc

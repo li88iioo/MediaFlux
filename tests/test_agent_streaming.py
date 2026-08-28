@@ -529,7 +529,11 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
                 "version": 1,
                 "source": "native",
                 "kind": "narrative",
-                "narrative": "订阅、媒体库和资源站已核对完成。",
+                "narrative": (
+                    "订阅、媒体库和资源站已核对完成。\n\n"
+                    "- 订阅：正常。\n"
+                    "- 媒体库：无需处理。"
+                ),
             },
         }
         service = _FakeService(payload)
@@ -557,7 +561,12 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual([item["step"] for item in events[2:5]], ["tool_finish", "tool_finish", "summary"])
         self.assertFalse(events[3]["ok"])
-        self.assertEqual(events[-1]["payload"]["presentation"]["narrative"], "订阅、媒体库和资源站已核对完成。")
+        self.assertEqual(
+            events[-1]["payload"]["presentation"]["narrative"],
+            "订阅、媒体库和资源站已核对完成。\n\n"
+            "- 订阅：正常。\n- 媒体库：无需处理。",
+        )
+        self.assertEqual(events[-1]["payload"]["presentation"]["source"], "native")
         history.assert_called_once()
 
     def test_confirmation_response_never_enters_provider_stream(self):

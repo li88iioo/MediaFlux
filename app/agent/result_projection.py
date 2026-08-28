@@ -817,10 +817,22 @@ def _decode_multiline_text(value: object) -> str:
 
 
 def _remove_internal_tool_guidance(text: str) -> str:
-    """移除面向实现者的工具调用说明，避免把内部协议转述给最终用户。"""
+    """移除面向实现者的工具调用说明，同时保留公开段落与列表结构。"""
     cleaned = _INTERNAL_TOOL_GUIDANCE_RE.sub(" ", str(text or ""))
     cleaned = re.sub(r"(?:下一步(?:建议)?|建议)\s*[:：]\s*$", "", cleaned).strip()
-    return " ".join(cleaned.split()).strip()
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    lines: list[str] = []
+    blank = False
+    for raw_line in cleaned.split("\n"):
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            if lines and not blank:
+                lines.append("")
+            blank = True
+            continue
+        blank = False
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _display_chunks(value: str, *, max_length: int = 150) -> list[str]:
@@ -901,12 +913,12 @@ def is_public_text_safe(value: object) -> bool:
 
 
 def smooth_sanitize_public_stream_text(value: object) -> str | None:
-    """流式公开文本：凭据/控制符致命，路径与链接平滑替换。"""
+    """流式公开文本：凭据/多行控制符与链接致命，路径平滑替换。"""
     text = str(value or "")
     if not text:
         return ""
     if (
-        _CONTROL_RE.search(text)
+        _MULTILINE_CONTROL_RE.search(text)
         or contains_sensitive_credential(text)
         or _URI_RE.search(text)
         or re.search(r"(?i)\b(?:https?|ftp|file)\s*://", text)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import re
 from typing import Any
 
 from app import config
@@ -114,7 +115,10 @@ def validate_filters(provider: str, category: str, media_type: str,
         raise ValueError("筛选参数必须是对象")
     allowed: set[str] = set()
     if provider == "tmdb" and category == "discover":
-        allowed = {"with_genres", "with_original_language", "sort_by"}
+        allowed = {
+            "with_genres", "with_original_language", "sort_by",
+            "primary_release_year", "first_air_date_year",
+        }
     elif provider == "douban" and category == "recommend":
         allowed = {"sort", "tags"}
     elif provider == "bangumi" and category == "calendar":
@@ -135,6 +139,13 @@ def validate_filters(provider: str, category: str, media_type: str,
         if not values or any(value not in genres for value in values):
             raise ValueError("TMDB 类型筛选无效")
         result["with_genres"] = ",".join(values)
+    for year_key in ("primary_release_year", "first_air_date_year"):
+        if year_key in result and not re.fullmatch(r"(?:19|20)[0-9]{2}", result[year_key]):
+            raise ValueError("TMDB 年份筛选无效")
+    if media_type == "movie" and "first_air_date_year" in result:
+        raise ValueError("TMDB 年份筛选与媒体类型不匹配")
+    if media_type == "tv" and "primary_release_year" in result:
+        raise ValueError("TMDB 年份筛选与媒体类型不匹配")
     if "with_original_language" in result:
         result["with_original_language"] = result["with_original_language"].lower()
     if "with_original_language" in result and result["with_original_language"] not in _LANGUAGES:

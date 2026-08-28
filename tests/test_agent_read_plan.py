@@ -232,7 +232,9 @@ class ReadPlanExecutionTests(unittest.TestCase):
         calls = []
         agent = AgentOrchestrator(_registry(calls=calls))
         first = agent._execute_read_plan(self._plan(), owner="web-session")
-        retried = agent.query("重试", owner="web-session", present=False)
+        retried = agent.query(
+            "稍后继续完成未完成的检查", owner="web-session", present=False
+        )
 
         self.assertEqual(first["mode"], "read_plan")
         self.assertEqual(retried["mode"], "read_plan")

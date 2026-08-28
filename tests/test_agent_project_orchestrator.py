@@ -156,7 +156,8 @@ class AgentObjectiveContractTests(unittest.TestCase):
         self.assertEqual(objective.task_kind, "media_recommendation")
         self.assertEqual(objective.required_sources, ("metadata_catalog",))
         self.assertNotIn("web.search", names)
-        self.assertIn("discovery.search", names)
+        self.assertIn("discovery.recommend", names)
+        self.assertNotIn("discovery.search", names)
 
     def test_current_year_recommendation_requires_catalog_and_web(self) -> None:
         query = f"{date.today().year} 科幻 欧美剧集推荐"
@@ -167,8 +168,8 @@ class AgentObjectiveContractTests(unittest.TestCase):
         self.assertEqual(
             objective.required_sources, ("metadata_catalog", "public_web")
         )
-        self.assertIn("discovery.search", names)
-        self.assertNotIn("discovery.recommend", names)
+        self.assertIn("discovery.recommend", names)
+        self.assertNotIn("discovery.search", names)
         self.assertIn("web.search", names)
         self.assertNotIn("discovery.add_watchlist", names)
 

@@ -116,8 +116,25 @@ class DiscoveryRegistryTests(unittest.TestCase):
             {"value": "popularity.desc", "label": "热度从高到低"},
             by_key["sort_by"]["options"],
         )
+        self.assertEqual(
+            validate_filters(
+                "tmdb", "discover", "tv",
+                {"first_air_date_year": "2025", "with_original_language": "EN"},
+            ),
+            {
+                "first_air_date_year": "2025",
+                "with_original_language": "en",
+                "sort_by": "popularity.desc",
+            },
+        )
         with self.assertRaises(ValueError):
             validate_filters("tmdb", "discover", "movie", {"api_key": "leak"})
+        with self.assertRaises(ValueError):
+            validate_filters("tmdb", "discover", "movie", {"first_air_date_year": "2025"})
+        with self.assertRaises(ValueError):
+            validate_filters("tmdb", "discover", "tv", {"primary_release_year": "2025"})
+        with self.assertRaises(ValueError):
+            validate_filters("tmdb", "discover", "tv", {"first_air_date_year": "25"})
         with self.assertRaises(ValueError):
             validate_filters("bangumi", "calendar", "tv", {"weekday": "8"})
         self.assertEqual(validate_filters("bangumi", "calendar", "tv", {}), {})

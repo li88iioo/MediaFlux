@@ -30,6 +30,18 @@ class AgentPresentationStreamTests(unittest.TestCase):
         self.assertIsNotNone(projected)
         self.assertEqual(projector.finalize(), "下载队列正常，共 3 项任务。")
 
+    def test_projector_preserves_safe_multiline_narrative(self):
+        projector = PublicNarrativeProjector()
+        projected = projector.feed(
+            "为你整理了 2 部影片：\n\n- 《示例一》：已经上线。\n- 《示例二》：即将上映。"
+        )
+
+        self.assertIsNotNone(projected)
+        self.assertEqual(
+            projector.finalize(),
+            "为你整理了 2 部影片：\n\n- 《示例一》：已经上线。\n- 《示例二》：即将上映。",
+        )
+
     def test_confirmation_and_confirmed_action_never_select_provider_stream(self):
         def tool_factory(*_args, **_kwargs):
             return object()

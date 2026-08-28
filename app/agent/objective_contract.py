@@ -61,12 +61,6 @@ _RECOMMEND_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?:推荐|安利|想看|值得看|有什么好看)",
     re.IGNORECASE,
 )
-_RECOMMEND_SEARCH_CRITERIA_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])|"
-    r"科幻|悬疑|喜剧|动作|恐怖|爱情|奇幻|犯罪|战争|历史|音乐|家庭|冒险|"
-    r"欧美|国产|美剧|英剧|日剧|韩剧|动画|动漫|番剧|纪录片|综艺",
-    re.IGNORECASE,
-)
 _NON_MEDIA_RELEASE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:服务|网站|实例|容器|应用|项目|接口|端口|镜像|版本|bot|agent|api)"
     r".{0,16}(?:上线|发布|部署|启动)",
@@ -1292,10 +1286,7 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             if time_sensitive
             else ("metadata_catalog",)
         )
-        has_search_criteria = bool(_RECOMMEND_SEARCH_CRITERIA_RE.search(text))
-        allowed_tools = [
-            "discovery.search" if has_search_criteria else "discovery.recommend"
-        ]
+        allowed_tools = ["discovery.recommend"]
         if time_sensitive:
             allowed_tools.append("web.search")
         return AgentObjectiveContract(
@@ -1310,8 +1301,8 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             max_tool_calls=3 if time_sensitive else 2,
             max_capabilities=len(allowed_tools),
             completion_rule=(
-                "有明确年份、地区、题材或媒体类型时只做聚合搜索，且每个搜索 query "
-                "必须完整保留这些限制词；宽泛片荒请求只读默认推荐。"
+                "有明确年份、地区、题材或媒体类型时，必须把限制条件传给受控推荐列表；"
+                "不得把筛选词拼成片名搜索，也不得丢失用户限制。"
                 "时效请求第一轮必须并行取得一个影视元数据目录结果和一个公开网页结果；"
                 "任一必需来源尚未成功前，不得重复调用已经成功的同类来源。"
                 "必须区分已上线、已定档和仍在制作，不得逐部无界搜索。"

@@ -64,6 +64,24 @@ class AgentDiscoveryRecommendTests(unittest.TestCase):
             recommend_arguments({}),
             {"provider": "tmdb", "media_type": "movie", "page": 1, "limit": 10},
         )
+        self.assertEqual(
+            recommend_arguments({
+                "provider": "tmdb",
+                "media_type": "tv",
+                "year": "2025",
+                "region": "美国",
+                "genre": "科幻",
+            }),
+            {
+                "provider": "tmdb",
+                "media_type": "tv",
+                "page": 1,
+                "limit": 10,
+                "year": "2025",
+                "region": "美国",
+                "genre": "科幻",
+            },
+        )
         invalid = (
             None,
             {"provider": "bangumi"},
@@ -74,6 +92,10 @@ class AgentDiscoveryRecommendTests(unittest.TestCase):
             {"page": 101},
             {"limit": 0},
             {"limit": 21},
+            {"year": "202A"},
+            {"year": "1899"},
+            {"region": "\x00"},
+            {"genre": "\x00"},
             {"filters": {"sort_by": "vote_average.desc"}},
             {"url": "https://example.invalid"},
             {"token": "secret"},
@@ -81,6 +103,48 @@ class AgentDiscoveryRecommendTests(unittest.TestCase):
         for arguments in invalid:
             with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
                 recommend_arguments(arguments)  # type: ignore[arg-type]
+
+    def test_filtered_tmdb_recommendation_uses_discover_filters(self):
+        page = DiscoveryPage(
+            items=(
+                _card(1, media_type="tv", year="2025"),
+                _card(2, media_type="tv", year="2024"),
+            ),
+            page=1,
+            has_more=False,
+            provider=ProviderHealth(name="tmdb", status="healthy"),
+        )
+        service = FakeDiscoveryService(page)
+        with patch(
+            "app.agent.discovery_actions.config.get_bool", return_value=True
+        ), patch(
+            "app.agent.discovery_actions.get_discovery_service", return_value=service
+        ):
+            result = recommend_discovery({
+                "provider": "tmdb",
+                "media_type": "tv",
+                "year": "2025",
+                "region": "美国",
+                "genre": "科幻",
+            })
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["returned"], 1)
+        self.assertEqual(result.data["items"][0]["year"], "2025")
+        self.assertEqual(result.data["filters"], {
+            "year": "2025", "region": "美国", "genre": "科幻",
+        })
+        self.assertEqual(service.calls, [(
+            "tmdb",
+            "discover",
+            "tv",
+            1,
+            {
+                "first_air_date_year": "2025",
+                "with_original_language": "en",
+                "with_genres": "10765",
+            },
+        )])
 
     def test_disabled_feature_does_not_create_or_call_service(self):
         service = Mock()
@@ -192,25 +256,36 @@ class AgentDiscoveryRecommendTests(unittest.TestCase):
                 })
 
         filtered = agent.query("2025 科幻剧推荐")
-        self.assertEqual(filtered["tool_call"]["name"], "discovery.search")
+        self.assertEqual(filtered["tool_call"]["name"], "discovery.recommend")
         self.assertEqual(filtered["tool_call"]["arguments"], {
-            "query": "2025 科幻",
-            "page": 1,
-            "limit": 20,
+            "provider": "tmdb",
             "media_type": "tv",
+            "page": 1,
+            "limit": 10,
             "year": "2025",
             "genre": "科幻",
         })
         self.assertEqual(
             agent.query("2025 欧美悬疑电影推荐")["tool_call"]["arguments"],
             {
-                "query": "2025 欧美 悬疑",
-                "page": 1,
-                "limit": 20,
+                "provider": "tmdb",
                 "media_type": "movie",
+                "page": 1,
+                "limit": 10,
                 "year": "2025",
                 "region": "欧美",
                 "genre": "悬疑",
+            },
+        )
+        self.assertEqual(
+            agent.query("2025美剧推荐")["tool_call"]["arguments"],
+            {
+                "provider": "tmdb",
+                "media_type": "tv",
+                "page": 1,
+                "limit": 10,
+                "year": "2025",
+                "region": "美国",
             },
         )
 

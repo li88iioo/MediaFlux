@@ -3587,7 +3587,10 @@ def build_tool_registry() -> ToolRegistry:
     ))
     registry.register(ToolSpec(
         name="discovery.recommend",
-        description="读取已启用的 TMDB 或豆瓣默认推荐列表，不接受自定义筛选，也不返回海报地址、收藏状态或配置值。",
+        description=(
+            "读取已启用的 TMDB 或豆瓣推荐列表；可按用户明确给出的年份、地区和题材做受控筛选，"
+            "不返回海报地址、收藏状态或配置值。"
+        ),
         risk=RiskLevel.READ,
         parameters={
             "type": "object",
@@ -3596,6 +3599,23 @@ def build_tool_registry() -> ToolRegistry:
                 "media_type": {"type": "string", "enum": ["movie", "tv"], "default": "movie"},
                 "page": {"type": "integer", "minimum": 1, "maximum": 100, "default": 1},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10},
+                "year": {
+                    "type": "string",
+                    "pattern": "^(?:19|20)[0-9]{2}$",
+                    "description": "用户明确给出的四位年份。",
+                },
+                "region": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 24,
+                    "description": "用户明确给出的地区或剧集产地，例如美国、欧美、日本。",
+                },
+                "genre": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 24,
+                    "description": "用户明确给出的题材，例如科幻、悬疑、喜剧。",
+                },
             },
             "additionalProperties": False,
         },
