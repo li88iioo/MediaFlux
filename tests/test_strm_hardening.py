@@ -157,6 +157,25 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
             "光鸭云盘/成人内容/SSIS-001 (2024)/SSIS-001 (2024).nfo",
         )
 
+    def test_clean_title_identity_is_hidden_from_local_strm_and_metadata_paths(self):
+        tag = "{clean_title-ATID-675}"
+        video = GuangYaFile("video", f"ATID-675 {tag}.mp4", False, 100, "etag")
+        sidecar = GuangYaFile("nfo", f"ATID-675 {tag}.nfo", False, 10, "meta")
+        rel_dir = f"成人内容/ATID-675 {tag}"
+
+        with tempfile.TemporaryDirectory() as root:
+            strm_path = generate_strm(video, rel_dir, "http://example", root)
+            metadata_path = strm_module._metadata_target(sidecar, rel_dir, root)
+
+        self.assertEqual(
+            strm_path.relative_to(Path(root)).as_posix(),
+            "光鸭云盘/成人内容/ATID-675/ATID-675.strm",
+        )
+        self.assertEqual(
+            metadata_path.relative_to(Path(root)).as_posix(),
+            "光鸭云盘/成人内容/ATID-675/ATID-675.nfo",
+        )
+
     def test_full_sync_migrates_indexed_double_suffix_strm(self):
         source_id = f"source-migrate-{uuid.uuid4().hex}"
         source_key = f"guangya:{source_id}"

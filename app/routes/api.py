@@ -128,6 +128,7 @@ _AGENT_SETTINGS_DEFAULTS = {
 
 _NSFW_ORGANIZE_KEYS = {
     "GY_ORGANIZE_NSFW_ENABLED",
+    "GY_ORGANIZE_NSFW_SOURCE_IDS",
     "GY_ORGANIZE_NSFW_METATUBE_ENDPOINT",
     "GY_ORGANIZE_NSFW_METATUBE_TOKEN",
     "GY_ORGANIZE_NSFW_CATEGORY_NAME",
@@ -596,6 +597,30 @@ def _validate_nsfw_organize_updates(data: dict[str, Any]) -> dict[str, str]:
             "0" if str(raw_enabled or "").strip() == "" else _normalize_discovery_boolean(
                 "GY_ORGANIZE_NSFW_ENABLED", raw_enabled
             )
+        )
+    if "GY_ORGANIZE_NSFW_SOURCE_IDS" in data:
+        from app.modules.organize_sources import (
+            encode_organize_source_ids,
+            normalize_organize_source_ids,
+            normalize_organize_sources,
+        )
+
+        configured_sources, source_error = normalize_organize_sources(
+            data.get(
+                "GY_ORGANIZE_SOURCE_DIRS",
+                config.get("GY_ORGANIZE_SOURCE_DIRS", ""),
+            )
+        )
+        if source_error:
+            raise ValueError(source_error)
+        source_ids, scope_error = normalize_organize_source_ids(
+            data.get("GY_ORGANIZE_NSFW_SOURCE_IDS"),
+            configured_sources=configured_sources,
+        )
+        if scope_error:
+            raise ValueError(f"成人识别来源范围无效: {scope_error}")
+        normalized["GY_ORGANIZE_NSFW_SOURCE_IDS"] = encode_organize_source_ids(
+            source_ids
         )
     if "GY_ORGANIZE_NSFW_METATUBE_ENDPOINT" in data:
         endpoint = str(data.get("GY_ORGANIZE_NSFW_METATUBE_ENDPOINT") or "").strip()
@@ -1162,12 +1187,28 @@ def save_config(request: Request, data: Any = Body(default=None)):
     old_strm_root = config.get("STRM_ROOT", "").strip()
     strm_source_config_changed = "GY_STRM_SOURCE_DIRS" in data
     if "GY_ORGANIZE_SOURCE_DIRS" in data:
-        from app.modules.organize_sources import encode_organize_sources, normalize_organize_sources
+        from app.modules.organize_sources import (
+            encode_organize_source_ids,
+            encode_organize_sources,
+            normalize_organize_source_ids,
+            normalize_organize_sources,
+        )
 
         sources, error = normalize_organize_sources(data["GY_ORGANIZE_SOURCE_DIRS"])
         if error:
             return api_error(error, 400)
         media_workflow_updates["GY_ORGANIZE_SOURCE_DIRS"] = encode_organize_sources(sources)
+        if "GY_ORGANIZE_NSFW_SOURCE_IDS" not in nsfw_organize_updates:
+            current_scope, scope_error = normalize_organize_source_ids(
+                config.get("GY_ORGANIZE_NSFW_SOURCE_IDS", "")
+            )
+            if scope_error:
+                current_scope = []
+            allowed = {str(item.get("id") or "").strip() for item in sources}
+            pruned_scope = [source_id for source_id in current_scope if source_id in allowed]
+            canonical_scope = encode_organize_source_ids(pruned_scope)
+            if canonical_scope != config.get("GY_ORGANIZE_NSFW_SOURCE_IDS", ""):
+                media_workflow_updates["GY_ORGANIZE_NSFW_SOURCE_IDS"] = canonical_scope
     if strm_source_config_changed:
         import json
         from app.modules.strm import parse_strm_sources
@@ -1304,6 +1345,14 @@ def save_config(request: Request, data: Any = Body(default=None)):
     # 允许从用户粘贴的完整 endpoint 派生协议，即使该请求未显式提交协议字段。
     for key, value in agent_llm_updates.items():
         updates.setdefault(key, value)
+    # 当整理来源被删除时，来源级成人识别范围会在上方自动裁剪。该派生
+    # 更新并不一定出现在原始请求 data 中，因此必须显式写回，避免遗留
+    # 一个已经不属于正式整理来源的目录 ID。
+    if "GY_ORGANIZE_NSFW_SOURCE_IDS" in media_workflow_updates:
+        updates.setdefault(
+            "GY_ORGANIZE_NSFW_SOURCE_IDS",
+            media_workflow_updates["GY_ORGANIZE_NSFW_SOURCE_IDS"],
+        )
     persisted_updates = {
         key: value
         for key, value in updates.items()

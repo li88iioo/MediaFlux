@@ -1,6 +1,6 @@
 preset = "basic"
 python-interpreter-path = ".venv/bin/python"
-search-path = ["."]
+search-path = [".", "packaging/scripts"]
 project-includes = [
     "app/**/*.py",
     "tests/**/*.py",
@@ -8,6 +8,8 @@ project-includes = [
     "*.py",
 ]
 ignore-missing-imports = [
+    "anitomy_ng",
+    "anitomy_ng.*",
     "playwright",
     "playwright.*",
 ]

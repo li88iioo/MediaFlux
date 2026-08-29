@@ -3,7 +3,7 @@
 {% block body_class %}organize-page{% if organize_view == "rules" %} organize-rules-page{% endif %} persistent-savebar-page{% endblock %}
 {% block page_title %}{{ "整理规则" if organize_view == "rules" else "光鸭整理" }}{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/organize.css') }}?v=20260825b">
+<link rel="stylesheet" href="{{ url_for('static', path='css/organize.css') }}?v=20260829a">
 {% endblock %}
 
 {% block content %}
@@ -214,14 +214,22 @@
                 </div>
             </div>
             <div class="nsfw-provider-body" id="nsfwProviderBody"{% if not organize_nsfw_enabled %} hidden{% endif %}>
+                <input type="hidden" id="nsfwSourceIds" data-key="GY_ORGANIZE_NSFW_SOURCE_IDS">
                 <div class="nsfw-provider-fields">
                     <label class="is-wide"><span>MetaTube 服务地址</span><input type="url" class="form-input nsfw-dependent" id="r_nsfw_endpoint" data-key="GY_ORGANIZE_NSFW_METATUBE_ENDPOINT" placeholder="http://192.168.1.10:8080" autocomplete="url"></label>
                     <label><span>Bearer Token（可选）</span><input type="password" class="form-input nsfw-dependent" id="r_nsfw_token" data-key="GY_ORGANIZE_NSFW_METATUBE_TOKEN" placeholder="服务未设置 Token 可留空" autocomplete="new-password"></label>
-                    <label><span>归档分类</span><input type="text" class="form-input nsfw-dependent" id="r_nsfw_category" data-key="GY_ORGANIZE_NSFW_CATEGORY_NAME" value="成人内容" maxlength="40"></label>
+                    <label><span>归档分类目录</span><input type="text" class="form-input nsfw-dependent" id="r_nsfw_category" data-key="GY_ORGANIZE_NSFW_CATEGORY_NAME" value="成人内容" maxlength="40"></label>
                     <label><span>请求超时（秒）</span><input type="number" class="form-input nsfw-dependent" id="r_nsfw_timeout" data-key="GY_ORGANIZE_NSFW_TIMEOUT_SECONDS" value="8" min="2" max="30"></label>
                     <label class="is-wide"><span>额外清理域名</span><input type="text" class="form-input nsfw-dependent" id="r_nsfw_domains" data-key="GY_ORGANIZE_NSFW_STRIP_DOMAINS" placeholder="例如：example.com, example.tv"></label>
+                    <div class="nsfw-source-scope is-wide">
+                        <div class="nsfw-source-scope-head">
+                            <div><strong>光鸭专用来源目录</strong><span>只有选中的整理来源会调用 MetaTube，并且只走成人番号识别。</span></div>
+                            <b id="nsfwSourceCount">0 个来源</b>
+                        </div>
+                        <div class="nsfw-source-options" id="nsfwSourceOptions" aria-label="成人番号专用来源"></div>
+                    </div>
                 </div>
-                <div class="nsfw-provider-note"><i data-lucide="shield-check"></i><span>自动整理只接受“提取番号与 MetaTube 返回番号完全一致”的结果；服务超时、无结果或弱匹配时会安全回退现有 TMDB 链路，不会凭首条结果移动文件。</span></div>
+                <div class="nsfw-provider-note"><i data-lucide="shield-check"></i><span>专用来源只接受“提取番号与 MetaTube 返回番号完全一致”的结果；超时、无结果或弱匹配会留在待确认，不会回退 TMDB。未选中的普通来源不会调用 MetaTube。归档路径为“整理目标 / 归档分类目录 / 年份 / 作品”。</span></div>
             </div>
         </div>
 
@@ -732,5 +740,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/organize.js') }}?v=20260825b"></script>
+<script src="{{ url_for('static', path='js/organize.js') }}?v=20260829a"></script>
 {% endblock %}

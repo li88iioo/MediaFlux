@@ -6,7 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import Callable, Iterable
+from typing import Awaitable, Callable, Iterable, cast
 
 from app.logger import get_logger
 
@@ -825,7 +825,11 @@ class IndexerService:
         try:
             wait_for_slot = getattr(adapter, "wait_for_search_slot", None)
             if callable(wait_for_slot):
-                await wait_for_slot(request)
+                typed_wait_for_slot = cast(
+                    Callable[[IndexerSearchRequest], Awaitable[None]],
+                    wait_for_slot,
+                )
+                await typed_wait_for_slot(request)
             timeout_overhead = getattr(adapter, "search_timeout_overhead_seconds", None)
             overhead_seconds = float(timeout_overhead()) if callable(timeout_overhead) else 0.0
             default_timeout_seconds = self.site_timeout_seconds + max(0.0, overhead_seconds)

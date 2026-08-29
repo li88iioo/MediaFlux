@@ -5772,10 +5772,13 @@ def create_local_media_source(
     safe_name = str(name or "").strip()
     safe_root = str(local_root or "").strip()
     safe_mode = str(mode or "move").strip().lower()
+    safe_media_type = str(media_type or "auto").strip().lower()
     if not safe_name or not safe_root:
         raise ValueError("本地媒体来源名称和路径不能为空")
     if safe_mode not in {"move", "preview_only"}:
         raise ValueError("本地媒体来源仅支持 move 或 preview_only")
+    if safe_media_type not in {"auto", "movie", "tv", "nsfw"}:
+        raise ValueError("本地媒体来源类型必须是 auto、movie、tv 或 nsfw")
     timestamp = now()
     with get_conn() as conn:
         cur = conn.execute(
@@ -5787,7 +5790,7 @@ def create_local_media_source(
                 safe_owner, safe_name, str(qb_profile or ""), str(qb_path_prefix or ""), safe_root,
                 "", "",
                 1 if enabled else 0, max(0, int(stable_seconds)), 1 if scan_enabled else 0,
-                max(1, int(scan_interval_minutes)), str(media_type or "auto"), safe_mode,
+                max(1, int(scan_interval_minutes)), safe_media_type, safe_mode,
                 timestamp, timestamp,
             ),
         )
@@ -5813,8 +5816,8 @@ def save_local_media_source_bundle(
         raise ValueError("本地媒体来源名称和路径不能为空")
     if safe_mode not in {"move", "preview_only"}:
         raise ValueError("本地媒体来源仅支持 move 或 preview_only")
-    if safe_media_type not in {"auto", "movie", "tv"}:
-        raise ValueError("本地媒体来源类型必须是 auto、movie 或 tv")
+    if safe_media_type not in {"auto", "movie", "tv", "nsfw"}:
+        raise ValueError("本地媒体来源类型必须是 auto、movie、tv 或 nsfw")
     if any("\x00" in value for value in (safe_root, str(qb_path_prefix or ""))):
         raise ValueError("本地媒体来源路径包含非法字符")
     normalized_targets: list[dict[str, str]] | None = None
@@ -6826,6 +6829,8 @@ def update_local_media_source(source_id: int, *, owner: str = "admin", **fields)
             continue
         if key == "mode" and value not in {"move", "preview_only"}:
             raise ValueError("本地媒体来源仅支持 move 或 preview_only")
+        if key == "media_type" and value not in {"auto", "movie", "tv", "nsfw"}:
+            raise ValueError("本地媒体来源类型必须是 auto、movie、tv 或 nsfw")
         if key in {"enabled", "scan_enabled"}:
             value = 1 if value else 0
         elif key == "stable_seconds":

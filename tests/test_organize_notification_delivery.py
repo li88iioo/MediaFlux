@@ -128,22 +128,48 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
             ))
         confirmation.assert_not_called()
         self.assertIn(("人工确认", "2 个暂无候选"), events[0].fields)
-        self.assertIn("暂无可用 TMDB 候选", events[0].footer)
+        self.assertIn("暂无可用候选", events[0].footer)
         self.assertNotIn("按钮卡发送", events[0].footer)
 
-    def test_incomplete_confirmation_groups_are_not_reported_as_actionable(self) -> None:
+    def test_confirmation_groups_require_safe_snapshot_but_keep_skip_buttons(self) -> None:
         cases = (
-            {"files": [{"file_id": "file-1", "name": "Show.mkv"}], "candidates": []},
-            {"files": [], "candidates": [{"tmdb_id": "1", "media_type": "tv"}]},
-            {"files": [{}], "candidates": [{"tmdb_id": "1", "media_type": "tv"}]},
-            {"files": [{"file_id": "file-1", "name": "Show.mkv"}, "bad"],
-             "candidates": [{"tmdb_id": "1", "media_type": "tv"}]},
+            (
+                "missing-candidates",
+                {"files": [{"file_id": "file-1", "name": "Show.mkv"}], "candidates": []},
+                True,
+            ),
+            (
+                "missing-files",
+                {"files": [], "candidates": [{"tmdb_id": "1", "media_type": "tv"}]},
+                False,
+            ),
+            (
+                "invalid-candidate",
+                {
+                    "files": [{"file_id": "file-1", "name": "Show.mkv"}],
+                    "candidates": [{"tmdb_id": "", "media_type": "tv"}],
+                },
+                True,
+            ),
+            (
+                "malformed-file",
+                {"files": [{}], "candidates": [{"tmdb_id": "1", "media_type": "tv"}]},
+                False,
+            ),
+            (
+                "mixed-invalid-file",
+                {
+                    "files": [{"file_id": "file-1", "name": "Show.mkv"}, "bad"],
+                    "candidates": [{"tmdb_id": "1", "media_type": "tv"}],
+                },
+                False,
+            ),
         )
-        for index, group in enumerate(cases):
-            with self.subTest(index=index):
+        for task_id, group, sends_skip_card in cases:
+            with self.subTest(task_id=task_id):
                 events = []
                 stats = {
-                    "task_id": f"task-invalid-{index}", "total": 1,
+                    "task_id": f"task-{task_id}", "total": 1,
                     "moved": 0, "metadata_moved": 0, "need_confirm": 1,
                     "skipped": 0, "failed": 0, "media_items": [],
                     "confirmation_groups": [group],
@@ -154,13 +180,22 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                         payload, events, **kwargs,
                     ),
                 ), patch(
-                    "app.modules.organize_confirmations.publish_confirmation_event"
+                    "app.modules.organize_confirmations.publish_confirmation_event",
+                    return_value=True,
                 ) as confirmation:
                     self.assertTrue(Organizer.notify_task_results(
                         stats, OrganizeRules(), source_name="来源目录", chat_id="100",
                     ))
-                confirmation.assert_not_called()
-                self.assertIn(("人工确认", "1 个暂无候选"), events[0].fields)
+                if sends_skip_card:
+                    confirmation.assert_called_once()
+                    card = confirmation.call_args.args[0]
+                    self.assertTrue(any(
+                        action.callback_data.endswith(":skip") for action in card.actions
+                    ))
+                    self.assertIn(("人工确认", "1 个文件 / 1 组跳过卡"), events[0].fields)
+                else:
+                    confirmation.assert_not_called()
+                    self.assertIn(("人工确认", "1 个暂无候选"), events[0].fields)
 
     def test_mixed_pending_items_only_report_real_actionable_cards(self) -> None:
         events = []
@@ -179,7 +214,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                 stats, OrganizeRules(), source_name="来源目录", chat_id="100",
             ))
         confirmation.assert_called_once()
-        self.assertIn(("人工确认", "1 个文件 / 1 组按钮卡 · 1 个暂无候选"), events[0].fields)
+        self.assertIn(("人工确认", "1 个文件 / 1 组候选卡 · 1 个暂无候选"), events[0].fields)
 
     def test_multiple_files_in_one_group_explains_single_card(self) -> None:
         events = []
@@ -202,7 +237,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                 stats, OrganizeRules(), source_name="来源目录", chat_id="100",
             ))
         confirmation.assert_called_once()
-        self.assertIn(("人工确认", "2 个文件 / 1 组按钮卡"), events[0].fields)
+        self.assertIn(("人工确认", "2 个文件 / 1 组候选卡"), events[0].fields)
 
     def test_confirmation_only_delivery_skips_task_summary(self) -> None:
         with patch(

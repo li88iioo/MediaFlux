@@ -27,6 +27,7 @@
     }
     const sourceInput=document.getElementById('organizeSourceDirs');
     let sources=[];
+    let nsfwSourceIds=[];
     let pollTimer=null;
     let scheduleTimer=null;
     let lastStatusRenderKey='';
@@ -532,6 +533,52 @@
             .filter(item=>item&&String(item.id||'').trim()&&String(item.id)!=='0'&&!seen.has(String(item.id))&&seen.add(String(item.id)))
             .map((item,index)=>({id:String(item.id),name:String(item.name||`源目录${index+1}`)}));
     }
+    function parseSourceIds(raw){
+        let items=[];const canonical=String(raw??'').trim();
+        try{items=canonical?JSON.parse(canonical):[];}catch(_){return [];}
+        if(!Array.isArray(items))return [];
+        return [...new Set(items.map(item=>String(item?.id??item??'').trim()).filter(id=>id&&id!=='0'))];
+    }
+    function syncNsfwSourceIds(){
+        const input=document.getElementById('nsfwSourceIds');
+        if(input)input.value=JSON.stringify(nsfwSourceIds);
+    }
+    function renderNsfwSources(){
+        const list=document.getElementById('nsfwSourceOptions');
+        const count=document.getElementById('nsfwSourceCount');
+        if(!list||!count)return;
+        const allowed=new Set(sources.map(source=>source.id));
+        nsfwSourceIds=nsfwSourceIds.filter(id=>allowed.has(id));
+        syncNsfwSourceIds();
+        count.textContent=nsfwSourceIds.length?`${nsfwSourceIds.length} 个专用来源`:'尚未分配';
+        list.replaceChildren();
+        if(!sources.length){
+            const empty=document.createElement('div');
+            empty.className='nsfw-source-empty';
+            empty.innerHTML='<i data-lucide="folder-x"></i><span>请先在“光鸭整理”页面配置待整理来源目录。</span>';
+            list.appendChild(empty);renderLucideIcons(list);return;
+        }
+        sources.forEach((source,index)=>{
+            const label=document.createElement('label');
+            label.className='nsfw-source-option';
+            const checkbox=document.createElement('input');
+            checkbox.type='checkbox';checkbox.className='nsfw-dependent';
+            checkbox.checked=nsfwSourceIds.includes(source.id);
+            checkbox.setAttribute('aria-label',`将 ${source.name||source.id} 设为成人番号专用来源`);
+            checkbox.addEventListener('change',()=>{
+                nsfwSourceIds=checkbox.checked
+                    ? [...new Set([...nsfwSourceIds,source.id])]
+                    : nsfwSourceIds.filter(id=>id!==source.id);
+                syncNsfwSourceIds();renderNsfwSources();syncNsfwPanel();
+            });
+            const marker=document.createElement('span');marker.className='nsfw-source-check';marker.innerHTML='<i data-lucide="check"></i>';
+            const copy=document.createElement('span');copy.className='nsfw-source-option-copy';
+            const strong=document.createElement('strong');strong.textContent=source.name||`源目录${index+1}`;
+            const small=document.createElement('small');small.textContent=`ID: ${source.id}`;
+            copy.append(strong,small);label.append(checkbox,marker,copy);list.appendChild(label);
+        });
+        renderLucideIcons(list);
+    }
     function syncSources(){if(sourceInput)sourceInput.value=JSON.stringify(sources);}
     function renderSources(){
         const list=document.getElementById('organizeSourceList');
@@ -623,7 +670,7 @@
     }
     function syncNsfwPanel({collapseWhenDisabled=false,focusEndpoint=false}={}){
         const enabled=bool('r_nsfw');const panel=document.getElementById('nsfwProviderPanel');
-        panel.classList.toggle('is-disabled',!enabled);document.getElementById('nsfwProviderState').textContent=enabled?'已启用':'未启用';
+        panel.classList.toggle('is-disabled',!enabled);document.getElementById('nsfwProviderState').textContent=enabled?(nsfwSourceIds.length?`已启用 · ${nsfwSourceIds.length} 源`:'已启用 · 待分配'):'未启用';
         document.querySelectorAll('.nsfw-dependent').forEach(field=>{field.disabled=!enabled;});
         if(enabled)setNsfwPanelExpanded(true,{focusEndpoint});else if(collapseWhenDisabled)setNsfwPanelExpanded(false);
     }
@@ -815,6 +862,9 @@
     syncPreprocessActionFields();
     loadAppConfig().then(config=>{
         fillConfigFields(workspace,config);
+        sources=parseSources(config.GY_ORGANIZE_SOURCE_DIRS);
+        nsfwSourceIds=parseSourceIds(config.GY_ORGANIZE_NSFW_SOURCE_IDS);
+        renderNsfwSources();
         extensionEditors.video?.set(config.GY_ORGANIZE_VIDEO_EXTS||extensionDefaults.video.join(','));
         extensionEditors.metadata?.set(config.GY_ORGANIZE_METADATA_EXTS||extensionDefaults.metadata.join(','));
         if(!config.GY_ORGANIZE_SMALL_FILE_MB)document.getElementById('r_small').value='10';

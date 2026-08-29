@@ -8,7 +8,7 @@ import unicodedata
 from dataclasses import asdict, dataclass, replace
 
 from app.clients.guangya import GuangYaClient, GuangYaFile
-from app.modules.organize import OrganizeRules, Organizer
+from app.modules.organize import OrganizeRules, Organizer, organize_rules_snapshot
 from app.modules.organize_postprocess import media_role, normalized_stem
 from app.modules.directory_scrape_errors import (
     DirectoryScrapeRequestError,
@@ -130,7 +130,7 @@ class DirectoryMediaInspector:
         ]
         visited: set[str] = set()
         scanned_entries = 0
-        parsed_dir = self._parse(source.name)
+        parsed_dir = self._parse_for_rules(source.name, rules)
 
         def scan(
             current_id: str,
@@ -156,7 +156,7 @@ class DirectoryMediaInspector:
                         else resolved_dir.name
                     )
                     directories.append(self._directory_snapshot(resolved_dir, child_rel))
-                    parsed_child = self._parse(resolved_dir.name)
+                    parsed_child = self._parse_for_rules(resolved_dir.name, rules)
                     child_season = self._optional_season(parsed_child.get("season"))
                     scan(
                         resolved_dir.file_id,
@@ -172,9 +172,13 @@ class DirectoryMediaInspector:
                     ):
                         continue
                     resolved = self._enrich_identity(item)
-                    parsed = self._parse(resolved.name)
-                    special_container = is_special_path(relative_dir)
-                    special_child = special_container or is_special_media_name(item.name)
+                    parsed = self._parse_for_rules(resolved.name, rules)
+                    special_container = (
+                        not rules.nsfw_exclusive and is_special_path(relative_dir)
+                    )
+                    special_child = special_container or (
+                        not rules.nsfw_exclusive and is_special_media_name(item.name)
+                    )
                     if special_child:
                         parsed = dict(parsed)
                         parsed["type"] = "tv"
@@ -329,12 +333,20 @@ class DirectoryMediaInspector:
         ]
         primary_title = primary_titles[0] if primary_titles else ""
         parsed_dir_title = str(parsed_dir.get("title") or "").strip()
-        suggested_query = (
-            (clean_dir_name if not self._weak_identity_title(clean_dir_name) else "")
-            or (parsed_dir_title if not self._weak_identity_title(parsed_dir_title) else "")
-            or primary_title
-            or source.name
-        )
+        if rules.nsfw_exclusive:
+            suggested_query = (
+                self._nsfw_code(source.name, rules)
+                or primary_title
+                or parsed_dir_title
+                or source.name
+            )
+        else:
+            suggested_query = (
+                (clean_dir_name if not self._weak_identity_title(clean_dir_name) else "")
+                or (parsed_dir_title if not self._weak_identity_title(parsed_dir_title) else "")
+                or primary_title
+                or source.name
+            )
         return DirectoryInspection(
             directory_id=source_id,
             directory_name=source.name,
@@ -386,7 +398,7 @@ class DirectoryMediaInspector:
         self._validate_target_outside_source(parent_id, target_id)
 
         resolved_source = self._enrich_identity(source)
-        parsed = self._parse(resolved_source.name)
+        parsed = self._parse_for_rules(resolved_source.name, rules)
         videos = [self._snapshot(resolved_source, "video", "", parsed)]
         metadata_exts = self.organizer.metadata_exts(rules)
         subtitle_candidates: list[GuangYaFile] = []
@@ -473,6 +485,47 @@ class DirectoryMediaInspector:
             }
         except (AttributeError, TypeError, ValueError):
             return {}
+
+    @staticmethod
+    def _nsfw_code(value: str, rules: OrganizeRules) -> str:
+        if not rules.nsfw_exclusive:
+            return ""
+        from app.modules.nsfw import extract_nsfw_identifier, normalize_code
+
+        identifier = extract_nsfw_identifier(value, rules.nsfw_strip_domains)
+        return normalize_code(identifier.code) if identifier is not None else ""
+
+    def _parse_for_rules(
+        self, filename: str, rules: OrganizeRules,
+    ) -> dict[str, object]:
+        if not rules.nsfw_exclusive:
+            return self._parse(filename)
+
+        # 成人专用来源不进入普通影视季集解析。番号末尾的数字（如 675）
+        # 否则会被 guessit/通用解析器误判为 S06E75，并污染单文件检查。
+        code = self._nsfw_code(filename, rules)
+        if code:
+            title = code
+        else:
+            from app.modules.nsfw import clean_nsfw_release_text
+
+            source = str(filename or "").strip()
+            stem, separator, extension = source.rpartition(".")
+            if separator and extension.casefold() in self.organizer.video_exts(rules):
+                source = stem
+            title = clean_nsfw_release_text(
+                source, rules.nsfw_strip_domains,
+            ).strip(" ._@-[]()【】")
+            if not title:
+                title = str(self._parse(filename).get("title") or "").strip()
+        return {
+            "title": title,
+            "year": "",
+            "type": "movie",
+            "tmdb_id": "",
+            "season": None,
+            "episode": None,
+        }
 
     def _enrich_identity(self, item: GuangYaFile) -> GuangYaFile:
         if item.etag:
@@ -947,7 +1000,7 @@ class DirectoryMediaInspector:
                     key=lambda row: (row.file_id, row.parent_id, row.name),
                 )
             ],
-            "rules": asdict(rules),
+            "rules": organize_rules_snapshot(rules),
         }
         encoded = json.dumps(
             payload,

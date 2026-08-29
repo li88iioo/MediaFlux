@@ -20,6 +20,7 @@ from app.modules.organize_confirmations import (
     create_confirmation_actions,
     create_local_media_confirmation_actions,
     semantic_candidate_category,
+    skip_confirmation,
     start_confirmation,
     stop_confirmation_dispatcher,
     wake_confirmation_dispatcher,
@@ -75,6 +76,67 @@ class ConfirmationGroupingTests(unittest.TestCase):
         self.assertEqual(groups[0]["candidates"][0]["genre_ids"], [16])
 
 
+    def test_metatube_candidates_are_grouped_with_provider_identity(self):
+        organizer = Organizer(client=SimpleNamespace(), scraper=_PositionScraper())
+        candidate = Candidate(
+            tmdb_id="", title="SSIS-001 测试标题", year="2024", score=1.0,
+            media_type="movie", provider="metatube",
+            external_id="javbus:ssis001", metadata={"number": "SSIS-001"},
+        )
+        match = MatchResult(
+            title=candidate.title, year="2024", media_type="movie",
+            confidence=1.0, candidates=[candidate], need_confirm=True,
+            error="同一番号命中多个元数据来源，请人工选择",
+            provider="metatube", external_id="javbus:ssis001",
+        )
+        plan = OrganizePlan(
+            file_id="adult-1", original_name="SSIS-001.mp4",
+            original_path="SSIS-001", original_parent_id="adult-parent",
+            size=100, etag="adult-etag", match=match, action="skip",
+        )
+        rules = OrganizeRules(
+            nsfw_enabled=True, nsfw_exclusive=True,
+            nsfw_metatube_endpoint="https://meta.example",
+            nsfw_metatube_token="server-secret",
+        )
+
+        groups = organizer._build_confirmation_groups(
+            [plan], {}, source_dir_id="adult-source", source_name="NSFW", rules=rules,
+        )
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["candidates"][0]["provider"], "metatube")
+        self.assertEqual(groups[0]["candidates"][0]["external_id"], "javbus:ssis001")
+        self.assertTrue(groups[0]["rules"]["nsfw_exclusive"])
+        self.assertNotIn("nsfw_metatube_token", groups[0]["rules"])
+        self.assertNotIn("server-secret", json.dumps(groups[0]["rules"]))
+
+    def test_no_metadata_group_is_retained_for_terminal_skip(self):
+        organizer = Organizer(client=SimpleNamespace(), scraper=_PositionScraper())
+        match = MatchResult(
+            media_type="movie", need_confirm=True, status="no_match",
+            provider="metatube", matched_by="metatube_only",
+            error="成人专用来源未找到完全一致的元数据",
+        )
+        plan = OrganizePlan(
+            file_id="adult-2", original_name="UNKNOWN-001.mp4",
+            original_path="UNKNOWN-001", original_parent_id="adult-parent",
+            size=100, etag="adult-etag", match=match, action="skip",
+        )
+
+        groups = organizer._build_confirmation_groups(
+            [plan], {}, source_dir_id="adult-source", source_name="NSFW",
+        )
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["candidates"], [])
+        validated, actionable = Organizer._validated_task_confirmation_groups({
+            "confirmation_groups": groups,
+        })
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(actionable, 1)
+
+
 class CandidateSemanticCategoryTests(unittest.TestCase):
     def test_tmdb_type_and_genres_render_user_facing_categories(self):
         cases = (
@@ -85,10 +147,70 @@ class CandidateSemanticCategoryTests(unittest.TestCase):
             ({"media_type": "movie", "genre_ids": [99]}, "电影 · 纪录片"),
             ({"media_type": "tv", "genre_ids": []}, "剧集"),
             ({"media_type": "movie", "genre_ids": []}, "电影"),
+            ({"provider": "metatube", "media_type": "movie"}, "成人内容"),
         )
         for candidate, expected in cases:
             with self.subTest(candidate=candidate):
                 self.assertEqual(semantic_candidate_category(candidate), expected)
+
+
+class NsfwConfirmationFallbackTests(unittest.TestCase):
+    def test_clean_title_candidate_resolves_without_metatube_request(self):
+        rules = OrganizeRules(
+            nsfw_enabled=True, nsfw_exclusive=True, nsfw_strip_domains="hhd800.com",
+        )
+        payload = {
+            "directory": "ATID-675",
+            "files": [{"name": "hhd800.com@ATID-675.mp4"}],
+        }
+        candidate = {
+            "provider": "clean_title", "external_id": "ATID-675",
+            "media_type": "movie", "title": "客户端篡改标题",
+        }
+
+        _scraper, match, detail, provider = (
+            confirmation_module._resolve_guangya_confirmation_candidate(
+                payload, candidate, rules,
+            )
+        )
+
+        self.assertEqual(provider, "clean_title")
+        self.assertEqual(match.external_id, "ATID-675")
+        self.assertEqual(match.title, "ATID-675")
+        self.assertTrue(match.locked)
+        self.assertEqual(detail["number"], "ATID-675")
+
+    def test_clean_title_candidate_rejects_mismatched_number(self):
+        with self.assertRaisesRegex(ValueError, "候选番号与待确认文件不一致"):
+            confirmation_module._resolve_guangya_confirmation_candidate(
+                {"directory": "ATID-675", "files": [{"name": "ATID-675.mp4"}]},
+                {
+                    "provider": "clean_title", "external_id": "ABP-123",
+                    "media_type": "movie", "title": "ABP-123",
+                },
+                OrganizeRules(nsfw_enabled=True, nsfw_exclusive=True),
+            )
+
+    def test_ambiguous_multipart_confirmation_uses_natural_sequence(self):
+        payload = {"multipart_strategy": "sequence", "directory": "FJIN-140"}
+        files = [
+            {"name": "FJIN-140-B.mp4"},
+            {"name": "FJIN-140-A.mp4"},
+        ]
+        overrides = confirmation_module._confirmed_multipart_overrides(payload, files)
+        self.assertEqual(overrides["FJIN-140-A.mp4"], 1)
+        self.assertEqual(overrides["FJIN-140-B.mp4"], 2)
+
+    def test_clean_title_button_is_explicit_action(self):
+        label = confirmation_module._safe_label({
+            "provider": "clean_title", "external_id": "ATID-675",
+            "media_type": "movie", "title": "ATID-675",
+        }, 0)
+        self.assertEqual(label, "清洗标题后入库 · ATID-675")
+        self.assertEqual(semantic_candidate_category({
+            "provider": "clean_title", "external_id": "ATID-675",
+            "media_type": "movie",
+        }), "成人内容")
 
 
 class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
@@ -137,6 +259,81 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         payload = json.loads(row["payload_json"])
         self.assertEqual(payload["files"][0]["file_id"], "file-4")
         self.assertEqual(payload["candidates"][0]["genre_ids"], [16])
+
+    def test_metatube_action_uses_provider_identity_and_source_rules(self):
+        group = self._group()
+        group["source_dir_id"] = "adult-source"
+        group["directory"] = "SSIS-001"
+        group["files"][0].update({"name": "SSIS-001.mp4", "parent_id": "parent"})
+        group["candidates"] = [{
+            "provider": "metatube", "external_id": "javbus:ssis001",
+            "tmdb_id": "", "media_type": "movie",
+            "title": "SSIS-001 测试标题", "year": "2024",
+            "score": 1.0, "support": 1,
+        }]
+        group["rules"] = {
+            **OrganizeRules().__dict__,
+            "nsfw_enabled": True,
+            "nsfw_exclusive": True,
+            "nsfw_source_ids": "adult-source",
+            "nsfw_metatube_endpoint": "https://meta.example",
+            "nsfw_metatube_token": "embedded-secret",
+        }
+
+        actions = create_confirmation_actions(
+            group, OrganizeRules(nsfw_metatube_token="server-secret"),
+            source_name="NSFW", chat_id="100",
+        )
+
+        self.assertEqual(len(actions), 2)
+        self.assertIn("MetaTube javbus:ssis001", str(actions[0].label))
+        self.assertTrue(actions[-1].callback_data.endswith(":skip"))
+        token = actions[0].callback_data.split(":")[1]
+        payload = json.loads(db.get_organize_confirmation(token)["payload_json"])
+        self.assertEqual(payload["candidates"][0]["provider"], "metatube")
+        self.assertTrue(payload["rules"]["nsfw_exclusive"])
+        self.assertNotIn("nsfw_metatube_token", payload["rules"])
+        self.assertNotIn("server-secret", json.dumps(payload))
+        self.assertNotIn("embedded-secret", json.dumps(payload))
+
+    def test_no_metadata_card_offers_skip_and_settles_manual_log(self):
+        log_id = db.add_organize_log(
+            "guangya", "UNKNOWN-001", "", "adult-2", "manual", "",
+            original_parent_id="parent", original_name="UNKNOWN-001.mp4",
+            current_parent_id="parent", current_name="UNKNOWN-001.mp4",
+            media_type="movie", title="UNKNOWN-001",
+            error="没有可用元数据", legacy_incomplete=False,
+        )
+        group = self._group()
+        group.update({
+            "directory": "UNKNOWN-001", "identity": "UNKNOWN-001",
+            "source_parent_id": "parent", "candidates": [],
+            "files": [{
+                "file_id": "adult-2", "name": "UNKNOWN-001.mp4",
+                "parent_id": "parent", "size": 100, "etag": "adult-etag",
+            }],
+        })
+        actions = create_confirmation_actions(
+            group, OrganizeRules(), source_name="NSFW", chat_id="100",
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(str(actions[0].label), "跳过此组")
+        self.assertTrue(actions[0].callback_data.endswith(":skip"))
+        token = actions[0].callback_data.split(":")[1]
+        with patch(
+            "app.modules.organize_confirmations.publish_confirmation_event",
+            return_value=True,
+        ) as publish:
+            result = skip_confirmation(token, chat_id="100", message_id=77)
+        publish.assert_called_once()
+        self.assertEqual(publish.call_args.kwargs["message_id"], 77)
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(db.get_organize_confirmation(token)["status"], "cancelled")
+        log = db.get_organize_log(log_id)
+        self.assertEqual(log["status"], "skipped")
+        self.assertEqual(log["error"], "用户选择跳过：暂无可用元数据")
 
     def test_callback_message_binding_is_persisted_and_chat_scoped(self):
         actions = create_confirmation_actions(
@@ -699,6 +896,69 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         )
 
 
+    def test_metatube_candidate_resolves_with_exact_source_number(self):
+        rules = OrganizeRules(
+            nsfw_enabled=True, nsfw_exclusive=True,
+            nsfw_metatube_endpoint="https://meta.example",
+            nsfw_timeout_seconds=8,
+        )
+        candidate = {
+            "provider": "metatube", "external_id": "javbus:ssis001",
+            "media_type": "movie", "title": "SSIS-001 测试标题",
+        }
+        match = MatchResult(
+            title="SSIS-001 测试标题", year="2024", media_type="movie",
+            provider="metatube", external_id="javbus:ssis001",
+        )
+        recognizer = SimpleNamespace(resolve=lambda _external_id: (
+            match, {"number": "SSIS-001", "title": "SSIS-001 测试标题"},
+        ))
+        payload = {
+            "directory": "SSIS-001",
+            "files": [{"name": "SSIS-001.1080p.mp4"}],
+        }
+
+        with patch(
+            "app.modules.organize_confirmations.NsfwRecognizer",
+            return_value=recognizer,
+        ) as factory:
+            _scraper, resolved, detail, provider = (
+                confirmation_module._resolve_guangya_confirmation_candidate(
+                    payload, candidate, rules,
+                )
+            )
+
+        self.assertEqual(provider, "metatube")
+        self.assertEqual(detail["number"], "SSIS-001")
+        self.assertTrue(resolved.locked)
+        self.assertFalse(resolved.need_confirm)
+        factory.assert_called_once()
+
+    def test_metatube_candidate_rejects_different_source_number(self):
+        rules = OrganizeRules(
+            nsfw_enabled=True, nsfw_exclusive=True,
+            nsfw_metatube_endpoint="https://meta.example",
+        )
+        recognizer = SimpleNamespace(resolve=lambda _external_id: (
+            MatchResult(
+                title="ABP-123", media_type="movie", provider="metatube",
+                external_id="javbus:abp123",
+            ),
+            {"number": "ABP-123", "title": "ABP-123"},
+        ))
+        with patch(
+            "app.modules.organize_confirmations.NsfwRecognizer",
+            return_value=recognizer,
+        ), self.assertRaisesRegex(ValueError, "候选番号与待确认文件不一致"):
+            confirmation_module._resolve_guangya_confirmation_candidate(
+                {"directory": "SSIS-001", "files": [{"name": "SSIS-001.mp4"}]},
+                {
+                    "provider": "metatube", "external_id": "javbus:abp123",
+                    "media_type": "movie",
+                },
+                rules,
+            )
+
     def test_worker_success_runs_preview_execute_and_post_actions(self):
         rules = OrganizeRules()
         group = self._group()
@@ -863,7 +1123,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         rendered = notifier.render_event(event)
         self.assertEqual(event.layout, "relaxed")
         self.assertIn("<b>剧集</b>  第 2 季 · E04 · 共 1 个视频", rendered)
-        self.assertIn("需要人工确认\n\n请选择下方候选继续整理。", rendered)
+        self.assertIn("需要人工确认\n\n请选择候选继续整理，或跳过此组。", rendered)
         self.assertIn("TMDB 105556 · 剧集 · 动漫 · 匹配 88% · 支持 1 个文件", rendered)
         self.assertIn("不要欺负我，长瀞同学 (2021)", rendered)
         self.assertIn("TMDB 105556", str(event.actions[0].label))
@@ -905,7 +1165,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(confirmations), 1)
         summary = summaries[0]
         self.assertTrue(any("S02" in line and "E01" in line and "E09" in line for line in summary.lines))
-        self.assertIn(("人工确认", "1 个文件 / 1 组按钮卡"), summary.fields)
+        self.assertIn(("人工确认", "1 个文件 / 1 组候选卡"), summary.fields)
         event = confirmations[0]
         self.assertEqual(event.title, "⚠️ 待确认媒体 1/1")
         self.assertIn(("剧集", "第 2 季 · E04 · 共 1 个视频"), event.fields)
@@ -1340,6 +1600,29 @@ class TelegramCallbackTests(unittest.TestCase):
         self.assertIn("继续选择其他待确认媒体", edited)
         self.assertIsNone(bot.edits[0][1]["reply_markup"])
 
+
+    def test_skip_callback_finishes_pending_group(self):
+        from app.bot.handlers import _handle_organize_confirmation_callback
+
+        bot = self.FakeBot()
+        call = SimpleNamespace(
+            id="callback", data="orgc:token:skip",
+            from_user=SimpleNamespace(id=9),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=100), message_id=77,
+            ),
+        )
+        with patch(
+            "app.modules.organize_confirmations.skip_confirmation",
+            return_value={"skipped": True, "directory": "/待确认"},
+        ) as skip_mock:
+            _handle_organize_confirmation_callback(bot, call)
+
+        skip_mock.assert_called_once_with(
+            "token", chat_id="100", message_id=77,
+        )
+        self.assertEqual(bot.answers[0][0][1], "已跳过，本次待确认结束")
+        self.assertEqual(bot.edits, [])
 
     def test_cancel_callback_uses_persisted_receipt_instead_of_direct_edit(self):
         from app.bot.handlers import _handle_organize_confirmation_callback

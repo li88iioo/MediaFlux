@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import threading
 from dataclasses import asdict
@@ -18,8 +19,19 @@ from app.config import get
 from app.logger import get_logger
 from app.modules.directory_scrape import FixedMatchScraper, ScopedGuangYaClient
 from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
-from app.modules.organize import OrganizeRules, Organizer, enforce_fixed_organize_rules
-from app.modules.scraper import TMDBScraper
+from app.modules.nsfw import (
+    MetaTubeError, NsfwRecognizer, build_clean_title_candidate,
+    extract_nsfw_identifier, normalize_code,
+)
+from app.modules.organize import (
+    OrganizeRules,
+    Organizer,
+    enforce_fixed_organize_rules,
+    organize_rules_snapshot,
+    organize_rules_snapshot_matches,
+    restore_organize_rules_snapshot,
+)
+from app.modules.scraper import MatchResult, TMDBScraper
 from app.notifier import NotificationAction, NotificationEvent, safe_int
 
 logger = get_logger(__name__)
@@ -43,8 +55,36 @@ def _timestamp(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _candidate_provider(candidate: dict) -> str:
+    provider = str(candidate.get("provider") or "").strip().lower()
+    if not provider and str(candidate.get("tmdb_id") or "").strip():
+        provider = "tmdb"
+    return provider
+
+
+def _candidate_external_id(candidate: dict) -> str:
+    return str(
+        candidate.get("external_id") or candidate.get("tmdb_id") or ""
+    ).strip()
+
+
+def _valid_confirmation_candidate(candidate: object) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    provider = _candidate_provider(candidate)
+    external_id = _candidate_external_id(candidate)
+    media_type = str(candidate.get("media_type") or "").strip().lower()
+    if provider == "tmdb":
+        return bool(str(candidate.get("tmdb_id") or "").strip() and media_type in {"movie", "tv"})
+    if provider in {"metatube", "clean_title"}:
+        return bool(external_id and media_type == "movie")
+    return False
+
+
 def semantic_candidate_category(candidate: dict) -> str:
-    """把 TMDB 大类与题材合并成对用户有意义的候选身份。"""
+    """把 provider、媒体大类与题材合并成用户可理解的候选身份。"""
+    if _candidate_provider(candidate) in {"metatube", "clean_title"}:
+        return "成人内容"
     media_type = str(candidate.get("media_type") or "").strip().lower()
     genre_ids = {
         int(value) for value in (candidate.get("genre_ids") or [])
@@ -67,30 +107,50 @@ def semantic_candidate_category(candidate: dict) -> str:
     return "未知类型"
 
 
+def _candidate_identity_label(candidate: dict) -> str:
+    provider = _candidate_provider(candidate)
+    external_id = _candidate_external_id(candidate)
+    if provider == "metatube":
+        return f"MetaTube {external_id}" if external_id else "MetaTube"
+    if provider == "clean_title":
+        return f"清洗标题 {external_id}" if external_id else "清洗标题"
+    if provider == "tmdb":
+        return f"TMDB {external_id}" if external_id else "TMDB"
+    return external_id or "未知来源"
+
+
+def _candidate_display_name(candidate: dict, fallback: str = "待确认媒体") -> str:
+    return str(
+        candidate.get("title") or _candidate_external_id(candidate) or fallback
+    ).strip()
+
+
 def _safe_label(candidate: dict, index: int) -> str:
-    title = str(candidate.get("title") or f"候选 {index + 1}").strip()
+    if _candidate_provider(candidate) == "clean_title":
+        code = _candidate_external_id(candidate)
+        return f"清洗标题后入库" + (f" · {code}" if code else "")
+    title = _candidate_display_name(candidate, f"候选 {index + 1}")
     if len(title) > 18:
         title = f"{title[:17].rstrip()}…"
-    tmdb_id = str(candidate.get("tmdb_id") or "").strip()
-    suffix = f" · TMDB {tmdb_id}" if tmdb_id else ""
-    return f"{index + 1}  {title}{suffix}"
+    return f"{index + 1}  {title} · {_candidate_identity_label(candidate)}"
 
 
 def _candidate_summary_lines(group: dict) -> tuple[str, ...]:
     lines: list[str] = []
     for index, candidate in enumerate((group.get("candidates") or [])[:_MAX_CANDIDATES]):
-        title = str(candidate.get("title") or f"候选 {index + 1}").strip()
+        title = _candidate_display_name(candidate, f"候选 {index + 1}")
         year = str(candidate.get("year") or "").strip()
-        tmdb_id = str(candidate.get("tmdb_id") or "").strip()
         score = max(0.0, min(float(candidate.get("score") or 0.0), 1.0))
         support = max(0, int(candidate.get("support") or 0))
         heading = f"{index + 1}. {title}" + (f" ({year})" if year else "")
-        identity = f"TMDB {tmdb_id} · {semantic_candidate_category(candidate)} · 匹配 {score:.0%}"
+        identity = (
+            f"{_candidate_identity_label(candidate)} · "
+            f"{semantic_candidate_category(candidate)} · 匹配 {score:.0%}"
+        )
         if support:
             identity += f" · 支持 {support} 个文件"
         lines.append(f"{heading}\n{identity}")
     return tuple(lines)
-
 
 def _fingerprint(payload: dict) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -109,7 +169,9 @@ def _persist_confirmation_actions(
     payload: dict, *, chat_id: str = ""
 ) -> tuple[NotificationAction, ...]:
     candidates = [dict(item) for item in (payload.get("candidates") or [])]
-    if not candidates or not list(payload.get("files") or []):
+    files = list(payload.get("files") or [])
+    allow_skip_terminal = bool(payload.get("allow_skip_terminal"))
+    if not files or (not candidates and not allow_skip_terminal):
         return ()
     resolved_chat = str(chat_id or get("TG_CHAT_ID", "") or "").strip()
     token = secrets.token_urlsafe(12)
@@ -126,7 +188,10 @@ def _persist_confirmation_actions(
         NotificationAction(_safe_label(candidate, index), f"orgc:{token}:{index}")
         for index, candidate in enumerate(candidates)
     ]
-    actions.append(NotificationAction("暂不处理", f"orgc:{token}:cancel"))
+    if allow_skip_terminal:
+        actions.append(NotificationAction("跳过此组", f"orgc:{token}:skip"))
+    else:
+        actions.append(NotificationAction("暂不处理", f"orgc:{token}:cancel"))
     return tuple(actions)
 
 
@@ -226,27 +291,35 @@ def create_confirmation_actions(
     source_name: str = "",
     chat_id: str = "",
 ) -> tuple[NotificationAction, ...]:
-    """持久化候选组并返回 Telegram 按钮；无有效候选时返回空。"""
+    """持久化候选组；无元数据时仍返回可终结待确认状态的跳过按钮。"""
     candidates = [
         dict(item) for item in (group.get("candidates") or [])[:_MAX_CANDIDATES]
-        if str((item or {}).get("tmdb_id") or "").strip()
-        and str((item or {}).get("media_type") or "") in {"movie", "tv"}
+        if _valid_confirmation_candidate(item)
     ]
     files = [dict(item) for item in (group.get("files") or [])]
-    if not candidates or not files:
+    if not files:
         return ()
+    group_rules = group.get("rules")
+    if isinstance(group_rules, dict):
+        effective_rules = restore_organize_rules_snapshot(
+            group_rules, trusted_rules=rules,
+        )
+    else:
+        effective_rules = enforce_fixed_organize_rules(OrganizeRules(**asdict(rules)))
     payload = {
-        "version": 1,
+        "version": 2,
+        "allow_skip_terminal": True,
         "source_dir_id": str(group.get("source_dir_id") or ""),
         "source_name": str(source_name or group.get("source_name") or ""),
         "directory": str(group.get("directory") or "/"),
         "source_parent_id": str(group.get("source_parent_id") or "0"),
         "identity": str(group.get("identity") or ""),
         "reason": str(group.get("reason") or ""),
+        "multipart_strategy": str(group.get("multipart_strategy") or ""),
         "files": files,
         "companions": [dict(item) for item in (group.get("companions") or [])],
         "candidates": candidates,
-        "rules": asdict(rules),
+        "rules": organize_rules_snapshot(effective_rules),
     }
     return _persist_confirmation_actions(payload, chat_id=chat_id)
 
@@ -429,6 +502,58 @@ def cancel_confirmation(
         payload, status="skipped", error="用户选择暂不处理",
     )
     return {"cancelled": True, "directory": directory}
+
+
+def skip_confirmation(
+    token: str, *, chat_id: str, message_id: int | str | None = None
+) -> dict:
+    """显式跳过无可用元数据的光鸭待确认组，并同步结束日志状态。"""
+    current = db.get_organize_confirmation(token)
+    if current is None:
+        raise ValueError("确认操作不存在或已失效")
+    payload = _decode_row(current)
+    if _confirmation_kind(payload) != "guangya" or not bool(
+        payload.get("allow_skip_terminal")
+    ):
+        raise ValueError("该确认操作不支持跳过")
+    directory = str(current["directory_path"] or "/")
+    try:
+        resolved_message_id = int(message_id or 0)
+    except (TypeError, ValueError):
+        resolved_message_id = 0
+    terminal_event = NotificationEvent(
+        "⏭️ 已跳过待确认项",
+        fields=(
+            ("媒体", payload.get("identity") or "未识别媒体"),
+            ("目录", directory),
+            ("文件", f"{len(payload.get('files') or [])} 个视频"),
+        ),
+        footer=(
+            "文件保持原位，本次待确认状态已结束；以后重新执行整理时仍会再次尝试识别。"
+        ),
+        layout="relaxed",
+    )
+    db.cancel_organize_confirmation(
+        token,
+        chat_id=chat_id,
+        event_json=_serialize_notification_event(terminal_event),
+        message_id=resolved_message_id or None,
+        enqueue_delivery=False,
+    )
+    reason = "用户选择跳过：暂无可用元数据"
+    _finalize_guangya_manual_logs(payload, status="skipped", error=reason)
+    if not publish_confirmation_event(
+        terminal_event,
+        chat_id=chat_id,
+        token=token,
+        message_id=resolved_message_id or None,
+        terminal=True,
+    ):
+        logger.warning(
+            "Telegram 跳过确认终态未被统一通知中心接纳 token=%s",
+            str(token)[:6],
+        )
+    return {"skipped": True, "directory": directory}
 
 
 def _confirmation_result(row, payload: dict, candidate: dict, *, status: str) -> dict:
@@ -857,6 +982,110 @@ def _validate_snapshot(client: GuangYaClient, item: dict, *, role: str) -> None:
         )
 
 
+def _validate_metatube_confirmation_identity(
+    payload: dict, detail: dict, rules: OrganizeRules,
+) -> None:
+    source_codes: set[str] = set()
+    source_values = [str(payload.get("directory") or "")]
+    source_values.extend(
+        str(item.get("name") or "")
+        for item in (payload.get("files") or [])
+        if isinstance(item, dict)
+    )
+    for value in source_values:
+        identifier = extract_nsfw_identifier(value, rules.nsfw_strip_domains)
+        if identifier is not None:
+            source_codes.add(normalize_code(identifier.code))
+    resolved_code = normalize_code(str(detail.get("number") or ""))
+    if not source_codes:
+        raise ValueError("待确认文件未提取到可校验番号，不能套用 MetaTube 元数据")
+    if not resolved_code or resolved_code not in source_codes:
+        raise ValueError("MetaTube 候选番号与待确认文件不一致")
+
+
+def _resolve_guangya_confirmation_candidate(
+    payload: dict, candidate: dict, rules: OrganizeRules,
+) -> tuple[TMDBScraper, object, dict, str]:
+    provider = _candidate_provider(candidate)
+    external_id = _candidate_external_id(candidate)
+    media_type = str(candidate.get("media_type") or "").strip().lower()
+    scraper = TMDBScraper()
+    if provider == "tmdb":
+        tmdb_id = str(candidate.get("tmdb_id") or "").strip()
+        if not tmdb_id or media_type not in {"movie", "tv"}:
+            raise ValueError("TMDB 候选媒体参数无效")
+        try:
+            detail = scraper.get_detail_with_credits(tmdb_id, media_type)
+            match = scraper.match_from_tmdb(tmdb_id, media_type)
+        except Exception as exc:
+            raise ConfirmationRetryableError(
+                "TMDB 服务暂时不可用，请稍后重试"
+            ) from exc
+        if not detail or not match.tmdb_id or match.need_confirm:
+            raise ConfirmationRetryableError(
+                "TMDB 候选暂时无法确认，请稍后重试"
+            )
+    elif provider == "metatube":
+        if media_type != "movie" or not external_id:
+            raise ValueError("MetaTube 候选媒体参数无效")
+        if not rules.nsfw_exclusive:
+            raise ValueError("当前来源不是成人专用来源，已拒绝 MetaTube 候选")
+        if not str(rules.nsfw_metatube_endpoint or "").strip():
+            raise ValueError("MetaTube 服务地址未配置")
+        try:
+            recognizer = NsfwRecognizer(
+                rules.nsfw_metatube_endpoint,
+                rules.nsfw_metatube_token,
+                strip_domains=rules.nsfw_strip_domains,
+                timeout=rules.nsfw_timeout_seconds,
+            )
+            match, detail = recognizer.resolve(external_id)
+        except MetaTubeError as exc:
+            raise ConfirmationRetryableError(
+                "MetaTube 服务暂时不可用，请稍后重试"
+            ) from exc
+        _validate_metatube_confirmation_identity(payload, detail, rules)
+    elif provider == "clean_title":
+        if media_type != "movie" or not external_id:
+            raise ValueError("清洗标题候选参数无效")
+        if not rules.nsfw_exclusive:
+            raise ValueError("当前来源不是成人专用来源，已拒绝清洗标题入库")
+        seed = next((
+            str(item.get("name") or "")
+            for item in (payload.get("files") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ), str(payload.get("directory") or ""))
+        fallback = build_clean_title_candidate(seed, rules.nsfw_strip_domains)
+        if fallback is None:
+            raise ValueError("待确认文件未提取到有效番号，不能清洗标题入库")
+        resolved_id = str(fallback.get("external_id") or "").strip()
+        if normalize_code(external_id) != normalize_code(resolved_id):
+            raise ValueError("清洗标题候选番号与待确认文件不一致")
+        # 标题由服务端根据原始文件重新生成，不能信任回传候选中的可修改文本。
+        title = str(fallback.get("title") or resolved_id).strip()
+        detail = {
+            **dict(fallback.get("metadata") or {}),
+            "number": resolved_id,
+            "title": title,
+            "fallback": True,
+        }
+        match = MatchResult(
+            title=title,
+            media_type="movie",
+            confidence=1.0,
+            provider="clean_title",
+            external_id=resolved_id,
+            metadata=detail,
+            status="matched",
+        )
+    else:
+        raise ValueError("候选媒体来源无效")
+    match.locked = True
+    match.need_confirm = False
+    match.matched_by = "telegram_confirmation"
+    return scraper, match, detail, provider
+
+
 def _record_confirmation_learning(
     scraper: TMDBScraper,
     payload: dict,
@@ -918,7 +1147,7 @@ def _confirmation_result_event(
     return NotificationEvent(
         "✅ 人工确认整理完成",
         fields=(
-            ("媒体", candidate.get("title") or candidate.get("tmdb_id") or "待确认媒体"),
+            ("媒体", _candidate_display_name(candidate)),
             ("目录", payload.get("directory") or payload.get("source_name") or "/"),
             ("结果", f"已移动 {moved} · 元数据 {metadata} · 跳过 {skipped} · 失败 {failed}"),
             ("STRM", strm_label),
@@ -945,7 +1174,7 @@ def _local_confirmation_result_event(
     return NotificationEvent(
         "✅ 本地媒体确认整理完成",
         fields=(
-            ("媒体", candidate.get("title") or candidate.get("tmdb_id") or "待确认媒体"),
+            ("媒体", _candidate_display_name(candidate)),
             ("来源", payload.get("source_name") or "本地媒体"),
             ("结果", f"已移动 {moved} · 清理 {deleted} · 警告 {warnings}"),
             ("媒体库", {
@@ -1078,7 +1307,7 @@ def _execute_local_media_confirmation(
             "❌ 本地媒体确认整理失败",
             fields=(
                 ("文件", payload.get("directory") or "本地媒体"),
-                ("候选", candidate.get("title") or candidate.get("tmdb_id") or ""),
+                ("候选", _candidate_display_name(candidate, "")),
             ),
             footer=f"{message}\n\n请前往 Web 的本地媒体待确认页继续处理。",
             layout="relaxed",
@@ -1119,17 +1348,37 @@ def _execute_confirmation(
     )
 
 
+def _natural_sort_key(value: str) -> tuple[object, ...]:
+    return tuple(
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"(\d+)", str(value or ""))
+    )
+
+
+def _confirmed_multipart_overrides(payload: dict, files: list[dict]) -> dict[object, int]:
+    if str(payload.get("multipart_strategy") or "") != "sequence":
+        return {}
+    ordered = sorted(
+        files, key=lambda item: _natural_sort_key(str(item.get("name") or ""))
+    )
+    directory = str(payload.get("directory") or "")
+    overrides: dict[object, int] = {}
+    for index, item in enumerate(ordered, 1):
+        name = str(item.get("name") or "")
+        overrides[name] = index
+        overrides[(directory, name)] = index
+    return overrides
+
+
 def _execute_guangya_confirmation(
     token: str, payload: dict, candidate: dict, *, selected_index: int, chat_id: str
 ) -> dict:
     # running 状态由 claim_queued_organize_confirmation 原子授予；worker 不得
     # 无条件重新取得所有权，否则重启恢复后的 failed 终态会被迟到执行覆盖。
     try:
-        stored_rules = enforce_fixed_organize_rules(
-            OrganizeRules(**dict(payload.get("rules") or {}))
-        )
-        current_rules = OrganizeRules.from_config()
-        if asdict(stored_rules) != asdict(current_rules):
+        source_dir_id = str(payload.get("source_dir_id") or "").strip()
+        current_rules = OrganizeRules.from_config().for_source(source_dir_id)
+        if not organize_rules_snapshot_matches(payload.get("rules"), current_rules):
             raise DirectoryScrapeConflictError("整理规则已变化，请重新执行整理后再确认")
 
         files = [dict(item) for item in (payload.get("files") or [])]
@@ -1144,30 +1393,15 @@ def _execute_guangya_confirmation(
         for item in companions:
             _validate_snapshot(client, item, role="伴随文件")
 
-        tmdb_id = str(candidate.get("tmdb_id") or "").strip()
-        media_type = str(candidate.get("media_type") or "").strip()
-        if not tmdb_id or media_type not in {"movie", "tv"}:
-            raise ValueError("候选媒体参数无效")
-        scraper = TMDBScraper()
-        try:
-            detail = scraper.get_detail_with_credits(tmdb_id, media_type)
-            match = scraper.match_from_tmdb(tmdb_id, media_type)
-        except Exception as exc:
-            raise ConfirmationRetryableError(
-                "TMDB 服务暂时不可用，请稍后重试"
-            ) from exc
-        if not detail or not match.tmdb_id or match.need_confirm:
-            raise ConfirmationRetryableError(
-                "TMDB 候选暂时无法确认，请稍后重试"
-            )
-        match.locked = True
-        match.need_confirm = False
-        match.matched_by = "telegram_confirmation"
+        scraper, match, detail, provider = _resolve_guangya_confirmation_candidate(
+            payload, candidate, current_rules,
+        )
 
         position_overrides = {
             str(item.get("name") or ""): (item.get("season"), item.get("episode"))
             for item in files
         }
+        multipart_overrides = _confirmed_multipart_overrides(payload, files)
         allowed_ids = {
             str(item.get("file_id") or "") for item in (*files, *companions)
             if str(item.get("file_id") or "")
@@ -1181,6 +1415,7 @@ def _execute_guangya_confirmation(
                 detail,
                 preserve_specials=True,
                 position_overrides=position_overrides,
+                multipart_overrides=multipart_overrides,
             ),
         )
         organizer._validate_target_outside_source(parent_id, current_rules.target_dir_id)
@@ -1211,11 +1446,12 @@ def _execute_guangya_confirmation(
             # 执行阶段只读缓存，保持与确认预览一致；缓存由预览阶段预热。
             media_probe_cache_only=True,
         )
-        learning_warnings = _record_confirmation_learning(
-            scraper, payload, candidate, match
-        )
-        if learning_warnings:
-            stats.setdefault("warnings", []).extend(learning_warnings)
+        if provider == "tmdb":
+            learning_warnings = _record_confirmation_learning(
+                scraper, payload, candidate, match
+            )
+            if learning_warnings:
+                stats.setdefault("warnings", []).extend(learning_warnings)
         scope_name = str(payload.get("directory") or payload.get("source_name") or "TG 人工确认")
         try:
             confirm_debounce = max(0, min(int(float(
@@ -1294,7 +1530,7 @@ def _execute_guangya_confirmation(
             "❌ Telegram 确认整理失败",
             fields=(
                 ("目录", payload.get("directory") or "/"),
-                ("候选", candidate.get("title") or candidate.get("tmdb_id") or ""),
+                ("候选", _candidate_display_name(candidate, "")),
             ),
             footer=(message + (
                 "\n\n可点击下方按钮重试。"
@@ -1336,7 +1572,13 @@ def confirmation_event(
         group, rules, source_name=source_name, chat_id=chat_id
     )
     reason = str(group.get("reason") or "匹配结果需要人工确认").strip()
-    footer = f"{reason}\n\n请选择下方候选继续整理。"
+    if list(group.get("candidates") or []):
+        footer = f"{reason}\n\n请选择候选继续整理，或跳过此组。"
+    else:
+        footer = (
+            f"{reason}\n\n当前没有可用元数据。可跳过此组；文件保持原位，"
+            "本次待确认状态会结束。"
+        )
     return NotificationEvent(
         title=title,
         fields=tuple(fields.items()),

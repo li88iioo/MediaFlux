@@ -203,7 +203,7 @@
                     </div>
                     <div class="lm-source-routing-row">
                         <label class="lm-field"><span>待整理（你的qB下载路径）</span><span class="lm-path-control"><input class="form-input" id="lmLocalRoot" required placeholder="例如：/media/downloads"><button class="jump-btn lm-picker-btn" type="button" id="lmPickLocalRootBtn" aria-label="浏览容器目录" title="浏览容器目录"><i data-lucide="folder-open"></i></button></span></label>
-                        <label class="lm-field"><span>识别范围</span><select class="form-select" id="lmSourceMediaType"><option value="auto">自动判断</option><option value="movie">仅电影</option><option value="tv">剧集 / 动漫</option></select></label>
+                        <label class="lm-field"><span>识别范围</span><select class="form-select" id="lmSourceMediaType"><option value="auto">自动判断</option><option value="movie">仅电影</option><option value="tv">剧集 / 动漫</option><option value="nsfw">成人番号（仅 MetaTube）</option></select></label>
                         <label class="lm-field"><span>qB 自动整理</span><select class="form-select" id="lmSourceEnabled"><option value="true">开启</option><option value="false">关闭</option></select></label>
                     </div>
                 </section>
@@ -218,5 +218,5 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260828a"></script>
-<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260829b"></script>
+<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260829c"></script>
 {% endblock %}

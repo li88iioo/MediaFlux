@@ -19,7 +19,7 @@ import re
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from difflib import SequenceMatcher
 from typing import Callable
 
@@ -558,6 +558,9 @@ class OrganizePlan:
     media_probe_pending: bool = False
     conflict_existing_id: str = ""
     conflict_existing_name: str = ""
+    multipart_index: int | None = None
+    multipart_token: str = ""
+    multipart_ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -638,6 +641,8 @@ class OrganizeRules:
     strm_detail_notify: bool = True
     emby_refresh: bool = True
     nsfw_enabled: bool = False
+    nsfw_source_ids: str = ""
+    nsfw_exclusive: bool = False
     nsfw_metatube_endpoint: str = ""
     nsfw_metatube_token: str = ""
     nsfw_category_name: str = "成人内容"
@@ -682,6 +687,8 @@ class OrganizeRules:
             strm_detail_notify=get_bool("GY_ORGANIZE_STRM_DETAIL_NOTIFY", True),
             emby_refresh=get_bool("GY_ORGANIZE_EMBY_REFRESH", True),
             nsfw_enabled=get_bool("GY_ORGANIZE_NSFW_ENABLED", False),
+            nsfw_source_ids=get("GY_ORGANIZE_NSFW_SOURCE_IDS", ""),
+            nsfw_exclusive=False,
             nsfw_metatube_endpoint=get("GY_ORGANIZE_NSFW_METATUBE_ENDPOINT", ""),
             nsfw_metatube_token=get("GY_ORGANIZE_NSFW_METATUBE_TOKEN", ""),
             nsfw_category_name=get("GY_ORGANIZE_NSFW_CATEGORY_NAME", "成人内容") or "成人内容",
@@ -691,6 +698,31 @@ class OrganizeRules:
                 get("GY_ORGANIZE_AUTOMATIC_MATCH_PRESET", "balanced")
             ),
         )
+
+    def selected_nsfw_source_ids(self) -> frozenset[str]:
+        """返回已配置的成人专用光鸭来源；异常配置按空集失败关闭。"""
+        from app.modules.organize_sources import normalize_organize_source_ids
+
+        source_ids, error = normalize_organize_source_ids(self.nsfw_source_ids)
+        if error:
+            return frozenset()
+        return frozenset(source_ids)
+
+    def for_source(self, source_id: str) -> "OrganizeRules":
+        """把全局规则收敛为单个光鸭来源的实际识别边界。
+
+        成人识别只有在来源被显式列入专用范围时才启用；选中的来源只走
+        MetaTube 精确番号链，未选来源完全禁用成人识别并保持普通 TMDB 链。
+        """
+        selected = str(source_id or "").strip() in self.selected_nsfw_source_ids()
+        active = bool(self.nsfw_enabled and selected)
+        return replace(self, nsfw_enabled=active, nsfw_exclusive=active)
+
+    def for_local_source(self, media_type: str) -> "OrganizeRules":
+        """把全局规则收敛为一个本地来源的实际识别边界。"""
+        selected = str(media_type or "").strip().lower() == "nsfw"
+        active = bool(self.nsfw_enabled and selected)
+        return replace(self, nsfw_enabled=active, nsfw_exclusive=active)
 
 
 def enforce_fixed_organize_rules(rules: OrganizeRules) -> OrganizeRules:
@@ -707,6 +739,45 @@ def enforce_fixed_organize_rules(rules: OrganizeRules) -> OrganizeRules:
         show_dir_template=SHOW_DIR_DEFAULT,
         naming_scope="both",
     )
+
+
+_ORGANIZE_RULE_SERVER_ONLY_FIELDS = frozenset({"nsfw_metatube_token"})
+
+
+def organize_rules_snapshot(rules: OrganizeRules) -> dict[str, object]:
+    """生成可持久化/返回前端的规则快照，不包含服务端密钥。"""
+    payload = asdict(enforce_fixed_organize_rules(rules))
+    for field_name in _ORGANIZE_RULE_SERVER_ONLY_FIELDS:
+        payload.pop(field_name, None)
+    return payload
+
+
+def restore_organize_rules_snapshot(
+    snapshot: object, *, trusted_rules: OrganizeRules | None = None,
+) -> OrganizeRules:
+    """从非敏感快照恢复规则；服务端字段始终取当前可信配置。"""
+    if not isinstance(snapshot, dict):
+        raise ValueError("整理规则快照无效")
+    trusted = enforce_fixed_organize_rules(
+        trusted_rules if trusted_rules is not None else OrganizeRules.from_config()
+    )
+    values = asdict(trusted)
+    allowed_fields = set(OrganizeRules.__dataclass_fields__) - _ORGANIZE_RULE_SERVER_ONLY_FIELDS
+    for key in allowed_fields:
+        if key in snapshot:
+            values[key] = snapshot[key]
+    return enforce_fixed_organize_rules(OrganizeRules(**values))
+
+
+def organize_rules_snapshot_matches(snapshot: object, current_rules: OrganizeRules) -> bool:
+    """比较可执行规则；密钥轮换不复用历史值，而是使用当前服务端配置。"""
+    if not isinstance(snapshot, dict):
+        return False
+    normalized = {
+        key: value for key, value in snapshot.items()
+        if key not in _ORGANIZE_RULE_SERVER_ONLY_FIELDS
+    }
+    return normalized == organize_rules_snapshot(current_rules)
 
 
 class Organizer:
@@ -850,12 +921,25 @@ class Organizer:
                 self._nsfw_recognizers[key] = None
         return self._nsfw_recognizers[key]
 
+    @staticmethod
+    def _nsfw_unresolved_match() -> MatchResult:
+        """成人专用来源无法精确命中时保持待确认，绝不回退普通影视链。"""
+        return MatchResult(
+            media_type="movie",
+            need_confirm=True,
+            error="成人专用来源未提取到有效番号，或 MetaTube 没有返回完全一致的结果",
+            status="no_match",
+            matched_by="metatube_only",
+            threshold=1.0,
+            provider="metatube",
+        )
+
     def classify(self, match: MatchResult,
                  rules: OrganizeRules | None = None) -> tuple[str, str, str]:
         """返回 (主类, 地区, 年份)，可选细分类严格受规则开关控制。"""
         rules = rules or OrganizeRules()
         detail = self._detail_for_match(match)
-        if self._match_provider(match) == "metatube":
+        if self._match_provider(match) in {"metatube", "clean_title"}:
             from app.modules.nsfw import validate_category_name
             return validate_category_name(rules.nsfw_category_name), "其他", (
                 match.year or str(detail.get("release_date") or "")[:4]
@@ -934,7 +1018,31 @@ class Organizer:
         templates_enabled = "both" in scope or "guangya" in scope
         configured_template = rules.tv_template if is_tv else rules.movie_template
 
+        def with_part_marker(rendered: str) -> str:
+            if self._match_provider(match) not in {"metatube", "clean_title"}:
+                return rendered
+            part = parsed.get("part")
+            try:
+                part_index = int(part) if part is not None else None
+            except (TypeError, ValueError):
+                part_index = None
+            if part_index is None or not (1 <= part_index <= 99):
+                return rendered
+            from app.modules.nsfw import extract_nsfw_part_index
+            if extract_nsfw_part_index(rendered) == part_index:
+                return rendered
+            stem, separator, suffix = rendered.rpartition(".")
+            # 年份为空的自定义模板可能在扩展名前留下连续点号；插入 CD 标记时
+            # 顺手收敛尾部分隔符，避免生成 ``番号..CD1.mp4``。
+            stem = stem.rstrip(" ._-")
+            return (
+                f"{stem}.CD{part_index}.{suffix}"
+                if separator and stem and suffix
+                else f"{rendered}.CD{part_index}"
+            )
+
         def with_variant_tags(rendered: str) -> str:
+            rendered = with_part_marker(rendered)
             if not include_variant_tags:
                 return rendered
             variant = classify_variant(
@@ -1725,7 +1833,11 @@ class Organizer:
                     source_file,
                     rules,
                     plan.match,
-                    {"season": plan.season, "episode": plan.episode},
+                    {
+                        "season": plan.season,
+                        "episode": plan.episode,
+                        "part": plan.multipart_index,
+                    },
                     profile,
                 )
                 plan.media_probe_complete = True
@@ -1752,8 +1864,13 @@ class Organizer:
             for skipped in result.skipped:
                 if skipped.reason not in stats["subtitle_reasons"]:
                     stats["subtitle_reasons"].append(skipped.reason)
+        self._apply_nsfw_multipart_policy(plans, rules)
         stats["confirmation_groups"] = self._build_confirmation_groups(
-            plans, companion_files, source_dir_id=source_dir_id, source_name=source_root_name
+            plans,
+            companion_files,
+            source_dir_id=source_dir_id,
+            source_name=source_root_name,
+            rules=rules,
         )
         # 在首次云盘写入前完成身份保护与同批版本仲裁。执行阶段仍会实时
         # 复核目标目录，以覆盖并发外部修改，但批内败者不会再先移动后替换。
@@ -2409,6 +2526,60 @@ class Organizer:
                 }
 
 
+    def _apply_nsfw_multipart_policy(
+        self, plans: list[OrganizePlan], rules: OrganizeRules,
+    ) -> None:
+        """只对成人专用来源处理明确分段；无法排序时回退人工确认。"""
+        if not rules.nsfw_exclusive:
+            return
+        from app.modules.nsfw import extract_nsfw_identifier, extract_nsfw_multipart
+
+        grouped: dict[tuple[str, str], list[tuple[OrganizePlan, object | None]]] = {}
+        for plan in plans:
+            identifier = extract_nsfw_identifier(
+                plan.original_name, rules.nsfw_strip_domains,
+            )
+            if identifier is None:
+                continue
+            multipart = extract_nsfw_multipart(
+                plan.original_name, rules.nsfw_strip_domains,
+            )
+            if multipart is not None and plan.multipart_index is None:
+                plan.multipart_index = multipart.part_index
+                plan.multipart_token = multipart.token
+                plan.multipart_ambiguous = multipart.ambiguous
+            grouped.setdefault(
+                (str(plan.original_path or "/"), identifier.code), []
+            ).append((plan, multipart))
+
+        for members in grouped.values():
+            if len(members) < 2:
+                continue
+            has_explicit_part = any(item is not None for _plan, item in members)
+            if not has_explicit_part:
+                # 多版本文件并不等于多分段，继续交给既有版本冲突策略。
+                continue
+            ambiguous = any(
+                item is None or bool(getattr(item, "ambiguous", False))
+                for _plan, item in members
+            )
+            if not ambiguous:
+                continue
+            message = "同一番号包含多个视频，但无法安全确定分段顺序，请人工确认"
+            for plan, _multipart in members:
+                if plan.match is None:
+                    plan.match = self._nsfw_unresolved_match()
+                plan.match.need_confirm = True
+                plan.match.status = "low_confidence"
+                plan.match.error = message
+                plan.match.metadata = {
+                    **dict(getattr(plan.match, "metadata", None) or {}),
+                    "nsfw_multipart_confirmation": True,
+                }
+                plan.action = "skip"
+                plan.note = message
+                plan.multipart_ambiguous = True
+
     def _build_confirmation_groups(
         self,
         plans: list[OrganizePlan],
@@ -2416,6 +2587,7 @@ class Organizer:
         *,
         source_dir_id: str,
         source_name: str,
+        rules: OrganizeRules | None = None,
     ) -> list[dict]:
         """把逐文件低置信度结果聚合为可由 Telegram 一次确认的媒体组。"""
         groups: dict[tuple[str, str], dict] = {}
@@ -2425,6 +2597,13 @@ class Organizer:
                 continue
             context = getattr(match, "context", None)
             identity = str(getattr(context, "normalized_title", "") or "").strip()
+            if rules is not None and rules.nsfw_exclusive:
+                from app.modules.nsfw import extract_nsfw_identifier
+                identifier = extract_nsfw_identifier(
+                    plan.original_name, rules.nsfw_strip_domains,
+                )
+                if identifier is not None:
+                    identity = identifier.code
             if not identity:
                 identity = str(match.title or plan.original_path or plan.original_name).strip()
             identity_key = _normalize_media_identity(identity) or str(plan.file_id)
@@ -2435,11 +2614,19 @@ class Organizer:
                 "directory": str(plan.original_path or "/"),
                 "source_parent_id": str(plan.original_parent_id or "0"),
                 "identity": identity,
-                "reason": str(match.error or "TMDB 匹配结果需人工确认"),
+                "reason": str(match.error or "识别结果需人工确认"),
+                "rules": organize_rules_snapshot(rules) if rules is not None else None,
                 "files": [],
                 "companions": [],
                 "_candidate_map": {},
+                "multipart_strategy": "",
             })
+            if bool(
+                dict(getattr(match, "metadata", None) or {}).get(
+                    "nsfw_multipart_confirmation"
+                )
+            ):
+                group["multipart_strategy"] = "sequence"
             season = episode = None
             parse_source_position = getattr(self.scraper, "parse_source_position", None)
             if callable(parse_source_position):
@@ -2461,6 +2648,8 @@ class Organizer:
                 "etag": str(plan.etag or ""),
                 "season": season,
                 "episode": episode,
+                "multipart_index": plan.multipart_index,
+                "multipart_token": plan.multipart_token,
             })
             existing_companions = {str(item["file_id"]) for item in group["companions"]}
             for companion in self._companions_for_plan(
@@ -2478,21 +2667,42 @@ class Organizer:
                 existing_companions.add(str(companion.file_id))
 
             candidates = list(match.candidates or [])
-            if match.tmdb_id and not any(
-                str(item.tmdb_id) == str(match.tmdb_id)
-                and str(item.media_type or match.media_type) == str(match.media_type)
+            match_provider = self._match_provider(match)
+            match_external_id = self._match_external_id(match)
+            if match_external_id and not any(
+                self._match_provider(item) == match_provider
+                and self._match_external_id(item) == match_external_id
+                and str(getattr(item, "media_type", "") or match.media_type or "")
+                == str(match.media_type or "")
                 for item in candidates
             ):
                 candidates.insert(0, match)
             candidate_map = group["_candidate_map"]
             for candidate in candidates[:5]:
                 tmdb_id = str(getattr(candidate, "tmdb_id", "") or "").strip()
+                provider = str(getattr(candidate, "provider", "") or "").strip().lower()
+                external_id = str(
+                    getattr(candidate, "external_id", "") or tmdb_id
+                ).strip()
+                if not provider and tmdb_id:
+                    provider = "tmdb"
+                if provider == "tmdb":
+                    external_id = tmdb_id
                 media_type = str(
                     getattr(candidate, "media_type", "") or match.media_type or ""
                 ).strip()
-                if not tmdb_id or media_type not in {"movie", "tv"}:
+                valid_identity = (
+                    (provider == "tmdb" and bool(tmdb_id))
+                    or (
+                        provider in {"metatube", "clean_title"}
+                        and bool(external_id)
+                    )
+                )
+                if not valid_identity or media_type not in {"movie", "tv"}:
                     continue
-                candidate_key = (tmdb_id, media_type)
+                if provider in {"metatube", "clean_title"} and media_type != "movie":
+                    continue
+                candidate_key = (provider, external_id, media_type)
                 score = float(
                     getattr(candidate, "score", getattr(candidate, "confidence", 0.0)) or 0.0
                 )
@@ -2502,7 +2712,9 @@ class Organizer:
                     if str(value).isdigit()
                 ] if isinstance(metadata, dict) else []
                 current = candidate_map.setdefault(candidate_key, {
-                    "tmdb_id": tmdb_id,
+                    "provider": provider,
+                    "external_id": external_id,
+                    "tmdb_id": tmdb_id if provider == "tmdb" else "",
                     "media_type": media_type,
                     "title": str(getattr(candidate, "title", "") or match.title or ""),
                     "year": str(getattr(candidate, "year", "") or match.year or ""),
@@ -2529,8 +2741,21 @@ class Organizer:
                     str(item.get("title") or "").casefold(),
                 )
             )
-            if not candidates:
-                continue
+            if rules is not None and rules.nsfw_exclusive and not candidates:
+                from app.modules.nsfw import build_clean_title_candidate
+                seed = next((
+                    str(item.get("name") or "")
+                    for item in (group.get("files") or [])
+                    if str(item.get("name") or "").strip()
+                ), str(group.get("identity") or ""))
+                fallback = build_clean_title_candidate(
+                    seed, rules.nsfw_strip_domains,
+                )
+                if fallback is not None:
+                    fallback["support"] = len(group.get("files") or [])
+                    candidates.append(fallback)
+            # 无有效番号时仍保留确认组并提供“跳过此组”终态；明确番号但
+            # MetaTube 无结果时，优先提供“清洗标题后入库”。
             group["candidates"] = candidates[:3]
             result.append(group)
         return result
@@ -2597,10 +2822,16 @@ class Organizer:
             groups, actionable_count = (
                 Organizer._validated_task_confirmation_groups(stats)
             )
+            candidate_group_count = sum(
+                1 for group in groups if list(group.get("candidates") or [])
+            )
+            skip_only_group_count = len(groups) - candidate_group_count
             notification_stats = {
                 **stats,
                 "notification_actionable_confirmation_files": actionable_count,
                 "notification_actionable_confirmation_groups": len(groups),
+                "notification_candidate_confirmation_groups": candidate_group_count,
+                "notification_skip_confirmation_groups": skip_only_group_count,
             }
             summary_sent = bool(publish_organize_lifecycle(
                 task_id,
@@ -2634,11 +2865,24 @@ class Organizer:
         groups: list[dict] = []
         actionable_file_keys: set[str] = set()
         for group_index, group in enumerate(raw_groups):
+            def valid_candidate(item: object) -> bool:
+                if not isinstance(item, dict):
+                    return False
+                provider = str(item.get("provider") or "").strip().lower()
+                tmdb_id = str(item.get("tmdb_id") or "").strip()
+                external_id = str(item.get("external_id") or tmdb_id).strip()
+                if not provider and tmdb_id:
+                    provider = "tmdb"
+                media_type = str(item.get("media_type") or "").strip().lower()
+                if provider == "tmdb":
+                    return bool(tmdb_id and media_type in {"movie", "tv"})
+                if provider in {"metatube", "clean_title"}:
+                    return bool(external_id and media_type == "movie")
+                return False
+
             valid_candidates = [
                 dict(item) for item in (group.get("candidates") or [])
-                if isinstance(item, dict)
-                and str(item.get("tmdb_id") or "").strip()
-                and str(item.get("media_type") or "") in {"movie", "tv"}
+                if valid_candidate(item)
             ]
             raw_files = list(group.get("files") or [])
             raw_companions = list(group.get("companions") or [])
@@ -2668,8 +2912,7 @@ class Organizer:
                 if valid_snapshot(item, require_scope=False)
             ]
             if (
-                not valid_candidates
-                or not valid_files
+                not valid_files
                 or len(valid_files) != len(raw_files)
                 or len(valid_companions) != len(raw_companions)
             ):
@@ -2862,8 +3105,10 @@ class Organizer:
         *,
         confirmation_group_count: int = 0,
         actionable_confirmation_count: int | None = None,
+        candidate_group_count: int | None = None,
+        skip_only_group_count: int | None = None,
     ) -> str:
-        """生成任务级提示，并区分可点击候选与无候选待确认项。"""
+        """生成任务级提示，区分候选卡、无元数据跳过卡与不可操作项。"""
         from app.notifier import safe_int
 
         sections: list[str] = []
@@ -2876,39 +3121,47 @@ class Organizer:
                 else safe_int(actionable_confirmation_count, 0, minimum=0)
             ),
         )
+        candidate_groups = max(0, min(
+            confirmation_group_count,
+            confirmation_group_count if candidate_group_count is None
+            else safe_int(candidate_group_count, 0, minimum=0),
+        ))
+        skip_only_groups = max(0, min(
+            confirmation_group_count - candidate_groups,
+            (confirmation_group_count - candidate_groups)
+            if skip_only_group_count is None
+            else safe_int(skip_only_group_count, 0, minimum=0),
+        ))
         if need_confirm:
             if confirmation_group_count > 0:
-                without_candidates = max(0, need_confirm - actionable)
-                grouped_candidate_line = (
-                    f"• {actionable} 个有可用候选，已合并为 "
-                    f"{confirmation_group_count} 组，将发送 "
-                    f"{confirmation_group_count} 张候选卡"
-                    if actionable != confirmation_group_count
-                    else f"• {actionable} 个可在下方候选卡中选择"
-                )
-                if without_candidates:
-                    sections.append(
-                        f"⚠️ 待确认 {need_confirm} 个\n"
-                        f"{grouped_candidate_line}\n"
-                        f"• {without_candidates} 个暂无可用 TMDB 候选，"
-                        "请前往 Web 待确认队列搜索或手动匹配。"
-                    )
-                elif need_confirm != confirmation_group_count:
-                    sections.append(
-                        f"⚠️ 待确认 {need_confirm} 个文件\n"
+                lines = [
+                    (
+                        f"⚠️ 待确认 {need_confirm} 个文件"
+                        if need_confirm != confirmation_group_count
+                        else f"⚠️ 待确认 {confirmation_group_count} 组"
+                    ),
+                    (
                         f"已按媒体合并为 {confirmation_group_count} 组，"
-                        f"因此下方仅发送 {confirmation_group_count} 张候选卡。"
+                        f"下方将发送 {confirmation_group_count} 张处理卡。"
+                    ),
+                ]
+                if candidate_groups:
+                    lines.append(f"• {candidate_groups} 组可直接选择识别候选")
+                if skip_only_groups:
+                    lines.append(
+                        f"• {skip_only_groups} 组暂无可用元数据，可在 Telegram 直接跳过"
                     )
-                else:
-                    sections.append(
-                        f"⚠️ 待确认 {confirmation_group_count} 组\n"
-                        "请在下方候选卡中选择匹配结果。"
+                without_cards = max(0, need_confirm - actionable)
+                if without_cards:
+                    lines.append(
+                        f"• {without_cards} 个缺少安全文件快照，请前往 Web 待确认队列处理"
                     )
+                sections.append("\n".join(lines))
             else:
                 sections.append(
                     f"⚠️ 待确认 {need_confirm} 个\n"
-                    "本轮暂无可用 TMDB 候选，无法生成候选卡；"
-                    "请前往 Web 待确认队列搜索或手动匹配。"
+                    "本轮没有可安全操作的 Telegram 处理卡；"
+                    "请前往 Web 待确认队列搜索、匹配或清理记录。"
                 )
 
         skipped = safe_int(stats.get("skipped", 0), 0, minimum=0)
@@ -3658,6 +3911,13 @@ class Organizer:
                 match = self.scraper._attach_preprocess(match, processed)
             except Exception:
                 match = None
+        if (
+            match is not None
+            and rules.nsfw_exclusive
+            and self._match_provider(match) not in {"metatube", "clean_title"}
+        ):
+            # 专用来源不能复用历史 TMDB 缓存、强制映射或其它普通影视结果。
+            match = None
         # 小数集号只有在扫描阶段已生成确定性的 Season 00 位置，或用户
         # 明确指定了目标集号时才允许继续；无法建立稳定映射时仍失败关闭。
         fractional_position = has_fractional_episode_position(file.name)
@@ -3678,6 +3938,12 @@ class Organizer:
             recognizer = self._nsfw_recognizer(rules)
             if recognizer is not None:
                 match = recognizer.match(match_name, parent_path)
+        if (
+            match is None
+            and rules.nsfw_exclusive
+            and type(self.scraper) is TMDBScraper
+        ):
+            return self._nsfw_unresolved_match()
         if match is None:
             if isinstance(self.scraper, TMDBScraper):
                 match = self.scraper.match(
@@ -3702,6 +3968,12 @@ class Organizer:
                     match = self.scraper.match(match_name, parent_path)
             else:
                 match = self.scraper.match(match_name)
+            if (
+                match is not None
+                and rules.nsfw_exclusive
+                and self._match_provider(match) not in {"metatube", "clean_title"}
+            ):
+                return self._nsfw_unresolved_match()
             if (
                 recognition_work_cache is not None
                 and recognition_work_cache_key is not None
@@ -3857,7 +4129,7 @@ class Organizer:
 
         # 目标路径：主类[/地区][/年份]/媒体目录[/Season N]
         parts = [main]
-        if rules.region_split and self._match_provider(match) != "metatube":
+        if rules.region_split and self._match_provider(match) not in {"metatube", "clean_title"}:
             parts.append(region)
         if rules.year_split and year:
             parts.append(year)
@@ -3909,6 +4181,12 @@ class Organizer:
         plan.media_profile = effective_profile
         plan.season = parsed.get("season")
         plan.episode = parsed.get("episode")
+        try:
+            plan.multipart_index = (
+                int(parsed.get("part")) if parsed.get("part") is not None else None
+            )
+        except (TypeError, ValueError):
+            plan.multipart_index = None
         plan.variant = classify_variant(file.name, effective_profile)
         variant_tags = plan.variant.filename_tags(rules)
         plan.variant_label = " / ".join(variant_tags) if variant_tags else "未识别版本"
@@ -4282,6 +4560,25 @@ class Organizer:
         }
         if release_parse.tmdb_id:
             parsed["tmdb_id"] = release_parse.tmdb_id
+        if rules.nsfw_exclusive:
+            from app.modules.nsfw import extract_nsfw_multipart
+            multipart = extract_nsfw_multipart(
+                file.name, rules.nsfw_strip_domains,
+            )
+            override_reader = getattr(self.scraper, "multipart_override", None)
+            override = (
+                override_reader(file.name, parent_path)
+                if callable(override_reader) else None
+            )
+            if override is not None:
+                plan.multipart_index = int(override)
+                plan.multipart_token = f"CD{plan.multipart_index}"
+            elif multipart is not None:
+                plan.multipart_index = multipart.part_index
+                plan.multipart_token = multipart.token
+                plan.multipart_ambiguous = multipart.ambiguous
+            if plan.multipart_index is not None:
+                parsed["part"] = plan.multipart_index
         source_season = release_parse.source_season
         source_episode = release_parse.source_episode
         if source_position_override is not None:
@@ -5015,6 +5312,14 @@ class Organizer:
             )
             if auxiliary:
                 return False
+            if self._match_provider(plan.match) in {"metatube", "clean_title"}:
+                from app.modules.nsfw import extract_nsfw_part_index
+                candidate_part = extract_nsfw_part_index(candidate.name)
+                if plan.multipart_index is not None or candidate_part is not None:
+                    return plan.multipart_index == candidate_part
+                # 成人媒体目录已由 provider + 番号身份隔离；目录内未分段视频
+                # 视为同一作品的版本候选，继续沿用现有冲突策略。
+                return True
             candidate_fields = self._parse_existing_media_fields(candidate.name)
             candidate_tmdb_id = str(candidate_fields.get("tmdb_id") or "")
             if not candidate_tmdb_id:
@@ -5277,7 +5582,7 @@ class Organizer:
     @staticmethod
     def _identity_marker(path: str) -> str:
         match = re.search(
-            r"[\{\(]((?:tmdb-\d+)|(?:metatube-[A-Za-z0-9._-]+))[\}\)]",
+            r"[\{\(]((?:tmdb-\d+)|(?:(?:metatube|clean_title)-[A-Za-z0-9._-]+))[\}\)]",
             str(path or ""), re.IGNORECASE,
         )
         return "{" + match.group(1).lower() + "}" if match else ""

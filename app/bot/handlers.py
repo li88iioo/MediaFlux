@@ -2094,7 +2094,7 @@ def _dispatch_resource_download(
 
 def _handle_organize_confirmation_callback(bot, call) -> None:
     from app.modules.organize_confirmations import (
-        cancel_confirmation, start_confirmation,
+        cancel_confirmation, skip_confirmation, start_confirmation,
     )
 
     chat_id, _user_id = _telegram_identity(call)
@@ -2102,17 +2102,26 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
         _prefix, token, selection = str(call.data or "").split(":", 2)
         if not token:
             raise ValueError("确认参数无效")
-        if selection == "cancel":
-            cancel_confirmation(
-                token,
-                chat_id=chat_id,
-                message_id=call.message.message_id,
-            )
+        if selection in {"cancel", "skip"}:
+            if selection == "skip":
+                skip_confirmation(
+                    token,
+                    chat_id=chat_id,
+                    message_id=call.message.message_id,
+                )
+                callback_text = "已跳过，本次待确认结束"
+            else:
+                cancel_confirmation(
+                    token,
+                    chat_id=chat_id,
+                    message_id=call.message.message_id,
+                )
+                callback_text = "已保留待确认文件"
             try:
-                bot.answer_callback_query(call.id, "已保留待确认文件")
+                bot.answer_callback_query(call.id, callback_text)
             except Exception as exc:
                 logger.info(
-                    "Telegram 取消确认回调应答失败 type=%s",
+                    "Telegram 确认终止回调应答失败 type=%s",
                     type(exc).__name__,
                 )
             return
@@ -2122,9 +2131,16 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
         )
         result = start_confirmation(token, selected_index, chat_id=chat_id)
         candidate = result.get("candidate") or {}
-        title = html.escape(str(candidate.get("title") or candidate.get("tmdb_id") or "候选媒体"))
+        provider = str(candidate.get("provider") or "").strip().lower()
+        tmdb_id_raw = str(candidate.get("tmdb_id") or "").strip()
+        external_id_raw = str(candidate.get("external_id") or tmdb_id_raw).strip()
+        if not provider and tmdb_id_raw:
+            provider = "tmdb"
+        title = html.escape(str(
+            candidate.get("title") or external_id_raw or "候选媒体"
+        ))
         year = html.escape(str(candidate.get("year") or ""))
-        tmdb_id = html.escape(str(candidate.get("tmdb_id") or ""))
+        external_id = html.escape(external_id_raw)
         display = f"{title} ({year})" if year else title
         status = str(result.get("status") or "queued")
         replayed = bool(result.get("replayed"))
@@ -2143,13 +2159,21 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
             callback_text = "该任务已在队列中" if replayed else "已加入整理队列"
         bot.answer_callback_query(call.id, callback_text)
         media_type = str(result.get("media_type") or candidate.get("media_type") or "")
-        media_label = "剧集" if media_type == "tv" else "电影"
+        media_label = (
+            "成人内容" if provider in {"metatube", "clean_title"}
+            else "剧集" if media_type == "tv" else "电影"
+        )
         scope_summary = html.escape(str(result.get("scope_summary") or ""))
         source_name = html.escape(str(result.get("source_name") or result.get("directory") or ""))
+        identity_label = (
+            "MetaTube" if provider == "metatube"
+            else "清洗标题" if provider == "clean_title"
+            else "TMDB"
+        )
         detail_lines = [
             f"<b>媒体</b>  {display}",
             f"<b>类型</b>  {media_label}" + (f" · {scope_summary}" if scope_summary else ""),
-            f"<b>TMDB</b>  {tmdb_id}",
+            f"<b>{identity_label}</b>  {external_id}",
             f"<b>文件</b>  {int(result.get('file_count') or 0)} 个视频",
         ]
         if source_name:

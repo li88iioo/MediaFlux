@@ -136,7 +136,7 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
             self.assertIn(f'value="{value}"', response.text)
         self.assertIn("guangya-directory-scrape.css?v=20260828c", response.text)
         self.assertIn("media-scrape-position.js?v=20260828a", response.text)
-        self.assertIn("guangya-directory-scrape.js?v=20260828c", response.text)
+        self.assertIn("guangya-directory-scrape.js?v=20260829a", response.text)
         self.assertIn('aria-label="列表视图" aria-pressed="true"', response.text)
         self.assertIn('aria-label="网格视图" aria-pressed="false"', response.text)
         self.assertNotIn('title="列表视图"', response.text)

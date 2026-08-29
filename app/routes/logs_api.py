@@ -331,6 +331,31 @@ def organize_log_detail(log_id: int, request: Request):
         return api_error("整理日志详情读取失败", 500)
 
 
+@router.post("/organize/{log_id}/recognition/search")
+def organize_recognition_search(log_id: int, request: Request,
+                                 data: dict | None = Body(default=None)):
+    """按日志来源选择 TMDB 或 MetaTube；成人来源不会回退普通识别。"""
+    require_api_login(request)
+    data = data or {}
+    media_type = str(data.get("media_type") or "").strip()
+    if media_type and media_type not in {"movie", "tv"}:
+        return api_error("media_type 仅支持 movie 或 tv", 400)
+    try:
+        return {
+            "candidates": OrganizeCorrectionService().search_candidates(
+                log_id, str(data.get("query") or "").strip(),
+                str(data.get("year") or "").strip(), media_type,
+            )
+        }
+    except LookupError as exc:
+        return api_error(str(exc), 404)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    except Exception as exc:
+        logger.error("整理日志识别搜索失败 log=%s type=%s", log_id, type(exc).__name__)
+        return api_error(str(exc), 502)
+
+
 @router.post("/organize/{log_id}/tmdb/search")
 def organize_tmdb_search(log_id: int, request: Request,
                          data: dict | None = Body(default=None)):
@@ -377,15 +402,18 @@ def preview_reorganize(log_id: int, request: Request,
     require_api_login(request)
     data = data or {}
     tmdb_id = str(data.get("tmdb_id") or "").strip()
+    provider = str(data.get("provider") or ("tmdb" if tmdb_id else "")).strip().lower()
+    external_id = str(data.get("external_id") or tmdb_id).strip()
     media_type = str(data.get("media_type") or "").strip()
-    if not tmdb_id or media_type not in {"movie", "tv"}:
-        return api_error("请选择有效的 TMDB 候选", 400)
+    if provider not in {"tmdb", "metatube", "clean_title"} or not external_id or media_type not in {"movie", "tv"}:
+        return api_error("请选择有效的媒体候选", 400)
     try:
         return OrganizeCorrectionService().preview_reorganize(
             log_id, tmdb_id, media_type,
             str(data.get("title") or "").strip(), str(data.get("year") or "").strip(),
             _optional_position(data, "season", minimum=0),
             _optional_position(data, "episode", minimum=1),
+            provider=provider, external_id=external_id,
         )
     except LookupError as exc:
         return api_error(str(exc), 404)
@@ -475,15 +503,17 @@ def run_reorganize(log_id: int, request: Request,
         token, version = _operation_payload(data)
         service = OrganizeCorrectionService()
         tmdb_id = str(data.get("tmdb_id") or "").strip()
+        provider = str(data.get("provider") or ("tmdb" if tmdb_id else "")).strip().lower()
+        external_id = str(data.get("external_id") or tmdb_id).strip()
         media_type = str(data.get("media_type") or "").strip()
-        if not tmdb_id or media_type not in {"movie", "tv"}:
-            return api_error("请选择有效的 TMDB 候选", 400)
+        if provider not in {"tmdb", "metatube", "clean_title"} or not external_id or media_type not in {"movie", "tv"}:
+            return api_error("请选择有效的媒体候选", 400)
         season = _optional_position(data, "season", minimum=0)
         episode = _optional_position(data, "episode", minimum=1)
         service.preview_reorganize(
             log_id, tmdb_id, media_type,
             str(data.get("title") or "").strip(), str(data.get("year") or "").strip(),
-            season, episode,
+            season, episode, provider=provider, external_id=external_id,
         )
         if not service.client.logged_in:
             return api_error("光鸭未登录，无法重新整理", 503)
@@ -492,7 +522,7 @@ def run_reorganize(log_id: int, request: Request,
             lambda: service.reorganize(
                 log_id, token, version, tmdb_id, media_type,
                 str(data.get("title") or "").strip(), str(data.get("year") or "").strip(),
-                season, episode,
+                season, episode, provider=provider, external_id=external_id,
             ),
         )
         if not result["ok"]:

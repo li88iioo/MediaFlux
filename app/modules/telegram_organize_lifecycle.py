@@ -133,24 +133,48 @@ def build_organize_lifecycle_event(
             0,
             minimum=0,
         )
+        candidate_groups = min(
+            actionable_groups,
+            safe_int(
+                stats.get("notification_candidate_confirmation_groups"),
+                actionable_groups,
+                minimum=0,
+            ),
+        )
+        skip_groups = min(
+            max(0, actionable_groups - candidate_groups),
+            safe_int(
+                stats.get("notification_skip_confirmation_groups"),
+                max(0, actionable_groups - candidate_groups),
+                minimum=0,
+            ),
+        )
         unresolved_files = max(0, counts["confirm"] - actionable_files)
         confirmation_parts: list[str] = []
+        card_parts: list[str] = []
+        if candidate_groups:
+            card_parts.append(f"{candidate_groups} 组候选卡")
+        if skip_groups:
+            card_parts.append(f"{skip_groups} 组跳过卡")
         if actionable_groups:
-            confirmation_parts.append(
-                f"{actionable_files} 个文件 / {actionable_groups} 组按钮卡"
-            )
+            card_label = " + ".join(card_parts) or f"{actionable_groups} 组按钮卡"
+            confirmation_parts.append(f"{actionable_files} 个文件 / {card_label}")
         if unresolved_files:
             confirmation_parts.append(f"{unresolved_files} 个暂无候选")
         confirmation_label = " · ".join(confirmation_parts) or "暂无可用候选"
         if actionable_groups and unresolved_files:
             footer = (
-                "可操作候选会以独立按钮卡发送；暂无候选的项目仍保留在 Web "
+                "可操作项目会以独立按钮卡发送；缺少安全快照的项目仍保留在 Web "
                 "待确认队列。"
             )
-        elif actionable_groups:
+        elif candidate_groups and skip_groups:
+            footer = "候选卡用于选择识别结果；暂无元数据的项目可在跳过卡直接结束。"
+        elif candidate_groups:
             footer = "候选已按媒体合并为独立按钮卡；任务快照同时保留在 Web。"
+        elif skip_groups:
+            footer = "本轮暂无可用元数据；可在独立跳过卡结束待确认，文件保持原位。"
         else:
-            footer = "本轮暂无可用 TMDB 候选，请在 Web 待确认队列手动识别。"
+            footer = "本轮暂无可用候选，请在 Web 待确认队列手动识别。"
     elif scan_incomplete:
         footer = (
             "目录扫描未完整结束，本次结果不是最终缺集结论；"

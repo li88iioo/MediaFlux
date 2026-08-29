@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import asdict
 from typing import TYPE_CHECKING, Callable
 
 from app.modules.organize_postprocess import (
@@ -633,11 +632,13 @@ def execute_organize_plans(
                     )
                 if p.media_probe_pending and isinstance(log_id, int):
                     try:
+                        from app.modules.organize import organize_rules_snapshot
+
                         db.enqueue_organize_probe_completion(
                             log_id,
                             source_id=str(rules.target_dir_id or ""),
                             rel_dir=str(p.target_path or ""),
-                            rules=asdict(rules),
+                            rules=organize_rules_snapshot(rules),
                             delay_seconds=130,
                             max_attempts=2,
                         )
