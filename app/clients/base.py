@@ -184,6 +184,16 @@ class MediaServerClient:
         self.allow_global_refresh_fallback = bool(allow_global_refresh_fallback)
         self._session = requests.Session()
 
+    def close(self) -> None:
+        """显式释放底层连接池；短生命周期探测不得依赖 GC 回收 socket。"""
+        self._session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
     # ---- 子类实现 ----
     def _headers(self) -> dict[str, str]:
         raise NotImplementedError

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -26,13 +27,14 @@ from app.modules.media_server_path_mapping import (
 )
 from app.modules.local_media_models import LOCAL_MEDIA_CATEGORIES
 from app.modules.media_server_profiles import MediaServerProfile, list_configured_profiles
+from app.modules.process_lock import CrossProcessLock
 from app.modules.strm import (
     STRM_SUBDIR,
     parse_strm_sources,
     plan_strm_sources,
     safe_path_component,
 )
-from app.web import api_error, require_api_login
+from app.web import api_error, config_write_api_error, require_api_login
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/media-libraries")
@@ -51,6 +53,18 @@ _MAPPING_CONFIG = {
     "jellyfin": ("JELLYFIN_PATH_MAPPINGS", "JELLYFIN_ALLOW_GLOBAL_REFRESH_FALLBACK"),
     "emby": ("EMBY_PATH_MAPPINGS", "EMBY_ALLOW_GLOBAL_REFRESH_FALLBACK"),
 }
+_MAPPING_SAVE_LOCK = CrossProcessLock("media-library-mappings")
+
+
+@contextmanager
+def _mapping_save_guard():
+    """串行化 SQLite 与 user.env 的组合更新，避免并发回滚互相覆盖。"""
+    if not _MAPPING_SAVE_LOCK.acquire():  # blocking=True 正常不会返回 False
+        raise RuntimeError("媒体库映射正在由其他请求保存")
+    try:
+        yield
+    finally:
+        _MAPPING_SAVE_LOCK.release()
 
 
 def _client_for(profile: MediaServerProfile):
@@ -63,6 +77,16 @@ def _client_for(profile: MediaServerProfile):
 
         return EmbyClient(profile.url, profile.credential)
     raise ValueError("媒体服务器类型无效")
+
+
+def _close_client(client: object | None) -> None:
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.debug("媒体库探测客户端关闭失败 type=%s", type(exc).__name__)
 
 
 def _library_payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -97,8 +121,10 @@ def _probe_profile(profile: MediaServerProfile) -> tuple[str, list[dict[str, Any
         return profile.server_type, [], "媒体服务器未启用"
     if not profile.configured:
         return profile.server_type, [], "媒体服务器配置不完整"
+    client = None
     try:
-        libraries = [_library_payload(item) for item in _client_for(profile).list_virtual_folders()]
+        client = _client_for(profile)
+        libraries = [_library_payload(item) for item in client.list_virtual_folders()]
         return profile.server_type, libraries, ""
     except Exception as exc:
         logger.warning(
@@ -107,6 +133,8 @@ def _probe_profile(profile: MediaServerProfile) -> tuple[str, list[dict[str, Any
             type(exc).__name__,
         )
         return profile.server_type, [], "媒体库读取失败，请测试服务器连接"
+    finally:
+        _close_client(client)
 
 
 def _local_sources() -> list[dict[str, Any]]:
@@ -427,36 +455,41 @@ def save_media_library_mappings(request: Request, data: dict | None = Body(defau
     if not isinstance(payload, dict):
         return api_error("映射配置必须是 JSON 对象", 400)
     try:
-        local_bindings = _validated_local_bindings(payload.get("local_bindings", []))
-        strm_updates = _validated_strm_mapping_updates(payload.get("strm_mappings", {}))
-        previous_bindings = [
-            {
-                "source_id": item["source_id"],
-                "category": item["category"],
-                "path": item["local_path"],
-                "provider": item["provider"],
-                "library_id": item["library_id"],
-                "library_name": item["library_name"],
-                "server_path": item["server_path"],
-            }
-            for item in _local_bindings()
-        ]
-        db.replace_local_library_targets(local_bindings, owner=_OWNER)
-        try:
-            if strm_updates:
-                config.set_and_save(strm_updates)
-        except Exception:
-            db.replace_local_library_targets(previous_bindings, owner=_OWNER)
-            raise
-        try:
-            from app.modules.local_media_scheduler import get_local_media_scheduler
-            get_local_media_scheduler().reload()
-        except Exception as exc:
-            logger.warning(
-                "统一媒体库映射保存后调度器重载失败 type=%s",
-                type(exc).__name__,
-            )
-        return {"success": True, "local_bindings": _local_bindings()}
+        with _mapping_save_guard():
+            local_bindings = _validated_local_bindings(payload.get("local_bindings", []))
+            strm_updates = _validated_strm_mapping_updates(payload.get("strm_mappings", {}))
+            previous_bindings = [
+                {
+                    "source_id": item["source_id"],
+                    "category": item["category"],
+                    "path": item["local_path"],
+                    "provider": item["provider"],
+                    "library_id": item["library_id"],
+                    "library_name": item["library_name"],
+                    "server_path": item["server_path"],
+                }
+                for item in _local_bindings()
+            ]
+            db.replace_local_library_targets(local_bindings, owner=_OWNER)
+            try:
+                if strm_updates:
+                    config.set_and_save(strm_updates)
+            except Exception as exc:
+                db.replace_local_library_targets(previous_bindings, owner=_OWNER)
+                return config_write_api_error(
+                    exc,
+                    logger=logger,
+                    operation="save_media_library_mappings",
+                )
+            try:
+                from app.modules.local_media_scheduler import get_local_media_scheduler
+                get_local_media_scheduler().reload()
+            except Exception as exc:
+                logger.warning(
+                    "统一媒体库映射保存后调度器重载失败 type=%s",
+                    type(exc).__name__,
+                )
+            return {"success": True, "local_bindings": _local_bindings()}
     except (ValueError, LookupError, PathMappingError) as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
@@ -489,8 +522,10 @@ def test_media_library_path(request: Request, data: dict | None = Body(default=N
     profile = profiles.get(provider)
     if profile is None or not profile.enabled or not profile.configured:
         return api_error("媒体服务器未启用或配置不完整", 400)
+    client = None
     try:
-        libraries = [_library_payload(item) for item in _client_for(profile).list_virtual_folders()]
+        client = _client_for(profile)
+        libraries = [_library_payload(item) for item in client.list_virtual_folders()]
     except Exception as exc:
         logger.warning(
             "媒体库路径测试读取上游失败 provider=%s type=%s",
@@ -498,6 +533,8 @@ def test_media_library_path(request: Request, data: dict | None = Body(default=N
             type(exc).__name__,
         )
         return api_error("媒体库读取失败，请先测试服务器连接", 502)
+    finally:
+        _close_client(client)
 
     matches: list[dict[str, Any]] = []
     for library in libraries:

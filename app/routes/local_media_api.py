@@ -336,7 +336,13 @@ def list_media_server_libraries(provider: str, request: Request):
         else:
             from app.clients.emby import EmbyClient
             client = EmbyClient(profile.url, profile.credential)
-        return {"provider": normalized, "libraries": client.list_virtual_folders()}
+        try:
+            return {"provider": normalized, "libraries": client.list_virtual_folders()}
+        finally:
+            try:
+                client.close()
+            except Exception as exc:
+                logger.debug("媒体库列表客户端关闭失败 type=%s", type(exc).__name__)
     except Exception as exc:
         return _safe_error(exc)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from app.clients.base import DashboardData
 from app.clients.emby import EmbyClient
@@ -11,6 +11,23 @@ from app.clients.jellyfin import JellyfinClient
 
 
 class MediaRuntimeTests(unittest.TestCase):
+    def test_client_context_manager_closes_underlying_session(self):
+        client = JellyfinClient("http://jellyfin.local", "key")
+        client._session = Mock()
+        with client as active:
+            self.assertIs(active, client)
+        client._session.close.assert_called_once_with()
+
+    def test_jellyfin_isolated_dashboard_part_closes_child_client(self):
+        parent = JellyfinClient("http://jellyfin.local", "key")
+        child = Mock()
+        child._libraries.return_value = ["library"]
+        with patch("app.clients.jellyfin.JellyfinClient", return_value=child):
+            result = parent._isolated_part("_libraries", "user-id")
+        self.assertEqual(result, ["library"])
+        self.assertEqual(child._cached_user_id, "user-id")
+        child.close.assert_called_once_with()
+
     def test_runtime_ticks_are_converted_to_rounded_minutes(self):
         payload = {"Id": "item", "Name": "示例", "Type": "Movie", "RunTimeTicks": 2_400_000_000}
 

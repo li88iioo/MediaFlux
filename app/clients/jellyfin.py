@@ -73,8 +73,11 @@ class JellyfinClient(MediaServerClient):
             path_mappings=self.path_mappings,
             allow_global_refresh_fallback=self.allow_global_refresh_fallback,
         )
-        client._cached_user_id = user_id
-        return getattr(client, method_name)()
+        try:
+            client._cached_user_id = user_id
+            return getattr(client, method_name)()
+        finally:
+            client.close()
 
     def get_dashboard(self) -> DashboardData:
         """并行读取互不依赖的 Jellyfin 看板分区。"""

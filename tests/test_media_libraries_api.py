@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+from app import config
 from app import database as db
 from app.main import create_app
 from app.routes import media_libraries_api
@@ -97,6 +98,15 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         })
         self.assertEqual(normalized["collection_type"], "tvshows")
         self.assertEqual(legacy["collection_type"], "movies")
+
+    def test_profile_probe_always_closes_short_lived_client(self):
+        profile = self._profiles()[0]
+        client = Mock()
+        client.list_virtual_folders.return_value = []
+        with patch("app.routes.media_libraries_api._client_for", return_value=client):
+            provider, libraries, error = media_libraries_api._probe_profile(profile)
+        self.assertEqual((provider, libraries, error), ("jellyfin", [], ""))
+        client.close.assert_called_once_with()
 
     def test_overview_projects_profiles_mappings_bindings_and_empty_online_server(self):
         self.login()
@@ -395,7 +405,53 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                         }],
                     },
                 )
-        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.status_code, 503, response.text)
+        targets = db.list_local_library_targets(source_id, owner="admin")
+        self.assertEqual([item.path for item in targets], [str(old_target)])
+
+    def test_unified_save_returns_conflict_and_rolls_back_on_concurrent_config_change(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        with TemporaryDirectory() as temp_raw:
+            base = Path(temp_raw).resolve()
+            source_root = base / "downloads"
+            old_target = base / "library" / "旧"
+            new_target = base / "library" / "新"
+            source_root.mkdir(parents=True)
+            old_target.mkdir(parents=True)
+            new_target.mkdir(parents=True)
+            source_id = db.create_local_media_source(
+                name="本地下载-并发", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), owner="admin",
+            )
+            db.upsert_local_library_target(
+                source_id, "default", str(old_target), owner="admin"
+            )
+            with (
+                patch("app.routes.media_libraries_api.config.has_external_override", return_value=False),
+                patch(
+                    "app.routes.media_libraries_api.config.set_and_save",
+                    side_effect=config.ConcurrentConfigUpdateError("private detail"),
+                ),
+            ):
+                response = self.client.post(
+                    "/api/media-libraries/mappings",
+                    headers=headers,
+                    json={
+                        "strm_mappings": {"jellyfin": []},
+                        "local_bindings": [{
+                            "source_id": source_id,
+                            "category": "default",
+                            "local_path": str(new_target),
+                            "provider": "jellyfin",
+                            "library_id": "movies",
+                            "library_name": "电影",
+                            "server_path": "//NAS/媒体/电影",
+                        }],
+                    },
+                )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertNotIn("private detail", response.text)
         targets = db.list_local_library_targets(source_id, owner="admin")
         self.assertEqual([item.path for item in targets], [str(old_target)])
 
@@ -440,6 +496,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(covered.json()["status"], "covered")
         self.assertEqual(covered.json()["matches"][0]["mode"], "covered")
         self.assertEqual(unmatched.json()["status"], "unmatched")
+        self.assertEqual(client.close.call_count, 3)
         self.assertEqual(unmatched.json()["matches"], [])
 
     def test_path_test_rejects_invalid_input_and_handles_upstream_failure(self):

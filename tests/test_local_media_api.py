@@ -329,6 +329,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(servers.json(), {"servers": [{"provider": "jellyfin", "label": "Jellyfin"}]})
         self.assertEqual(libraries.json()["libraries"][0]["id"], "movies")
         self.assertNotIn("secret", servers.text + libraries.text)
+        client.close.assert_called_once_with()
 
     def test_invalid_path_and_category_are_rejected_without_db_write(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}
