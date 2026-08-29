@@ -7,7 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from app.modules.organize_sources import normalize_organize_sources
+from app.modules.organize_sources import (
+    normalize_organize_source_ids,
+    normalize_organize_sources,
+)
 from app.modules.organize_scheduler import OrganizeScheduler
 from app.modules.strm import parse_strm_sources
 
@@ -26,6 +29,24 @@ class OrganizeSourceParserTests(unittest.TestCase):
         sources, error = normalize_organize_sources('[{"id":"0"}]')
         self.assertEqual(sources, [])
         self.assertIn("不能为根目录", error)
+
+    def test_source_scope_is_canonical_deduplicated_and_limited_to_configured_sources(self):
+        configured = [
+            {"id": "11", "name": "普通源"},
+            {"id": "22", "name": "成人源"},
+        ]
+        source_ids, error = normalize_organize_source_ids(
+            '["22", {"id":"22"}, "11"]',
+            configured_sources=configured,
+        )
+        self.assertEqual(error, "")
+        self.assertEqual(source_ids, ["22", "11"])
+
+        source_ids, error = normalize_organize_source_ids(
+            '["33"]', configured_sources=configured,
+        )
+        self.assertEqual(source_ids, [])
+        self.assertIn("未配置的整理源目录", error)
 
     def test_source_count_and_field_lengths_are_bounded(self):
         sources, error = normalize_organize_sources(
@@ -105,6 +126,26 @@ class MediaConfigSaveTests(unittest.TestCase):
         ])
         strm_scheduler.reload.assert_called_once_with()
         organize_scheduler.reload.assert_called_once_with()
+
+    def test_removing_organize_source_prunes_and_persists_nsfw_scope(self):
+        current = {
+            "GY_ORGANIZE_SOURCE_DIRS": json.dumps([
+                {"id": "11", "name": "普通源"},
+                {"id": "22", "name": "成人源"},
+            ]),
+            "GY_ORGANIZE_NSFW_SOURCE_IDS": '["11","22"]',
+        }
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": current.get(key, default),
+        ):
+            result, save, _, _ = self._save({
+                "GY_ORGANIZE_SOURCE_DIRS": '[{"id":"11","name":"普通源"}]',
+            })
+
+        self.assertEqual(result, {"success": True})
+        saved = save.call_args.args[0]
+        self.assertEqual(json.loads(saved["GY_ORGANIZE_NSFW_SOURCE_IDS"]), ["11"])
 
     def test_advanced_media_server_mapping_is_validated_and_canonicalized(self):
         result, save, _, _ = self._save({

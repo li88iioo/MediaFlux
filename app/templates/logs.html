@@ -212,12 +212,12 @@
                 <div id="organizeDetailItems" class="organize-item-list"></div>
             </section>
             <section class="organize-detail-section" id="organizeCorrectionPanel">
-                <div class="organize-detail-section-head"><strong>重新识别</strong></div>
+                <div class="organize-detail-section-head"><strong id="organizeRecognitionTitle">重新识别</strong></div>
                 <div class="organize-search-grid">
-                    <input type="text" class="form-input" id="organizeTmdbQuery" placeholder="输入片名或剧名">
-                    <input type="text" class="form-input" id="organizeTmdbYear" placeholder="搜索年份（可选）" inputmode="numeric">
-                    <select class="form-select" id="organizeTmdbType" aria-label="TMDB 搜索媒体类型"><option value="movie">电影结果</option><option value="tv">剧集结果</option></select>
-                    <button type="button" class="jump-btn" id="organizeTmdbSearchBtn"><i data-lucide="search"></i>搜索</button>
+                    <input type="text" class="form-input" id="organizeTmdbQuery" placeholder="输入片名或剧名" aria-label="识别搜索词">
+                    <input type="text" class="form-input" id="organizeTmdbYear" placeholder="搜索年份（可选）" inputmode="numeric" data-recognition-tmdb-only>
+                    <select class="form-select" id="organizeTmdbType" aria-label="搜索媒体类型" data-recognition-tmdb-only><option value="movie">电影结果</option><option value="tv">剧集结果</option></select>
+                    <button type="button" class="jump-btn" id="organizeTmdbSearchBtn"><i data-lucide="search"></i><span id="organizeRecognitionSearchLabel">搜索</span></button>
                 </div>
                 <div class="organize-position-fields" id="organizePositionFields" hidden>
                     <span>剧集位置</span>
@@ -251,5 +251,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/logs.js') }}?v=20260825e"></script>
+<script src="{{ url_for('static', path='js/logs.js') }}?v=20260829a"></script>
 {% endblock %}

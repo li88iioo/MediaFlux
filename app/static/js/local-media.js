@@ -141,7 +141,11 @@
 
     function setPreviewControlsBusy(busy) {
         document.querySelectorAll('[data-candidate]').forEach((button) => { button.disabled = busy; });
-        setBusy($('lmAutoPreviewBtn'), busy, busy ? '生成计划中' : '自动匹配');
+        setBusy(
+            $('lmAutoPreviewBtn'),
+            busy,
+            busy ? '生成计划中' : (activeNsfwSource() ? '识别番号' : '自动匹配'),
+        );
         if (busy && $('lmExecuteBtn')) $('lmExecuteBtn').disabled = true;
     }
 
@@ -189,7 +193,10 @@
     function sourceCard(source) {
         const targetItems = source.targets || [];
         const automatic = Boolean(source.enabled);
-        const triggerText = automatic ? 'qB 完成自动接管' : '仅手动整理';
+        const recognitionText = source.media_type === 'nsfw'
+            ? '成人番号专用'
+            : ({movie: '仅电影', tv: '剧集 / 动漫'}[source.media_type] || '自动识别');
+        const triggerText = `${automatic ? 'qB 完成自动接管' : '仅手动整理'} · ${recognitionText}`;
         const targetPaths = targetItems.map((target) => `${categoryLabels[target.category] || target.category}: ${target.path}`).join('\n');
         const chips = targetItems.length
             ? targetItems.slice(0, 4).map((target) => `<span title="${esc(target.path)}">${esc(categoryLabels[target.category] || target.category)}</span>`).join('')
@@ -817,8 +824,33 @@
     });
 
     function resolvedScrapeMediaType() {
+        if (activeNsfwSource()) return 'movie';
         const selected = $('lmMediaType').value;
         return selected === 'auto' ? (inspection?.media_type || 'auto') : selected;
+    }
+
+    function activeSource() {
+        return sources.find((entry) => Number(entry.id) === Number(activeMediaItem?.source_id));
+    }
+
+    function activeNsfwSource() {
+        return activeSource()?.media_type === 'nsfw';
+    }
+
+    function syncNsfwScrapeMode() {
+        const nsfwOnly = activeNsfwSource();
+        if (nsfwOnly) $('lmMediaType').value = 'movie';
+        $('lmMediaType').disabled = nsfwOnly;
+        if ($('lmScrapeExternalBtn')) $('lmScrapeExternalBtn').disabled = nsfwOnly;
+        if ($('lmSearchBtn')) $('lmSearchBtn').disabled = nsfwOnly;
+        const autoLabel = $('lmAutoPreviewBtn')?.querySelector('[data-button-label], span');
+        if (autoLabel) autoLabel.textContent = nsfwOnly ? '识别番号' : '自动匹配';
+        const candidateTitle = $('lmCandidateTitle');
+        if (candidateTitle) candidateTitle.textContent = nsfwOnly ? 'MetaTube 精确识别' : '媒体候选';
+        const query = $('lmSearchQuery');
+        if (query) query.placeholder = nsfwOnly
+            ? 'MetaTube 将从文件名或目录中提取番号'
+            : '输入片名或剧名';
     }
 
     function syncScrapePosition() {
@@ -954,7 +986,9 @@
             $('lmScrapeExternalHints').replaceChildren();
         }
         $('lmCandidateCount').textContent = '0 项';
-        $('lmCandidates').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>等待搜索</strong><span>检查完成后会在这里展示 TMDB 候选。</span></div>';
+        $('lmCandidates').innerHTML = activeNsfwSource()
+            ? '<div class="lm-scrape-placeholder"><i data-lucide="shield-check"></i><strong>等待番号识别</strong><span>只接受 MetaTube 完全一致结果，不调用或回退 TMDB。</span></div>'
+            : '<div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>等待搜索</strong><span>检查完成后会在这里展示 TMDB 候选。</span></div>';
         $('lmScrapeDetail').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="clapperboard"></i><strong>等待媒体识别</strong><span>选择候选或使用自动匹配后，将显示完整归档方案。</span></div>';
         $('lmScrapeStatus').textContent = '尚未选择';
         $('lmScrapeInspectionSummary').textContent = '等待检查';
@@ -971,9 +1005,13 @@
         $('lmSearchQuery').value = inspection.suggested_query || inspection.selected_name || activeMediaItem?.name || '';
         syncScrapePosition();
         $('lmScrapeInspectionSummary').textContent = `${inspection.video_count} 个视频 · ${inspection.file_count} 个扫描文件`;
-        $('lmScrapeStatus').textContent = '等待匹配';
-        $('lmCandidates').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>检查完成</strong><span>可以搜索 TMDB 候选，或直接使用自动匹配。</span></div>';
+        const nsfwOnly = activeNsfwSource();
+        $('lmScrapeStatus').textContent = nsfwOnly ? '等待番号识别' : '等待匹配';
+        $('lmCandidates').innerHTML = nsfwOnly
+            ? '<div class="lm-scrape-placeholder"><i data-lucide="shield-check"></i><strong>成人番号专用来源</strong><span>只会按文件名或目录番号查询 MetaTube，不会调用 TMDB。</span></div>'
+            : '<div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>检查完成</strong><span>可以搜索 TMDB 候选，或直接使用自动匹配。</span></div>';
         $('lmScrapeDetail').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="route"></i><strong>等待生成归档方案</strong><span>确认前不会移动、覆盖或清理任何文件。</span></div>';
+        syncNsfwScrapeMode();
         icons($('lmScrapeModal'));
     }
 
@@ -984,10 +1022,12 @@
         activeMediaItem = item;
         resetScrapeWorkspace();
         const source = sources.find((entry) => Number(entry.id) === Number(item.source_id));
-        $('lmMediaType').value = ['auto', 'movie', 'tv'].includes(source?.media_type)
+        $('lmMediaType').value = source?.media_type === 'nsfw' ? 'movie' : ['auto', 'movie', 'tv'].includes(source?.media_type)
             ? source.media_type : 'auto';
         syncScrapePosition();
-        $('lmScrapeTitle').textContent = automatic ? '自动匹配' : '搜索刮削';
+        $('lmScrapeTitle').textContent = activeNsfwSource()
+            ? '成人番号识别与归档'
+            : (automatic ? '自动匹配' : '搜索刮削');
         $('lmScrapeItemPath').textContent = `${item.name} · ${item.source_name} / ${item.path}`;
         $('lmScrapeItemPath').title = `${item.source_name} / ${item.path}`;
         if (scrapeModal) scrapeModal.open(trigger);
@@ -1003,7 +1043,9 @@
             });
             if (requestSerial !== inspectionRequestSerial) return;
             applyInspection(result);
-            if (automatic) {
+            if (activeNsfwSource()) {
+                await preview();
+            } else if (automatic) {
                 const planned = await preview();
                 if (!planned) await search();
             } else {
@@ -1060,7 +1102,7 @@
             $('lmScrapeItemPath').title = `${activeMediaItem.source_name} / 待确认任务 #${taskId}`;
             const source = sources.find((entry) => Number(entry.id) === Number(result.source_id));
             const reviewType = task?.media_type || source?.media_type || result.media_type || 'auto';
-            $('lmMediaType').value = ['auto', 'movie', 'tv'].includes(reviewType)
+            $('lmMediaType').value = source?.media_type === 'nsfw' ? 'movie' : ['auto', 'movie', 'tv'].includes(reviewType)
                 ? reviewType : 'auto';
             if (scrapeModal) scrapeModal.open(button);
             else $('lmScrapeModal').hidden = false;
@@ -1071,7 +1113,8 @@
                 numbering_mode: task?.numbering_mode || result.task_numbering_mode || 'auto',
             });
             syncScrapePosition();
-            await search();
+            if (activeNsfwSource()) await preview();
+            else await search();
         } catch (error) {
             if (requestSerial === inspectionRequestSerial) appAlert({type: 'error', title: '无法进入人工确认', message: error.message});
         } finally {
@@ -1084,6 +1127,9 @@
 
     async function search() {
         if (!inspection) return false;
+        if (activeNsfwSource()) {
+            return preview();
+        }
         const query = $('lmSearchQuery').value.trim();
         if (!query) {
             appAlert({type: 'warning', title: '请输入搜索名称', message: '搜索名称不能为空。'});
@@ -1145,6 +1191,13 @@
 
     async function loadExternalHints() {
         if (!inspection) return;
+        if (activeNsfwSource()) {
+            return appAlert({
+                type: 'info',
+                title: '成人番号专用来源',
+                message: '该来源只使用 MetaTube 精确番号识别，不调用豆瓣、BGM 或 TMDB。',
+            });
+        }
         const query = $('lmSearchQuery').value.trim();
         if (!query) {
             return appAlert({type: 'warning', title: '请输入搜索名称', message: '外部线索搜索名称不能为空。'});
@@ -1376,7 +1429,7 @@
             if (requestSerial !== previewRequestSerial || inspection?.inspection_id !== context.inspectionId) return false;
             if (previewResult.status !== 'planned') {
                 $('lmScrapeStatus').textContent = '需要人工确认';
-                $('lmScrapeDetail').innerHTML = `<div class="lm-scrape-placeholder"><i data-lucide="circle-alert"></i><strong>自动识别需要确认</strong><span>${esc(previewResult.reason || '请选择一个 TMDB 候选。')}</span></div>`;
+                $('lmScrapeDetail').innerHTML = `<div class="lm-scrape-placeholder"><i data-lucide="circle-alert"></i><strong>自动识别需要确认</strong><span>${esc(previewResult.reason || (activeNsfwSource() ? '请检查文件名是否包含可识别番号。' : '请选择一个 TMDB 候选。'))}</span></div>`;
                 icons($('lmScrapeDetail'));
                 return false;
             }
@@ -1396,6 +1449,10 @@
             const matched = previewResult.matches?.[0];
             const matchedMediaType = matched?.media_type || context.mediaType;
             const matchedMediaTypeLabel = matchedMediaType === 'tv' ? '剧集' : (matchedMediaType === 'movie' ? '电影' : matchedMediaType);
+            const matchedProvider = String(matched?.provider || '').toLowerCase();
+            const identityLabel = matchedProvider === 'metatube'
+                ? `MetaTube ${matched?.external_id || '精确番号'}`
+                : `TMDB ${matched?.tmdb_id || context.tmdbId || '自动'}`;
             const positionLabel = Number.isInteger(matched?.episode)
                 ? ` · S${String(matched.season ?? 1).padStart(2, '0')}E${String(matched.episode).padStart(2, '0')}`
                 : (Number.isInteger(appliedPreviewContext.season) ? ` · 第 ${appliedPreviewContext.season} 季` : '');
@@ -1407,7 +1464,7 @@
             $('lmScrapeModal').querySelector('.lm-scrape-dialog')?.classList.add('has-plan');
             $('lmScrapeDetail').innerHTML = `
                 <div class="lm-scrape-summary">
-                    <div><strong>${esc(matched?.title || activeMediaItem?.name || '已识别')}</strong><span>${esc(matchedMediaTypeLabel)} · TMDB ${esc(matched?.tmdb_id || context.tmdbId || '自动')}${positionLabel}</span></div>
+                    <div><strong>${esc(matched?.title || activeMediaItem?.name || '已识别')}</strong><span>${esc(matchedMediaTypeLabel)} · ${esc(identityLabel)}${positionLabel}</span></div>
                     <div><strong>${plans.length}</strong><span>媒体与伴随文件</span></div>
                     <div><strong>${replacements}</strong><span>同名目标安全覆盖${skipped ? ` · ${skipped} 项保留` : ''}</span></div>
                 </div>

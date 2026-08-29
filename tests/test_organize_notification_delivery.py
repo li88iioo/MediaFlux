@@ -128,11 +128,11 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         send_event.assert_not_called()
         self.assertEqual(len(delivered), 1)
         self.assertIn("待确认 2 个", delivered[0])
-        self.assertIn("本轮暂无可用 TMDB 候选", delivered[0])
+        self.assertIn("本轮没有可安全操作的 Telegram 处理卡", delivered[0])
         self.assertIn("Web 待确认队列", delivered[0])
-        self.assertNotIn("请在下方候选卡中选择匹配结果", delivered[0])
+        self.assertNotIn("下方将发送", delivered[0])
 
-    def test_incomplete_confirmation_groups_are_not_reported_as_actionable(self) -> None:
+    def test_confirmation_groups_only_need_a_safe_file_snapshot_for_terminal_skip(self) -> None:
         cases = (
             (
                 "missing-candidates",
@@ -140,6 +140,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                     "files": [{"file_id": "file-1", "name": "Show.mkv"}],
                     "candidates": [],
                 },
+                True,
             ),
             (
                 "missing-files",
@@ -149,6 +150,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                         "tmdb_id": "1", "media_type": "tv", "title": "Show",
                     }],
                 },
+                False,
             ),
             (
                 "invalid-candidate",
@@ -158,6 +160,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                         "tmdb_id": "", "media_type": "tv", "title": "Show",
                     }],
                 },
+                True,
             ),
             (
                 "malformed-file",
@@ -167,6 +170,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                         "tmdb_id": "1", "media_type": "tv", "title": "Show",
                     }],
                 },
+                False,
             ),
             (
                 "mixed-invalid-file",
@@ -179,9 +183,10 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                         "tmdb_id": "1", "media_type": "tv", "title": "Show",
                     }],
                 },
+                False,
             ),
         )
-        for task_id, group in cases:
+        for task_id, group, sends_skip_card in cases:
             with self.subTest(task_id=task_id):
                 delivered: list[str] = []
                 stats = {
@@ -198,16 +203,22 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                 with patch(
                     "app.modules.organize_notification_outbox.deliver_organize_notification",
                     side_effect=lambda _key, body, **_kwargs: delivered.append(body) or True,
-                ), patch("app.notifier.send_event") as send_event:
+                ), patch("app.notifier.send_event", return_value=True) as send_event:
                     result = Organizer.notify_task_results(
                         stats, OrganizeRules(), source_name="来源目录", chat_id="100",
                     )
 
                 self.assertTrue(result)
-                send_event.assert_not_called()
                 self.assertEqual(len(delivered), 1)
-                self.assertIn("本轮暂无可用 TMDB 候选", delivered[0])
-                self.assertNotIn("请在下方候选卡中选择匹配结果", delivered[0])
+                if sends_skip_card:
+                    send_event.assert_called_once()
+                    self.assertIn("下方将发送 1 张处理卡", delivered[0])
+                    self.assertIn("1 组暂无可用元数据", delivered[0])
+                    self.assertIn("Telegram 直接跳过", delivered[0])
+                else:
+                    send_event.assert_not_called()
+                    self.assertIn("本轮没有可安全操作的 Telegram 处理卡", delivered[0])
+                    self.assertNotIn("下方将发送", delivered[0])
 
     def test_mixed_pending_items_only_promise_actionable_candidate_cards(self) -> None:
         stats = _stats_with_confirmation()
@@ -230,8 +241,8 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         send_event.assert_called_once()
         self.assertEqual(len(delivered), 1)
         self.assertIn("待确认 2 个", delivered[0])
-        self.assertIn("1 个可在下方候选卡中选择", delivered[0])
-        self.assertIn("1 个暂无可用 TMDB 候选", delivered[0])
+        self.assertIn("1 组可直接选择识别候选", delivered[0])
+        self.assertIn("1 个缺少安全文件快照", delivered[0])
 
     def test_multiple_files_in_one_confirmation_group_explains_single_card(self) -> None:
         stats = _stats_with_confirmation()
@@ -258,7 +269,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(delivered), 1)
         self.assertIn("待确认 2 个文件", delivered[0])
         self.assertIn("已按媒体合并为 1 组", delivered[0])
-        self.assertIn("仅发送 1 张候选卡", delivered[0])
+        self.assertIn("下方将发送 1 张处理卡", delivered[0])
 
     def test_confirmation_only_delivery_skips_task_summary(self) -> None:
         with patch(

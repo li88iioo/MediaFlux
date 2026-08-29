@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
-from app.modules.organize import OrganizeRules
+from app.modules.organize import OrganizeRules, organize_rules_snapshot
 from app.modules.organize_probe_worker import OrganizeProbeWorker
 from tests.support import IsolatedDatabaseTestCase
 
@@ -109,6 +109,29 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         self.assertEqual([item["id"] for item in claimed], [job_id])
         self.assertEqual(db.recover_stale_organize_probe_jobs(force=True), 1)
         self.assertEqual(db.count_organize_probe_jobs()["retry_wait"], 1)
+
+    def test_queue_snapshot_excludes_token_and_worker_restores_current_server_secret(self):
+        log_id = self._create_log()
+        configured = OrganizeRules(
+            target_dir_id="target", nsfw_metatube_token="server-secret",
+        )
+        db.enqueue_organize_probe_completion(
+            log_id, source_id="target", rel_dir="电影/测试",
+            rules=organize_rules_snapshot(configured), delay_seconds=130,
+        )
+        with db.get_conn() as conn:
+            row = dict(conn.execute(
+                "SELECT * FROM organize_probe_queue WHERE organize_log_id=?",
+                (log_id,),
+            ).fetchone())
+
+        self.assertNotIn("nsfw_metatube_token", row["rules_json"])
+        self.assertNotIn("server-secret", row["rules_json"])
+        with patch(
+            "app.modules.organize.OrganizeRules.from_config", return_value=configured,
+        ):
+            restored = OrganizeProbeWorker._rules_from_job(row)
+        self.assertEqual(restored.nsfw_metatube_token, "server-secret")
 
     def test_successful_completion_renames_video_companion_and_triggers_incremental_strm(self):
         from app.modules.media_probe import MediaProfile

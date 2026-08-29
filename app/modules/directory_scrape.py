@@ -22,6 +22,8 @@ from app.modules.organize import (
     OrganizeRules,
     Organizer,
     enforce_fixed_organize_rules,
+    organize_rules_snapshot,
+    organize_rules_snapshot_matches,
 )
 from app.modules.organize_sources import normalize_organize_sources
 from app.repositories.organize_operation_jobs import OrganizeOperationCancelled
@@ -263,6 +265,7 @@ class FixedMatchScraper:
         episode_override: int | None = None,
         preserve_specials: bool = False,
         position_overrides: dict[object, tuple[int | None, int | None]] | None = None,
+        multipart_overrides: dict[object, int] | None = None,
     ) -> None:
         self.delegate = delegate
         self.fixed_match = dataclasses.replace(match)
@@ -271,6 +274,7 @@ class FixedMatchScraper:
         self.episode_override = episode_override
         self.preserve_specials = bool(preserve_specials)
         self.position_overrides = dict(position_overrides or {})
+        self.multipart_overrides = dict(multipart_overrides or {})
 
     def match(self, _filename: str, _parent_path: str = "") -> MatchResult:
         return dataclasses.replace(self.fixed_match)
@@ -300,6 +304,37 @@ class FixedMatchScraper:
         if position is None:
             position = self.position_overrides.get(normalized_filename)
         return position
+
+    def multipart_override(
+        self, filename: str, parent_path: str = ""
+    ) -> int | None:
+        """读取人工确认后的成人媒体分段序号。"""
+        normalized_parent = str(parent_path or "").replace("\\", "/").strip("/")
+        normalized_filename = str(filename)
+        value = self.multipart_overrides.get((str(parent_path or ""), normalized_filename))
+        if value is None and normalized_parent:
+            matches: list[int] = []
+            for key, candidate in self.multipart_overrides.items():
+                if not isinstance(key, tuple) or len(key) != 2:
+                    continue
+                relative_parent, override_filename = key
+                if str(override_filename) != normalized_filename:
+                    continue
+                normalized_relative = str(relative_parent or "").replace("\\", "/").strip("/")
+                if normalized_relative and (
+                    normalized_parent == normalized_relative
+                    or normalized_parent.endswith(f"/{normalized_relative}")
+                ):
+                    matches.append(int(candidate))
+            if len(matches) == 1:
+                value = matches[0]
+        if value is None:
+            value = self.multipart_overrides.get(normalized_filename)
+        try:
+            index = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+        return index if index is not None and 1 <= index <= 99 else None
 
     def _apply_manual_position(
         self, season: int | None, episode: int | None
@@ -507,6 +542,34 @@ class DirectoryScrapeService:
         self._cached_nsfw_recognizer = recognizer
         return recognizer
 
+    def _rules_for_scope(self, scope_id: str) -> OrganizeRules:
+        """沿光鸭父目录向上寻找正式来源，并应用来源级成人识别边界。"""
+        rules = self.rules_loader()
+        selected = rules.selected_nsfw_source_ids()
+        if not selected:
+            return rules.for_source("")
+        current = str(scope_id or "").strip()
+        visited: set[str] = set()
+        for _ in range(96):
+            if not current or current in visited:
+                break
+            if current in selected:
+                return rules.for_source(current)
+            visited.add(current)
+            try:
+                item = self.client.file_info(current)
+            except Exception:
+                break
+            if isinstance(item, dict):
+                parent_id = str(item.get("parent_id") or item.get("parentId") or "").strip()
+            else:
+                parent_id = str(getattr(item, "parent_id", "") or "").strip()
+            if not parent_id or parent_id == "0" or parent_id == current:
+                break
+            current = parent_id
+        # 无法证明属于专用来源时失败关闭成人识别，普通 TMDB 链保持原状。
+        return rules.for_source("")
+
     @staticmethod
     def _validate_metatube_source_identity(
         inspection: DirectoryInspection,
@@ -537,10 +600,12 @@ class DirectoryScrapeService:
             match = recognizer.match(filename, parent_path)
             if match is not None:
                 return match
+        if rules.nsfw_exclusive:
+            return Organizer._nsfw_unresolved_match()
         return self.scraper.match(filename, parent_path)
 
     def inspect(self, owner: str, directory_id: str) -> dict:
-        rules = self.rules_loader()
+        rules = self._rules_for_scope(directory_id)
         inspection = DirectoryMediaInspector(
             client=self.client,
             scraper=self.scraper,
@@ -555,7 +620,7 @@ class DirectoryScrapeService:
         return self._inspection_payload(inspection_id, inspection, rules)
 
     def inspect_file(self, owner: str, file_id: str) -> dict:
-        rules = self.rules_loader()
+        rules = self._rules_for_scope(file_id)
         inspection = DirectoryMediaInspector(
             client=self.client,
             scraper=self.scraper,
@@ -629,6 +694,7 @@ class DirectoryScrapeService:
             "episode": inspection.episode,
             "season_inferred": inspection.season_inferred,
             "requires_manual_match": inspection.requires_manual_match,
+            "nsfw_only": bool(rules.nsfw_exclusive),
             "manual_match_reason": inspection.manual_match_reason,
             "counts": dict(inspection.counts),
             "pending_videos": [
@@ -664,7 +730,9 @@ class DirectoryScrapeService:
         record = self.store.get_inspection(owner, inspection_id)
         search_query = str(query or record.inspection.suggested_query).strip()
         if not search_query:
-            raise DirectoryScrapeRequestError("请输入 TMDB 搜索词")
+            raise DirectoryScrapeRequestError(
+                "请输入番号或文件名" if record.rules.nsfw_exclusive else "请输入 TMDB 搜索词"
+            )
         normalized_type = str(media_type or "auto").strip().lower()
         if normalized_type not in {"auto", "movie", "tv"}:
             raise DirectoryScrapeRequestError("媒体类型只能是自动、电影或剧集")
@@ -675,17 +743,18 @@ class DirectoryScrapeService:
         )
         candidates: list[dict] = []
         seen: set[tuple[str, str, str]] = set()
-        for current_type in types:
-            for candidate in self.scraper.search_candidates(
-                search_query,
-                str(year or "").strip(),
-                current_type,
-            ):
-                key = ("tmdb", str(candidate.tmdb_id), current_type)
-                if not candidate.tmdb_id or key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(self._candidate_payload(candidate, current_type))
+        if not record.rules.nsfw_exclusive:
+            for current_type in types:
+                for candidate in self.scraper.search_candidates(
+                    search_query,
+                    str(year or "").strip(),
+                    current_type,
+                ):
+                    key = ("tmdb", str(candidate.tmdb_id), current_type)
+                    if not candidate.tmdb_id or key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(self._candidate_payload(candidate, current_type))
         if normalized_type in {"auto", "movie"}:
             recognizer = self._nsfw_recognizer(record.rules)
             if recognizer is not None:
@@ -718,6 +787,10 @@ class DirectoryScrapeService:
     ) -> dict:
         """按需查询豆瓣/Bangumi 线索；结果不参与自动评分，也不写入映射。"""
         record = self.store.get_inspection(owner, inspection_id)
+        if record.rules.nsfw_exclusive:
+            raise DirectoryScrapeRequestError(
+                "成人番号专用来源不使用豆瓣、Bangumi 或普通 TMDB 线索"
+            )
         search_query = str(query or record.inspection.suggested_query).strip()
         if not search_query:
             raise DirectoryScrapeRequestError("请输入外部资料搜索词")
@@ -828,6 +901,10 @@ class DirectoryScrapeService:
         if current.fingerprint != record.inspection.fingerprint:
             raise DirectoryScrapeConflictError("目录内容已变化，请重新检查")
         resolved_provider = str(provider or "tmdb").strip().lower()
+        if record.rules.nsfw_exclusive and resolved_provider != "metatube":
+            raise DirectoryScrapeRequestError(
+                "成人番号专用来源只接受 MetaTube 精确番号候选"
+            )
         requested_tmdb_id = str(tmdb_id or "").strip()
         if resolved_provider == "metatube":
             recognizer = self._nsfw_recognizer(record.rules)
@@ -916,7 +993,7 @@ class DirectoryScrapeService:
             "plans": [self._plan_payload(plan) for plan in plans],
             "companion_plans": companion_plans,
             "stats": dict(stats),
-            "rules": asdict(record.rules),
+            "rules": organize_rules_snapshot(record.rules),
             "numbering": {
                 "mode": normalized_numbering_mode,
                 "changed": sum(1 for item in episode_mappings.values() if item.changed),
@@ -1020,8 +1097,13 @@ class DirectoryScrapeService:
 
         try:
             check_cancel()
-            current_rules = self.rules_loader()
-            if asdict(current_rules) != asdict(record.rules):
+            # 预览保存的是“来源级”规则快照。成人专用来源会在全局规则上
+            # 额外启用 nsfw_exclusive，因此执行阶段也必须按同一 scope 重新
+            # 派生规则；直接拿全局规则比较会把合法成人预览误判成规则变化。
+            current_rules = self._rules_for_scope(record.scope_id)
+            if not organize_rules_snapshot_matches(
+                organize_rules_snapshot(record.rules), current_rules,
+            ):
                 raise DirectoryScrapeConflictError("光鸭整理规则已变化，请重新检查并生成预览")
             check_cancel()
             try:

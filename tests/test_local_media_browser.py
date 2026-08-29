@@ -33,6 +33,7 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
             'id="lmPickLocalRootBtn"', 'id="lmSourceMediaType"',
             'id="lmSourceEnabled"', 'qB 自动整理',
             '<option value="true">开启</option>', '<option value="false">关闭</option>',
+            '<option value="nsfw">成人番号（仅 MetaTube）</option>',
             'class="lm-source-routing-row"',
             'js/local-media.js', 'css/local-media.css',
         ):
@@ -80,6 +81,9 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn("confirm: 'CLEAR'", js)
         self.assertNotIn("data-target-library", js)
         self.assertIn("归档映射", js)
+        self.assertIn("成人番号专用", js)
+        self.assertIn("MetaTube 精确识别", js)
+        self.assertIn("activeNsfwSource", js)
         self.assertIn("lmSourceMode", page.text)
         self.assertNotIn("row.dataset.libraryRequest", js)
         self.assertIn("allowRoot: !isRootsMode && Boolean(sourceId)", js)

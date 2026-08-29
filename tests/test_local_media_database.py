@@ -10,6 +10,21 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
+    def test_source_media_type_accepts_explicit_nsfw_and_rejects_unknown_values(self):
+        source_id = db.create_local_media_source(
+            name="adult-source", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/adult-source", media_type="nsfw", owner="admin",
+        )
+        self.assertEqual(
+            db.get_local_media_source(source_id, owner="admin").media_type,
+            "nsfw",
+        )
+        with self.assertRaises(ValueError):
+            db.create_local_media_source(
+                name="bad-source", qb_profile="", qb_path_prefix="",
+                local_root="/tmp/bad-source", media_type="unknown", owner="admin",
+            )
+
     def test_source_target_and_task_round_trip(self):
         source_id = db.create_local_media_source(
             name="qB 下载目录 1",

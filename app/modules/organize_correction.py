@@ -8,14 +8,22 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 from app import config, database as db
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.logger import get_logger
-from app.modules.organize import OrganizeRules, Organizer, enforce_fixed_organize_rules
+from app.modules.organize import (
+    OrganizeRules,
+    Organizer,
+    organize_rules_snapshot,
+    restore_organize_rules_snapshot,
+)
 from app.modules.organize_delete_audit import (
     DeleteCandidate, execute_recycle_bin_delete, record_blocked_delete,
+)
+from app.modules.nsfw import (
+    build_clean_title_candidate, extract_nsfw_identifier, normalize_code,
 )
 from app.modules.organize_postprocess import companion_target_name, normalize_media_number
 from app.modules.organize_sources import normalize_organize_sources
@@ -24,7 +32,7 @@ from app.modules.scraper import Candidate, MatchResult, TMDBScraper
 logger = get_logger(__name__)
 
 BUSY_STATUSES = {"reorganizing", "returning", "reverting", "deleting"}
-REORGANIZE_STATUSES = {"success", "failed", "skipped", "reverted", "interrupted"}
+REORGANIZE_STATUSES = {"success", "failed", "skipped", "manual", "reverted", "interrupted"}
 RETURN_STATUSES = {"success", "failed", "reverted", "interrupted"}
 REVERT_STATUSES = {"success"}
 DELETE_STATUSES = {"success", "failed", "skipped", "reverted", "interrupted"}
@@ -133,7 +141,44 @@ class OrganizeCorrectionService:
                 "检测到云端操作或补偿未完整完成。系统已冻结自动写操作；"
                 "请根据成员快照和操作步骤人工核对云端现状，禁止猜测式续写。"
             )
+        rules = self._rules_for_source_scope(str(data.get("source_dir_id") or ""))
+        nsfw_only = bool(rules.nsfw_exclusive)
+        data["recognition"] = {
+            "provider": "metatube" if nsfw_only else "tmdb",
+            "label": "MetaTube / 清洗标题" if nsfw_only else "TMDB",
+            "nsfw_only": nsfw_only,
+            "query_placeholder": (
+                "输入番号或包含番号的文件名" if nsfw_only else "输入片名或剧名"
+            ),
+        }
         return data
+
+    def _rules_for_source_scope(self, source_dir_id: str) -> OrganizeRules:
+        """按日志来源重新派生规则；无法证明成人来源时失败关闭 MetaTube。"""
+        rules = OrganizeRules.from_config()
+        selected = rules.selected_nsfw_source_ids()
+        if not selected:
+            return rules.for_source("")
+        current = str(source_dir_id or "").strip()
+        visited: set[str] = set()
+        for _ in range(96):
+            if not current or current in visited:
+                break
+            if current in selected:
+                return rules.for_source(current)
+            visited.add(current)
+            try:
+                item = self.client.file_info(current)
+            except Exception:
+                break
+            if isinstance(item, dict):
+                parent_id = str(item.get("parent_id") or item.get("parentId") or "").strip()
+            else:
+                parent_id = str(getattr(item, "parent_id", "") or "").strip()
+            if not parent_id or parent_id == "0" or parent_id == current:
+                break
+            current = parent_id
+        return rules.for_source("")
 
     def validate_batch(self, log_ids: list[int], action: str) -> list[dict]:
         """批量操作写入前统一校验；任何不合格成员都会阻止整个批次。"""
@@ -241,26 +286,53 @@ class OrganizeCorrectionService:
             "warnings": warnings,
         }
 
-    def search_tmdb(self, log_id: int, query: str = "", year: str = "",
-                    media_type: str = "") -> list[dict]:
+    def search_candidates(self, log_id: int, query: str = "", year: str = "",
+                          media_type: str = "") -> list[dict]:
         detail = self.detail(log_id)
         if not detail["allowed_actions"]["search"]:
             raise ValueError(detail.get("safety_notice") or "该日志不能人工纠偏")
         query = (query or detail.get("title") or detail.get("original_name") or "").strip()
+        rules = self._rules_for_source_scope(str(detail.get("source_dir_id") or ""))
+        if rules.nsfw_exclusive:
+            recognizer = self.organizer._nsfw_recognizer(rules)
+            if recognizer is None:
+                raise ValueError("成人来源未配置可用的 MetaTube 服务")
+            candidates = recognizer.candidates(query)
+            if candidates:
+                return [self._candidate_dict(item) for item in candidates]
+            seed = (
+                query or detail.get("original_name") or detail.get("current_name") or ""
+            )
+            fallback = build_clean_title_candidate(
+                str(seed), rules.nsfw_strip_domains,
+            )
+            return [fallback] if fallback is not None else []
         media_type = "tv" if media_type == "tv" else (
             "movie" if media_type == "movie" else detail.get("media_type") or "movie"
         )
         candidates = self.scraper.search_candidates(query, year, media_type)
         return [self._candidate_dict(item) for item in candidates]
 
+    def search_tmdb(self, log_id: int, query: str = "", year: str = "",
+                    media_type: str = "") -> list[dict]:
+        """兼容旧 API；成人来源必须走 provider-aware 搜索，禁止回退 TMDB。"""
+        detail = self.detail(log_id)
+        if bool((detail.get("recognition") or {}).get("nsfw_only")):
+            raise ValueError("成人番号专用来源只允许使用 MetaTube 精确识别")
+        return self.search_candidates(log_id, query, year, media_type)
+
     @staticmethod
     def _candidate_dict(item: Candidate) -> dict:
+        provider = str(getattr(item, "provider", "") or "tmdb").strip().lower()
+        external_id = str(getattr(item, "external_id", "") or item.tmdb_id or "").strip()
         return {
             "tmdb_id": item.tmdb_id,
             "title": item.title,
             "year": item.year,
             "score": item.score,
             "media_type": item.media_type,
+            "provider": provider,
+            "external_id": external_id,
         }
 
     @staticmethod
@@ -286,10 +358,60 @@ class OrganizeCorrectionService:
         return videos[0]
 
     def _match(self, tmdb_id: str, media_type: str, title: str = "",
-               year: str = "") -> MatchResult:
-        """客户端候选只用于选择 ID，标题、年份和类型以 TMDB 详情为准。"""
+               year: str = "", *, provider: str = "", external_id: str = "",
+               rules: OrganizeRules | None = None,
+               source_values: tuple[str, ...] = ()) -> MatchResult:
+        """按来源边界解析人工候选；成人来源绝不接受 TMDB 回退。"""
+        effective_rules = rules or OrganizeRules.from_config().for_source("")
+        normalized_provider = str(provider or "").strip().lower()
+        if effective_rules.nsfw_exclusive:
+            if normalized_provider not in {"metatube", "clean_title"} or not str(external_id or "").strip():
+                raise ValueError("请选择有效的成人内容候选")
+            source_codes: set[str] = set()
+            source_seed = ""
+            for value in source_values:
+                if not source_seed and str(value or "").strip():
+                    source_seed = str(value)
+                identifier = extract_nsfw_identifier(value, effective_rules.nsfw_strip_domains)
+                if identifier is not None:
+                    source_codes.add(normalize_code(identifier.code))
+            if not source_codes:
+                raise ValueError("原文件名未提取到可校验番号，不能执行成人内容人工整理")
+            if normalized_provider == "clean_title":
+                fallback = build_clean_title_candidate(
+                    source_seed, effective_rules.nsfw_strip_domains,
+                )
+                if fallback is None:
+                    raise ValueError("原文件名无法生成安全的清洗标题")
+                resolved_code = normalize_code(str(fallback.get("external_id") or ""))
+                if normalize_code(str(external_id)) != resolved_code:
+                    raise ValueError("清洗标题候选番号与原文件不一致，请重新生成")
+                # Web 请求中的 title 可被修改；清洗入库始终以原文件服务端重算结果为准。
+                resolved_title = str(fallback.get("title") or resolved_code).strip()
+                metadata = {
+                    **dict(fallback.get("metadata") or {}),
+                    "number": resolved_code,
+                    "title": resolved_title,
+                    "fallback": True,
+                }
+                return MatchResult(
+                    title=resolved_title, media_type="movie", confidence=1.0,
+                    provider="clean_title", external_id=resolved_code,
+                    metadata=metadata, status="matched", locked=True,
+                )
+            recognizer = self.organizer._nsfw_recognizer(effective_rules)
+            if recognizer is None:
+                raise ValueError("成人来源未配置可用的 MetaTube 服务")
+            result, detail = recognizer.resolve(str(external_id).strip())
+            resolved_code = normalize_code(str(detail.get("number") or ""))
+            if not resolved_code or resolved_code not in source_codes:
+                raise ValueError("MetaTube 候选番号与原文件不一致，请重新搜索")
+            return result
+        if normalized_provider not in {"", "tmdb"}:
+            raise ValueError("普通媒体来源只允许使用 TMDB 候选")
         media_type = "tv" if media_type == "tv" else "movie"
-        result = self.scraper.match_from_tmdb(str(tmdb_id), media_type)
+        resolved_tmdb_id = str(tmdb_id or external_id or "").strip()
+        result = self.scraper.match_from_tmdb(resolved_tmdb_id, media_type)
         if not result.tmdb_id:
             raise ValueError(result.error or "TMDB 详情不存在")
         return result
@@ -298,17 +420,29 @@ class OrganizeCorrectionService:
         self, log_id: int, tmdb_id: str, media_type: str,
         title: str = "", year: str = "",
         season: int | None = None, episode: int | None = None,
+        *, provider: str = "", external_id: str = "",
     ) -> dict:
         detail = self.detail(log_id)
         if not detail["allowed_actions"]["preview"]:
             raise ValueError(detail.get("safety_notice") or "当前状态不能重新整理")
         items = self._load_items(log_id)
         video = self._video(items)
-        match = self._match(tmdb_id, media_type, title, year)
-        rules = OrganizeRules.from_config()
+        rules = self._rules_for_source_scope(str(detail.get("source_dir_id") or ""))
         source_name = video.original_name or video.current_name
-        parsed = self.organizer._parse_media_fields(source_name)
         parent_path = str(detail.get("original_path") or "")
+        match = self._match(
+            tmdb_id, media_type, title, year,
+            provider=provider, external_id=external_id, rules=rules,
+            source_values=(video.original_name, video.current_name, parent_path),
+        )
+        parsed = self.organizer._parse_media_fields(source_name)
+        if rules.nsfw_exclusive:
+            from app.modules.nsfw import extract_nsfw_multipart
+            multipart = extract_nsfw_multipart(
+                source_name, rules.nsfw_strip_domains,
+            )
+            if multipart is not None and multipart.part_index is not None:
+                parsed["part"] = multipart.part_index
         position = None
         try:
             release_parse = self.scraper.parse_media(source_name, parent_path, match)
@@ -340,7 +474,7 @@ class OrganizeCorrectionService:
             and parsed.get("season") is None
         ):
             parsed["season"] = 1
-        if isinstance(self.scraper, TMDBScraper) and match.media_type == "tv":
+        if Organizer._match_provider(match) == "tmdb" and isinstance(self.scraper, TMDBScraper) and match.media_type == "tv":
             tmdb_detail = self.scraper.get_detail(match.tmdb_id, match.media_type)
             validation = self.scraper.validate_position(
                 tmdb_detail, match.media_type, parsed.get("season"), parsed.get("episode")
@@ -355,7 +489,7 @@ class OrganizeCorrectionService:
         new_name = self.organizer.build_new_name(match, current_file, parsed, rules)
         main, region, resolved_year = self.organizer.classify(match, rules)
         parts = [main]
-        if rules.region_split:
+        if rules.region_split and Organizer._match_provider(match) not in {"metatube", "clean_title"}:
             parts.append(region)
         if rules.year_split and resolved_year:
             parts.append(resolved_year)
@@ -389,7 +523,7 @@ class OrganizeCorrectionService:
             "season": parsed.get("season"),
             "episode": parsed.get("episode"),
             "items": planned,
-            "rules_snapshot": asdict(rules),
+            "rules_snapshot": organize_rules_snapshot(rules),
             "cloud_write": False,
         }
 
@@ -397,9 +531,11 @@ class OrganizeCorrectionService:
         self, log_id: int, operation_token: str, expected_version: int,
         tmdb_id: str, media_type: str, title: str = "", year: str = "",
         season: int | None = None, episode: int | None = None,
+        *, provider: str = "", external_id: str = "",
     ) -> dict:
         preview = self.preview_reorganize(
-            log_id, tmdb_id, media_type, title, year, season, episode
+            log_id, tmdb_id, media_type, title, year, season, episode,
+            provider=provider, external_id=external_id,
         )
         items = self._load_items(log_id)
         self._verify_items(items)
@@ -981,7 +1117,7 @@ class OrganizeCorrectionService:
         rejected_tmdb_ids: list[str] | None = None,
     ) -> list[str]:
         warnings: list[str] = []
-        if match:
+        if match and str(match.get("provider") or "tmdb").strip().lower() == "tmdb":
             try:
                 self.scraper.confirm(
                     self._video(items).original_name,
@@ -1021,6 +1157,7 @@ class OrganizeCorrectionService:
             media_item = {
                 "title": match.get("title"), "year": match.get("year"),
                 "media_type": match.get("media_type"), "tmdb_id": match.get("tmdb_id"),
+                "provider": match.get("provider"), "external_id": match.get("external_id"),
                 "season": parsed.get("season"), "episode": parsed.get("episode"),
                 "source": "光鸭云盘 · 人工识别", "category": preview.get("target_path"),
                 "filename": preview.get("file_name"), "size": video.size,
@@ -1035,8 +1172,11 @@ class OrganizeCorrectionService:
 
     def _execute_reorganize(self, log_id: int, operation_token: str,
                             preview: dict, items: list[CorrectionItem]) -> dict:
-        rules = enforce_fixed_organize_rules(
-            OrganizeRules(**preview["rules_snapshot"])
+        rules = restore_organize_rules_snapshot(
+            preview["rules_snapshot"],
+            trusted_rules=self._rules_for_source_scope(
+                str(self.detail(log_id).get("source_dir_id") or "")
+            ),
         )
         created_dirs: list[str] = []
         completed: list[AppliedTransition] = []

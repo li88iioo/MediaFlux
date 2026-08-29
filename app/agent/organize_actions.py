@@ -1,7 +1,6 @@
 """光鸭整理的只读预览与服务端确认后启动动作。"""
 from __future__ import annotations
 
-from dataclasses import asdict
 from datetime import datetime
 import hashlib
 import json
@@ -13,7 +12,7 @@ from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
 from app.clients.guangya import GuangYaClient
 from app.logger import get_logger
-from app.modules.organize import OrganizeRules, Organizer
+from app.modules.organize import OrganizeRules, Organizer, organize_rules_snapshot
 from app.modules.organize_sources import normalize_organize_sources
 from app.modules.organize_tasks import get_organize_manager
 
@@ -75,7 +74,7 @@ def _serialize_organize_context(
     payload = {
         "credential_generation": max(0, int(credential_generation)),
         "sources": sources,
-        "rules": asdict(rules),
+        "rules": organize_rules_snapshot(rules),
     }
     encoded = json.dumps(
         payload,
@@ -165,9 +164,10 @@ def _preview_data(
     for source in sources:
         if remaining <= 0:
             break
+        source_rules = rules.for_source(str(source.get("id") or ""))
         plans, stats = organizer.organize(
             source["id"],
-            rules,
+            source_rules,
             dry_run=True,
             max_files=remaining,
             post_actions=False,

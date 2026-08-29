@@ -5,6 +5,7 @@ import json
 import re
 import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -1287,6 +1288,41 @@ class SingleFileInspectionTests(IsolatedDatabaseTestCase):
             "metadata": 0,
         })
 
+    def test_nsfw_file_and_directory_use_exact_code_instead_of_episode_parse(self):
+        from app.modules.directory_media import DirectoryMediaInspector
+
+        adult_dir = _dir("adult-dir", "ATID-675")
+        video = _file(
+            "adult-video", "hhd800.com@ATID-675.mp4", "adult-dir",
+        )
+        client = _TreeClient(
+            {"adult-dir": [video], "archive": []},
+            {
+                "adult-dir": adult_dir,
+                "adult-video": video,
+                "archive": _dir("archive", "媒体库"),
+            },
+        )
+        rules = OrganizeRules(
+            target_dir_id="archive", small_file_mb=0,
+            nsfw_enabled=True, nsfw_exclusive=True,
+            nsfw_metatube_endpoint="http://127.0.0.1:8080",
+        )
+        inspector = DirectoryMediaInspector(
+            client=client, scraper=TMDBScraper(),
+        )
+
+        directory = inspector.inspect("adult-dir", rules)
+        selected_file = inspector.inspect_file("adult-video", rules)
+
+        for inspection in (directory, selected_file):
+            self.assertEqual(inspection.suggested_query, "ATID-675")
+            self.assertEqual(inspection.media_type, "movie")
+            self.assertIsNone(inspection.season)
+            self.assertIsNone(inspection.episode)
+            self.assertEqual(inspection.videos[0].season, None)
+            self.assertEqual(inspection.videos[0].episode, None)
+
     def test_release_episode_uses_clean_title_and_infers_season_one(self):
         from app.modules.directory_media import DirectoryMediaInspector
 
@@ -1822,6 +1858,70 @@ class DirectoryScrapeServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "requires_manual")
         self.assertIn("类型", result["message"])
 
+    def test_nsfw_single_file_auto_match_keeps_movie_identity(self):
+        from app.modules.directory_scrape import DirectoryScrapeService, DirectoryScrapeStore
+
+        offline_root = _dir("offline-root", "离线")
+        adult_dir = _dir("adult-dir", "ATID-675", "offline-root")
+        video = _file(
+            "adult-video", "hhd800.com@ATID-675.mp4", "adult-dir",
+        )
+        tree = {
+            "offline-root": [adult_dir],
+            "adult-dir": [video],
+            "archive": [],
+        }
+        infos = {
+            "offline-root": offline_root,
+            "adult-dir": adult_dir,
+            "adult-video": video,
+            "archive": _dir("archive", "媒体库"),
+        }
+        client = _TreeClient(tree, infos)
+        rules = OrganizeRules(
+            target_dir_id="archive",
+            small_file_mb=0,
+            nsfw_enabled=True,
+            nsfw_source_ids='["offline-root"]',
+            nsfw_metatube_endpoint="http://127.0.0.1:8080",
+        )
+        service = DirectoryScrapeService(
+            client=client,
+            scraper=TMDBScraper(),
+            store=DirectoryScrapeStore(clock=lambda: 100.0),
+            rules_loader=lambda: rules,
+        )
+        inspected = service.inspect_file("owner", "adult-video")
+        match = MatchResult(
+            title="ATID-675",
+            year="2026",
+            media_type="movie",
+            confidence=1.0,
+            status="matched",
+            matched_by="metatube",
+            provider="metatube",
+            external_id="javbus:atid-675",
+        )
+
+        with patch.object(service, "_recognize", return_value=match) as recognize, \
+                patch.object(service, "preview", return_value={"preview_id": "preview"}) as preview:
+            result = service.auto_match("owner", inspected["inspection_id"])
+
+        self.assertEqual(inspected["suggested_query"], "ATID-675")
+        self.assertEqual(inspected["media_type"], "movie")
+        self.assertIsNone(inspected["season"])
+        self.assertIsNone(inspected["episode"])
+        self.assertEqual(result["status"], "matched")
+        recognize.assert_called_once_with(
+            "hhd800.com@ATID-675.mp4",
+            "hhd800.com@ATID-675.mp4",
+            service.store.get_inspection("owner", inspected["inspection_id"]).rules,
+        )
+        preview.assert_called_once_with(
+            "owner", inspected["inspection_id"], "", "movie",
+            provider="metatube", external_id="javbus:atid-675",
+        )
+
 
 class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
     def setUp(self):
@@ -1955,6 +2055,22 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
 
         self.assertTrue(calls)
         self.assertIs(calls[0].get("media_probe_cache_only"), False)
+
+    def test_execute_preview_compares_same_source_scoped_rules_snapshot(self):
+        global_rules = replace(
+            self.rules,
+            nsfw_enabled=True,
+            nsfw_source_ids='["movie-dir"]',
+            nsfw_metatube_endpoint="http://127.0.0.1:8080",
+        )
+        record = self.store.get_preview("owner", self.preview_id)
+        record.rules = global_rules.for_source("movie-dir")
+        self.service.rules_loader = lambda: global_rules
+
+        with patch.object(
+            self.service, "_inspect_scope", side_effect=ValueError("stop after rules")
+        ), self.assertRaisesRegex(RuntimeError, "目录内容已变化"):
+            self.service.execute_preview("owner", self.preview_id)
 
     def test_execute_preview_rejects_changed_directory_snapshot(self):
         self.client.rename("v1", "Changed.Name.2008.mkv")
@@ -3444,6 +3560,7 @@ class DirectoryScrapeSecretBoundaryTests(IsolatedDatabaseTestCase):
             clean_empty=False,
             link_strm=False,
             notify_enabled=False,
+            nsfw_metatube_token=self.SECRET,
         )
         inspection = DirectoryInspection(
             directory_id="source",
@@ -3472,6 +3589,7 @@ class DirectoryScrapeSecretBoundaryTests(IsolatedDatabaseTestCase):
 
         serialized = json.dumps(preview, ensure_ascii=False)
         self.assertNotIn(self.SECRET, serialized)
+        self.assertNotIn("nsfw_metatube_token", preview["rules"])
         self.assertEqual(preview["stats"]["scan_errors"], [])
         client.list_dir.assert_not_called()
 

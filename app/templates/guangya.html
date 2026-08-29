@@ -114,7 +114,7 @@
 <div class="gy-directory-context-menu" id="gyDirectoryContextMenu" role="menu" aria-label="目录与文件操作" hidden>
     <button type="button" role="menuitem" data-scrape-action="manual">
         <i data-lucide="search-check"></i>
-        <span><strong>搜索并刮削</strong><small>人工选择 TMDB 媒体</small></span>
+        <span><strong>搜索并刮削</strong><small>人工核对媒体身份与归档目标</small></span>
     </button>
     <button type="button" role="menuitem" data-scrape-action="auto">
         <i data-lucide="wand-sparkles"></i>
@@ -155,7 +155,7 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260828a"></script>
-<script src="{{ url_for('static', path='js/guangya-directory-scrape.js') }}?v=20260828c"></script>
+<script src="{{ url_for('static', path='js/guangya-directory-scrape.js') }}?v=20260829a"></script>
 <script>
 function gyApi(path, opts){
     return fetch('/api/guangya'+path, opts).then(async response=>{

@@ -1456,6 +1456,7 @@ class OrganizeTaskManager:
                 if not _credential_snapshot_is_current(client, expected_credential_generation):
                     raise RuntimeError("光鸭登录凭据已变化，已拒绝继续整理")
                 current_source = str(source.get("name") or source.get("id") or "")
+                source_rules = rules.for_source(str(source.get("id") or ""))
                 with self._state_lock:
                     self._task["current_source"] = current_source
                     self._task["message"] = f"正在整理：{current_source}"
@@ -1489,10 +1490,10 @@ class OrganizeTaskManager:
                             self._task["message"] = f"正在整理：{_source} · {detail}"
 
                 organizer._validate_target_outside_source(
-                    source["id"], rules.target_dir_id
+                    source["id"], source_rules.target_dir_id
                 )
                 _plans, stats = organizer.organize(
-                    source["id"], rules, dry_run=False,
+                    source["id"], source_rules, dry_run=False,
                     cancel_event=self._cancel_event, post_actions=False,
                     source_name=current_source,
                     require_complete_scan=True,
@@ -1504,7 +1505,7 @@ class OrganizeTaskManager:
                     organizer,
                     source["id"],
                     current_source,
-                    rules,
+                    source_rules,
                     stats,
                     trigger_type=trigger_type,
                 )

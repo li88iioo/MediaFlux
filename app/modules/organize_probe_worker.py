@@ -10,7 +10,6 @@ import json
 import logging
 import threading
 import uuid
-from dataclasses import fields
 
 from app import database as db
 from app.clients.guangya import GuangYaClient, GuangYaFile
@@ -144,15 +143,13 @@ class OrganizeProbeWorker:
 
     @staticmethod
     def _rules_from_job(job: dict):
-        from app.modules.organize import OrganizeRules, enforce_fixed_organize_rules
+        from app.modules.organize import restore_organize_rules_snapshot
 
         try:
             raw = json.loads(str(job.get("rules_json") or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             raw = {}
-        allowed = {item.name for item in fields(OrganizeRules)}
-        values = {key: value for key, value in raw.items() if key in allowed}
-        return enforce_fixed_organize_rules(OrganizeRules(**values))
+        return restore_organize_rules_snapshot(raw)
 
     def _desired_plan(
         self, job: dict, log: dict, video: dict, remote: GuangYaFile, profile,

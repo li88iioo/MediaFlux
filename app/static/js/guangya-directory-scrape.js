@@ -250,6 +250,30 @@
         return Boolean(state.activeDirectory && !state.activeDirectory.is_dir);
     }
 
+    function isNsfwOnly() {
+        return Boolean(state.inspection?.nsfw_only);
+    }
+
+    function syncRecognitionMode() {
+        const nsfwOnly = isNsfwOnly();
+        modal.toggleAttribute('data-nsfw-only', nsfwOnly);
+        const queryLabel = elements.query.closest('label')?.querySelector('span');
+        const typeLabel = elements.type.closest('label')?.querySelector('span');
+        const candidateTitle = document.getElementById('gyScrapeCandidateTitle');
+        const candidateTab = modal.querySelector('[data-scrape-mobile-pane="candidates"] span');
+
+        if (nsfwOnly) elements.type.value = 'movie';
+        elements.type.disabled = nsfwOnly;
+        elements.query.placeholder = nsfwOnly ? '输入番号，或保留包含番号的文件名' : '输入电影或剧集名称';
+        if (queryLabel) queryLabel.textContent = nsfwOnly ? '番号或文件名' : '搜索名称';
+        if (typeLabel) typeLabel.textContent = nsfwOnly ? '归档结构' : '媒体类型';
+        if (candidateTitle) candidateTitle.textContent = nsfwOnly ? 'MetaTube 精确候选' : '媒体候选';
+        if (candidateTab) candidateTab.textContent = nsfwOnly ? '番号候选' : '媒体候选';
+        if (elements.cleanBtn) elements.cleanBtn.hidden = nsfwOnly;
+        if (elements.externalBtn) elements.externalBtn.hidden = nsfwOnly;
+        setButtonContent(elements.search, 'search', nsfwOnly ? '识别番号' : '搜索');
+    }
+
     function syncEpisodeFields(mediaType = elements.type.value) {
         positionControls.sync(mediaType);
     }
@@ -356,18 +380,23 @@
         setButtonContent(elements.externalBtn, 'book-open-check', '豆瓣 / BGM 线索');
         elements.externalHints.hidden = true;
         elements.externalHints.replaceChildren();
+        syncRecognitionMode();
         elements.candidateCount.textContent = '0 项';
         placeholder(
             elements.candidates,
-            'scan-search',
-            '正在准备媒体搜索',
-            '搜索结果会保留在这里，切换候选不会改变弹窗尺寸。',
+            isNsfwOnly() ? 'shield-check' : 'scan-search',
+            isNsfwOnly() ? '正在准备番号识别' : '正在准备媒体搜索',
+            isNsfwOnly()
+                ? '只会查询 MetaTube 的完全一致番号，不会调用或回退 TMDB。'
+                : '搜索结果会保留在这里，切换候选不会改变弹窗尺寸。',
         );
         placeholder(
             elements.detail,
             'clapperboard',
-            '选择一个媒体候选',
-            '选择候选后，将逐项核对源文件、季集映射和最终归档名称。',
+            isNsfwOnly() ? '选择精确番号候选' : '选择一个媒体候选',
+            isNsfwOnly()
+                ? '确认 MetaTube 身份后，将逐项核对源文件与成人归档分类目录。'
+                : '选择候选后，将逐项核对源文件、季集映射和最终归档名称。',
         );
     }
 
@@ -436,8 +465,10 @@
             placeholder(
                 elements.candidates,
                 'search-x',
-                '没有找到候选',
-                '可以修改搜索名称或切换电影/剧集类型后重试。',
+                isNsfwOnly() ? '没有找到完全一致的番号' : '没有找到候选',
+                isNsfwOnly()
+                    ? '请检查文件名中的番号；专用来源不会改走 TMDB 或采用相似结果。'
+                    : '可以修改搜索名称或切换电影/剧集类型后重试。',
             );
             return;
         }
@@ -533,6 +564,14 @@
 
     async function loadExternalHints() {
         if (!state.inspection) return;
+        if (isNsfwOnly()) {
+            window.appAlert?.({
+                type: 'info',
+                title: '成人番号专用来源',
+                message: '该来源只使用 MetaTube 精确番号识别，不调用豆瓣、Bangumi 或 TMDB。',
+            });
+            return;
+        }
         const query = elements.query.value.trim();
         if (!query) {
             window.appAlert?.({type: 'warning', title: '缺少搜索名称', message: '请先输入媒体名称'});
@@ -870,13 +909,17 @@
         setPlanReady(false);
         setMobilePane('candidates');
         elements.run.disabled = true;
-        elements.status.textContent = '正在更新候选';
-        elements.planSummary.textContent = '选择候选后生成归档预览';
+        elements.status.textContent = isNsfwOnly() ? '正在核对番号' : '正在更新候选';
+        elements.planSummary.textContent = isNsfwOnly()
+            ? '只接受完全一致的 MetaTube 番号结果'
+            : '选择候选后生成归档预览';
         placeholder(
             elements.detail,
             'route',
-            '选择候选生成预览',
-            '搜索结果更新后，请选择候选核对季集映射和最终归档名称。',
+            isNsfwOnly() ? '选择精确番号候选' : '选择候选生成预览',
+            isNsfwOnly()
+                ? '候选返回后，请核对番号、标题与最终成人归档分类目录。'
+                : '搜索结果更新后，请选择候选核对季集映射和最终归档名称。',
         );
         const previous = elements.search.querySelector('span')?.textContent || '搜索';
         elements.search.disabled = true;
@@ -887,7 +930,7 @@
             const data = await api('/search', {
                 inspection_id: state.inspection.inspection_id,
                 query,
-                media_type: elements.type.value,
+                media_type: isNsfwOnly() ? 'movie' : elements.type.value,
             }, {signal: controller.signal});
             if (version !== state.requestVersion) return;
             renderCandidates(data.candidates || []);

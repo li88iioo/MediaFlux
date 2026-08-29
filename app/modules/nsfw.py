@@ -1,7 +1,7 @@
-"""可选的成人媒体番号识别与 MetaTube 元数据客户端。
+"""来源级成人媒体番号识别与 MetaTube 元数据客户端。
 
-该模块只在明确识别到高置信番号时访问用户配置的 MetaTube 服务。普通影视名称
-不会发送到成人元数据服务，网络错误也不会阻断既有 TMDB 识别链路。
+只有被用户显式标记为成人番号专用的整理来源才会调用本模块；该来源只接受
+番号与 MetaTube 返回番号完全一致的结果，不会回退普通 TMDB 识别链路。
 """
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import hashlib
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -63,6 +63,20 @@ class NsfwIdentifier:
 
 
 @dataclass(frozen=True)
+class NsfwMultipart:
+    """成人媒体分段标记。
+
+    ``part_index`` 仅在文件名明确包含数字分段时赋值；字母分段等无法可靠
+    判断先后顺序的形式会标记 ``ambiguous``，由人工确认决定。
+    """
+
+    part_index: int | None = None
+    token: str = ""
+    ambiguous: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class MetaTubeMetadata:
     provider: str
     external_id: str
@@ -97,6 +111,83 @@ class MetaTubeMetadata:
         ):
             return title
         return " ".join(part for part in (number, title) if part).strip()
+
+
+_METATUBE_PROVIDER_PRIORITY = {
+    # 数据完整度相同时优先使用更常见、身份编号更稳定的聚合源。
+    "javbus": 40,
+    "javdb": 30,
+    "jav321": 20,
+    "duga": 10,
+}
+
+
+def _equivalent_metatube_metadata(
+    left: MetaTubeMetadata, right: MetaTubeMetadata,
+) -> bool:
+    """精确番号且年份不冲突时视为同一作品的跨源副本。
+
+    成人片名是各元数据站点自行编写的描述文案，同一番号经常出现完全不同的
+    标题前缀、宣传语和发布日期。精确番号才是稳定身份；标题不能反过来把
+    同一作品拆成人工候选。只有双方都给出年份且年份矛盾时才保留人工确认。
+    """
+    if normalize_code(left.number) != normalize_code(right.number):
+        return False
+    return not (left.year and right.year and left.year != right.year)
+
+
+def _metadata_quality_key(item: MetaTubeMetadata) -> tuple[int, ...]:
+    populated = sum(bool(value) for value in (
+        item.release_date, item.actors, item.genres, item.maker, item.label,
+        item.director, item.series, item.summary, item.cover_url, item.thumb_url,
+        item.homepage,
+    ))
+    canonical_external_id = int(
+        _code_comparison_key(item.external_id) == _code_comparison_key(item.number)
+    )
+    return (
+        populated,
+        int(bool(item.cover_url)),
+        int(bool(item.release_date)),
+        min(len(item.actors), 20),
+        min(len(item.genres), 20),
+        min(len(item.summary), 5000),
+        canonical_external_id,
+        _METATUBE_PROVIDER_PRIORITY.get(item.provider.casefold(), 0),
+    )
+
+
+def _collapse_equivalent_metatube_results(
+    rows: list[MetaTubeMetadata],
+) -> list[MetaTubeMetadata]:
+    """合并同一作品的跨 provider 副本，保留真实冲突供人工确认。"""
+    clusters: list[list[MetaTubeMetadata]] = []
+    for item in rows:
+        for cluster in clusters:
+            if all(_equivalent_metatube_metadata(item, member) for member in cluster):
+                cluster.append(item)
+                break
+        else:
+            clusters.append([item])
+
+    collapsed: list[MetaTubeMetadata] = []
+    for cluster in clusters:
+        stable = sorted(
+            cluster, key=lambda item: (item.provider.casefold(), item.external_id.casefold())
+        )
+        selected = max(stable, key=_metadata_quality_key)
+        if len(cluster) > 1:
+            raw = dict(selected.raw)
+            raw["mediaflux_equivalent_sources"] = [
+                {"provider": item.provider, "id": item.external_id}
+                for item in stable
+            ]
+            raw["mediaflux_equivalent_source_count"] = len(cluster)
+            selected = replace(selected, raw=raw)
+        collapsed.append(selected)
+    return sorted(
+        collapsed, key=lambda item: (item.provider.casefold(), item.external_id.casefold())
+    )
 
 
 def normalize_code(value: str) -> str:
@@ -172,13 +263,143 @@ def extract_nsfw_identifier(value: str, strip_domains: str = "") -> NsfwIdentifi
             number = match.group(2)
             if prefix in _CODE_PREFIX_BLOCKLIST:
                 continue
-            if prefix.startswith(("S", "E")) and len(prefix) <= 3:
+            # 只排除真正的季/集占位；不能按首字母整段屏蔽，否则 SW、SD、
+            # EB 等合法成人番号前缀会被误判为普通剧集位置。
+            if prefix in {"S", "E"}:
                 continue
             if len(number) == 4 and 1900 <= int(number) <= 2099:
                 continue
             return NsfwIdentifier(f"{prefix}-{number}", match.group(0), source)
     return None
 
+
+_MEDIA_EXTENSION_RE = re.compile(
+    r"(?i)\.(?:mkv|mp4|avi|mov|wmv|flv|m2ts|ts|iso|rmvb|webm|strm)$"
+)
+_MULTIPART_LABEL_RE = re.compile(
+    r"(?i)^[\s._\-]*(?:CD|DISC|DISK|PART|PT)[\s._\-]*(\d{1,2})(?=$|[\s._\-])"
+)
+_MULTIPART_NUMERIC_RE = re.compile(r"^[\s._\-]+(\d{1,2})(?=$|[\s._\-])")
+_MULTIPART_ALPHA_RE = re.compile(
+    r"(?i)^[\s._\-]*(?:CD|DISC|DISK|PART|PT)?[\s._\-]*([AB])(?=$|[\s._\-])"
+)
+_LEADING_RELEASE_YEAR_RE = re.compile(r"^(?:19|20)\d{2}(?=$|[\s._\-])")
+
+
+def _identifier_span(value: str, identifier: NsfwIdentifier) -> tuple[str, int, int] | None:
+    """在清洗后的字符串中定位番号，兼容连字符、点、空格和紧凑写法。"""
+    cleaned = str(value or "")
+    code = normalize_code(identifier.code)
+    parts = [part for part in code.split("-") if part]
+    if not parts:
+        return None
+    pattern = re.compile(
+        r"(?i)(?<![A-Z0-9])" + r"[\s._-]*".join(map(re.escape, parts))
+        + r"(?![A-Z0-9])"
+    )
+    match = pattern.search(cleaned)
+    if match is None:
+        compact = re.sub(r"[^A-Z0-9]", "", code)
+        if not compact:
+            return None
+        match = re.search(rf"(?i)(?<![A-Z0-9]){re.escape(compact)}(?![A-Z0-9])", cleaned)
+    return (cleaned, match.start(), match.end()) if match else None
+
+
+def extract_nsfw_multipart(value: str, strip_domains: str = "") -> NsfwMultipart | None:
+    """提取强确定性的成人媒体分段；不把普通标题数字误当成分段。"""
+    identifier = extract_nsfw_identifier(value, strip_domains)
+    if identifier is None:
+        return None
+    cleaned = clean_nsfw_release_text(value, strip_domains)
+    located = _identifier_span(cleaned, identifier)
+    if located is None:
+        return None
+    cleaned, _start, end = located
+    suffix = _MEDIA_EXTENSION_RE.sub("", cleaned[end:].strip())
+    label = _MULTIPART_LABEL_RE.match(suffix)
+    if label:
+        index = int(label.group(1))
+        if 1 <= index <= 99:
+            return NsfwMultipart(index, label.group(0).strip(" ._-"), False, "explicit_label")
+    numeric = _MULTIPART_NUMERIC_RE.match(suffix)
+    if numeric:
+        index = int(numeric.group(1))
+        if 1 <= index <= 99:
+            return NsfwMultipart(index, numeric.group(1), False, "numeric_suffix")
+    alpha = _MULTIPART_ALPHA_RE.match(suffix)
+    if alpha:
+        return NsfwMultipart(
+            None,
+            alpha.group(0).strip(" ._-"),
+            True,
+            "字母分段无法安全确定先后顺序",
+        )
+    return None
+
+
+def extract_nsfw_part_index(value: str) -> int | None:
+    """从已归档名称读取 ``CDn`` 分段，用于目标目录冲突判定。"""
+    matches = list(re.finditer(
+        r"(?i)(?:^|[._ \-])CD(\d{1,2})(?=$|[._ \-])",
+        str(value or ""),
+    ))
+    if not matches:
+        return None
+    index = int(matches[-1].group(1))
+    return index if 1 <= index <= 99 else None
+
+
+def clean_nsfw_archive_title(value: str, strip_domains: str = "") -> str:
+    """生成无元数据时可直接归档的安全标题。
+
+    优先保留标准番号；仅当文件名在去除站点、扩展名、分段和技术噪声后仍有
+    可读描述时才追加描述，避免把下载站域名或编码信息写入媒体库。
+    """
+    identifier = extract_nsfw_identifier(value, strip_domains)
+    cleaned = clean_nsfw_release_text(value, strip_domains)
+    cleaned = _MEDIA_EXTENSION_RE.sub("", cleaned).strip()
+    cleaned = re.sub(r"^[\s@._\-]+|[\s@._\-]+$", "", cleaned)
+    if identifier is None:
+        return re.sub(r"[._]+", " ", cleaned).strip()
+
+    located = _identifier_span(cleaned, identifier)
+    code = normalize_code(identifier.code)
+    if located is None:
+        return code
+    _text, _start, end = located
+    tail = cleaned[end:]
+    tail = _MULTIPART_LABEL_RE.sub(" ", tail, count=1)
+    tail = _MULTIPART_NUMERIC_RE.sub(" ", tail, count=1)
+    tail = _MULTIPART_ALPHA_RE.sub(" ", tail, count=1)
+    tail = re.sub(r"^[\s@._\-]+", "", tail)
+    tail = _LEADING_RELEASE_YEAR_RE.sub(" ", tail, count=1)
+    tail = re.sub(r"^[\s@._\-]+", "", tail)
+    tail = re.sub(r"[._]+", " ", tail)
+    tail = re.sub(r"\s+", " ", tail).strip(" -_.@")
+    return f"{code} {tail}".strip() if tail else code
+
+
+def build_clean_title_candidate(value: str, strip_domains: str = "") -> dict[str, object] | None:
+    """为 MetaTube 无结果的明确番号生成“清洗标题后入库”候选。"""
+    identifier = extract_nsfw_identifier(value, strip_domains)
+    if identifier is None:
+        return None
+    title = clean_nsfw_archive_title(value, strip_domains)
+    if not title:
+        return None
+    code = normalize_code(identifier.code)
+    return {
+        "provider": "clean_title",
+        "external_id": code,
+        "tmdb_id": "",
+        "media_type": "movie",
+        "title": title,
+        "year": "",
+        "score": 1.0,
+        "support": 1,
+        "metadata": {"number": code, "title": title, "fallback": True},
+    }
 
 def validate_category_name(value: str) -> str:
     category = str(value or "成人内容").strip()
@@ -422,6 +643,7 @@ class NsfwRecognizer:
             rows, error = cached
             if error or rows is None:
                 return []
+        rows = _collapse_equivalent_metatube_results(list(rows))
         result: list[Candidate] = []
         for item in rows:
             result.append(Candidate(
@@ -447,6 +669,12 @@ class NsfwRecognizer:
             return None
         candidate = candidates[0]
         ambiguous = len(candidates) > 1
+        try:
+            equivalent_source_count = max(1, int(
+                candidate.metadata.get("mediaflux_equivalent_source_count") or 1
+            ))
+        except (TypeError, ValueError, OverflowError):
+            equivalent_source_count = 1
         return MatchResult(
             tmdb_id="",
             title=candidate.title,
@@ -455,9 +683,12 @@ class NsfwRecognizer:
             confidence=1.0,
             candidates=candidates,
             need_confirm=ambiguous,
-            error="同一番号命中多个元数据来源，请人工选择" if ambiguous else "",
+            error="同一番号存在相互冲突的元数据，请人工选择" if ambiguous else "",
             status="ambiguous" if ambiguous else "matched",
-            matched_by="metatube_exact",
+            matched_by=(
+                "metatube_equivalent_sources"
+                if equivalent_source_count > 1 else "metatube_exact"
+            ),
             threshold=1.0,
             provider="metatube",
             external_id=candidate.external_id,

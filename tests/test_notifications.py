@@ -675,7 +675,7 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
             "视频 302 · 入库 187 · 待确认 2 · 跳过 113",
         )
         self.assertIn("⚠️ 待确认 2 组", footer)
-        self.assertIn("请在下方候选卡中选择匹配结果", footer)
+        self.assertIn("2 组可直接选择识别候选", footer)
         self.assertIn("⏭️ 跳过 113 个", footer)
         self.assertIn("• 同版本仍按冲突策略处理", footer)
         self.assertNotIn("最佳候选", footer)

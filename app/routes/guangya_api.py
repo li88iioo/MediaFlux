@@ -344,13 +344,14 @@ def organize_preview(request: Request, data: dict | None = Body(default=None)):
         for source in sources:
             if max_files and remaining <= 0:
                 break
+            source_rules = rules.for_source(str(source.get("id") or ""))
             organizer = Organizer()
             organizer._validate_target_outside_source(
-                source["id"], rules.target_dir_id
+                source["id"], source_rules.target_dir_id
             )
             plans, stats = organizer.organize(
                 source["id"],
-                rules,
+                source_rules,
                 dry_run=True,
                 max_files=remaining if max_files else 0,
                 protected_source_ids=protected_source_ids,

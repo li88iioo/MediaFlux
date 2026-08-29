@@ -390,15 +390,15 @@ def safe_path_component(
     return result
 
 
-_METATUBE_IDENTITY_TAG = re.compile(
-    r"\s*[\{\(]metatube-[A-Za-z0-9._-]+[\}\)]\s*",
+_ADULT_IDENTITY_TAG = re.compile(
+    r"\s*[\{\(](?:metatube|clean_title)-[A-Za-z0-9._-]+[\}\)]\s*",
     re.IGNORECASE,
 )
 
 
 def _jellyfin_visible_name(value: str) -> str:
-    """移除 Jellyfin 不识别的 MetaTube 内部身份标记。"""
-    cleaned = _METATUBE_IDENTITY_TAG.sub(" ", str(value or ""))
+    """移除 Jellyfin 不识别的成人媒体内部身份标记。"""
+    cleaned = _ADULT_IDENTITY_TAG.sub(" ", str(value or ""))
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return re.sub(r"\s+(?=\.[A-Za-z0-9]{1,8}$)", "", cleaned)
 

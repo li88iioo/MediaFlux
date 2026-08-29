@@ -65,6 +65,8 @@ from app.modules.special_media import (
 
 _SERVER_ONLY_RULE_FIELDS = {
     "nsfw_enabled",
+    "nsfw_source_ids",
+    "nsfw_exclusive",
     "nsfw_metatube_endpoint",
     "nsfw_metatube_token",
     "nsfw_category_name",
@@ -316,6 +318,13 @@ class LocalMediaService:
         owner: str = "admin",
         inspection_id: str = "",
     ) -> list[dict[str, Any]]:
+        if inspection_id:
+            inspection = self.inspections.get(owner, inspection_id)
+            source = db.get_local_media_source(inspection.source_id, owner=owner)
+            if source is not None and source.media_type == "nsfw":
+                raise LocalMediaServiceError(
+                    "成人番号专用来源不使用 TMDB 搜索，请直接运行 MetaTube 自动识别"
+                )
         effective_type = str(media_type or "").strip().lower()
         if effective_type == "auto":
             if inspection_id:
@@ -341,6 +350,11 @@ class LocalMediaService:
         media_type: str = "auto",
     ) -> dict[str, Any]:
         inspection = self.inspections.get(owner, inspection_id)
+        source = db.get_local_media_source(inspection.source_id, owner=owner)
+        if source is not None and source.media_type == "nsfw":
+            raise LocalMediaServiceError(
+                "成人番号专用来源不使用豆瓣/BGM 或普通 TMDB 线索"
+            )
         search_query = str(query or "").strip()
         if not search_query:
             raise LocalMediaServiceError("请输入外部资料搜索词")
@@ -576,7 +590,15 @@ class LocalMediaService:
 
     @staticmethod
     def _target_directory_for_plan(plan: OrganizePlan, targets):
-        category = _CATEGORY_KEYS.get(plan.main_category, "default")
+        provider = str(getattr(plan.match, "provider", "") or "").strip().lower()
+        # MetaTube 结果采用电影目录结构，但仍复用“媒体库”页面为当前来源
+        # 选择的真实电影/默认归档映射。这里不能把成人分类名当成一套新的
+        # 本地媒体库类型，否则会绕开用户已经配置好的媒体库下拉选择。
+        category = (
+            "movie"
+            if provider in {"metatube", "clean_title"}
+            else _CATEGORY_KEYS.get(plan.main_category, "default")
+        )
         by_category = {item.category: item for item in targets}
         media_fallback = (
             "tv"
@@ -797,7 +819,15 @@ class LocalMediaService:
             }
             if allowed_overrides:
                 rules = replace(rules, **allowed_overrides)
-        rules = enforce_fixed_organize_rules(rules)
+        rules = enforce_fixed_organize_rules(rules).for_local_source(source.media_type)
+        nsfw_only = source.media_type == "nsfw"
+        if nsfw_only and (
+            not rules.nsfw_enabled
+            or not str(rules.nsfw_metatube_endpoint or "").strip()
+        ):
+            raise LocalMediaServiceError(
+                "该来源已设为成人番号专用，但 MetaTube 成人识别尚未启用或配置完整"
+            )
         effective_rules_snapshot = self._serialize_rules_snapshot(rules)
 
         cleanup_candidates = cleanup_candidates_from_snapshots(current)
@@ -818,17 +848,26 @@ class LocalMediaService:
             raise LocalMediaServiceError("选择路径中没有可整理的视频")
 
         requested_media_type = str(media_type or "").strip().lower()
-        if requested_media_type not in {"", "auto", "movie", "tv"}:
-            raise LocalMediaServiceError("媒体类型必须是 auto、movie 或 tv")
-        effective_media_type = requested_media_type
-        if effective_media_type in {"", "auto"}:
-            effective_media_type = (
-                inspection.media_type
-                if inspection.media_type in {"movie", "tv"}
-                else source.media_type
-            )
-        if effective_media_type not in {"movie", "tv"}:
+        if nsfw_only:
+            if str(tmdb_id or "").strip():
+                raise LocalMediaServiceError(
+                    "成人番号专用来源不能套用 TMDB 候选，只接受 MetaTube 精确番号结果"
+                )
+            if requested_media_type not in {"", "auto", "movie", "nsfw"}:
+                raise LocalMediaServiceError("成人番号专用来源只能按电影结构归档")
             effective_media_type = "movie"
+        else:
+            if requested_media_type not in {"", "auto", "movie", "tv"}:
+                raise LocalMediaServiceError("媒体类型必须是 auto、movie 或 tv")
+            effective_media_type = requested_media_type
+            if effective_media_type in {"", "auto"}:
+                effective_media_type = (
+                    inspection.media_type
+                    if inspection.media_type in {"movie", "tv"}
+                    else source.media_type
+                )
+            if effective_media_type not in {"movie", "tv"}:
+                effective_media_type = "movie"
         if (
             season_override is not None or episode_override is not None
         ) and effective_media_type != "tv":
@@ -1557,8 +1596,15 @@ class LocalMediaService:
         if normalized_type not in {"", "auto", "movie", "tv"}:
             raise LocalMediaServiceError("媒体类型必须是 auto、movie 或 tv")
         source = db.get_local_media_source(inspection.source_id, owner=owner)
+        nsfw_only = source is not None and source.media_type == "nsfw"
+        if nsfw_only and str(tmdb_id or "").strip():
+            raise LocalMediaServiceError(
+                "成人番号专用来源不能套用 TMDB 候选，只接受 MetaTube 精确番号结果"
+            )
         effective_type = (
-            normalized_type
+            "movie"
+            if nsfw_only
+            else normalized_type
             if normalized_type in {"movie", "tv"}
             else inspection.media_type or (source.media_type if source else "")
         )

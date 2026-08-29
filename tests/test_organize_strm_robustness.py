@@ -185,7 +185,10 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
         ):
             execute_organize_plans(organizer,
                 [plan],
-                OrganizeRules(target_dir_id="archive", rename_enabled=True),
+                OrganizeRules(
+                    target_dir_id="archive", rename_enabled=True,
+                    nsfw_metatube_token="server-secret",
+                ),
                 stats, {}, None, source_dir_id="source-id",
             )
 
@@ -200,6 +203,8 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
             "电影/Movie (2026) {tmdb-1}",
         )
         self.assertTrue(enqueue_probe.call_args.kwargs["rules"]["media_probe_enabled"])
+        self.assertNotIn("nsfw_metatube_token", enqueue_probe.call_args.kwargs["rules"])
+        self.assertNotIn("server-secret", str(enqueue_probe.call_args.kwargs["rules"]))
         probe_worker.wake.assert_called_once_with()
         self.assertEqual(stats["strm_changes"], [{
             "source_id": "archive", "kind": "video", "action": "upsert",
