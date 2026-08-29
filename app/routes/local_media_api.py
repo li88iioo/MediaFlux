@@ -103,9 +103,9 @@ def _source_payload(source) -> dict:
     return {
         "id": source.id, "name": source.name, "qb_profile": source.qb_profile,
         "qb_path_prefix": source.qb_path_prefix, "local_root": source.local_root,
-        "enabled": source.enabled, "stable_seconds": source.stable_seconds,
-        "scan_enabled": source.scan_enabled,
-        "scan_interval_minutes": source.scan_interval_minutes,
+        "enabled": source.enabled,
+        # 旧字段保留在响应中兼容历史客户端，但产品链路已取消固定等待与定时扫描。
+        "stable_seconds": 0, "scan_enabled": False, "scan_interval_minutes": 10,
         "media_type": source.media_type, "mode": source.mode,
         "targets": [
             {"id": item.id, "category": item.category, "path": item.path,
@@ -140,6 +140,7 @@ def _task_payload(task) -> dict:
         "tmdb_id": getattr(task, "tmdb_id", ""), "media_type": getattr(task, "media_type", ""),
         "season": getattr(task, "season_override", None),
         "episode": getattr(task, "episode_override", None),
+        "numbering_mode": getattr(task, "numbering_mode", "auto") or "auto",
         "clearable": task.status not in LOCAL_BUSY_TASK_STATUSES,
         "error": task.error, "warning": task.warning,
         "created_at": task.created_at, "updated_at": task.updated_at,
@@ -360,9 +361,8 @@ def create_source(request: Request, data: dict | None = Body(default=None)):
             qb_path_prefix=_text(payload, "qb_path_prefix"),
             local_root=local_root,
             enabled=_boolean(payload, "enabled", True),
-            stable_seconds=_integer(payload, "stable_seconds", 300, 0, 86400),
-            scan_enabled=_boolean(payload, "scan_enabled", False),
-            scan_interval_minutes=_integer(payload, "scan_interval_minutes", 10, 1, 1440),
+            # 保留数据库列以兼容旧数据；新来源不再启用固定等待或目录轮询。
+            stable_seconds=0, scan_enabled=False, scan_interval_minutes=10,
             owner=_OWNER, media_type=_text(payload, "media_type", max_length=16) or "auto",
             mode=_text(payload, "mode", max_length=16) or "move", targets=targets,
         )
@@ -400,9 +400,8 @@ def update_source(source_id: int, request: Request, data: dict | None = Body(def
             smb_user="",
             smb_pass="",
             enabled=_boolean(payload, "enabled", source.enabled) if "enabled" in payload else source.enabled,
-            stable_seconds=_integer(payload, "stable_seconds", source.stable_seconds, 0, 86400) if "stable_seconds" in payload else source.stable_seconds,
-            scan_enabled=_boolean(payload, "scan_enabled", source.scan_enabled) if "scan_enabled" in payload else source.scan_enabled,
-            scan_interval_minutes=_integer(payload, "scan_interval_minutes", source.scan_interval_minutes, 1, 1440) if "scan_interval_minutes" in payload else source.scan_interval_minutes,
+            # 编辑旧来源时同步归一化已废弃的等待/轮询配置，避免隐藏配置继续生效。
+            stable_seconds=0, scan_enabled=False, scan_interval_minutes=10,
             media_type=_text(payload, "media_type", max_length=16) if "media_type" in payload else source.media_type,
             mode=_text(payload, "mode", max_length=16) if "mode" in payload else source.mode,
             targets=effective_targets,
@@ -624,10 +623,17 @@ def search_media(request: Request, data: dict | None = Body(default=None)):
     payload = data or {}
     try:
         query = _text(payload, "query", required=True, max_length=256)
-        media_type = _text(payload, "media_type", max_length=16) or "movie"
-        if media_type not in {"movie", "tv"}:
-            raise ValueError("媒体类型必须是 movie 或 tv")
-        return {"candidates": get_local_media_service().search(query, _text(payload, "year", max_length=4), media_type)}
+        media_type = _text(payload, "media_type", max_length=16) or "auto"
+        if media_type not in {"auto", "movie", "tv"}:
+            raise ValueError("媒体类型必须是 auto、movie 或 tv")
+        inspection_id = _text(payload, "inspection_id", max_length=64)
+        return {"candidates": get_local_media_service().search(
+            query,
+            _text(payload, "year", max_length=4),
+            media_type,
+            owner=_OWNER,
+            inspection_id=inspection_id,
+        )}
     except Exception as exc:
         return _safe_error(exc)
 
@@ -647,8 +653,24 @@ def preview_media(request: Request, data: dict | None = Body(default=None)):
             episode_override=_optional_integer(
                 payload, "episode", minimum=1, maximum=999, label="集数",
             ),
+            numbering_mode=_text(payload, "numbering_mode", max_length=32) or "auto",
         )
         return {key: value for key, value in result.items() if not key.startswith("_")}
+    except Exception as exc:
+        return _safe_error(exc)
+
+
+@router.post("/external-hints")
+def external_hints(request: Request, data: dict | None = Body(default=None)):
+    require_api_login(request)
+    payload = data or {}
+    try:
+        return get_local_media_service().external_hints(
+            _OWNER,
+            _text(payload, "inspection_id", required=True, max_length=64),
+            _text(payload, "query", required=True, max_length=256),
+            _text(payload, "media_type", max_length=16) or "auto",
+        )
     except Exception as exc:
         return _safe_error(exc)
 
@@ -670,6 +692,7 @@ def execute_media(request: Request, data: dict | None = Body(default=None)):
             episode_override=_optional_integer(
                 payload, "episode", minimum=1, maximum=999, label="集数",
             ),
+            numbering_mode=_text(payload, "numbering_mode", max_length=32) or "auto",
         )
         if not db.claim_local_media_task(task_id, expected="waiting_stable", owner=_OWNER):
             raise LocalMediaServiceError("任务已被其他操作认领")
@@ -708,6 +731,10 @@ def retry_task(task_id: int, request: Request, data: dict | None = Body(default=
         if "episode" in payload:
             retry_fields["episode_override"] = _optional_integer(
                 payload, "episode", minimum=1, maximum=999, label="集数",
+            )
+        if "numbering_mode" in payload:
+            retry_fields["numbering_mode"] = (
+                _text(payload, "numbering_mode", max_length=32) or "auto"
             )
         if not db.reset_local_media_task(task_id, owner=_OWNER, **retry_fields):
             return api_error("任务不存在或当前状态不可重试", 409)

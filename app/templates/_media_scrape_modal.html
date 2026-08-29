@@ -74,6 +74,19 @@
             </button>
         </div>
 
+        {% if media_scrape.mobile_tabs %}
+        <nav class="{{ media_scrape.css }}-mobile-tabs" aria-label="刮削工作区视图">
+            <button type="button" class="is-active" data-scrape-mobile-pane="candidates"
+                    aria-pressed="true" aria-controls="{{ media_scrape.candidates_id }}">
+                <i data-lucide="list-filter"></i><span>媒体候选</span>
+            </button>
+            <button type="button" data-scrape-mobile-pane="preview"
+                    aria-pressed="false" aria-controls="{{ media_scrape.detail_id }}">
+                <i data-lucide="route"></i><span>归档预览</span>
+            </button>
+        </nav>
+        {% endif %}
+
         <div class="{{ media_scrape.css }}-workspace">
             <section class="{{ media_scrape.css }}-candidate-region"
                      aria-labelledby="{{ media_scrape.candidate_title_id }}">
@@ -81,7 +94,7 @@
                     <div><strong id="{{ media_scrape.candidate_title_id }}">媒体候选</strong><small id="{{ media_scrape.candidate_count_id }}">0 项</small></div>
                     {% if media_scrape.external_id %}
                     <button type="button" class="jump-btn {{ media_scrape.css }}-external-btn" id="{{ media_scrape.external_id }}">
-                        <i data-lucide="book-open-check"></i><span>豆瓣 / BGM 线索</span>
+                        <i data-lucide="book-open-check"></i><span>{{ media_scrape.external_label or "豆瓣 / BGM 线索" }}</span>
                     </button>
                     {% endif %}
                 </div>

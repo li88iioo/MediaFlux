@@ -28,7 +28,7 @@ _LOCAL_MEDIA_SOURCE_CONTROL_PATTERN = re.compile(
     rf"{_LOCAL_MEDIA_SOURCE_SCOPE_PATTERN}\s*"
     r"(?:(?:编号|序号)\s*)?[#:]?\s*(\d{1,5})\s*(?:的\s*)?"
     r"(q\s*b(?:ittorrent)?\s*(?:下载完成)?(?:自动)?接管|"
-    r"下载完成(?:自动)?接管|目录(?:自动)?扫描|自动扫描|扫描触发)"
+    r"下载完成(?:自动)?接管)"
     r"(?:一下)?[.!。！？]?$",
     re.IGNORECASE,
 )
@@ -91,9 +91,9 @@ def local_media_source_trigger_control_request(
     if source_number <= 0:
         return None
     trigger_text = re.sub(r"\s+", "", raw_trigger)
-    trigger = "qb_completed" if (
-        trigger_text.startswith("qb") or "下载完成" in trigger_text
-    ) else "scan"
+    if not (trigger_text.startswith("qb") or "下载完成" in trigger_text):
+        return None
+    trigger = "qb_completed"
     return (
         "local_media.set_source_trigger_enabled",
         {

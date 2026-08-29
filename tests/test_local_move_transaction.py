@@ -21,6 +21,8 @@ class Plan:
     role: str = "video"
     action: str = "move"
     expected_target_identity: tuple[int, int, int, int] | None = None
+    retire_target: Path | None = None
+    expected_retire_identity: tuple[int, int, int, int] | None = None
 
 
 class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
@@ -68,6 +70,123 @@ class LocalMoveTransactionTests(IsolatedDatabaseTestCase):
             self.assertEqual(result.status, "completed")
             self.assertFalse(source.exists())
             self.assertEqual(target.read_bytes(), b"new-version")
+            self.assertEqual(list(target_root.glob(".*.mediaflux-replaced-*")), [])
+
+    def test_replace_can_retire_differently_named_old_version(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root, target_root = root / "source", root / "library"
+            source_root.mkdir(); target_root.mkdir()
+            source = source_root / "Show.S01E01.2160p.mkv"
+            source.write_bytes(b"new-better-version")
+            old_target = target_root / "Show.S01E01.1080p.mkv"
+            old_target.write_bytes(b"old-version")
+            new_target = target_root / "Show.S01E01.2160p.mkv"
+            snapshot = LocalFilesystemAdapter(source_root).snapshot(source)
+            old_identity = LocalFilesystemAdapter.regular_file_identity(old_target)
+
+            result = LocalMoveTransaction(
+                [source_root], [target_root], operation_token="replace-renamed-version"
+            ).execute([Plan(
+                snapshot,
+                new_target,
+                action="replace",
+                retire_target=old_target,
+                expected_retire_identity=old_identity,
+            )])
+
+            self.assertEqual(result.status, "completed")
+            self.assertFalse(source.exists())
+            self.assertFalse(old_target.exists())
+            self.assertEqual(new_target.read_bytes(), b"new-better-version")
+            self.assertEqual(list(target_root.glob(".*.mediaflux-replaced-*")), [])
+
+    def test_later_failure_restores_differently_named_old_version(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root, target_root = root / "source", root / "library"
+            source_root.mkdir(); target_root.mkdir()
+            first = source_root / "Show.S01E01.2160p.mkv"
+            second = source_root / "Show.S01E02.mkv"
+            first.write_bytes(b"new-better-version")
+            second.write_bytes(b"second-version")
+            old_target = target_root / "Show.S01E01.1080p.mkv"
+            old_target.write_bytes(b"old-version")
+            new_target = target_root / "Show.S01E01.2160p.mkv"
+            occupied = target_root / "Show.S01E02.mkv"
+            occupied.write_bytes(b"external-existing")
+            adapter = LocalFilesystemAdapter(source_root)
+
+            with self.assertRaises(LocalMoveError):
+                LocalMoveTransaction(
+                    [source_root], [target_root], operation_token="replace-renamed-rollback"
+                ).execute([
+                    Plan(
+                        adapter.snapshot(first),
+                        new_target,
+                        action="replace",
+                        retire_target=old_target,
+                        expected_retire_identity=(
+                            LocalFilesystemAdapter.regular_file_identity(old_target)
+                        ),
+                    ),
+                    Plan(adapter.snapshot(second), occupied),
+                ])
+
+            self.assertEqual(first.read_bytes(), b"new-better-version")
+            self.assertEqual(second.read_bytes(), b"second-version")
+            self.assertEqual(old_target.read_bytes(), b"old-version")
+            self.assertFalse(new_target.exists())
+            self.assertEqual(occupied.read_bytes(), b"external-existing")
+            self.assertEqual(list(target_root.glob(".*.mediaflux-replaced-*")), [])
+
+    def test_backup_identity_read_failure_restores_old_target(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root, target_root = root / "source", root / "library"
+            source_root.mkdir()
+            target_root.mkdir()
+            source = source_root / "Movie.new.mkv"
+            source.write_bytes(b"new-version")
+            target = target_root / "Movie.old.mkv"
+            target.write_bytes(b"old-version")
+            snapshot = LocalFilesystemAdapter(source_root).snapshot(source)
+            expected = LocalFilesystemAdapter.regular_file_identity(target)
+            transaction = LocalMoveTransaction(
+                [source_root], [target_root], operation_token="backup-read-failure"
+            )
+            real_identity = LocalMoveTransaction._identity
+            injected = False
+
+            def fail_first_backup_read(path):
+                nonlocal injected
+                candidate = Path(path)
+                if (
+                    not injected
+                    and candidate.exists()
+                    and ".mediaflux-replaced-" in candidate.name
+                ):
+                    injected = True
+                    raise LocalMoveError("injected backup identity failure")
+                return real_identity(candidate)
+
+            with patch.object(
+                LocalMoveTransaction, "_identity", side_effect=fail_first_backup_read,
+            ):
+                with self.assertRaisesRegex(
+                    LocalMoveError, "injected backup identity failure",
+                ):
+                    transaction.execute([Plan(
+                        snapshot,
+                        target_root / "Movie.new.mkv",
+                        action="replace",
+                        retire_target=target,
+                        expected_retire_identity=expected,
+                    )])
+
+            self.assertTrue(source.exists())
+            self.assertEqual(target.read_bytes(), b"old-version")
+            self.assertFalse((target_root / "Movie.new.mkv").exists())
             self.assertEqual(list(target_root.glob(".*.mediaflux-replaced-*")), [])
 
     def test_replace_backup_cleanup_failure_requires_manual_attention(self):

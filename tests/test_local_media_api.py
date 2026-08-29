@@ -84,12 +84,18 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(created.json()["targets"][0]["library_id"], "movies")
         self.assertEqual(created.json()["targets"][0]["library_name"], "电影")
         self.assertEqual(created.json()["targets"][0]["server_path"], "//NAS/Video/Movies")
+        self.assertEqual(created.json()["stable_seconds"], 0)
+        self.assertFalse(created.json()["scan_enabled"])
+        self.assertEqual(created.json()["scan_interval_minutes"], 10)
         self.assertNotIn("smb_user", created.json())
         self.assertNotIn("has_smb_pass", created.json())
         self.assertNotIn("secret123", created.text)
         scheduler.return_value.reload.assert_called_once()
         stored_source = db.get_local_media_source(source_id, owner="admin")
         self.assertEqual((stored_source.smb_user, stored_source.smb_pass), ("", ""))
+        self.assertEqual(stored_source.stable_seconds, 0)
+        self.assertFalse(stored_source.scan_enabled)
+        self.assertEqual(stored_source.scan_interval_minutes, 10)
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE local_media_sources SET smb_user=?,smb_pass=? WHERE id=?",
@@ -118,6 +124,8 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(updated.json()["name"], "主下载目录")
         self.assertEqual([item["category"] for item in updated.json()["targets"]], ["default"])
         self.assertEqual(updated.json()["targets"][0]["server_path"], "D:/Media")
+        self.assertEqual(updated.json()["stable_seconds"], 0)
+        self.assertFalse(updated.json()["scan_enabled"])
         self.assertNotIn("smb_user", updated.json())
         self.assertNotIn("has_smb_pass", updated.json())
         stored_source = db.get_local_media_source(source_id, owner="admin")
@@ -699,6 +707,7 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         }
         service.create_manual_task.return_value = 88
         service.execute_task.return_value = {"status": "completed", "task_id": 88}
+        service.external_hints.return_value = {"items": [{"title": "Example"}], "errors": []}
         with patch("app.routes.local_media_api.get_local_media_service", return_value=service), patch(
             "app.routes.local_media_api.db.claim_local_media_task", return_value=True
         ):
@@ -708,13 +717,18 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             previewed = self.client.post(
                 "/api/local-media/preview",
                 json={"inspection_id": "inspect-1", "tmdb_id": "1", "media_type": "tv",
-                      "season": 2, "episode": 7},
+                      "season": 2, "episode": 7, "numbering_mode": "season_continuous"},
                 headers=headers,
             )
             executed = self.client.post(
                 "/api/local-media/execute",
                 json={"inspection_id": "inspect-1", "tmdb_id": "1", "media_type": "tv",
-                      "season": 2, "episode": 7},
+                      "season": 2, "episode": 7, "numbering_mode": "season_continuous"},
+                headers=headers,
+            )
+            hinted = self.client.post(
+                "/api/local-media/external-hints",
+                json={"inspection_id": "inspect-1", "query": "Example", "media_type": "auto"},
                 headers=headers,
             )
         self.assertEqual(inspected.status_code, 200)
@@ -722,10 +736,16 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         preview_call = service.preview.call_args
         self.assertEqual(preview_call.kwargs["season_override"], 2)
         self.assertEqual(preview_call.kwargs["episode_override"], 7)
+        self.assertEqual(preview_call.kwargs["numbering_mode"], "season_continuous")
         create_call = service.create_manual_task.call_args
         self.assertEqual(create_call.kwargs["season_override"], 2)
         self.assertEqual(create_call.kwargs["episode_override"], 7)
+        self.assertEqual(create_call.kwargs["numbering_mode"], "season_continuous")
         self.assertEqual(executed.json()["status"], "completed")
+        self.assertEqual(hinted.json()["items"][0]["title"], "Example")
+        service.external_hints.assert_called_once_with(
+            "admin", "inspect-1", "Example", "auto",
+        )
 
     def test_preview_rejects_invalid_position_override_before_service_call(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}

@@ -136,6 +136,7 @@ class LocalMediaTask:
     media_type: str
     season_override: int | None
     episode_override: int | None
+    numbering_mode: str
     title: str
     year: str
     attempts: int
@@ -165,6 +166,7 @@ class LocalMediaTask:
                 None if _value(row, "episode_override", None) is None
                 else int(_value(row, "episode_override"))
             ),
+            numbering_mode=str(_value(row, "numbering_mode", "auto") or "auto"),
             title=str(_value(row, "title")), year=str(_value(row, "year")),
             attempts=int(_value(row, "attempts", 0)),
             version=int(_value(row, "version", 1)), error=str(_value(row, "error")),

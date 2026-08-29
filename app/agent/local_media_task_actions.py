@@ -810,7 +810,7 @@ def _status_reason(status: str) -> str:
     return {
         "requires_manual": "manual_match_required",
         "failed": "processing_failed",
-        "waiting_stable": "waiting_for_stable_files",
+        "waiting_stable": "waiting_to_run",
         "recognizing": "recognizing",
         "planned": "plan_ready",
         "moving": "moving_files",
@@ -984,6 +984,7 @@ def preview_local_media_task(arguments: dict[str, Any], context: ToolContext) ->
             automatic=False,
             season_override=task.season_override,
             episode_override=task.episode_override,
+            numbering_mode=task.numbering_mode,
         )
 
     try:
@@ -1103,7 +1104,7 @@ def prepare_retry_local_media_task(
             "current_status": str(task.status),
             "title": _safe_title(task.title),
             "effects": [
-                "任务会回到等待文件稳定阶段，并由调度器重新检查和处理。",
+                "任务会回到等待执行阶段，并由调度器立即重新检查和处理。",
                 "会生成新的操作幂等标识；不会复用上一次中断的文件步骤。",
                 "本次确认不会直接移动、覆盖或删除媒体文件。",
             ],

@@ -180,7 +180,7 @@ def _configured_organize_sources() -> list[dict[str, str]]:
 
 
 def _configured_local_organize_sources() -> list[object]:
-    """返回可执行移动入库的本地来源；显式整理不依赖定时扫描开关。"""
+    """返回可执行移动入库的本地来源；显式整理不依赖 qB 自动接管开关。"""
     sources = []
     try:
         for source in db.list_local_media_sources(owner="admin"):
@@ -823,7 +823,7 @@ def _start_organize_local(bot, telebot, source_message) -> bool:
             timeout_seconds=4 * 60 * 60,
         ).begin(
             "<b>正在扫描本地下载目录</b>\n"
-            "将发现已有媒体、等待文件稳定并按当前整理规则归档。"
+            "将发现已有媒体，并立即按当前整理规则检查与归档。"
         )
         threading.Thread(
             target=_do_organize_local,

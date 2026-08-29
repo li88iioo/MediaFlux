@@ -236,9 +236,11 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         task_id = db.prepare_manual_local_media_task(
             source_id, "/tmp/manual-position/Show.S01E07.mkv", owner="admin",
             tmdb_id="42", media_type="tv", season_override=2, episode_override=7,
+            numbering_mode="season_continuous",
         )
         task = db.get_local_media_task(task_id, owner="admin")
         self.assertEqual((task.season_override, task.episode_override), (2, 7))
+        self.assertEqual(task.numbering_mode, "season_continuous")
         db.add_local_media_task_item(
             task_id, "/tmp/manual-position/Show.S01E07.mkv",
             "/tmp/library/Show.S01E07.mkv", role="video", owner="admin",
@@ -257,6 +259,7 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(retried.tmdb_id, "42")
         self.assertEqual(retried.media_type, "tv")
         self.assertEqual((retried.season_override, retried.episode_override), (2, 7))
+        self.assertEqual(retried.numbering_mode, "season_continuous")
 
     def test_task_recognition_summary_round_trip_is_versioned(self):
         source_id = db.create_local_media_source(

@@ -14,7 +14,7 @@ send = send_event
 
 _TRIGGER_LABELS = {
     "qb_completed": "qB 下载完成",
-    "scan": "定时扫描",
+    "scan": "手动扫描",
     "manual": "手动整理",
 }
 

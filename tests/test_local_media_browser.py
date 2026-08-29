@@ -30,18 +30,25 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
             'id="lmTaskDetailModal"', 'id="lmTaskDetailBody"',
             'id="lmMediaPathbar"', 'id="lmMediaBrowseHome"',
             'id="lmMediaBreadcrumb"', 'id="lmMediaBrowseUp"',
-            'id="lmPickLocalRootBtn"', 'id="lmSourceMediaType"', 'id="lmStableSeconds"',
-            'id="lmScanMinutes"', 'class="lm-form-grid-3 lm-wide"',
+            'id="lmPickLocalRootBtn"', 'id="lmSourceMediaType"',
+            'id="lmSourceEnabled"', 'qB 自动整理',
+            '<option value="true">开启</option>', '<option value="false">关闭</option>',
+            'class="lm-source-routing-row"',
             'js/local-media.js', 'css/local-media.css',
         ):
             self.assertIn(marker, page.text)
+        for removed_marker in (
+            'id="lmStableSeconds"', 'id="lmScanMinutes"', 'id="lmScanEnabled"',
+            '>稳定等待<', '>扫描间隔<', '>定时扫描<',
+        ):
+            self.assertNotIn(removed_marker, page.text)
         self.assertIn("本地媒体", page.text)
         self.assertIn("整理日志", page.text)
         self.assertNotIn("<span>整理任务</span>", page.text)
         self.assertIn("正在读取来源配置", page.text)
         self.assertRegex(page.text, re.compile(r'class="[^"]*\blocal-media-page\b[^"]*"'))
         self.assertIn('class="app-modal lm-modal"', page.text)
-        self.assertIn("MediaFlux 容器路径", page.text)
+        self.assertIn("待整理（你的qB下载路径）", page.text)
         self.assertIn("/media/downloads", page.text)
         for legacy_marker in (
             'data-windows-package', 'id="lmSmbAuthSection"', 'id="lmSmbUser"',
@@ -54,7 +61,7 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertNotIn("复制模式", page.text)
         js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
         self.assertIn("/api/local-media/directories", js)
-        self.assertIn("/api/local-media/media-servers", js)
+        self.assertNotIn("/api/local-media/media-servers", js)
         self.assertIn("/api/local-media/items", js)
         self.assertIn("/api/local-media/items/delete", js)
         self.assertIn("function openScrapeForItem", js)
@@ -71,9 +78,10 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn("data-task-detail", js)
         self.assertIn("method: 'DELETE'", js)
         self.assertIn("confirm: 'CLEAR'", js)
-        self.assertIn("library_id: libraryId, library_name: libraryName", js)
+        self.assertNotIn("data-target-library", js)
+        self.assertIn("归档映射", js)
         self.assertIn("lmSourceMode", page.text)
-        self.assertIn("row.dataset.libraryRequest", js)
+        self.assertNotIn("row.dataset.libraryRequest", js)
         self.assertIn("allowRoot: !isRootsMode && Boolean(sourceId)", js)
         self.assertIn('id="lmTaskMore"', page.text)
         self.assertIn("taskDisplayLimit = 60", js)
@@ -116,5 +124,9 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertIn(".lm-task-detail-dialog", css)
         self.assertIn(".lm-task-actions", css)
         self.assertIn(".lm-form-grid-3", css)
+        self.assertIn(".lm-source-routing-row", css)
+        self.assertIn("grid-template-columns: minmax(260px, 1.75fr) minmax(160px, .72fr) minmax(140px, .55fr)", css)
         self.assertIn("grid-template-columns: minmax(340px, 35%) minmax(0, 1fr)", css)
+        self.assertNotIn(".lm-source-trigger-control", css)
+        self.assertNotIn(".lm-source-head-toggle", css)
         self.assertNotRegex(css, r"\.lm-media-row:hover\s*\{[^}]*transform")

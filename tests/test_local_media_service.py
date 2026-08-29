@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
-from app.modules.local_media_service import LocalMediaService
+from app.modules.local_media_service import LocalMediaService, LocalMediaServiceError
 from app.modules.scraper import MatchResult
 from tests.support import IsolatedDatabaseTestCase, release_parse_result
 
@@ -116,6 +116,99 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             target = Path(preview["plans"][0]["target_path"])
             self.assertIn("封神第二部：战火西岐 (2025) {tmdb-1155281}", target.parent.name)
             self.assertIn("封神第二部：战火西岐.2025", target.name)
+
+    def test_auto_multi_video_directory_prefers_episode_evidence_over_generic_folder_name(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "auto-detect-downloads"
+            target_root = root / "auto-detect-library"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "Example.Show.S01E01.mkv").write_bytes(b"episode-1")
+            (source_root / "Example.Show.S01E02.mkv").write_bytes(b"episode-2")
+            source_id = self._source(source_root, target_root, "tv")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="42", title="Example Show", year="2026",
+                media_type="movie", confidence=1.0,
+            )))
+
+            inspection = service.inspect_source("admin", source_id, source_root)
+
+            self.assertEqual(inspection["media_type"], "tv")
+
+    def test_manual_directory_rejects_two_distinct_media_titles(self):
+        class MixedTitleScraper(FakeScraper):
+            def parse_media(self, filename: str, parent_path: str = "", match=None):
+                title = "Alpha Show" if "Alpha" in filename else "Beta Show"
+                return release_parse_result(
+                    {
+                        "season": 1,
+                        "episode": 1 if "Alpha" in filename else 2,
+                        "title": title,
+                        "year": "2026",
+                        "type": "tv",
+                    },
+                    filename=filename, parent_path=parent_path,
+                )
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "mixed-downloads"
+            target_root = root / "tv"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "Alpha.Show.S01E01.mkv").write_bytes(b"alpha")
+            (source_root / "Beta.Show.S01E02.mkv").write_bytes(b"beta")
+            source_id = self._source(source_root, target_root, "tv")
+            service = LocalMediaService(scraper=MixedTitleScraper(MatchResult(
+                tmdb_id="1", title="Alpha Show", year="2026",
+                media_type="tv", confidence=1.0,
+            )))
+            inspection = service.inspect_source("admin", source_id, source_root)
+
+            with self.assertRaisesRegex(
+                LocalMediaServiceError, "目录包含多个不同媒体",
+            ):
+                service.preview(
+                    "admin", inspection["inspection_id"],
+                    tmdb_id="1", media_type="tv",
+                )
+
+    def test_batch_version_winner_never_retires_another_source_file(self):
+        from app.modules.organize import OrganizeRules
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "batch-downloads"
+            target_root = root / "movies"
+            source_root.mkdir()
+            target_root.mkdir()
+            (source_root / "Movie.2026.1080p-SMALL.mkv").write_bytes(b"small")
+            (source_root / "Movie.2026.1080p-LARGE.mkv").write_bytes(b"larger-version")
+            source_id = self._source(source_root, target_root, "movie")
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="1", title="Movie", year="2026",
+                media_type="movie", confidence=1.0,
+            )))
+            inspection = service.inspect_source("admin", source_id, source_root)
+            rules = OrganizeRules(
+                region_split=False, year_split=False, naming_scope="both",
+                conflict_strategy=2,
+            )
+            with patch(
+                "app.modules.local_media_service.OrganizeRules.from_config",
+                return_value=rules,
+            ):
+                preview = service.preview("admin", inspection["inspection_id"])
+
+            actions = [item.action for item in preview["_move_plans"] if item.role == "video"]
+            self.assertEqual(sorted(actions), ["move", "skip"])
+            winner = next(
+                item for item in preview["_move_plans"]
+                if item.role == "video" and item.action == "move"
+            )
+            self.assertIsNone(winner.retire_target)
+            self.assertIsNone(winner.expected_retire_identity)
 
     def test_local_preview_reuses_one_bounded_probe_budget_for_all_videos(self):
         from app.modules.media_probe import ProbeBudget
@@ -274,7 +367,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertEqual(second["plans"][0]["action"], "replace")
             self.assertIn("替换", second["plans"][0]["note"])
 
-    def test_manual_conflict_always_uses_safe_replace_but_automatic_keeps_strategy(self):
+    def test_manual_and_automatic_conflicts_share_organizer_strategy(self):
         from app.modules.organize import OrganizeRules
 
         with tempfile.TemporaryDirectory() as root_raw:
@@ -304,8 +397,8 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                     "admin", inspection["inspection_id"], tmdb_id="1", media_type="movie",
                     automatic=True,
                 )
-            self.assertEqual(manual["plans"][0]["action"], "replace")
-            self.assertIn("安全覆盖", manual["plans"][0]["note"])
+            self.assertEqual(manual["plans"][0]["action"], "skip")
+            self.assertIn("保留现有版本", manual["plans"][0]["note"])
             self.assertEqual(Path(manual["plans"][0]["target_path"]), target)
             self.assertEqual(automatic["plans"][0]["action"], "skip")
 
@@ -326,7 +419,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             inspection = service.inspect_source("admin", source_id, incoming)
             rules = OrganizeRules(
                 region_split=False, year_split=False, naming_scope="both",
-                conflict_strategy=1, emby_refresh=False,
+                conflict_strategy=3, emby_refresh=False,
             )
             with patch("app.modules.local_media_service.OrganizeRules.from_config", return_value=rules):
                 preview = service.preview(
@@ -528,7 +621,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertEqual((stored.season_override, stored.episode_override), (2, None))
             self.assertTrue(episode.exists())
 
-    def test_single_video_directory_allows_one_episode_override(self):
+    def test_single_video_directory_rejects_episode_override_like_guangya(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source_root = root / "downloads-directory-override"; target_root = root / "tv"
             show = source_root / "Show"
@@ -544,12 +637,11 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertEqual(inspection["primary_video_name"], "Show.S01E01.mkv")
             self.assertEqual(inspection["parsed_season"], 1)
             self.assertEqual(inspection["parsed_episode"], 1)
-            preview = service.preview(
-                "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
-                episode_override=2,
-            )
-            self.assertEqual(preview["status"], "planned")
-            self.assertIn("S01E02", preview["plans"][0]["target_name"])
+            with self.assertRaisesRegex(Exception, "目录刮削只能统一指定归档季"):
+                service.preview(
+                    "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                    episode_override=2,
+                )
 
     def test_multi_video_directory_rejects_one_episode_override(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -564,7 +656,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             )))
             inspection = service.inspect_source("admin", source_id, show)
             self.assertFalse(inspection["single_video"])
-            with self.assertRaisesRegex(Exception, "包含多个视频的目录只能指定归档季"):
+            with self.assertRaisesRegex(Exception, "目录刮削只能统一指定归档季"):
                 service.preview(
                     "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
                     episode_override=2,
@@ -597,6 +689,106 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             )
             self.assertEqual(preview["status"], "planned")
             self.assertIn("S01E02", preview["plans"][0]["target_name"])
+
+    def test_directory_numbering_mode_reuses_shared_season_continuous_mapping(self):
+        class SeasonDetailScraper(FakeScraper):
+            def get_detail(self, tmdb_id: str, media_type: str):
+                return {
+                    "id": int(tmdb_id),
+                    "genres": [{"id": 16}],
+                    "origin_country": ["JP"],
+                    "first_air_date": "2026-01-01",
+                    "seasons": [
+                        {"season_number": 1, "episode_count": 12},
+                        {"season_number": 2, "episode_count": 12},
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "numbering-downloads"
+            target_root = root / "numbering-library"
+            show = source_root / "Example Show Second Season"
+            show.mkdir(parents=True)
+            target_root.mkdir()
+            (show / "Example.Show.S02E13.mkv").write_bytes(b"episode-13")
+            (show / "Example.Show.S02E14.mkv").write_bytes(b"episode-14")
+            source_id = self._source(source_root, target_root, "tv")
+            service = LocalMediaService(scraper=SeasonDetailScraper(MatchResult(
+                tmdb_id="42", title="Example Show", year="2026",
+                media_type="tv", confidence=1.0,
+            )))
+            inspection = service.inspect_source("admin", source_id, show)
+
+            preview = service.preview(
+                "admin",
+                inspection["inspection_id"],
+                tmdb_id="42",
+                media_type="tv",
+                numbering_mode="season_continuous",
+            )
+
+            self.assertEqual(preview["numbering_mode"], "season_continuous")
+            self.assertEqual(preview["numbering"]["changed"], 2)
+            target_names = [item["target_name"] for item in preview["plans"]]
+            self.assertTrue(any("S02E01" in name for name in target_names))
+            self.assertTrue(any("S02E02" in name for name in target_names))
+
+    def test_manual_task_execution_reuses_persisted_numbering_mode(self):
+        class SeasonDetailScraper(FakeScraper):
+            def get_detail(self, tmdb_id: str, media_type: str):
+                return {
+                    "id": int(tmdb_id),
+                    "genres": [{"id": 16}],
+                    "origin_country": ["JP"],
+                    "first_air_date": "2026-01-01",
+                    "seasons": [
+                        {"season_number": 1, "episode_count": 12},
+                        {"season_number": 2, "episode_count": 12},
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "persisted-numbering-downloads"
+            target_root = root / "persisted-numbering-library"
+            source_root.mkdir()
+            target_root.mkdir()
+            episode = source_root / "Example.Show.S02E13.mkv"
+            episode.write_bytes(b"episode")
+            source_id = db.create_local_media_source(
+                name="persisted-numbering-source",
+                qb_profile="",
+                qb_path_prefix="",
+                local_root=str(source_root),
+                media_type="tv",
+                mode="preview_only",
+                stable_seconds=0,
+                owner="admin",
+            )
+            db.upsert_local_library_target(source_id, "tv", str(target_root), owner="admin")
+            service = LocalMediaService(scraper=SeasonDetailScraper(MatchResult(
+                tmdb_id="42", title="Example Show", year="2026",
+                media_type="tv", confidence=1.0,
+            )))
+            inspection = service.inspect_source("admin", source_id, episode)
+            preview = service.preview(
+                "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                numbering_mode="season_continuous",
+            )
+            task_id = service.create_manual_task(
+                "admin", inspection["inspection_id"], tmdb_id="42", media_type="tv",
+                rules_snapshot=preview["rules_snapshot"],
+                numbering_mode="season_continuous",
+            )
+            self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+
+            result = service.execute_task("admin", task_id)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertIn("S02E01", result["preview"]["plans"][0]["target_name"])
+            stored = db.get_local_media_task(task_id, owner="admin")
+            self.assertEqual(stored.numbering_mode, "season_continuous")
             self.assertNotIn("S09E99", preview["plans"][0]["target_name"])
 
     def test_source_media_type_is_forwarded_to_automatic_recognition(self):

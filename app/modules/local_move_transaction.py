@@ -27,6 +27,8 @@ class MovePlanLike(Protocol):
     role: str
     action: str
     expected_target_identity: tuple[int, int, int, int] | None
+    retire_target: Path | None
+    expected_retire_identity: tuple[int, int, int, int] | None
 
 
 class LocalMoveError(RuntimeError):
@@ -84,7 +86,7 @@ class LocalMoveTransaction:
         self._moved_steps: dict[Path, int] = {}
         self._step_ids: dict[int, int] = {}
         self._replaced_backups: dict[
-            Path, tuple[Path, tuple[int, int, int, int]]
+            Path, tuple[Path, tuple[int, int, int, int], Path]
         ] = {}
 
     @staticmethod
@@ -435,12 +437,89 @@ class LocalMoveTransaction:
             raise
         self._unlink_owned(retired, snapshot.identity, label="来源退役文件")
 
+    def _backup_replaced_target(
+        self,
+        retire_display: Path,
+        expected_identity: tuple[int, int, int, int],
+        *,
+        transaction_target: Path,
+    ) -> tuple[Path, tuple[int, int, int, int]]:
+        """原子退役旧版本，并记录其真实恢复位置供事务回滚。"""
+        backup_display = retire_display.with_name(
+            f".{retire_display.name}.mediaflux-replaced-{self.operation_token[:12]}"
+        )
+        with self._pinned_entry(
+            retire_display, self.target_roots,
+        ) as (_retire_display, retire), self._pinned_entry(
+            backup_display, self.target_roots,
+        ) as (_backup_display, backup):
+            self._require_identity(retire, expected_identity, label="待替换目标")
+            if self._identity_or_none(backup) is not None:
+                raise FileExistsError(f"发现未清理的替换备份: {backup_display}")
+            os.replace(retire, backup)
+            # rename 成功后先登记可恢复状态；后续身份读取即使瞬态失败，
+            # 外层 rollback 仍能找到隐藏备份并尝试恢复原媒体库路径。
+            self._replaced_backups[transaction_target] = (
+                backup_display,
+                expected_identity,
+                retire_display,
+            )
+            try:
+                backup_identity = self._identity(backup)
+                if backup_identity != expected_identity:
+                    raise LocalMoveError(
+                        f"待替换目标在备份时发生变化: {retire_display.name}"
+                    )
+            except Exception:
+                try:
+                    self._restore_replaced_backup(
+                        transaction_target,
+                        backup_display,
+                        expected_identity,
+                        retire_display,
+                    )
+                except Exception:
+                    # 保留登记记录，交给事务级 rollback 再次恢复；若仍失败，
+                    # 会明确返回人工核验错误，而不是静默遗留隐藏文件。
+                    pass
+                raise
+        return backup_display, backup_identity
+
+    def _restore_replaced_backup(
+        self,
+        transaction_target: Path,
+        backup_display: Path,
+        backup_identity: tuple[int, int, int, int],
+        restore_display: Path,
+    ) -> None:
+        with self._pinned_entry(
+            backup_display, self.target_roots,
+        ) as (_backup_display, backup), self._pinned_entry(
+            restore_display, self.target_roots,
+        ) as (_restore_display, restore):
+            self._require_identity(backup, backup_identity, label="替换备份")
+            if self._identity_or_none(restore) is not None:
+                raise LocalMoveError(f"回滚目标路径已被占用: {restore_display}")
+            os.replace(backup, restore)
+            self._require_identity(
+                restore,
+                backup_identity,
+                label="恢复后的替换目标",
+            )
+        self._replaced_backups.pop(transaction_target, None)
+
     def _move_one(self, plan: MovePlanLike, index: int) -> MovedItem:
         source_display = self._within_any(plan.source.path, self.source_roots)
         target_display = self._within_any(Path(plan.target), self.target_roots)
         plan_action = str(getattr(plan, "action", "move") or "move")
         if plan_action not in {"move", "replace"}:
             raise LocalMoveError(f"不支持的本地移动动作: {plan_action}")
+        retire_value = getattr(plan, "retire_target", None)
+        retire_display = (
+            self._within_any(Path(retire_value), self.target_roots)
+            if retire_value is not None else target_display
+        )
+        replace_same_path = plan_action == "replace" and retire_display == target_display
         with self._pinned_entry(
             source_display, self.source_roots
         ) as (_source_display, source), self._pinned_entry(
@@ -451,14 +530,29 @@ class LocalMoveTransaction:
             if current_target_identity is not None and plan_action != "replace":
                 raise FileExistsError(f"本地媒体库已存在目标文件: {target_display}")
             if plan_action == "replace":
-                if current_target_identity is None:
+                expected_target = (
+                    getattr(plan, "expected_target_identity", None)
+                    if replace_same_path
+                    else getattr(plan, "expected_retire_identity", None)
+                )
+                if replace_same_path:
+                    current_retire_identity = current_target_identity
+                else:
+                    if current_target_identity is not None:
+                        raise LocalMoveError(
+                            f"新版本目标在预览后已被占用，请重新生成预览: {target_display.name}"
+                        )
+                    with self._pinned_entry(
+                        retire_display, self.target_roots,
+                    ) as (_retire_display, retire):
+                        current_retire_identity = self._identity_or_none(retire)
+                if current_retire_identity is None:
                     raise LocalMoveError(
-                        f"待替换目标已不存在，请重新生成预览: {target_display.name}"
+                        f"待替换目标已不存在，请重新生成预览: {retire_display.name}"
                     )
-                expected_target = getattr(plan, "expected_target_identity", None)
-                if expected_target is not None and current_target_identity != expected_target:
+                if expected_target is not None and current_retire_identity != expected_target:
                     raise LocalMoveError(
-                        f"待替换目标在预览后发生变化，请重新生成预览: {target_display.name}"
+                        f"待替换目标在预览后发生变化，请重新生成预览: {retire_display.name}"
                     )
             same_fs = LocalFilesystemAdapter.same_filesystem(source, target)
             action = "replace" if plan_action == "replace" else (
@@ -473,35 +567,20 @@ class LocalMoveTransaction:
             published_identity: tuple[int, int, int, int] | None = None
             moved: MovedItem | None = None
             backup: Path | None = None
-            backup_display: Path | None = None
             backup_identity: tuple[int, int, int, int] | None = None
             try:
                 if plan_action == "replace":
-                    self._require_identity(
-                        target,
-                        current_target_identity,
-                        label="待替换目标",
+                    backup_display, backup_identity = self._backup_replaced_target(
+                        retire_display,
+                        current_retire_identity,
+                        transaction_target=target_display,
                     )
-                    backup_display = target_display.with_name(
-                        f".{target_display.name}.mediaflux-replaced-{self.operation_token[:12]}"
-                    )
-                    backup = target.with_name(
-                    f".{target.name}.mediaflux-replaced-{self.operation_token[:12]}"
-                    )
-                    if backup.exists():
-                        raise FileExistsError(f"发现未清理的替换备份: {backup_display}")
-                    os.replace(target, backup)
-                    backup_identity = self._identity(backup)
-                    if backup_identity != current_target_identity:
-                        raise LocalMoveError(f"待替换目标在备份时发生变化: {target_display.name}")
-                    self._replaced_backups[target_display] = (
-                        backup_display, backup_identity
-                    )
+                    backup = backup_display
                 else:
                     if self._identity_or_none(target) is not None:
                         raise FileExistsError(f"本地媒体库已存在目标文件: {target_display}")
                 if same_fs:
-                    if plan_action == "replace":
+                    if replace_same_path:
                         os.replace(source, target)
                         published_identity = plan.source.identity
                     else:
@@ -532,7 +611,7 @@ class LocalMoveTransaction:
                         )
                     if plan_action != "replace" and self._identity_or_none(target) is not None:
                         raise FileExistsError(f"本地媒体库已存在目标文件: {target_display}")
-                    if plan_action == "replace":
+                    if replace_same_path:
                         published_identity = self._identity(partial)
                         os.replace(partial, target)
                     else:
@@ -567,10 +646,12 @@ class LocalMoveTransaction:
                         cleanup_errors.append(str(cleanup_exc))
                 if moved is None and backup is not None and backup_identity is not None:
                     try:
-                        self._require_identity(backup, backup_identity, label="替换备份")
-                        if self._identity_or_none(target) is None:
-                            os.replace(backup, target)
-                            self._replaced_backups.pop(target_display, None)
+                        self._restore_replaced_backup(
+                            target_display,
+                            backup,
+                            backup_identity,
+                            retire_display,
+                        )
                     except Exception as cleanup_exc:
                         cleanup_errors.append(str(cleanup_exc))
                 error_text = str(exc)
@@ -631,40 +712,47 @@ class LocalMoveTransaction:
             index = self._moved_steps.get(moved.target)
             try:
                 self._restore_one(moved)
-                backup_record = self._replaced_backups.pop(moved.target, None)
+                backup_record = self._replaced_backups.get(moved.target)
                 if backup_record is not None:
-                    backup, backup_identity = backup_record
-                    with self._pinned_entry(
-                        backup, self.target_roots
-                    ) as (_backup_display, pinned_backup), self._pinned_entry(
-                        moved.target, self.target_roots
-                    ) as (_target_display, pinned_target):
-                        self._require_identity(
-                            pinned_backup, backup_identity, label="替换备份"
-                        )
-                        if self._identity_or_none(pinned_target) is not None:
-                            raise LocalMoveError(f"回滚目标路径已被占用: {moved.target}")
-                        os.replace(pinned_backup, pinned_target)
-                        self._require_identity(
-                            pinned_target,
-                            backup_identity,
-                            label="恢复后的替换目标",
-                        )
+                    backup, backup_identity, restore_target = backup_record
+                    self._restore_replaced_backup(
+                        moved.target,
+                        backup,
+                        backup_identity,
+                        restore_target,
+                    )
                 if index is not None:
                     self._finish_step(index, "rolled_back")
             except Exception as exc:
                 errors.append(f"{moved.target}: {exc}")
                 if index is not None:
                     self._finish_step(index, "failed", f"回滚失败: {exc}")
+        # 备份可能在新目标发布前就因身份复核失败而产生，此时尚没有
+        # MovedItem。继续恢复所有剩余记录，避免旧媒体只留在隐藏文件中。
+        for target, backup_record in list(self._replaced_backups.items()):
+            backup, backup_identity, restore_target = backup_record
+            try:
+                self._restore_replaced_backup(
+                    target, backup, backup_identity, restore_target,
+                )
+            except Exception as exc:
+                errors.append(f"{restore_target}: {exc}")
         return errors
 
     def _execute_locked(self, plans: Sequence[MovePlanLike]) -> MoveTransactionResult:
         targets: set[Path] = set()
+        retired_targets: set[Path] = set()
         for plan in plans:
             normalized = Path(plan.target).expanduser().resolve(strict=False)
             if normalized in targets:
                 raise LocalMoveError(f"移动计划包含重复目标: {normalized.name}")
             targets.add(normalized)
+            retire_value = getattr(plan, "retire_target", None)
+            if retire_value is not None:
+                retired = Path(retire_value).expanduser().resolve(strict=False)
+                if retired in retired_targets:
+                    raise LocalMoveError(f"移动计划重复替换同一旧版本: {retired.name}")
+                retired_targets.add(retired)
         self._moved = []
         self._moved_steps = {}
         self._replaced_backups = {}
@@ -673,7 +761,7 @@ class LocalMoveTransaction:
                 self._move_one(plan, index)
             warnings: list[str] = []
             for target, backup_record in list(self._replaced_backups.items()):
-                backup, backup_identity = backup_record
+                backup, backup_identity, _restore_target = backup_record
                 try:
                     self._unlink_owned_anchored(
                         backup,

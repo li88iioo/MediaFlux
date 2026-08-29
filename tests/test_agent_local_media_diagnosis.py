@@ -131,6 +131,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
             active = diagnose_local_media({})
         self.assertEqual(active.status, "active")
         self.assertEqual(active.data["attention"]["total"], 0)
+        self.assertNotIn("scan_enabled", active.data["sources"])
         self.assertEqual(active.data["tasks"]["planned"], 1)
 
         self._task(source, "requires_manual", suffix="manual")

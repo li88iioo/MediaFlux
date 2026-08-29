@@ -254,6 +254,26 @@
         positionControls.sync(mediaType);
     }
 
+    function scrapeDialog() {
+        return modal.querySelector('.gy-scrape-dialog');
+    }
+
+    function setMobilePane(pane) {
+        const dialog = scrapeDialog();
+        if (!dialog) return;
+        const normalized = pane === 'preview' ? 'preview' : 'candidates';
+        dialog.dataset.mobilePane = normalized;
+        modal.querySelectorAll('[data-scrape-mobile-pane]').forEach((button) => {
+            const active = button.dataset.scrapeMobilePane === normalized;
+            button.classList.toggle('is-active', active);
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+    }
+
+    function setPlanReady(ready) {
+        scrapeDialog()?.classList.toggle('has-plan', Boolean(ready));
+    }
+
     function episodePreviewPayload(mediaType) {
         return positionControls.payload(mediaType);
     }
@@ -264,6 +284,7 @@
         state.previewController = null;
         state.pendingPreviewKey = '';
         state.preview = null;
+        setPlanReady(false);
         elements.run.disabled = true;
         elements.status.textContent = '搜索条件已更新';
         elements.planSummary.textContent = '请重新选择候选并生成预览';
@@ -296,6 +317,8 @@
         state.inspection = inspection;
         state.selectedCandidate = null;
         state.preview = null;
+        setPlanReady(false);
+        setMobilePane('candidates');
         elements.directory.textContent = `${inspection.directory.name} · ${inspection.counts.video} 个视频`;
         renderInspectionSummary(inspection);
         elements.query.value = inspection.suggested_query || inspection.directory.name || '';
@@ -421,6 +444,7 @@
         candidates.forEach((candidate) => {
             const button = node('button', 'gy-scrape-candidate');
             button.type = 'button';
+            button.setAttribute('aria-pressed', 'false');
             button.appendChild(poster(candidate.poster_url, 'gy-scrape-candidate-poster'));
             const copy = node('span', 'gy-scrape-candidate-copy');
             copy.append(
@@ -428,11 +452,18 @@
                 node('span', '', candidate.original_title || candidateMeta(candidate)),
                 node('span', '', candidateMeta(candidate)),
             );
-            button.append(copy, node(
+            const score = node(
                 'span',
                 'gy-scrape-score',
                 `${Math.round(Number(candidate.score || 0) * 100)}%`,
-            ));
+            );
+            const candidateState = node('span', 'gy-scrape-candidate-state');
+            candidateState.setAttribute('aria-hidden', 'true');
+            candidateState.append(
+                icon('chevron-right', 'gy-scrape-candidate-arrow'),
+                icon('check', 'gy-scrape-candidate-check'),
+            );
+            button.append(copy, score, candidateState);
             button.addEventListener('click', () => selectCandidate(candidate, button));
             elements.candidates.appendChild(button);
         });
@@ -768,10 +799,14 @@
         state.pendingPreviewKey = previewKey;
         state.selectedCandidate = candidate;
         state.preview = null;
+        setPlanReady(false);
+        setMobilePane('preview');
         elements.run.disabled = true;
         elements.status.textContent = '正在生成预览';
         elements.candidates.querySelectorAll('.gy-scrape-candidate').forEach((item) => {
-            item.classList.toggle('is-selected', item === button);
+            const selected = item === button;
+            item.classList.toggle('is-selected', selected);
+            item.setAttribute('aria-pressed', selected ? 'true' : 'false');
         });
         renderDetail(candidate);
         const version = ++state.requestVersion;
@@ -786,6 +821,7 @@
             }, {signal: controller.signal});
             if (version !== state.requestVersion) return;
             state.preview = preview;
+            setPlanReady(true);
             renderDetail(candidate, preview);
             elements.archiveTarget.textContent = archiveTargetLabel(
                 preview.archive_target?.name || preview.archive_target?.id,
@@ -831,14 +867,16 @@
         state.pendingPreviewKey = '';
         state.preview = null;
         state.selectedCandidate = null;
+        setPlanReady(false);
+        setMobilePane('candidates');
         elements.run.disabled = true;
-        elements.status.textContent = '搜索条件已更新';
-        elements.planSummary.textContent = '请选择新候选并重新生成预览';
+        elements.status.textContent = '正在更新候选';
+        elements.planSummary.textContent = '选择候选后生成归档预览';
         placeholder(
             elements.detail,
-            'refresh-cw',
-            '旧预览已失效',
-            '搜索条件已变化，请选择新候选后再确认刮削。',
+            'route',
+            '选择候选生成预览',
+            '搜索结果更新后，请选择候选核对季集映射和最终归档名称。',
         );
         const previous = elements.search.querySelector('span')?.textContent || '搜索';
         elements.search.disabled = true;
@@ -1142,67 +1180,17 @@
     window.visualViewport?.addEventListener('resize', closeMenu);
     document.addEventListener('scroll', () => closeMenu(), true);
     modal.addEventListener('click', (event) => {
+        const paneButton = event.target.closest('[data-scrape-mobile-pane]');
+        if (paneButton) {
+            setMobilePane(paneButton.dataset.scrapeMobilePane);
+            return;
+        }
         if (event.target === modal) closeModal();
     });
     function sanitizeSearchQuery(query) {
-        if (!query) return '';
-        let text = String(query).trim();
-        const technicalNoise = /^(?:1080p|720p|2160p|4k|uhd|hdr10?\+?|hdr|web-?dl|webrip|b[dr]rip|bluray|remux|h\.?264|h\.?265|x264|x265|hevc|avc|(?:hevc|avc|x26[45])[ ._-]?(?:8|10|12)bit|(?:8|10|12)bit|aac(?:[ .]?\d(?:\.\d)?)?|flac|bilibili|baha|cht|chs|jpn|big5|gb|mp4|mkv|assx?\d*|srtx?\d*)$/i;
-        const episodeRange = /^(?:e?p?\s*)?\d{1,3}\s*[-~–—]\s*\d{1,3}(?:\s*(?:fin(?:al)?|complete|全集))?$/i;
-        const releaseGroup = /^(?:ani|orion[-_. ]?origin|loli[-_. ]?house|h[-_. ]?enc|ktxp|lilith[-_. ]?raws|nc[-_. ]?raws|vcb[-_. ]?studio|reinforce|moozzi2|snow[-_. ]?raws|beatrice[-_. ]?raws|(?:.+[-_. ])?(?:fansub|raws?|subs?|字幕组|字幕社|压制组))$/i;
-        const isBracketNoise = (content) => {
-            const compact = String(content || '').replace(/\s+/g, ' ').trim();
-            const tokens = compact.split(/[\s,;+/＆&._-]+/).filter(Boolean);
-            const hasTechnicalToken = tokens.some(token => technicalNoise.test(token));
-            const languageTokensOnly = tokens.length > 1
-                && hasTechnicalToken
-                && tokens.every(token => technicalNoise.test(token) || /^japanese$/i.test(token));
-            return !compact
-                || technicalNoise.test(compact)
-                || episodeRange.test(compact)
-                || releaseGroup.test(compact)
-                || languageTokensOnly;
-        };
-        const looksLikeTitle = (content) => {
-            const compact = String(content || '').replace(/\s+/g, ' ').trim();
-            if (!compact || isBracketNoise(compact)) return false;
-            return /[\u3400-\u9fff]/.test(compact) || compact.split(/\s+/).filter(Boolean).length >= 2;
-        };
-
-        text = text.replace(/\.[a-z0-9]{2,5}$/i, ' ');
-        let leading = /^\s*(?:\[([^\]]{1,96})\]|【([^】]{1,96})】)\s*/.exec(text);
-        while (leading) {
-            const content = (leading[1] || leading[2] || '').trim();
-            const remainder = text.slice(leading[0].length).trimStart();
-            const nextBracket = /^(?:\[([^\]]{1,96})\]|【([^】]{1,96})】)/.exec(remainder);
-            const compactPublisher = !/\s/.test(content)
-                && content.length <= 24
-                && !/^japanese$/i.test(content);
-            const remainderHasPlainTitle = remainder && !/^[\[【]/.test(remainder) && /[A-Za-z\u3400-\u9fff]/.test(remainder);
-            const followedByBracketedTitle = Boolean(nextBracket && looksLikeTitle(nextBracket[1] || nextBracket[2]));
-            if (isBracketNoise(content) || (compactPublisher && (remainderHasPlainTitle || followedByBracketedTitle))) {
-                text = remainder;
-                leading = /^\s*(?:\[([^\]]{1,96})\]|【([^】]{1,96})】)\s*/.exec(text);
-                continue;
-            }
-            text = `${content} ${remainder}`.trim();
-            break;
-        }
-        text = text.replace(/[（(【\[]\s*(?:仅限|僅限|限)[^）)】\]]{1,24}(?:[）)】\]]|$)/gi, ' ');
-        text = text.replace(/([（(【\[])([^）)】\]]{1,96})([）)】\]])/g, (match, open, content) => (
-            isBracketNoise(content) ? ' ' : match
-        ));
-        const knownEpisode = Number(state.inspection?.episode);
-        text = text.replace(/\s+-\s*(\d{1,3})(?=\s*(?:[（(【\[]|$))/g, (match, value) => (
-            Number.isInteger(knownEpisode) && Number(value) === knownEpisode ? ' ' : match
-        ));
-        text = text.replace(/(?:1080p|720p|2160p|4k|uhd|hdr10?\+?|hdr|web-?dl|webrip|b[dr]rip|bluray|remux|h\.?264|h\.?265|x264|x265|hevc|avc|aac[0-9.]*|flac|bilibili|baha|cht|chs|big5|catchplay\+?|blacktv|www\.[a-z0-9.-]+)/gi, ' ');
-        text = text.replace(/第[0-9一二三四五六七八九十]+[季集]/g, ' ');
-        text = text.replace(/(?:S[0-9]{1,2}(?:E[0-9]{1,3})?|Season[ ._-]*[0-9]{1,2}|[0-9]{1,2}(?:st|nd|rd|th)[ ._-]*Season)/gi, ' ');
-        text = text.replace(/[._\-·]+/g, ' ');
-        text = text.replace(/[（(【\[]\s*[）)】\]]/g, ' ');
-        text = text.replace(/\s+/g, ' ').trim();
-        return text;
+        return window.MediaScrapePosition.sanitizeSearchQuery(query, {
+            knownEpisode: state.inspection?.episode,
+        });
     }
 
     elements.close.addEventListener('click', closeModal);

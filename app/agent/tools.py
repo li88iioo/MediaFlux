@@ -1442,14 +1442,14 @@ def build_tool_registry() -> ToolRegistry:
     ))
     registry.register(ToolSpec(
         name="local_media.set_source_trigger_enabled",
-        description="确认后精确启停一个本地媒体来源的 qB 下载完成接管或目录扫描；不修改目录、规则、目标或凭据。",
+        description="确认后精确启停一个本地媒体来源的 qB 下载完成自动接管；不修改目录、规则、目标或凭据。",
         risk=RiskLevel.LOW_WRITE,
         parameters={
             "type": "object",
             "required": ["source_number", "trigger", "enabled"],
             "properties": {
                 "source_number": {"type": "integer", "minimum": 1},
-                "trigger": {"type": "string", "enum": ["qb_completed", "scan"]},
+                "trigger": {"type": "string", "enum": ["qb_completed"]},
                 "enabled": {"type": "boolean"},
             },
             "additionalProperties": False,

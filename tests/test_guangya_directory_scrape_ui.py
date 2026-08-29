@@ -111,6 +111,8 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
         self.assertIn('id="gyScrapeExternalBtn"', response.text)
         self.assertIn('id="gyScrapeExternalHints"', response.text)
         self.assertIn('豆瓣 / BGM 线索', response.text)
+        self.assertIn('data-scrape-mobile-pane="candidates"', response.text)
+        self.assertIn('data-scrape-mobile-pane="preview"', response.text)
         self.assertLess(
             response.text.index('class="gy-scrape-workspace"'),
             response.text.index('class="gy-scrape-footer"'),
@@ -132,9 +134,9 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
             "updated_desc", "updated_asc", "type_asc", "size_desc", "size_asc",
         ):
             self.assertIn(f'value="{value}"', response.text)
-        self.assertIn("guangya-directory-scrape.css?v=20260821a", response.text)
-        self.assertIn("media-scrape-position.js?v=20260821a", response.text)
-        self.assertIn("guangya-directory-scrape.js?v=20260821a", response.text)
+        self.assertIn("guangya-directory-scrape.css?v=20260828c", response.text)
+        self.assertIn("media-scrape-position.js?v=20260828a", response.text)
+        self.assertIn("guangya-directory-scrape.js?v=20260828c", response.text)
         self.assertIn('aria-label="列表视图" aria-pressed="true"', response.text)
         self.assertIn('aria-label="网格视图" aria-pressed="false"', response.text)
         self.assertNotIn('title="列表视图"', response.text)
@@ -301,17 +303,12 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
     def test_one_click_clean_preserves_bracketed_title_and_removes_release_tags(self):
         if not shutil.which("node"):
             self.skipTest("node 不可用")
-        script = DIRECTORY_SCRIPT.read_text("utf-8")
-        match = re.search(
-            r"    function sanitizeSearchQuery\(query\) \{([\s\S]*?)\n    \}\n\n    elements\.close",
-            script,
-        )
-        self.assertIsNotNone(match)
-        node_script = textwrap.dedent(
-            f"""
-            const state = {{inspection: {{episode: null}}}};
-            function sanitizeSearchQuery(query) {{{match.group(1)}
-            }}
+        shared_script = POSITION_SCRIPT.read_text("utf-8")
+        directory_script = DIRECTORY_SCRIPT.read_text("utf-8")
+        self.assertIn("window.MediaScrapePosition.sanitizeSearchQuery", directory_script)
+        node_script = "const window = {};\n" + shared_script + textwrap.dedent(
+            """
+            const sanitizeSearchQuery = window.MediaScrapePosition.sanitizeSearchQuery;
             const results = [];
             results.push(sanitizeSearchQuery(
                 '[Arifureta Shokugyou de Sekai Saikyou S2][01-12][BIG5][1080P][MP4]'
@@ -322,9 +319,9 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
             results.push(sanitizeSearchQuery(
                 '[Sakurato] Kage no Jitsuryokusha ni Naritakute! [01-20 FIN][AVC-8bit 1080P AAC][CHS]'
             ));
-            state.inspection.episode = 3;
             results.push(sanitizeSearchQuery(
-                '[LoliHouse] The Ghost in the Shell - 03 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv'
+                '[LoliHouse] The Ghost in the Shell - 03 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv',
+                {knownEpisode: 3}
             ));
             process.stdout.write(results.join('\\n'));
             """
@@ -402,6 +399,20 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
         self.assertIn("function archiveTargetLabel(target)", script)
         self.assertIn("return `将整理至：${value}`", script)
         self.assertIn("elements.detail.setAttribute('aria-busy'", script)
+        self.assertIn("function setMobilePane(pane)", script)
+        self.assertIn("setMobilePane('candidates')", script)
+        self.assertIn("setMobilePane('preview')", script)
+        self.assertIn("function setPlanReady(ready)", script)
+        self.assertIn("gy-scrape-candidate-state", script)
+        self.assertIn("button.setAttribute('aria-pressed', 'false')", script)
+        self.assertIn("item.setAttribute('aria-pressed', selected ? 'true' : 'false')", script)
+        self.assertNotIn("'旧预览已失效'", script)
+        self.assertIn('.gy-scrape-mobile-tabs { display: none; }', css)
+        self.assertIn('.gy-scrape-dialog[data-mobile-pane="candidates"] .gy-scrape-detail-region', css)
+        self.assertIn('.gy-scrape-dialog:not(.has-plan) .gy-scrape-target { display: none; }', css)
+        self.assertIn('.gy-scrape-episode-fields { display: contents; }', css)
+        self.assertIn(':has(.gy-scrape-episode-fields.is-season-only:not([hidden]))', css)
+        self.assertNotIn('box-shadow: inset 3px 0 0 var(--accent);', css)
         self.assertRegex(
             css,
             r"\.gy-scrape-workspace\s*\{[^}]*grid-template-columns:\s*clamp\(276px, 23vw, 340px\) minmax\(0, 1fr\);",

@@ -16,20 +16,19 @@
         return data;
     };
 
-    const categories = [
-        ['default', '默认'], ['movie', '电影'], ['tv', '剧集'], ['anime', '动漫'],
-        ['documentary', '纪录片'], ['variety', '综艺'], ['concert', '演唱会'], ['kids', '儿童'],
-    ];
-    const categoryLabels = Object.fromEntries(categories);
+    const categoryLabels = {
+        default: '默认', movie: '电影', tv: '剧集', anime: '动漫',
+        documentary: '纪录片', variety: '综艺', concert: '演唱会', kids: '儿童',
+    };
     const states = {
-        waiting_stable: ['等待稳定', 'paused'], recognizing: ['识别中', 'running'],
+        waiting_stable: ['等待执行', 'paused'], recognizing: ['识别中', 'running'],
         requires_manual: ['待确认', 'paused'], planned: ['已规划', 'running'],
         moving: ['移动中', 'running'], verifying: ['校验中', 'running'],
         refreshing: ['刷新中', 'running'], completed: ['已完成', 'done'],
         failed: ['失败', 'failed'], rolling_back: ['回滚中', 'failed'],
     };
     const triggerLabels = {
-        manual: '手动整理', qb_completed: 'qB 完成', scan: '目录扫描', retry: '重新入队',
+        manual: '手动整理', qb_completed: 'qB 完成', scan: '手动扫描', retry: '重新入队',
     };
 
     let sources = [];
@@ -46,6 +45,7 @@
     let appliedPreviewContext = null;
     let previewRequestSerial = 0;
     let searchRequestSerial = 0;
+    let externalHintsRequestSerial = 0;
     let inspectionRequestSerial = 0;
     let hasLoadedLocalMedia = false;
     let refreshing = false;
@@ -61,7 +61,6 @@
     let activeContextItem = null;
     let activeContextTrigger = null;
     const mediaItemMap = new Map();
-    let mediaServers = [];
     let taskDisplayLimit = 60;
     const selectedTaskIds = new Set();
     let taskDetailRequestSerial = 0;
@@ -70,7 +69,6 @@
     let initialLoadingTimer = null;
     let initialLoadingShownAt = 0;
     let pollTimer = null;
-    const libraryCache = new Map();
     const activeTaskStates = new Set(['waiting_stable', 'recognizing', 'planned', 'moving', 'verifying', 'refreshing', 'rolling_back']);
 
     function icons(root = document) {
@@ -137,6 +135,7 @@
         selectedCandidate = null;
         lastPreview = null;
         appliedPreviewContext = null;
+        $('lmScrapeModal')?.querySelector('.lm-scrape-dialog')?.classList.remove('has-plan');
         if ($('lmExecuteBtn')) $('lmExecuteBtn').disabled = true;
     }
 
@@ -189,8 +188,8 @@
 
     function sourceCard(source) {
         const targetItems = source.targets || [];
-        const automatic = source.enabled || source.scan_enabled;
-        const triggerText = [source.enabled ? 'qB 完成' : '', source.scan_enabled ? '定时扫描' : ''].filter(Boolean).join(' + ') || '仅手动';
+        const automatic = Boolean(source.enabled);
+        const triggerText = automatic ? 'qB 完成自动接管' : '仅手动整理';
         const targetPaths = targetItems.map((target) => `${categoryLabels[target.category] || target.category}: ${target.path}`).join('\n');
         const chips = targetItems.length
             ? targetItems.slice(0, 4).map((target) => `<span title="${esc(target.path)}">${esc(categoryLabels[target.category] || target.category)}</span>`).join('')
@@ -639,7 +638,7 @@
             : `<div class="lm-empty-state">
                 <div class="lm-empty-icon"><i data-lucide="${sources.length ? 'folder-open' : 'folder-plus'}"></i></div>
                 <strong>${query ? '没有匹配的本地媒体条目' : mediaBrowse.sourceId ? '当前目录暂无媒体条目' : sources.length ? '暂无本地媒体条目' : '暂无媒体来源配置'}</strong>
-                <p>${query ? '调整筛选关键词后重试。' : mediaBrowse.sourceId ? '可以返回上一级，或刷新后再次检查。' : sources.length ? '新下载内容会在刷新后显示。' : '先在「媒体来源」中配置本地目录和归档目标。'}</p>
+                <p>${query ? '调整筛选关键词后重试。' : mediaBrowse.sourceId ? '可以返回上一级，或刷新后再次检查。' : sources.length ? '新下载内容会在刷新后显示。' : '先配置媒体来源，并在「媒体库」中设置本地归档映射。'}</p>
             </div>`;
         const failures = mediaItemSources.filter((source) => source.error);
         const errorBox = $('lmMediaSourceErrors');
@@ -677,13 +676,11 @@
                     try {
                         const shouldLoadItems = currentTab === 'manual' || currentManual;
                         const itemRequestSerial = mediaBrowseRequestSerial;
-                        const [sourceData, taskData, serverData, itemData] = await Promise.all([
+                        const [sourceData, taskData, itemData] = await Promise.all([
                             api('/api/local-media/sources'),
                             api('/api/local-media/tasks'),
-                            api('/api/local-media/media-servers'),
                             shouldLoadItems ? api(mediaItemsUrl()) : Promise.resolve(null),
                         ]);
-                        mediaServers = serverData.servers || [];
                         sources = sourceData.sources || [];
                         tasks = taskData.tasks || [];
                         const canApplyItems = itemData && itemRequestSerial === mediaBrowseRequestSerial;
@@ -722,169 +719,6 @@
             }
         })();
         return refreshPromise;
-    }
-
-    function providerOptions(selected = '') {
-        const known = mediaServers.some((item) => item.provider === selected);
-        const unavailable = selected && !known
-            ? `<option value="${esc(selected)}" selected>${esc(selected)}（当前不可用）</option>` : '';
-        return `<option value="">自动按路径刷新</option>${mediaServers.map((item) =>
-            `<option value="${esc(item.provider)}" ${item.provider === selected ? 'selected' : ''}>${esc(item.label)}</option>`
-        ).join('')}${unavailable}`;
-    }
-
-    async function librariesFor(provider) {
-        if (!provider) return [];
-        if (!libraryCache.has(provider)) {
-            libraryCache.set(provider, api(`/api/local-media/media-servers/${encodeURIComponent(provider)}/libraries`)
-                .then((data) => data.libraries || []).catch((error) => { libraryCache.delete(provider); throw error; }));
-        }
-        return libraryCache.get(provider);
-    }
-
-    function mediaServerPathKey(value) {
-        const normalized = String(value || '').trim().replaceAll('\\', '/').replace(/\/+$/, '');
-        return normalized.startsWith('//') || /^[A-Za-z]:\//.test(normalized)
-            ? normalized.toLocaleLowerCase() : normalized;
-    }
-
-    function renderServerPathSelect(row, library, selectedPath = '') {
-        const provider = row.querySelector('[data-target-provider]').value;
-        const select = row.querySelector('[data-target-server-path]');
-        const locations = [...new Set((Array.isArray(library?.locations) ? library.locations : [])
-            .map((item) => String(item || '').trim()).filter(Boolean))];
-        let value = String(selectedPath || row.dataset.serverPath || '').trim();
-        if (!provider) {
-            row.dataset.serverPath = '';
-            row.dataset.serverPathRequired = '0';
-            select.disabled = true;
-            select.classList.remove('is-required');
-            select.innerHTML = '<option value="">绑定媒体库后选择可见路径</option>';
-            return;
-        }
-        if (!library) {
-            row.dataset.serverPath = value;
-            row.dataset.serverPathRequired = '0';
-            select.disabled = true;
-            select.classList.remove('is-required');
-            select.innerHTML = value
-                ? `<option value="${esc(value)}" selected>${esc(value)}（当前不可用）</option>`
-                : '<option value="">选择媒体库后显示路径</option>';
-            return;
-        }
-        if (!value) {
-            const localKey = mediaServerPathKey(row.querySelector('[data-target-path]').value);
-            value = locations.find((item) => mediaServerPathKey(item) === localKey)
-                || (locations.length === 1 ? locations[0] : '');
-        }
-        select.innerHTML = `<option value="">${locations.length ? '请选择服务端可见路径' : '媒体库未返回可见路径'}</option>`
-            + locations.map((item) => `<option value="${esc(item)}">${esc(item)}</option>`).join('');
-        if (value && !locations.some((item) => mediaServerPathKey(item) === mediaServerPathKey(value))) {
-            select.insertAdjacentHTML('beforeend', `<option value="${esc(value)}">${esc(value)}（当前不可用）</option>`);
-        }
-        const matched = locations.find((item) => mediaServerPathKey(item) === mediaServerPathKey(value));
-        select.value = matched || value;
-        row.dataset.serverPath = select.value;
-        const required = locations.length > 0 && !select.value;
-        row.dataset.serverPathRequired = required ? '1' : '0';
-        select.classList.toggle('is-required', required);
-        select.disabled = locations.length === 0 && !select.value;
-        select.title = select.value || '选择该媒体库在 Jellyfin / Emby 中实际看到的目录';
-    }
-
-    async function populateLibrarySelect(row, selected = {}) {
-        const provider = row.querySelector('[data-target-provider]').value;
-        const select = row.querySelector('[data-target-library]');
-        const serverPathSelect = row.querySelector('[data-target-server-path]');
-        const requestVersion = Number(row.dataset.libraryRequest || 0) + 1;
-        row.dataset.libraryRequest = String(requestVersion);
-        select.disabled = !provider;
-        select.innerHTML = `<option value="">${provider ? '正在读取媒体库…' : '未绑定媒体库'}</option>`;
-        serverPathSelect.disabled = true;
-        serverPathSelect.innerHTML = `<option value="">${provider ? '正在读取服务器路径…' : '绑定媒体库后选择可见路径'}</option>`;
-        if (!provider) {
-            renderServerPathSelect(row, null, '');
-            return;
-        }
-        try {
-            const libraries = await librariesFor(provider);
-            if (row.dataset.libraryRequest !== String(requestVersion)
-                || row.querySelector('[data-target-provider]').value !== provider) return;
-            const selectedId = selected.id || '';
-            const selectedName = selected.name || '';
-            select.innerHTML = '<option value="">请选择媒体库</option>' + libraries.map((item) => {
-                const isSelected = item.id === selectedId || (!selectedId && item.name === selectedName);
-                return `<option value="${esc(item.id)}" data-name="${esc(item.name)}" ${isSelected ? 'selected' : ''}>${esc(item.name)}</option>`;
-            }).join('');
-            const matched = libraries.find((item) => item.id === selectedId || (!selectedId && item.name === selectedName));
-            if (matched) {
-                row.dataset.libraryId = matched.id;
-                row.dataset.libraryName = matched.name;
-            } else if (selectedId || selectedName) {
-                const fallbackId = selectedId || '';
-                select.insertAdjacentHTML('beforeend', `<option value="${esc(fallbackId)}" data-name="${esc(selectedName)}" selected>${esc(selectedName || selectedId)}（当前不可用）</option>`);
-            }
-            renderServerPathSelect(row, matched || null, selected.serverPath || '');
-        } catch (error) {
-            if (row.dataset.libraryRequest !== String(requestVersion)
-                || row.querySelector('[data-target-provider]').value !== provider) return;
-            const selectedId = selected.id || '';
-            const selectedName = selected.name || '';
-            select.innerHTML = selectedId || selectedName
-                ? `<option value="${esc(selectedId)}" data-name="${esc(selectedName)}" selected>${esc(selectedName || selectedId)}（读取失败）</option>`
-                : '<option value="">媒体库读取失败</option>';
-            renderServerPathSelect(row, null, selected.serverPath || '');
-        }
-    }
-
-    async function populateCurrentServerPath(row) {
-        const provider = row.querySelector('[data-target-provider]').value;
-        const libraryId = row.dataset.libraryId || '';
-        const libraryName = row.dataset.libraryName || '';
-        if (!provider || (!libraryId && !libraryName)) {
-            renderServerPathSelect(row, null, '');
-            return;
-        }
-        const requestVersion = row.dataset.libraryRequest || '';
-        try {
-            const libraries = await librariesFor(provider);
-            if (row.dataset.libraryRequest !== requestVersion
-                || row.querySelector('[data-target-provider]').value !== provider) return;
-            const library = libraries.find((item) => item.id === libraryId
-                || (!libraryId && item.name === libraryName));
-            renderServerPathSelect(row, library || null, '');
-        } catch (_error) {
-            renderServerPathSelect(row, null, '');
-        }
-    }
-
-    function targetRows(values = {}) {
-        $('lmTargetRows').innerHTML = categories.map(([key, label]) => {
-            const target = values[key] || {};
-            return `<div class="lm-target-row" data-target-row="${key}" data-library-id="${esc(target.library_id || '')}" data-library-name="${esc(target.library_name || '')}" data-server-path="${esc(target.server_path || '')}" data-server-path-required="0">
-                <span>${label}</span>
-                <div class="lm-target-fields">
-                    <span class="lm-path-control">
-                        <input class="form-input" data-target-path="${key}" value="${esc(target.path || '')}" placeholder="未配置">
-                        <button class="jump-btn lm-picker-btn" type="button" data-pick-target="${key}" aria-label="选择${label}目录" title="选择${label}目录"><i data-lucide="folder-open"></i></button>
-                    </span>
-                    <span class="lm-target-binding">
-                        <select class="form-select" data-target-provider aria-label="${label}媒体服务器">${providerOptions(target.provider || '')}</select>
-                        <select class="form-select" data-target-library aria-label="${label}媒体库" disabled><option value="">未绑定媒体库</option></select>
-                        <select class="form-select lm-target-server-path" data-target-server-path aria-label="${label}服务端可见路径" disabled><option value="">绑定媒体库后选择可见路径</option></select>
-                    </span>
-                </div>
-            </div>`;
-        }).join('');
-        document.querySelectorAll('[data-target-row]').forEach((row) => {
-            const target = values[row.dataset.targetRow] || {};
-            populateLibrarySelect(row, {
-                id: target.library_id || '',
-                name: target.library_name || '',
-                serverPath: target.server_path || '',
-            });
-        });
-        icons($('lmTargetRows'));
     }
 
     function openLocalDirectoryPicker(input, {sourceId = 0, rootId = '__roots__', rootName = '容器目录'} = {}) {
@@ -974,13 +808,34 @@
 
     const positionControls = window.MediaScrapePosition.create({
         root: $('lmScrapeModal'),
-        isSingleFile: () => inspection?.selected_kind === 'file' || Boolean(inspection?.single_video),
+        isSingleFile: () => inspection?.selected_kind === 'file',
         elements: {
             fields: $('lmScrapeEpisodeFields'), seasonField: $('lmScrapeSeasonField'),
             episodeField: $('lmScrapeEpisodeField'), season: $('lmScrapeSeason'),
-            episode: $('lmScrapeEpisode'),
+            episode: $('lmScrapeEpisode'), numbering: $('lmScrapeNumbering'),
         },
     });
+
+    function resolvedScrapeMediaType() {
+        const selected = $('lmMediaType').value;
+        return selected === 'auto' ? (inspection?.media_type || 'auto') : selected;
+    }
+
+    function syncScrapePosition() {
+        positionControls.sync(resolvedScrapeMediaType());
+    }
+
+    function setScrapeMobilePane(pane) {
+        const dialog = $('lmScrapeModal')?.querySelector('.lm-scrape-dialog');
+        if (!dialog) return;
+        const normalized = pane === 'preview' ? 'preview' : 'candidates';
+        dialog.dataset.mobilePane = normalized;
+        $('lmScrapeModal').querySelectorAll('[data-scrape-mobile-pane]').forEach((button) => {
+            const active = button.dataset.scrapeMobilePane === normalized;
+            button.classList.toggle('is-active', active);
+            button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+    }
 
     async function openTaskDetail(taskId, trigger = null) {
         const requestSerial = ++taskDetailRequestSerial;
@@ -1045,12 +900,8 @@
         $('lmSourceName').value = source?.name || '';
         $('lmQbPrefix').value = source?.qb_path_prefix || '';
         $('lmLocalRoot').value = source?.local_root || '';
-        $('lmStableSeconds').value = source?.stable_seconds ?? 300;
-        $('lmScanMinutes').value = source?.scan_interval_minutes ?? 10;
-        $('lmSourceEnabled').checked = source?.enabled ?? true;
-        $('lmScanEnabled').checked = source?.scan_enabled ?? false;
+        $('lmSourceEnabled').value = (source?.enabled ?? true) ? 'true' : 'false';
         $('lmSourceMediaType').value = source?.media_type || 'auto';
-        targetRows(Object.fromEntries((source?.targets || []).map((target) => [target.category, target])));
         if (sourceModal) sourceModal.open(trigger);
         else $('lmSourceModal').hidden = false;
         icons($('lmSourceModal'));
@@ -1066,43 +917,14 @@
         const button = $('lmSaveSourceBtn');
         if (button.disabled) return;
         const id = $('lmSourceId').value;
-        const targets = [];
-        for (const row of document.querySelectorAll('[data-target-row]')) {
-            const path = row.querySelector('[data-target-path]').value.trim();
-            if (!path) continue;
-            const provider = row.querySelector('[data-target-provider]').value;
-            const select = row.querySelector('[data-target-library]');
-            const serverPathSelect = row.querySelector('[data-target-server-path]');
-            const selectedOption = select.selectedOptions[0];
-            const libraryId = select.value || row.dataset.libraryId || '';
-            const libraryName = selectedOption?.dataset.name || row.dataset.libraryName || '';
-            if (provider && libraryName && row.dataset.serverPathRequired === '1') {
-                serverPathSelect.focus();
-                appAlert({
-                    type: 'warning',
-                    title: '请选择服务端可见路径',
-                    message: '该媒体库包含多个目录，请选择 Jellyfin / Emby 实际看到的归档目录。',
-                });
-                return;
-            }
-            targets.push({
-                category: row.dataset.targetRow, path, provider,
-                library_id: libraryId, library_name: libraryName,
-                server_path: serverPathSelect.value || row.dataset.serverPath || '',
-            });
-        }
         const payload = {
             name: $('lmSourceName').value.trim(),
             qb_profile: 'configured:qb',
             qb_path_prefix: $('lmQbPrefix').value.trim(),
             local_root: $('lmLocalRoot').value.trim(),
-            enabled: $('lmSourceEnabled').checked,
-            stable_seconds: Number($('lmStableSeconds').value) || 0,
-            scan_enabled: $('lmScanEnabled').checked,
-            scan_interval_minutes: Number($('lmScanMinutes').value) || 10,
+            enabled: $('lmSourceEnabled').value === 'true',
             media_type: $('lmSourceMediaType').value,
             mode: $('lmSourceMode').value || 'move',
-            targets,
         };
         setBusy(button, true, '保存中');
         try {
@@ -1121,10 +943,16 @@
 
     function resetScrapeWorkspace() {
         searchRequestSerial += 1;
+        externalHintsRequestSerial += 1;
         invalidatePreview();
         inspection = null;
         positionControls.reset();
-        positionControls.sync($('lmMediaType').value);
+        syncScrapePosition();
+        setScrapeMobilePane('candidates');
+        if ($('lmScrapeExternalHints')) {
+            $('lmScrapeExternalHints').hidden = true;
+            $('lmScrapeExternalHints').replaceChildren();
+        }
         $('lmCandidateCount').textContent = '0 项';
         $('lmCandidates').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>等待搜索</strong><span>检查完成后会在这里展示 TMDB 候选。</span></div>';
         $('lmScrapeDetail').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="clapperboard"></i><strong>等待媒体识别</strong><span>选择候选或使用自动匹配后，将显示完整归档方案。</span></div>';
@@ -1141,7 +969,7 @@
         lastPreview = null;
         appliedPreviewContext = null;
         $('lmSearchQuery').value = inspection.suggested_query || inspection.selected_name || activeMediaItem?.name || '';
-        positionControls.sync($('lmMediaType').value);
+        syncScrapePosition();
         $('lmScrapeInspectionSummary').textContent = `${inspection.video_count} 个视频 · ${inspection.file_count} 个扫描文件`;
         $('lmScrapeStatus').textContent = '等待匹配';
         $('lmCandidates').innerHTML = '<div class="lm-scrape-placeholder"><i data-lucide="scan-search"></i><strong>检查完成</strong><span>可以搜索 TMDB 候选，或直接使用自动匹配。</span></div>';
@@ -1151,15 +979,17 @@
 
     async function openScrapeForItem(item, {automatic = false, trigger = null} = {}) {
         if (!item?.organize_ready) {
-            return appAlert({type: 'warning', title: '尚未配置归档目标', message: '请先在媒体来源中为该目录配置至少一个媒体库目标。'});
+            return appAlert({type: 'warning', title: '尚未配置归档映射', message: '请先到「媒体库」页面为该来源配置至少一个本地归档映射。'});
         }
         activeMediaItem = item;
         resetScrapeWorkspace();
         const source = sources.find((entry) => Number(entry.id) === Number(item.source_id));
-        $('lmMediaType').value = source?.media_type === 'tv' ? 'tv' : 'movie';
-        positionControls.sync($('lmMediaType').value);
-        $('lmScrapeTitle').textContent = automatic ? `自动匹配 · ${item.name}` : `搜索刮削 · ${item.name}`;
-        $('lmScrapeItemPath').textContent = `${item.source_name} / ${item.path}`;
+        $('lmMediaType').value = ['auto', 'movie', 'tv'].includes(source?.media_type)
+            ? source.media_type : 'auto';
+        syncScrapePosition();
+        $('lmScrapeTitle').textContent = automatic ? '自动匹配' : '搜索刮削';
+        $('lmScrapeItemPath').textContent = `${item.name} · ${item.source_name} / ${item.path}`;
+        $('lmScrapeItemPath').title = `${item.source_name} / ${item.path}`;
         if (scrapeModal) scrapeModal.open(trigger);
         else $('lmScrapeModal').hidden = false;
         icons($('lmScrapeModal'));
@@ -1183,6 +1013,7 @@
             if (requestSerial !== inspectionRequestSerial) return;
             $('lmScrapeStatus').textContent = '检查失败';
             $('lmScrapeDetail').innerHTML = `<div class="lm-scrape-placeholder"><i data-lucide="circle-alert"></i><strong>无法检查此条目</strong><span>${esc(error.message)}</span></div>`;
+            setScrapeMobilePane('preview');
             icons($('lmScrapeDetail'));
             appAlert({type: 'error', title: '检查失败', message: error.message});
         } finally {
@@ -1200,7 +1031,12 @@
     }
 
     $('lmScrapeModal').addEventListener('click', (event) => {
-        if (event.target === $('lmScrapeModal')) closeScrape();
+        if (event.target === $('lmScrapeModal')) {
+            closeScrape();
+            return;
+        }
+        const paneButton = event.target.closest('[data-scrape-mobile-pane]');
+        if (paneButton) setScrapeMobilePane(paneButton.dataset.scrapeMobilePane);
     });
 
     async function beginTaskReview(taskId, button) {
@@ -1219,18 +1055,22 @@
                 organize_ready: true,
             };
             resetScrapeWorkspace();
-            $('lmScrapeTitle').textContent = `人工确认 · ${activeMediaItem.name}`;
-            $('lmScrapeItemPath').textContent = `${activeMediaItem.source_name} / 待确认任务 #${taskId}`;
+            $('lmScrapeTitle').textContent = '人工确认';
+            $('lmScrapeItemPath').textContent = `${activeMediaItem.name} · ${activeMediaItem.source_name} / 待确认任务 #${taskId}`;
+            $('lmScrapeItemPath').title = `${activeMediaItem.source_name} / 待确认任务 #${taskId}`;
             const source = sources.find((entry) => Number(entry.id) === Number(result.source_id));
-            $('lmMediaType').value = task?.media_type || (source?.media_type === 'tv' ? 'tv' : 'movie');
+            const reviewType = task?.media_type || source?.media_type || result.media_type || 'auto';
+            $('lmMediaType').value = ['auto', 'movie', 'tv'].includes(reviewType)
+                ? reviewType : 'auto';
             if (scrapeModal) scrapeModal.open(button);
             else $('lmScrapeModal').hidden = false;
             applyInspection(result);
             positionControls.reset({
                 season: task?.season ?? result.parsed_season ?? null,
                 episode: task?.episode ?? result.parsed_episode ?? null,
+                numbering_mode: task?.numbering_mode || result.task_numbering_mode || 'auto',
             });
-            positionControls.sync($('lmMediaType').value);
+            syncScrapePosition();
             await search();
         } catch (error) {
             if (requestSerial === inspectionRequestSerial) appAlert({type: 'error', title: '无法进入人工确认', message: error.message});
@@ -1249,6 +1089,7 @@
             appAlert({type: 'warning', title: '请输入搜索名称', message: '搜索名称不能为空。'});
             return false;
         }
+        setScrapeMobilePane('candidates');
         const requestSerial = ++searchRequestSerial;
         const inspectionId = inspection.inspection_id;
         setBusy($('lmSearchBtn'), true, '搜索中');
@@ -1256,16 +1097,35 @@
         try {
             const data = await api('/api/local-media/search', {
                 method: 'POST',
-                body: JSON.stringify({query, media_type: $('lmMediaType').value}),
+                body: JSON.stringify({
+                    query,
+                    media_type: $('lmMediaType').value,
+                    inspection_id: inspectionId,
+                }),
             });
             if (requestSerial !== searchRequestSerial || inspection?.inspection_id !== inspectionId) return false;
             const candidates = data.candidates || [];
             $('lmCandidates').innerHTML = candidates.length
-                ? candidates.map((candidate, index) => `
+                ? candidates.map((candidate, index) => {
+                    const candidateType = candidate.media_type === 'tv' ? '剧集' : '电影';
+                    const candidateIcon = candidate.media_type === 'tv' ? 'circle-play' : 'clapperboard';
+                    const score = (Number(candidate.score) || 0).toFixed(0);
+                    return `
                     <button type="button" class="lm-candidate" data-candidate="${index}">
-                        <span><strong>${esc(candidate.title)}${candidate.year ? ` (${esc(candidate.year)})` : ''}</strong><span>TMDB ${esc(candidate.tmdb_id)} · ${(Number(candidate.score) || 0).toFixed(0)}% 匹配</span></span>
-                        <i data-lucide="chevron-right"></i>
-                    </button>`).join('')
+                        <span class="lm-candidate-main">
+                            <span class="lm-candidate-mark"><i data-lucide="${candidateIcon}"></i></span>
+                            <span class="lm-candidate-copy">
+                                <strong>${esc(candidate.title)}${candidate.year ? ` <em>${esc(candidate.year)}</em>` : ''}</strong>
+                                <span><b>${candidateType}</b><span>TMDB ${esc(candidate.tmdb_id)}</span></span>
+                            </span>
+                        </span>
+                        <span class="lm-candidate-score">${score}%</span>
+                        <span class="lm-candidate-state" aria-hidden="true">
+                            <i class="lm-candidate-arrow" data-lucide="chevron-right"></i>
+                            <i class="lm-candidate-check" data-lucide="check"></i>
+                        </span>
+                    </button>`;
+                }).join('')
                 : '<div class="lm-scrape-placeholder"><i data-lucide="search-x"></i><strong>没有搜索到候选</strong><span>可以调整名称或媒体类型后重试。</span></div>';
             $('lmCandidates')._items = candidates;
             $('lmCandidateCount').textContent = `${candidates.length} 项`;
@@ -1280,6 +1140,56 @@
             return false;
         } finally {
             if (requestSerial === searchRequestSerial) setBusy($('lmSearchBtn'), false, '搜索');
+        }
+    }
+
+    async function loadExternalHints() {
+        if (!inspection) return;
+        const query = $('lmSearchQuery').value.trim();
+        if (!query) {
+            return appAlert({type: 'warning', title: '请输入搜索名称', message: '外部线索搜索名称不能为空。'});
+        }
+        const container = $('lmScrapeExternalHints');
+        const requestSerial = ++externalHintsRequestSerial;
+        const inspectionId = inspection.inspection_id;
+        setBusy($('lmScrapeExternalBtn'), true, '查询中');
+        try {
+            const data = await api('/api/local-media/external-hints', {
+                method: 'POST',
+                body: JSON.stringify({
+                    inspection_id: inspectionId,
+                    query,
+                    media_type: $('lmMediaType').value,
+                }),
+            });
+            if (
+                requestSerial !== externalHintsRequestSerial
+                || inspection?.inspection_id !== inspectionId
+            ) return;
+            const items = data.items || [];
+            const errors = data.errors || [];
+            container.hidden = false;
+            container.innerHTML = `
+                <div class="lm-scrape-external-head"><strong>豆瓣 / BGM 线索</strong><small>${items.length} 项</small></div>
+                ${items.map((item, index) => `
+                    <button type="button" data-external-hint="${index}">
+                        <strong>${esc(item.title || item.original_title || '未命名')}</strong>
+                        <span>${esc(item.provider || 'external')} · ${esc(item.media_type || '')}${item.year ? ` · ${esc(item.year)}` : ''}</span>
+                    </button>`).join('') || `<p>${esc(errors[0]?.message || '没有找到可用外部线索。')}</p>`}
+                <small>${esc(data.advisory || '外部资料仅作为搜索线索，最终仍由 TMDB 确认。')}</small>`;
+            container._items = items;
+            icons(container);
+        } catch (error) {
+            if (
+                requestSerial === externalHintsRequestSerial
+                && inspection?.inspection_id === inspectionId
+            ) {
+                appAlert({type: 'error', title: '外部线索查询失败', message: error.message});
+            }
+        } finally {
+            if (requestSerial === externalHintsRequestSerial) {
+                setBusy($('lmScrapeExternalBtn'), false, '豆瓣 / BGM 线索');
+            }
         }
     }
 
@@ -1425,7 +1335,8 @@
 
     async function preview(candidate = null) {
         if (!inspection) return false;
-        const mediaType = candidate?.media_type || $('lmMediaType').value;
+        setScrapeMobilePane('preview');
+        const mediaType = candidate?.media_type || resolvedScrapeMediaType();
         positionControls.sync(mediaType);
         let positionPayload;
         try {
@@ -1442,6 +1353,7 @@
             mediaType,
             season: positionPayload.season ?? null,
             episode: positionPayload.episode ?? null,
+            numberingMode: positionPayload.numbering_mode || 'auto',
         });
         selectedCandidate = null;
         lastPreview = null;
@@ -1458,6 +1370,7 @@
                     media_type: context.mediaType,
                     season: context.season,
                     episode: context.episode,
+                    numbering_mode: context.numberingMode,
                 }),
             });
             if (requestSerial !== previewRequestSerial || inspection?.inspection_id !== context.inspectionId) return false;
@@ -1476,10 +1389,13 @@
                 episode: effectivePosition.episode ?? context.episode,
             });
             const plans = previewResult.plans || [];
+            const pendingConfirmations = previewResult.pending_confirmations || [];
             const cleanup = previewResult.cleanup || [];
             const replacements = plans.filter((item) => item.action === 'replace').length;
             const skipped = plans.filter((item) => item.action === 'skip').length;
             const matched = previewResult.matches?.[0];
+            const matchedMediaType = matched?.media_type || context.mediaType;
+            const matchedMediaTypeLabel = matchedMediaType === 'tv' ? '剧集' : (matchedMediaType === 'movie' ? '电影' : matchedMediaType);
             const positionLabel = Number.isInteger(matched?.episode)
                 ? ` · S${String(matched.season ?? 1).padStart(2, '0')}E${String(matched.episode).padStart(2, '0')}`
                 : (Number.isInteger(appliedPreviewContext.season) ? ` · 第 ${appliedPreviewContext.season} 季` : '');
@@ -1487,15 +1403,20 @@
             const primaryTargetPath = plans[0]?.target_path || '';
             $('lmScrapeTarget').textContent = primaryTargetPath ? `将整理至：${primaryTargetPath}` : '目标路径已校验';
             $('lmScrapeTarget').title = primaryTargetPath;
-            $('lmScrapeStatus').textContent = '计划已就绪';
+            $('lmScrapeStatus').textContent = pendingConfirmations.length ? '仍需人工确认' : '计划已就绪';
+            $('lmScrapeModal').querySelector('.lm-scrape-dialog')?.classList.add('has-plan');
             $('lmScrapeDetail').innerHTML = `
                 <div class="lm-scrape-summary">
-                    <div><strong>${esc(matched?.title || activeMediaItem?.name || '已识别')}</strong><span>${esc(matched?.media_type || context.mediaType)} · TMDB ${esc(matched?.tmdb_id || context.tmdbId || '自动')}${positionLabel}</span></div>
+                    <div><strong>${esc(matched?.title || activeMediaItem?.name || '已识别')}</strong><span>${esc(matchedMediaTypeLabel)} · TMDB ${esc(matched?.tmdb_id || context.tmdbId || '自动')}${positionLabel}</span></div>
                     <div><strong>${plans.length}</strong><span>媒体与伴随文件</span></div>
                     <div><strong>${replacements}</strong><span>同名目标安全覆盖${skipped ? ` · ${skipped} 项保留` : ''}</span></div>
                 </div>
                 <div class="lm-plan-list">${renderPlanTree(plans, cleanup)}</div>`;
-            $('lmExecuteBtn').disabled = false;
+            $('lmExecuteBtn').disabled = pendingConfirmations.length > 0;
+            if (pendingConfirmations.length) {
+                $('lmPlanSummary').textContent += ` · ${pendingConfirmations.length} 组待确认`;
+                appliedPreviewContext = null;
+            }
             document.querySelectorAll('[data-candidate]').forEach((button) => button.classList.remove('is-selected'));
             if (candidate) {
                 const candidates = $('lmCandidates')._items || [];
@@ -1543,6 +1464,7 @@
                     media_type: confirmedContext.mediaType,
                     season: confirmedContext.season,
                     episode: confirmedContext.episode,
+                    numbering_mode: confirmedContext.numberingMode,
                     rules_snapshot: confirmedPreview.rules_snapshot || '',
                 }),
             });
@@ -1578,7 +1500,7 @@
         const menu = $('lmItemContextMenu');
         menu.querySelectorAll('[data-item-action="search"], [data-item-action="auto"]').forEach((button) => {
             button.disabled = !item.organize_ready;
-            button.title = item.organize_ready ? '' : '请先为来源配置归档目标';
+            button.title = item.organize_ready ? '' : '请先在媒体库页面配置归档映射';
         });
         const deleteButton = menu.querySelector('[data-item-action="delete"]');
         if (deleteButton) {
@@ -1685,46 +1607,46 @@
     $('lmRefreshItemsBtn').addEventListener('click', refreshMediaItems);
     $('lmSearchBtn').addEventListener('click', search);
     $('lmAutoPreviewBtn').addEventListener('click', () => preview());
+    $('lmScrapeCleanBtn')?.addEventListener('click', () => {
+        const cleaned = window.MediaScrapePosition.sanitizeSearchQuery(
+            $('lmSearchQuery').value,
+            {knownEpisode: inspection?.parsed_episode},
+        );
+        if (!cleaned) {
+            $('lmScrapeStatus').textContent = '请手动修改搜索名称';
+            return $('lmSearchQuery').focus();
+        }
+        $('lmSearchQuery').value = cleaned;
+        invalidatePreview();
+        $('lmSearchQuery').focus();
+    });
+    $('lmScrapeExternalBtn')?.addEventListener('click', loadExternalHints);
+    $('lmScrapeExternalHints')?.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-external-hint]');
+        if (!button) return;
+        const item = $('lmScrapeExternalHints')._items?.[Number(button.dataset.externalHint)];
+        if (!item) return;
+        $('lmSearchQuery').value = item.title || item.original_title || $('lmSearchQuery').value;
+        if (['movie', 'tv'].includes(item.media_type)) $('lmMediaType').value = item.media_type;
+        syncScrapePosition();
+        invalidatePreview();
+        search();
+    });
     $('lmSearchQuery').addEventListener('keydown', (event) => {
         if (event.key === 'Enter') { event.preventDefault(); search(); }
     });
     $('lmMediaType').addEventListener('change', () => {
-        positionControls.sync($('lmMediaType').value);
+        syncScrapePosition();
         invalidatePreview();
     });
     $('lmScrapeSeason').addEventListener('input', invalidatePreview);
     $('lmScrapeEpisode').addEventListener('input', invalidatePreview);
+    $('lmScrapeNumbering')?.addEventListener('change', invalidatePreview);
     $('lmScrapeCloseBtn').addEventListener('click', closeScrape);
     $('lmScrapeCancelBtn').addEventListener('click', closeScrape);
     $('lmExecuteBtn').addEventListener('click', execute);
 
-    $('lmTargetRows').addEventListener('change', async (event) => {
-        const row = event.target.closest('[data-target-row]');
-        if (!row) return;
-        if (event.target.matches('[data-target-provider]')) {
-            row.dataset.libraryId = '';
-            row.dataset.libraryName = '';
-            row.dataset.serverPath = '';
-            await populateLibrarySelect(row);
-            return;
-        }
-        if (event.target.matches('[data-target-library]')) {
-            const option = event.target.selectedOptions[0];
-            row.dataset.libraryId = event.target.value;
-            row.dataset.libraryName = option?.dataset.name || '';
-            row.dataset.serverPath = '';
-            await populateCurrentServerPath(row);
-            return;
-        }
-        if (event.target.matches('[data-target-server-path]')) {
-            row.dataset.serverPath = event.target.value;
-            const hasAvailableLocations = [...event.target.options]
-                .some((option) => option.value && !option.textContent.includes('当前不可用'));
-            const required = hasAvailableLocations && !event.target.value;
-            row.dataset.serverPathRequired = required ? '1' : '0';
-            event.target.classList.toggle('is-required', required);
-        }
-    });
+
 
     document.addEventListener('click', async (event) => {
         const itemMenuButton = event.target.closest('[data-open-item-menu]');
@@ -1792,13 +1714,6 @@
             } finally {
                 setBusy(remove, false, '删除');
             }
-            return;
-        }
-
-        const pickTarget = event.target.closest('[data-pick-target]');
-        if (pickTarget) {
-            const row = pickTarget.closest('[data-target-row]');
-            openLocalDirectoryPicker(row.querySelector('[data-target-path]'));
             return;
         }
 

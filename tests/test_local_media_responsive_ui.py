@@ -57,21 +57,23 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertRegex(css, r"\.lm-review-list\s*\{[^}]*min-height:\s*220px")
         self.assertIn(".lm-source-card,", css)
         self.assertIn(".lm-review-item,", css)
-        self.assertIn("?v=20260821a", template)
+        self.assertIn("?v=20260828", template)
 
-    def test_media_source_targets_bind_server_visible_library_locations(self):
+    def test_media_source_dialog_stays_inside_mobile_viewport_and_defers_archive_mapping(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
         js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
         css = Path("app/static/css/local-media.css").read_text(encoding="utf-8")
 
-        self.assertIn("媒体服务器实际可见的对应路径", template)
-        self.assertIn("data-target-server-path", js)
-        self.assertIn("server_path: serverPathSelect.value", js)
-        self.assertIn("library?.locations", js)
-        self.assertIn("row.dataset.serverPathRequired", js)
-        self.assertIn("hasAvailableLocations && !event.target.value", js)
-        self.assertIn("classList.toggle('is-required', required)", js)
-        self.assertIn(".lm-target-server-path.is-required", css)
+        self.assertIn(".lm-modal { padding: 10px; }", css)
+        self.assertIn("width: 100%; max-width: 100%; max-height: calc(100dvh - 20px)", css)
+        self.assertIn(".lm-dialog-body { padding: 14px; overflow-x: hidden; }", css)
+        self.assertIn("grid-template-columns: minmax(0, 1fr);", css)
+        self.assertIn("归档目录统一在“媒体库”页面维护", template)
+        self.assertNotIn('id="lmTargetRows"', template)
+        self.assertNotIn("data-target-row", js)
+        self.assertNotIn("data-target-library", js)
+        self.assertNotIn(".lm-target-editor", css)
+        self.assertNotIn(".lm-target-binding", css)
 
     def test_all_initial_tab_loading_hints_are_delayed_and_have_minimum_visible_time(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
@@ -96,7 +98,7 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn("opacity: 0", css)
         self.assertIn(".lm-initial-loading.is-visible", css)
         self.assertIn(".lm-initial-loading svg", css)
-        self.assertIn("?v=20260825b", template)
+        self.assertIn("?v=20260829j", template)
 
     def test_initial_hash_tab_is_prepainted_before_page_script_loads(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
@@ -163,7 +165,7 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn('data-media-scrape-role="episode"', shared_modal)
         for removed in ('id="lmManualSource"', 'id="lmManualPath"', 'id="lmPickManualPathBtn"'):
             self.assertNotIn(removed, template)
-        self.assertIn("grid-template-columns: minmax(340px, 35%) minmax(0, 1fr);", css)
+        self.assertIn("grid-template-columns: clamp(320px, 27vw, 360px) minmax(0, 1fr);", css)
         self.assertIn(".lm-item-context-menu", css)
         self.assertNotRegex(css, r"\.lm-media-row:hover\s*\{[^}]*transform")
         self.assertIn("/api/local-media/items", js)
@@ -199,6 +201,54 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertNotIn(".lm-plan-tree-branch > ul::before", css)
         self.assertIn("overflow-wrap: anywhere", css)
         self.assertNotIn("${esc(item.source_path)} → ${esc(item.target_name)}", js)
+
+    def test_local_scrape_reuses_shared_numbering_and_stable_mobile_order(self):
+        template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
+        shared_js = Path("app/static/js/media-scrape-position.js").read_text(encoding="utf-8")
+        js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
+        css = Path("app/static/css/local-media.css").read_text(encoding="utf-8")
+
+        for marker in (
+            '"allow_auto_type": true',
+            '"numbering_id": "lmScrapeNumbering"',
+            '"external_id": "lmScrapeExternalBtn"',
+            '"external_label": "外部线索"',
+            '"mobile_tabs": true',
+        ):
+            self.assertIn(marker, template)
+        self.assertIn("numbering.value = values.numbering_mode || 'auto'", shared_js)
+        self.assertIn("candidate?.media_type || resolvedScrapeMediaType()", js)
+        self.assertIn("let externalHintsRequestSerial = 0", js)
+        self.assertIn("inspection?.inspection_id !== inspectionId", js)
+        self.assertIn("grid-row: 3", css)
+        self.assertIn("#lmSearchBtn { grid-column: 1 / -1; grid-row: 4; }", css)
+
+    def test_local_scrape_mobile_uses_single_pane_segmented_workspace(self):
+        shared_modal = Path("app/templates/_media_scrape_modal.html").read_text(encoding="utf-8")
+        js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
+        css = Path("app/static/css/local-media.css").read_text(encoding="utf-8")
+
+        self.assertIn('data-scrape-mobile-pane="candidates"', shared_modal)
+        self.assertIn('data-scrape-mobile-pane="preview"', shared_modal)
+        self.assertIn("function setScrapeMobilePane(pane)", js)
+        self.assertIn("setScrapeMobilePane('candidates');", js)
+        self.assertIn("setScrapeMobilePane('preview');", js)
+        self.assertIn('.lm-scrape-mobile-tabs { display: none; }', css)
+        self.assertIn('.lm-scrape-dialog[data-mobile-pane="candidates"] .lm-scrape-detail-region', css)
+        self.assertIn('.lm-scrape-dialog[data-mobile-pane="preview"] .lm-scrape-candidate-region', css)
+        self.assertIn('.lm-scrape-dialog:not(.has-plan) .lm-scrape-target { display: none; }', css)
+        self.assertIn('width: min(1240px, calc(100vw - 64px));', css)
+        self.assertIn('height: min(780px, calc(100dvh - 64px));', css)
+        self.assertIn("candidate.media_type === 'tv' ? 'circle-play' : 'clapperboard'", js)
+        self.assertIn('class="lm-candidate-state"', js)
+        self.assertIn('class="lm-candidate-check"', js)
+        self.assertIn('.lm-candidate.is-selected .lm-candidate-check { display: block; }', css)
+        self.assertIn('.lm-candidate .lm-candidate-mark {', css)
+        self.assertIn('align-items: center;', css)
+        self.assertIn('justify-content: center;', css)
+        self.assertNotIn('.lm-candidate span span {', css)
+        self.assertNotIn('box-shadow: inset 3px 0 0 var(--accent);', css)
+        self.assertNotRegex(css, r"\.lm-candidate:hover\s*\{[^}]*transform")
 
     def test_task_detail_uses_sorted_ordinal_timeline_and_stable_modal_layout(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")

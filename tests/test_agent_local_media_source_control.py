@@ -84,9 +84,9 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(
             local_media_source_trigger_arguments(
-                {"source_number": 1, "trigger": "SCAN", "enabled": True}
+                {"source_number": 1, "trigger": "QB_COMPLETED", "enabled": True}
             ),
-            {"source_number": 1, "trigger": "scan", "enabled": True},
+            {"source_number": 1, "trigger": "qb_completed", "enabled": True},
         )
         invalid_cases = (
             (local_media_source_summaries_arguments, {"path": "/private"}),
@@ -95,6 +95,10 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
             (
                 local_media_source_trigger_arguments,
                 {"source_number": 1, "trigger": "all", "enabled": True},
+            ),
+            (
+                local_media_source_trigger_arguments,
+                {"source_number": 1, "trigger": "scan", "enabled": True},
             ),
             (
                 local_media_source_trigger_arguments,
@@ -138,14 +142,10 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
                 {"source_number": 2, "trigger": "qb_completed", "enabled": False},
             ),
         )
-        self.assertEqual(
+        self.assertIsNone(
             local_media_source_trigger_control_request(
                 "启用本地媒体来源 2 的目录自动扫描"
-            ),
-            (
-                "local_media.set_source_trigger_enabled",
-                {"source_number": 2, "trigger": "scan", "enabled": True},
-            ),
+            )
         )
         self.assertIsNone(
             local_media_source_trigger_control_request("暂停所有本地媒体来源的目录扫描")
@@ -168,7 +168,6 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         self.assertTrue(listed.ok)
         self.assertEqual(listed.data["total"], 2)
         self.assertEqual(listed.data["enabled_count"], 1)
-        self.assertEqual(listed.data["scan_enabled_count"], 0)
         self.assertEqual(detail.data["source_number"], 1)
         self.assertEqual(detail.data["target_categories"], ["tv"])
 
@@ -189,19 +188,21 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         ):
             self.assertNotIn(secret, serialized)
         self.assertIn("source_number", serialized)
-        self.assertIn("scan_enabled", serialized)
+        self.assertNotIn("scan_enabled", serialized)
+        self.assertNotIn("stable_seconds", serialized)
+        self.assertNotIn("scan_interval_minutes", serialized)
 
     def test_prepare_confirm_updates_only_requested_trigger_and_records_safe_history(self) -> None:
         service = get_agent_service()
         before = db.get_local_media_source(self.source_one)
         prepared = service.prepare(
             "local_media.set_source_trigger_enabled",
-            {"source_number": 1, "trigger": "scan", "enabled": True},
+            {"source_number": 1, "trigger": "qb_completed", "enabled": False},
             owner="owner",
         )
         after_prepare = db.get_local_media_source(self.source_one)
-        self.assertFalse(before.scan_enabled)
-        self.assertFalse(after_prepare.scan_enabled)
+        self.assertTrue(before.enabled)
+        self.assertTrue(after_prepare.enabled)
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(
             prepared["confirmation"]["contract"]["action"],
@@ -217,11 +218,11 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
                 prepared["confirmation"]["confirmation_id"], owner="owner"
             )
         self.assertTrue(confirmed["result"]["ok"])
-        self.assertTrue(confirmed["result"]["data"]["enabled"])
+        self.assertFalse(confirmed["result"]["data"]["enabled"])
         scheduler.reload.assert_called_once_with()
         changed = db.get_local_media_source(self.source_one)
-        self.assertTrue(changed.enabled)
-        self.assertTrue(changed.scan_enabled)
+        self.assertFalse(changed.enabled)
+        self.assertFalse(changed.scan_enabled)
         self.assertEqual(changed.local_root, before.local_root)
         self.assertEqual(changed.qb_profile, before.qb_profile)
 
@@ -236,10 +237,10 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
                 "runtime_refreshed",
             )},
             {
-                "operation": "enable",
+                "operation": "disable",
                 "source_number": 1,
-                "trigger": "scan",
-                "enabled": True,
+                "trigger": "qb_completed",
+                "enabled": False,
                 "affected": 1,
                 "runtime_refreshed": True,
             },
@@ -252,7 +253,7 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         service = get_agent_service()
         prepared = service.prepare(
             "local_media.set_source_trigger_enabled",
-            {"source_number": 1, "trigger": "scan", "enabled": True},
+            {"source_number": 1, "trigger": "qb_completed", "enabled": False},
             owner="owner",
         )
         db.update_local_media_source(self.source_one, stable_seconds=301)
@@ -360,8 +361,8 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(ambiguous["mode"], "clarification")
         self.assertEqual(ambiguous["result"]["status"], "clarification_required")
         unauthenticated = service.query("启用本地媒体来源 2 的目录自动扫描")
-        self.assertEqual(unauthenticated["mode"], "read_only")
-        self.assertEqual(unauthenticated["result"]["status"], "unsupported")
+        self.assertEqual(unauthenticated["mode"], "clarification")
+        self.assertEqual(unauthenticated["result"]["status"], "clarification_required")
 
         registry = build_tool_registry()
         read_names = {item["name"] for item in read_tool_capabilities(registry)}

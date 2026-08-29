@@ -17,7 +17,6 @@ logger = get_logger(__name__)
 
 _TRIGGER_FIELDS = {
     "qb_completed": ("enabled", "qB 下载完成自动接管"),
-    "scan": ("scan_enabled", "目录自动扫描"),
 }
 _MAX_SOURCE_NUMBER = 10_000
 
@@ -59,7 +58,7 @@ def local_media_source_trigger_arguments(arguments: dict[str, Any]) -> dict[str,
         )
     trigger = str(arguments.get("trigger") or "").strip().lower()
     if trigger not in _TRIGGER_FIELDS:
-        raise AgentToolError("trigger 只支持 qb_completed 或 scan")
+        raise AgentToolError("trigger 只支持 qb_completed")
     enabled = arguments.get("enabled")
     if not isinstance(enabled, bool):
         raise AgentToolError("enabled 必须是布尔值")
@@ -106,16 +105,11 @@ def _public_summary(conn: Any, row: Any, source_number: int) -> dict[str, Any]:
     categories = sorted({str(item["category"] or "default") for item in targets})
     mode = str(row["mode"] or "move")
     qb_enabled = bool(row["enabled"])
-    scan_enabled = bool(row["scan_enabled"])
     return {
         "source_number": source_number,
         "enabled": qb_enabled,
-        "scan_enabled": scan_enabled,
-        "scan_effective": scan_enabled and mode != "preview_only",
         "mode": mode,
         "media_type": str(row["media_type"] or "auto"),
-        "stable_seconds": max(0, int(row["stable_seconds"] or 0)),
-        "scan_interval_minutes": max(1, int(row["scan_interval_minutes"] or 1)),
         "target_count": len(targets),
         "target_categories": categories,
     }
@@ -151,19 +145,16 @@ def list_local_media_source_summaries(_arguments: dict[str, Any]) -> ToolResult:
             for index, row in enumerate(rows, start=1)
         ]
     enabled_count = sum(int(item["enabled"]) for item in sources)
-    scan_count = sum(int(item["scan_effective"]) for item in sources)
     return ToolResult(
         ok=True,
         status="healthy" if sources else "not_configured",
         summary=(
-            f"共有 {len(sources)} 个本地媒体来源，{enabled_count} 个接管 qB 完成任务，"
-            f"{scan_count} 个执行目录扫描"
+            f"共有 {len(sources)} 个本地媒体来源，{enabled_count} 个接管 qB 完成任务"
             if sources else "尚未配置本地媒体来源"
         ),
         data={
             "total": len(sources),
             "enabled_count": enabled_count,
-            "scan_enabled_count": scan_count,
             "sources": sources,
         },
         evidence=[Evidence(
@@ -172,7 +163,7 @@ def list_local_media_source_summaries(_arguments: dict[str, Any]) -> ToolResult:
             collected_at=_now(),
         )],
         suggestions=(
-            ["可按来源编号查看详情，或精确启停 qB 自动接管与目录扫描。"]
+            ["可按来源编号查看详情，或精确启停 qB 完成自动接管。"]
             if sources else ["请先在本地媒体页面添加来源。"]
         ),
     )

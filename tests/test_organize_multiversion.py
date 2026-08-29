@@ -916,6 +916,40 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(execute_stats["skipped"], 1)
 
 
+    def test_batch_winner_inherits_real_existing_target_for_replacement(self):
+        existing = GuangYaFile(
+            "existing", "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-OLD.mkv",
+            False, 500, "existing-etag", "movie",
+        )
+        first = GuangYaFile(
+            "a-first", "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-FIRST.mkv",
+            False, 1000, "first-etag", "source",
+        )
+        second = GuangYaFile(
+            "b-second", "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-SECOND.mkv",
+            False, 2000, "second-etag", "source",
+        )
+        client = _VariantTreeClient(first, existing)
+        client.tree["source"] = [first, second]
+        organizer = Organizer(client=client, scraper=_VariantScraper())
+
+        plans, _stats = organizer.organize(
+            "source", self._rules(), dry_run=True, post_actions=False,
+        )
+
+        by_id = {plan.file_id: plan for plan in plans}
+        self.assertEqual(by_id["a-first"].action, "skip")
+        self.assertEqual(
+            by_id["a-first"].conflict_decision, "batch_superseded",
+        )
+        self.assertEqual(by_id["b-second"].action, "move")
+        self.assertEqual(by_id["b-second"].conflict_decision, "replace")
+        self.assertEqual(by_id["b-second"].conflict_existing_id, "existing")
+        self.assertEqual(
+            by_id["b-second"].conflict_existing_name, existing.name,
+        )
+
+
     def test_batch_arbitration_skips_earlier_smaller_candidate_before_cloud_write(self):
         smaller = GuangYaFile(
             "a-smaller", "Variant.Movie.2026.2160p.SDR.DDP5.1.x265-SMALL.mkv",
@@ -945,6 +979,8 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         )
         self.assertIn("未执行云盘写入", by_id["a-smaller"].note)
         self.assertEqual(by_id["b-larger"].action, "move")
+        self.assertEqual(by_id["b-larger"].conflict_decision, "new")
+        self.assertEqual(by_id["b-larger"].conflict_existing_id, "")
         self.assertEqual(stats["moved"], 1)
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(client.moves, [(("b-larger",), "movie")])

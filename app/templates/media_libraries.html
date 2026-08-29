@@ -3,7 +3,7 @@
 {% block page_title %}媒体库{% endblock %}
 {% block body_class %}media-libraries-page{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/media-libraries.css') }}?v=20260825g">
+<link rel="stylesheet" href="{{ url_for('static', path='css/media-libraries.css') }}?v=20260829c">
 {% endblock %}
 
 {% block content %}
@@ -29,7 +29,7 @@
         </div>
         <div class="stat-card">
             <div class="stat-card-head">
-                <span class="stat-label">媒体库映射</span>
+                <span class="stat-label">路径映射</span>
                 <i data-lucide="folder-symlink" class="stat-icon-subtle is-purple"></i>
             </div>
             <div class="stat-value" id="mlMappingCount">—</div>
@@ -37,11 +37,11 @@
         </div>
         <div class="stat-card">
             <div class="stat-card-head">
-                <span class="stat-label">STRM 目录</span>
-                <i data-lucide="hard-drive" class="stat-icon-subtle is-amber"></i>
+                <span class="stat-label">本地归档</span>
+                <i data-lucide="archive" class="stat-icon-subtle is-amber"></i>
             </div>
             <div class="stat-value" id="mlBindingCount">—</div>
-            <div class="stat-foot" id="mlBindingSummary">正在读取 STRM 输出</div>
+            <div class="stat-foot" id="mlBindingSummary">正在读取本地归档来源</div>
         </div>
     </div>
 
@@ -50,12 +50,12 @@
             <div class="ml-studio-title-group">
                 <div class="ml-studio-icon"><i data-lucide="route"></i></div>
                 <div>
-                    <h2 id="mlMappingsTitle">媒体库路径映射</h2>
-                    <p>选择已配置服务器中的媒体库，把对应 STRM 目录映射到该媒体库在服务器中可见的路径。</p>
+                    <h2 id="mlMappingsTitle">媒体库与路径映射</h2>
+                    <p>统一管理 STRM 输出目录和本地归档目录，并映射到 Jellyfin / Emby 实际可见的媒体库路径。</p>
                 </div>
             </div>
             <button class="jump-btn ml-add-library-btn" type="button" data-add-library-mapping disabled>
-                <i data-lucide="plus"></i><span>添加媒体库</span>
+                <i data-lucide="plus"></i><span>添加映射</span>
             </button>
         </header>
 
@@ -64,17 +64,17 @@
                 <div class="ml-mapping-columns" aria-hidden="true">
                     <span>媒体库</span>
                     <span>来源</span>
-                    <span>STRM 目录</span>
+                    <span>来源目录</span>
                     <span>服务器路径</span>
                     <span>操作</span>
                 </div>
                 <div class="ml-mapping-list" id="mlMappingList" data-mapping-list>
-                    <div class="ml-empty-row">正在读取媒体库与 STRM 目录…</div>
+                    <div class="ml-empty-row">正在读取媒体库与来源目录…</div>
                 </div>
                 <footer class="ml-mapping-footer">
-                    <p id="mlMappingHint">媒体服务器连接信息继续在“设置”中维护，本页只管理媒体库与路径的对应关系。</p>
+                    <p id="mlMappingHint">媒体服务器连接继续在“设置”中维护；本页统一管理 STRM 与本地归档的目录去向。</p>
                     <button class="btn btn-primary ml-save-btn" type="button" data-save-mappings disabled>
-                        <i data-lucide="save"></i><span data-button-label>保存媒体库映射</span>
+                        <i data-lucide="save"></i><span data-button-label>保存映射</span>
                     </button>
                 </footer>
             </section>
@@ -84,5 +84,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/media-libraries.js') }}?v=20260825g"></script>
+<script src="{{ url_for('static', path='js/media-libraries.js') }}?v=20260829c"></script>
 {% endblock %}

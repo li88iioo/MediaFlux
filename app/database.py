@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -1191,6 +1191,7 @@ CREATE TABLE IF NOT EXISTS local_media_tasks (
     media_type TEXT DEFAULT '',
     season_override INTEGER,
     episode_override INTEGER,
+    numbering_mode TEXT NOT NULL DEFAULT 'auto',
     title TEXT DEFAULT '',
     year TEXT DEFAULT '',
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -2198,6 +2199,19 @@ def _migrate_agent_guangya_operation_jobs_v10(
     )
 
 
+def _migrate_local_media_numbering_mode_v11(conn: sqlite3.Connection) -> None:
+    """持久化本地剧集编号方式，保证预览与最终执行使用同一映射。"""
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(local_media_tasks)")
+    }
+    if columns and "numbering_mode" not in columns:
+        conn.execute(
+            "ALTER TABLE local_media_tasks ADD COLUMN "
+            "numbering_mode TEXT NOT NULL DEFAULT 'auto'"
+        )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2209,6 +2223,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     7: _migrate_local_library_target_server_path_v8,
     8: _migrate_media_proxy_trusted_forwarders_v9,
     9: _migrate_agent_guangya_operation_jobs_v10,
+    10: _migrate_local_media_numbering_mode_v11,
 }
 
 
@@ -5903,6 +5918,74 @@ def list_local_library_targets(source_id: int, *, owner: str = "admin"):
     return [LocalLibraryTarget.from_row(row) for row in rows]
 
 
+def replace_local_library_targets(
+    bindings: list[dict[str, object]],
+    *,
+    owner: str = "admin",
+) -> None:
+    """原子替换当前用户的全部本地归档目标，供统一媒体库页面保存。"""
+    from app.modules.local_media_models import LOCAL_MEDIA_CATEGORIES
+
+    safe_owner = _local_media_owner(owner)
+    normalized: list[dict[str, object]] = []
+    seen: set[tuple[int, str]] = set()
+    for item in bindings:
+        source_id = int(item.get("source_id") or 0)
+        category = str(item.get("category") or "").strip().lower()
+        path = str(item.get("path") or "").strip()
+        provider = str(item.get("provider") or "").strip().lower()
+        library_id = str(item.get("library_id") or "").strip()
+        library_name = str(item.get("library_name") or "").strip()
+        server_path = str(item.get("server_path") or "").strip()
+        key = (source_id, category)
+        if source_id <= 0 or category not in LOCAL_MEDIA_CATEGORIES or key in seen:
+            raise ValueError("本地归档目标的来源或分类无效、重复")
+        if not path or "\x00" in path:
+            raise ValueError("本地归档目标路径无效")
+        if provider not in {"", "jellyfin", "emby"}:
+            raise ValueError("本地归档目标媒体服务器类型无效")
+        if provider and not library_name:
+            raise ValueError("媒体服务器和媒体库名称必须同时选择")
+        if not provider and (library_id or library_name or server_path):
+            raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
+        seen.add(key)
+        normalized.append({
+            "source_id": source_id,
+            "category": category,
+            "path": path,
+            "provider": provider,
+            "library_id": library_id,
+            "library_name": library_name,
+            "server_path": server_path,
+        })
+
+    timestamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing_source_ids = {
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM local_media_sources WHERE owner=?",
+                (safe_owner,),
+            ).fetchall()
+        }
+        unknown = sorted({int(item["source_id"]) for item in normalized} - existing_source_ids)
+        if unknown:
+            raise LookupError("本地媒体来源不存在")
+        conn.execute("DELETE FROM local_library_targets WHERE owner=?", (safe_owner,))
+        for item in normalized:
+            conn.execute(
+                "INSERT INTO local_library_targets(source_id,owner,category,path,provider,"
+                "library_id,library_name,server_path,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    int(item["source_id"]), safe_owner, item["category"], item["path"],
+                    item["provider"], item["library_id"], item["library_name"],
+                    item["server_path"], timestamp, timestamp,
+                ),
+            )
+
+
 def create_local_media_task(
     source_id: int,
     qb_hash: str,
@@ -6039,7 +6122,8 @@ def create_and_link_qb_local_media_task(
                     "UPDATE local_media_tasks SET content_path=?,trigger='qb_completed',"
                     "status='waiting_stable',stable_since='',snapshot_digest='',rules_snapshot='',"
                     "recognition_summary='',tmdb_id='',media_type='',season_override=NULL,"
-                    "episode_override=NULL,title='',year='',operation_token=?,error='',warning='',"
+                    "episode_override=NULL,numbering_mode='auto',title='',year='',"
+                    "operation_token=?,error='',warning='',"
                     "completed_at=NULL,version=version+1,updated_at=? WHERE id=? AND owner=?",
                     (safe_path, uuid.uuid4().hex, timestamp, task_id, safe_owner),
                 )
@@ -6341,6 +6425,7 @@ def prepare_manual_local_media_task(
     source_id: int, content_path: str, *, owner: str = "admin",
     tmdb_id: str = "", media_type: str = "", rules_snapshot: str = "",
     season_override: int | None = None, episode_override: int | None = None,
+    numbering_mode: str = "auto",
 ) -> int:
     """原子创建或重置可重试的手动任务；活动任务绝不被改回等待态。"""
     import uuid
@@ -6348,6 +6433,11 @@ def prepare_manual_local_media_task(
     safe_owner = _local_media_owner(owner)
     safe_path = str(content_path or "").strip()
     normalized_type = str(media_type or "").strip().lower()
+    from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
+    raw_numbering_mode = str(numbering_mode or "auto").strip().lower()
+    if raw_numbering_mode not in NUMBERING_MODES:
+        raise ValueError("剧集编号模式无效")
+    normalized_numbering_mode = normalize_numbering_mode(raw_numbering_mode)
     if not safe_path:
         raise ValueError("本地媒体任务路径不能为空")
     if normalized_type and normalized_type not in {"movie", "tv"}:
@@ -6364,6 +6454,8 @@ def prepare_manual_local_media_task(
             raise ValueError("集数超出允许范围")
     if normalized_type == "movie" and (season_override is not None or episode_override is not None):
         raise ValueError("电影任务不能指定季数或集数")
+    if normalized_type == "movie":
+        normalized_numbering_mode = "auto"
     timestamp = now()
     token = uuid.uuid4().hex
     with get_conn() as conn:
@@ -6382,11 +6474,12 @@ def prepare_manual_local_media_task(
             cur = conn.execute(
                 "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',snapshot_digest='',"
                 "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
-                "season_override=?,episode_override=?,title='',year='',"
+                "season_override=?,episode_override=?,numbering_mode=?,title='',year='',"
                 "operation_token=?,error='',warning='',completed_at=NULL,"
                 "version=version+1,updated_at=? WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
                 (str(rules_snapshot or ""), str(tmdb_id or "").strip(), normalized_type,
-                 season_override, episode_override, token, timestamp, task_id, safe_owner),
+                 season_override, episode_override, normalized_numbering_mode,
+                 token, timestamp, task_id, safe_owner),
             )
             if cur.rowcount != 1:
                 raise ValueError("任务状态已变化，请刷新后重试")
@@ -6400,10 +6493,11 @@ def prepare_manual_local_media_task(
         cur = conn.execute(
             "INSERT INTO local_media_tasks(owner,source_id,qb_hash,content_path,trigger,status,"
             "operation_token,rules_snapshot,tmdb_id,media_type,season_override,episode_override,"
-            "created_at,updated_at) VALUES(?,?,NULL,?,'manual','waiting_stable',?,?,?,?,?,?,?,?)",
+            "numbering_mode,created_at,updated_at) "
+            "VALUES(?,?,NULL,?,'manual','waiting_stable',?,?,?,?,?,?,?,?,?)",
             (safe_owner, int(source_id), safe_path, token, str(rules_snapshot or ""),
              str(tmdb_id or "").strip(), normalized_type, season_override, episode_override,
-             timestamp, timestamp),
+             normalized_numbering_mode, timestamp, timestamp),
         )
         return int(cur.lastrowid)
 
@@ -6440,12 +6534,18 @@ def claim_local_media_confirmation_task(
     rules_snapshot: str,
     season_override: int | None = None,
     episode_override: int | None = None,
+    numbering_mode: str = "auto",
     title: str = "",
     year: str = "",
 ) -> bool:
     """把仍然有效的本地待确认任务原子转换为执行态。"""
     normalized_type = str(media_type or "").strip().lower()
     normalized_tmdb_id = str(tmdb_id or "").strip()
+    from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
+    raw_numbering_mode = str(numbering_mode or "auto").strip().lower()
+    if raw_numbering_mode not in NUMBERING_MODES:
+        raise ValueError("剧集编号模式无效")
+    normalized_numbering_mode = normalize_numbering_mode(raw_numbering_mode)
     if not normalized_tmdb_id or normalized_type not in {"movie", "tv"}:
         raise ValueError("候选媒体参数无效")
     if isinstance(expected_version, bool) or int(expected_version) <= 0:
@@ -6463,11 +6563,13 @@ def claim_local_media_confirmation_task(
     if normalized_type == "movie":
         season_override = None
         episode_override = None
+        normalized_numbering_mode = "auto"
 
     where = "id=? AND owner=? AND status='requires_manual' AND version=?"
     params: list[object] = [
         str(rules_snapshot or ""), normalized_tmdb_id, normalized_type,
-        season_override, episode_override, str(title or ""), str(year or ""),
+        season_override, episode_override, normalized_numbering_mode,
+        str(title or ""), str(year or ""),
         now(), int(task_id), _local_media_owner(owner), int(expected_version),
     ]
     expected_digest = str(expected_snapshot_digest or "").strip()
@@ -6478,7 +6580,7 @@ def claim_local_media_confirmation_task(
         cur = conn.execute(
             "UPDATE local_media_tasks SET status='recognizing',attempts=attempts+1,"
             "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
-            "season_override=?,episode_override=?,"
+            "season_override=?,episode_override=?,numbering_mode=?,"
             "title=?,year=?,error='',warning='',completed_at=NULL,version=version+1,updated_at=? "
             f"WHERE {where}",
             params,
@@ -6492,7 +6594,7 @@ def update_local_media_task(task_id: int, *, owner: str = "admin", **fields) -> 
     allowed = {
         "status", "stable_since", "snapshot_digest", "rules_snapshot", "recognition_summary",
         "tmdb_id", "media_type",
-        "season_override", "episode_override", "title", "year",
+        "season_override", "episode_override", "numbering_mode", "title", "year",
         "error", "warning", "completed_at", "content_path",
     }
     sets: list[str] = []
@@ -6695,10 +6797,18 @@ def reset_local_media_task(
     media_type: str | None = None,
     season_override: int | None = None,
     episode_override: int | None = None,
+    numbering_mode: str | None = None,
 ) -> bool:
     import uuid
 
     normalized_type = None if media_type is None else str(media_type or "").strip().lower()
+    normalized_numbering_mode = None
+    if numbering_mode is not None:
+        from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
+        raw_numbering_mode = str(numbering_mode or "auto").strip().lower()
+        if raw_numbering_mode not in NUMBERING_MODES:
+            raise ValueError("剧集编号模式无效")
+        normalized_numbering_mode = normalize_numbering_mode(raw_numbering_mode)
     if normalized_type and normalized_type not in {"movie", "tv"}:
         raise ValueError("媒体类型必须是 movie 或 tv")
     for value, minimum, maximum, label in (
@@ -6713,6 +6823,8 @@ def reset_local_media_task(
             raise ValueError(f"{label}超出允许范围")
     if normalized_type == "movie" and (season_override is not None or episode_override is not None):
         raise ValueError("电影任务不能指定季数或集数")
+    if normalized_type == "movie":
+        normalized_numbering_mode = "auto"
     assignments = [
         "status='waiting_stable'", "stable_since=''", "snapshot_digest=''",
         "recognition_summary=''", "title=''", "year=''", "operation_token=?",
@@ -6734,6 +6846,9 @@ def reset_local_media_task(
     if episode_override is not None:
         assignments.append("episode_override=?")
         params.append(episode_override)
+    if normalized_numbering_mode is not None:
+        assignments.append("numbering_mode=?")
+        params.append(normalized_numbering_mode)
     params.extend([int(task_id), _local_media_owner(owner)])
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")

@@ -556,6 +556,8 @@ class OrganizePlan:
     media_profile: object | None = field(default=None, repr=False, compare=False)
     media_probe_complete: bool = False
     media_probe_pending: bool = False
+    conflict_existing_id: str = ""
+    conflict_existing_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -582,6 +584,10 @@ class OrganizeContext:
     group_pipeline: bool = True
     # 单次调用的审计归属键；用于精确回读本轮日志，避免并发任务污染。
     operation_token: str = ""
+    # 来源适配器可提供显式媒体类型提示；普通光鸭整理保持空值，继续依赖
+    # 文件名与目录上下文自动判断。本地来源配置和手动刮削可复用同一规划
+    # 流水线，而不需要在规划器外再实现一套 match/parse 分支。
+    media_type_hint: str = ""
 
     @property
     def probe_cache_only(self) -> bool:
@@ -1210,6 +1216,14 @@ class Organizer:
     def _build_plans(
         self, scan_result: OrganizeScanResult, context: OrganizeContext,
         rules: OrganizeRules, stats: dict, performance_before: dict[str, int],
+        *,
+        media_profile_loader: Callable[[GuangYaFile, OrganizePlan], object | None] | None = None,
+        target_inventory_loader: Callable[
+            [OrganizePlan], tuple[str | None, list[GuangYaFile], dict[str, str]]
+        ] | None = None,
+        identity_history_loader: Callable[
+            [OrganizePlan], set[tuple[str, str]]
+        ] | None = None,
     ) -> OrganizePlanningResult:
         """识别媒体、生成命名计划、规划伴随文件并完成只读冲突预演。"""
         scanned_videos = scan_result.scanned_videos
@@ -1356,8 +1370,15 @@ class Organizer:
             position = special_positions.get(item.file.file_id)
             recognition_name = ""
             explicit_file_marker = _has_explicit_tmdb_marker(item.file.name)
+            configured_media_type_hint = str(
+                context.media_type_hint or ""
+            ).strip().lower()
+            if configured_media_type_hint not in {"movie", "tv"}:
+                configured_media_type_hint = ""
             recognition_media_type_hint = (
-                "tv" if position is not None and explicit_file_marker else ""
+                "tv"
+                if position is not None and explicit_file_marker
+                else configured_media_type_hint
             )
             if position is not None and not explicit_file_marker:
                 # S00/OVA/NCOP 文件若自身带有完整作品名，优先使用清洗后的
@@ -1651,28 +1672,73 @@ class Organizer:
         performance_after = self._read_performance_snapshot()
         for key, value in performance_after.items():
             stats[key] = max(0, value - performance_before.get(key, 0))
-        # 从真正进入在线探测时才启动墙钟预算，避免 TMDB/AI 识别耗时
-        # 提前消耗探测窗口。每个扫描视频仍保留首次和一次瞬态重试额度。
-        from app.modules.media_probe import ProbeBudget
-        probe_budget_seconds = float(
-            max(10, min(60, int(rules.media_probe_timeout or 30) * 2))
-        )
-        self._probe_budget = ProbeBudget(
-            max(24, len(scanned_videos) * 2),
-            max_seconds=probe_budget_seconds,
-        )
-        stats["media_probe_budget_seconds"] = probe_budget_seconds
-        self._probe_move_plan_profiles(
-            plans,
-            source_files_by_id,
-            source_probe_cache,
-            cache_prefetched=source_probe_cache_loaded,
-            rules=rules,
-            automatic=automatic,
-            cache_only=probe_cache_only,
-            stats=stats,
-            cancel_event=context.cancel_event,
-        )
+        if media_profile_loader is None:
+            # 从真正进入在线探测时才启动墙钟预算，避免 TMDB/AI 识别耗时
+            # 提前消耗探测窗口。每个扫描视频仍保留首次和一次瞬态重试额度。
+            from app.modules.media_probe import ProbeBudget
+            probe_budget_seconds = float(
+                max(10, min(60, int(rules.media_probe_timeout or 30) * 2))
+            )
+            self._probe_budget = ProbeBudget(
+                max(24, len(scanned_videos) * 2),
+                max_seconds=probe_budget_seconds,
+            )
+            stats["media_probe_budget_seconds"] = probe_budget_seconds
+            self._probe_move_plan_profiles(
+                plans,
+                source_files_by_id,
+                source_probe_cache,
+                cache_prefetched=source_probe_cache_loaded,
+                rules=rules,
+                automatic=automatic,
+                cache_only=probe_cache_only,
+                stats=stats,
+                cancel_event=context.cancel_event,
+            )
+        else:
+            # 规划策略不关心媒体来自云端还是本地。来源适配器只返回统一
+            # MediaProfile，命名与版本身份仍由 Organizer 的同一函数重算。
+            profile_started = time.monotonic()
+            loaded_profiles = 0
+            failed_profiles = 0
+            for plan in plans:
+                if plan.action != "move" or plan.match is None:
+                    continue
+                source_file = source_files_by_id.get(str(plan.file_id or ""))
+                if source_file is None:
+                    continue
+                try:
+                    profile = media_profile_loader(source_file, plan)
+                except Exception as exc:
+                    failed_profiles += 1
+                    logger.warning(
+                        "来源媒体探测失败 file_id=%s type=%s",
+                        plan.file_id,
+                        type(exc).__name__,
+                    )
+                    profile = None
+                if profile is None:
+                    plan.media_probe_pending = False
+                    continue
+                self._apply_media_profile_to_move_plan(
+                    plan,
+                    source_file,
+                    rules,
+                    plan.match,
+                    {"season": plan.season, "episode": plan.episode},
+                    profile,
+                )
+                plan.media_probe_complete = True
+                plan.media_probe_pending = False
+                loaded_profiles += 1
+            stats["media_probe_online_candidates"] = sum(
+                1 for plan in plans if plan.action == "move" and plan.match is not None
+            )
+            stats["media_probe_online_profiles"] = loaded_profiles
+            stats["media_probe_failures"] = failed_profiles
+            stats["media_probe_elapsed_seconds"] = round(
+                time.monotonic() - profile_started, 3
+            )
         self._apply_media_source_consensus(
             plans, source_files_by_id, rules=rules, stats=stats,
         )
@@ -1692,7 +1758,13 @@ class Organizer:
         # 在首次云盘写入前完成身份保护与同批版本仲裁。执行阶段仍会实时
         # 复核目标目录，以覆盖并发外部修改，但批内败者不会再先移动后替换。
         conflict_started = time.monotonic()
-        self._preview_conflicts(plans, rules)
+        if target_inventory_loader is None:
+            self._preview_conflicts(plans, rules)
+        else:
+            self._preview_conflicts_with_inventory(
+                plans, rules, target_inventory_loader,
+                identity_history_loader=identity_history_loader,
+            )
         stats["conflict_check_elapsed_seconds"] = round(
             time.monotonic() - conflict_started, 3
         )
@@ -1720,6 +1792,56 @@ class Organizer:
             plans=plans,
             subtitle_plans_by_video=subtitle_plans_by_video,
         )
+
+    def plan_scan_result(
+        self,
+        scan_result: OrganizeScanResult,
+        rules: OrganizeRules,
+        *,
+        automatic: bool = False,
+        source_dir_id: str = "",
+        source_name: str = "",
+        media_type_hint: str = "",
+        media_profile_loader: Callable[[GuangYaFile, OrganizePlan], object | None] | None = None,
+        target_inventory_loader: Callable[
+            [OrganizePlan], tuple[str | None, list[GuangYaFile], dict[str, str]]
+        ] | None = None,
+        identity_history_loader: Callable[
+            [OrganizePlan], set[tuple[str, str]]
+        ] | None = None,
+    ) -> tuple[OrganizePlanningResult, dict]:
+        """对已由来源适配器生成的稳定快照运行统一只读规划。
+
+        光鸭和本地只需要分别提供扫描快照、媒体探测与目标库存读取；身份
+        识别、目录证据、季集映射、特殊篇、命名和冲突策略均经过同一入口。
+        本方法不会执行移动、重命名、删除、清理或整理后联动。
+        """
+        effective_rules = enforce_fixed_organize_rules(rules)
+        self._reset_task_caches()
+        stats = self._initial_stats()
+        stats["total"] = len(scan_result.scanned_videos)
+        context = OrganizeContext(
+            source_dir_id=str(source_dir_id or "planning"),
+            dry_run=True,
+            post_actions=False,
+            source_name=str(source_name or scan_result.source_root_name or ""),
+            media_probe_cache_only=True,
+            automatic=bool(automatic),
+            group_pipeline=False,
+            media_type_hint=str(media_type_hint or ""),
+        )
+        performance_before = self._read_performance_snapshot()
+        result = self._build_plans(
+            scan_result,
+            context,
+            effective_rules,
+            stats,
+            performance_before,
+            media_profile_loader=media_profile_loader,
+            target_inventory_loader=target_inventory_loader,
+            identity_history_loader=identity_history_loader,
+        )
+        return result, stats
 
     @staticmethod
     def _validate_scan_for_execution(context: OrganizeContext, stats: dict) -> None:
@@ -3666,7 +3788,20 @@ class Organizer:
                     media_type_hint=recognition_media_type_hint,
                 )
             elif bool(getattr(self.scraper, "supports_parent_path", False)):
-                match = self.scraper.match(match_name, parent_path)
+                if recognition_media_type_hint:
+                    try:
+                        match = self.scraper.match(
+                            match_name,
+                            parent_path,
+                            media_type_hint=recognition_media_type_hint,
+                        )
+                    except TypeError as exc:
+                        # 兼容只声明 parent_path、尚未接受类型提示的旧扩展识别器。
+                        if "media_type_hint" not in str(exc):
+                            raise
+                        match = self.scraper.match(match_name, parent_path)
+                else:
+                    match = self.scraper.match(match_name, parent_path)
             else:
                 match = self.scraper.match(match_name)
             if (
@@ -4426,10 +4561,11 @@ class Organizer:
             parsed_override is None
             and not manual_position_confirmed
             and match.media_type == "tv"
-            and parsed_season not in (None, 0)
             and parsed_episode is None
         ):
-            message = "已识别为剧集但无法确定集号，已阻止自动整理"
+            message = (
+                f"剧集文件缺少集数，不能自动归档: {file.name}（无法确定集号）"
+            )
             match.need_confirm = True
             match.status = "low_confidence"
             match.error = message
@@ -5269,6 +5405,9 @@ class Organizer:
         plan: OrganizePlan,
         batch_bindings: dict[str, tuple[str, str]],
         history_cache: dict[str, set[tuple[str, str]]],
+        identity_history_loader: Callable[
+            [OrganizePlan], set[tuple[str, str]]
+        ] | None = None,
     ) -> str:
         if not plan.identity_guard_required or not plan.media_root_path:
             return ""
@@ -5283,22 +5422,35 @@ class Organizer:
         if marker and expected_marker and marker != expected_marker:
             return "目标目录媒体身份标识与当前媒体不一致，已阻止混入"
         if plan.media_root_path not in history_cache:
-            history_cache[plan.media_root_path] = self._historical_root_identities(
-                plan.media_root_path
-            )
+            if identity_history_loader is None:
+                known_identities = self._historical_root_identities(
+                    plan.media_root_path
+                )
+            else:
+                known_identities = identity_history_loader(plan)
+            history_cache[plan.media_root_path] = set(known_identities or set())
         known = history_cache[plan.media_root_path]
         if any(existing != identity for existing in known):
             return "历史整理记录显示该目录属于其他媒体，已阻止混入"
         batch_bindings.setdefault(plan.media_root_path, identity)
         return ""
 
-    def _apply_identity_guards(self, plans: list[OrganizePlan]) -> None:
+    def _apply_identity_guards(
+        self,
+        plans: list[OrganizePlan],
+        *,
+        identity_history_loader: Callable[
+            [OrganizePlan], set[tuple[str, str]]
+        ] | None = None,
+    ) -> None:
         batch_bindings: dict[str, tuple[str, str]] = {}
         history_cache: dict[str, set[tuple[str, str]]] = {}
         for plan in plans:
             if plan.action != "move":
                 continue
-            reason = self._identity_guard_reason(plan, batch_bindings, history_cache)
+            reason = self._identity_guard_reason(
+                plan, batch_bindings, history_cache, identity_history_loader,
+            )
             if not reason:
                 continue
             plan.action = "conflict"
@@ -5306,44 +5458,46 @@ class Organizer:
             plan.conflict_note = reason
             plan.note = reason
 
-    def _preview_conflicts(self, plans: list[OrganizePlan], rules: OrganizeRules) -> None:
-        """按计划涉及的目标目录做有界只读检查，并复用执行冲突判定。"""
-        self._apply_identity_guards(plans)
-        directory_cache: dict[
-            str,
-            tuple[str | None, list[GuangYaFile], dict[str, str]],
+    def _preview_conflicts_with_inventory(
+        self,
+        plans: list[OrganizePlan],
+        rules: OrganizeRules,
+        inventory_loader: Callable[
+            [OrganizePlan], tuple[str | None, list[GuangYaFile], dict[str, str]]
+        ],
+        *,
+        identity_history_loader: Callable[
+            [OrganizePlan], set[tuple[str, str]]
+        ] | None = None,
+    ) -> None:
+        """使用来源适配器提供的只读目标库存执行统一冲突仲裁。"""
+        self._apply_identity_guards(
+            plans, identity_history_loader=identity_history_loader,
+        )
+        inventory_cache: dict[
+            str, tuple[str | None, list[GuangYaFile], dict[str, str]]
         ] = {}
-        listing_cache: dict[str, list[GuangYaFile]] = {}
         batch_plans_by_file_id: dict[str, OrganizePlan] = {}
         for plan in plans:
             if plan.action != "move":
                 continue
             try:
-                if plan.target_path not in directory_cache:
-                    target_id = self._find_existing_dir_chain(
-                        rules.target_dir_id, plan.target_path, listing_cache
-                    )
-                    if target_id:
-                        target_files = listing_cache.get(target_id)
-                        if target_files is None:
-                            target_files = self.client.list_dir(target_id)
-                            listing_cache[target_id] = target_files
-                    else:
-                        target_files = []
-                    evidence_names = {
-                        item.file_id: item.name for item in target_files if not item.is_dir
-                    }
+                target_id, loaded_files, loaded_evidence = inventory_loader(plan)
+                inventory_key = str(target_id or plan.target_path or "")
+                if inventory_key not in inventory_cache:
+                    target_files = list(loaded_files or [])
+                    evidence_names = dict(loaded_evidence or {})
                     self._prime_existing_variant_cache(
                         target_files, rules, evidence_names
                     )
-                    directory_cache[plan.target_path] = (
+                    inventory_cache[inventory_key] = (
                         target_id, target_files, evidence_names
                     )
-                _target_id, target_files, evidence_names = directory_cache[plan.target_path]
+                target_id, target_files, evidence_names = inventory_cache[inventory_key]
                 if (
                     plan.original_parent_id
-                    and _target_id
-                    and str(plan.original_parent_id) == str(_target_id)
+                    and target_id
+                    and str(plan.original_parent_id) == str(target_id)
                 ):
                     note = "文件已位于目标目录，未执行重复移动、覆盖或回收"
                     plan.action = "skip"
@@ -5354,21 +5508,52 @@ class Organizer:
                 existing, decision, note = self._resolve_variant_conflict(
                     plan, target_files, rules, evidence_names
                 )
+                previous_plan = (
+                    batch_plans_by_file_id.get(str(existing.file_id or ""))
+                    if existing is not None else None
+                )
                 plan.conflict_decision = decision
                 plan.conflict_note = note
+                if previous_plan is None:
+                    plan.conflict_existing_id = str(
+                        existing.file_id if existing is not None else ""
+                    )
+                    plan.conflict_existing_name = str(
+                        existing.name if existing is not None else ""
+                    )
+                else:
+                    # 批内候选只是只读仲裁时加入的虚拟库存，绝不能作为本地
+                    # 事务的 retire_target。当前胜出者继承上一胜出者面对的真实
+                    # 目标库存语义；目标库原本为空时继续保持 new/coexist。
+                    plan.conflict_existing_id = previous_plan.conflict_existing_id
+                    plan.conflict_existing_name = previous_plan.conflict_existing_name
+                    if decision == "replace":
+                        inherited = previous_plan.conflict_decision
+                        plan.conflict_decision = (
+                            inherited
+                            if inherited in {"new", "coexist", "replace"}
+                            else "new"
+                        )
+                        plan.conflict_note = (
+                            f"{previous_plan.conflict_note}；批内同版本由当前更优版本胜出"
+                            if previous_plan.conflict_note
+                            else "批内同版本由当前更优版本胜出"
+                        )
                 if decision == "skip":
                     plan.action = "skip"
                     plan.note = note
+                    if previous_plan is not None:
+                        plan.conflict_existing_id = ""
+                        plan.conflict_existing_name = ""
                 elif decision in {"new", "coexist", "replace"}:
                     if existing is not None:
-                        previous_plan = batch_plans_by_file_id.pop(
-                            existing.file_id, None
-                        )
                         if previous_plan is not None:
+                            batch_plans_by_file_id.pop(existing.file_id, None)
                             previous_plan.action = "skip"
                             previous_plan.conflict_decision = "batch_superseded"
                             previous_plan.conflict_note = (
-                                "批内同版本冲突：由更优版本胜出，未执行云盘写入"
+                                "批内同版本冲突：由更优版本胜出，"
+                                "未执行云盘写入或本地文件事务"
                             )
                             previous_plan.note = previous_plan.conflict_note
                         target_files[:] = [
@@ -5382,7 +5567,7 @@ class Organizer:
                         is_dir=False,
                         size=plan.size,
                         etag=plan.etag,
-                        parent_id=_target_id or "0",
+                        parent_id=target_id or "0",
                     ))
                     evidence_names[plan.file_id] = (
                         f"{plan.original_name} {plan.new_name}"
@@ -5398,6 +5583,38 @@ class Organizer:
                 plan.conflict_decision = "blocked"
                 plan.conflict_note = "目标版本扫描失败，禁止替换"
                 plan.note = plan.conflict_note
+
+    def _preview_conflicts(self, plans: list[OrganizePlan], rules: OrganizeRules) -> None:
+        """按计划涉及的光鸭目标目录做有界只读检查。"""
+        directory_cache: dict[
+            str, tuple[str | None, list[GuangYaFile], dict[str, str]]
+        ] = {}
+        listing_cache: dict[str, list[GuangYaFile]] = {}
+
+        def load_inventory(
+            plan: OrganizePlan,
+        ) -> tuple[str | None, list[GuangYaFile], dict[str, str]]:
+            cached = directory_cache.get(plan.target_path)
+            if cached is not None:
+                return cached
+            target_id = self._find_existing_dir_chain(
+                rules.target_dir_id, plan.target_path, listing_cache
+            )
+            if target_id:
+                target_files = listing_cache.get(target_id)
+                if target_files is None:
+                    target_files = self.client.list_dir(target_id)
+                    listing_cache[target_id] = target_files
+            else:
+                target_files = []
+            evidence_names = {
+                item.file_id: item.name for item in target_files if not item.is_dir
+            }
+            result = (target_id, target_files, evidence_names)
+            directory_cache[plan.target_path] = result
+            return result
+
+        self._preview_conflicts_with_inventory(plans, rules, load_inventory)
 
     def _restore_remote_file(
         self,

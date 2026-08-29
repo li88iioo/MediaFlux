@@ -1,11 +1,9 @@
-"""qB 完成、定时扫描与稳定等待驱动的本地媒体调度器。"""
+"""qB 完成与显式手动扫描驱动的本地媒体调度器。"""
 from __future__ import annotations
 
 import logging
 import threading
-import time
 import uuid
-from datetime import datetime
 import re
 import unicodedata
 from pathlib import Path
@@ -23,7 +21,7 @@ from app.modules.local_path_mapping import (
     assert_within,
     require_container_absolute_path,
 )
-from app.modules.local_storage import LocalFilesystemAdapter, LocalStorageError, snapshot_digest
+from app.modules.local_storage import LocalFilesystemAdapter, LocalStorageError
 
 logger = get_logger(__name__)
 
@@ -66,8 +64,8 @@ class LocalMediaScheduler:
         self.interval = max(0.2, float(interval))
         self.service = service or LocalMediaService()
         self.qb_factory = qb_factory or self._default_qb_client
-        self._clock = clock or time.monotonic
-        self._last_scan_at: dict[int, float] = {}
+        # ``clock`` 仅为旧调用签名保留；目录定时轮询已经移除。
+        _ = clock
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -182,39 +180,8 @@ class LocalMediaScheduler:
     _source_candidates = staticmethod(discover_local_media_candidates)
 
     def _enqueue_scan_candidates(self) -> int:
-        count = 0
-        now = float(self._clock())
-        sources = db.list_local_media_sources(owner=self.owner)
-        active_ids = {source.id for source in sources}
-        self._last_scan_at = {key: value for key, value in self._last_scan_at.items() if key in active_ids}
-        for source in sources:
-            if not source.scan_enabled or source.mode == "preview_only":
-                continue
-            last_scan = self._last_scan_at.get(source.id)
-            if last_scan is not None and now - last_scan < source.scan_interval_minutes * 60:
-                continue
-            self._last_scan_at[source.id] = now
-            source_error = _source_path_error(source)
-            if source_error:
-                log_throttled(
-                    logger, logging.WARNING, f"invalid_source:{source.id}",
-                    "本地媒体来源扫描失败 %s: %s", source.name, source_error,
-                    interval_seconds=3600.0,
-                )
-                continue
-            candidates, error = self._source_candidates(source)
-            if error:
-                logger.warning("本地媒体来源扫描失败 %s: %s", source.name, error)
-                continue
-            for candidate in candidates:
-                try:
-                    db.create_local_media_task(
-                        source.id, "", str(candidate), owner=self.owner, trigger="scan",
-                    )
-                    count += 1
-                except Exception as exc:
-                    logger.warning("本地媒体扫描候选入队失败 %s: %s", candidate.name, exc)
-        return count
+        """兼容旧调用：目录定时轮询已移除，不再自动创建整理任务。"""
+        return 0
 
     def enqueue_manual_scan_candidates(
         self,
@@ -226,8 +193,8 @@ class LocalMediaScheduler:
     ) -> dict[str, object]:
         """显式扫描全部本地来源，把已存在媒体作为手动任务加入队列。
 
-        与定时扫描不同，本入口不要求 ``scan_enabled``，用于 Web/TG 的一次性
-        用户操作；仅预览来源和未配置归档目标的来源不会被移动。
+        本入口用于 Web/TG 的一次性用户操作，不依赖已废弃的目录轮询配置；
+        仅预览来源和未配置归档目标的来源不会被移动。
         """
         task_ids: list[int] = []
         source_results: list[dict[str, object]] = []
@@ -416,25 +383,17 @@ class LocalMediaScheduler:
         token = str(getattr(task, "operation_token", "") or "")
         return token.startswith(SILENT_MANUAL_SCAN_TOKEN_PREFIX)
 
-    @staticmethod
-    def _elapsed_seconds(value: str) -> float:
-        if not value:
-            return 0.0
-        try:
-            return max(0.0, (datetime.now() - datetime.strptime(value, "%Y-%m-%d %H:%M:%S")).total_seconds())
-        except ValueError:
-            return 0.0
-
     def _process_waiting(self, task) -> bool:
         source = db.get_local_media_source(task.source_id, owner=self.owner)
         manual_scan = self._is_manual_scan_task(task)
-        disabled = (
-            source is None
-            or (task.trigger == "qb_completed" and not source.enabled)
-            or (task.trigger == "scan" and not source.scan_enabled and not manual_scan)
-        )
-        if disabled:
-            error = "来源不存在或对应触发方式已停用"
+        error = ""
+        if source is None:
+            error = "本地媒体来源不存在"
+        elif task.trigger == "qb_completed" and not source.enabled:
+            error = "该来源的 qB 完成自动接管已停用"
+        elif task.trigger == "scan" and not manual_scan:
+            error = "目录定时扫描已移除，请使用手动整理重新入队"
+        if error:
             db.update_local_media_task(
                 task.id, owner=self.owner, status="failed", error=error,
             )
@@ -457,17 +416,9 @@ class LocalMediaScheduler:
                 return False
             self._path_locks.add(key)
         try:
-            if task.stable_since and self._elapsed_seconds(task.stable_since) < source.stable_seconds:
-                return False
-            snapshots = LocalFilesystemAdapter(Path(source.local_root)).scan(Path(task.content_path))
-            digest = snapshot_digest(snapshots)
-            if not task.stable_since or task.snapshot_digest != digest:
-                db.update_local_media_task(
-                    task.id, owner=self.owner, stable_since=db.now(), snapshot_digest=digest,
-                )
-                task = db.get_local_media_task(task.id, owner=self.owner)
-            if self._elapsed_seconds(task.stable_since) < source.stable_seconds:
-                return False
+            # qB 已通过 API 的完成状态与进度双重确认；TG/Web 显式整理则由用户主动触发。
+            # 直接交给服务层执行一次检查与预览复核，避免调度器额外预扫和固定等待；
+            # 真正移动时仍会基于 inode/size/mtime 再校验源文件身份。
             if not db.claim_local_media_task(task.id, expected="waiting_stable", owner=self.owner):
                 return False
             qb_client = self.qb_factory() if task.qb_hash else None
@@ -532,7 +483,6 @@ class LocalMediaScheduler:
                 self._path_locks.discard(key)
 
     def run_once(self) -> int:
-        self._enqueue_scan_candidates()
         processed = 0
         for task in reversed(db.list_local_media_tasks(owner=self.owner, status="waiting_stable", limit=500)):
             processed += int(self._process_waiting(task))

@@ -3,7 +3,7 @@
 {% block page_title %}本地媒体{% endblock %}
 {% block body_class %}local-media-page{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260825b">
+<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260829j">
 <script>
 (() => {
     const hashTab = (window.location.hash || '').replace('#', '').trim();
@@ -52,7 +52,7 @@
                         <input class="form-input" id="lmTaskSearch" type="search" autocomplete="off" placeholder="搜索名称、来源、错误…">
                     </label>
                     <select class="form-select lm-filter" id="lmTaskFilter" aria-label="筛选整理日志状态">
-                        <option value="">全部状态</option><option value="waiting_stable">等待稳定</option><option value="recognizing">识别中</option>
+                        <option value="">全部状态</option><option value="waiting_stable">等待执行</option><option value="recognizing">识别中</option>
                         <option value="requires_manual">待确认</option><option value="moving">移动中</option><option value="completed">已完成</option><option value="failed">失败</option>
                     </select>
                     <button class="jump-btn lm-clear-task-btn" type="button" id="lmClearTasksBtn" disabled title="仅清除选中的日志，不删除或移动媒体文件"><i data-lucide="trash-2"></i><span data-button-label>清除选中</span><span class="lm-selection-count" id="lmTaskSelectionCount">0</span></button>
@@ -83,7 +83,7 @@
             <div class="lm-panel-subhead">
                 <div>
                     <h2 id="lmSourcesTitle">媒体来源配置</h2>
-                    <p>管理 qBittorrent 下载路径映射、定时扫描轮询策略与分类媒体库。</p>
+                    <p>管理 qBittorrent 下载路径映射与完成后自动接管；归档目录统一在“媒体库”页面维护。</p>
                 </div>
                 <button class="btn btn-primary lm-compact-btn lm-mobile-add-btn" type="button" id="lmAddSourceMobileBtn"><i data-lucide="plus"></i><span>新增来源</span></button>
             </div>
@@ -146,18 +146,18 @@
 </div>
 
 {% set media_scrape = {
-    "source": "local", "css": "lm-scrape", "card": false,
+    "source": "local", "css": "lm-scrape", "card": false, "mobile_tabs": true,
     "modal_id": "lmScrapeModal", "title_id": "lmScrapeTitle", "title": "本地手动刮削",
     "path_id": "lmScrapeItemPath", "path_placeholder": "等待选择条目",
     "close_id": "lmScrapeCloseBtn", "query_id": "lmSearchQuery",
-    "query_label_class": "", "clean_id": "", "type_id": "lmMediaType",
-    "allow_auto_type": false, "position_id": "lmScrapeEpisodeFields",
-    "numbering_field_id": "", "numbering_id": "", "season_field_id": "lmScrapeSeasonField",
+    "query_label_class": "lm-scrape-query-label", "clean_id": "lmScrapeCleanBtn", "type_id": "lmMediaType",
+    "allow_auto_type": true, "position_id": "lmScrapeEpisodeFields",
+    "numbering_field_id": "lmScrapeNumberingField", "numbering_id": "lmScrapeNumbering", "season_field_id": "lmScrapeSeasonField",
     "season_id": "lmScrapeSeason", "episode_field_id": "lmScrapeEpisodeField",
     "episode_id": "lmScrapeEpisode", "auto_id": "lmAutoPreviewBtn", "search_id": "lmSearchBtn",
     "candidate_title_id": "lmCandidateTitle", "candidate_count_id": "lmCandidateCount",
     "candidate_list_class": "lm-candidate-list", "candidates_id": "lmCandidates",
-    "external_id": "", "external_hints_id": "", "detail_title_id": "lmScrapeDetailTitle",
+    "external_id": "lmScrapeExternalBtn", "external_label": "外部线索", "external_hints_id": "lmScrapeExternalHints", "detail_title_id": "lmScrapeDetailTitle",
     "status_id": "lmScrapeStatus", "detail_id": "lmScrapeDetail",
     "detail_placeholder_title": "选择媒体候选或自动匹配",
     "detail_placeholder_copy": "这里会逐项展示移动、覆盖和清理动作；不会生成编号副本。",
@@ -185,7 +185,11 @@
 <div class="app-modal lm-modal" id="lmSourceModal" hidden>
     <div class="card lm-source-dialog" role="dialog" aria-modal="true" aria-labelledby="lmSourceDialogTitle">
         <header class="lm-dialog-head">
-            <div><span class="subscription-eyebrow">MEDIA SOURCE</span><h2 id="lmSourceDialogTitle">新增媒体来源</h2><p>配置下载路径映射、扫描策略与分类媒体库。</p></div>
+            <div class="lm-dialog-head-main">
+                <span class="subscription-eyebrow">MEDIA SOURCE</span>
+                <h2 id="lmSourceDialogTitle">新增媒体来源</h2>
+                <p>配置下载路径映射与 qB 自动整理；归档目录统一在“媒体库”页面维护。</p>
+            </div>
             <button class="icon-action" id="lmCloseSourceBtn" type="button" data-modal-close aria-label="关闭媒体来源配置"><i data-lucide="x"></i></button>
         </header>
         <form id="lmSourceForm">
@@ -196,21 +200,12 @@
                     <div class="lm-form-grid">
                         <label class="lm-field"><span>来源名称</span><input class="form-input" id="lmSourceName" required maxlength="128" placeholder="例如：下载目录 1"></label>
                         <label class="lm-field"><span>qB 路径前缀</span><input class="form-input" id="lmQbPrefix" placeholder="/downloads"></label>
-                        <label class="lm-field lm-wide"><span>MediaFlux 容器路径</span><span class="lm-path-control"><input class="form-input" id="lmLocalRoot" required placeholder="例如：/media/downloads"><button class="jump-btn lm-picker-btn" type="button" id="lmPickLocalRootBtn" aria-label="浏览容器目录" title="浏览容器目录"><i data-lucide="folder-open"></i></button></span></label>
-                        <div class="lm-form-grid-3 lm-wide">
-                            <label class="lm-field"><span>识别范围</span><select class="form-select" id="lmSourceMediaType"><option value="auto">自动判断</option><option value="movie">仅电影</option><option value="tv">剧集 / 动漫</option></select></label>
-                            <label class="lm-field"><span>稳定等待</span><div class="lm-input-unit"><input class="form-input" id="lmStableSeconds" type="number" min="0" max="86400" value="300"><span>秒</span></div></label>
-                            <label class="lm-field"><span>扫描间隔</span><div class="lm-input-unit"><input class="form-input" id="lmScanMinutes" type="number" min="1" max="1440" value="10"><span>分钟</span></div></label>
-                        </div>
                     </div>
-                    <div class="lm-switch-row">
-                        <label class="lm-switch-item"><span class="toggle"><input id="lmSourceEnabled" type="checkbox" checked><span class="toggle-slider"></span></span><span><strong>qB 完成触发</strong><small>下载完成后自动加入队列</small></span></label>
-                        <label class="lm-switch-item"><span class="toggle"><input id="lmScanEnabled" type="checkbox"><span class="toggle-slider"></span></span><span><strong>定时扫描</strong><small>按间隔检查来源目录</small></span></label>
+                    <div class="lm-source-routing-row">
+                        <label class="lm-field"><span>待整理（你的qB下载路径）</span><span class="lm-path-control"><input class="form-input" id="lmLocalRoot" required placeholder="例如：/media/downloads"><button class="jump-btn lm-picker-btn" type="button" id="lmPickLocalRootBtn" aria-label="浏览容器目录" title="浏览容器目录"><i data-lucide="folder-open"></i></button></span></label>
+                        <label class="lm-field"><span>识别范围</span><select class="form-select" id="lmSourceMediaType"><option value="auto">自动判断</option><option value="movie">仅电影</option><option value="tv">剧集 / 动漫</option></select></label>
+                        <label class="lm-field"><span>qB 自动整理</span><select class="form-select" id="lmSourceEnabled"><option value="true">开启</option><option value="false">关闭</option></select></label>
                     </div>
-                </section>
-                <section class="lm-dialog-section">
-                    <div class="lm-dialog-section-title"><strong>分类媒体库</strong><small>设置容器归档目录，并选择媒体服务器实际可见的对应路径；具体分类未配置时使用默认目标</small></div>
-                    <div class="lm-target-editor"><div id="lmTargetRows"></div></div>
                 </section>
             </div>
             <footer class="lm-dialog-actions">
@@ -222,6 +217,6 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260821a"></script>
-<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260825b"></script>
+<script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260828a"></script>
+<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260829b"></script>
 {% endblock %}

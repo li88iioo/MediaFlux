@@ -170,7 +170,7 @@
 }
 
 .ml-add-library-btn {
-    min-width: 132px;
+    min-width: 118px;
     min-height: 38px;
     padding: 0 16px;
     display: inline-flex;
@@ -196,7 +196,7 @@
 .ml-mapping-columns,
 .ml-library-mapping-row {
     display: grid;
-    grid-template-columns: minmax(190px, 1.05fr) 92px minmax(190px, 1fr) minmax(230px, 1.25fr) 82px;
+    grid-template-columns: minmax(200px, .95fr) 96px minmax(240px, 1.08fr) minmax(250px, 1.15fr) 82px;
     gap: 12px;
 }
 
@@ -238,8 +238,13 @@
     background: var(--control-tint);
 }
 
-.ml-mapping-field {
+.ml-mapping-field,
+.ml-mapping-source,
+.ml-directory-control {
     min-width: 0;
+}
+
+.ml-mapping-field {
     display: block;
 }
 
@@ -255,20 +260,69 @@
 .ml-mapping-field .form-input,
 .ml-mapping-field .form-select {
     width: 100%;
+    min-width: 0;
     min-height: var(--ml-control-h);
     background: var(--bg-card);
     border-radius: var(--radius-sm);
     font-size: 12px;
 }
 
-.ml-strm-control {
+.ml-source-control {
     min-width: 0;
+    min-height: var(--ml-control-h);
+    display: flex;
+    align-items: stretch;
+}
+
+.ml-source-toggle {
+    width: 100%;
+    min-width: 0;
+    min-height: var(--ml-control-h);
+    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-border);
+    border-radius: var(--radius-sm);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .02em;
+    cursor: pointer;
+}
+
+.ml-source-toggle.is-local {
+    color: #2563eb;
+    background: color-mix(in srgb, #3b82f6 8%, var(--bg-card));
+    border-color: color-mix(in srgb, #3b82f6 30%, var(--border));
+}
+
+.ml-source-toggle:hover:not(:disabled) {
+    filter: saturate(1.08);
+    background: color-mix(in srgb, currentColor 9%, var(--bg-card));
+}
+
+.ml-source-toggle:focus-visible {
+    outline: 2px solid var(--accent-border);
+    outline-offset: 2px;
+}
+
+.ml-source-toggle svg {
+    width: 15px;
+    height: 15px;
+    flex: 0 0 auto;
+}
+
+
+.ml-directory-control {
     display: grid;
     grid-template-columns: minmax(0, 1fr) var(--ml-control-h);
     gap: 6px;
 }
 
-.ml-strm-picker-btn {
+.ml-directory-picker-btn {
     width: var(--ml-control-h);
     min-width: var(--ml-control-h);
     height: var(--ml-control-h);
@@ -278,12 +332,12 @@
     border-radius: var(--radius-sm);
 }
 
-.ml-strm-picker-btn svg {
+.ml-directory-picker-btn svg {
     width: 16px;
     height: 16px;
 }
 
-.ml-strm-path[readonly] {
+.ml-directory-path[readonly] {
     overflow: hidden;
     color: var(--text-secondary);
     font-family: var(--font-mono, "SFMono-Regular", Consolas, monospace);
@@ -296,31 +350,6 @@
 .ml-server-path-field .form-input {
     font-family: var(--font-mono, "SFMono-Regular", Consolas, monospace);
     font-size: 11px;
-}
-
-.ml-mapping-source {
-    min-width: 0;
-}
-
-.ml-source-value {
-    min-height: var(--ml-control-h);
-    padding: 0 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 7px;
-    color: var(--accent);
-    background: var(--accent-soft);
-    border: 1px solid var(--accent-border);
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .04em;
-}
-
-.ml-source-value svg {
-    width: 15px;
-    height: 15px;
 }
 
 .ml-mapping-actions {
@@ -431,7 +460,7 @@
 }
 
 .ml-empty-state p {
-    max-width: 480px;
+    max-width: 520px;
     margin: 0;
     color: var(--text-muted);
     font-size: 11.5px;
@@ -469,7 +498,7 @@
 
 .ml-mapping-footer .btn-primary {
     width: auto !important;
-    min-width: 176px;
+    min-width: 148px;
     min-height: 42px;
     padding: 0 20px;
     display: inline-flex;
@@ -494,8 +523,8 @@
     .ml-library-mapping-row {
         grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
         grid-template-areas:
-            "library strm"
-            "source server"
+            "library source"
+            "directory server"
             "actions actions"
             "result result"
             "managed managed";
@@ -507,16 +536,12 @@
     }
 
     .ml-library-field { grid-area: library; }
-    .ml-strm-field { grid-area: strm; }
     .ml-mapping-source { grid-area: source; }
+    .ml-directory-field { grid-area: directory; }
     .ml-server-path-field { grid-area: server; }
     .ml-mapping-actions { grid-area: actions; }
     .ml-mapping-result { grid-area: result; }
     .ml-managed-note { grid-area: managed; }
-
-    .ml-source-value {
-        justify-content: flex-start;
-    }
 }
 
 @media (max-width: 960px) {
@@ -542,6 +567,10 @@
         gap: 14px;
     }
 
+    .ml-studio-title-group p {
+        max-width: 42ch;
+    }
+
     .ml-add-library-btn {
         width: 100%;
     }
@@ -551,16 +580,23 @@
     }
 
     .ml-library-mapping-row {
+        width: 100%;
+        min-width: 0;
         grid-template-columns: minmax(0, 1fr);
         grid-template-areas:
             "library"
             "source"
-            "strm"
+            "directory"
             "server"
             "actions"
             "result"
             "managed";
         gap: 11px;
+    }
+
+
+    .ml-source-control {
+        width: 108px;
     }
 
     .ml-mapping-actions {
@@ -615,4 +651,5 @@
         width: 36px;
         height: 36px;
     }
+
 }

@@ -245,8 +245,8 @@ _LIBRARY_PATROL_POLICY_RE: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 _LOCAL_MEDIA_TRIGGER_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:本地媒体来源|本地来源).{0,30}(?:qb\s*完成触发|qb\s*下载完成|目录扫描|定时扫描).{0,16}(?:开启|关闭|启用|停用)?|"
-    r"(?:开启|关闭|启用|停用).{0,20}(?:本地媒体来源|本地来源).{0,20}(?:qb\s*完成触发|qb\s*下载完成|目录扫描|定时扫描)",
+    r"(?:本地媒体来源|本地来源).{0,30}(?:qb\s*完成触发|qb\s*下载完成).{0,16}(?:开启|关闭|启用|停用)?|"
+    r"(?:开启|关闭|启用|停用).{0,20}(?:本地媒体来源|本地来源).{0,20}(?:qb\s*完成触发|qb\s*下载完成)",
     re.IGNORECASE,
 )
 _PROXY_CONTROL_RE: Final[re.Pattern[str]] = re.compile(

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+from app import database as db
 from app.main import create_app
 from app.routes import media_libraries_api
 from app.modules.media_server_profiles import MediaServerProfile
@@ -65,6 +66,8 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
     def test_routes_require_login_and_page_renders_after_login(self):
         self.assertEqual(self.client.get("/api/media-libraries/overview").status_code, 401)
         self.assertEqual(self.client.get("/api/media-libraries/strm-directories").status_code, 401)
+        self.assertEqual(self.client.get("/api/media-libraries/local-directories").status_code, 401)
+        self.assertEqual(self.client.post("/api/media-libraries/mappings", json={}).status_code, 401)
         self.assertEqual(
             self.client.post("/api/media-libraries/path-test", json={}).status_code,
             401,
@@ -72,12 +75,28 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.login()
         page = self.client.get("/media-libraries")
         self.assertEqual(page.status_code, 200, page.text)
-        self.assertIn("css/media-libraries.css?v=20260825g", page.text)
+        self.assertIn("css/media-libraries.css?v=20260829c", page.text)
         self.assertIn('id="mediaLibrariesPage"', page.text)
         self.assertEqual(
             self.client.post("/api/media-libraries/path-test", json={}).status_code,
             403,
         )
+
+    def test_library_payload_preserves_collection_type_for_local_category_inference(self):
+        normalized = media_libraries_api._library_payload({
+            "id": "shows",
+            "name": "节目",
+            "collection_type": "TVShows",
+            "locations": ["//NAS/节目"],
+        })
+        legacy = media_libraries_api._library_payload({
+            "id": "movies",
+            "name": "电影",
+            "CollectionType": "Movies",
+            "locations": [],
+        })
+        self.assertEqual(normalized["collection_type"], "tvshows")
+        self.assertEqual(legacy["collection_type"], "movies")
 
     def test_overview_projects_profiles_mappings_bindings_and_empty_online_server(self):
         self.login()
@@ -131,6 +150,8 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
             "libraries": 0,
             "path_mappings": 1,
             "local_bindings": 1,
+            "total_mappings": 2,
+            "local_sources": 0,
             "strm_sources": 1,
         })
         jellyfin = payload["servers"][0]
@@ -222,6 +243,161 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
                 missing_output = self.client.get("/api/media-libraries/strm-directories")
         self.assertEqual(missing_output.status_code, 400, missing_output.text)
         self.assertIn("不存在", missing_output.text)
+
+
+    def test_local_directory_browser_uses_configured_roots_and_blocks_escape(self):
+        self.login()
+        with TemporaryDirectory() as root_raw, TemporaryDirectory() as outside_raw:
+            root = Path(root_raw).resolve()
+            child = root / "动漫"
+            child.mkdir()
+            outside = Path(outside_raw).resolve()
+            with patch(
+                "app.modules.local_directory_browser._configured_roots",
+                return_value=[root],
+            ):
+                roots = self.client.get(
+                    "/api/media-libraries/local-directories", params={"path": "__roots__"}
+                )
+                nested = self.client.get(
+                    "/api/media-libraries/local-directories", params={"path": str(root)}
+                )
+                escaped = self.client.get(
+                    "/api/media-libraries/local-directories", params={"path": str(outside)}
+                )
+        self.assertEqual(roots.status_code, 200, roots.text)
+        self.assertEqual(roots.json()["directories"][0]["id"], str(root))
+        self.assertEqual(nested.status_code, 200, nested.text)
+        self.assertEqual(nested.json()["directories"][0]["id"], str(child))
+        self.assertEqual(escaped.status_code, 400, escaped.text)
+
+    def test_unified_save_persists_strm_and_local_mappings(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        with TemporaryDirectory() as temp_raw:
+            base = Path(temp_raw).resolve()
+            source_root = base / "downloads"
+            target_root = base / "library" / "动漫"
+            source_root.mkdir(parents=True)
+            target_root.mkdir(parents=True)
+            source_id = db.create_local_media_source(
+                name="本地下载-保存", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), owner="admin",
+            )
+            scheduler = Mock()
+            with (
+                patch("app.routes.media_libraries_api.config.has_external_override", return_value=False),
+                patch("app.routes.media_libraries_api.config.set_and_save") as save_config,
+                patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ),
+            ):
+                response = self.client.post(
+                    "/api/media-libraries/mappings",
+                    headers=headers,
+                    json={
+                        "strm_mappings": {
+                            "jellyfin": [{"local": "/data/strm", "server": "//NAS/STRM"}],
+                        },
+                        "local_bindings": [{
+                            "source_id": source_id,
+                            "category": "anime",
+                            "local_path": str(target_root),
+                            "provider": "jellyfin",
+                            "library_id": "anime",
+                            "library_name": "动漫",
+                            "server_path": "//NAS/媒体/动漫",
+                        }],
+                    },
+                )
+        self.assertEqual(response.status_code, 200, response.text)
+        targets = db.list_local_library_targets(source_id, owner="admin")
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].path, str(target_root))
+        self.assertEqual(targets[0].server_path, "//NAS/媒体/动漫")
+        save_config.assert_called_once_with({
+            "JELLYFIN_PATH_MAPPINGS": '[{"local":"/data/strm","server":"//NAS/STRM"}]',
+        })
+        scheduler.reload.assert_called_once_with()
+
+    def test_unified_save_rejects_local_mapping_without_media_library(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        with TemporaryDirectory() as temp_raw:
+            base = Path(temp_raw).resolve()
+            source_root = base / "downloads-unbound"
+            target_root = base / "library-unbound"
+            source_root.mkdir()
+            target_root.mkdir()
+            source_id = db.create_local_media_source(
+                name="本地下载-未绑定", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), owner="admin",
+            )
+            response = self.client.post(
+                "/api/media-libraries/mappings",
+                headers=headers,
+                json={
+                    "strm_mappings": {},
+                    "local_bindings": [{
+                        "source_id": source_id,
+                        "category": "default",
+                        "local_path": str(target_root),
+                        "provider": "",
+                        "library_id": "",
+                        "library_name": "",
+                        "server_path": "",
+                    }],
+                },
+            )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("必须选择 Jellyfin 或 Emby", response.text)
+        self.assertEqual(db.list_local_library_targets(source_id, owner="admin"), [])
+
+    def test_unified_save_rolls_back_local_bindings_when_config_save_fails(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        with TemporaryDirectory() as temp_raw:
+            base = Path(temp_raw).resolve()
+            source_root = base / "downloads"
+            old_target = base / "library" / "旧"
+            new_target = base / "library" / "新"
+            source_root.mkdir(parents=True)
+            old_target.mkdir(parents=True)
+            new_target.mkdir(parents=True)
+            source_id = db.create_local_media_source(
+                name="本地下载-回滚", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), owner="admin",
+            )
+            db.upsert_local_library_target(
+                source_id, "default", str(old_target), owner="admin"
+            )
+            with (
+                patch("app.routes.media_libraries_api.config.has_external_override", return_value=False),
+                patch(
+                    "app.routes.media_libraries_api.config.set_and_save",
+                    side_effect=OSError("write failed"),
+                ),
+            ):
+                response = self.client.post(
+                    "/api/media-libraries/mappings",
+                    headers=headers,
+                    json={
+                        "strm_mappings": {"jellyfin": []},
+                        "local_bindings": [{
+                            "source_id": source_id,
+                            "category": "default",
+                            "local_path": str(new_target),
+                            "provider": "jellyfin",
+                            "library_id": "movies",
+                            "library_name": "电影",
+                            "server_path": "//NAS/媒体/电影",
+                        }],
+                    },
+                )
+        self.assertEqual(response.status_code, 500, response.text)
+        targets = db.list_local_library_targets(source_id, owner="admin")
+        self.assertEqual([item.path for item in targets], [str(old_target)])
 
     def test_path_test_reports_matched_covered_and_unmatched(self):
         csrf = self.login()

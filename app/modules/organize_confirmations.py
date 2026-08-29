@@ -266,6 +266,7 @@ def create_local_media_confirmation_actions(
         "snapshot_digest": expected_digest,
         "season_override": getattr(task, "season_override", None),
         "episode_override": getattr(task, "episode_override", None),
+        "numbering_mode": str(getattr(task, "numbering_mode", "auto") or "auto"),
     }
     return _persist_confirmation_actions(payload, chat_id=chat_id)
 
@@ -902,6 +903,7 @@ def _execute_local_media_confirmation(
             rules_snapshot=rules_snapshot,
             season_override=payload.get("season_override"),
             episode_override=payload.get("episode_override"),
+            numbering_mode=str(payload.get("numbering_mode") or "auto"),
             title=str(candidate.get("title") or ""),
             year=str(candidate.get("year") or ""),
         ):

@@ -1,7 +1,6 @@
 """本地媒体检查、识别预览和移动编排服务。"""
 from __future__ import annotations
 
-import inspect
 import json
 import threading
 import time
@@ -12,6 +11,15 @@ from typing import Any
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
+from app.modules.directory_media import (
+    DirectoryInspection,
+    DirectoryMediaInspector,
+    MediaSnapshot,
+    _VideoIdentity,
+)
+from app.modules.directory_scrape import DirectoryScrapeService, FixedMatchScraper
+from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
+from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
 from app.modules.local_move_transaction import LocalMoveTransaction, MoveTransactionResult
 from app.modules.local_path_mapping import (
     assert_within,
@@ -19,7 +27,11 @@ from app.modules.local_path_mapping import (
     validate_source_target_roots,
 )
 from app.modules.local_storage import (
-    LocalContentChanged, LocalFileSnapshot, LocalFilesystemAdapter, snapshot_digest,
+    LocalContentChanged,
+    LocalFileSnapshot,
+    LocalFilesystemAdapter,
+    LocalStorageError,
+    snapshot_digest,
 )
 from app.modules.local_media_cleanup import (
     cleanup_candidates_from_snapshots,
@@ -31,23 +43,25 @@ from app.modules.local_media_recognition_summary import (
     serialize_recognition_summary,
 )
 from app.modules.organize import (
+    OrganizePlan,
     OrganizeRules,
     Organizer,
-    automatic_match_requires_confirmation,
     enforce_fixed_organize_rules,
 )
+from app.modules.organize_scan import OrganizeScanResult, ScannedVideo
+from app.modules.organize_postprocess import media_role
 from app.modules.media_probe import ProbeBudget, probe_local_media_profile
 from app.modules.media_server_path_mapping import (
     MediaServerPathMapping,
     configured_media_server_refresh_options,
 )
-from app.modules.recognition_policy import (
-    automatic_match_confirmation_message,
-    automatic_match_policy,
-)
 from app.modules.scraper import MatchResult, TMDBScraper
 from app.config import get, get_bool
-from app.modules.subtitle_identity import plan_subtitle_companions
+from app.modules.special_media import (
+    is_special_media_name,
+    is_special_path,
+    special_parent_context,
+)
 
 _SERVER_ONLY_RULE_FIELDS = {
     "nsfw_enabled",
@@ -77,13 +91,8 @@ class LocalMovePlan:
     local_target_root: str = ""
     server_path: str = ""
     expected_target_identity: tuple[int, int, int, int] | None = None
-
-
-@dataclass(frozen=True)
-class _LocalFile:
-    file_id: str
-    name: str
-    snapshot: LocalFileSnapshot
+    retire_target: Path | None = None
+    expected_retire_identity: tuple[int, int, int, int] | None = None
 
 
 @dataclass
@@ -95,6 +104,7 @@ class _Inspection:
     snapshots: list[LocalFileSnapshot]
     digest: str
     created_at: float
+    media_type: str = "movie"
 
 
 class _InspectionStore:
@@ -170,13 +180,28 @@ class LocalMediaService:
         suggested_query = ""
         parsed_season: int | None = None
         parsed_episode: int | None = None
+        detected_media_type = (
+            source.media_type if source.media_type in {"movie", "tv"} else ""
+        )
         if primary_video is not None:
-            parsed = self.scraper.parse_media(
-                primary_video.path.name, self._relative_parent(primary_video),
-            )
+            try:
+                parsed = self.scraper.parse_media(
+                    primary_video.path.name, self._relative_parent(primary_video),
+                )
+            except Exception:
+                parsed = None
             suggested_query = str(getattr(parsed, "title", "") or "").strip()
             parsed_season = getattr(parsed, "effective_season", None)
             parsed_episode = getattr(parsed, "effective_episode", None)
+            if not detected_media_type:
+                parsed_type = str(
+                    getattr(parsed, "media_type", "") or ""
+                ).strip().lower()
+                detected_media_type = (
+                    "tv"
+                    if parsed_season is not None or parsed_episode is not None
+                    else parsed_type if parsed_type in {"movie", "tv"} else ""
+                )
             if not suggested_query:
                 clean_title = getattr(self.scraper, "clean_title", None)
                 if callable(clean_title):
@@ -184,15 +209,61 @@ class LocalMediaService:
             if not suggested_query:
                 suggested_query = primary_video.path.stem
         else:
+            try:
+                parsed = self.scraper.parse_media(selected.name)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                suggested_query = str(getattr(parsed, "title", "") or "").strip()
+                if not detected_media_type:
+                    parsed_type = str(
+                        getattr(parsed, "media_type", "") or ""
+                    ).strip().lower()
+                    parsed_season = getattr(parsed, "effective_season", None)
+                    parsed_episode = getattr(parsed, "effective_episode", None)
+                    # 多视频目录名只有出现明确剧集证据时才可锁定类型；
+                    # 普通 staging/downloads 目录不能仅因解析器回退就判成电影。
+                    if (
+                        parsed_type == "tv"
+                        or parsed_season is not None
+                        or parsed_episode is not None
+                    ):
+                        detected_media_type = "tv"
             clean_title = getattr(self.scraper, "clean_title", None)
-            if callable(clean_title):
+            if not suggested_query and callable(clean_title):
                 suggested_query = str(clean_title(selected.name) or "").strip()
             if not suggested_query:
                 suggested_query = selected.name
+        if detected_media_type not in {"movie", "tv"}:
+            detected_media_type = "movie"
+            for item in videos[:8]:
+                source_season = source_episode = None
+                try:
+                    source_season, source_episode = self.scraper.parse_source_position(
+                        item.path.name, self._relative_parent(item),
+                    )
+                except Exception:
+                    try:
+                        parsed_item = self.scraper.parse_media(
+                            item.path.name, self._relative_parent(item),
+                        )
+                    except Exception:
+                        parsed_item = None
+                    source_season = getattr(parsed_item, "effective_season", None)
+                    source_episode = getattr(parsed_item, "effective_episode", None)
+                    if str(
+                        getattr(parsed_item, "media_type", "") or ""
+                    ).strip().lower() == "tv":
+                        detected_media_type = "tv"
+                        break
+                if source_season is not None or source_episode is not None:
+                    detected_media_type = "tv"
+                    break
         digest = snapshot_digest(snapshots)
         inspection_id = self.inspections.put(_Inspection(
             owner=str(owner), source_id=int(source_id), root=root, selected_path=selected,
             snapshots=snapshots, digest=digest, created_at=time.time(),
+            media_type=detected_media_type,
         ))
         return {
             "inspection_id": inspection_id,
@@ -204,6 +275,7 @@ class LocalMediaService:
             "single_video": primary_video is not None,
             "primary_video_name": primary_video.path.name if primary_video else "",
             "suggested_query": suggested_query,
+            "media_type": detected_media_type,
             "parsed_season": parsed_season,
             "parsed_episode": parsed_episode,
             "digest": digest,
@@ -229,28 +301,341 @@ class LocalMediaService:
             "task_year": str(getattr(task, "year", "") or ""),
             "task_tmdb_id": str(getattr(task, "tmdb_id", "") or ""),
             "task_media_type": str(getattr(task, "media_type", "") or ""),
+            "task_numbering_mode": str(
+                getattr(task, "numbering_mode", "auto") or "auto"
+            ),
         })
         return result
 
-    def search(self, query: str, year: str = "", media_type: str = "movie") -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        year: str = "",
+        media_type: str = "movie",
+        *,
+        owner: str = "admin",
+        inspection_id: str = "",
+    ) -> list[dict[str, Any]]:
+        effective_type = str(media_type or "").strip().lower()
+        if effective_type == "auto":
+            if inspection_id:
+                effective_type = self.inspections.get(owner, inspection_id).media_type
+            if effective_type not in {"movie", "tv"}:
+                effective_type = "movie"
+        if effective_type not in {"movie", "tv"}:
+            raise LocalMediaServiceError("媒体类型必须是 auto、movie 或 tv")
         return [
             {
                 "tmdb_id": item.tmdb_id, "title": item.title, "year": item.year,
-                "media_type": item.media_type or media_type, "score": item.score,
+                "media_type": item.media_type or effective_type, "score": item.score,
                 "overview": item.overview, "poster_path": item.poster_path,
             }
-            for item in self.scraper.search_candidates(query, year, media_type)
+            for item in self.scraper.search_candidates(query, year, effective_type)
         ]
 
-    @staticmethod
-    def _target_for_category(targets, category: str):
-        by_category = {item.category: item for item in targets}
-        return by_category.get(category) or by_category.get("default")
+    def external_hints(
+        self,
+        owner: str,
+        inspection_id: str,
+        query: str,
+        media_type: str = "auto",
+    ) -> dict[str, Any]:
+        inspection = self.inspections.get(owner, inspection_id)
+        search_query = str(query or "").strip()
+        if not search_query:
+            raise LocalMediaServiceError("请输入外部资料搜索词")
+        normalized_type = str(media_type or "auto").strip().lower()
+        if normalized_type not in {"auto", "movie", "tv"}:
+            raise LocalMediaServiceError("媒体类型只能是自动、电影或剧集")
+        resolved_type = (
+            inspection.media_type if normalized_type == "auto" else normalized_type
+        )
+        try:
+            return DirectoryScrapeService.query_external_hints(
+                search_query, resolved_type,
+            )
+        except Exception as exc:
+            raise LocalMediaServiceError(str(exc)) from exc
 
     @staticmethod
     def _relative_parent(snapshot: LocalFileSnapshot) -> str:
         parent = Path(snapshot.relative_path).parent.as_posix()
         return "" if parent == "." else parent
+
+    @staticmethod
+    def _scope_relative_parent(
+        inspection: _Inspection,
+        snapshot: LocalFileSnapshot,
+    ) -> str:
+        if inspection.selected_path.is_file():
+            return LocalMediaService._relative_parent(snapshot)
+        try:
+            parent = snapshot.path.parent.relative_to(inspection.selected_path).as_posix()
+        except ValueError:
+            return LocalMediaService._relative_parent(snapshot)
+        return "" if parent == "." else parent
+
+    @staticmethod
+    def _local_etag(snapshot: LocalFileSnapshot) -> str:
+        return ":".join(str(value) for value in (
+            snapshot.mtime_ns, snapshot.device, snapshot.inode,
+        ))
+
+    def _build_local_scan_result(
+        self,
+        inspection: _Inspection,
+        videos: list[LocalFileSnapshot],
+        companions: list[LocalFileSnapshot],
+    ) -> tuple[OrganizeScanResult, dict[str, LocalFileSnapshot]]:
+        snapshots_by_id: dict[str, LocalFileSnapshot] = {}
+        scanned_videos: list[ScannedVideo] = []
+        companion_files: dict[str, list[GuangYaFile]] = {}
+        video_files_by_path: dict[str, list[GuangYaFile]] = {}
+
+        source_root_name = (
+            "" if inspection.selected_path.is_file() else inspection.selected_path.name
+        )
+        for snapshot in videos:
+            file_id = snapshot.relative_path
+            snapshots_by_id[file_id] = snapshot
+            relative_dir = self._scope_relative_parent(inspection, snapshot)
+            proxy = GuangYaFile(
+                file_id=file_id,
+                name=snapshot.path.name,
+                is_dir=False,
+                size=snapshot.size,
+                etag=self._local_etag(snapshot),
+                parent_id=str(snapshot.path.parent.resolve(strict=False)),
+            )
+            special = bool(
+                is_special_path(relative_dir)
+                or is_special_media_name(snapshot.path.name)
+            )
+            scanned_videos.append(ScannedVideo(
+                file=proxy,
+                relative_dir=relative_dir,
+                special=special,
+                recognition_parent_path=(
+                    special_parent_context(relative_dir, source_root_name)
+                    if special else relative_dir
+                ),
+                source_group_id=str(inspection.selected_path),
+                source_group_path=relative_dir or "__root__",
+            ))
+            video_files_by_path.setdefault(relative_dir, []).append(proxy)
+
+        for snapshot in companions:
+            file_id = snapshot.relative_path
+            snapshots_by_id[file_id] = snapshot
+            relative_dir = self._scope_relative_parent(inspection, snapshot)
+            companion_files.setdefault(relative_dir, []).append(GuangYaFile(
+                file_id=file_id,
+                name=snapshot.path.name,
+                is_dir=False,
+                size=snapshot.size,
+                etag=self._local_etag(snapshot),
+                parent_id=str(snapshot.path.parent.resolve(strict=False)),
+            ))
+
+        return OrganizeScanResult(
+            scanned_videos=scanned_videos,
+            scanned_dirs=[],
+            companion_files=companion_files,
+            video_files_by_path=video_files_by_path,
+            protected_sources=set(),
+            # 目录整理与光鸭一致：选择目录名作为来源根标题证据，文件内部
+            # 只保留相对路径；单文件整理则沿用来源根下的父目录上下文。
+            source_root_name=source_root_name,
+        ), snapshots_by_id
+
+    def _build_local_directory_inspection(
+        self,
+        inspection: _Inspection,
+        scan_result: OrganizeScanResult,
+        *,
+        media_type: str,
+    ) -> DirectoryInspection:
+        videos: list[MediaSnapshot] = []
+        identities: list[_VideoIdentity] = []
+        for item in scan_result.scanned_videos:
+            parent_context = "/".join(
+                value for value in (
+                    scan_result.source_root_name, item.recognition_parent_path,
+                ) if value
+            )
+            try:
+                parsed = self.scraper.parse_media(item.file.name, parent_context)
+            except Exception:
+                parsed = None
+            season = getattr(parsed, "source_season", None)
+            episode = getattr(parsed, "source_episode", None)
+            if season is None:
+                season = getattr(parsed, "effective_season", None)
+            if episode is None:
+                episode = getattr(parsed, "effective_episode", None)
+            try:
+                source_season, source_episode = self.scraper.parse_source_position(
+                    item.file.name, parent_context,
+                )
+            except Exception:
+                source_season, source_episode = None, None
+            if source_season is not None:
+                season = source_season
+            if source_episode is not None:
+                episode = source_episode
+
+            special_container = is_special_path(item.relative_dir)
+            special = bool(item.special or special_container)
+            if special:
+                season = 0
+            snapshot = MediaSnapshot(
+                file_id=item.file.file_id,
+                parent_id=item.file.parent_id,
+                name=item.file.name,
+                size=item.file.size,
+                etag=item.file.etag,
+                role="video",
+                relative_dir=item.relative_dir,
+                season=season,
+                episode=episode,
+            )
+            videos.append(snapshot)
+            parsed_type = str(
+                getattr(parsed, "media_type", "") or ""
+            ).strip().lower()
+            identity_type = (
+                "tv"
+                if media_type == "tv"
+                or parsed_type == "tv"
+                or season is not None
+                or episode is not None
+                else "movie"
+            )
+            identities.append(_VideoIdentity(
+                file=snapshot,
+                special=special,
+                special_container=special_container,
+                media_type=identity_type,
+                title=str(getattr(parsed, "title", "") or "").strip(),
+                year=str(getattr(parsed, "year", "") or "").strip(),
+                tmdb_id=str(getattr(parsed, "tmdb_id", "") or "").strip(),
+            ))
+
+        videos = DirectoryMediaInspector._assign_special_episodes(videos)
+        snapshots_by_id = {item.file_id: item for item in videos}
+        identities = [
+            replace(item, file=snapshots_by_id[item.file.file_id])
+            for item in identities
+        ]
+        try:
+            selected_videos, pending_videos = (
+                DirectoryMediaInspector._select_primary_media_group(identities)
+            )
+        except DirectoryScrapeRequestError as exc:
+            raise LocalMediaServiceError(str(exc)) from exc
+
+        companions: list[MediaSnapshot] = []
+        for relative_dir, items in scan_result.companion_files.items():
+            companions.extend(MediaSnapshot(
+                file_id=item.file_id,
+                parent_id=item.parent_id,
+                name=item.name,
+                size=item.size,
+                etag=item.etag,
+                role=media_role(item.name),
+                relative_dir=relative_dir,
+            ) for item in items)
+        if pending_videos:
+            companions = DirectoryMediaInspector._safe_companions_for_videos(
+                selected_videos, companions,
+            )
+
+        return DirectoryInspection(
+            directory_id=str(inspection.selected_path),
+            directory_name=scan_result.source_root_name,
+            media_type=media_type,
+            suggested_query="",
+            videos=tuple(selected_videos),
+            companions=tuple(companions),
+            counts={
+                "video": len(selected_videos),
+                "subtitle": sum(item.role == "subtitle" for item in companions),
+                "metadata": sum(item.role != "subtitle" for item in companions),
+            },
+            mixed=bool(pending_videos),
+            fingerprint=inspection.digest,
+            pending_videos=tuple(pending_videos),
+        )
+
+    @staticmethod
+    def _normalize_numbering_mode(value: str) -> str:
+        mode = str(value or "auto").strip().lower()
+        if mode not in NUMBERING_MODES:
+            raise LocalMediaServiceError("剧集编号模式无效")
+        return normalize_numbering_mode(mode)
+
+    @staticmethod
+    def _target_directory_for_plan(plan: OrganizePlan, targets):
+        category = _CATEGORY_KEYS.get(plan.main_category, "default")
+        by_category = {item.category: item for item in targets}
+        media_fallback = (
+            "tv"
+            if str(getattr(plan.match, "media_type", "") or "") == "tv"
+            else "movie"
+        )
+        target_config = (
+            by_category.get(category)
+            or by_category.get(media_fallback)
+            or by_category.get("default")
+        )
+        if target_config is None:
+            raise LocalMediaServiceError(
+                f"未配置 {plan.main_category or '当前媒体'} 或默认归档目标"
+            )
+        parts = [part for part in str(plan.target_path or "").split("/") if part]
+        if (
+            target_config.category != "default"
+            and parts
+            and parts[0] == plan.main_category
+        ):
+            parts = parts[1:]
+        destination = Path(target_config.path).expanduser().resolve(
+            strict=False
+        ).joinpath(*parts)
+        return target_config, destination
+
+    @staticmethod
+    def _local_target_inventory(
+        destination: Path,
+    ) -> tuple[str, list[GuangYaFile], dict[str, str]]:
+        target_id = str(destination)
+        if not destination.exists():
+            return target_id, [], {}
+        if not destination.is_dir() or destination.is_symlink():
+            raise LocalMediaServiceError(
+                f"本地归档目标不是安全目录: {destination.name}"
+            )
+        files: list[GuangYaFile] = []
+        evidence: dict[str, str] = {}
+        for path in destination.iterdir():
+            try:
+                size, mtime_ns, device, inode = (
+                    LocalFilesystemAdapter.regular_file_identity(path)
+                )
+            except (LocalContentChanged, LocalStorageError, OSError):
+                continue
+            file_id = str(path.resolve(strict=False))
+            item = GuangYaFile(
+                file_id=file_id,
+                name=path.name,
+                is_dir=False,
+                size=size,
+                etag=f"{mtime_ns}:{device}:{inode}",
+                parent_id=target_id,
+            )
+            files.append(item)
+            evidence[file_id] = path.name
+        return target_id, files, evidence
 
     @staticmethod
     def _normalize_position_overrides(
@@ -268,13 +653,11 @@ class LocalMediaService:
                 raise LocalMediaServiceError(f"{label}必须是整数")
             if not minimum <= value <= maximum:
                 raise LocalMediaServiceError(f"{label}必须是 {minimum}-{maximum} 的整数")
-        video_count = sum(item.role == "video" for item in inspection.snapshots)
         if (
             episode_override is not None
             and not inspection.selected_path.is_file()
-            and video_count != 1
         ):
-            raise LocalMediaServiceError("包含多个视频的目录只能指定归档季，不能统一指定集数")
+            raise LocalMediaServiceError("目录刮削只能统一指定归档季，不能覆盖全部集号")
         if episode_override is not None and season_override is None:
             season_override = 1
         return season_override, episode_override
@@ -328,35 +711,6 @@ class LocalMediaService:
             append_candidate(candidate)
         return candidates[:3]
 
-    def _match_video(
-        self,
-        video: LocalFileSnapshot,
-        *,
-        tmdb_id: str = "",
-        media_type: str = "",
-        rules: OrganizeRules | None = None,
-    ) -> MatchResult:
-        if tmdb_id:
-            return self.scraper.match_from_tmdb(tmdb_id, media_type or "movie")
-        if rules is not None and type(self.scraper) is TMDBScraper:
-            recognizer = self.organizer._nsfw_recognizer(rules)
-            if recognizer is not None:
-                match = recognizer.match(video.path.name, self._relative_parent(video))
-                if match is not None:
-                    return match
-        matcher = self.scraper.match
-        try:
-            parameters = inspect.signature(matcher).parameters
-        except (TypeError, ValueError):
-            parameters = {}
-        if "media_type_hint" in parameters or any(
-            item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
-        ):
-            return matcher(
-                video.path.name, self._relative_parent(video), media_type_hint=media_type
-            )
-        return matcher(video.path.name, self._relative_parent(video))
-
     @staticmethod
     def _serialize_rules_snapshot(rules: OrganizeRules) -> str:
         payload = asdict(rules)
@@ -409,8 +763,10 @@ class LocalMediaService:
         automatic: bool = False,
         season_override: int | None = None,
         episode_override: int | None = None,
+        numbering_mode: str = "auto",
     ) -> dict[str, Any]:
         inspection = self.inspections.get(owner, inspection_id)
+        normalized_numbering_mode = self._normalize_numbering_mode(numbering_mode)
         season_override, episode_override = self._normalize_position_overrides(
             inspection, season_override, episode_override,
         )
@@ -425,7 +781,9 @@ class LocalMediaService:
         targets = db.list_local_library_targets(inspection.source_id, owner=owner)
         if not targets:
             raise LocalMediaServiceError("当前来源尚未配置归档目标")
-        validate_source_target_roots(inspection.root, [Path(item.path) for item in targets])
+        validate_source_target_roots(
+            inspection.root, [Path(item.path) for item in targets],
+        )
 
         if rules_snapshot:
             rules = self._restore_rules_snapshot(rules_snapshot)
@@ -451,230 +809,381 @@ class LocalMediaService:
             and item.path not in cleanup_paths
             and item.path not in retained_sample_paths
         ]
-        subtitles = [_LocalFile(item.relative_path, item.path.name, item) for item in current if item.role == "subtitle"]
-        video_files = [_LocalFile(item.relative_path, item.path.name, item) for item in videos]
-        # 本地预览共享一个有界预算：缓存命中免费，慢文件不会把整次预览拖成 N×30 秒。
-        probe_budget = ProbeBudget(attempts=24, max_seconds=20)
-        subtitle_result = plan_subtitle_companions(video_files, subtitles)
-        # 一个视频可有多个语言字幕，使用 multimap。
-        subtitle_groups: dict[str, list] = {}
-        for item in subtitle_result.plans:
-            subtitle_groups.setdefault(item.video_file_id, []).append(item)
+        companions = [
+            item for item in current
+            if item.role in {"subtitle", "metadata", "image"}
+            and item.path not in cleanup_paths
+        ]
+        if not videos:
+            raise LocalMediaServiceError("选择路径中没有可整理的视频")
 
-        effective_media_type = str(media_type or "").strip().lower()
-        if effective_media_type not in {"movie", "tv"}:
-            effective_media_type = source.media_type if source.media_type in {"movie", "tv"} else ""
-        if (season_override is not None or episode_override is not None) and effective_media_type == "movie":
-            raise LocalMediaServiceError("电影整理不能指定季数或集数")
-
-        plans: list[LocalMovePlan] = []
-        matches: list[dict[str, Any]] = []
-        seen_targets: set[Path] = set()
-        for video in videos:
-            match = self._match_video(
-                video, tmdb_id=tmdb_id, media_type=effective_media_type, rules=rules,
+        requested_media_type = str(media_type or "").strip().lower()
+        if requested_media_type not in {"", "auto", "movie", "tv"}:
+            raise LocalMediaServiceError("媒体类型必须是 auto、movie 或 tv")
+        effective_media_type = requested_media_type
+        if effective_media_type in {"", "auto"}:
+            effective_media_type = (
+                inspection.media_type
+                if inspection.media_type in {"movie", "tv"}
+                else source.media_type
             )
-            match_identity = self.organizer._match_external_id(match)
-            if (season_override is not None or episode_override is not None) and match.media_type != "tv":
-                raise LocalMediaServiceError("只有剧集整理可以指定季数或集数")
-            automatic_policy = automatic_match_policy(rules.automatic_match_preset)
-            automatic_requires_confirmation = bool(
-                not tmdb_id
-                and automatic
-                and automatic_match_requires_confirmation(
-                    match,
-                    threshold=automatic_policy.threshold,
+        if effective_media_type not in {"movie", "tv"}:
+            effective_media_type = "movie"
+        if (
+            season_override is not None or episode_override is not None
+        ) and effective_media_type != "tv":
+            raise LocalMediaServiceError("只有剧集整理可以指定季数或集数")
+        if (
+            not str(tmdb_id or "").strip()
+            and (
+                normalized_numbering_mode != "auto"
+                or season_override is not None
+                or episode_override is not None
+            )
+        ):
+            raise LocalMediaServiceError("请先选择剧集候选，再指定编号方式或归档位置")
+
+        scan_result, snapshots_by_id = self._build_local_scan_result(
+            inspection, videos, companions,
+        )
+        planner_scraper = self.scraper
+        position_overrides: dict[object, tuple[int | None, int | None]] = {}
+        episode_mappings = {}
+        fixed_match: MatchResult | None = None
+        detail: dict[str, Any] = {}
+        manual_pending_confirmations: list[dict[str, Any]] = []
+        requested_tmdb_id = str(tmdb_id or "").strip()
+        if requested_tmdb_id:
+            fixed_match = self.scraper.match_from_tmdb(
+                requested_tmdb_id, effective_media_type,
+            )
+            if not self.organizer._match_external_id(fixed_match) or fixed_match.need_confirm:
+                raise LocalMediaServiceError("TMDB 详情不存在或无法确认")
+            detail_loader = getattr(self.scraper, "get_detail_with_credits", None)
+            if not callable(detail_loader):
+                detail_loader = getattr(self.scraper, "get_detail", None)
+            detail = (
+                detail_loader(requested_tmdb_id, effective_media_type)
+                if callable(detail_loader) else {}
+            )
+            if not detail:
+                raise LocalMediaServiceError("TMDB 详情不存在或无法确认")
+            directory_inspection = self._build_local_directory_inspection(
+                inspection, scan_result, media_type=effective_media_type,
+            )
+            if directory_inspection.pending_videos:
+                allowed_video_ids = {
+                    item.file_id for item in directory_inspection.videos
+                }
+                allowed_companion_ids = {
+                    item.file_id for item in directory_inspection.companions
+                }
+                scan_result = OrganizeScanResult(
+                    scanned_videos=[
+                        item for item in scan_result.scanned_videos
+                        if item.file.file_id in allowed_video_ids
+                    ],
+                    scanned_dirs=list(scan_result.scanned_dirs),
+                    companion_files={
+                        relative_dir: [
+                            item for item in items
+                            if item.file_id in allowed_companion_ids
+                        ]
+                        for relative_dir, items in scan_result.companion_files.items()
+                        if any(
+                            item.file_id in allowed_companion_ids for item in items
+                        )
+                    },
+                    video_files_by_path={
+                        relative_dir: [
+                            item for item in items
+                            if item.file_id in allowed_video_ids
+                        ]
+                        for relative_dir, items in scan_result.video_files_by_path.items()
+                        if any(item.file_id in allowed_video_ids for item in items)
+                    },
+                    protected_sources=set(scan_result.protected_sources),
+                    source_root_name=scan_result.source_root_name,
+                )
+                manual_pending_confirmations = [
+                    {
+                        "source_name": item.file.name,
+                        "reason": item.reason,
+                        "candidate": None,
+                        "candidates": [],
+                    }
+                    for item in directory_inspection.pending_videos
+                ]
+            season_detail_loader = getattr(
+                self.scraper, "get_tv_season_detail", None,
+            )
+            position_overrides, episode_mappings = (
+                DirectoryScrapeService._mapped_position_overrides(
+                    directory_inspection,
+                    detail,
+                    normalized_numbering_mode,
+                    season_override=season_override,
+                    episode_override=episode_override,
+                    season_detail_loader=(
+                        season_detail_loader
+                        if callable(season_detail_loader) else None
+                    ),
                 )
             )
-            if (
-                not match_identity
-                or (match.need_confirm and not (
-                    automatic and not tmdb_id and not automatic_requires_confirmation
-                ))
-                or automatic_requires_confirmation
-            ):
-                candidates = self._confirmation_candidates(match)
-                return {
-                    "inspection_id": inspection_id,
-                    "status": "requires_manual",
-                    "reason": (
-                        automatic_match_confirmation_message(automatic_policy.name)
-                        if automatic_requires_confirmation
-                        else (match.error or "媒体识别结果需要人工确认")
-                    ),
-                    "candidate": candidates[0] if candidates else {
-                        "tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
-                        "media_type": match.media_type, "confidence": match.confidence,
-                        "provider": self.organizer._match_provider(match),
-                        "external_id": match_identity,
-                    },
-                    "candidates": candidates,
-                    "files": [{"name": item.path.name} for item in videos],
-                    "snapshot_digest": inspection.digest,
-                    "plans": [], "cloud_write": False,
-                    "rules_snapshot": effective_rules_snapshot,
-                }
-            release_parse = self.scraper.parse_media(
-                video.path.name, self._relative_parent(video),
-                match if not tmdb_id else None,
+            planner_scraper = FixedMatchScraper(
+                self.scraper,
+                fixed_match,
+                detail,
+                season_override=season_override,
+                episode_override=episode_override,
+                preserve_specials=not inspection.selected_path.is_file(),
+                position_overrides=position_overrides,
             )
-            # 人工指定 TMDB 只固定媒体身份，不应在确认后再被通用季集偏移改写。
-            # 自动识别消费统一有效位置；人工身份锁定继续使用原始文件位置。
-            parsed: dict[str, object] = {
-                "title": release_parse.title,
-                "year": release_parse.year,
-                "type": release_parse.media_type,
-                "tmdb_id": release_parse.tmdb_id,
-                "season": (
-                    release_parse.effective_season
-                    if not tmdb_id else release_parse.source_season
-                ),
-                "episode": (
-                    release_parse.effective_episode
-                    if not tmdb_id else release_parse.source_episode
-                ),
-            }
-            if tmdb_id and match.season_override is not None:
-                parsed["season"] = match.season_override
-            if match.media_type == "tv":
-                if season_override is not None:
-                    parsed["season"] = season_override
-                if episode_override is not None:
-                    parsed["episode"] = episode_override
-            if match.media_type == "tv" and parsed.get("episode") is not None and parsed.get("season") is None:
-                parsed["season"] = 1
-            if match.media_type == "tv" and parsed.get("episode") is None:
-                candidates = self._confirmation_candidates(match)
-                return {
-                    "inspection_id": inspection_id, "status": "requires_manual",
-                    "reason": f"剧集文件缺少集数，不能自动归档: {video.path.name}",
-                    "candidate": candidates[0] if candidates else {
-                        "tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
-                        "media_type": match.media_type, "confidence": match.confidence,
-                        "provider": self.organizer._match_provider(match),
-                        "external_id": match_identity,
-                    },
-                    "candidates": candidates,
-                    "files": [{"name": item.path.name} for item in videos],
-                    "snapshot_digest": inspection.digest,
-                    "plans": [], "cloud_write": False,
-                    "rules_snapshot": effective_rules_snapshot,
-                }
-            proxy = GuangYaFile(video.relative_path, video.path.name, False, video.size)
-            media_profile = probe_local_media_profile(
-                video.path,
-                size=video.size,
-                mtime_ns=video.mtime_ns,
-                device=video.device,
-                inode=video.inode,
+
+        planner = (
+            self.organizer
+            if planner_scraper is self.scraper
+            else Organizer(client=object(), scraper=planner_scraper)
+        )
+        probe_budget = ProbeBudget(attempts=24, max_seconds=20)
+
+        def load_media_profile(file: GuangYaFile, _plan: OrganizePlan):
+            if not rules.media_info_enabled or not rules.media_probe_enabled:
+                return None
+            snapshot = snapshots_by_id.get(str(file.file_id))
+            if snapshot is None or snapshot.role != "video":
+                return None
+            return probe_local_media_profile(
+                snapshot.path,
+                size=snapshot.size,
+                mtime_ns=snapshot.mtime_ns,
+                device=snapshot.device,
+                inode=snapshot.inode,
                 timeout=rules.media_probe_timeout,
                 budget=probe_budget,
             )
-            target_name = self.organizer.build_new_name(
-                match,
-                proxy,
-                parsed,
-                rules,
-                media_info_override=media_profile.render() if media_profile else "",
-                media_variant_override=media_profile,
-            )
-            main, region, year = self.organizer.classify(match, rules)
-            category = _CATEGORY_KEYS.get(main, "default")
-            target_config = self._target_for_category(targets, category)
-            if target_config is None:
-                raise LocalMediaServiceError(f"未配置 {main} 或默认归档目标")
-            parts: list[str] = []
-            if target_config.category == "default":
-                parts.append(main)
-            if rules.region_split:
-                parts.append(region)
-            if rules.year_split and year:
-                parts.append(year)
-            parts.extend(self.organizer.build_media_path_parts(match, parsed, rules))
-            destination_dir = Path(target_config.path).expanduser().resolve(strict=False).joinpath(*parts)
-            target = destination_dir / target_name
-            if target in seen_targets:
-                raise LocalMediaServiceError(f"本地整理计划包含重复目标: {target.name}")
-            video_action = "move"
-            video_note = ""
-            video_target_identity: tuple[int, int, int, int] | None = None
-            try:
-                video_target_identity = LocalFilesystemAdapter.regular_file_identity(target)
-            except LocalContentChanged:
-                pass
-            if video_target_identity is not None:
-                if not automatic:
-                    video_action = "replace"
-                    video_note = "手动整理将安全覆盖并替换媒体库中的现有文件"
-                else:
-                    existing = GuangYaFile(str(target), target.name, False, video_target_identity[0])
-                    incoming = GuangYaFile(video.relative_path, video.path.name, False, video.size)
-                    if self.organizer.should_replace(
-                        existing, incoming, target_name, rules,
-                        existing_evidence=target.name,
-                        incoming_evidence=video.path.name,
-                    ):
-                        video_action = "replace"
-                        video_note = "按统一冲突策略替换媒体库中的现有文件"
-                    else:
-                        video_action = "skip"
-                        video_note = "按统一冲突策略保留媒体库现有文件"
-            seen_targets.add(target)
-            group_id = f"{match.media_type}:{self.organizer._match_identity_key(match)}:{video.relative_path}"
-            plans.append(LocalMovePlan(
-                video, target, "video", group_id, action=video_action, note=video_note,
-                provider=target_config.provider, library_id=target_config.library_id,
-                library_name=target_config.library_name,
-                local_target_root=target_config.path, server_path=target_config.server_path,
-                expected_target_identity=(
-                    video_target_identity if video_action == "replace" else None
-                ),
-            ))
-            for subtitle_plan in subtitle_groups.get(video.relative_path, []):
-                subtitle_snapshot = subtitle_plan.file.snapshot
-                subtitle_target = destination_dir / subtitle_plan.target_name(target_name)
-                if subtitle_target in seen_targets:
-                    raise LocalMediaServiceError(f"本地整理计划包含重复字幕目标: {subtitle_target.name}")
-                subtitle_action = "skip" if video_action == "skip" else "move"
-                subtitle_note = "对应视频保留现有版本，字幕不移动" if video_action == "skip" else ""
-                subtitle_target_identity: tuple[int, int, int, int] | None = None
+
+        target_directory_cache: dict[str, tuple[object, Path]] = {}
+        inventory_cache: dict[
+            str, tuple[str, list[GuangYaFile], dict[str, str]]
+        ] = {}
+
+        def target_for_plan(plan: OrganizePlan):
+            cached = target_directory_cache.get(str(plan.file_id))
+            if cached is None:
+                cached = self._target_directory_for_plan(plan, targets)
+                target_directory_cache[str(plan.file_id)] = cached
+            return cached
+
+        def load_target_inventory(plan: OrganizePlan):
+            _target_config, destination = target_for_plan(plan)
+            key = str(destination)
+            if key not in inventory_cache:
+                inventory_cache[key] = self._local_target_inventory(destination)
+            return inventory_cache[key]
+
+        planning_result, planning_stats = planner.plan_scan_result(
+            scan_result,
+            rules,
+            automatic=bool(automatic and not requested_tmdb_id),
+            source_dir_id=str(inspection.selected_path),
+            source_name="",
+            media_type_hint=effective_media_type,
+            media_profile_loader=load_media_profile,
+            target_inventory_loader=load_target_inventory,
+            # 光鸭历史日志不属于本地媒体库；本地仍复用同批身份绑定和
+            # 目录标记校验，但历史来源必须由本地后端单独提供。
+            identity_history_loader=lambda _plan: set(),
+        )
+
+        local_plans: list[LocalMovePlan] = []
+        matches: list[dict[str, Any]] = []
+        pending_confirmations: list[dict[str, Any]] = list(
+            manual_pending_confirmations
+        )
+        seen_targets: set[Path] = set()
+
+        for plan in planning_result.plans:
+            match = plan.match or MatchResult()
+            snapshot = snapshots_by_id.get(str(plan.file_id))
+            if match.need_confirm or plan.action == "conflict":
+                candidates = self._confirmation_candidates(match)
+                pending_confirmations.append({
+                    "source_name": plan.original_name,
+                    "reason": plan.note or match.error or "媒体识别结果需要人工确认",
+                    "candidate": candidates[0] if candidates else None,
+                    "candidates": candidates,
+                })
+                continue
+            if snapshot is None or not plan.new_name or not plan.target_path:
+                continue
+            target_config, destination_dir = target_for_plan(plan)
+            target = destination_dir / plan.new_name
+            action = "skip" if plan.action == "skip" else "move"
+            if action != "skip":
+                if target in seen_targets:
+                    raise LocalMediaServiceError(
+                        f"本地整理计划包含重复目标: {target.name}"
+                    )
+                seen_targets.add(target)
+
+            note = plan.note or plan.conflict_note
+            expected_target_identity = None
+            retire_target = None
+            expected_retire_identity = None
+            if plan.action == "move" and plan.conflict_decision == "replace":
+                action = "replace"
+                existing_path = Path(plan.conflict_existing_id)
                 try:
-                    subtitle_target_identity = LocalFilesystemAdapter.regular_file_identity(subtitle_target)
-                except LocalContentChanged:
+                    existing_identity = (
+                        LocalFilesystemAdapter.regular_file_identity(existing_path)
+                    )
+                except (LocalContentChanged, LocalStorageError, OSError) as exc:
+                    raise LocalMediaServiceError(
+                        f"待替换目标已变化，请重新生成预览: {existing_path.name}"
+                    ) from exc
+                if existing_path == target:
+                    expected_target_identity = existing_identity
+                else:
+                    retire_target = existing_path
+                    expected_retire_identity = existing_identity
+
+            group_id = (
+                f"{match.media_type}:{planner._match_identity_key(match)}:"
+                f"{plan.source_group_path or plan.original_path or '__root__'}"
+            )
+            local_plans.append(LocalMovePlan(
+                snapshot,
+                target,
+                "video",
+                group_id,
+                action=action,
+                note=note,
+                provider=target_config.provider,
+                library_id=target_config.library_id,
+                library_name=target_config.library_name,
+                local_target_root=target_config.path,
+                server_path=target_config.server_path,
+                expected_target_identity=expected_target_identity,
+                retire_target=retire_target,
+                expected_retire_identity=expected_retire_identity,
+            ))
+
+            for subtitle_plan in planning_result.subtitle_plans_by_video.get(
+                str(plan.file_id), []
+            ):
+                subtitle_snapshot = snapshots_by_id.get(
+                    str(subtitle_plan.file.file_id)
+                )
+                if subtitle_snapshot is None:
+                    continue
+                subtitle_target = destination_dir / subtitle_plan.target_name(
+                    plan.new_name
+                )
+                subtitle_action = "skip" if action == "skip" else "move"
+                if subtitle_action != "skip":
+                    if subtitle_target in seen_targets:
+                        raise LocalMediaServiceError(
+                            f"本地整理计划包含重复字幕目标: {subtitle_target.name}"
+                        )
+                    seen_targets.add(subtitle_target)
+                subtitle_note = (
+                    "对应视频保留现有版本，字幕不移动"
+                    if action == "skip" else ""
+                )
+                subtitle_target_identity = None
+                try:
+                    subtitle_target_identity = (
+                        LocalFilesystemAdapter.regular_file_identity(subtitle_target)
+                    )
+                except (LocalContentChanged, LocalStorageError, OSError):
                     pass
-                if subtitle_target_identity is not None and video_action != "skip":
+                if subtitle_target_identity is not None and action != "skip":
                     subtitle_action = "replace"
                     subtitle_note = "随视频替换现有字幕"
-                seen_targets.add(subtitle_target)
-                plans.append(LocalMovePlan(
-                    subtitle_snapshot, subtitle_target, "subtitle", group_id,
-                    action=subtitle_action, note=subtitle_note,
-                    provider=target_config.provider, library_id=target_config.library_id,
+                local_plans.append(LocalMovePlan(
+                    subtitle_snapshot,
+                    subtitle_target,
+                    "subtitle",
+                    group_id,
+                    action=subtitle_action,
+                    note=subtitle_note,
+                    provider=target_config.provider,
+                    library_id=target_config.library_id,
                     library_name=target_config.library_name,
-                    local_target_root=target_config.path, server_path=target_config.server_path,
+                    local_target_root=target_config.path,
+                    server_path=target_config.server_path,
                     expected_target_identity=(
-                        subtitle_target_identity if subtitle_action == "replace" else None
+                        subtitle_target_identity
+                        if subtitle_action == "replace" else None
                     ),
                 ))
+
+            mapping = episode_mappings.get(str(plan.file_id))
             matches.append({
-                "tmdb_id": match.tmdb_id, "title": match.title, "year": match.year,
-                "media_type": match.media_type, "confidence": match.confidence,
-                "provider": self.organizer._match_provider(match),
-                "external_id": match_identity,
-                "source_name": video.path.name, "target_name": target_name,
-                "season": parsed.get("season"), "episode": parsed.get("episode"),
-                "category": main, "target_root": target_config.path,
+                "tmdb_id": match.tmdb_id,
+                "title": match.title,
+                "year": match.year,
+                "media_type": match.media_type,
+                "confidence": match.confidence,
+                "provider": planner._match_provider(match),
+                "external_id": planner._match_external_id(match),
+                "source_name": snapshot.path.name,
+                "target_name": plan.new_name,
+                "season": plan.season,
+                "episode": plan.episode,
+                "source_season": plan.source_season,
+                "source_episode": plan.source_episode,
+                "episode_mapping": (
+                    mapping.to_dict()
+                    if mapping is not None
+                    else (
+                        plan.episode_mapping.to_dict()
+                        if plan.episode_mapping is not None else {}
+                    )
+                ),
+                "category": plan.main_category,
+                "target_root": target_config.path,
             })
+
+        if not local_plans and pending_confirmations:
+            first = pending_confirmations[0]
+            candidates = first.get("candidates") or []
+            return {
+                "inspection_id": inspection_id,
+                "status": "requires_manual",
+                "reason": first.get("reason") or "媒体识别结果需要人工确认",
+                "candidate": first.get("candidate") or {},
+                "candidates": candidates,
+                "pending_confirmations": pending_confirmations,
+                "files": [{"name": item.path.name} for item in videos],
+                "snapshot_digest": inspection.digest,
+                "plans": [],
+                "cloud_write": False,
+                "rules_snapshot": effective_rules_snapshot,
+                "numbering_mode": normalized_numbering_mode,
+            }
+
         return {
             "inspection_id": inspection_id,
             "status": "planned",
             "digest": inspection.digest,
             "cloud_write": False,
             "rules_snapshot": effective_rules_snapshot,
+            "numbering_mode": normalized_numbering_mode,
             "position_overrides": {
-                "season": season_override, "episode": episode_override,
+                "season": season_override,
+                "episode": episode_override,
+            },
+            "numbering": {
+                "mode": normalized_numbering_mode,
+                "changed": sum(
+                    1 for item in episode_mappings.values() if item.changed
+                ),
             },
             "matches": matches,
+            "pending_confirmations": pending_confirmations,
+            "planning_stats": planning_stats,
             "plans": [
                 {
                     "source_path": item.source.relative_path,
@@ -685,14 +1194,18 @@ class LocalMediaService:
                     "action": item.action,
                     "note": item.note,
                 }
-                for item in plans
+                for item in local_plans
             ],
             "subtitle_skipped": [
-                {"name": item.file.name, "reason": item.reason, "reason_code": item.reason_code}
-                for item in subtitle_result.skipped
+                {"reason": str(reason)}
+                for reason in planning_stats.get("subtitle_reasons", [])
             ],
             "cleanup": [
-                {"name": item.snapshot.path.name, "reason": item.reason, "reason_code": item.reason_code}
+                {
+                    "name": item.snapshot.path.name,
+                    "reason": item.reason,
+                    "reason_code": item.reason_code,
+                }
                 for item in cleanup_candidates
             ],
             "retained": [
@@ -703,9 +1216,11 @@ class LocalMediaService:
                 }
                 for path in sorted(retained_sample_paths)
             ],
-            "_move_plans": plans,
+            "_move_plans": local_plans,
             "_cleanup_candidates": cleanup_candidates,
-            "_retained_paths": [str(path) for path in sorted(retained_sample_paths)],
+            "_retained_paths": [
+                str(path) for path in sorted(retained_sample_paths)
+            ],
         }
 
     @staticmethod
@@ -876,13 +1391,35 @@ class LocalMediaService:
                 rules_snapshot=task.rules_snapshot,
                 automatic=task.trigger in {"scan", "qb_completed"},
                 season_override=task.season_override, episode_override=task.episode_override,
+                numbering_mode=task.numbering_mode,
             )
             if preview.get("status") != "planned":
                 db.update_local_media_task(
                     task_id, owner=owner, status="requires_manual",
+                    snapshot_digest=str(preview.get("digest") or inspection.get("digest") or ""),
                     error=str(preview.get("reason") or "TMDB 结果需要人工确认"),
                 )
                 return {"status": "requires_manual", "task_id": task_id, "preview": preview}
+            pending_confirmations = list(preview.get("pending_confirmations") or [])
+            if pending_confirmations:
+                reason = (
+                    f"仍有 {len(pending_confirmations)} 组媒体需要人工确认；"
+                    "为保证本地文件事务完整，本次尚未移动任何文件"
+                )
+                db.update_local_media_task(
+                    task_id,
+                    owner=owner,
+                    status="requires_manual",
+                    snapshot_digest=str(preview.get("digest") or inspection.get("digest") or ""),
+                    error=reason,
+                    completed_at=None,
+                )
+                return {
+                    "status": "requires_manual",
+                    "task_id": task_id,
+                    "preview": preview,
+                    "reason": reason,
+                }
             for plan in preview["_move_plans"]:
                 db.add_local_media_task_item(
                     task_id, str(plan.source.path), str(plan.target), role=plan.role,
@@ -894,6 +1431,7 @@ class LocalMediaService:
             recognition_fields: dict[str, object] = {
                 "status": "planned",
                 "error": "",
+                "snapshot_digest": str(preview.get("digest") or inspection.get("digest") or ""),
                 "recognition_summary": serialize_recognition_summary(recognition),
             }
             resolved_media = recognition.get("media") if recognition.get("status") == "resolved" else None
@@ -1008,19 +1546,28 @@ class LocalMediaService:
     def create_manual_task(
         self, owner: str, inspection_id: str, *, tmdb_id: str = "", media_type: str = "",
         rules_snapshot: str = "", season_override: int | None = None,
-        episode_override: int | None = None,
+        episode_override: int | None = None, numbering_mode: str = "auto",
     ) -> int:
         inspection = self.inspections.get(owner, inspection_id)
+        normalized_numbering_mode = self._normalize_numbering_mode(numbering_mode)
         season_override, episode_override = self._normalize_position_overrides(
             inspection, season_override, episode_override,
         )
         normalized_type = str(media_type or "").strip().lower()
-        if normalized_type and normalized_type not in {"movie", "tv"}:
-            raise LocalMediaServiceError("媒体类型必须是 movie 或 tv")
+        if normalized_type not in {"", "auto", "movie", "tv"}:
+            raise LocalMediaServiceError("媒体类型必须是 auto、movie 或 tv")
         source = db.get_local_media_source(inspection.source_id, owner=owner)
-        effective_type = normalized_type or (source.media_type if source else "")
+        effective_type = (
+            normalized_type
+            if normalized_type in {"movie", "tv"}
+            else inspection.media_type or (source.media_type if source else "")
+        )
+        if effective_type not in {"movie", "tv"}:
+            raise LocalMediaServiceError("无法确定媒体类型，请先选择电影或剧集")
         if (season_override is not None or episode_override is not None) and effective_type != "tv":
             raise LocalMediaServiceError("只有剧集整理可以指定季数或集数")
+        if normalized_numbering_mode != "auto" and effective_type != "tv":
+            raise LocalMediaServiceError("只有剧集整理可以指定编号方式")
         normalized_snapshot = ""
         if rules_snapshot:
             normalized_snapshot = self._serialize_rules_snapshot(
@@ -1028,20 +1575,31 @@ class LocalMediaService:
             )
         return db.prepare_manual_local_media_task(
             inspection.source_id, str(inspection.selected_path), owner=owner,
-            tmdb_id=str(tmdb_id or "").strip(), media_type=normalized_type,
+            tmdb_id=str(tmdb_id or "").strip(), media_type=effective_type,
             rules_snapshot=normalized_snapshot, season_override=season_override,
             episode_override=episode_override,
+            numbering_mode=normalized_numbering_mode,
         )
 
     def execute_preview(self, owner: str, inspection_id: str, preview: dict[str, Any]) -> MoveTransactionResult:
         inspection = self.inspections.get(owner, inspection_id)
         if preview.get("status") != "planned" or not preview.get("_move_plans"):
             raise LocalMediaServiceError("预览尚未达到可执行状态")
+        if preview.get("pending_confirmations"):
+            raise LocalMediaServiceError("预览仍有媒体需要人工确认，尚未移动任何文件")
+        executable_plans = [
+            item for item in preview["_move_plans"] if item.action != "skip"
+        ]
+        if not executable_plans:
+            return MoveTransactionResult(
+                status="completed",
+                warnings=["按冲突策略保留现有文件，没有需要移动的项目"],
+            )
         targets = db.list_local_library_targets(inspection.source_id, owner=owner)
         transaction = LocalMoveTransaction(
             [inspection.root], [Path(item.path) for item in targets], owner=owner,
         )
-        return transaction.execute(preview["_move_plans"])
+        return transaction.execute(executable_plans)
 
 
 _service: LocalMediaService | None = None

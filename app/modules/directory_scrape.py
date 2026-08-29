@@ -729,6 +729,11 @@ class DirectoryScrapeService:
             if normalized_type == "auto"
             else normalized_type
         )
+        return self.query_external_hints(search_query, resolved_type)
+
+    @staticmethod
+    def query_external_hints(search_query: str, resolved_type: str) -> dict:
+        """查询共享外部识别线索；光鸭与本地只负责提供已校验的查询上下文。"""
         from app.modules.recognition_hints import enabled_hint_providers
 
         providers = list(enabled_hint_providers(resolved_type))

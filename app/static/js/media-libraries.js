@@ -10,6 +10,10 @@
         .replaceAll('&', '&amp;').replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
     const providerLabels = {jellyfin: 'Jellyfin', emby: 'Emby'};
+    const categoryLabels = {
+        default: '默认', movie: '电影', tv: '剧集', anime: '动漫',
+        documentary: '纪录片', variety: '综艺', concert: '演唱会', kids: '儿童节目',
+    };
     const state = {
         config: {},
         overview: null,
@@ -75,7 +79,7 @@
         const started = performance.now();
         const duration = 360;
         const frame = (now) => {
-            const progress = Math.min(1, (now - started) / duration);
+            const progress = Math.max(0, Math.min(1, (now - started) / duration));
             const eased = 1 - Math.pow(1 - progress, 3);
             node.textContent = Math.round(current + ((target - current) * eased)).toLocaleString();
             if (progress < 1) window.requestAnimationFrame(frame);
@@ -106,33 +110,36 @@
     }
 
     function serverFor(provider) {
-        return configuredServers().find((server) => server.server_type === provider) || null;
+        return (state.overview?.servers || []).find((server) => server.server_type === provider) || null;
+    }
+
+    function localSources() {
+        return Array.isArray(state.overview?.local_sources) ? state.overview.local_sources : [];
     }
 
     function libraryChoices() {
         return configuredServers().flatMap((server) => (server.libraries || []).map((library, index) => ({
-            key: `${server.server_type}:${index}`,
+            key: `${server.server_type}:${String(library.id || index)}`,
             provider: server.server_type,
             providerLabel: server.label || providerLabels[server.server_type] || server.server_type,
             libraryId: String(library.id || ''),
             libraryName: String(library.name || '未命名媒体库'),
+            collectionType: String(library.collection_type || '').trim().toLocaleLowerCase(),
             locations: (library.locations || []).map((item) => String(item || '').trim()).filter(Boolean),
         })));
-    }
-
-    function discoveredStrmDirectories() {
-        return (state.overview?.strm?.directories || []).filter((item) => {
-            return item?.kind !== 'root' && String(item?.local_path || '').trim();
-        });
     }
 
     function choiceForKey(key) {
         return libraryChoices().find((choice) => choice.key === key) || null;
     }
 
-    function inferLibraryChoice(provider, serverPath) {
+    function inferLibraryChoice(provider, serverPath, libraryId = '') {
         const choices = libraryChoices().filter((choice) => choice.provider === provider);
-        const exact = choices.filter((choice) => choice.locations.some((location) => pathKey(location) === pathKey(serverPath)));
+        const byId = libraryId && choices.find((choice) => choice.libraryId === String(libraryId));
+        if (byId) return byId;
+        const exact = choices.filter((choice) => choice.locations.some(
+            (location) => pathKey(location) === pathKey(serverPath),
+        ));
         if (exact.length === 1) return exact[0];
         const related = choices.filter((choice) => choice.locations.some(
             (location) => pathContains(serverPath, location) || pathContains(location, serverPath),
@@ -140,22 +147,85 @@
         return related.length === 1 ? related[0] : null;
     }
 
+    function inferLocalCategory(choice) {
+        if (!choice) return 'default';
+        const name = String(choice.libraryName || '').toLocaleLowerCase();
+        const type = String(choice.collectionType || '').toLocaleLowerCase();
+        const namedCategories = [
+            ['anime', /动漫|動畫|动画|anime|animation/iu],
+            ['documentary', /纪录|紀錄|documentary|documentaries|docs?/iu],
+            ['variety', /综艺|綜藝|variety|reality/iu],
+            ['concert', /演唱会|演唱會|音乐会|音樂會|concert|music[ _-]?videos?|live/iu],
+            ['kids', /儿童|兒童|少儿|少兒|幼儿|幼兒|kids?|children/iu],
+            ['movie', /电影|電影|影片|movies?|films?/iu],
+            ['tv', /剧集|劇集|电视剧|電視劇|节目|節目|tv|shows?|series/iu],
+        ];
+        const named = namedCategories.find(([, pattern]) => pattern.test(name));
+        if (named) return named[0];
+        if (type === 'movies') return 'movie';
+        if (type === 'tvshows') return 'tv';
+        if (type === 'musicvideos') return 'concert';
+        return 'default';
+    }
+
+    function availableLocalSourceIds(sourceIds = []) {
+        const available = new Set(localSources().map((source) => Number(source.id)));
+        return [...new Set(sourceIds.map(Number))].filter((sourceId) => available.has(sourceId));
+    }
+
+    function allLocalSourceIds() {
+        return localSources().map((source) => Number(source.id)).filter((sourceId) => sourceId > 0);
+    }
+
     function hydrateRows() {
         const rows = [];
-        for (const server of configuredServers()) {
+        for (const server of state.overview?.servers || []) {
             for (const mapping of server.mappings || []) {
                 const choice = inferLibraryChoice(server.server_type, mapping.server);
                 rows.push({
+                    kind: 'strm',
                     provider: server.server_type,
                     libraryKey: choice?.key || '',
                     libraryId: choice?.libraryId || '',
                     libraryName: choice?.libraryName || '',
                     local: String(mapping.local || ''),
                     server: String(mapping.server || ''),
+                    sourceIds: [],
+                    category: 'default',
                     legacy: !choice,
                 });
             }
         }
+
+        const groupedBindings = new Map();
+        for (const binding of state.overview?.local_bindings || []) {
+            const provider = String(binding.provider || '');
+            const choice = inferLibraryChoice(provider, binding.server_path, binding.library_id);
+            const row = {
+                kind: 'local',
+                provider,
+                libraryKey: choice?.key || '',
+                libraryId: choice?.libraryId || String(binding.library_id || ''),
+                libraryName: choice?.libraryName || String(binding.library_name || ''),
+                local: String(binding.local_path || ''),
+                server: String(binding.server_path || ''),
+                sourceIds: [Number(binding.source_id || 0)],
+                category: String(binding.category || 'default'),
+                legacy: Boolean(provider && !choice),
+            };
+            const signature = JSON.stringify([
+                row.provider, row.libraryId, row.libraryName, row.local,
+                row.server, row.category, row.libraryKey, row.legacy,
+            ]);
+            const existing = groupedBindings.get(signature);
+            if (existing) {
+                existing.sourceIds = availableLocalSourceIds([...existing.sourceIds, ...row.sourceIds]);
+            } else {
+                row.sourceIds = availableLocalSourceIds(row.sourceIds);
+                groupedBindings.set(signature, row);
+            }
+        }
+        rows.push(...groupedBindings.values());
         state.rows = rows;
         state.dirty = false;
     }
@@ -163,11 +233,12 @@
     function renderSummary() {
         const summary = state.overview?.summary || {};
         const servers = state.overview?.servers || [];
-        const directories = discoveredStrmDirectories();
+        const strmCount = Number(summary.path_mappings || 0);
+        const localCount = Number(summary.local_bindings || 0);
         animateCount('mlServerCount', summary.configured_servers);
         animateCount('mlLibraryCount', summary.libraries);
-        animateCount('mlMappingCount', summary.path_mappings);
-        animateCount('mlBindingCount', directories.length);
+        animateCount('mlMappingCount', summary.total_mappings ?? (strmCount + localCount));
+        animateCount('mlBindingCount', localCount);
 
         const serverFoot = $('#mlServerSummary');
         if (serverFoot) {
@@ -184,104 +255,107 @@
         }
 
         const mappingFoot = $('#mlMappingSummary');
-        if (mappingFoot) mappingFoot.textContent = `${Number(summary.path_mappings || 0)} 条规则已配置`;
+        if (mappingFoot) mappingFoot.textContent = `${strmCount} 条 STRM · ${localCount} 条本地`;
 
         const bindingFoot = $('#mlBindingSummary');
         if (bindingFoot) {
-            const outputRoot = String(state.overview?.strm?.output_root || '');
-            bindingFoot.textContent = outputRoot || '尚未配置 STRM 输出目录';
-            bindingFoot.title = outputRoot;
+            const sourceCount = Number(summary.local_sources ?? localSources().length);
+            bindingFoot.textContent = sourceCount
+                ? `${sourceCount} 个本地来源已接入`
+                : '尚未配置本地媒体来源';
+            bindingFoot.title = bindingFoot.textContent;
         }
-    }
-
-    function libraryOptions(row, rowIndex) {
-        const options = libraryChoices().map((choice) => `
-            <option value="${esc(choice.key)}" ${choice.key === row.libraryKey ? 'selected' : ''}>
-                ${esc(choice.providerLabel)} · ${esc(choice.libraryName)}
-            </option>`).join('');
-        const legacy = row.legacy && !row.libraryKey
-            ? `<option value="legacy:${rowIndex}" selected>${esc(providerLabels[row.provider] || row.provider)} · 现有映射</option>`
-            : '';
-        return `<option value="" ${!row.libraryKey && !row.legacy ? 'selected' : ''}>请选择媒体库</option>${legacy}${options}`;
     }
 
     function rowLocked(row) {
+        if (row.kind !== 'strm') return false;
         const server = serverFor(row.provider);
-        return Boolean(server?.mapping_key && managedFields().has(server.mapping_key));
+        return Boolean(server && managedFields().has(server.mapping_key));
+    }
+
+    function libraryOptions(row) {
+        const options = ['<option value="">请选择媒体库</option>'];
+        if (row.legacy && row.provider) {
+            const label = `${providerLabels[row.provider] || row.provider} · ${row.libraryName || row.server || '已有映射'}`;
+            options.push(`<option value="__legacy__" selected>${esc(label)}</option>`);
+        }
+        for (const choice of libraryChoices()) {
+            const selected = choice.key === row.libraryKey ? ' selected' : '';
+            options.push(`<option value="${esc(choice.key)}"${selected}>${esc(choice.providerLabel)} · ${esc(choice.libraryName)}</option>`);
+        }
+        return options.join('');
     }
 
     function mappingRow(row, index) {
-        const choice = choiceForKey(row.libraryKey);
-        const locations = choice?.locations || (row.server ? [row.server] : []);
-        const datalistId = `mlServerLocations-${index}`;
         const locked = rowLocked(row);
-        return `<div class="ml-library-mapping-row${locked ? ' is-locked' : ''}" data-mapping-row="${index}">
-            <label class="ml-mapping-field ml-library-field">
-                <span class="ml-field-label">媒体库</span>
-                <select class="form-select" data-mapping-library ${locked ? 'disabled' : ''}>${libraryOptions(row, index)}</select>
-            </label>
-            <div class="ml-mapping-source" aria-label="来源类型 STRM">
-                <span class="ml-field-label">来源</span>
-                <span class="ml-source-value"><i data-lucide="file-video-2"></i><span>STRM</span></span>
-            </div>
-            <label class="ml-mapping-field ml-strm-field">
-                <span class="ml-field-label">STRM 目录</span>
-                <span class="ml-strm-control">
-                    <input class="form-input ml-strm-path" data-mapping-strm-path value="${esc(row.local)}" placeholder="点击文件夹选择真实 STRM 目录" readonly>
-                    <button class="jump-btn ml-strm-picker-btn" type="button" data-pick-strm title="浏览 STRM 目录" aria-label="浏览 STRM 目录" ${locked ? 'disabled' : ''}><i data-lucide="folder-open"></i></button>
-                </span>
-            </label>
-            <label class="ml-mapping-field ml-server-path-field">
-                <span class="ml-field-label">服务器路径</span>
-                <input class="form-input" data-mapping-server value="${esc(row.server)}" list="${datalistId}" placeholder="媒体服务器可见路径" ${locked ? 'disabled' : ''}>
-                <datalist id="${datalistId}">${locations.map((location) => `<option value="${esc(location)}"></option>`).join('')}</datalist>
-            </label>
-            <span class="ml-mapping-actions">
-                <button class="jump-btn" type="button" data-test-mapping title="测试媒体库映射" aria-label="测试媒体库映射" ${locked ? 'disabled' : ''}><i data-lucide="scan-search"></i></button>
-                <button class="jump-btn danger" type="button" data-remove-mapping title="删除媒体库映射" aria-label="删除媒体库映射" ${locked ? 'disabled' : ''}><i data-lucide="trash-2"></i></button>
-            </span>
-            <span class="ml-mapping-result" data-mapping-result aria-live="polite"></span>
-            ${locked ? '<span class="ml-managed-note">此映射由部署环境管理</span>' : ''}
-        </div>`;
+        const isLocal = row.kind === 'local';
+        return `
+            <article class="ml-library-mapping-row${locked ? ' is-locked' : ''}" data-mapping-row="${index}">
+                <label class="ml-mapping-field ml-library-field">
+                    <span class="ml-field-label">媒体库</span>
+                    <select class="form-select" data-mapping-library ${locked ? 'disabled' : ''}>${libraryOptions(row)}</select>
+                </label>
+                <div class="ml-mapping-field ml-mapping-source">
+                    <span class="ml-field-label">来源</span>
+                    <div class="ml-source-control">
+                        <button class="ml-source-toggle${isLocal ? ' is-local' : ''}" type="button" data-toggle-mapping-source
+                            aria-label="当前来源为${isLocal ? `本地，自动归档为${categoryLabels[row.category] || '默认分类'}` : 'STRM'}，点击切换"
+                            title="${isLocal ? `自动归档为${categoryLabels[row.category] || '默认分类'}；` : ''}点击切换为${isLocal ? 'STRM' : '本地'}" ${locked ? 'disabled' : ''}>
+                            <i data-lucide="${isLocal ? 'hard-drive' : 'file-symlink'}"></i><span>${isLocal ? '本地' : 'STRM'}</span>
+                        </button>
+                    </div>
+                </div>
+                <label class="ml-mapping-field ml-directory-field">
+                    <span class="ml-field-label">${isLocal ? '本地归档目录' : 'STRM 目录'}</span>
+                    <span class="ml-directory-control">
+                        <input class="form-input ml-directory-path" data-mapping-local-path value="${esc(row.local)}" readonly
+                            placeholder="${isLocal ? '点击文件夹选择本地归档目录' : '点击文件夹选择真实 STRM 目录'}" title="${esc(row.local)}">
+                        <button class="jump-btn ml-directory-picker-btn" type="button" data-pick-directory
+                            aria-label="选择${isLocal ? '本地归档' : 'STRM'}目录" title="选择${isLocal ? '本地归档' : 'STRM'}目录" ${locked ? 'disabled' : ''}>
+                            <i data-lucide="folder-open"></i>
+                        </button>
+                    </span>
+                </label>
+                <label class="ml-mapping-field ml-server-path-field">
+                    <span class="ml-field-label">服务器路径</span>
+                    <input class="form-input" data-mapping-server value="${esc(row.server)}"
+                        placeholder="${row.provider ? '媒体服务器实际可见路径' : '请先选择媒体库'}"
+                        ${locked || !row.provider ? 'disabled' : ''}>
+                </label>
+                <div class="ml-mapping-actions">
+                    <button class="jump-btn" type="button" data-test-mapping aria-label="测试路径映射" title="测试路径映射"
+                        ${locked || !row.provider ? 'disabled' : ''}><i data-lucide="scan-line"></i></button>
+                    <button class="jump-btn danger" type="button" data-remove-mapping aria-label="删除映射" title="删除映射"
+                        ${locked ? 'disabled' : ''}><i data-lucide="trash-2"></i></button>
+                </div>
+                <div class="ml-mapping-result" data-mapping-result></div>
+                ${locked ? '<div class="ml-managed-note">该 STRM 映射由部署环境管理，本页仅展示。</div>' : ''}
+            </article>`;
+    }
+
+    function canAddMapping() {
+        if (!state.initialized) return false;
+        const hasLocal = localSources().length > 0;
+        const hasWritableStrm = Boolean(state.overview?.strm?.output_root)
+            && configuredServers().some((server) => !managedFields().has(server.mapping_key));
+        return hasLocal || hasWritableStrm;
     }
 
     function updateActions() {
-        const choices = libraryChoices();
-        const hasStrmRoot = Boolean(String(state.overview?.strm?.output_root || '').trim());
-        const writableProviders = configuredServers().filter((server) => !managedFields().has(server.mapping_key));
-        const add = $('[data-add-library-mapping]');
-        if (add) {
-            add.disabled = !state.initialized || !choices.length || !hasStrmRoot || !writableProviders.length;
-            add.title = !configuredServers().length
-                ? '请先在设置中配置并启用媒体服务器'
-                : !choices.length ? '当前服务器尚未返回媒体库'
-                    : !hasStrmRoot ? '请先配置 STRM 本地根目录'
-                        : !writableProviders.length ? '媒体库映射由部署环境管理' : '';
-        }
-        const save = $('[data-save-mappings]');
-        if (save) {
-            save.disabled = !state.initialized || !state.dirty || !writableProviders.length;
-        }
+        const addButton = $('[data-add-library-mapping]');
+        const saveButton = $('[data-save-mappings]');
+        if (addButton) addButton.disabled = !canAddMapping();
+        if (saveButton) saveButton.disabled = !state.initialized || !state.dirty;
     }
 
     function renderRows() {
         const list = $('#mlMappingList');
         if (!list) return;
-        const servers = configuredServers();
-        const choices = libraryChoices();
-        const hasStrmRoot = Boolean(String(state.overview?.strm?.output_root || '').trim());
-        const mappingErrors = servers.map((server) => server.mapping_error).filter(Boolean);
-
-        if (mappingErrors.length) {
-            list.innerHTML = `<div class="ml-empty-row is-error">当前路径映射配置无效：${esc(mappingErrors.join('；'))}</div>`;
-        } else if (!servers.length) {
-            list.innerHTML = '<div class="ml-empty-state"><div class="ml-empty-icon"><i data-lucide="server-cog"></i></div><strong>尚未配置媒体服务器</strong><p>请先在设置中启用并填写 Jellyfin 或 Emby，媒体库会自动出现在这里。</p></div>';
-        } else if (!choices.length) {
-            list.innerHTML = '<div class="ml-empty-state"><div class="ml-empty-icon"><i data-lucide="library"></i></div><strong>未读取到媒体库</strong><p>请检查媒体服务器连接；连接正常后，本页会直接跟随服务器中的媒体库。</p></div>';
-        } else if (!hasStrmRoot) {
-            list.innerHTML = '<div class="ml-empty-state"><div class="ml-empty-icon"><i data-lucide="folder-search-2"></i></div><strong>尚未配置 STRM 根目录</strong><p>请先配置 STRM 本地根目录，再从真实输出目录中选择媒体库路径。</p></div>';
-        } else if (!state.rows.length) {
-            list.innerHTML = '<div class="ml-empty-state"><div class="ml-empty-icon"><i data-lucide="folder-symlink"></i></div><strong>尚未添加媒体库映射</strong><p>点击右上角“添加媒体库”，选择媒体库、STRM 目录和服务器可见路径。</p></div>';
+        if (!state.rows.length) {
+            const hasSource = Boolean(state.overview?.strm?.output_root) || localSources().length > 0;
+            list.innerHTML = hasSource
+                ? '<div class="ml-empty-state"><div class="ml-empty-icon"><i data-lucide="route"></i></div><strong>还没有路径映射</strong><p>点击右上角“添加映射”，选择 STRM 或本地来源，再设置目录与媒体服务器路径。</p></div>'
+                : '<div class="ml-empty-state"><div class="ml-empty-icon"><i data-lucide="folder-x"></i></div><strong>没有可用来源目录</strong><p>请先完成一次 STRM 同步，或在“本地整理”中新增媒体来源。</p></div>';
         } else {
             list.innerHTML = state.rows.map(mappingRow).join('');
         }
@@ -332,14 +406,24 @@
         const row = state.rows[index];
         if (!row) return null;
         const selectedKey = $('[data-mapping-library]', rowElement)?.value || '';
-        const choice = choiceForKey(selectedKey);
-        if (choice) {
-            row.libraryKey = choice.key;
-            row.libraryId = choice.libraryId;
-            row.libraryName = choice.libraryName;
-            row.provider = choice.provider;
+        if (!selectedKey) {
+            row.provider = '';
+            row.libraryKey = '';
+            row.libraryId = '';
+            row.libraryName = '';
+            row.server = '';
             row.legacy = false;
+        } else {
+            const choice = choiceForKey(selectedKey);
+            if (choice) {
+                row.libraryKey = choice.key;
+                row.libraryId = choice.libraryId;
+                row.libraryName = choice.libraryName;
+                row.provider = choice.provider;
+                row.legacy = false;
+            }
         }
+        row.local = $('[data-mapping-local-path]', rowElement)?.value.trim() || row.local || '';
         row.server = $('[data-mapping-server]', rowElement)?.value.trim() || '';
         return row;
     }
@@ -351,69 +435,86 @@
         result.textContent = '';
     }
 
-    function openStrmDirectoryPicker(rowElement) {
+    function openMappingDirectoryPicker(rowElement) {
         const index = Number(rowElement.dataset.mappingRow);
         const row = state.rows[index];
-        const outputRoot = String(state.overview?.strm?.output_root || '').trim();
-        if (!row || !outputRoot) {
-            window.showToast?.('尚未配置可浏览的 STRM 输出目录', 'warning', 4200);
-            return;
-        }
+        if (!row) return;
         if (typeof window.openGuangYaDirectoryPicker !== 'function') {
             window.showToast?.('目录选择器尚未加载，请刷新页面后重试', 'error', 4200);
             return;
         }
 
+        const isLocal = row.kind === 'local';
+        const outputRoot = String(state.overview?.strm?.output_root || '').trim();
+        if (!isLocal && !outputRoot) {
+            window.showToast?.('尚未配置可浏览的 STRM 输出目录', 'warning', 4200);
+            return;
+        }
+        const rootId = isLocal ? '__roots__' : outputRoot;
         window.openGuangYaDirectoryPicker({
-            modalId: 'mediaLibraryStrmDirModal',
-            title: '选择 STRM 目录',
-            rootId: outputRoot,
-            rootName: 'STRM 输出',
+            modalId: isLocal ? 'mediaLibraryLocalDirModal' : 'mediaLibraryStrmDirModal',
+            title: isLocal ? '选择本地归档目录' : '选择 STRM 目录',
+            rootId,
+            rootName: isLocal ? '容器目录' : 'STRM 输出',
             allowRoot: true,
             fetchDirectory: async (path) => {
-                const query = new URLSearchParams({path: String(path || outputRoot)});
-                const data = await api(`/api/media-libraries/strm-directories?${query}`);
+                const requested = String(path || rootId);
+                const query = new URLSearchParams({path: requested});
+                const endpoint = isLocal
+                    ? '/api/media-libraries/local-directories'
+                    : '/api/media-libraries/strm-directories';
+                const data = await api(`${endpoint}?${query}`);
                 return Array.isArray(data.directories) ? data.directories : [];
             },
             onSelect: (selected) => {
                 const localPath = String(selected?.id || '').trim();
-                if (!localPath) return false;
+                if (!localPath || localPath === '__roots__') return false;
                 row.local = localPath;
                 state.dirty = true;
                 renderRows();
                 const renderedRow = $(`[data-mapping-row="${index}"]`, $('#mlMappingList'));
-                $('[data-pick-strm]', renderedRow)?.focus();
+                $('[data-pick-directory]', renderedRow)?.focus();
                 return true;
             },
         });
     }
 
+    function applyChoiceToRow(row, choice, {replaceServer = true} = {}) {
+        if (!choice) return;
+        row.provider = choice.provider;
+        row.libraryKey = choice.key;
+        row.libraryId = choice.libraryId;
+        row.libraryName = choice.libraryName;
+        row.legacy = false;
+        if (row.kind === 'local') row.category = inferLocalCategory(choice);
+        if (replaceServer) row.server = String(choice.locations[0] || '');
+    }
+
     function addLibraryMapping() {
-        const writableChoices = libraryChoices().filter((choice) => {
+        const choices = libraryChoices();
+        const writableChoices = choices.filter((choice) => {
             const server = serverFor(choice.provider);
             return server && !managedFields().has(server.mapping_key);
         });
-        const mappedLibraries = new Set(state.rows.map((row) => `${row.provider}:${row.libraryId}`));
-        const choice = writableChoices.find(
-            (item) => !mappedLibraries.has(`${item.provider}:${item.libraryId}`),
-        ) || writableChoices[0];
-        if (!choice) {
-            window.showToast?.('没有可添加的媒体库', 'warning', 4200);
+        const hasStrm = Boolean(state.overview?.strm?.output_root) && writableChoices.length > 0;
+        const source = localSources()[0];
+        const choice = writableChoices[0] || choices[0] || null;
+        if (!hasStrm && !source) {
+            window.showToast?.('没有可添加的来源目录', 'warning', 4200);
             return;
         }
-        state.rows.push({
-            provider: choice.provider,
-            libraryKey: choice.key,
-            libraryId: choice.libraryId,
-            libraryName: choice.libraryName,
-            local: '',
-            server: String(choice.locations[0] || ''),
-            legacy: false,
-        });
+        const row = {
+            kind: hasStrm ? 'strm' : 'local',
+            provider: '', libraryKey: '', libraryId: '', libraryName: '',
+            local: '', server: '', sourceIds: source ? allLocalSourceIds() : [],
+            category: 'default', legacy: false,
+        };
+        if (choice) applyChoiceToRow(row, choice);
+        state.rows.push(row);
         state.dirty = true;
         renderRows();
         const rows = $$('[data-mapping-row]', $('#mlMappingList'));
-        $('[data-pick-strm]', rows.at(-1))?.focus();
+        $('[data-pick-directory]', rows.at(-1))?.focus();
     }
 
     async function testMapping(rowElement, button) {
@@ -421,7 +522,7 @@
         const resultNode = $('[data-mapping-result]', rowElement);
         if (!row?.provider || !row.local || !row.server) {
             resultNode.className = 'ml-mapping-result is-error';
-            resultNode.textContent = '请选择媒体库、STRM 目录并填写服务器路径';
+            resultNode.textContent = '请选择媒体库、来源目录并填写服务器路径';
             return;
         }
         setBusy(button, true, '');
@@ -437,7 +538,9 @@
                     sample_path: row.local,
                 }),
             });
-            const selectedMatch = !row.libraryId || result.matches.some((item) => String(item.id || '') === row.libraryId);
+            const selectedMatch = !row.libraryId || result.matches.some(
+                (item) => String(item.id || '') === row.libraryId,
+            );
             const names = result.matches.map((item) => item.name).filter(Boolean);
             if ((result.status === 'matched' || result.status === 'covered') && selectedMatch) {
                 resultNode.className = 'ml-mapping-result is-success';
@@ -457,52 +560,86 @@
         }
     }
 
+    function showRowError(rowElements, index, message) {
+        const result = $('[data-mapping-result]', rowElements[index]);
+        if (!result) return false;
+        result.className = 'ml-mapping-result is-error';
+        result.textContent = message;
+        rowElements[index].scrollIntoView({behavior: 'smooth', block: 'nearest'});
+        return false;
+    }
+
     async function saveMappings(button) {
         const rowElements = $$('[data-mapping-row]', $('#mlMappingList'));
         rowElements.forEach(syncRow);
-        const seen = new Set();
+        const seenStrm = new Set();
+        const seenLocal = new Set();
         for (const [index, row] of state.rows.entries()) {
-            const element = rowElements[index];
-            const result = $('[data-mapping-result]', element);
-            if (!row.provider || !row.local || !row.server) {
-                result.className = 'ml-mapping-result is-error';
-                result.textContent = '请选择媒体库、STRM 目录并填写服务器路径';
-                return;
+            if (rowLocked(row)) continue;
+            if (row.kind === 'strm') {
+                if (!row.provider || !row.local || !row.server) {
+                    showRowError(rowElements, index, 'STRM 映射需要选择媒体库、STRM 目录和服务器路径');
+                    return;
+                }
+                const key = `${row.provider}:${pathKey(row.local)}`;
+                if (seenStrm.has(key)) {
+                    showRowError(rowElements, index, '同一服务器不能重复映射相同 STRM 目录');
+                    return;
+                }
+                seenStrm.add(key);
+            } else {
+                row.sourceIds = availableLocalSourceIds(row.sourceIds);
+                if (!row.sourceIds.length || !categoryLabels[row.category] || !row.local) {
+                    showRowError(rowElements, index, '本地映射需要可用的本地来源和本地归档目录');
+                    return;
+                }
+                if (!row.provider || !row.libraryName || !row.server) {
+                    showRowError(rowElements, index, '本地映射需要选择媒体库并填写服务器路径');
+                    return;
+                }
+                for (const sourceId of row.sourceIds) {
+                    const key = `${sourceId}:${row.category}`;
+                    if (seenLocal.has(key)) {
+                        showRowError(rowElements, index, '同一归档分类只能为每个本地来源配置一次');
+                        return;
+                    }
+                    seenLocal.add(key);
+                }
             }
-            const key = `${row.provider}:${pathKey(row.local)}`;
-            if (seen.has(key)) {
-                result.className = 'ml-mapping-result is-error';
-                result.textContent = '同一服务器不能重复映射相同 STRM 目录';
-                return;
-            }
-            seen.add(key);
         }
 
-        const managed = managedFields();
-        const payload = {};
-        for (const server of configuredServers()) {
-            if (managed.has(server.mapping_key)) continue;
-            payload[server.mapping_key] = JSON.stringify(
-                state.rows
-                    .filter((row) => row.provider === server.server_type)
-                    .map((row) => ({local: row.local, server: row.server})),
-            );
+        const strmMappings = {};
+        for (const server of state.overview?.servers || []) {
+            if (managedFields().has(server.mapping_key)) continue;
+            strmMappings[server.server_type] = state.rows
+                .filter((row) => row.kind === 'strm' && row.provider === server.server_type)
+                .map((row) => ({local: row.local, server: row.server}));
         }
-        if (!Object.keys(payload).length) {
-            window.showToast?.('媒体库映射由部署环境管理', 'warning', 3600);
-            return;
-        }
+        const localBindings = state.rows
+            .filter((row) => row.kind === 'local')
+            .flatMap((row) => availableLocalSourceIds(row.sourceIds).map((sourceId) => ({
+                source_id: sourceId,
+                category: row.category,
+                local_path: row.local,
+                provider: row.provider,
+                library_id: row.libraryId,
+                library_name: row.libraryName,
+                server_path: row.server,
+            })));
 
         setBusy(button, true, '保存中');
         try {
-            await api('/api/config', {method: 'POST', body: JSON.stringify(payload)});
+            await api('/api/media-libraries/mappings', {
+                method: 'POST',
+                body: JSON.stringify({strm_mappings: strmMappings, local_bindings: localBindings}),
+            });
             state.dirty = false;
-            window.showToast?.('媒体库路径映射已保存', 'success');
+            window.showToast?.('媒体库与路径映射已保存', 'success');
             await loadAll({reloadRows: true});
         } catch (error) {
             window.showToast?.(error.message, 'error', 4200);
         } finally {
-            setBusy(button, false, '保存媒体库映射');
+            setBusy(button, false, '保存映射');
             updateActions();
         }
     }
@@ -515,9 +652,34 @@
         const rowElement = event.target.closest('[data-mapping-row]');
         if (!rowElement) return;
         const index = Number(rowElement.dataset.mappingRow);
-        const pickerButton = event.target.closest('[data-pick-strm]');
-        if (pickerButton) {
-            openStrmDirectoryPicker(rowElement);
+        if (event.target.closest('[data-toggle-mapping-source]')) {
+            const row = state.rows[index];
+            if (!row) return;
+            if (row.kind === 'strm') {
+                const source = localSources()[0];
+                if (!source) {
+                    window.showToast?.('请先在“本地整理”中新增媒体来源', 'warning', 4200);
+                    return;
+                }
+                row.kind = 'local';
+                row.sourceIds = allLocalSourceIds();
+                row.category = inferLocalCategory(choiceForKey(row.libraryKey));
+            } else {
+                row.kind = 'strm';
+                row.sourceIds = [];
+                row.category = 'default';
+                if (!row.provider) applyChoiceToRow(row, libraryChoices()[0]);
+            }
+            row.local = '';
+            row.legacy = false;
+            state.dirty = true;
+            renderRows();
+            const renderedRow = $(`[data-mapping-row="${index}"]`, $('#mlMappingList'));
+            $('[data-toggle-mapping-source]', renderedRow)?.focus();
+            return;
+        }
+        if (event.target.closest('[data-pick-directory]')) {
+            openMappingDirectoryPicker(rowElement);
             return;
         }
         const testButton = event.target.closest('[data-test-mapping]');
@@ -539,18 +701,27 @@
         const row = state.rows[index];
         if (!row) return;
 
+
+
         if (event.target.matches('[data-mapping-library]')) {
             const oldChoice = choiceForKey(row.libraryKey);
             const oldLocations = oldChoice?.locations || [];
-            const choice = choiceForKey(event.target.value);
-            if (choice) {
-                const shouldReplaceServer = !row.server || oldLocations.some((location) => pathKey(location) === pathKey(row.server));
-                row.provider = choice.provider;
-                row.libraryKey = choice.key;
-                row.libraryId = choice.libraryId;
-                row.libraryName = choice.libraryName;
+            const selectedKey = event.target.value;
+            if (!selectedKey) {
+                row.provider = '';
+                row.libraryKey = '';
+                row.libraryId = '';
+                row.libraryName = '';
+                row.server = '';
                 row.legacy = false;
-                if (shouldReplaceServer) row.server = choice.locations[0] || '';
+            } else {
+                const choice = choiceForKey(selectedKey);
+                if (choice) {
+                    const replaceServer = !row.server || oldLocations.some(
+                        (location) => pathKey(location) === pathKey(row.server),
+                    );
+                    applyChoiceToRow(row, choice, {replaceServer});
+                }
             }
             state.dirty = true;
             renderRows();

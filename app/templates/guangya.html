@@ -2,7 +2,7 @@
 {% block title %}光鸭云盘 - MediaFlux{% endblock %}
 {% block page_title %}光鸭云盘{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/guangya-directory-scrape.css') }}?v=20260821a">
+<link rel="stylesheet" href="{{ url_for('static', path='css/guangya-directory-scrape.css') }}?v=20260828c">
 {% endblock %}
 
 {% block content %}
@@ -127,7 +127,7 @@
 </div>
 
 {% set media_scrape = {
-    "source": "guangya", "css": "gy-scrape", "card": true,
+    "source": "guangya", "css": "gy-scrape", "card": true, "mobile_tabs": true,
     "modal_id": "gyScrapeModal", "title_id": "", "title": "手动刮削",
     "path_id": "gyScrapeDirectory", "path_placeholder": "等待目录检查",
     "close_id": "gyScrapeCloseBtn", "query_id": "gyScrapeQuery",
@@ -154,8 +154,8 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260821a"></script>
-<script src="{{ url_for('static', path='js/guangya-directory-scrape.js') }}?v=20260821a"></script>
+<script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260828a"></script>
+<script src="{{ url_for('static', path='js/guangya-directory-scrape.js') }}?v=20260828c"></script>
 <script>
 function gyApi(path, opts){
     return fetch('/api/guangya'+path, opts).then(async response=>{
