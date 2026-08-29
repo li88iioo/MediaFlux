@@ -452,12 +452,10 @@ class MediaCardTests(unittest.TestCase):
 
         sent = []
         stats = {
-            "directories": {
-                "批次": {
-                    "total": 2, "moved": 1, "metadata_moved": 0,
-                    "skipped": 1, "need_confirm": 0, "failed": 0,
-                },
-            },
+            "directories": {"批次": {
+                "total": 2, "moved": 1, "metadata_moved": 0,
+                "skipped": 1, "need_confirm": 0, "failed": 0,
+            }},
             "media_items": [{
                 "directory": "批次", "title": "测试剧", "year": "2026",
                 "media_type": "tv", "tmdb_id": "100", "season": 1,
@@ -466,19 +464,22 @@ class MediaCardTests(unittest.TestCase):
                 "category": "动漫",
             }],
         }
-
-        with patch("app.notifier.send_event", side_effect=lambda event, chat_id=None: sent.append(event) or True):
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: sent.append(event) or True,
+        ):
             Organizer.notify_directory_results(stats, OrganizeRules(), source_name="下载")
 
-        media = next(event for event in sent if "剧集入库" in str(event.title))
-        rendered = notifier.render_event(media)
-        self.assertNotIn("<b>🧩 缺集：</b>", rendered)
-        self.assertIn("暂不生成最终缺集结论", rendered)
+        self.assertEqual(len(sent), 1)
+        rendered = notifier.render_event(sent[0])
+        self.assertIn("光鸭整理部分完成", rendered)
+        self.assertNotIn("缺集", rendered)
+        self.assertIn("跳过 1", rendered)
 
     def test_scan_incomplete_task_does_not_claim_final_missing_episodes(self):
         from app.modules.organize import Organizer, OrganizeRules
 
-        sent_text = []
+        sent = []
         stats = {
             "total": 1, "moved": 1, "metadata_moved": 0,
             "need_confirm": 0, "skipped": 0, "failed": 0,
@@ -491,17 +492,19 @@ class MediaCardTests(unittest.TestCase):
                 "source": "光鸭云盘", "category": "动漫",
             }],
         }
-
         with patch(
-            "app.modules.organize_notification_outbox.deliver_organize_notification",
-            side_effect=lambda key, text, chat_id="": sent_text.append(text) or True,
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: sent.append(event) or True,
         ):
-            Organizer.notify_task_results(stats, OrganizeRules(), source_name="1 个源目录")
+            self.assertTrue(Organizer.notify_task_results(
+                stats, OrganizeRules(), source_name="1 个源目录", chat_id="100",
+            ))
 
-        rendered = "\n".join(sent_text)
+        rendered = notifier.render_event(sent[0])
         self.assertIn("光鸭整理部分完成", rendered)
-        self.assertNotIn("<b>🧩 缺集：</b>", rendered)
+        self.assertNotIn("缺集：", rendered)
         self.assertIn("目录扫描未完整结束", rendered)
+        self.assertIn("不是最终缺集结论", rendered)
 
     def test_media_card_without_identification_data_falls_back_to_stats(self):
         """若业务数据不足时卡片为空或报错，而非结构化统计，本测试必须失败。"""
@@ -540,8 +543,7 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
         notifier.reset()
 
     def test_organize_directory_prefers_media_cards_and_falls_back_to_stats(self):
-        """若整理结果仍直接拼 HTML 或识别数据不足时不回退，本测试必须失败。"""
-        from unittest.mock import patch
+        """目录结果应聚合为一条事务消息，保留媒体与异常总数。"""
         from app.modules.organize import Organizer, OrganizeRules
 
         sent = []
@@ -551,103 +553,88 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
                 "未知目录<&>": {"total": 2, "moved": 0, "metadata_moved": 0, "skipped": 1, "failed": 1},
             },
             "media_items": [{
-                "directory": "电影目录",
-                "title": "流浪地球2",
-                "year": "2023",
-                "media_type": "movie",
-                "tmdb_id": "533535",
-                "source": "光鸭云盘",
-                "category": "电影/国产",
-                "filename": "demo.2160p.BluRay.mkv",
+                "directory": "电影目录", "title": "流浪地球2", "year": "2023",
+                "media_type": "movie", "tmdb_id": "533535", "source": "光鸭云盘",
+                "category": "电影/国产", "filename": "demo.2160p.BluRay.mkv",
                 "size": 1024 ** 3,
             }],
         }
-        self.assertTrue(hasattr(notifier, "send_event"))
-        with patch("app.notifier.send_event", side_effect=lambda event, chat_id=None: sent.append(event) or True):
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: sent.append(event) or True,
+        ):
             Organizer.notify_directory_results(stats, OrganizeRules(), source_name="来源<&>")
 
-        self.assertEqual(len(sent), 2)
-        rendered = [notifier.render_event(event) for event in sent]
-        self.assertTrue(any("新片入库" in text for text in rendered))
-        fallback = next(text for text in rendered if "整理目录部分完成" in text)
-        self.assertIn("未知目录&lt;&amp;&gt;", fallback)
-        self.assertNotIn("未知目录<&>", fallback)
+        self.assertEqual(len(sent), 1)
+        rendered = notifier.render_event(sent[0])
+        self.assertIn("流浪地球2", rendered)
+        self.assertIn("视频 3", rendered)
+        self.assertIn("入库 1", rendered)
+        self.assertIn("跳过 1", rendered)
+        self.assertIn("失败 1", rendered)
+        self.assertIn("来源&lt;&amp;&gt;", rendered)
 
     def test_unidentified_directory_media_uses_real_stats_fallback(self):
-        """若无有效识别信息时没有真正发送统计卡片，本测试必须失败。"""
-        from unittest.mock import patch
         from app.modules.organize import Organizer, OrganizeRules
 
         sent = []
         stats = {
-            "directories": {
-                "待确认": {
-                    "total": 2, "moved": 0, "metadata_moved": 0,
-                    "skipped": 1, "need_confirm": 1, "failed": 0,
-                },
-            },
+            "directories": {"待确认": {
+                "total": 2, "moved": 0, "metadata_moved": 0,
+                "skipped": 1, "need_confirm": 1, "failed": 0,
+            }},
             "media_items": [{
-                "directory": "待确认",
-                "title": "",
-                "tmdb_id": "",
-                "media_type": "movie",
-                "filename": "unknown.mkv",
-                "size": 123,
+                "directory": "待确认", "title": "", "tmdb_id": "",
+                "media_type": "movie", "filename": "unknown.mkv", "size": 123,
             }],
         }
-        with patch("app.notifier.send_event", side_effect=lambda event, chat_id=None: sent.append(event) or True):
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: sent.append(event) or True,
+        ):
             Organizer.notify_directory_results(stats, OrganizeRules(), source_name="下载")
 
         self.assertEqual(len(sent), 1)
         rendered = notifier.render_event(sent[0])
-        self.assertIn("整理目录部分完成", rendered)
-        self.assertIn(
-            "<b>处理结果</b>  视频 2 个 · 需要确认 1 个 · 跳过 1 个",
-            rendered,
-        )
-        self.assertNotIn("新片入库", rendered)
+        self.assertIn("光鸭整理部分完成", rendered)
+        self.assertIn("视频 2", rendered)
+        self.assertIn("待确认 1", rendered)
+        self.assertIn("跳过 1", rendered)
+        self.assertIn("暂无可用 TMDB 候选", rendered)
 
     def test_partial_directory_sends_media_card_and_warning_stats(self):
-        """若部分成功目录只发送成功卡片，失败和待确认会被隐藏。"""
-        from unittest.mock import patch
+        """部分完成也只能发一条消息，成功媒体与异常统计均不能丢。"""
         from app.modules.organize import Organizer, OrganizeRules
 
         sent = []
         stats = {
-            "directories": {
-                "混合目录": {
-                    "total": 4, "moved": 1, "metadata_moved": 0,
-                    "skipped": 2, "need_confirm": 1, "failed": 1,
-                    "skip_reasons": ["目标已有同版本", "同批次较小文件已淘汰"],
-                },
-            },
+            "directories": {"混合目录": {
+                "total": 4, "moved": 1, "metadata_moved": 0,
+                "skipped": 2, "need_confirm": 1, "failed": 1,
+                "skip_reasons": ["目标已有同版本", "同批次较小文件已淘汰"],
+            }},
             "media_items": [{
-                "directory": "混合目录",
-                "title": "流浪地球2",
-                "year": "2023",
-                "media_type": "movie",
-                "tmdb_id": "533535",
-                "source": "光鸭云盘",
-                "category": "电影/国产",
-                "filename": "demo.2160p.mkv",
+                "directory": "混合目录", "title": "流浪地球2", "year": "2023",
+                "media_type": "movie", "tmdb_id": "533535", "source": "光鸭云盘",
+                "category": "电影/国产", "filename": "demo.2160p.mkv",
                 "size": 1024 ** 3,
             }],
         }
-        with patch("app.notifier.send_event", side_effect=lambda event, chat_id=None: sent.append(event) or True):
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: sent.append(event) or True,
+        ):
             Organizer.notify_directory_results(stats, OrganizeRules(), source_name="下载")
 
-        self.assertEqual(len(sent), 2)
-        media = next(event for event in sent if "入库：" in str(event.title))
-        warning = next(event for event in sent if "部分完成" in str(event.title))
-        self.assertFalse(media.footer)
-        rendered = notifier.render_event(warning)
-        self.assertIn(
-            "<b>处理结果</b>  视频 4 个 · 成功入库 1 个 · "
-            "需要确认 1 个 · 跳过 2 个 · 失败 1 个",
-            rendered,
-        )
-        self.assertIn("跳过原因：目标已有同版本；同批次较小文件已淘汰", rendered)
-
+        self.assertEqual(len(sent), 1)
+        rendered = notifier.render_event(sent[0])
+        self.assertIn("光鸭整理部分完成", rendered)
+        self.assertIn("流浪地球2", rendered)
+        self.assertIn("视频 4", rendered)
+        self.assertIn("入库 1", rendered)
+        self.assertIn("待确认 1", rendered)
+        self.assertIn("跳过 2", rendered)
+        self.assertIn("失败 1", rendered)
 
     def test_task_summary_uses_compact_sections_instead_of_inline_candidate_dump(self):
         from app.modules.organize import Organizer
@@ -681,8 +668,6 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
         self.assertNotIn("最佳候选", footer)
 
     def test_bad_numeric_media_data_does_not_block_later_directory_notifications(self):
-        """若单条坏数值中断目录循环，后续目录通知会全部丢失。"""
-        from unittest.mock import patch
         from app.modules.organize import Organizer, OrganizeRules
 
         sent = []
@@ -692,68 +677,56 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
                 "正常目录": {"total": 1, "moved": 1, "metadata_moved": 0, "skipped": 0, "need_confirm": 0, "failed": 0},
             },
             "media_items": [
-                {
-                    "directory": "坏数据目录", "title": "坏数据剧", "year": "2026",
-                    "media_type": "tv", "tmdb_id": "bad-1", "season": 2,
-                    "episode": 1, "season_total": "未知", "size": "无法转换",
-                    "source": "光鸭云盘", "filename": "Bad.S02E01.mkv",
-                },
-                {
-                    "directory": "正常目录", "title": "正常电影", "year": "2025",
-                    "media_type": "movie", "tmdb_id": "good-1", "size": 1024,
-                    "source": "光鸭云盘", "filename": "Good.1080p.mkv",
-                },
+                {"directory": "坏数据目录", "title": "坏数据剧", "year": "2026",
+                 "media_type": "tv", "tmdb_id": "bad-1", "season": 2,
+                 "episode": 1, "season_total": "未知", "size": "无法转换"},
+                {"directory": "正常目录", "title": "正常电影", "year": "2025",
+                 "media_type": "movie", "tmdb_id": "good-1", "size": 1024},
             ],
         }
-        with patch("app.notifier.send_event", side_effect=lambda event, chat_id=None: sent.append(event) or True):
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: sent.append(event) or True,
+        ):
             Organizer.notify_directory_results(stats, OrganizeRules(), source_name="下载")
 
-        self.assertEqual(len(sent), 2)
-        rendered = [notifier.render_event(event) for event in sent]
-        self.assertTrue(any(
-            "坏数据剧" in text
-            and "<b>本次</b>  E01" in text
-            and "<b>本季</b>" not in text
-            and "<b>文件</b>  1 个" in text
-            for text in rendered
-        ))
-        self.assertTrue(any("正常电影" in text for text in rendered))
+        self.assertEqual(len(sent), 1)
+        rendered = notifier.render_event(sent[0])
+        self.assertIn("坏数据剧", rendered)
+        self.assertIn("S02", rendered)
+        self.assertIn("E01", rendered)
+        self.assertIn("正常电影", rendered)
 
     def test_download_and_scheduler_notifications_use_structured_events(self):
-        """若下载或 STRM 通知绕过统一事件模型，本测试必须失败。"""
-        from unittest.mock import patch
+        """兼容下载事件与独立 STRM 错误也必须交给统一通知中心。"""
         from app.modules import download_tracker, scheduler
 
-        self.assertTrue(hasattr(download_tracker, "send_event"), "下载通知尚未接入 send_event")
-        self.assertTrue(hasattr(scheduler, "send_event"), "STRM 通知尚未接入 send_event")
         sent = []
         row = {"status": "downloading", "title": "任务<&>", "chat_id": "900"}
-        with patch.object(download_tracker, "send", side_effect=lambda event, chat_id=None: sent.append((event, chat_id)) or True):
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_event",
+            side_effect=lambda _key, event, **kwargs: sent.append((event, kwargs)) or True,
+        ):
             download_tracker.DownloadTracker._notify_completion(
                 row, "completed", "failed", {"status": "completed"}
             )
             download_tracker.DownloadTracker._notify_completion(
                 row, "manual_review", "completed", {"status": "manual_review"}
             )
-        with patch.object(scheduler, "get_bool", return_value=True), patch.object(
-            scheduler, "send", side_effect=lambda event, chat_id=None: sent.append((event, chat_id)) or True
-        ):
-            scheduler.STRMScheduler._notify_failure("错误<&>", "cron")
+            with patch.object(scheduler, "get_bool", return_value=True):
+                scheduler.STRMScheduler._notify_failure("错误<&>", "cron")
 
         self.assertEqual(len(sent), 3)
         download_text = notifier.render_event(sent[0][0])
         review_text = notifier.render_event(sent[1][0])
         failure_text = notifier.render_event(sent[2][0])
         self.assertIn("任务&lt;&amp;&gt;", download_text)
-        self.assertNotIn("任务<&>", download_text)
-        self.assertEqual(sent[0][1], "900")
+        self.assertEqual(sent[0][1]["chat_id"], "900")
         self.assertIn("需要人工核对", review_text)
         self.assertIn("请勿重复提交", review_text)
-        self.assertEqual(sent[1][1], "900")
+        self.assertEqual(sent[1][1]["chat_id"], "900")
         self.assertIn("错误&lt;&amp;&gt;", failure_text)
-        self.assertNotIn("错误<&>", failure_text)
 
-class OrganizeMediaDataTests(unittest.TestCase):
     def test_plan_one_tolerates_invalid_tmdb_and_parsed_season_numbers(self):
         """异常季号或集数不得从 _plan_one 冒泡并中断整个整理扫描。"""
         from unittest.mock import Mock

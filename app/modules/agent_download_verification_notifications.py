@@ -9,9 +9,7 @@ from app.agent.owner_routes import (
     parse_telegram_owner_route,
     telegram_owner_route_is_currently_authorized,
 )
-from app.notifier import NotificationEvent, TelegramSendResult, send_event, send_event_result
-
-send = send_event
+from app.notifier import NotificationEvent, TelegramSendResult
 
 _RESULT_LABELS = {
     "visible": "目标剧集已在媒体库中可见",
@@ -114,7 +112,7 @@ def build_download_verification_event(
 
 
 def notify_download_verification_terminal_result(
-    *, owner: str, chat_id: str, **payload
+    *, owner: str, chat_id: str, request_id: int = 0, **payload
 ) -> TelegramSendResult:
     """向 owner 绑定 chat 投递终态通知，并保留结果未知语义。"""
     if not config.get_bool("AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED", True):
@@ -125,19 +123,51 @@ def notify_download_verification_terminal_result(
         return TelegramSendResult(False, error="InvalidRoute", status_code=403)
     if not telegram_owner_route_is_currently_authorized(route, chat_id=target):
         return TelegramSendResult(False, error="AuthorizationRevoked", status_code=403)
-    return send_event_result(build_download_verification_event(**payload), chat_id=target)
+    if int(request_id or 0) > 0:
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        normalized_status = str(payload.get("status") or "attention")
+        normalized_result = str(payload.get("result") or "inconclusive")
+        outcome = publish_download_lifecycle(
+            int(request_id),
+            verification_status=normalized_status,
+            verification_result=_RESULT_LABELS.get(normalized_result, _RESULT_LABELS[""]),
+        )
+        return TelegramSendResult(
+            ok=bool(outcome),
+            error="" if outcome else str(outcome.status or "DeliveryFailed"),
+            status_code=0 if outcome else 503,
+        )
+
+    from app.modules.telegram_notification_center import publish_notification_event
+    from app.modules.telegram_notification_policy import (
+        NotificationImportance, NotificationTopic,
+    )
+    event = build_download_verification_event(**payload)
+    digest = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    outcome = publish_notification_event(
+        f"agent-download-verification:{owner}:{digest}",
+        event,
+        topic=NotificationTopic.AGENT,
+        importance=(
+            NotificationImportance.RESULT
+            if str(payload.get("status") or "") == "visible"
+            else NotificationImportance.ERROR
+        ),
+        chat_id=target,
+        topic_enabled=True,
+    )
+    return TelegramSendResult(
+        ok=bool(outcome),
+        error="" if outcome else str(outcome.status or "DeliveryFailed"),
+        status_code=0 if outcome else 503,
+    )
 
 
 def notify_download_verification_terminal(
-    *, owner: str, chat_id: str, **payload
+    *, owner: str, chat_id: str, request_id: int = 0, **payload
 ) -> bool:
     """兼容既有调用者与测试替身的布尔接口。"""
-    if not config.get_bool("AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED", True):
-        return False
-    route = parse_telegram_owner_route(owner)
-    target = str(chat_id or "").strip()
-    if route is None or not target or route.chat_id != target:
-        return False
-    if not telegram_owner_route_is_currently_authorized(route, chat_id=target):
-        return False
-    return bool(send(build_download_verification_event(**payload), chat_id=target))
+    return bool(notify_download_verification_terminal_result(
+        owner=owner, chat_id=chat_id, request_id=request_id, **payload,
+    ).ok)

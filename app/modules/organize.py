@@ -2308,6 +2308,7 @@ class Organizer:
         download_request_ids: list[int] | None = None,
         *, notify_result: bool = True,
         strm_debounce_seconds: float | None = None,
+        notification_threads: list[dict[str, object]] | None = None,
     ) -> None:
         """多源任务聚合完成后只执行一次 STRM 联动和总结通知。"""
         unsafe_partial = bool(
@@ -2343,6 +2344,7 @@ class Organizer:
                 stats, rules, download_request_ids=download_request_ids,
                 chat_id=chat_id, force_incremental=unsafe_partial,
                 debounce_seconds=normalized_debounce,
+                notification_threads=notification_threads,
             )
         elif rules.link_strm and unsafe_partial:
             stats["strm"] = {
@@ -2362,6 +2364,7 @@ class Organizer:
         chat_id: str = "",
         force_incremental: bool = False,
         debounce_seconds: float = 0.0,
+        notification_threads: list[dict[str, object]] | None = None,
     ) -> None:
         """整理后联动：触发 STRM；媒体库刷新由 STRM 完成后统一处理。"""
         base_url = get("GY_STRM_BASE_URL", "")
@@ -2369,6 +2372,16 @@ class Organizer:
         if base_url and strm_root:
             try:
                 from app.modules.scheduler import get_scheduler
+                linked_threads = (
+                    list(notification_threads or [])
+                    or ([{
+                        "topic": "organize",
+                        "thread_key": f"organize:{str(stats.get('task_id') or '')}",
+                        "task_id": str(stats.get("task_id") or ""),
+                        "chat_id": str(chat_id or ""),
+                        "topic_enabled": bool(rules.notify_enabled and rules.library_notify),
+                    }] if str(stats.get("task_id") or "").strip() and not download_request_ids else [])
+                )
                 trigger_options = {
                     "notify_override": rules.notify_enabled,
                     "detail_notify_override": rules.notify_enabled and rules.strm_detail_notify,
@@ -2379,6 +2392,8 @@ class Organizer:
                         bool(stats.get("strm_force_full")) or not bool(stats.get("strm_changes"))
                     ),
                 }
+                if linked_threads:
+                    trigger_options["notification_threads"] = linked_threads
                 if chat_id:
                     trigger_options["chat_id"] = chat_id
                 if debounce_seconds > 0:
@@ -2523,182 +2538,79 @@ class Organizer:
     @staticmethod
     def notify_directory_results(stats: dict, rules: OrganizeRules,
                                  source_name: str = "", chat_id: str = "") -> None:
-        """按本次扫描的底层目录发送入库结果，供多源任务逐源调用。"""
+        """目录刮削只发一条汇总；人工候选继续使用独立可更新按钮卡。"""
         if not rules.notify_enabled or not rules.library_notify:
             return
-        directories = stats.get("directories") or {}
-        if not isinstance(directories, dict):
-            return
         try:
-            from app.notifier import NotificationEvent, build_media_events, safe_int, send_event
-            from app.modules.organize_confirmations import confirmation_event
+            from app.modules.telegram_organize_lifecycle import publish_organize_lifecycle
 
-            media_items = stats.get("media_items") or []
-            all_groups = [
-                item for item in (stats.get("confirmation_groups") or [])
-                if isinstance(item, dict)
-            ]
-            scan_incomplete = bool(
-                stats.get("scan_errors")
-                or stats.get("scan_limited")
-                or stats.get("scan_complete") is False
-                or stats.get("stopped")
+            task_id = str(
+                stats.get("task_id") or stats.get("operation_token") or ""
+            ).strip() or f"directory-{time.time_ns()}"
+            groups, actionable_count = Organizer._validated_task_confirmation_groups(stats)
+            notification_stats = {
+                **stats,
+                "notification_actionable_confirmation_files": actionable_count,
+                "notification_actionable_confirmation_groups": len(groups),
+            }
+            publish_organize_lifecycle(
+                task_id, notification_stats, source_name=source_name or "目录刮削",
+                chat_id=chat_id,
+                topic_enabled=rules.notify_enabled and rules.library_notify,
+                strm_status="等待后处理" if rules.link_strm else "未启用",
+                media_refresh="等待 STRM 完成" if rules.link_strm else "未触发",
             )
-            for path, current in directories.items():
-                if not isinstance(current, dict):
-                    continue
-                scope = f"{source_name}/{path}" if source_name and path != "/" else (source_name or path)
-                counts = {
-                    "视频": safe_int(current.get("total", 0), 0, minimum=0),
-                    "已移动": safe_int(current.get("moved", 0), 0, minimum=0),
-                    "元数据": safe_int(current.get("metadata_moved", 0), 0, minimum=0),
-                    "跳过": safe_int(current.get("skipped", 0), 0, minimum=0),
-                    "需确认": safe_int(current.get("need_confirm", 0), 0, minimum=0),
-                    "失败": safe_int(current.get("failed", 0), 0, minimum=0),
-                }
-                groups = [
-                    item for item in all_groups
-                    if str(item.get("directory") or "/") == str(path)
-                ]
-                current_items = [
-                    item for item in media_items
-                    if isinstance(item, dict) and str(item.get("directory") or "/") == str(path)
-                ]
-                has_attention = scan_incomplete or any(
-                    counts[key] for key in ("跳过", "需确认", "失败")
-                )
-                events = build_media_events(
-                    current_items, layout="relaxed",
-                    inventory_final=not has_attention,
-                )
-                for event in events:
-                    send_event(event, chat_id=chat_id or None)
-
-                title = (
-                    "⚠️ 整理目录部分完成"
-                    if has_attention else "✅ 整理目录完成"
-                )
-                if len(groups) == 1:
-                    group = groups[0]
-                    event = confirmation_event(
-                        "⚠️ 发现需要确认的媒体",
-                        {
-                            "媒体": str(group.get("identity") or "待确认媒体"),
-                            "剧集": Organizer._confirmation_scope_summary(group),
-                            "来源": scope,
-                        },
-                        group, rules, source_name=source_name, chat_id=chat_id,
-                    )
-                    send_event(event, chat_id=chat_id or None)
-                    continue
-
-                footer = Organizer._notification_footer(current)
-                if groups:
-                    footer = f"已按媒体分为 {len(groups)} 组，请逐项确认。"
-                if not events or has_attention:
-                    send_event(NotificationEvent(
-                        title,
-                        fields=(
-                            ("目录", scope),
-                            ("处理结果", Organizer._notification_count_summary(counts)),
-                        ),
-                        footer=footer,
-                        layout="relaxed",
-                    ), chat_id=chat_id or None)
-                for index, group in enumerate(groups, start=1):
-                    send_event(confirmation_event(
-                        f"⚠️ 待确认媒体 {index}/{len(groups)}",
-                        {
-                            "媒体": str(group.get("identity") or "待确认媒体"),
-                            "剧集": Organizer._confirmation_scope_summary(group),
-                            "来源": scope,
-                        },
-                        group, rules, source_name=source_name, chat_id=chat_id,
-                    ), chat_id=chat_id or None)
+            Organizer._deliver_task_confirmation_groups(
+                groups, rules, source_name=source_name, chat_id=chat_id,
+            )
         except Exception as exc:
             logger.warning("整理目录通知失败 type=%s", type(exc).__name__)
 
     @staticmethod
     def notify_task_results(stats: dict, rules: OrganizeRules,
                             source_name: str = "", chat_id: str = "") -> bool:
-        """按整个整理任务汇总媒体；需要人工选择的媒体继续发送独立按钮卡。"""
+        """发送一条可被 STRM 终态继续更新的整理事务消息，并独立保留候选卡。"""
         if not rules.notify_enabled or not rules.library_notify:
             return False
         try:
-            from app.notifier import (
-                NotificationEvent,
-                build_media_events,
-                render_event,
+            from app.modules.telegram_organize_lifecycle import (
+                publish_organize_lifecycle,
             )
 
-            counts = {
-                "视频": stats.get("total", 0),
-                "已移动": stats.get("moved", 0),
-                "元数据": stats.get("metadata_moved", 0),
-                "需确认": stats.get("need_confirm", 0),
-                "跳过": stats.get("skipped", 0),
-                "失败": stats.get("failed", 0),
-            }
-            stopped = bool(stats.get("stopped"))
-            scan_incomplete = bool(
-                stats.get("scan_errors")
-                or stats.get("scan_limited")
-                or stats.get("scan_complete") is False
-            )
-            attention = scan_incomplete or any(
-                int(counts.get(key, 0) or 0) for key in ("需确认", "跳过", "失败")
-            )
-            title = (
-                "⏹️ 光鸭整理已停止"
-                if stopped else ("⚠️ 光鸭整理部分完成" if attention else "✅ 光鸭整理完成")
-            )
-            groups, actionable_confirmation_count = (
+            task_id = str(stats.get("task_id") or "").strip()
+            if not task_id:
+                # 兼容旧插件直接调用；正式任务始终携带稳定 task_id。
+                task_id = f"legacy-{time.time_ns()}"
+            strm = stats.get("strm") if isinstance(stats.get("strm"), dict) else {}
+            if strm.get("ok"):
+                strm_status = "已排队"
+                refresh_status = "等待 STRM 完成"
+            elif strm.get("skipped"):
+                strm_status = "已跳过"
+                refresh_status = "未触发"
+            elif strm:
+                strm_status = "启动失败"
+                refresh_status = "未触发"
+            else:
+                strm_status = "未启用或无变更"
+                refresh_status = "未触发"
+            groups, actionable_count = (
                 Organizer._validated_task_confirmation_groups(stats)
             )
-            summary = NotificationEvent(
-                title,
-                fields=(
-                    ("来源目录", source_name),
-                    ("结果", Organizer._notification_count_summary(counts, compact=True)),
-                ),
-                footer=Organizer._task_notification_footer(
-                    stats,
-                    confirmation_group_count=len(groups),
-                    actionable_confirmation_count=actionable_confirmation_count,
-                ),
-                layout="relaxed",
-            )
-            media_events = build_media_events(
-                stats.get("media_items") or [], layout="relaxed",
-                inventory_final=not bool(attention or stopped),
-            )
-            sections = [render_event(summary)]
-            sections.extend(render_event(event) for event in media_events)
-            summary_body = "\n\n".join(sections)
-            # 单一媒体身份可用同一张封面承载整条任务汇总；多个不同媒体
-            # 继续保持一条纯文本汇总，避免批量整理时连续刷出多张图片。
-            summary_image_url = (
-                str(media_events[0].image_url or "").strip()
-                if len(media_events) == 1 else ""
-            )
-            # 汇总与媒体卡走持久化 outbox：临时网络失败可重试，已成功的
-            # 事件不会因重试而重复发送。带按钮的待确认卡另有确认投递队列。
-            from app.modules.organize_notification_outbox import (
-                deliver_organize_notification,
-                summary_idempotency_key,
-            )
-
-            delivery_kwargs = {"chat_id": chat_id or ""}
-            if summary_image_url:
-                delivery_kwargs["image_url"] = summary_image_url
-            summary_sent = bool(deliver_organize_notification(
-                summary_idempotency_key(
-                    str(stats.get("task_id") or ""), chat_id=chat_id,
-                ),
-                summary_body,
-                **delivery_kwargs,
+            notification_stats = {
+                **stats,
+                "notification_actionable_confirmation_files": actionable_count,
+                "notification_actionable_confirmation_groups": len(groups),
+            }
+            summary_sent = bool(publish_organize_lifecycle(
+                task_id,
+                notification_stats,
+                source_name=source_name,
+                chat_id=chat_id,
+                topic_enabled=rules.notify_enabled and rules.library_notify,
+                strm_status=strm_status,
+                media_refresh=refresh_status,
             ))
-
             confirmations_sent = Organizer._deliver_task_confirmation_groups(
                 groups,
                 rules,
@@ -2787,8 +2699,9 @@ class Organizer:
         """发送独立候选卡；失败时保留已持久化任务并给出 Web 回退。"""
         if not groups:
             return True
-        from app.modules.organize_confirmations import confirmation_event
-        from app.notifier import send as send_text, send_event
+        from app.modules.organize_confirmations import (
+            confirmation_event, publish_confirmation_event,
+        )
 
         confirmation_failures = 0
         for index, group in enumerate(groups, start=1):
@@ -2799,7 +2712,7 @@ class Organizer:
             elif group_source:
                 scope = group_source
             try:
-                delivered = bool(send_event(confirmation_event(
+                event = confirmation_event(
                     f"⚠️ 待确认媒体 {index}/{len(groups)}",
                     {
                         "媒体": str(group.get("identity") or "待确认媒体"),
@@ -2810,7 +2723,8 @@ class Organizer:
                     rules,
                     source_name=group_source,
                     chat_id=chat_id,
-                ), chat_id=chat_id or None))
+                )
+                delivered = publish_confirmation_event(event, chat_id=chat_id)
             except Exception as exc:
                 delivered = False
                 logger.warning(
@@ -2821,16 +2735,10 @@ class Organizer:
             if not delivered:
                 confirmation_failures += 1
         if confirmation_failures:
-            try:
-                send_text(
-                    "⚠️ 有待确认候选未能发送到 Telegram，请前往 Web 的待确认队列继续处理。",
-                    chat_id=chat_id or None,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "整理待确认卡回退提示发送失败 type=%s",
-                    type(exc).__name__,
-                )
+            logger.warning(
+                "整理待确认卡未被通知中心接纳 count=%s；候选仍保留在 Web 待确认队列",
+                confirmation_failures,
+            )
         return confirmation_failures == 0
 
     @staticmethod
@@ -2860,28 +2768,18 @@ class Organizer:
     @staticmethod
     def _notify_result(stats: dict, rules: OrganizeRules,
                        source_name: str = "", chat_id: str = "") -> None:
+        """兼容旧插件的汇总入口；统一转入整理事务消息。"""
         if not rules.notify_enabled or not rules.library_notify:
             return
         try:
-            from app.notifier import NotificationEvent, send_event
-            stopped = bool(stats.get("stopped"))
-            counts = {
-                "视频": stats.get("total", 0),
-                "已移动": stats.get("moved", 0),
-                "元数据": stats.get("metadata_moved", 0),
-                "需确认": stats.get("need_confirm", 0),
-                "跳过": stats.get("skipped", 0),
-                "失败": stats.get("failed", 0),
-            }
-            send_event(NotificationEvent(
-                "⏹️ 光鸭整理已停止" if stopped else "✅ 光鸭整理完成",
-                fields=(
-                    ("来源目录", source_name),
-                    ("本次处理", Organizer._notification_count_summary(counts)),
-                ),
-                footer=Organizer._notification_footer(stats),
-                layout="relaxed",
-            ), chat_id=chat_id or None)
+            from app.modules.telegram_organize_lifecycle import publish_organize_lifecycle
+
+            task_id = str(stats.get("task_id") or "").strip() or f"legacy-{time.time_ns()}"
+            publish_organize_lifecycle(
+                task_id, stats, source_name=source_name, chat_id=chat_id,
+                topic_enabled=rules.notify_enabled and rules.library_notify,
+                strm_status="未启用或无变更", media_refresh="未触发",
+            )
         except Exception as exc:
             logger.warning("整理通知失败 type=%s", type(exc).__name__)
 

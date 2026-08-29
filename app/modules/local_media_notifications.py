@@ -7,10 +7,9 @@ from typing import Any, Mapping
 from app import config
 from app import database as db
 from app.logger import get_logger
-from app.notifier import NotificationEvent, send_event
+from app.notifier import NotificationEvent
 
 logger = get_logger(__name__)
-send = send_event
 
 _TRIGGER_LABELS = {
     "qb_completed": "qB 下载完成",
@@ -165,6 +164,47 @@ def notify_local_media_task(
         error=error,
         chat_id=chat_id,
     )
-    if chat_id:
-        return bool(send(event, chat_id=chat_id))
-    return bool(send(event))
+    linked_requests = db.list_download_requests_for_local_media_task(task_id)
+    if linked_requests:
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        accepted = False
+        for request in linked_requests:
+            outcome = publish_download_lifecycle(
+                int(request["id"]), stats=result,
+            )
+            accepted = bool(outcome) or accepted
+        # 人工候选按钮必须独立保留；其余结果已合并到下载事务消息。
+        if event.actions:
+            from app.modules.organize_confirmations import publish_confirmation_event
+
+            accepted = publish_confirmation_event(event, chat_id=chat_id) or accepted
+        return accepted
+
+    if event.actions:
+        from app.modules.organize_confirmations import publish_confirmation_event
+
+        return publish_confirmation_event(event, chat_id=chat_id)
+
+    from app.modules.telegram_notification_center import publish_notification_thread
+    from app.modules.telegram_notification_policy import (
+        NotificationImportance, NotificationTopic,
+    )
+
+    status = str((result or {}).get("status") or getattr(task, "status", ""))
+    importance = (
+        NotificationImportance.ERROR if status == "failed" else
+        NotificationImportance.ACTION if status == "requires_manual" else
+        NotificationImportance.RESULT
+    )
+    return bool(publish_notification_thread(
+        f"local-media:{int(task_id)}",
+        event,
+        topic=NotificationTopic.LOCAL_MEDIA,
+        importance=importance,
+        chat_id=chat_id,
+        topic_enabled=(
+            config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
+            and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY", True)
+        ),
+    ))

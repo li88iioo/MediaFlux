@@ -19,6 +19,7 @@ from app import notifier
 from app.main import create_app
 from app.modules import gcid_import
 from app.modules.gcid_manifest import FORMAT_NAME
+from app.modules.telegram_notification_center import NotificationPublishResult
 
 
 def _digest(payload: dict) -> str:
@@ -253,11 +254,19 @@ class GCIDImportAPITests(InitializedWebTestCase):
             "operation_token": "run-success-once",
         }
 
+        thread_keys = []
         with patch(
             "app.modules.gcid_import.get_private_importer",
             return_value=fake,
             create=True,
-        ), patch("app.notifier.send_event", side_effect=lambda event: events.append(event) or True):
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda key, event, **_kwargs: (
+                thread_keys.append(key)
+                or events.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
             first = self.client.post(
                 "/api/tools/gcid/import/run", json=body, headers=headers
             )
@@ -271,11 +280,13 @@ class GCIDImportAPITests(InitializedWebTestCase):
         self.assertTrue(replay.json()["replayed"])
         self.assertEqual(len(fake.calls), 2)
         self.assertEqual(len(events), 2)
+        self.assertEqual(thread_keys, [thread_keys[0], thread_keys[0]])
+        self.assertTrue(thread_keys[0].startswith("gcid:"))
         rendered_events = json.dumps(
             [{"title": event.title, "fields": list(event.fields), "lines": list(event.lines)} for event in events],
             ensure_ascii=False,
         )
-        self.assertIn("开始", rendered_events)
+        self.assertIn("进行中", rendered_events)
         self.assertIn("成功", rendered_events)
         self.assertNotIn("gcid-a", rendered_events)
         self.assertNotIn(body["operation_token"], rendered_events)
@@ -455,7 +466,13 @@ class GCIDImportNotificationTests(unittest.TestCase):
             {"path": f"Dir/File-{index}.mkv", "error": f"PRIVATE RESPONSE {index}"}
             for index in range(5)
         ]
-        with patch("app.notifier.send_event", side_effect=lambda event: captured.append(event) or True):
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                captured.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
             notifier.notify_gcid_import_finished(
                 task_id=9,
                 status="partial_success",

@@ -290,7 +290,8 @@ class NotificationEmojiTests(unittest.TestCase):
             "media_items": [], "confirmation_groups": [],
         }
         with patch(
-            "app.modules.organize_notification_outbox.deliver_organize_notification", return_value=False
+            "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle",
+            return_value=False,
         ):
             delivered = Organizer.notify_task_results(
                 stats, OrganizeRules(), source_name="1 个源目录", chat_id="123"

@@ -470,7 +470,12 @@ class AgentLibraryPatrolScheduler:
 
     @staticmethod
     def _notifications_enabled() -> bool:
-        return config.get_bool("AGENT_LIBRARY_PATROL_NOTIFY_ENABLED", False)
+        from app.modules.telegram_notification_policy import notifications_enabled
+
+        return (
+            config.get_bool("AGENT_LIBRARY_PATROL_NOTIFY_ENABLED", False)
+            and notifications_enabled()
+        )
 
     @staticmethod
     def _max_series() -> int:

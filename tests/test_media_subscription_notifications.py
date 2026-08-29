@@ -8,7 +8,7 @@ from app import database as db
 from app.modules.media_subscription_notifications import (
     drain_media_subscription_notifications,
 )
-from app.notifier import TelegramSendResult
+from app.notifier import TelegramSendResult, render_event
 from app.repositories.media_experience import (
     claim_due_notifications,
     get_notification_rule,
@@ -25,6 +25,7 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         with db.get_conn() as conn:
             conn.execute("DELETE FROM media_subscription_notification_outbox")
+            conn.execute("DELETE FROM telegram_notification_outbox")
             conn.execute("DELETE FROM media_subscription_notification_rules")
             conn.execute("DELETE FROM media_subscription_runs")
             conn.execute("DELETE FROM media_subscriptions")
@@ -156,12 +157,16 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         self._enable_rule(notify_on_missing=True)
         self._finalize()
         with patch(
-            "app.notifier.send_result", return_value=TelegramSendResult(ok=True)
+            "app.modules.telegram_notification_center.notification_target_chat_id",
+            return_value="100",
+        ), patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=TelegramSendResult(ok=True, message_id=51),
         ) as send:
             self.assertTrue(drain_media_subscription_notifications())
             self.assertTrue(drain_media_subscription_notifications())
         send.assert_called_once()
-        body = send.call_args.args[0]
+        body = render_event(send.call_args.args[0])
         self.assertIn("安全追更标题", body)
         self.assertNotIn("PRIVATE", body)
         self.assertEqual(list_notification_outbox()[0]["status"], "sent")
@@ -175,13 +180,17 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         self._enable_rule(notify_on_missing=True)
         self._finalize()
         with patch(
-            "app.notifier.send_result", return_value=TelegramSendResult(ok=True)
+            "app.modules.telegram_notification_center.notification_target_chat_id",
+            return_value="100",
+        ), patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=TelegramSendResult(ok=True, message_id=52),
         ) as send:
             self.assertTrue(drain_media_subscription_notifications())
-        body = send.call_args.args[0]
+        body = render_event(send.call_args.args[0])
         self.assertIn("&lt;b&gt;伪装 &amp;", body)
         self.assertIn("&lt;broken", body)
-        self.assertNotIn("<b>", body)
+        self.assertNotIn("伪装 & <broken", body)
         self.assertNotIn("<broken", body)
 
     def test_retry_after_recovery_uses_lease_fence(self) -> None:
@@ -219,16 +228,26 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         self._enable_rule(notify_on_missing=True)
         self._finalize()
         with patch(
-            "app.notifier.send_result",
+            "app.modules.telegram_notification_center.notification_target_chat_id",
+            return_value="100",
+        ), patch(
+            "app.modules.telegram_notification_center.send_event_result",
             return_value=TelegramSendResult(
-                ok=False, error="rate limited", retry_after_seconds=120
+                ok=False, error="rate limited", status_code=429,
+                retry_after_seconds=120
             ),
         ):
-            self.assertFalse(drain_media_subscription_notifications())
-        row = list_notification_outbox()[0]
+            # 旧订阅 outbox 只负责可靠移交；Telegram 重试由统一 outbox 接管。
+            self.assertTrue(drain_media_subscription_notifications())
+        legacy_row = list_notification_outbox()[0]
+        self.assertEqual(legacy_row["status"], "sent")
+        with db.get_conn() as conn:
+            row = dict(conn.execute(
+                "SELECT * FROM telegram_notification_outbox"
+            ).fetchone())
         self.assertEqual(row["status"], "retry_wait")
         self.assertEqual(int(row["attempts"]), 1)
-        self.assertEqual(row["last_error"], "telegram_rate_limited")
+        self.assertEqual(row["last_error"], "rate limited")
         next_at = datetime.strptime(row["next_attempt_at"], "%Y-%m-%d %H:%M:%S")
         updated = datetime.strptime(row["updated_at"], "%Y-%m-%d %H:%M:%S")
         self.assertGreaterEqual((next_at - updated).total_seconds(), 120)

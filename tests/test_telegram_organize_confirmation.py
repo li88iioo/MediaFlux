@@ -25,6 +25,12 @@ from app.modules.organize_confirmations import (
     wake_confirmation_dispatcher,
 )
 from app.modules.scraper import Candidate, MatchResult
+from app.modules.telegram_notification_center import (
+    NotificationPublishResult, notification_thread_event_key,
+)
+from app.modules.telegram_notification_policy import NotificationTopic
+from app.notifier import TelegramSendResult
+from app.repositories.telegram_notifications import get_notification
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -339,22 +345,25 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         token = actions[0].callback_data.split(":")[1]
 
         with patch(
-            "app.modules.organize_confirmations.edit_event", return_value=False
-        ) as edit_mock, patch(
-            "app.modules.organize_confirmations.send_event", return_value=False
-        ) as send_mock:
-            result = cancel_confirmation(
-                token, chat_id="100", message_id=77
-            )
+            "app.modules.telegram_notification_center.edit_event_result",
+            return_value=TelegramSendResult(
+                ok=False, error="temporarily unavailable", status_code=503,
+            ),
+        ) as edit_mock:
+            result = cancel_confirmation(token, chat_id="100", message_id=77)
 
         self.assertTrue(result["cancelled"])
         self.assertEqual(db.get_organize_confirmation(token)["status"], "cancelled")
-        delivery = db.get_organize_confirmation_delivery(token)
+        key = notification_thread_event_key(
+            f"confirmation:{token}",
+            topic=NotificationTopic.CONFIRMATION,
+            chat_id="100",
+        )
+        delivery = get_notification(key)
         self.assertEqual(delivery["status"], "retry_wait")
         self.assertEqual(delivery["message_id"], 77)
         self.assertIn("已暂不处理", str(delivery["event_json"]))
         edit_mock.assert_called_once()
-        send_mock.assert_called_once()
 
     def test_dispatcher_wakeup_stays_disabled_after_stop(self):
         stop_confirmation_dispatcher()
@@ -443,9 +452,14 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 (token,),
             )
 
+        published = []
         with patch(
-            "app.modules.organize_confirmations.send_event", return_value=True
-        ) as send_mock:
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
             result = _dispatch_next_queued_confirmation()
 
         self.assertFalse(result["ok"])
@@ -454,9 +468,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         row = db.get_organize_confirmation(token)
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["error"], result["error"])
-        delivery = db.get_organize_confirmation_delivery(token)
-        self.assertEqual(delivery["status"], "sent")
-        event = send_mock.call_args.args[0]
+        self.assertIsNone(db.get_organize_confirmation_delivery(token))
+        event = published[-1]
         self.assertIn("确认任务数据损坏", event.footer)
         self.assertEqual(event.actions, ())
 
@@ -473,17 +486,24 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         )
         with patch(
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
-        ) as _manager_patch:
+        ):
             start_confirmation(token, 0, chat_id="100")
+        published = []
         with patch(
             "app.modules.organize_confirmations.OrganizeRules.from_config",
             side_effect=RuntimeError("TMDB 网络暂时不可用"),
-        ), patch("app.modules.organize_confirmations.send_event") as send_mock:
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
             with self.assertRaisesRegex(RuntimeError, "TMDB 网络"):
                 callbacks[0]()
         row = db.get_organize_confirmation(token)
         self.assertEqual(row["status"], "pending")
-        event = send_mock.call_args.args[0]
+        event = published[-1]
         self.assertEqual(event.actions[0].callback_data, f"orgc:{token}:0")
         self.assertIn("重新尝试", str(event.actions[0].label))
 
@@ -523,17 +543,17 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(delivery["status"], "pending")
         self.assertEqual(delivery["message_id"], 77)
         with patch(
-            "app.modules.organize_confirmations.edit_event", return_value=True
-        ) as edit_mock, patch(
-            "app.modules.organize_confirmations.send_event"
-        ) as send_mock:
+            "app.modules.organize_confirmations.publish_confirmation_event",
+            return_value=True,
+        ) as publish_mock:
             attempted = confirmation_module._dispatch_due_confirmation_delivery(token)
 
         self.assertTrue(attempted)
-        edit_mock.assert_called_once()
-        send_mock.assert_not_called()
-        event = edit_mock.call_args.args[0]
+        publish_mock.assert_called_once()
+        event = publish_mock.call_args.args[0]
         self.assertIn("已中断", str(event.title))
+        self.assertEqual(publish_mock.call_args.kwargs["token"], token)
+        self.assertEqual(publish_mock.call_args.kwargs["message_id"], 77)
         self.assertEqual(
             db.get_organize_confirmation_delivery(token)["status"], "sent"
         )
@@ -560,14 +580,12 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         )
 
         with patch(
-            "app.modules.organize_confirmations.edit_event", return_value=False
-        ) as edit_mock, patch(
-            "app.modules.organize_confirmations.send_event", return_value=False
-        ) as send_mock:
+            "app.modules.organize_confirmations.publish_confirmation_event",
+            return_value=False,
+        ) as publish_mock:
             attempted = confirmation_module._dispatch_due_confirmation_delivery(token)
         self.assertTrue(attempted)
-        edit_mock.assert_called_once()
-        send_mock.assert_called_once()
+        publish_mock.assert_called_once()
         delivery = db.get_organize_confirmation_delivery(token)
         self.assertEqual(delivery["status"], "retry_wait")
         self.assertEqual(delivery["attempts"], 1)
@@ -579,18 +597,16 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 (db.now(), token),
             )
         with patch(
-            "app.modules.organize_confirmations.edit_event", return_value=True
-        ) as retry_edit, patch(
-            "app.modules.organize_confirmations.send_event"
-        ) as retry_send:
+            "app.modules.organize_confirmations.publish_confirmation_event",
+            return_value=True,
+        ) as retry_publish:
             self.assertTrue(
                 confirmation_module._dispatch_due_confirmation_delivery(token)
             )
             self.assertFalse(
                 confirmation_module._dispatch_due_confirmation_delivery(token)
             )
-        retry_edit.assert_called_once()
-        retry_send.assert_not_called()
+        retry_publish.assert_called_once()
         self.assertEqual(
             db.get_organize_confirmation_delivery(token)["status"], "sent"
         )
@@ -718,10 +734,6 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 return plans, ({"moved": 1} if not kwargs["dry_run"] else {})
 
             @staticmethod
-            def notify_directory_results(*_args, **_kwargs):
-                calls.append("notified")
-
-            @staticmethod
             def trigger_post_actions(*_args, **kwargs):
                 calls.append("post_actions")
                 post_action_kwargs.append(dict(kwargs))
@@ -744,8 +756,9 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         fake_scoped = SimpleNamespace(begin_source_scan=lambda: calls.append("scan"))
         with patch(
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
-        ) as _manager_patch:
+        ):
             start_confirmation(token, 0, chat_id="100")
+        published = []
         with patch(
             "app.modules.organize_confirmations.OrganizeRules.from_config",
             return_value=rules,
@@ -762,23 +775,23 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             "app.modules.organize_confirmations.FixedMatchScraper",
             return_value=SimpleNamespace(),
         ), patch(
-            "app.modules.organize_confirmations.Organizer", FakeOrganizer
+            "app.modules.organize_confirmations.Organizer", FakeOrganizer,
         ), patch(
-            "app.modules.organize_confirmations.get", return_value="8"
+            "app.modules.organize_confirmations.get", return_value="8",
         ), patch(
-            "app.modules.organize_confirmations.edit_event", return_value=True
-        ) as edit_mock:
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
             result = callbacks[0]()
         self.assertEqual(result["stats"], {"moved": 1})
         self.assertEqual(
             [item for item in calls if isinstance(item, tuple)],
             [("organize", True), ("organize", False)],
         )
-        self.assertIn("notified", calls)
         self.assertIn("post_actions", calls)
-        self.assertEqual(len(post_action_kwargs), 1)
-        self.assertFalse(post_action_kwargs[0]["notify_result"])
-        self.assertEqual(post_action_kwargs[0]["strm_debounce_seconds"], 8)
         self.assertEqual(len(confirmation_calls), 1)
         args, kwargs = confirmation_calls[0]
         self.assertEqual(args[:5], (
@@ -786,10 +799,13 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         ))
         self.assertEqual(kwargs["parent_path"], "长瀞同学 2nd Attack")
         self.assertEqual(kwargs["rejected_tmdb_ids"], ["999999"])
+        self.assertFalse(post_action_kwargs[0]["notify_result"])
+        self.assertEqual(post_action_kwargs[0]["strm_debounce_seconds"], 8)
+        thread_ref = post_action_kwargs[0]["notification_threads"][0]
+        self.assertEqual(thread_ref["topic"], "confirmation")
+        self.assertEqual(thread_ref["token"], token)
         self.assertEqual(db.get_organize_confirmation(token)["status"], "completed")
-        terminal_event = edit_mock.call_args.args[0]
-        self.assertIn("人工确认整理完成", str(terminal_event.title))
-        self.assertEqual(edit_mock.call_args.kwargs, {"chat_id": "100", "message_id": 77})
+        self.assertIn("人工确认整理完成", published[-1].title)
 
     def test_snapshot_conflict_is_terminal_and_requires_new_scan(self):
         rules = OrganizeRules()
@@ -805,23 +821,30 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         )
         with patch(
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
-        ) as _manager_patch:
+        ):
             start_confirmation(token, 0, chat_id="100")
         missing_client = SimpleNamespace(file_info=lambda _file_id: None)
+        published = []
         with patch(
             "app.modules.organize_confirmations.OrganizeRules.from_config",
             return_value=rules,
         ), patch(
             "app.modules.organize_confirmations.GuangYaClient",
             return_value=missing_client,
-        ), patch("app.modules.organize_confirmations.send_event") as send_mock:
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
             with self.assertRaisesRegex(Exception, "已不存在"):
                 callbacks[0]()
         row = db.get_organize_confirmation(token)
         self.assertEqual(row["status"], "failed")
-        event = send_mock.call_args.args[0]
-        self.assertFalse(event.actions)
-        self.assertIn("重新执行整理", str(event.footer))
+        event = published[-1]
+        self.assertIn("重新执行整理生成新候选", event.footer)
+        self.assertEqual(event.actions, ())
 
     def test_confirmation_event_uses_relaxed_episode_summary_layout(self):
         event = confirmation_event(
@@ -849,67 +872,74 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
     def test_task_notification_groups_episodes_and_keeps_confirmation_card_separate(self):
         group = self._group()
         stats = {
-            "total": 3, "moved": 2, "need_confirm": 1,
-            "skipped": 0, "failed": 0, "metadata_moved": 0,
+            "task_id": "task-grouped", "total": 3, "moved": 2,
+            "need_confirm": 1, "skipped": 0, "failed": 0,
+            "metadata_moved": 0,
             "media_items": [
-                {
-                    "tmdb_id": "105556", "media_type": "tv",
-                    "title": "不要欺负我，长瀞同学", "year": "2021",
-                    "season": 2, "episode": 1, "source": "下载",
-                    "filename": "Nagatoro.S02E01.1080p.mkv",
-                },
-                {
-                    "tmdb_id": "105556", "media_type": "tv",
-                    "title": "不要欺负我，长瀞同学", "year": "2021",
-                    "season": 2, "episode": 9, "source": "下载",
-                    "filename": "Nagatoro.S02E09.1080p.mkv",
-                },
+                {"tmdb_id": "105556", "media_type": "tv",
+                 "title": "不要欺负我，长瀞同学", "year": "2021",
+                 "season": 2, "episode": 1},
+                {"tmdb_id": "105556", "media_type": "tv",
+                 "title": "不要欺负我，长瀞同学", "year": "2021",
+                 "season": 2, "episode": 9},
             ],
             "confirmation_groups": [group],
         }
-        sent_text: list[str] = []
+        summaries = []
+        confirmations = []
         with patch(
-            "app.modules.organize_notification_outbox.deliver_organize_notification",
-            side_effect=lambda key, text, chat_id="": sent_text.append(text) or True,
-        ) as deliver, patch(
-            "app.notifier.send_event"
-        ) as send_event:
-            Organizer.notify_task_results(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: summaries.append(event) or True,
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                confirmations.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
+            self.assertTrue(Organizer.notify_task_results(
                 stats, OrganizeRules(), source_name="2 个源目录", chat_id="100"
-            )
+            ))
 
-        deliver.assert_called_once()
-        rendered = sent_text[0]
-        self.assertIn("光鸭整理部分完成", rendered)
-        self.assertIn("<b>来源目录</b>  2 个源目录", rendered)
-        self.assertNotIn("<b>范围</b>", rendered)
-        self.assertIn("E01、E09", rendered)
-        self.assertEqual(deliver.call_args.kwargs["chat_id"], "100")
-        send_event.assert_called_once()
-        event = send_event.call_args.args[0]
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(len(confirmations), 1)
+        summary = summaries[0]
+        self.assertTrue(any("S02" in line and "E01" in line and "E09" in line for line in summary.lines))
+        self.assertIn(("人工确认", "1 个文件 / 1 组按钮卡"), summary.fields)
+        event = confirmations[0]
         self.assertEqual(event.title, "⚠️ 待确认媒体 1/1")
-        self.assertEqual(len(event.actions), 2)
-        self.assertRegex(event.actions[0].callback_data, r"^orgc:[A-Za-z0-9_-]+:0$")
+        self.assertIn(("剧集", "第 2 季 · E04 · 共 1 个视频"), event.fields)
+        self.assertTrue(event.actions)
 
     def test_directory_notification_creates_clickable_candidate_event(self):
         group = self._group()
         stats = {
-            "directories": {
-                group["directory"]: {
-                    "total": 1, "moved": 0, "metadata_moved": 0,
-                    "skipped": 0, "need_confirm": 1, "failed": 0,
-                }
-            },
-            "confirmation_groups": [group],
-            "media_items": [],
+            "task_id": "directory-confirmation",
+            "directories": {group["directory"]: {
+                "total": 1, "moved": 0, "metadata_moved": 0,
+                "skipped": 0, "need_confirm": 1, "failed": 0,
+            }},
+            "confirmation_groups": [group], "media_items": [],
         }
-        with patch("app.notifier.send_event") as send_mock:
+        summaries = []
+        confirmations = []
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: summaries.append(event) or True,
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                confirmations.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
             Organizer.notify_directory_results(
                 stats, OrganizeRules(), source_name="下载", chat_id="100"
             )
-        self.assertEqual(send_mock.call_count, 1)
-        event = send_mock.call_args.args[0]
-        self.assertEqual(event.title, "⚠️ 发现需要确认的媒体")
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(len(confirmations), 1)
+        event = confirmations[0]
+        self.assertEqual(event.title, "⚠️ 待确认媒体 1/1")
         self.assertEqual(event.layout, "relaxed")
         self.assertIn(("剧集", "第 2 季 · E04 · 共 1 个视频"), event.fields)
         self.assertEqual(len(event.actions), 2)
@@ -1030,17 +1060,9 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         self.assertTrue(db.link_download_request_to_local_media_task(
             request_id, self.task_id, "/downloads/Movie.2026.mkv"
         ))
-        self.assertEqual(
-            db.update_download_request_for_local_media_task(
-                self.task_id, "requires_manual", error="匹配置信度不足"
-            ),
-            1,
+        db.update_download_request_for_local_media_task(
+            self.task_id, "requires_manual", error="匹配置信度不足"
         )
-        self.assertEqual(
-            db.get_download_request(request_id)["local_import_status"],
-            "requires_manual",
-        )
-
         actions = self._actions()
         token = actions[0].callback_data.split(":")[1]
         callbacks = []
@@ -1058,28 +1080,31 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
                 task_id, owner=owner, status="completed", completed_at=db.now()
             )
             return {
-                "status": "completed",
-                "task_id": task_id,
+                "status": "completed", "task_id": task_id,
                 "moved": ["/library/Movie.2026.mkv"],
-                "deleted_junk": [],
-                "warnings": [],
+                "deleted_junk": [], "warnings": [],
+                "media_refresh_status": "completed",
             }
 
-        service = SimpleNamespace(
-            inspect_source=lambda *_args: {"digest": "digest-1"},
-            execute_task=execute,
-        )
         scheduler = SimpleNamespace(
-            service=service,
+            service=SimpleNamespace(
+                inspect_source=lambda *_args: {"digest": "digest-1"},
+                execute_task=execute,
+            ),
             qb_factory=lambda: self.fail("无 qB 任务时不应创建客户端"),
         )
+        published = []
         with patch(
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
         ), patch(
             "app.modules.local_media_scheduler.get_local_media_scheduler",
             return_value=scheduler,
         ), patch(
-            "app.modules.organize_confirmations.send_event", return_value=True
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
         ):
             queued = start_confirmation(token, 0, chat_id="100")
             worker_result = callbacks[0]()
@@ -1092,9 +1117,8 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         self.assertEqual(request["local_import_error"], "")
         self.assertTrue(request["local_import_completed_at"])
         self.assertEqual(db.get_organize_confirmation(token)["status"], "completed")
-        delivery = db.get_organize_confirmation_delivery(token)
-        self.assertEqual(delivery["status"], "sent")
-        self.assertIn("本地媒体确认整理完成", str(delivery["event_json"]))
+        self.assertIn("本地媒体确认整理完成", published[-1].title)
+        self.assertIn(("媒体库", "已刷新"), published[-1].fields)
 
     def test_local_confirmation_failure_settles_linked_download_request(self):
         request_id, _created = db.create_download_request(
@@ -1129,7 +1153,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
             "app.modules.local_media_scheduler.get_local_media_scheduler",
             return_value=scheduler,
         ), patch(
-            "app.modules.organize_confirmations.send_event", return_value=True
+            "app.modules.organize_confirmations.publish_confirmation_event", return_value=True
         ):
             start_confirmation(token, 0, chat_id="100")
             with self.assertRaisesRegex(RuntimeError, "归档写入失败"):
@@ -1164,7 +1188,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
             "app.modules.local_media_scheduler.get_local_media_scheduler",
             return_value=scheduler,
         ), patch(
-            "app.modules.organize_confirmations.send_event", return_value=True
+            "app.modules.organize_confirmations.publish_confirmation_event", return_value=True
         ):
             start_confirmation(token, 0, chat_id="100")
             with self.assertRaisesRegex(ValueError, "源文件在通知后发生变化"):
@@ -1181,7 +1205,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         token = actions[0].callback_data.split(":")[1]
 
         with patch(
-            "app.modules.organize_confirmations.send_event", return_value=True
+            "app.modules.organize_confirmations.publish_confirmation_event", return_value=True
         ):
             cancel_confirmation(token, chat_id="100")
 

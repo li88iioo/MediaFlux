@@ -1,6 +1,7 @@
 """RSS 订阅周期调度器。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -9,7 +10,7 @@ import time
 from app import database as db
 from app.logger import get_logger, log_throttled
 from app.modules.rss import RSSEngine, rss_subscription_refresh_revision
-from app.notifier import NotificationEvent, send_event
+from app.notifier import NotificationEvent
 
 logger = get_logger(__name__)
 _MAX_CONCURRENT_REFRESHES = 4
@@ -71,12 +72,24 @@ class RSSScheduler:
             return
         name = str(subscription["name"] or f"订阅 #{sub_id}") if subscription else f"订阅 #{sub_id}"
         try:
-            delivered = send_event(
-                NotificationEvent(
-                    "RSS 周期任务需要处理",
-                    fields=(("订阅", name), *tuple(fields)),
-                )
+            from app.modules.telegram_notification_center import publish_notification_event
+            from app.modules.telegram_notification_policy import (
+                NotificationImportance, NotificationTopic,
             )
+
+            digest = hashlib.sha256(
+                self._serialize_signature(signature).encode("utf-8")
+            ).hexdigest()[:20]
+            delivered = bool(publish_notification_event(
+                f"rss-alert:{sub_id}:{digest}",
+                NotificationEvent(
+                    "⚠️ RSS 周期任务需要处理",
+                    fields=(("订阅", name), *tuple(fields)),
+                    footer="相同问题只提醒一次；恢复后再次发生会重新提醒。",
+                ),
+                topic=NotificationTopic.RSS,
+                importance=NotificationImportance.ERROR,
+            ))
         except Exception as exc:
             logger.warning(
                 "RSS 周期告警发送异常 sub#%s type=%s",

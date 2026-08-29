@@ -205,8 +205,8 @@ def _normalize_telegram_agent_user_ids(value: Any) -> str:
 
 def _validate_telegram_agent_updates(data: dict[str, Any]) -> dict[str, str]:
     relevant = {
-        "TG_BOT_TOKEN", "TG_CHAT_ID", "TG_AGENT_ENABLED",
-        "TG_AGENT_ALLOWED_USER_IDS",
+        "TG_BOT_TOKEN", "TG_CHAT_ID", "TG_NOTIFICATION_ENABLED",
+        "TG_NOTIFICATION_LEVEL", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS",
     }
     if not relevant & data.keys():
         return {}
@@ -227,6 +227,15 @@ def _validate_telegram_agent_updates(data: dict[str, Any]) -> dict[str, str]:
         raise ValueError("Telegram Chat ID 必须是数字会话 ID")
 
     updates: dict[str, str] = {}
+    if "TG_NOTIFICATION_ENABLED" in data:
+        updates["TG_NOTIFICATION_ENABLED"] = _normalize_discovery_boolean(
+            "TG_NOTIFICATION_ENABLED", data["TG_NOTIFICATION_ENABLED"]
+        )
+    if "TG_NOTIFICATION_LEVEL" in data:
+        level = str(data["TG_NOTIFICATION_LEVEL"] or "standard").strip().lower()
+        if level not in {"essential", "standard", "detailed"}:
+            raise ValueError("TG_NOTIFICATION_LEVEL 必须是 essential、standard 或 detailed")
+        updates["TG_NOTIFICATION_LEVEL"] = level
     if "TG_AGENT_ENABLED" in data:
         updates["TG_AGENT_ENABLED"] = _normalize_discovery_boolean(
             "TG_AGENT_ENABLED", data["TG_AGENT_ENABLED"]
@@ -976,7 +985,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         "TG_QB_CATEGORY", "TG_QB_SAVE_PATH",
         "TMDB_API_KEY", "TMDB_API_URL",
         "TMDB_MATCH_MODE", "PROXY_URL", "TG_BOT_TOKEN", "TG_CHAT_ID",
-        "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS", "AGENT_ENABLED",
+        "TG_NOTIFICATION_ENABLED", "TG_NOTIFICATION_LEVEL", "TG_AGENT_ENABLED", "TG_AGENT_ALLOWED_USER_IDS", "AGENT_ENABLED",
         *_AI_RECOGNITION_KEYS,
         *_ORGANIZE_TAVILY_KEYS,
         *_ORGANIZE_POLICY_KEYS,

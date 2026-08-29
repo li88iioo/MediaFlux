@@ -12,6 +12,7 @@ from app.modules.agent_library_patrol_notifications import (
     serialize_patrol_notification_payload,
     send_library_patrol_notification,
 )
+from app.modules.telegram_notification_center import NotificationPublishResult
 from app.notifier import render_event
 
 
@@ -107,8 +108,11 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
             "app.modules.agent_library_patrol_notifications.get",
             return_value="",
         ), patch(
-            "app.modules.agent_library_patrol_notifications.send_event",
-            side_effect=lambda event: captured.append(event) or True,
+            "app.modules.telegram_notification_center.publish_notification_event",
+            side_effect=lambda _key, event, **_kwargs: (
+                captured.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
         ):
             self.assertTrue(send_library_patrol_notification(_projection()))
         self.assertEqual(captured[0].actions, ())
@@ -124,8 +128,11 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
             "app.modules.agent_library_patrol_notifications.get",
             side_effect=lambda key, default="": values.get(key, default),
         ), patch(
-            "app.modules.agent_library_patrol_notifications.send_event",
-            side_effect=lambda event: captured.append(event) or True,
+            "app.modules.telegram_notification_center.publish_notification_event",
+            side_effect=lambda _key, event, **_kwargs: (
+                captured.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
         ):
             self.assertTrue(send_library_patrol_notification(_projection()))
         self.assertEqual(

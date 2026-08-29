@@ -6,6 +6,7 @@ Token 或会话 ID 时静默降级为日志；配置热更新由 ``app.bot.resta
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import os
@@ -164,6 +165,7 @@ class TelegramSendResult:
     error: str = ""
     status_code: int = 0
     partially_delivered: bool = False
+    message_id: int = 0
 
     @property
     def outcome_unknown(self) -> bool:
@@ -476,6 +478,12 @@ def get_bot():
     return _bot
 
 
+def notification_target_chat_id(chat_id: Optional[str] = None) -> str:
+    """解析主动通知的实际目标会话，不暴露配置读取细节给业务模块。"""
+    _init()
+    return str(chat_id or _chat_id or "").strip()
+
+
 def render_event(event: NotificationEvent) -> str:
     """把结构化事件渲染为 Telegram HTML，并转义全部动态内容。"""
     relaxed = str(event.layout or "default") == "relaxed"
@@ -651,30 +659,47 @@ def _send_text(bot, target: str, text: str, *, reply_markup=None) -> bool:
     return True
 
 
-def _partial_delivery(result: TelegramSendResult) -> TelegramSendResult:
+def _partial_delivery(
+    result: TelegramSendResult, *, message_id: int = 0,
+) -> TelegramSendResult:
     return TelegramSendResult(
         ok=False,
         retry_after_seconds=result.retry_after_seconds,
         error=result.error,
         status_code=result.status_code,
         partially_delivered=True,
+        message_id=int(message_id or result.message_id or 0),
     )
 
 
 def _send_text_result(bot, target: str, text: str, *, reply_markup=None) -> TelegramSendResult:
     chunks = split_message(text)
     sent = 0
+    last_message_id = 0
     try:
         for index, chunk in enumerate(chunks):
             kwargs = {
                 "reply_markup": reply_markup
             } if reply_markup is not None and index == len(chunks) - 1 else {}
-            bot.send_message(target, chunk, **kwargs)
+            message = bot.send_message(target, chunk, **kwargs)
+            try:
+                last_message_id = int(getattr(message, "message_id", 0) or 0)
+            except (TypeError, ValueError):
+                last_message_id = 0
             sent += 1
-        return TelegramSendResult(ok=True)
+        return TelegramSendResult(ok=True, message_id=last_message_id)
     except Exception as exc:
         result = _telegram_send_error(exc)
-        return _partial_delivery(result) if sent else result
+        if sent:
+            result = TelegramSendResult(
+                ok=False,
+                retry_after_seconds=result.retry_after_seconds,
+                error=result.error,
+                status_code=result.status_code,
+                partially_delivered=True,
+                message_id=last_message_id,
+            )
+        return result
 
 
 def _telegram_send_error(exc: Exception) -> TelegramSendResult:
@@ -743,7 +768,11 @@ def send_result(
 
     chunks = split_message(text, _CAPTION_LIMIT)
     try:
-        bot.send_photo(target, image, caption=chunks[0])
+        photo_message = bot.send_photo(target, image, caption=chunks[0])
+        try:
+            last_message_id = int(getattr(photo_message, "message_id", 0) or 0)
+        except (TypeError, ValueError):
+            last_message_id = 0
     except Exception as exc:
         result = _telegram_send_error(exc)
         if not _photo_failure_allows_text_fallback(result):
@@ -761,10 +790,16 @@ def send_result(
 
     try:
         for chunk in chunks[1:]:
-            bot.send_message(target, chunk)
-        return TelegramSendResult(ok=True)
+            message = bot.send_message(target, chunk)
+            try:
+                last_message_id = int(getattr(message, "message_id", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        return TelegramSendResult(ok=True, message_id=last_message_id)
     except Exception as exc:
-        result = _partial_delivery(_telegram_send_error(exc))
+        result = _partial_delivery(
+            _telegram_send_error(exc), message_id=last_message_id,
+        )
         logger.error(
             "Telegram 结果续发失败 type=%s status=%s retry_after=%s error=%s",
             type(exc).__name__, result.status_code or "-",
@@ -790,33 +825,56 @@ def _telegram_message_is_unchanged(exc: Exception) -> bool:
     )
 
 
-def edit_event(
+def edit_event_result(
     event: NotificationEvent, *, chat_id: str, message_id: int | str
-) -> bool:
-    """原位更新一条结构化 Telegram 消息；失败时由调用方决定是否另发回执。"""
+) -> TelegramSendResult:
+    """原位更新结构化消息，并保留限流、结果未知与消息身份语义。"""
     bot = get_bot()
     target = str(chat_id or "").strip()
     try:
         resolved_message_id = int(message_id)
     except (TypeError, ValueError):
-        return False
+        return TelegramSendResult(ok=False, error="InvalidMessageId", status_code=400)
     if not bot or not target or resolved_message_id <= 0:
-        return False
+        return TelegramSendResult(
+            ok=False, error="Telegram Bot、Chat ID 或消息 ID 无效", status_code=503,
+        )
     text = render_event(event)
     if len(split_message(text)) != 1:
         logger.warning("Telegram 原位更新内容过长，改用新消息回执")
-        return False
+        return TelegramSendResult(
+            ok=False, error="MessageTooLongForEdit", status_code=400,
+            message_id=resolved_message_id,
+        )
     try:
         bot.edit_message_text(
             text, target, resolved_message_id, reply_markup=_event_markup(event)
         )
-        return True
+        return TelegramSendResult(ok=True, message_id=resolved_message_id)
     except Exception as exc:
         if _telegram_message_is_unchanged(exc):
             logger.debug("Telegram 原位消息已是目标内容，按幂等成功处理")
-            return True
-        logger.warning("Telegram 原位更新失败 type=%s", type(exc).__name__)
-        return False
+            return TelegramSendResult(ok=True, message_id=resolved_message_id)
+        result = _telegram_send_error(exc)
+        logger.warning(
+            "Telegram 原位更新失败 type=%s status=%s",
+            type(exc).__name__, result.status_code or "-",
+        )
+        return TelegramSendResult(
+            ok=False,
+            retry_after_seconds=result.retry_after_seconds,
+            error=result.error,
+            status_code=result.status_code,
+            partially_delivered=result.partially_delivered,
+            message_id=resolved_message_id,
+        )
+
+
+def edit_event(
+    event: NotificationEvent, *, chat_id: str, message_id: int | str
+) -> bool:
+    """兼容既有调用者的布尔编辑接口。"""
+    return bool(edit_event_result(event, chat_id=chat_id, message_id=message_id).ok)
 
 
 def send_event_result(
@@ -852,7 +910,13 @@ def send_event_result(
         photo_kwargs = {
             "reply_markup": reply_markup
         } if reply_markup is not None and len(caption_chunks) == 1 else {}
-        bot.send_photo(target, image_url, caption=caption_chunks[0], **photo_kwargs)
+        photo_message = bot.send_photo(
+            target, image_url, caption=caption_chunks[0], **photo_kwargs
+        )
+        try:
+            last_message_id = int(getattr(photo_message, "message_id", 0) or 0)
+        except (TypeError, ValueError):
+            last_message_id = 0
     except Exception as exc:
         result = _telegram_send_error(exc)
         if not _photo_failure_allows_text_fallback(result):
@@ -879,10 +943,16 @@ def send_event_result(
             kwargs = {
                 "reply_markup": reply_markup
             } if reply_markup is not None and index == len(caption_chunks) - 2 else {}
-            bot.send_message(target, chunk, **kwargs)
-        return TelegramSendResult(ok=True)
+            message = bot.send_message(target, chunk, **kwargs)
+            try:
+                last_message_id = int(getattr(message, "message_id", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        return TelegramSendResult(ok=True, message_id=last_message_id)
     except Exception as exc:
-        result = _partial_delivery(_telegram_send_error(exc))
+        result = _partial_delivery(
+            _telegram_send_error(exc), message_id=last_message_id,
+        )
         logger.error(
             "Telegram 图片通知续发失败 type=%s status=%s",
             type(exc).__name__, result.status_code or "-",
@@ -897,15 +967,27 @@ def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
 
 def notify_gcid_import_started(*, task_id: int, file_count: int, total_size: int,
                                retry: bool = False) -> None:
-    """发送 GCID 导入开始统计，不包含清单、GCID、凭据或私有响应。"""
-    send_event(NotificationEvent(
-        "GCID 重试开始" if retry else "GCID 导入开始",
-        fields=(
-            ("任务", f"#{int(task_id)}"),
-            ("文件", f"{max(0, int(file_count))} 个"),
-            ("体积", _format_size(max(0, int(total_size)))),
+    """登记 GCID 导入事务；终态会原位更新同一条消息。"""
+    from app.modules.telegram_notification_center import publish_notification_thread
+    from app.modules.telegram_notification_policy import (
+        NotificationImportance, NotificationTopic,
+    )
+
+    publish_notification_thread(
+        f"gcid:{int(task_id)}",
+        NotificationEvent(
+            "GCID 重试进行中" if retry else "GCID 导入进行中",
+            fields=(
+                ("任务", f"#{int(task_id)}"),
+                ("文件", f"{max(0, int(file_count))} 个"),
+                ("体积", _format_size(max(0, int(total_size)))),
+                ("状态", "正在导入"),
+            ),
+            footer="完成后会更新本条消息。",
         ),
-    ))
+        topic=NotificationTopic.GCID,
+        importance=NotificationImportance.RESULT,
+    )
 
 
 def notify_gcid_import_finished(*, task_id: int, status: str, success_count: int,
@@ -924,30 +1006,75 @@ def notify_gcid_import_finished(*, task_id: int, status: str, success_count: int
         path = str(_item_value(sample, "path", "") or "").strip()[:240]
         if path:
             lines.append(f"{path}：导入失败")
-    send_event(NotificationEvent(
-        title,
-        fields=(
-            ("任务", f"#{int(task_id)}"),
-            ("成功", f"{max(0, int(success_count))} 个"),
-            ("失败", f"{max(0, int(failed_count))} 个"),
+    from app.modules.telegram_notification_center import publish_notification_thread
+    from app.modules.telegram_notification_policy import (
+        NotificationImportance, NotificationTopic,
+    )
+
+    publish_notification_thread(
+        f"gcid:{int(task_id)}",
+        NotificationEvent(
+            title,
+            fields=(
+                ("任务", f"#{int(task_id)}"),
+                ("成功", f"{max(0, int(success_count))} 个"),
+                ("失败", f"{max(0, int(failed_count))} 个"),
+            ),
+            lines=tuple(lines),
         ),
-        lines=tuple(lines),
-    ))
+        topic=NotificationTopic.GCID,
+        importance=(
+            NotificationImportance.RESULT
+            if normalized == "success" else NotificationImportance.ERROR
+        ),
+    )
+
+
+def _publish_legacy_notification(
+    logical_prefix: str,
+    event: NotificationEvent,
+    *,
+    topic: str,
+) -> None:
+    """兼容旧插件入口，但禁止绕过统一策略与可靠 outbox。"""
+    from app.modules.telegram_notification_center import publish_notification_event
+    from app.modules.telegram_notification_policy import NotificationImportance
+
+    digest = hashlib.sha256(
+        render_event(event).encode("utf-8")
+    ).hexdigest()[:24]
+    publish_notification_event(
+        f"legacy-{logical_prefix}:{digest}",
+        event,
+        topic=topic,
+        importance=NotificationImportance.RESULT,
+    )
 
 
 def notify_organize_done(summary: str) -> None:
-    send_event(NotificationEvent("光鸭整理完成", lines=(summary,)))
+    _publish_legacy_notification(
+        "organize", NotificationEvent("光鸭整理完成", lines=(summary,)),
+        topic="organize",
+    )
 
 
 def notify_strm_done(summary: str) -> None:
-    send_event(NotificationEvent("STRM 同步完成", lines=(summary,)))
+    _publish_legacy_notification(
+        "strm", NotificationEvent("STRM 同步完成", lines=(summary,)),
+        topic="strm",
+    )
 
 
 def notify_download(source: str, title: str, path: str) -> None:
-    send_event(NotificationEvent(
-        "下载完成",
-        fields=(("来源", source), ("任务", title), ("路径", path)),
-    ))
+    safe_name = str(path or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    _publish_legacy_notification(
+        "download",
+        NotificationEvent(
+            "下载完成",
+            fields=(("来源", source), ("任务", title), ("文件", safe_name)),
+        ),
+        topic="download",
+    )
 
 
 def reset() -> None:

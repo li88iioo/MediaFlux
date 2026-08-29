@@ -6,6 +6,7 @@ OrganizeTaskManager 的统一写锁异步执行。历史或损坏快照只读展
 from __future__ import annotations
 
 import json
+import time
 import re
 import uuid
 from dataclasses import asdict, dataclass
@@ -1008,7 +1009,11 @@ class OrganizeCorrectionService:
         """人工纠偏提交成功后发送媒体卡片；失败只返回 warning。"""
         warnings: list[str] = []
         try:
-            from app.notifier import build_media_events, send_event
+            from app.notifier import build_media_events
+            from app.modules.telegram_notification_center import publish_notification_event
+            from app.modules.telegram_notification_policy import (
+                NotificationImportance, NotificationTopic,
+            )
             match = preview.get("match") or {}
             video = self._video(items)
             parsed = self.organizer._parse_media_fields(
@@ -1026,7 +1031,22 @@ class OrganizeCorrectionService:
                 "filename": preview.get("file_name"), "size": video.size,
             }
             events = build_media_events([media_item])
-            if not events or not all(send_event(event) for event in events):
+            logical_base = str(
+                preview.get("operation_token")
+                or preview.get("log_id")
+                or getattr(video, "log_id", "")
+                or getattr(video, "file_id", "")
+                or time.time_ns()
+            )
+            accepted = bool(events)
+            for index, event in enumerate(events, start=1):
+                accepted = bool(publish_notification_event(
+                    f"organize-correction:{logical_base}:{index}",
+                    event,
+                    topic=NotificationTopic.ORGANIZE,
+                    importance=NotificationImportance.RESULT,
+                )) and accepted
+            if not accepted:
                 warnings.append("人工识别媒体通知发送失败")
         except Exception as exc:
             warnings.append(f"人工识别媒体通知发送失败: {exc}")

@@ -12,6 +12,7 @@ from app.modules.agent_download_verification_notifications import (
     load_download_verification_payload,
     notify_download_verification_terminal,
 )
+from app.modules.telegram_notification_center import NotificationPublishResult
 from app.notifier import render_event
 from app.routes.api import save_config
 
@@ -93,7 +94,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
             "app.modules.agent_download_verification_notifications.config.get_bool",
             return_value=False,
         ), patch(
-            "app.modules.agent_download_verification_notifications.send"
+            "app.modules.telegram_notification_center.publish_notification_event"
         ) as sender:
             sent = notify_download_verification_terminal(
                 owner="tg:v1:100\x1f200",
@@ -123,9 +124,9 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
             "app.modules.agent_download_verification_notifications.config.get_bool",
             return_value=True,
         ), patch(
-            "app.modules.agent_download_verification_notifications.send",
-            return_value=True,
-        ) as sender:
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=NotificationPublishResult(True, delivered=True, status="sent"),
+        ) as publisher:
             sent = notify_download_verification_terminal(
                 owner="tg:v1:100\x1f200",
                 chat_id="100",
@@ -138,8 +139,9 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
             )
 
         self.assertTrue(sent)
-        sender.assert_called_once()
-        self.assertEqual(sender.call_args.kwargs["chat_id"], "100")
+        publisher.assert_called_once()
+        self.assertEqual(publisher.call_args.kwargs["chat_id"], "100")
+        self.assertEqual(publisher.call_args.args[1].fields[0], ("媒体", "The Show"))
 
     def test_revoked_route_never_calls_sender(self):
         base = {
@@ -159,7 +161,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
                 {**base, key: value},
                 clear=False,
             ), patch(
-                "app.modules.agent_download_verification_notifications.send"
+                "app.modules.telegram_notification_center.publish_notification_event"
             ) as sender:
                 sent = notify_download_verification_terminal(
                     owner="tg:v1:100\x1f200",
@@ -180,7 +182,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
             "app.modules.agent_download_verification_notifications.config.get_bool",
             return_value=True,
         ), patch(
-            "app.modules.agent_download_verification_notifications.send"
+            "app.modules.telegram_notification_center.publish_notification_event"
         ) as sender:
             sent = notify_download_verification_terminal(
                 owner="web:v1:abc",

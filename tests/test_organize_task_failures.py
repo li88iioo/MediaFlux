@@ -117,7 +117,10 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
         ), patch("app.modules.organize_tasks.db.add_task_run", return_value=77), patch(
             "app.modules.organize_tasks.db.finish_task_run"
-        ) as finish, patch("app.notifier.send_event", return_value=True) as send_event, self.assertLogs(
+        ) as finish, patch(
+            "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle",
+            return_value=True,
+        ) as send_event, self.assertLogs(
             "app.modules.organize_tasks", level="ERROR"
         ) as captured:
             result = manager.start(
@@ -140,6 +143,7 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         self.assertIn("ProgrammingError", finish.call_args.kwargs["error"])
         send_event.assert_called_once()
         self.assertEqual(send_event.call_args.kwargs["chat_id"], "12345")
+        self.assertEqual(send_event.call_args.args[0], result["task_id"])
         self.assertTrue(status["notification_sent"])
 
     def test_failure_keeps_progress_terminal_when_notification_delivery_fails(self):
@@ -151,7 +155,10 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
         ), patch("app.modules.organize_tasks.db.add_task_run", return_value=78), patch(
             "app.modules.organize_tasks.db.finish_task_run"
-        ), patch("app.notifier.send_event", return_value=False):
+        ), patch(
+            "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle",
+            return_value=False,
+        ):
             result = manager.start(
                 [{"id": "source", "name": "源目录"}],
                 OrganizeRules(target_dir_id="target"),

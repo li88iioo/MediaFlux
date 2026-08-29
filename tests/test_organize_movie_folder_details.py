@@ -429,10 +429,13 @@ class ManualCorrectionNotificationTests(unittest.TestCase):
             "file_name":"封神第二部：战火西岐.2025.1080p.SDR.H.265.AAC.2.0.mkv",
         }
         items=[CorrectionItem(1,"f1","video","p","old.mkv","p","old.mkv",10_000,"e")]
-        with patch("app.notifier.send_event", return_value=True) as sent:
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=True,
+        ) as sent:
             warnings=service._notify_reorganize_result(preview,items)
         self.assertEqual(warnings,[])
-        rendered=sent.call_args.args[0]
+        rendered=sent.call_args.args[1]
         self.assertIn("人工识别", str(rendered.fields))
         self.assertIn("电影 / 封神第二部", str(rendered.fields))
 
@@ -537,20 +540,28 @@ class StrmSchedulerDetailNotificationTests(unittest.TestCase):
             "directory": "电影/测试<&>",
             "filename": "测试<&>.strm",
         }]}
-        sent = []
-        with patch.object(scheduler, "get_bool", return_value=True), patch.object(
-            scheduler, "send_text", side_effect=lambda text, chat_id=None: sent.append(text) or True
-        ):
+        with patch.object(scheduler, "get_bool", return_value=True), patch(
+            "app.modules.telegram_notification_policy.allows_notification",
+            return_value=True,
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=True,
+        ) as sent:
             scheduler.STRMScheduler._notify_details(stats, "organize")
-        self.assertEqual(len(sent), 1)
-        self.assertIn("STRM 文件明细 1/1", sent[0])
-        self.assertIn("&lt;&amp;&gt;", sent[0])
-        self.assertNotIn("测试<&>", sent[0])
+        sent.assert_called_once()
+        from app.notifier import render_event
+
+        rendered = render_event(sent.call_args.args[1])
+        self.assertIn("STRM 文件明细 1/1", rendered)
+        self.assertIn("&lt;&amp;&gt;", rendered)
+        self.assertNotIn("测试<&>", rendered)
 
     def test_non_organize_trigger_does_not_send_file_details(self):
         from app.modules import scheduler
 
-        with patch.object(scheduler, "send_text") as sent:
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_event"
+        ) as sent:
             scheduler.STRMScheduler._notify_details(
                 {"changes": [{"action": "generated", "directory": "电影", "filename": "a.strm"}]},
                 "manual",

@@ -66,6 +66,7 @@ class DownloadLibraryVerificationScheduler:
     ) -> None:
         self._audit_executor = audit_executor or self._default_audit_executor
         self._terminal_notifier = terminal_notifier or notify_download_verification_terminal_result
+        self._terminal_notifier_uses_request_id = terminal_notifier is None
         self._notification_enabled_override = terminal_notifier is not None
         self.interval = max(0.1, float(interval))
         self.max_attempts = max(1, min(int(max_attempts), len(_RETRY_DELAYS)))
@@ -633,11 +634,16 @@ class DownloadLibraryVerificationScheduler:
                             next_attempt_at=current,
                         )
                         return 0
-                    raw_result = self._terminal_notifier(
-                        owner=owner,
-                        chat_id=chat_id,
-                        **payload,
-                    )
+                    if self._terminal_notifier_uses_request_id:
+                        raw_result = self._terminal_notifier(
+                            owner=owner, chat_id=chat_id,
+                            request_id=int(item["request_id"]), **payload,
+                        )
+                    else:
+                        # 外部注入器沿用既有公开签名，避免插件被内部关联 ID 破坏。
+                        raw_result = self._terminal_notifier(
+                            owner=owner, chat_id=chat_id, **payload,
+                        )
                 result = (
                     raw_result if isinstance(raw_result, TelegramSendResult)
                     else TelegramSendResult(
@@ -728,7 +734,12 @@ class DownloadLibraryVerificationScheduler:
             return True
         from app import config
 
-        return config.get_bool("AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED", True)
+        from app.modules.telegram_notification_policy import notifications_enabled
+
+        return (
+            config.get_bool("AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED", True)
+            and notifications_enabled()
+        )
 
     def _record(self, job, *, target: str) -> RecentDownloadSubmission:
         verification = RecentDownloadVerification(

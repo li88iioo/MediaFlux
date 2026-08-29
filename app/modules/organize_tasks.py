@@ -96,6 +96,29 @@ def _credential_snapshot_is_current(client: Any, expected_generation: int | None
     return logged_in and generation == int(expected_generation)
 
 
+def _publish_download_lifecycles(
+    request_ids: list[int] | tuple[int, ...],
+    *,
+    stats: dict | None = None,
+) -> bool:
+    accepted = True
+    if not request_ids:
+        return False
+    try:
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        for request_id in request_ids:
+            accepted = bool(
+                publish_download_lifecycle(int(request_id), stats=stats)
+            ) and accepted
+    except Exception as exc:
+        logger.warning(
+            "整理链路更新下载事务通知失败 type=%s", type(exc).__name__
+        )
+        return False
+    return accepted
+
+
 _SOURCE_ROOT_CLEANUP_UNSAFE_STATS = (
     "failed",
     "scan_errors",
@@ -345,6 +368,7 @@ class OrganizeTaskManager:
                 organize_error="", organize_finished_at=None,
                 strm_status="pending", strm_error="", strm_finished_at=None,
             )
+        _publish_download_lifecycles(request_ids)
         try:
             worker = threading.Thread(
                 target=self._run,
@@ -388,6 +412,7 @@ class OrganizeTaskManager:
                         )
                     except Exception:
                         logger.exception("记录整理线程启动失败请求状态异常 request=%s", request_id)
+                _publish_download_lifecycles(request_ids)
                 if run_id:
                     try:
                         failed_result = build_organize_result(
@@ -1558,12 +1583,26 @@ class OrganizeTaskManager:
                     download_request_ids=download_request_ids,
                     notify_result=False,
                 )
-                notification_sent = bool(Organizer.notify_task_results(
-                    aggregate,
-                    rules,
-                    source_name=f"{len(source_results)} 个源目录",
-                    chat_id=chat_id,
-                ))
+                if download_request_ids:
+                    # 下载来源复用同一条下载入库事务消息；这里只额外发送
+                    # 必须由用户操作的候选卡。
+                    lifecycle_sent = _publish_download_lifecycles(
+                        list(download_request_ids), stats=aggregate,
+                    )
+                    confirmations_sent = Organizer.notify_task_confirmations(
+                        aggregate,
+                        rules,
+                        source_name=f"{len(source_results)} 个源目录",
+                        chat_id=chat_id,
+                    )
+                    notification_sent = bool(lifecycle_sent and confirmations_sent)
+                else:
+                    notification_sent = bool(Organizer.notify_task_results(
+                        aggregate,
+                        rules,
+                        source_name=f"{len(source_results)} 个源目录",
+                        chat_id=chat_id,
+                    ))
             status = "stopped" if stopped else ("partial" if partial else "completed")
             message = (
                 "整理任务已停止" if stopped
@@ -1640,6 +1679,10 @@ class OrganizeTaskManager:
                         "strm_finished_at": db.now(),
                     })
                 db.update_download_request(request_id, **fields)
+            if download_request_ids:
+                _publish_download_lifecycles(
+                    list(download_request_ids), stats=aggregate,
+                )
             if run_id:
                 try:
                     db.finish_task_run(
@@ -1673,26 +1716,36 @@ class OrganizeTaskManager:
                     strm_finished_at=db.now(),
                 )
             notification_sent = False
-            try:
-                from app.notifier import NotificationEvent, send_event
-                notification_sent = bool(send_event(
-                    NotificationEvent(
-                        "❌ 光鸭整理任务失败",
-                        fields=(
-                            ("任务", task_id),
-                            ("当前目录", current_source or "未记录"),
-                            ("状态", "可能已部分执行，请先核对整理日志"),
-                        ),
-                        footer="已停止后续 STRM 同步和媒体库刷新，请勿直接重复执行。",
-                    ),
-                    chat_id=chat_id or None,
-                ))
-            except Exception as notify_exc:
-                logger.error(
-                    "发送整理失败通知失败 task_id=%s type=%s",
-                    task_id,
-                    type(notify_exc).__name__,
+            if download_request_ids:
+                notification_sent = _publish_download_lifecycles(
+                    list(download_request_ids), stats=aggregate,
                 )
+            else:
+                try:
+                    from app.modules.telegram_organize_lifecycle import (
+                        publish_organize_lifecycle,
+                    )
+
+                    failed_stats = dict(aggregate)
+                    failed_stats["failed"] = max(
+                        1, int(failed_stats.get("failed", 0) or 0)
+                    )
+                    failed_stats["task_id"] = task_id
+                    notification_sent = bool(publish_organize_lifecycle(
+                        task_id,
+                        failed_stats,
+                        source_name=current_source or f"{len(source_results)} 个源目录",
+                        chat_id=chat_id,
+                        topic_enabled=rules.notify_enabled,
+                        strm_status="未执行",
+                        media_refresh="未触发",
+                    ))
+                except Exception as notify_exc:
+                    logger.error(
+                        "发送整理失败通知失败 task_id=%s type=%s",
+                        task_id,
+                        type(notify_exc).__name__,
+                    )
             persistence_error = f"{type(exc).__name__}: {str(exc)[:500]}"
             structured_result = build_organize_result(
                 aggregate,

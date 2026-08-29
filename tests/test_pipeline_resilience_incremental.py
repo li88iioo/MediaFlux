@@ -226,7 +226,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             "organize_started": 0,
         }
         with patch("app.database.update_download_request_and_sync_media_admission") as update, patch(
-            "app.modules.download_tracker.send",
+            "app.modules.download_tracker.DownloadTracker._publish_lifecycle",
         ):
             tracker._update_request(row, [], [], qb_available=False)
         update.assert_not_called()
@@ -241,7 +241,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             "source_value": "magnet:?xt=urn:btih:gyhash", "organize_started": 0,
         }
         with patch("app.database.update_download_request_and_sync_media_admission") as update, patch(
-            "app.modules.download_tracker.send",
+            "app.modules.download_tracker.DownloadTracker._publish_lifecycle",
         ):
             tracker._update_request(dict(base_row), [], [], gy_available=True)
         self.assertIn("gy_task_missing_since", update.call_args.kwargs)
@@ -250,7 +250,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         stale = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
         aged_row = {**base_row, "gy_task_missing_since": stale}
         with patch("app.database.update_download_request_and_sync_media_admission") as update, patch(
-            "app.modules.download_tracker.send",
+            "app.modules.download_tracker.DownloadTracker._publish_lifecycle",
         ):
             tracker._update_request(aged_row, [], [], gy_available=True)
         self.assertEqual(update.call_args.kwargs["gy_status"], "manual_review")
@@ -265,7 +265,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             "organize_started": 0,
         }
         with patch("app.database.update_download_request_and_sync_media_admission") as update, patch(
-            "app.modules.download_tracker.send",
+            "app.modules.download_tracker.DownloadTracker._publish_lifecycle",
         ):
             tracker._update_request(row, [], [], qb_available=True)
         self.assertEqual(update.call_args.kwargs["qb_status"], "manual_review")
@@ -285,7 +285,7 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         )
         tracker = DownloadTracker()
         row = db.get_download_request(request_id)
-        with patch("app.modules.download_tracker.send", return_value=False):
+        with patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle", return_value=False):
             tracker._update_request(row, [], [], qb_available=True)
 
         pending = db.get_download_request(request_id)
@@ -299,15 +299,17 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
             notification_next_retry_at="2000-01-01 00:00:00",
         )
         retry_row = db.get_download_request(request_id)
-        with patch("app.modules.download_tracker.send", return_value=True) as send:
+        with patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle", return_value=True) as send:
             tracker._update_request(retry_row, [], [], qb_available=True)
 
         delivered = db.get_download_request(request_id)
         self.assertEqual(delivered["notification_delivery_status"], "sent")
         self.assertTrue(delivered["notification_sent_at"])
-        send.assert_called_once()
-        event = send.call_args.args[0]
-        self.assertEqual(dict(event.fields)["任务"], "Notify")
+        send.assert_called_once_with(request_id)
+        from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
+
+        event = build_download_lifecycle_event(delivered)
+        self.assertEqual(dict(event.fields)["媒体"], "Notify")
 
     def test_manual_review_targets_require_explicit_successor_resubmit(self):
         request_id, _ = db.create_download_request(

@@ -9,9 +9,7 @@ from typing import Any
 
 from app.agent.library_patrol_status import validate_persisted_patrol_projection
 from app.config import get
-from app.notifier import (
-    NotificationAction, NotificationEvent, TelegramSendResult, send_event, send_event_result,
-)
+from app.notifier import NotificationAction, NotificationEvent, TelegramSendResult
 
 _FINGERPRINT_SCHEMA_VERSION = 1
 _MAX_PAYLOAD_BYTES = 32_768
@@ -129,16 +127,31 @@ def _patrol_actions_configured() -> bool:
 
 
 def send_library_patrol_notification_result(projection: Any) -> TelegramSendResult:
-    """发送安全结构化通知，并保留结果未知语义。"""
+    """把巡检结果交给统一通知中心，保留人工查询按钮。"""
     event = build_library_patrol_event(projection)
     if event.actions and not _patrol_actions_configured():
         event = replace(event, actions=())
-    return send_event_result(event)
+    from app.modules.telegram_notification_center import publish_notification_event
+    from app.modules.telegram_notification_policy import (
+        NotificationImportance, NotificationTopic, notifications_enabled,
+    )
+
+    if not notifications_enabled():
+        return TelegramSendResult(False, error="NotificationsDisabled", status_code=503)
+    fingerprint = build_patrol_result_fingerprint(projection)
+    outcome = publish_notification_event(
+        f"agent-library-patrol:{fingerprint}",
+        event,
+        topic=NotificationTopic.AGENT,
+        importance=NotificationImportance.ACTION,
+    )
+    return TelegramSendResult(
+        ok=bool(outcome),
+        error="" if outcome else str(outcome.status or "DeliveryFailed"),
+        status_code=0 if outcome else 503,
+    )
 
 
 def send_library_patrol_notification(projection: Any) -> bool:
     """兼容既有调用者与测试替身的布尔接口。"""
-    event = build_library_patrol_event(projection)
-    if event.actions and not _patrol_actions_configured():
-        event = replace(event, actions=())
-    return bool(send_event(event))
+    return bool(send_library_patrol_notification_result(projection).ok)

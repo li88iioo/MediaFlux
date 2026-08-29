@@ -20,10 +20,7 @@ from app.logger import get_logger, log_throttled
 from app.modules.naming import sanitize_name
 from app.modules.organize import OrganizeRules
 from app.modules.organize_tasks import get_organize_manager
-from app.notifier import NotificationEvent, send_event
-
-# 保留模块级 ``send`` 名称，兼容既有测试/补丁；实际发送仍走结构化 send_event。
-send = send_event
+from app.notifier import NotificationEvent
 
 logger = get_logger(__name__)
 
@@ -657,15 +654,7 @@ class DownloadTracker:
             request_id, attempts, delay, observed, error,
         )
         if first_notice:
-            send(
-                NotificationEvent(
-                    "⏳ 下载完成，等待云端文件落稳",
-                    fields=(("任务", self._row_value(row, "title", "") or "未命名任务"), ("状态", error)),
-                    footer="文件落稳后会自动进入串行整理，无需重复提交。",
-                    layout="relaxed",
-                ),
-                chat_id=str(DownloadTracker._row_value(row, "chat_id", "") or "") or None,
-            )
+            self._publish_lifecycle(request_id)
 
     @staticmethod
     def _fail_settle(row, message: str) -> None:
@@ -676,15 +665,7 @@ class DownloadTracker:
             strm_status="skipped", strm_error=message, strm_finished_at=db.now(), error=message,
         )
         logger.warning("光鸭下载落稳检查失败 request=%s detail=%s", request_id, message)
-        send(
-            NotificationEvent(
-                "⚠️ 自动入库需要人工核验",
-                fields=(("任务", DownloadTracker._row_value(row, "title", "") or "未命名任务"), ("原因", message)),
-                footer="已停止自动整理与后续 STRM 同步，请在下载任务的待处理列表中核验。",
-                layout="relaxed",
-            ),
-            chat_id=str(DownloadTracker._row_value(row, "chat_id", "") or "") or None,
-        )
+        DownloadTracker._publish_lifecycle(request_id)
 
     def _retain_staging_without_organize(self, row, reason: str) -> None:
         """保留无法安全收口的隔离目录，并让待处理页给出明确原因。"""
@@ -849,13 +830,7 @@ class DownloadTracker:
                 organize_finished_at=db.now(), strm_status="skipped",
                 strm_error=message, strm_finished_at=db.now(), error=message,
             )
-            send(
-                NotificationEvent(
-                    "⚠️ 自动入库未启动",
-                    fields=(("任务", DownloadTracker._row_value(row, "title", "") or "未命名任务"), ("原因", message)),
-                ),
-                chat_id=str(self._row_value(row, "chat_id", "") or "") or None,
-            )
+            self._publish_lifecycle(int(row["id"]))
             return
         if not db.claim_download_request_organize(int(row["id"])):
             logger.info(
@@ -870,15 +845,7 @@ class DownloadTracker:
             download_request_ids=[int(row["id"])],
         )
         if result.get("ok"):
-            send(
-                NotificationEvent(
-                    "🚀 下载完成，自动整理已启动",
-                    fields=(("任务", row["title"] or "未命名任务"),),
-                    footer="整理完成后将自动生成 STRM 并刷新媒体库。",
-                    layout="relaxed",
-                ),
-                chat_id=str(row["chat_id"] or "") or None,
-            )
+            self._publish_lifecycle(int(row["id"]))
         else:
             error = str(result.get("error") or "整理任务启动失败")
             if "正在运行" in error:
@@ -891,15 +858,7 @@ class DownloadTracker:
                     strm_status="pending", strm_error="",
                 )
                 if not already_queued:
-                    send(
-                        NotificationEvent(
-                            "⏳ 下载完成，整理已排队",
-                            fields=(("任务", row["title"] or "未命名任务"),),
-                            footer="当前整理完成后将自动处理本任务，不会并行扫描云盘。",
-                            layout="relaxed",
-                        ),
-                        chat_id=str(row["chat_id"] or "") or None,
-                    )
+                    self._publish_lifecycle(int(row["id"]))
             else:
                 attempts = int(self._row_value(row, "organize_attempts", 0) or 0) + 1
                 permanent = any(marker in error for marker in (
@@ -926,6 +885,7 @@ class DownloadTracker:
                         strm_status="skipped", strm_error=error,
                         strm_finished_at=db.now(), error=error,
                     )
+                self._publish_lifecycle(int(row["id"]))
 
     @staticmethod
     def _organize_retry_due(row) -> bool:
@@ -942,20 +902,24 @@ class DownloadTracker:
             return True
 
     @staticmethod
+    def _publish_lifecycle(request_id: int) -> bool:
+        try:
+            from app.modules.telegram_download_lifecycle import (
+                publish_download_lifecycle,
+            )
+
+            return bool(publish_download_lifecycle(int(request_id)))
+        except Exception as exc:
+            logger.warning(
+                "下载入库事务通知更新异常 request#%s type=%s",
+                request_id,
+                type(exc).__name__,
+            )
+            return False
+
+    @staticmethod
     def _notify_completion(row, qb_status: str, gy_status: str, updates: dict) -> None:
-        payload: dict[str, object] = {}
-        payload_raw = str(
-            updates.get("notification_payload_json")
-            or DownloadTracker._row_value(row, "notification_payload_json", "")
-            or ""
-        )
-        if payload_raw:
-            try:
-                decoded = json.loads(payload_raw)
-                if isinstance(decoded, dict):
-                    payload = decoded
-            except (TypeError, ValueError, json.JSONDecodeError):
-                payload = {}
+        """把旧下载终态 outbox 收口到统一下载事务消息。"""
         delivery_status = str(
             updates.get("notification_delivery_status")
             or DownloadTracker._row_value(row, "notification_delivery_status", "")
@@ -967,108 +931,78 @@ class DownloadTracker:
             or updates.get("status")
             or ""
         )
-        # 兼容直接调用该格式化入口的旧测试/插件；真实 tracker 行必须走持久化状态。
         request_id = int(DownloadTracker._row_value(row, "id", 0) or 0)
         if not delivery_status and not request_id:
-            delivery_status = "pending"
-            event_status = str(updates.get("status") or "")
+            # 兼容旧插件/测试直接调用：没有持久请求时仍返回一条简单终态。
+            if event_status not in {"completed", "failed", "manual_review"}:
+                return
+            fields = [("任务", DownloadTracker._row_value(row, "title", "") or "未命名任务")]
+            if qb_status:
+                fields.append(("qBittorrent", DownloadTracker._label(qb_status)))
+            if gy_status:
+                fields.append(("光鸭云盘", DownloadTracker._label(gy_status)))
+            from app.modules.telegram_notification_center import publish_notification_event
+            from app.modules.telegram_notification_policy import (
+                NotificationImportance, NotificationTopic,
+            )
+
+            chat_id = str(DownloadTracker._row_value(row, "chat_id", "") or "")
+            digest = hashlib.sha256(
+                json.dumps(
+                    [fields, event_status, chat_id],
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            publish_notification_event(
+                f"download-compat:{digest}",
+                NotificationEvent(
+                    "下载任务需要人工核对"
+                    if event_status == "manual_review"
+                    else "📥 下载任务状态更新",
+                    fields=tuple(fields),
+                    footer=(
+                        "请勿重复提交；可在 Web 下载任务中继续核对。"
+                        if event_status == "manual_review" else ""
+                    ),
+                ),
+                topic=NotificationTopic.DOWNLOAD,
+                importance=(
+                    NotificationImportance.ERROR
+                    if event_status in {"failed", "manual_review"}
+                    else NotificationImportance.RESULT
+                ),
+                chat_id=chat_id,
+            )
+            return
         if (
             delivery_status not in {"pending", "retry_wait", "sending"}
             or event_status not in {"completed", "failed", "manual_review"}
+            or request_id <= 0
         ):
             return
-        event_status = str(payload.get("event_status") or event_status)
-        qb_status = str(payload.get("qb_status") or qb_status)
-        gy_status = str(payload.get("gy_status") or gy_status)
-        claim: dict[str, object] | None = None
-        if request_id:
-            claim = db.claim_download_request_notification(
-                request_id, lease_seconds=_NOTIFICATION_LEASE_SECONDS,
-            )
-            if claim is None:
-                return
-        token = str(claim.get("token") or "") if claim else ""
-        attempts = int(claim.get("attempts") or 0) + 1 if claim else 1
-        lease_stop = threading.Event()
-        lease_thread: threading.Thread | None = None
-        if request_id and token:
-            def renew_notification_lease() -> None:
-                interval = max(10.0, _NOTIFICATION_LEASE_SECONDS / 3.0)
-                while not lease_stop.wait(interval):
-                    try:
-                        if not db.renew_download_request_notification_lease(
-                            request_id,
-                            token,
-                            lease_seconds=_NOTIFICATION_LEASE_SECONDS,
-                        ):
-                            return
-                    except Exception as exc:
-                        logger.warning(
-                            "下载任务通知续租异常 request#%s type=%s",
-                            request_id,
-                            type(exc).__name__,
-                        )
-                        return
-
-            lease_thread = threading.Thread(
-                target=renew_notification_lease,
-                name=f"download-notification-lease-{request_id}",
-                daemon=True,
-            )
-            lease_thread.start()
-        fields = [(
-            "任务",
-            str(payload.get("title") or DownloadTracker._row_value(row, "title", "") or "未命名任务"),
-        )]
-        if qb_status:
-            fields.append(("qBittorrent", DownloadTracker._label(qb_status)))
-        if gy_status:
-            fields.append(("光鸭云盘", DownloadTracker._label(gy_status)))
-        if event_status == "manual_review":
-            fields.append(("处理", "结果待人工核对，请勿重复提交"))
-        try:
-            delivered = bool(send(
-                NotificationEvent(
-                    "下载任务需要人工核对" if event_status == "manual_review" else "📥 下载任务状态更新",
-                    fields=tuple(fields),
-                ),
-                chat_id=str(
-                    payload.get("chat_id")
-                    or DownloadTracker._row_value(row, "chat_id", "")
-                    or ""
-                ) or None,
-            ))
-        except Exception as exc:
-            delivered = False
-            logger.warning(
-                "下载任务通知发送异常 request#%s type=%s",
-                request_id,
-                type(exc).__name__,
-            )
-        finally:
-            lease_stop.set()
-            if lease_thread is not None:
-                lease_thread.join(timeout=1.0)
-        if not request_id or claim is None:
+        claim = db.claim_download_request_notification(
+            request_id, lease_seconds=_NOTIFICATION_LEASE_SECONDS,
+        )
+        if claim is None:
             return
+        token = str(claim.get("token") or "")
+        accepted = DownloadTracker._publish_lifecycle(request_id)
+        attempts = int(claim.get("attempts") or 0) + 1
         delay = min(3600, 30 * (2 ** min(attempts - 1, 6)))
         retry_at = (datetime.now() + timedelta(seconds=delay)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
         try:
-            if not db.finalize_download_request_notification(
+            db.finalize_download_request_notification(
                 request_id,
                 token,
-                delivered=delivered,
-                retry_at=None if delivered else retry_at,
-            ):
-                logger.warning(
-                    "下载任务通知 lease 已失效 request#%s",
-                    request_id,
-                )
+                delivered=accepted,
+                retry_at=None if accepted else retry_at,
+            )
         except Exception as exc:
             logger.warning(
-                "下载任务通知状态提交异常 request#%s type=%s",
+                "下载任务旧通知状态提交异常 request#%s type=%s",
                 request_id,
                 type(exc).__name__,
             )

@@ -283,12 +283,17 @@ def start_background_services() -> None:
     from app.modules.agent_jobs_scheduler import get_agent_jobs_scheduler
     from app.modules.local_media_scheduler import get_local_media_scheduler
     from app.modules.organize_confirmations import start_confirmation_dispatcher
+    from app.modules.telegram_notification_center import (
+        start_telegram_notification_dispatcher,
+    )
     from app.modules.agent_runtime import resume_agent_runtime
     from app.modules.media_refresh_coordinator import get_media_refresh_coordinator
 
     resume_agent_runtime()
     get_media_refresh_coordinator().start()
     get_organize_manager().resume()
+    # 统一通知 outbox 必须先于所有可能产生主动通知的消费者启动。
+    start_telegram_notification_dispatcher()
     start_confirmation_dispatcher()
     get_scheduler().start()
     get_rss_scheduler().start()
@@ -320,6 +325,7 @@ def stop_background_services() -> bool:
     organize_scheduler_stopped = True
     local_media_scheduler_stopped = True
     confirmation_dispatcher_stopped = True
+    notification_dispatcher_stopped = True
     organize_drained = True
     strm_workers_stopped = True
     media_refresh_stopped = True
@@ -448,6 +454,20 @@ def stop_background_services() -> bool:
     except Exception as exc:
         media_refresh_stopped = False
         logger.warning("停止媒体库刷新合并器失败 type=%s", type(exc).__name__)
+    try:
+        from app.modules.telegram_notification_center import (
+            stop_telegram_notification_dispatcher,
+        )
+
+        notification_dispatcher_stopped = bool(
+            stop_telegram_notification_dispatcher(timeout=3.0)
+        )
+        if not notification_dispatcher_stopped:
+            logger.warning("停止 Telegram 通知中心超时，待投递记录将在下次启动恢复")
+    except Exception as exc:
+        notification_dispatcher_stopped = False
+        logger.warning("停止 Telegram 通知中心失败 type=%s", type(exc).__name__)
+
     return all((
         bot_workers_stopped,
         download_tracker_stopped,
@@ -459,6 +479,7 @@ def stop_background_services() -> bool:
         organize_scheduler_stopped,
         local_media_scheduler_stopped,
         confirmation_dispatcher_stopped,
+        notification_dispatcher_stopped,
         organize_drained,
         strm_workers_stopped,
         media_refresh_stopped,

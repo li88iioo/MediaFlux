@@ -1,11 +1,9 @@
 """媒体订阅通知 outbox 的幂等投递与恢复。"""
 from __future__ import annotations
 
-from html import escape
-
 from app.agent.result_projection import sanitize_public_text
 from app.logger import get_logger
-from app.notifier import TelegramSendResult
+from app.notifier import NotificationEvent
 from app.repositories.media_experience import (
     claim_due_notifications,
     mark_notification_sent,
@@ -16,38 +14,57 @@ from app.repositories.media_experience import (
 logger = get_logger(__name__)
 
 
-def _body(item: dict) -> str:
+def _event(item: dict) -> NotificationEvent:
     payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-    title = escape(
-        sanitize_public_text(payload.get("title"), limit=120) or "媒体订阅",
-        quote=False,
-    )
+    title = sanitize_public_text(payload.get("title"), limit=120) or "媒体订阅"
     event_type = str(item.get("event_type") or "")
     if event_type == "missing":
         missing = max(0, int(payload.get("missing_count") or 0))
-        return f"📺 追更更新\n{title}\n检测到 {missing} 项待补内容。"
+        return NotificationEvent(
+            "📺 追更发现待补内容",
+            fields=(("媒体", title), ("待补", f"{missing} 项")),
+            footer="可在媒体追更中查看范围并决定是否下载。",
+        )
     if event_type == "satisfied":
-        return f"✅ 追更已满足\n{title}\n当前没有检测到缺失内容。"
-    return f"⚠️ 追更检查异常\n{title}\n本轮检查未能完成，可稍后重试。"
+        return NotificationEvent(
+            "✅ 追更已满足",
+            fields=(("媒体", title), ("状态", "当前没有检测到缺失内容")),
+        )
+    return NotificationEvent(
+        "⚠️ 追更检查异常",
+        fields=(("媒体", title),),
+        footer="本轮检查未能完成，可稍后重试。",
+    )
 
 
 def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
-    """至少一次投递：事件入队幂等；过期 lease 可恢复，崩溃窗口可能重复通知。"""
+    """把旧订阅 outbox 转交统一通知中心；旧记录只在接纳后确认。"""
     recover_notifications()
     claimed = claim_due_notifications(limit=limit)
     if not claimed:
         return True
     delivered = True
-    from app.notifier import send_result
+    from app.modules.telegram_notification_center import publish_notification_event
+    from app.modules.telegram_notification_policy import (
+        NotificationImportance, NotificationTopic, notifications_enabled,
+    )
+
     for item in claimed:
-        try:
-            outcome = send_result(_body(item))
-        except Exception:
-            outcome = TelegramSendResult(
-                ok=False, error="telegram_exception"
-            )
         generation = int(item["lease_generation"])
-        if outcome.ok:
+        event_type = str(item.get("event_type") or "")
+        outcome = publish_notification_event(
+            f"media-subscription:{item['id']}:{event_type}",
+            _event(item),
+            topic=NotificationTopic.MEDIA_SUBSCRIPTION,
+            importance=(
+                NotificationImportance.ERROR
+                if event_type not in {"missing", "satisfied"}
+                else NotificationImportance.RESULT
+            ),
+        )
+        # 用户主动关闭全局通知属于消费策略，不应让旧 outbox 无限重试。
+        accepted = bool(outcome) or not notifications_enabled()
+        if accepted:
             if not mark_notification_sent(item["id"], lease_generation=generation):
                 delivered = False
             continue
@@ -55,12 +72,7 @@ def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
         retry_notification(
             item["id"],
             lease_generation=generation,
-            error=(
-                "telegram_rate_limited"
-                if int(outcome.retry_after_seconds or 0) > 0
-                else "telegram_unavailable"
-            ),
-            retry_after_seconds=outcome.retry_after_seconds,
+            error=str(outcome.status or "telegram_unavailable"),
         )
     return delivered
 

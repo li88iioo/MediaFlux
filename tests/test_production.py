@@ -4804,7 +4804,7 @@ class SecurityTests(InitializedWebTestCase):
         ), patch(
             "app.database.finalize_download_request_notification",
             return_value=True,
-        ), patch("app.modules.download_tracker.send") as notify:
+        ), patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle") as notify:
             tracker._update_request(row, [task], [])
         self.assertEqual(update.call_args.kwargs["qb_status"], "failed")
         self.assertEqual(update.call_args.kwargs["status"], "failed")
@@ -4841,7 +4841,7 @@ class SecurityTests(InitializedWebTestCase):
             "app.database.finalize_download_request_notification",
             return_value=True,
         ), patch(
-            "app.modules.download_tracker.send"
+            "app.modules.download_tracker.DownloadTracker._publish_lifecycle"
         ):
             tracker._update_request(row, [], [task])
         manager.start.assert_called_once_with(
@@ -4869,7 +4869,7 @@ class SecurityTests(InitializedWebTestCase):
         ), patch(
             "app.database.claim_download_request_organize", return_value=True
         ), patch("app.database.update_download_request") as update, patch(
-            "app.modules.download_tracker.send"
+            "app.modules.download_tracker.DownloadTracker._publish_lifecycle"
         ) as notify:
             tracker._start_organize(row)
 

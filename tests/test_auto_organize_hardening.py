@@ -121,7 +121,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         with patch.object(tracker, "_start_organize") as start, patch.object(
             tracker, "_update_backend_log"
         ), patch.object(db, "update_download_request_and_sync_media_admission") as update, patch(
-            "app.modules.download_tracker.send"
+            "app.modules.download_tracker.DownloadTracker._publish_lifecycle"
         ):
             tracker._update_request(row, [], one_done)
             self.assertEqual(update.call_args.kwargs["gy_status"], "downloading")
@@ -159,7 +159,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             tracker, "_start_organize"
         ) as start, patch.object(tracker, "_update_backend_log"), patch.object(
             db, "update_download_request"
-        ) as update, patch("app.modules.download_tracker.send"):
+        ) as update, patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle"):
             tracker._update_request(row, [], done)
 
         start.assert_not_called()
@@ -200,7 +200,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             tracker, "_start_organize"
         ) as start, patch.object(tracker, "_update_backend_log"), patch.object(
             db, "update_download_request"
-        ), patch("app.modules.download_tracker.send"):
+        ), patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle"):
             tracker._update_request(row, [], done)
 
         start.assert_called_once_with(row)
@@ -234,7 +234,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             tracker, "_start_organize"
         ) as start, patch.object(tracker, "_update_backend_log"), patch.object(
             db, "update_download_request"
-        ) as update, patch("app.modules.download_tracker.send"):
+        ) as update, patch("app.modules.download_tracker.DownloadTracker._publish_lifecycle"):
             tracker._update_request(row, [], done)
 
         start.assert_not_called()
@@ -384,7 +384,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         with patch.object(tracker, "_start_organize") as start, patch.object(
             tracker, "_update_backend_log"
         ), patch.object(db, "update_download_request_and_sync_media_admission"), patch(
-            "app.modules.download_tracker.send"
+            "app.modules.download_tracker.DownloadTracker._publish_lifecycle"
         ):
             tracker._update_request(row, [], [])
 

@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -248,6 +248,32 @@ CREATE TABLE IF NOT EXISTS organize_notification_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_organize_notification_outbox_due
     ON organize_notification_outbox(status, next_attempt_at, id);
+
+CREATE TABLE IF NOT EXISTS telegram_notification_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    thread_key TEXT NOT NULL DEFAULT '',
+    topic TEXT NOT NULL DEFAULT 'system',
+    importance TEXT NOT NULL DEFAULT 'result',
+    chat_id TEXT NOT NULL DEFAULT '',
+    event_json TEXT NOT NULL,
+    message_id INTEGER,
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+    delivered_revision INTEGER NOT NULL DEFAULT 0 CHECK(delivered_revision >= 0),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','sending','retry_wait','sent','failed','outcome_unknown','suppressed')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT NOT NULL DEFAULT '',
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_notification_outbox_due
+    ON telegram_notification_outbox(status, next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS idx_telegram_notification_outbox_thread
+    ON telegram_notification_outbox(thread_key, chat_id);
 
 CREATE TABLE IF NOT EXISTS organize_log_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2212,6 +2238,34 @@ def _migrate_local_media_numbering_mode_v11(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_telegram_notification_outbox_v12(conn: sqlite3.Connection) -> None:
+    """建立统一 Telegram 通知 outbox 与可更新消息线程。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS telegram_notification_outbox ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "event_key TEXT NOT NULL UNIQUE,thread_key TEXT NOT NULL DEFAULT '',"
+        "topic TEXT NOT NULL DEFAULT 'system',importance TEXT NOT NULL DEFAULT 'result',"
+        "chat_id TEXT NOT NULL DEFAULT '',event_json TEXT NOT NULL,"
+        "message_id INTEGER,revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),"
+        "delivered_revision INTEGER NOT NULL DEFAULT 0 CHECK(delivered_revision >= 0),"
+        "status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN "
+        "('pending','sending','retry_wait','sent','failed','outcome_unknown','suppressed')),"
+        "attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),"
+        "lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),"
+        "next_attempt_at TEXT NOT NULL,last_error TEXT NOT NULL DEFAULT '',"
+        "sent_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telegram_notification_outbox_due "
+        "ON telegram_notification_outbox(status,next_attempt_at,id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telegram_notification_outbox_thread "
+        "ON telegram_notification_outbox(thread_key,chat_id)"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2224,6 +2278,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     8: _migrate_media_proxy_trusted_forwarders_v9,
     9: _migrate_agent_guangya_operation_jobs_v10,
     10: _migrate_local_media_numbering_mode_v11,
+    11: _migrate_telegram_notification_outbox_v12,
 }
 
 
@@ -2697,6 +2752,12 @@ def init_db() -> None:
             )
             conn.execute(
                 "UPDATE organize_confirmation_delivery_outbox "
+                "SET status='retry_wait',lease_generation=lease_generation+1,"
+                "next_attempt_at=?,updated_at=? WHERE status='sending'",
+                (timestamp, timestamp),
+            )
+            conn.execute(
+                "UPDATE telegram_notification_outbox "
                 "SET status='retry_wait',lease_generation=lease_generation+1,"
                 "next_attempt_at=?,updated_at=? WHERE status='sending'",
                 (timestamp, timestamp),
@@ -4839,6 +4900,7 @@ def cancel_organize_confirmation(
     chat_id: str,
     event_json: str = "",
     message_id: int | None = None,
+    enqueue_delivery: bool = True,
 ) -> sqlite3.Row:
     """原子取消待确认任务，并可在同一事务写入终态回执。"""
     timestamp = now()
@@ -4878,7 +4940,7 @@ def cancel_organize_confirmation(
             cancelled = conn.execute(
                 "SELECT * FROM organize_confirmations WHERE id=?", (int(row["id"]),)
             ).fetchone()
-            if str(event_json or ""):
+            if enqueue_delivery and str(event_json or ""):
                 _enqueue_organize_confirmation_delivery(
                     conn,
                     token=token,
@@ -5043,8 +5105,9 @@ def complete_organize_confirmation_with_delivery(
     event_json: str,
     chat_id: str,
     message_id: int | None,
+    enqueue_delivery: bool = True,
 ) -> None:
-    """原子保存成功终态与待投递回执，避免状态完成后丢失通知。"""
+    """原子保存成功终态；升级前回执队列可按需继续写入。"""
     timestamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -5055,14 +5118,15 @@ def complete_organize_confirmation_with_delivery(
         )
         if cursor.rowcount != 1:
             raise ValueError("确认操作不存在或已失效")
-        _enqueue_organize_confirmation_delivery(
-            conn,
-            token=token,
-            event_json=event_json,
-            chat_id=chat_id,
-            message_id=message_id,
-            timestamp=timestamp,
-        )
+        if enqueue_delivery:
+            _enqueue_organize_confirmation_delivery(
+                conn,
+                token=token,
+                event_json=event_json,
+                chat_id=chat_id,
+                message_id=message_id,
+                timestamp=timestamp,
+            )
 
 
 def fail_organize_confirmation_with_delivery(
@@ -5073,6 +5137,7 @@ def fail_organize_confirmation_with_delivery(
     chat_id: str,
     message_id: int | None,
     retryable: bool,
+    enqueue_delivery: bool = True,
 ) -> None:
     """原子保存失败/可重试状态与待投递回执。"""
     timestamp = now()
@@ -5093,14 +5158,15 @@ def fail_organize_confirmation_with_delivery(
             )
         if cursor.rowcount != 1:
             raise ValueError("确认操作不存在或已失效")
-        _enqueue_organize_confirmation_delivery(
-            conn,
-            token=token,
-            event_json=event_json,
-            chat_id=chat_id,
-            message_id=message_id,
-            timestamp=timestamp,
-        )
+        if enqueue_delivery:
+            _enqueue_organize_confirmation_delivery(
+                conn,
+                token=token,
+                event_json=event_json,
+                chat_id=chat_id,
+                message_id=message_id,
+                timestamp=timestamp,
+            )
 
 
 def claim_due_organize_confirmation_delivery(
@@ -6148,6 +6214,16 @@ def create_and_link_qb_local_media_task(
         if cur.rowcount != 1:
             raise ValueError("下载请求的本地入库状态已变化")
         return task_id, restarted
+
+
+def list_download_requests_for_local_media_task(task_id: int) -> list[sqlite3.Row]:
+    """返回绑定到同一本地整理任务的下载事务。"""
+    target = f"local-media-task:{int(task_id)}"
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM download_requests WHERE local_import_target=? ORDER BY id",
+            (target,),
+        ).fetchall()
 
 
 def get_local_media_task(task_id: int, *, owner: str = "admin"):

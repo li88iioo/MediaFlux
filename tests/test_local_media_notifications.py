@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from app import database as db
 from app.modules.local_media_notifications import build_local_media_event, notify_local_media_task
+from app.modules.telegram_notification_center import NotificationPublishResult
 from app.notifier import render_event
 from tests.support import IsolatedDatabaseTestCase
 
@@ -144,9 +145,14 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
 
     def test_notify_uses_structured_sender_without_real_transport(self):
         result = {"status": "completed", "moved": [], "deleted_junk": [], "warnings": []}
-        with patch("app.modules.local_media_notifications.send", return_value=True) as sender:
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            return_value=NotificationPublishResult(True, delivered=True, status="sent"),
+        ) as publisher:
             self.assertTrue(notify_local_media_task(self.task_id, result, owner="admin"))
-        sender.assert_called_once()
+        publisher.assert_called_once()
+        self.assertEqual(publisher.call_args.args[0], f"local-media:{self.task_id}")
+        self.assertIn("本地媒体整理完成", publisher.call_args.args[1].title)
 
     def test_notify_binds_local_confirmation_buttons_to_explicit_chat(self):
         db.update_local_media_task(
@@ -166,15 +172,16 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
             },
         }
         with patch(
-            "app.modules.local_media_notifications.send", return_value=True,
-        ) as sender:
+            "app.modules.organize_confirmations.publish_confirmation_event",
+            return_value=True,
+        ) as publisher:
             self.assertTrue(notify_local_media_task(
                 self.task_id, result, owner="admin", chat_id="-100",
             ))
 
-        event = sender.call_args.args[0]
+        event = publisher.call_args.args[0]
         self.assertTrue(event.actions)
-        self.assertEqual(sender.call_args.kwargs["chat_id"], "-100")
+        self.assertEqual(publisher.call_args.kwargs["chat_id"], "-100")
 
     def test_warning_and_failure_details_never_expose_absolute_paths(self):
         task = db.get_local_media_task(self.task_id, owner="admin")

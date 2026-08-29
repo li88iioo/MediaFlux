@@ -29,10 +29,7 @@ from app.modules.strm import (
 )
 from app.modules.media_refresh import plan_refresh_targets
 from app.modules.strm_notifications import append_change, build_strm_detail_messages, relative_change
-from app.notifier import NotificationEvent, send as send_text, send_event
-
-# 保留模块级 ``send`` 名称，兼容既有测试/补丁；实际发送仍走结构化 send_event。
-send = send_event
+from app.notifier import NotificationEvent
 
 logger = get_logger(__name__)
 
@@ -66,6 +63,28 @@ def _normalize_selected_source_ids(value: object) -> list[str]:
     ))
 
 
+def _merge_notification_threads(*groups) -> list[dict[str, object]]:
+    merged: dict[tuple[str, str, str], dict[str, object]] = {}
+    for group in groups:
+        for raw in group or []:
+            if not isinstance(raw, dict):
+                continue
+            topic = str(raw.get("topic") or "").strip().lower()
+            thread_key = str(raw.get("thread_key") or "").strip()
+            chat_id = str(raw.get("chat_id") or "").strip()
+            if not topic or not thread_key:
+                continue
+            merged[(topic, thread_key, chat_id)] = {
+                "topic": topic,
+                "thread_key": thread_key,
+                "task_id": str(raw.get("task_id") or "").strip(),
+                "token": str(raw.get("token") or "").strip(),
+                "chat_id": chat_id,
+                "topic_enabled": bool(raw.get("topic_enabled", True)),
+            }
+    return list(merged.values())
+
+
 def _request_ids(options: dict[str, object]) -> list[int]:
     return [
         int(item) for item in options.get("download_request_ids", [])
@@ -76,6 +95,99 @@ def _request_ids(options: dict[str, object]) -> list[int]:
 def _update_strm_requests(options: dict[str, object], **fields) -> None:
     for request_id in _request_ids(options):
         db.update_download_request(request_id, **fields)
+
+
+def _refresh_notification_label(refresh: dict) -> str:
+    if not refresh:
+        return "未启用或无目标"
+    labels = []
+    for name, status in refresh.items():
+        value = {
+            True: "完成",
+            False: "失败",
+            "failed": "失败",
+            "queued": "已排队",
+            "skipped": "已跳过",
+        }.get(status, str(status or "未知"))
+        labels.append(f"{name} {value}")
+    return " / ".join(labels)
+
+
+def _publish_linked_notification_threads(
+    options: dict[str, object],
+    *,
+    strm_status: str,
+    media_refresh: str,
+    partial: bool = False,
+    error: str = "",
+) -> bool:
+    accepted = False
+    try:
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        for request_id in _request_ids(options):
+            accepted = bool(publish_download_lifecycle(
+                request_id, media_refresh=media_refresh,
+            )) or accepted
+    except Exception as exc:
+        logger.warning(
+            "STRM 更新下载事务通知失败 type=%s", type(exc).__name__
+        )
+    try:
+        from app.modules.telegram_organize_lifecycle import (
+            update_organize_lifecycle_downstream,
+        )
+
+        for ref in _merge_notification_threads(options.get("notification_threads")):
+            if str(ref.get("topic") or "") != "organize":
+                continue
+            task_id = str(ref.get("task_id") or "").strip()
+            if not task_id:
+                continue
+            accepted = bool(update_organize_lifecycle_downstream(
+                task_id,
+                chat_id=str(ref.get("chat_id") or ""),
+                strm_status=strm_status,
+                media_refresh=media_refresh,
+                partial=partial,
+                error=error,
+                topic_enabled=bool(ref.get("topic_enabled", True)),
+            )) or accepted
+    except Exception as exc:
+        logger.warning(
+            "STRM 更新整理事务通知失败 type=%s", type(exc).__name__
+        )
+    try:
+        from app.modules.organize_confirmations import (
+            update_confirmation_lifecycle_downstream,
+        )
+
+        for ref in _merge_notification_threads(options.get("notification_threads")):
+            if str(ref.get("topic") or "") != "confirmation":
+                continue
+            token = str(ref.get("token") or "").strip()
+            if not token:
+                continue
+            accepted = bool(update_confirmation_lifecycle_downstream(
+                token,
+                chat_id=str(ref.get("chat_id") or ""),
+                strm_status=strm_status,
+                media_refresh=media_refresh,
+                partial=partial,
+                error=error,
+            )) or accepted
+    except Exception as exc:
+        logger.warning(
+            "STRM 更新人工确认事务通知失败 type=%s", type(exc).__name__
+        )
+    return accepted
+
+
+def _has_linked_notification_thread(options: dict[str, object]) -> bool:
+    return bool(
+        _request_ids(options)
+        or _merge_notification_threads(options.get("notification_threads"))
+    )
 
 
 def _merge_organize_changes(*groups) -> list[dict[str, object]]:
@@ -402,6 +514,13 @@ class STRMScheduler:
                 options, strm_status="failed", strm_error="STRM 同步任务启动失败",
                 strm_finished_at=db.now(),
             )
+            _publish_linked_notification_threads(
+                options,
+                strm_status="启动失败",
+                media_refresh="未触发",
+                partial=True,
+                error="STRM 同步任务启动失败",
+            )
             logger.exception("启动 STRM 同步线程失败 trigger=%s", trigger_type)
             return {"ok": False, "error": "STRM 同步任务启动失败"}
         return {"ok": True, "message": "STRM 同步任务已启动"}
@@ -454,6 +573,13 @@ class STRMScheduler:
                 strm_error="服务停止，排队中的 STRM 联动已取消",
                 strm_finished_at=db.now(),
             )
+            _publish_linked_notification_threads(
+                cancelled_options,
+                strm_status="已停止",
+                media_refresh="未触发",
+                partial=True,
+                error="服务停止，排队中的 STRM 联动已取消",
+            )
             logger.warning("应用停止，已取消尚未执行的整理联动 STRM")
 
     def _queue_organize_trigger(
@@ -494,6 +620,10 @@ class STRMScheduler:
                     pending[key] = bool(pending.get(key)) or bool(value)
                 elif key == "organize_changes":
                     pending[key] = _merge_organize_changes(
+                        pending.get(key), value
+                    )
+                elif key == "notification_threads":
+                    pending[key] = _merge_notification_threads(
                         pending.get(key), value
                     )
                 elif key == "force_full":
@@ -571,6 +701,13 @@ class STRMScheduler:
                         pending, strm_status="failed", strm_error="STRM 整理联动排队失败",
                         strm_finished_at=db.now(),
                     )
+                    _publish_linked_notification_threads(
+                        pending,
+                        strm_status="排队失败",
+                        media_refresh="未触发",
+                        partial=True,
+                        error="STRM 整理联动排队失败",
+                    )
                     logger.exception("启动整理联动 STRM 等待线程失败")
                     return {"ok": False, "error": "STRM 整理联动排队失败"}
         message = "STRM 整理联动已排队，将在当前操作结束后执行"
@@ -587,6 +724,7 @@ class STRMScheduler:
                 media_server_refresh_override: bool | None = None,
                 on_progress=None,
                 download_request_ids: list[int] | None = None,
+                notification_threads: list[dict[str, object]] | None = None,
                 organize_changes: list[dict[str, object]] | None = None,
                 force_full: bool = False,
                 sync_mode: str = "auto",
@@ -628,6 +766,7 @@ class STRMScheduler:
                 "media_server_refresh_override": media_server_refresh_override,
                 "on_progress": on_progress,
                 "download_request_ids": list(download_request_ids or []),
+                "notification_threads": _merge_notification_threads(notification_threads),
                 "organize_changes": _merge_organize_changes(organize_changes),
                 "force_full": bool(force_full),
                 "sync_mode": normalized_mode,
@@ -1697,19 +1836,29 @@ class STRMScheduler:
                     strm_error=("STRM 同步部分完成，请查看运行记录" if partial else ""),
                     strm_finished_at=db.now(),
                 )
-            self._notify_success(
-                stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
-                notify_override=options.get("notify_override"),
-                chat_ids=list(options.get("chat_ids") or []),
-                uses_default_notification_scope=options.get(
-                    "uses_default_notification_scope"
-                ),
-                has_silent_notification_scope=bool(
-                    options.get("has_silent_notification_scope")
-                ),
+            refresh_label = _refresh_notification_label(media_refresh)
+            _publish_linked_notification_threads(
+                options,
+                strm_status="部分完成" if partial else "完成",
+                media_refresh=refresh_label,
+                partial=partial,
+                error=("STRM 同步部分完成，请查看 Web 运行记录" if partial else ""),
             )
+            if not _has_linked_notification_thread(options):
+                self._notify_success(
+                    stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
+                    run_id=run_id,
+                    notify_override=options.get("notify_override"),
+                    chat_ids=list(options.get("chat_ids") or []),
+                    uses_default_notification_scope=options.get(
+                        "uses_default_notification_scope"
+                    ),
+                    has_silent_notification_scope=bool(
+                        options.get("has_silent_notification_scope")
+                    ),
+                )
             self._notify_details(
-                stats, trigger_type,
+                stats, trigger_type, run_id=run_id,
                 enabled_override=options.get("detail_notify_override"),
                 chat_ids=list(options.get("chat_ids") or []),
                 uses_default_notification_scope=options.get(
@@ -1750,6 +1899,13 @@ class STRMScheduler:
                     strm_finished_at=db.now(),
                 )
             logger.exception("STRM 任务失败 trigger=%s: %s", trigger_type, error_text)
+            _publish_linked_notification_threads(
+                options,
+                strm_status="失败",
+                media_refresh="未完成",
+                partial=True,
+                error=error_text[:260],
+            )
             if lease_heartbeat:
                 lease_heartbeat.stop()
                 lease_heartbeat = None
@@ -1757,18 +1913,20 @@ class STRMScheduler:
                 claimed_targets, "failed", error=error_text,
                 empty_retry_delay=60.0,
             )
-            self._notify_failure(
-                error_text,
-                trigger_type,
-                notify_override=options.get("notify_override"),
-                chat_ids=list(options.get("chat_ids") or []),
-                uses_default_notification_scope=options.get(
-                    "uses_default_notification_scope"
-                ),
-                has_silent_notification_scope=bool(
-                    options.get("has_silent_notification_scope")
-                ),
-            )
+            if not _has_linked_notification_thread(options):
+                self._notify_failure(
+                    error_text,
+                    trigger_type,
+                    run_id=run_id,
+                    notify_override=options.get("notify_override"),
+                    chat_ids=list(options.get("chat_ids") or []),
+                    uses_default_notification_scope=options.get(
+                        "uses_default_notification_scope"
+                    ),
+                    has_silent_notification_scope=bool(
+                        options.get("has_silent_notification_scope")
+                    ),
+                )
             return {"ok": False, "error": error_text}
         finally:
             if lease_heartbeat:
@@ -1996,6 +2154,7 @@ class STRMScheduler:
     @staticmethod
     def _notify_success(stats: dict, refresh: dict, elapsed: float,
                         trigger_type: str, sources: list[dict], strm_root: str,
+                        run_id: int = 0,
                         notify_override: bool | None = None,
                         chat_ids: list[str] | None = None,
                         uses_default_notification_scope: bool | None = None,
@@ -2031,14 +2190,30 @@ class STRMScheduler:
             event = STRMScheduler._build_success_event(
                 stats, refresh, elapsed, trigger_type, sources, strm_root
             )
+        from app.modules.telegram_notification_center import publish_notification_event
+        from app.modules.telegram_notification_policy import (
+            NotificationImportance, NotificationTopic,
+        )
+        logical_key = f"strm-run:{int(run_id or 0)}:{trigger_type}"
+        importance = (
+            NotificationImportance.ERROR
+            if event.title.startswith("⚠️") else NotificationImportance.RESULT
+        )
         if recipients:
             for recipient in recipients:
-                send(event, chat_id=recipient)
+                publish_notification_event(
+                    logical_key, event, topic=NotificationTopic.STRM,
+                    importance=importance, chat_id=recipient, topic_enabled=enabled,
+                )
         if send_default:
-            send(event)
+            publish_notification_event(
+                logical_key, event, topic=NotificationTopic.STRM,
+                importance=importance, topic_enabled=enabled,
+            )
 
     @staticmethod
     def _notify_details(stats: dict, trigger_type: str,
+                        run_id: int = 0,
                         enabled_override: bool | None = None,
                         chat_ids: list[str] | None = None,
                         uses_default_notification_scope: bool | None = None,
@@ -2052,6 +2227,14 @@ class STRMScheduler:
         )
         if not enabled:
             return
+        from app.modules.telegram_notification_policy import (
+            NotificationImportance,
+            allows_notification,
+        )
+        if not allows_notification(
+            NotificationImportance.DETAIL, topic_enabled=enabled,
+        ):
+            return
         recipients, send_default, restricted = STRMScheduler._resolve_notification_scopes(
             chat_ids,
             uses_default_notification_scope,
@@ -2063,20 +2246,34 @@ class STRMScheduler:
                 len(recipients), send_default, bool(has_silent_notification_scope),
             )
             return
-        for message in build_strm_detail_messages(
+        from app.modules.telegram_notification_center import publish_notification_event
+        from app.modules.telegram_notification_policy import NotificationTopic
+        for index, message in enumerate(build_strm_detail_messages(
             stats.get("changes") or [],
             omitted_count=int(stats.get("omitted_count", 0) or 0),
             max_messages=max(0, get_int("STRM_DETAIL_MAX_MESSAGES", 200)),
-        ):
-            # notifier.send 接收 HTML 文本；完整转义动态目录和文件名。
+        ), start=1):
+            event = NotificationEvent(
+                f"📄 STRM 文件明细 {index}", lines=(message,),
+                layout="relaxed", field_emojis=False,
+            )
+            logical_key = f"strm-detail:{int(run_id or 0)}:{index}"
             if recipients:
                 for recipient in recipients:
-                    send_text(html.escape(message), chat_id=recipient)
+                    publish_notification_event(
+                        logical_key, event, topic=NotificationTopic.STRM,
+                        importance=NotificationImportance.DETAIL,
+                        chat_id=recipient, topic_enabled=enabled,
+                    )
             if send_default:
-                send_text(html.escape(message))
+                publish_notification_event(
+                    logical_key, event, topic=NotificationTopic.STRM,
+                    importance=NotificationImportance.DETAIL, topic_enabled=enabled,
+                )
 
     @staticmethod
     def _notify_failure(error: str, trigger_type: str,
+                        run_id: int = 0,
                         notify_override: bool | None = None,
                         chat_ids: list[str] | None = None,
                         uses_default_notification_scope: bool | None = None,
@@ -2101,11 +2298,23 @@ class STRMScheduler:
                         "请在 Web 运行记录中查看。",
                     ),),
                 )
+            from app.modules.telegram_notification_center import publish_notification_event
+            from app.modules.telegram_notification_policy import (
+                NotificationImportance, NotificationTopic,
+            )
+            logical_key = f"strm-run:{int(run_id or 0)}:{trigger_type}:failed"
             if recipients:
                 for recipient in recipients:
-                    send(event, chat_id=recipient)
+                    publish_notification_event(
+                        logical_key, event, topic=NotificationTopic.STRM,
+                        importance=NotificationImportance.ERROR, chat_id=recipient,
+                        topic_enabled=enabled,
+                    )
             if send_default:
-                send(event)
+                publish_notification_event(
+                    logical_key, event, topic=NotificationTopic.STRM,
+                    importance=NotificationImportance.ERROR, topic_enabled=enabled,
+                )
 
     @staticmethod
     def _row_to_dict(row) -> dict:

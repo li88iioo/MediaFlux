@@ -1221,9 +1221,13 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             "metadata_cleaned": 0,
             "changes": [{"path": "动漫/Private.Show/Private.S01E01.strm"}],
         }
-        with patch.object(scheduler_module, "send") as send, patch.object(
-            scheduler_module, "send_text"
-        ) as send_text:
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=True,
+        ) as send, patch(
+            "app.modules.telegram_notification_policy.allows_notification",
+            return_value=True,
+        ):
             scheduler_module.STRMScheduler._notify_success(
                 stats,
                 {"jellyfin": True},
@@ -1243,12 +1247,11 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(send.call_count, 2)
         for call in send.call_args_list:
-            event = call.args[0]
+            event = call.args[1]
             rendered = str(event)
             self.assertIn("多个整理请求", rendered)
             self.assertNotIn("Private.Show", rendered)
             self.assertNotIn("/private/strm-root", rendered)
-        send_text.assert_not_called()
 
     def test_default_and_explicit_chat_notifications_hide_shared_details(self) -> None:
         from app.modules import scheduler as scheduler_module
@@ -1261,9 +1264,13 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             "metadata_cleaned": 0,
             "changes": [{"path": "动漫/Private.Show/Private.S01E01.strm"}],
         }
-        with patch.object(scheduler_module, "send") as send, patch.object(
-            scheduler_module, "send_text"
-        ) as send_text, patch.object(
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=True,
+        ) as send, patch(
+            "app.modules.telegram_notification_policy.allows_notification",
+            return_value=True,
+        ), patch.object(
             scheduler_module, "get", return_value="default-chat",
         ):
             scheduler_module.STRMScheduler._notify_success(
@@ -1291,11 +1298,10 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             {"100", "default"},
         )
         for call in send.call_args_list:
-            rendered = str(call.args[0])
+            rendered = str(call.args[1])
             self.assertIn("多个整理请求", rendered)
             self.assertNotIn("Private.Show", rendered)
             self.assertNotIn("/private/strm-root", rendered)
-        send_text.assert_not_called()
 
     def test_silent_and_explicit_chat_notifications_hide_shared_details(self) -> None:
         from app.modules import scheduler as scheduler_module
@@ -1308,9 +1314,13 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
             "metadata_cleaned": 0,
             "changes": [{"path": "动漫/Recovered.Private/Recovered.S01E01.strm"}],
         }
-        with patch.object(scheduler_module, "send") as send, patch.object(
-            scheduler_module, "send_text"
-        ) as send_text:
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=True,
+        ) as send, patch(
+            "app.modules.telegram_notification_policy.allows_notification",
+            return_value=True,
+        ):
             scheduler_module.STRMScheduler._notify_success(
                 stats,
                 {},
@@ -1342,11 +1352,10 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(send.call_count, 2)
         for call in send.call_args_list:
-            rendered = str(call.args[0])
+            rendered = str(call.args[1])
             self.assertIn("多个整理请求", rendered)
             self.assertNotIn("Recovered.Private", rendered)
             self.assertNotIn("secret backend path", rendered)
-        send_text.assert_not_called()
 
     def test_persisted_extra_changes_are_treated_as_unscoped(self) -> None:
         from app.modules.scheduler import _claimed_changes_extend_notification_scope

@@ -502,19 +502,20 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         }
         healthy = {"total": 0, "new": 0, "skipped": 0}
         with patch("app.modules.rss_scheduler.RSSEngine") as engine, patch(
-            "app.modules.rss_scheduler.send_event", side_effect=[False, True, True]
-        ) as send_event:
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=True,
+        ) as publisher:
             engine.return_value.auto_download.return_value = issue
             scheduler._execute(sid, "download")
             scheduler._execute(sid, "download")
             scheduler._execute(sid, "download")
-            self.assertEqual(send_event.call_count, 2)
+            self.assertEqual(publisher.call_count, 1)
             engine.return_value.refresh.return_value = healthy
             scheduler._execute(sid, "subscribe")
             engine.return_value.auto_download.return_value = issue
             scheduler._execute(sid, "download")
 
-        self.assertEqual(send_event.call_count, 3)
+        self.assertEqual(publisher.call_count, 2)
 
     def test_scheduler_retries_unresolved_alert_and_persists_delivery_signature(self):
         sid = self._subscription("scheduler-durable-alert")
@@ -533,24 +534,25 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
         healthy = {"total": 0, "new": 0, "skipped": 0}
         scheduler = RSSScheduler()
         with patch("app.modules.rss_scheduler.RSSEngine") as engine, patch(
-            "app.modules.rss_scheduler.send_event", side_effect=[False, True]
-        ) as send_event:
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=True,
+        ) as publisher:
             engine.return_value.auto_download.return_value = issue
             scheduler._execute(sid, "download")
             engine.return_value.refresh.return_value = healthy
             scheduler._execute(sid, "subscribe")
 
-        self.assertEqual(send_event.call_count, 2)
+        self.assertEqual(publisher.call_count, 1)
         persisted = db.kv_get(scheduler._alert_key(sid), "")
         self.assertIn("outcome_unknown", persisted)
 
         restarted = RSSScheduler()
         with patch("app.modules.rss_scheduler.RSSEngine") as engine, patch(
-            "app.modules.rss_scheduler.send_event"
-        ) as send_event:
+            "app.modules.telegram_notification_center.publish_notification_event"
+        ) as publisher:
             engine.return_value.refresh.return_value = healthy
             restarted._execute(sid, "subscribe")
-        send_event.assert_not_called()
+        publisher.assert_not_called()
 
         db.update_rss_entries_processed([int(entry_id)], True)
         with patch("app.modules.rss_scheduler.RSSEngine") as engine:
@@ -568,7 +570,8 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             "app.modules.rss_scheduler.db.get_rss_subscription",
             return_value={"name": "测试订阅"},
         ), patch(
-            "app.modules.rss_scheduler.send_event", return_value=False,
+            "app.modules.telegram_notification_center.publish_notification_event",
+            return_value=False,
         ):
             scheduler._notify_issue(9, "new_issue", [("错误", "新错误")])
 
