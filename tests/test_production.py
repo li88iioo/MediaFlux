@@ -4143,7 +4143,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn(".settings-tab:hover { color: var(--text-primary); background: var(--bg-card-hover); }", settings_css)
         self.assertIn(".settings-tab.active { color: var(--accent); background: var(--accent-soft); }", settings_css)
         self.assertIn(".settings-tab:focus-visible", settings_css)
-        self.assertIn("@media (max-width: 760px)", settings_css)
+        self.assertIn("@media (max-width: 900px)", settings_css)
         self.assertIn("height: 38px; padding: 0 14px; gap: 6px;", settings_css)
         self.assertNotIn("repeat(7,minmax(0,1fr))", main_css)
         self.assertNotIn(".settings-tab::before { content:", main_css)

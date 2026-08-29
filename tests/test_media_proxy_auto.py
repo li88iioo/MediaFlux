@@ -504,6 +504,24 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(response.json()["error"], "请求体过大")
         self.assertEqual(_FakeAsyncClient.init_kwargs, [])
 
+    def test_client_disconnect_while_reading_body_is_not_raised_as_asgi_error(self):
+        app = media_proxy.create_proxy_app(7)
+        with (
+            patch("app.modules.media_proxy.database.get_media_proxy_instance", return_value=self._instance()),
+            patch("app.modules.media_proxy.database.get_media_proxy_binding", return_value=None),
+            patch("app.modules.media_proxy.httpx.AsyncClient", _FakeAsyncClient),
+            patch(
+                "app.modules.media_proxy._read_proxy_request_body",
+                side_effect=media_proxy.ClientDisconnect(),
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post("/Items", content=b"cancelled")
+
+        self.assertEqual(response.status_code, 499)
+        self.assertEqual(response.content, b"")
+        self.assertEqual(_FakeAsyncClient.init_kwargs, [])
+
     def test_runtime_payload_limits_are_clamped(self):
         with patch("app.modules.media_proxy.get", return_value="99999"):
             self.assertEqual(

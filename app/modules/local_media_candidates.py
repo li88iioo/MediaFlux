@@ -229,10 +229,13 @@ def candidate_payload(
         "modified_at": datetime.fromtimestamp(info.st_mtime, tz=timezone.utc).isoformat(),
         "organize_ready": bool(organize_ready),
         "identity": {
-            "size": int(info.st_size),
-            "mtime_ns": int(info.st_mtime_ns),
-            "device": int(info.st_dev),
-            "inode": int(info.st_ino),
+            # 文件身份是前端回传的透明快照。mtime_ns 与部分 NAS 文件系统的
+            # inode/device 会超过 JavaScript Number 的安全整数范围，必须使用
+            # 十进制字符串传输，避免浏览器 JSON 往返后被舍入并误报条目变化。
+            "size": str(int(info.st_size)),
+            "mtime_ns": str(int(info.st_mtime_ns)),
+            "device": str(int(info.st_dev)),
+            "inode": str(int(info.st_ino)),
         },
     }
 

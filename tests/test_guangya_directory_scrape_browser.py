@@ -831,7 +831,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
             )
             self.assertEqual(dimensions["menuWidth"], 220)
             self.assertEqual(dimensions["menuItemHeight"], 48)
-            self.assertEqual(dimensions["heights"], [36] * 7)
+            self.assertEqual(dimensions["heights"], [42] * 7)
             self.assertEqual(dimensions["cancelWidth"], 80)
             self.assertEqual(dimensions["runWidth"], 160)
         finally:

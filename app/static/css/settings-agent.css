@@ -61,7 +61,7 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     --agent-panel-shadow: 0 1px 2px rgba(15, 23, 42, .035);
 }
 .settings-page .content {
-    padding: 0 0 84px;
+    padding: 0 0 calc(84px + var(--mf-window-bottom-inset));
     animation: none;
 }
 :root[data-sidebar="collapsed"] .settings-page .content {
@@ -1561,7 +1561,7 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     position: fixed;
     left: var(--sidebar-w);
     right: 0;
-    bottom: 0;
+    bottom: var(--mf-window-bottom-inset);
     z-index: 95;
     width: auto;
     min-height: var(--settings-savebar-h);
@@ -1630,7 +1630,7 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     .discovery-settings-grid,
     .metadata-settings-grid { grid-template-columns: minmax(0, 1fr); }
 }
-@media (max-width: 1160px) {
+@media (max-width: 1280px) {
     .agent-settings-stack {
         grid-template-columns: minmax(0, 1fr);
         grid-template-areas: "global" "model" "search" "patrol" "notify";
@@ -1663,8 +1663,8 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
         height: 18px;
     }
 }
-@media (max-width: 760px) {
-    .settings-page .content { padding: 0 0 88px; }
+@media (max-width: 900px) {
+    .settings-page .content { padding: 0 0 calc(88px + var(--mf-window-bottom-inset)); }
     .settings-page { --settings-inline-gutter: 14px; }
     .settings-page .settings-stage { padding: 0 var(--settings-inline-gutter); }
     .settings-page .workspace-bar { padding-inline: 14px; }
@@ -1839,7 +1839,7 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     }
 }
 @media (max-width: 480px) {
-    .settings-page .content { padding-bottom: 84px; }
+    .settings-page .content { padding-bottom: calc(84px + var(--mf-window-bottom-inset)); }
     .discovery-card-head { min-height: 58px; padding-inline: 12px; }
     .discovery-card-icon { width: 32px; height: 32px; flex-basis: 32px; }
     .discovery-card-body { padding-inline: 12px; }

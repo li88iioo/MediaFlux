@@ -34,6 +34,7 @@ from aiohttp.abc import AbstractResolver
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.requests import ClientDisconnect
 
 from app import database
 from app.clients.guangya import GuangYaClient
@@ -5419,6 +5420,12 @@ def create_proxy_app(
         playback_match = _PLAYBACK_INFO_RE.match(request.url.path)
         try:
             body = await _read_proxy_request_body(request)
+        except ClientDisconnect:
+            # 播放器切源、取消播放或页面离开时可能在请求体尚未读完前断开。
+            # 这是客户端生命周期事件，不应冒泡为 Uvicorn ASGI ERROR 堆栈。
+            request.state.proxy_action = "client_disconnected"
+            request.state.proxy_failure_stage = "client_disconnect"
+            return Response(status_code=499)
         except ProxyRequestBodyTooLarge:
             request.state.proxy_failure_stage = "request_body"
             return JSONResponse({"error": "请求体过大"}, status_code=413)

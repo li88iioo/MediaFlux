@@ -419,6 +419,11 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual([item["name"] for item in items], ["Loose.Movie.2026.mkv", "Movie.2026"])
         self.assertTrue(all(item["organize_ready"] for item in items))
         self.assertEqual({item["kind"] for item in items}, {"directory", "video"})
+        self.assertTrue(all(
+            isinstance(value, str)
+            for item in items
+            for value in item["identity"].values()
+        ))
         self.assertNotIn("readme.txt", listed.text)
         self.assertNotIn("Documents", listed.text)
         self.assertNotIn("archive.zip", listed.text)
@@ -526,7 +531,8 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             local_root=str(self.local_root), owner="admin",
         )
         item = self.client.get("/api/local-media/items").json()["items"][0]
-        changed = dict(item["identity"]); changed["mtime_ns"] += 1
+        changed = dict(item["identity"])
+        changed["mtime_ns"] = str(int(changed["mtime_ns"]) + 1)
         rejected = self.client.post(
             "/api/local-media/items/delete",
             json={"source_id": source_id, "path": item["path"], "identity": changed},
