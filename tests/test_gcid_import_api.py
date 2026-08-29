@@ -489,7 +489,8 @@ class GCIDImportNotificationTests(unittest.TestCase):
             "lines": list(event.lines),
         }, ensure_ascii=False)
         self.assertNotIn("PRIVATE RESPONSE", rendered)
-        self.assertIn("Dir/File-0.mkv", rendered)
+        self.assertIn("File-0.mkv", rendered)
+        self.assertNotIn("Dir/", rendered)
         self.assertIn("导入失败", rendered)
 
 

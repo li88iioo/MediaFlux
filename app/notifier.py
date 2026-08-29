@@ -15,6 +15,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
+import requests
+
 from app.config import get
 from app.logger import configure_telebot_logging, get_logger, log_throttled
 
@@ -715,9 +717,18 @@ def _telegram_send_error(exc: Exception) -> TelegramSendResult:
         except (TypeError, ValueError):
             return 0
 
+    response = getattr(exc, "result", None)
     status_code = positive_int(
-        payload.get("error_code") or getattr(exc, "error_code", 0)
+        payload.get("error_code")
+        or getattr(exc, "error_code", 0)
+        or getattr(response, "status_code", 0)
     )
+    if isinstance(exc, requests.ConnectTimeout):
+        # 连接尚未建立，Telegram 不可能已经接收请求，可以安全重试。
+        status_code = 503
+    elif isinstance(exc, requests.ReadTimeout):
+        # 请求可能已经到达 Telegram，但响应未返回，必须避免盲目重放。
+        status_code = 408
     retry_after = positive_int(
         parameters.get("retry_after") or getattr(exc, "retry_after", 0)
     )
@@ -1003,9 +1014,10 @@ def notify_gcid_import_finished(*, task_id: int, status: str, success_count: int
         title = "GCID 重试失败" if retry else "GCID 导入失败"
     lines = []
     for sample in tuple(failed_samples or ())[:3]:
-        path = str(_item_value(sample, "path", "") or "").strip()[:240]
-        if path:
-            lines.append(f"{path}：导入失败")
+        path = str(_item_value(sample, "path", "") or "").strip()
+        safe_name = path.replace("\\", "/").rsplit("/", 1)[-1][:180]
+        if safe_name:
+            lines.append(f"{safe_name}：导入失败")
     from app.modules.telegram_notification_center import publish_notification_thread
     from app.modules.telegram_notification_policy import (
         NotificationImportance, NotificationTopic,

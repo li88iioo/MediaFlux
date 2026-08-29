@@ -199,6 +199,21 @@ class OrganizeNotificationOutboxTests(IsolatedDatabaseTestCase):
         row = dict(list_organize_notifications()[0])
         self.assertEqual(row["image_url"], "https://image.example/poster.jpg")
 
+    def test_disabled_notification_policy_consumes_legacy_outbox_without_sending(self):
+        with patch(
+            "app.modules.telegram_notification_policy.allows_notification",
+            return_value=False,
+        ), patch("app.notifier.send_result") as sender:
+            delivered = deliver_organize_notification(
+                "task:disabled", "整理完成", chat_id="1",
+            )
+
+        self.assertTrue(delivered)
+        sender.assert_not_called()
+        row = dict(list_organize_notifications()[0])
+        self.assertEqual(row["status"], "sent")
+        self.assertEqual(count_pending_organize_notifications(), 0)
+
     def test_temporary_failure_is_retried_and_not_duplicated(self):
         sent: list[str] = []
         with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=False, error="timeout")):

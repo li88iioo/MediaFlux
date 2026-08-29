@@ -105,6 +105,30 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertEqual(result.error, "Too Many Requests: retry later")
         self.assertFalse(notifier.send("兼容布尔接口"))
 
+    def test_connect_timeout_is_safe_to_retry(self):
+        result = notifier._telegram_send_error(notifier.requests.ConnectTimeout("connect"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status_code, 503)
+        self.assertFalse(result.outcome_unknown)
+
+    def test_read_timeout_is_marked_as_unknown_delivery(self):
+        result = notifier._telegram_send_error(notifier.requests.ReadTimeout("read"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status_code, 408)
+        self.assertTrue(result.outcome_unknown)
+
+    def test_http_exception_preserves_response_status_code(self):
+        class TelegramHTTPError(RuntimeError):
+            result = Mock(status_code=503)
+
+        result = notifier._telegram_send_error(TelegramHTTPError("unavailable"))
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status_code, 503)
+        self.assertFalse(result.outcome_unknown)
+
     def test_send_result_uses_cover_and_falls_back_to_text(self):
         class TelegramPhotoRejected(RuntimeError):
             result_json = {

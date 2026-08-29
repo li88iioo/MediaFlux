@@ -15,6 +15,52 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
+    def test_v12_subscription_notification_outbox_migrates_inconclusive(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                "CREATE TABLE media_subscription_notification_outbox ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,event_key TEXT NOT NULL UNIQUE,"
+                "subscription_id INTEGER NOT NULL,subscription_revision INTEGER NOT NULL,"
+                "run_id INTEGER,event_type TEXT NOT NULL CHECK(event_type IN "
+                "('missing','satisfied','error')),payload_json TEXT NOT NULL DEFAULT '{}',"
+                "status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN "
+                "('pending','sending','retry_wait','sent','failed','discarded')),"
+                "attempts INTEGER NOT NULL DEFAULT 0,lease_generation INTEGER NOT NULL DEFAULT 0,"
+                "lease_until TEXT NOT NULL DEFAULT '',next_attempt_at TEXT NOT NULL,"
+                "last_error TEXT NOT NULL DEFAULT '',sent_at TEXT,created_at TEXT NOT NULL,"
+                "updated_at TEXT NOT NULL);"
+                "CREATE INDEX idx_media_subscription_notification_due ON "
+                "media_subscription_notification_outbox(status,next_attempt_at,id);"
+                "CREATE INDEX idx_media_subscription_notification_subscription ON "
+                "media_subscription_notification_outbox(subscription_id,id DESC);"
+                "INSERT INTO media_subscription_notification_outbox("
+                "event_key,subscription_id,subscription_revision,event_type,next_attempt_at,"
+                "created_at,updated_at) VALUES('old',1,1,'missing','now','now','now');"
+            )
+
+            db._migrate_media_subscription_notification_outbox_v13(conn)
+            conn.execute(
+                "INSERT INTO media_subscription_notification_outbox("
+                "event_key,subscription_id,subscription_revision,event_type,next_attempt_at,"
+                "created_at,updated_at) VALUES('new',1,1,'inconclusive','now','now','now')"
+            )
+            rows = conn.execute(
+                "SELECT event_key,event_type FROM media_subscription_notification_outbox "
+                "ORDER BY id"
+            ).fetchall()
+            indexes = {
+                str(row[1]) for row in conn.execute(
+                    "PRAGMA index_list(media_subscription_notification_outbox)"
+                )
+            }
+        finally:
+            conn.close()
+
+        self.assertEqual(rows, [("old", "missing"), ("new", "inconclusive")])
+        self.assertIn("idx_media_subscription_notification_due", indexes)
+        self.assertIn("idx_media_subscription_notification_subscription", indexes)
+
     def test_fresh_database_contains_complete_v10_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])

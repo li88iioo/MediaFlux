@@ -87,6 +87,21 @@ def drain_organize_notifications(*, limit: int = 20) -> bool:
     claimed = claim_due_organize_notifications(limit=limit)
     if not claimed:
         return True
+    from app.modules.telegram_notification_policy import (
+        NotificationImportance,
+        allows_notification,
+    )
+
+    if not allows_notification(NotificationImportance.RESULT):
+        # 升级前遗留 outbox 仍可能有待发记录；关闭统一通知策略后应消费为
+        # 已抑制，不能绕过总开关直发，也不能永久占用旧队列重试。
+        consumed = True
+        for item in claimed:
+            consumed = bool(mark_organize_notification_sent(
+                item["id"],
+                expected_lease_generation=int(item["lease_generation"]),
+            )) and consumed
+        return consumed
     delivered = True
     for item in claimed:
         try:

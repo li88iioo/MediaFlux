@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import database as db
+from app.modules import telegram_notification_center as notification_center
 from app.modules.telegram_notification_center import (
     deserialize_notification_event,
     drain_telegram_notifications,
@@ -20,7 +21,12 @@ from app.modules.telegram_notification_policy import (
     NotificationImportance,
     NotificationTopic,
 )
-from app.notifier import NotificationAction, NotificationEvent, TelegramSendResult
+from app.notifier import (
+    NotificationAction,
+    NotificationEvent,
+    TelegramSendResult,
+    render_event,
+)
 from app.repositories.telegram_notifications import get_notification
 from app.routes.api import save_config
 from tests.support import IsolatedDatabaseTestCase
@@ -28,8 +34,16 @@ from tests.support import IsolatedDatabaseTestCase
 
 class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
+        self._dispatcher_was_stopped = notification_center._dispatch_stop.is_set()
+        notification_center._dispatch_stop.clear()
         with db.get_conn() as conn:
             conn.execute("DELETE FROM telegram_notification_outbox")
+
+    def tearDown(self) -> None:
+        if self._dispatcher_was_stopped:
+            notification_center._dispatch_stop.set()
+        else:
+            notification_center._dispatch_stop.clear()
 
     def test_round_trip_keeps_actions_and_rendering_flags(self) -> None:
         event = NotificationEvent(
@@ -108,6 +122,169 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         row = get_notification(key)
         self.assertEqual(row["lease_generation"], 1)
         self.assertEqual(row["message_id"], 81)
+
+    def test_repeated_dispatcher_start_does_not_recover_live_leases(self) -> None:
+        live_thread = SimpleNamespace(is_alive=lambda: True)
+        stop_event = threading.Event()
+        wake_event = threading.Event()
+        with patch.object(notification_center, "_dispatch_thread", live_thread), patch.object(
+            notification_center, "_dispatch_stop", stop_event,
+        ), patch.object(
+            notification_center, "_dispatch_wakeup", wake_event,
+        ), patch.object(
+            notification_center, "recover_notifications",
+        ) as recover:
+            notification_center.start_telegram_notification_dispatcher()
+
+        recover.assert_not_called()
+        self.assertTrue(wake_event.is_set())
+
+    @patch("app.modules.telegram_notification_center.edit_event_result")
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_essential_level_still_closes_existing_action_thread(
+        self, sender, editor,
+    ) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=91)
+        editor.return_value = TelegramSendResult(ok=True, message_id=91)
+        with patch(
+            "app.modules.telegram_notification_policy.notification_level",
+            return_value="essential",
+        ):
+            initial = publish_notification_thread(
+                "confirmation:essential",
+                NotificationEvent(
+                    "待确认",
+                    actions=(NotificationAction("确认", "orgc:token:0"),),
+                ),
+                topic=NotificationTopic.CONFIRMATION,
+                importance=NotificationImportance.ACTION,
+                chat_id="100",
+            )
+            terminal = publish_notification_thread(
+                "confirmation:essential",
+                NotificationEvent("已完成", footer="按钮已失效"),
+                topic=NotificationTopic.CONFIRMATION,
+                importance=NotificationImportance.RESULT,
+                chat_id="100",
+            )
+
+        self.assertTrue(initial.delivered)
+        self.assertTrue(terminal.delivered)
+        sender.assert_called_once()
+        editor.assert_called_once()
+        self.assertEqual(tuple(editor.call_args.args[0].actions), ())
+
+    @patch("app.modules.telegram_notification_center.edit_event_result")
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_newer_thread_revision_survives_prior_unknown_edit(
+        self, sender, editor,
+    ) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=92)
+        self.assertTrue(publish_notification_thread(
+            "organize:unknown-revision",
+            NotificationEvent("初始状态"),
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+        ).delivered)
+
+        started = threading.Event()
+        release = threading.Event()
+        edits = 0
+
+        def edit(_event, **_kwargs):
+            nonlocal edits
+            edits += 1
+            if edits == 1:
+                started.set()
+                release.wait(2.0)
+                return TelegramSendResult(
+                    ok=False, status_code=408, error="ReadTimeout", message_id=92,
+                )
+            return TelegramSendResult(ok=True, message_id=92)
+
+        editor.side_effect = edit
+        worker = threading.Thread(target=lambda: publish_notification_thread(
+            "organize:unknown-revision",
+            NotificationEvent("中间状态"),
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+        ))
+        worker.start()
+        self.assertTrue(started.wait(1.0))
+        publish_notification_thread(
+            "organize:unknown-revision",
+            NotificationEvent("最新终态"),
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+        )
+        release.set()
+        worker.join(2.0)
+
+        key = notification_thread_event_key(
+            "organize:unknown-revision",
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+        )
+        pending = get_notification(key)
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["revision"], 3)
+        self.assertTrue(drain_telegram_notifications(event_key=key))
+        final = get_notification(key)
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(final["delivered_revision"], 3)
+        self.assertEqual(editor.call_count, 2)
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_thread_is_bounded_to_one_editable_text_message(self, sender) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=93)
+        result = publish_notification_thread(
+            "system:long-thread",
+            NotificationEvent(
+                "长生命周期",
+                lines=("超长详情" * 1500,),
+                image_url="https://example.invalid/poster.jpg",
+            ),
+            topic=NotificationTopic.SYSTEM,
+            chat_id="100",
+        )
+        self.assertTrue(result.delivered)
+        delivered_event = sender.call_args.args[0]
+        self.assertEqual(delivered_event.image_url, "")
+        self.assertLessEqual(len(render_event(delivered_event)), 3800)
+        self.assertIn("完整详情请在 Web", str(delivered_event.footer))
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_action_event_with_only_invalid_buttons_is_rejected(self, sender) -> None:
+        result = publish_notification_event(
+            "invalid-actions",
+            NotificationEvent(
+                "待确认",
+                actions=(NotificationAction("确认", "x" * 65),),
+            ),
+            topic=NotificationTopic.CONFIRMATION,
+            importance=NotificationImportance.ACTION,
+            chat_id="100",
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.status, "invalid_actions")
+        sender.assert_not_called()
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_permanent_telegram_4xx_fails_without_retry(self, sender) -> None:
+        sender.return_value = TelegramSendResult(
+            ok=False, status_code=403, error="Forbidden",
+        )
+        result = publish_notification_event(
+            "forbidden",
+            NotificationEvent("不可投递"),
+            topic=NotificationTopic.SYSTEM,
+            importance=NotificationImportance.ERROR,
+            chat_id="100",
+        )
+        row = get_notification(result.event_key)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["attempts"], 1)
 
     @patch("app.modules.telegram_notification_center.edit_event_result")
     @patch("app.modules.telegram_notification_center.send_event_result")

@@ -219,7 +219,19 @@ def build_download_lifecycle_event(
             errors.append(value[:220])
     footer = ""
     if state == "attention":
-        footer = "请按候选按钮继续处理；若按钮未送达，可在 Web 待确认队列操作。"
+        states = {
+            _status(_value(row, key))
+            for key in (
+                "status", "qb_status", "gy_status", "local_import_status",
+                "organize_status", "strm_status",
+            )
+        }
+        if "requires_manual" in states:
+            footer = "整理候选卡会单独发送；若未收到，可在 Web 待确认队列继续处理。"
+        elif _status(verification_status) == "attention":
+            footer = "请在 Agent 中查询最近下载状态，或前往 Web 查看入库复核详情。"
+        else:
+            footer = "请前往 Web 下载任务核对当前状态；为避免重复提交，请勿直接重试。"
     elif state == "error":
         footer = errors[0] if errors else "本次链路存在未完成阶段，请查看 Web 运行记录。"
     elif state == "processing":

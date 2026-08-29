@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _configured_test_mode = False
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
@@ -833,7 +833,7 @@ CREATE TABLE IF NOT EXISTS media_subscription_notification_outbox (
     subscription_revision INTEGER NOT NULL,
     run_id INTEGER,
     event_type TEXT NOT NULL
-        CHECK(event_type IN ('missing','satisfied','error')),
+        CHECK(event_type IN ('missing','satisfied','inconclusive','error')),
     payload_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK(status IN ('pending','sending','retry_wait','sent','failed','discarded')),
@@ -2266,6 +2266,74 @@ def _migrate_telegram_notification_outbox_v12(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_media_subscription_notification_outbox_v13(
+    conn: sqlite3.Connection,
+) -> None:
+    """允许追更“无法判定”结果进入可靠通知 outbox。"""
+    schema = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='media_subscription_notification_outbox'"
+    ).fetchone()
+    if schema is None:
+        return
+    normalized = re.sub(r"\s+", "", str(schema[0] or "").casefold())
+    if "'inconclusive'" in normalized:
+        return
+
+    legacy = "media_subscription_notification_outbox_v12"
+    conn.execute(
+        "DROP INDEX IF EXISTS idx_media_subscription_notification_due"
+    )
+    conn.execute(
+        "DROP INDEX IF EXISTS idx_media_subscription_notification_subscription"
+    )
+    conn.execute(
+        f"ALTER TABLE media_subscription_notification_outbox RENAME TO {legacy}"
+    )
+    conn.execute(
+        "CREATE TABLE media_subscription_notification_outbox ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "event_key TEXT NOT NULL UNIQUE,"
+        "subscription_id INTEGER NOT NULL,"
+        "subscription_revision INTEGER NOT NULL,"
+        "run_id INTEGER,"
+        "event_type TEXT NOT NULL CHECK(event_type IN "
+        "('missing','satisfied','inconclusive','error')),"
+        "payload_json TEXT NOT NULL DEFAULT '{}',"
+        "status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN "
+        "('pending','sending','retry_wait','sent','failed','discarded')),"
+        "attempts INTEGER NOT NULL DEFAULT 0,"
+        "lease_generation INTEGER NOT NULL DEFAULT 0,"
+        "lease_until TEXT NOT NULL DEFAULT '',"
+        "next_attempt_at TEXT NOT NULL,"
+        "last_error TEXT NOT NULL DEFAULT '',"
+        "sent_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+        "FOREIGN KEY (subscription_id) REFERENCES media_subscriptions(id) "
+        "ON DELETE CASCADE,"
+        "FOREIGN KEY (run_id) REFERENCES media_subscription_runs(id) "
+        "ON DELETE SET NULL"
+        ")"
+    )
+    columns = (
+        "id,event_key,subscription_id,subscription_revision,run_id,event_type,"
+        "payload_json,status,attempts,lease_generation,lease_until,"
+        "next_attempt_at,last_error,sent_at,created_at,updated_at"
+    )
+    conn.execute(
+        f"INSERT INTO media_subscription_notification_outbox({columns}) "
+        f"SELECT {columns} FROM {legacy}"
+    )
+    conn.execute(f"DROP TABLE {legacy}")
+    conn.execute(
+        "CREATE INDEX idx_media_subscription_notification_due "
+        "ON media_subscription_notification_outbox(status,next_attempt_at,id)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_media_subscription_notification_subscription "
+        "ON media_subscription_notification_outbox(subscription_id,id DESC)"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2279,6 +2347,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     9: _migrate_agent_guangya_operation_jobs_v10,
     10: _migrate_local_media_numbering_mode_v11,
     11: _migrate_telegram_notification_outbox_v12,
+    12: _migrate_media_subscription_notification_outbox_v13,
 }
 
 

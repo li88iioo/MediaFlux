@@ -1135,6 +1135,7 @@ def _confirmation_result_event(
     metadata = safe_int(stats.get("metadata_moved"), 0, minimum=0)
     skipped = safe_int(stats.get("skipped"), 0, minimum=0)
     failed = safe_int(stats.get("failed"), 0, minimum=0)
+    warnings = len(list(stats.get("warnings") or []))
     strm = stats.get("strm") if isinstance(stats.get("strm"), dict) else {}
     if strm.get("ok"):
         strm_label, refresh_label = "已排队", "等待 STRM 完成"
@@ -1144,8 +1145,9 @@ def _confirmation_result_event(
         strm_label, refresh_label = "启动失败", "未触发"
     else:
         strm_label, refresh_label = "未启用或无变更", "未触发"
+    partial = bool(failed or warnings or (strm and not strm.get("ok") and not strm.get("skipped")))
     return NotificationEvent(
-        "✅ 人工确认整理完成",
+        "⚠️ 人工确认整理部分完成" if partial else "✅ 人工确认整理完成",
         fields=(
             ("媒体", _candidate_display_name(candidate)),
             ("目录", payload.get("directory") or payload.get("source_name") or "/"),
@@ -1171,8 +1173,10 @@ def _local_confirmation_result_event(
     moved = len(list(result.get("moved") or []))
     deleted = len(list(result.get("deleted_junk") or []))
     warnings = len(list(result.get("warnings") or []))
+    refresh_status = str(result.get("media_refresh_status") or "")
+    partial = bool(warnings or refresh_status == "failed")
     return NotificationEvent(
-        "✅ 本地媒体确认整理完成",
+        "⚠️ 本地媒体确认整理部分完成" if partial else "✅ 本地媒体确认整理完成",
         fields=(
             ("媒体", _candidate_display_name(candidate)),
             ("来源", payload.get("source_name") or "本地媒体"),
@@ -1180,7 +1184,7 @@ def _local_confirmation_result_event(
             ("媒体库", {
                 "completed": "已刷新", "queued": "已排队",
                 "failed": "刷新失败", "skipped": "未启用",
-            }.get(str(result.get("media_refresh_status") or ""), "已处理")),
+            }.get(refresh_status, "已处理")),
         ),
         layout="relaxed",
     )
@@ -1270,6 +1274,7 @@ def _execute_local_media_confirmation(
         publish_confirmation_event(
             terminal_event, chat_id=chat_id, token=token,
             message_id=_confirmation_message_id(payload), terminal=True,
+            error=terminal_event.title.startswith("⚠️"),
         )
         return {"candidate": candidate, "stats": result, "local_task_id": task_id}
     except Exception as exc:
@@ -1473,6 +1478,7 @@ def _execute_guangya_confirmation(
         publish_confirmation_event(
             terminal_event, chat_id=chat_id, token=token,
             message_id=_confirmation_message_id(payload), terminal=True,
+            error=terminal_event.title.startswith("⚠️"),
         )
         try:
             Organizer.trigger_post_actions(

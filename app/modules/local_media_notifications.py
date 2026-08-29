@@ -6,8 +6,10 @@ from typing import Any, Mapping
 
 from app import config
 from app import database as db
+from app.agent.result_projection import sanitize_public_text
 from app.logger import get_logger
 from app.notifier import NotificationEvent
+from app.sensitive_data import redact_sensitive_text
 
 logger = get_logger(__name__)
 
@@ -25,6 +27,24 @@ def _value(data: Mapping[str, Any] | None, key: str, default: Any = "") -> Any:
 def _basename(value: object) -> str:
     text = str(value or "").strip().replace("\\", "/")
     return text.rsplit("/", 1)[-1] if text else ""
+
+
+def _safe_error_summary(value: object) -> str:
+    raw = str(value or "").strip()
+    normalized = raw.casefold()
+    mappings = (
+        (("目标目录不存在", "归档目录不存在"), "目标归档目录不存在或不可访问，请检查媒体来源的归档路径。"),
+        (("permission denied", "权限不足", "不可写"), "目标目录权限不足，请检查容器挂载与读写权限。"),
+        (("源文件不存在", "no such file", "文件已不存在"), "源文件已不存在或已被其他任务移动，请重新扫描来源。"),
+        (("目标已存在", "移动冲突", "发生变化"), "文件状态或目标位置已变化，请重新预览后再整理。"),
+        (("tmdb",), "TMDB 识别或查询失败，请稍后重试或手动确认。"),
+        (("媒体库刷新", "jellyfin", "emby"), "媒体文件已处理，但媒体库刷新未完成，请检查媒体服务器连接。"),
+    )
+    for markers, message in mappings:
+        if any(marker in normalized for marker in markers):
+            return message
+    safe = sanitize_public_text(redact_sensitive_text(raw), limit=180)
+    return safe or "执行失败，请到本地媒体任务详情查看。"
 
 
 def build_local_media_event(
@@ -82,7 +102,10 @@ def build_local_media_event(
             lines.append(f"…另有 {len(media) - 8} 个媒体未展示")
         if warnings:
             lines.append(f"⚠️ 共有 {len(warnings)} 条警告，请到本地媒体任务详情查看。")
-        return NotificationEvent("✅ 本地媒体整理完成", fields=tuple(fields), lines=tuple(lines))
+        title = "✅ 本地媒体整理完成"
+        if refresh_status == "failed":
+            title = "⚠️ 本地媒体整理部分完成"
+        return NotificationEvent(title, fields=tuple(fields), lines=tuple(lines))
 
     preview = _value(payload, "preview", {})
     if status == "requires_manual":
@@ -137,7 +160,10 @@ def build_local_media_event(
     if status == "planned":
         return NotificationEvent("ℹ️ 本地媒体预览完成", fields=tuple(fields))
 
-    fields.append(("错误", "执行失败，请到本地媒体任务详情查看"))
+    fields.append((
+        "错误",
+        _safe_error_summary(error or getattr(task, "error", "")),
+    ))
     return NotificationEvent("❌ 本地媒体整理失败", fields=tuple(fields))
 
 
@@ -193,7 +219,7 @@ def notify_local_media_task(
 
     status = str((result or {}).get("status") or getattr(task, "status", ""))
     importance = (
-        NotificationImportance.ERROR if status == "failed" else
+        NotificationImportance.ERROR if event.title.startswith(("❌", "⚠️")) else
         NotificationImportance.ACTION if status == "requires_manual" else
         NotificationImportance.RESULT
     )

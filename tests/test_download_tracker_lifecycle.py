@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from app.modules.download_tracker import DownloadTracker
+from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
 
 
 class DownloadTrackerLifecycleTests(unittest.TestCase):
@@ -32,6 +33,39 @@ class DownloadTrackerLifecycleTests(unittest.TestCase):
 
         self.assertFalse(starter.is_alive())
         self.assertIsNone(tracker._thread)
+
+    def test_manual_review_without_candidate_button_points_to_web(self) -> None:
+        row = {
+            "id": 1, "title": "待核对任务", "status": "manual_review",
+            "qb_status": "manual_review", "gy_status": "",
+            "local_import_status": "", "organize_status": "", "strm_status": "",
+            "notification_payload_json": "{}",
+        }
+        with patch(
+            "app.modules.telegram_download_lifecycle.get_notification_thread_event",
+            return_value=None,
+        ):
+            event = build_download_lifecycle_event(row)
+
+        self.assertIn("Web 下载任务", event.footer)
+        self.assertIn("请勿直接重试", event.footer)
+        self.assertNotIn("候选卡会单独发送", event.footer)
+
+    def test_requires_manual_explains_separate_candidate_card(self) -> None:
+        row = {
+            "id": 2, "title": "待确认任务", "status": "requires_manual",
+            "qb_status": "completed", "gy_status": "",
+            "local_import_status": "requires_manual", "organize_status": "",
+            "strm_status": "", "notification_payload_json": "{}",
+        }
+        with patch(
+            "app.modules.telegram_download_lifecycle.get_notification_thread_event",
+            return_value=None,
+        ):
+            event = build_download_lifecycle_event(row)
+
+        self.assertIn("候选卡会单独发送", event.footer)
+        self.assertIn("Web 待确认队列", event.footer)
 
     def test_stop_returns_false_while_worker_remains_alive(self) -> None:
         class StubbornThread:

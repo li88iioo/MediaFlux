@@ -13,8 +13,11 @@ from app import database as db, notifier
 from app.clients.guangya import GuangYaFile
 from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
 from app.modules import organize_confirmations as confirmation_module
+from app.modules import telegram_notification_center as notification_center
 from app.modules.organize_confirmations import (
+    _confirmation_result_event,
     _dispatch_next_queued_confirmation,
+    _local_confirmation_result_event,
     cancel_confirmation,
     confirmation_event,
     create_confirmation_actions,
@@ -39,6 +42,35 @@ class _PositionScraper:
     @staticmethod
     def parse_source_position(_name, _path=""):
         return 2, 4
+
+
+class ConfirmationTerminalNotificationTests(unittest.TestCase):
+    def test_guangya_warning_is_not_reported_as_full_success(self):
+        event = _confirmation_result_event(
+            {"directory": "/待确认"},
+            {"title": "测试剧集", "year": "2026"},
+            {
+                "moved": 1, "metadata_moved": 0, "skipped": 0, "failed": 0,
+                "warnings": ["媒体库刷新失败"],
+                "strm": {"ok": True},
+            },
+        )
+
+        self.assertIn("部分完成", event.title)
+        self.assertIn(("STRM", "已排队"), event.fields)
+
+    def test_local_refresh_failure_is_not_reported_as_full_success(self):
+        event = _local_confirmation_result_event(
+            {"source_name": "本地来源"},
+            {"title": "测试电影", "year": "2026"},
+            {
+                "moved": ["file.mkv"], "deleted_junk": [], "warnings": [],
+                "media_refresh_status": "failed",
+            },
+        )
+
+        self.assertIn("部分完成", event.title)
+        self.assertIn(("媒体库", "刷新失败"), event.fields)
 
 
 class ConfirmationGroupingTests(unittest.TestCase):
@@ -215,12 +247,20 @@ class NsfwConfirmationFallbackTests(unittest.TestCase):
 
 class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
     def setUp(self):
+        self._notification_dispatcher_was_stopped = (
+            notification_center._dispatch_stop.is_set()
+        )
+        notification_center._dispatch_stop.clear()
         stop_confirmation_dispatcher()
         with db.get_conn() as conn:
             conn.execute("DELETE FROM organize_confirmations")
 
     def tearDown(self):
         stop_confirmation_dispatcher()
+        if self._notification_dispatcher_was_stopped:
+            notification_center._dispatch_stop.set()
+        else:
+            notification_center._dispatch_stop.clear()
 
     @staticmethod
     def _group():

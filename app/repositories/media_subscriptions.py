@@ -610,6 +610,7 @@ def _enqueue_run_notification(
         "missing": "notify_on_missing",
         "satisfied": "notify_on_satisfied",
         "error": "notify_on_error",
+        "inconclusive": "notify_on_error",
     }.get(str(event_type))
     if flag is None:
         return False
@@ -680,11 +681,12 @@ def finalize_media_subscription_check(
             "WHERE id=? AND status='running'",
             (final_status, final_summary, _json(payload, {}), final_error, stamp, int(run_id)),
         )
-        if committed and final_status in {"missing", "satisfied"}:
+        if committed and final_status in {"missing", "satisfied", "inconclusive"}:
             subscription = conn.execute(
-                "SELECT title FROM media_subscriptions WHERE id=?",
+                "SELECT title,action FROM media_subscriptions WHERE id=?",
                 (int(subscription_id),),
             ).fetchone()
+            result_payload = payload if isinstance(payload, dict) else {}
             _enqueue_run_notification(
                 conn,
                 subscription_id=subscription_id,
@@ -698,6 +700,18 @@ def finalize_media_subscription_check(
                     "expected_count": int(expected_count),
                     "local_count": int(local_count),
                     "missing_count": int(missing_count),
+                    "summary": str(summary or "")[:300],
+                    "action": str(
+                        result_payload.get("action")
+                        or (subscription["action"] if subscription else "notify")
+                        or "notify"
+                    ),
+                    "candidate_count": max(
+                        0, int(result_payload.get("candidate_count") or 0)
+                    ),
+                    "auto_submitted": max(
+                        0, int(result_payload.get("auto_submitted") or 0)
+                    ),
                 },
                 stamp=stamp,
             )

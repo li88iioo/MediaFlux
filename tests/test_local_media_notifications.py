@@ -54,6 +54,7 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
             "warnings": ["Jellyfin 刷新失败: /media/Movies"],
             "media_refresh_status": "failed",
         }))
+        self.assertIn("本地媒体整理部分完成", rendered)
         self.assertIn("媒体库刷新：</b>失败（需处理）", rendered)
         self.assertNotIn("媒体库刷新：</b>完成", rendered)
 
@@ -182,6 +183,18 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
         event = publisher.call_args.args[0]
         self.assertTrue(event.actions)
         self.assertEqual(publisher.call_args.kwargs["chat_id"], "-100")
+
+    def test_missing_archive_directory_is_actionable_without_leaking_path(self):
+        task = db.get_local_media_task(self.task_id, owner="admin")
+        source = db.get_local_media_source(self.source_id, owner="admin")
+        rendered = render_event(build_local_media_event(
+            task, source, {"status": "failed"},
+            error="目标归档目录不存在: /srv/private/动漫",
+        ))
+
+        self.assertIn("目标归档目录不存在或不可访问", rendered)
+        self.assertIn("检查媒体来源的归档路径", rendered)
+        self.assertNotIn("/srv/private", rendered)
 
     def test_warning_and_failure_details_never_expose_absolute_paths(self):
         task = db.get_local_media_task(self.task_id, owner="admin")

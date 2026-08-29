@@ -1140,9 +1140,15 @@ class OrganizeCorrectionService:
                 logger.warning(warnings[-1])
         return warnings
 
-    def _notify_reorganize_result(self, preview: dict,
-                                  items: list[CorrectionItem]) -> list[str]:
+    def _notify_reorganize_result(
+        self,
+        preview: dict,
+        items: list[CorrectionItem],
+        rules: OrganizeRules | None = None,
+    ) -> list[str]:
         """人工纠偏提交成功后发送媒体卡片；失败只返回 warning。"""
+        if rules is not None and not (rules.notify_enabled and rules.library_notify):
+            return []
         warnings: list[str] = []
         try:
             from app.notifier import build_media_events
@@ -1182,6 +1188,7 @@ class OrganizeCorrectionService:
                     event,
                     topic=NotificationTopic.ORGANIZE,
                     importance=NotificationImportance.RESULT,
+                    topic_enabled=True,
                 )) and accepted
             if not accepted:
                 warnings.append("人工识别媒体通知发送失败")
@@ -1256,7 +1263,7 @@ class OrganizeCorrectionService:
             media_type=match["media_type"],
             title=match["title"], year=match["year"], error="",
         )
-        warnings = self._notify_reorganize_result(preview, items)
+        warnings = self._notify_reorganize_result(preview, items, rules)
         warnings.extend(self._run_post_actions(
             items=items,
             rules=rules,

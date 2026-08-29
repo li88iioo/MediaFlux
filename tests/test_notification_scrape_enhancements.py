@@ -757,6 +757,22 @@ class GuangYaFileInfoTests(unittest.TestCase):
         client = self._client_with_response({"msg": "success", "data": {"fileInfo": {}}})
         self.assertIsNone(client.file_info("missing"))
 
+    def test_reorganize_notification_disabled_is_silent_not_a_warning(self):
+        from types import SimpleNamespace
+        from app.modules.organize_correction import OrganizeCorrectionService
+
+        service = SimpleNamespace()
+        rules = SimpleNamespace(notify_enabled=False, library_notify=True)
+        with patch(
+            "app.modules.telegram_notification_center.publish_notification_event"
+        ) as publisher:
+            warnings = OrganizeCorrectionService._notify_reorganize_result(
+                service, {}, [], rules,
+            )
+
+        self.assertEqual(warnings, [])
+        publisher.assert_not_called()
+
     def test_snapshot_validation_reports_unreadable_detail_before_position_drift(self):
         from app.modules.organize_correction import CorrectionItem, OrganizeCorrectionService
 

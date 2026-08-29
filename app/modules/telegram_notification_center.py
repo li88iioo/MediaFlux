@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from app.logger import get_logger
 from app.modules.telegram_notification_policy import (
@@ -18,11 +18,13 @@ from app.notifier import (
     TelegramSendResult,
     edit_event_result,
     notification_target_chat_id,
+    render_event,
     send_event_result,
 )
 from app.repositories.telegram_notifications import (
     claim_due_notifications,
     complete_notification,
+    fail_notification,
     get_notification,
     mark_outcome_unknown,
     purge_notifications,
@@ -39,6 +41,8 @@ _dispatch_stop = threading.Event()
 _dispatch_wakeup = threading.Event()
 _dispatch_thread: threading.Thread | None = None
 _dispatch_accepting = False
+_delivery_lock = threading.Lock()
+_THREAD_MESSAGE_LIMIT = 3800
 
 
 @dataclass(frozen=True)
@@ -153,11 +157,72 @@ def _edit_can_fallback_to_new_message(result: TelegramSendResult) -> bool:
     ))
 
 
+def _is_valid_action(action: NotificationAction) -> bool:
+    label = str(action.label or "").strip()
+    callback_data = str(action.callback_data or "").strip()
+    return bool(
+        label
+        and callback_data
+        and len(callback_data.encode("utf-8")) <= 64
+    )
+
+
+def _bounded_thread_event(event: NotificationEvent) -> NotificationEvent:
+    """保证生命周期线程始终可由单条纯文本消息原位更新。"""
+    valid_actions = tuple(action for action in event.actions if _is_valid_action(action))
+    bounded = replace(event, image_url="", actions=valid_actions)
+    if len(render_event(bounded)) <= _THREAD_MESSAGE_LIMIT:
+        return bounded
+
+    clipped = replace(
+        bounded,
+        title=str(bounded.title or "Telegram 通知")[:180],
+        fields=tuple(
+            (str(label or "")[:64], str(value or "")[:520])
+            for label, value in tuple(bounded.fields or ())[:16]
+        ),
+        lines=tuple(str(line or "")[:700] for line in tuple(bounded.lines or ())[:12]),
+        footer=str(bounded.footer or "")[:360],
+    )
+    truncation_note = "内容过长已截断，完整详情请在 Web 运行记录中查看。"
+    lines = list(clipped.lines)
+    fields = list(clipped.fields)
+    while lines and len(render_event(replace(
+        clipped, lines=tuple(lines), footer=truncation_note,
+    ))) > _THREAD_MESSAGE_LIMIT:
+        lines.pop()
+    while fields and len(render_event(replace(
+        clipped, fields=tuple(fields), lines=tuple(lines), footer=truncation_note,
+    ))) > _THREAD_MESSAGE_LIMIT:
+        fields.pop()
+    return replace(
+        clipped,
+        fields=tuple(fields),
+        lines=tuple(lines),
+        footer=truncation_note,
+    )
+
+
+def _allows_dispatch(item: dict) -> bool:
+    importance = str(item.get("importance") or "result")
+    if allows_notification(importance):
+        return True
+    # 通知等级只决定是否创建新消息。已经投递过的生命周期线程必须允许
+    # 收敛终态并清除旧按钮；全局通知总开关关闭时仍不发送。
+    from app.modules.telegram_notification_policy import notifications_enabled
+
+    return bool(
+        notifications_enabled()
+        and str(item.get("thread_key") or "").strip()
+        and int(item.get("message_id") or 0) > 0
+    )
+
+
 def _dispatch_item(item: dict) -> bool:
     notification_id = int(item["id"])
     generation = int(item["lease_generation"])
     claimed_revision = int(item["revision"])
-    if not allows_notification(str(item.get("importance") or "result")):
+    if not _allows_dispatch(item):
         suppress_notification(
             notification_id, lease_generation=generation,
             reason="NotificationPolicyDisabled",
@@ -204,8 +269,16 @@ def _dispatch_item(item: dict) -> bool:
         mark_outcome_unknown(
             notification_id,
             lease_generation=generation,
+            claimed_revision=claimed_revision,
             error=outcome.error or "OutcomeUnknown",
             message_id=int(outcome.message_id or message_id or 0),
+        )
+        return False
+    if 400 <= int(outcome.status_code or 0) < 500 and int(outcome.status_code) not in {408, 429}:
+        fail_notification(
+            notification_id,
+            lease_generation=generation,
+            error=outcome.error or "TelegramRequestRejected",
         )
         return False
     retry_notification(
@@ -220,14 +293,25 @@ def _dispatch_item(item: dict) -> bool:
 def drain_telegram_notifications(
     *, limit: int = 20, event_key: str = "",
 ) -> bool:
-    claimed = claim_due_notifications(limit=limit, event_key=event_key)
-    if not claimed:
-        row = get_notification(event_key) if event_key else None
-        return bool(row and str(row.get("status") or "") == "sent")
+    processed = 0
     delivered = True
-    for item in claimed:
-        delivered = _dispatch_item(item) and delivered
-    return delivered
+    for _ in range(max(1, min(int(limit or 1), 100))):
+        # 只在真正发送前领取一条，并串行化进程内 transport；避免批量预领取
+        # 的后排记录等待超过租约后被另一个 drain 重领。
+        if not _delivery_lock.acquire(blocking=False):
+            break
+        try:
+            claimed = claim_due_notifications(limit=1, event_key=event_key)
+            if not claimed:
+                break
+            processed += 1
+            delivered = _dispatch_item(claimed[0]) and delivered
+        finally:
+            _delivery_lock.release()
+    if processed:
+        return delivered
+    row = get_notification(event_key) if event_key else None
+    return bool(row and str(row.get("status") or "") == "sent")
 
 
 def _publish(
@@ -243,10 +327,6 @@ def _publish(
     deliver_now: bool = True,
 ) -> NotificationPublishResult:
     normalized_importance = NotificationImportance(_importance(importance))
-    if not allows_notification(
-        normalized_importance, topic_enabled=topic_enabled,
-    ):
-        return NotificationPublishResult(False, status="disabled")
     target = notification_target_chat_id(chat_id)
     if not target:
         return NotificationPublishResult(False, status="unconfigured")
@@ -254,6 +334,34 @@ def _publish(
     key = _event_key(
         "thread" if thread else "event", normalized_topic, logical_key, target
     )
+    existing = get_notification(key) if thread else None
+    continuation = bool(
+        existing
+        and int(existing.get("message_id") or 0) > 0
+        and int(existing.get("delivered_revision") or 0) > 0
+    )
+    allowed = allows_notification(
+        normalized_importance, topic_enabled=topic_enabled,
+    )
+    if not allowed:
+        from app.modules.telegram_notification_policy import notifications_enabled
+
+        # 已经展示给用户的线程需要完成终态更新，避免 essential 等级下
+        # 候选按钮、错误或“等待后处理”永久停留。
+        allowed = bool(thread and continuation and notifications_enabled())
+    if not allowed:
+        return NotificationPublishResult(False, status="disabled")
+    if event.actions:
+        valid_actions = tuple(action for action in event.actions if _is_valid_action(action))
+        if not valid_actions:
+            logger.error("拒绝没有有效按钮的 Telegram 操作通知 topic=%s", normalized_topic)
+            return NotificationPublishResult(
+                False, status="invalid_actions", event_key=key,
+            )
+        if valid_actions != tuple(event.actions):
+            event = replace(event, actions=valid_actions)
+    if thread:
+        event = _bounded_thread_event(event)
     row = upsert_notification(
         key,
         thread_key=str(logical_key or "") if thread else "",
@@ -267,7 +375,7 @@ def _publish(
     if row is None:
         return NotificationPublishResult(False, status="invalid", event_key=key)
     status = str(row.get("status") or "pending")
-    if deliver_now and status in {"pending", "retry_wait"}:
+    if deliver_now and not _dispatch_stop.is_set() and status in {"pending", "retry_wait"}:
         drain_telegram_notifications(limit=1, event_key=key)
         row = get_notification(key) or row
         status = str(row.get("status") or status)
@@ -346,17 +454,23 @@ def _dispatch_loop() -> None:
 def start_telegram_notification_dispatcher() -> None:
     global _dispatch_thread, _dispatch_accepting
     with _dispatch_lock:
+        if _dispatch_thread is not None and _dispatch_thread.is_alive():
+            if not _dispatch_stop.is_set():
+                _dispatch_accepting = True
+                _dispatch_wakeup.set()
+            else:
+                logger.warning("Telegram 通知中心仍在停止中，暂缓重复启动")
+            return
         _dispatch_accepting = True
         _dispatch_stop.clear()
         recover_notifications()
         purge_notifications()
-        if _dispatch_thread is None or not _dispatch_thread.is_alive():
-            _dispatch_thread = threading.Thread(
-                target=_dispatch_loop,
-                name="telegram-notification-outbox",
-                daemon=True,
-            )
-            _dispatch_thread.start()
+        _dispatch_thread = threading.Thread(
+            target=_dispatch_loop,
+            name="telegram-notification-outbox",
+            daemon=True,
+        )
+        _dispatch_thread.start()
     _dispatch_wakeup.set()
 
 

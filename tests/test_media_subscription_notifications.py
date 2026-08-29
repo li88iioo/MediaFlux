@@ -55,7 +55,10 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         )
         self.assertIsNotNone(result)
 
-    def _finalize(self, *, status: str = "missing", missing_count: int = 1) -> int:
+    def _finalize(
+        self, *, status: str = "missing", missing_count: int = 1,
+        payload: dict | None = None, summary: str = "检查完成",
+    ) -> int:
         run_id = db.claim_media_subscription_check_run(self.sid, "manual")
         self.assertIsNotNone(run_id)
         revision = int(db.get_media_subscription(self.sid)["revision"])
@@ -64,8 +67,8 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
             int(run_id),
             status=status,
             run_status=status,
-            summary="检查完成",
-            payload={"status": status},
+            summary=summary,
+            payload=payload or {"status": status},
             interval_minutes=60,
             expected_count=10,
             local_count=10 - missing_count,
@@ -170,6 +173,73 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         self.assertIn("安全追更标题", body)
         self.assertNotIn("PRIVATE", body)
         self.assertEqual(list_notification_outbox()[0]["status"], "sent")
+
+    def test_inconclusive_uses_error_rule_and_sends_safe_reason(self) -> None:
+        self._enable_rule(notify_on_error=True)
+        self._finalize(
+            status="inconclusive", missing_count=0,
+            summary="Jellyfin 连接失败，请检查媒体库映射",
+        )
+        rows = list_notification_outbox()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event_type"], "inconclusive")
+
+        with patch(
+            "app.modules.telegram_notification_center.notification_target_chat_id",
+            return_value="100",
+        ), patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=TelegramSendResult(ok=True, message_id=53),
+        ) as send:
+            self.assertTrue(drain_media_subscription_notifications())
+
+        body = render_event(send.call_args.args[0])
+        self.assertIn("追更检查无法得出结论", body)
+        self.assertIn("Jellyfin 连接失败", body)
+
+    def test_missing_payload_preserves_candidates_and_auto_submission(self) -> None:
+        self._enable_rule(notify_on_missing=True)
+        self._finalize(payload={
+            "status": "missing",
+            "action": "auto",
+            "candidate_count": 4,
+            "auto_submitted": 2,
+        })
+        with patch(
+            "app.modules.telegram_notification_center.notification_target_chat_id",
+            return_value="100",
+        ), patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=TelegramSendResult(ok=True, message_id=54),
+        ) as send:
+            self.assertTrue(drain_media_subscription_notifications())
+
+        body = render_event(send.call_args.args[0])
+        self.assertIn("追更已自动提交下载", body)
+        self.assertIn("候选：</b>4 个", body)
+        self.assertIn("已提交：</b>2 项", body)
+
+    def test_missing_confirm_candidates_are_reported_as_actionable(self) -> None:
+        self._enable_rule(notify_on_missing=True)
+        self._finalize(payload={
+            "status": "missing",
+            "action": "confirm",
+            "candidate_count": 3,
+            "auto_submitted": 0,
+        })
+        with patch(
+            "app.modules.telegram_notification_center.notification_target_chat_id",
+            return_value="100",
+        ), patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=TelegramSendResult(ok=True, message_id=55),
+        ) as send:
+            self.assertTrue(drain_media_subscription_notifications())
+
+        body = render_event(send.call_args.args[0])
+        self.assertIn("追更候选待确认", body)
+        self.assertIn("候选：</b>3 个", body)
+        self.assertIn("媒体追更中确认", body)
 
     def test_notification_title_is_escaped_for_telegram_html(self) -> None:
         with db.get_conn() as conn:

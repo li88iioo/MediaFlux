@@ -1772,6 +1772,13 @@ class STRMScheduler:
                         strm_error="服务停止，STRM 同步已安全中止",
                         strm_finished_at=db.now(),
                     )
+                _publish_linked_notification_threads(
+                    options,
+                    strm_status="已停止",
+                    media_refresh="未触发",
+                    partial=True,
+                    error="服务停止，STRM 同步已安全中止；变化目标已保留，重启后可继续处理",
+                )
                 self._set_progress("stopped", 1, 1, "同步已停止")
                 if lease_heartbeat:
                     lease_heartbeat.stop()

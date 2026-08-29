@@ -81,7 +81,8 @@ def upsert_notification(
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT id,status,revision,delivered_revision,message_id,event_json FROM "
+            "SELECT id,status,revision,delivered_revision,message_id,event_json,"
+            "thread_key,topic,importance,chat_id FROM "
             "telegram_notification_outbox WHERE event_key=?",
             (key,),
         ).fetchone()
@@ -109,12 +110,33 @@ def upsert_notification(
             existing_message_id = int(row["message_id"] or 0)
             message_id = existing_message_id or int(preferred_message_id or 0)
             if str(row["event_json"] or "") == payload:
-                if not existing_message_id and message_id:
-                    conn.execute(
-                        "UPDATE telegram_notification_outbox SET message_id=?,updated_at=? "
-                        "WHERE event_key=?",
-                        (message_id, stamp, key),
-                    )
+                status = str(row["status"] or "")
+                revive = status in {"failed", "suppressed"} or (
+                    status == "outcome_unknown" and message_id > 0
+                )
+                conn.execute(
+                    "UPDATE telegram_notification_outbox SET thread_key=?,topic=?,"
+                    "importance=?,chat_id=?,message_id=?,"
+                    "status=CASE WHEN ? THEN 'pending' ELSE status END,"
+                    "attempts=CASE WHEN ? THEN 0 ELSE attempts END,"
+                    "next_attempt_at=CASE WHEN ? THEN ? ELSE next_attempt_at END,"
+                    "last_error=CASE WHEN ? THEN '' ELSE last_error END,updated_at=? "
+                    "WHERE event_key=?",
+                    (
+                        str(thread_key or ""),
+                        str(topic or "system"),
+                        str(importance or "result"),
+                        str(chat_id or ""),
+                        message_id or None,
+                        int(revive),
+                        int(revive),
+                        int(revive),
+                        stamp,
+                        int(revive),
+                        stamp,
+                        key,
+                    ),
+                )
                 return dict(conn.execute(
                     "SELECT * FROM telegram_notification_outbox WHERE event_key=?", (key,)
                 ).fetchone())
@@ -279,6 +301,32 @@ def retry_notification(
         return status
 
 
+def fail_notification(
+    notification_id: int,
+    *,
+    lease_generation: int,
+    error: str,
+) -> bool:
+    """记录 Telegram 明确拒绝的永久错误，不做无意义重试。"""
+    database = _database()
+    stamp = database.now()
+    with database.get_conn() as conn:
+        _ensure_schema(conn)
+        cur = conn.execute(
+            "UPDATE telegram_notification_outbox SET status='failed',"
+            "attempts=attempts+1,last_error=?,next_attempt_at=?,updated_at=? "
+            "WHERE id=? AND status='sending' AND lease_generation=?",
+            (
+                str(error or "TelegramRequestRejected")[:300],
+                stamp,
+                stamp,
+                int(notification_id),
+                int(lease_generation),
+            ),
+        )
+        return bool(cur.rowcount)
+
+
 def suppress_notification(
     notification_id: int,
     *,
@@ -303,6 +351,7 @@ def mark_outcome_unknown(
     notification_id: int,
     *,
     lease_generation: int,
+    claimed_revision: int,
     error: str,
     message_id: int = 0,
 ) -> bool:
@@ -310,6 +359,33 @@ def mark_outcome_unknown(
     stamp = database.now()
     with database.get_conn() as conn:
         _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT revision,message_id FROM telegram_notification_outbox WHERE id=? "
+            "AND status='sending' AND lease_generation=?",
+            (int(notification_id), int(lease_generation)),
+        ).fetchone()
+        if row is None:
+            return False
+        latest_revision = int(row["revision"] or 0)
+        known_message_id = int(message_id or row["message_id"] or 0)
+        # 旧 revision 的编辑结果未知，但消息身份已知时，最新 revision 仍可
+        # 安全地再次原位编辑；不能把尚未发送的新终态一起吞进 unknown。
+        if latest_revision != int(claimed_revision) and known_message_id > 0:
+            cur = conn.execute(
+                "UPDATE telegram_notification_outbox SET status='pending',"
+                "message_id=?,last_error=?,next_attempt_at=?,updated_at=? "
+                "WHERE id=? AND status='sending' AND lease_generation=?",
+                (
+                    known_message_id,
+                    ("PriorRevisionOutcomeUnknown:" + str(error or "OutcomeUnknown"))[:300],
+                    stamp,
+                    stamp,
+                    int(notification_id),
+                    int(lease_generation),
+                ),
+            )
+            return bool(cur.rowcount)
         cur = conn.execute(
             "UPDATE telegram_notification_outbox SET status='outcome_unknown',"
             "message_id=COALESCE(NULLIF(?,0),message_id),last_error=?,updated_at=? "
