@@ -10,6 +10,7 @@ from app.notifier import (
     decorate_field_label,
     render_event,
     safe_int,
+    telegram_text_length,
 )
 
 # Telegram 文本上限为 4096；通知中心按 4000 分段。生命周期消息还会补写
@@ -122,15 +123,24 @@ def attach_bounded_media_details(
         return event
 
     full = replace(event, lines=normalized)
-    if len(render_event(full)) <= _EDIT_SAFE_LIMIT:
+    if telegram_text_length(render_event(full)) <= _EDIT_SAFE_LIMIT:
         return full
 
     total = len(normalized)
-    for keep in range(total - 1, -1, -1):
+    best: NotificationEvent | None = None
+    low = 0
+    high = total - 1
+    # 保留块数越少，渲染结果越短。用二分定位最大可保留前缀，避免大批量
+    # 整理结果逐项重渲染形成 O(n²) 开销。
+    while low <= high:
+        keep = (low + high) // 2
         omitted = total - keep
         notice = f"…另有 {omitted} 项媒体详情未展开，完整记录见 Web 整理日志"
         candidate = replace(event, lines=normalized[:keep] + (notice,))
-        if len(render_event(candidate)) <= _EDIT_SAFE_LIMIT:
-            return candidate
+        if telegram_text_length(render_event(candidate)) <= _EDIT_SAFE_LIMIT:
+            best = candidate
+            low = keep + 1
+        else:
+            high = keep - 1
 
-    return event
+    return best or event

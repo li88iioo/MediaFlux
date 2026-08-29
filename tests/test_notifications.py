@@ -322,6 +322,27 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertEqual(bot.messages, [("300", first), ("300", second)])
         self.assertTrue(all(len(text) <= 4000 for _, text in bot.messages))
 
+    def test_non_bmp_text_is_split_by_telegram_utf16_units(self):
+        chunks = notifier.split_message("😀" * 3000, 4000)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(
+            [notifier.telegram_text_length(chunk) for chunk in chunks],
+            [4000, 2000],
+        )
+
+    def test_existing_status_symbols_and_negative_completion_are_not_misdecorated(self):
+        for title in (
+            "⏳ 下载与入库处理中",
+            "⏭ 已跳过",
+            "⬇ 下载中",
+            "ℹ️ 本地媒体预览完成",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(notifier.decorate_title(title), title)
+        self.assertTrue(notifier.decorate_title("本次同步未完成").startswith("⚠️"))
+        self.assertTrue(notifier.decorate_title("本次同步无法完成").startswith("⚠️"))
+
     def test_long_escaped_event_never_splits_inside_html_entity_or_bold_tag(self):
         """若分段切断 HTML entity 或粗体标签，本测试必须失败。"""
         event_type = getattr(notifier, "NotificationEvent", None)

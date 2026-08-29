@@ -13,6 +13,7 @@ from app.modules.agent_library_patrol_notifications import (
     send_library_patrol_notification,
 )
 from app.modules.telegram_notification_center import NotificationPublishResult
+from app.modules.telegram_notification_policy import NotificationImportance
 from app.notifier import render_event
 
 
@@ -152,6 +153,35 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
         self.assertEqual(event.lines, ())
         self.assertEqual(event.actions, ())
         self.assertIn("恢复正常", str(event.title))
+
+    def test_recovery_is_result_while_available_updates_remain_actionable(self):
+        captured = []
+
+        def publish(_key, _event, **kwargs):
+            captured.append(kwargs["importance"])
+            return NotificationPublishResult(True, delivered=True, status="sent")
+
+        recovered = _projection()
+        recovered.update({
+            "patrol_status": "up_to_date",
+            "updates_available_count": 0,
+            "missing_episode_count": 0,
+            "options": [],
+        })
+        with patch(
+            "app.modules.agent_library_patrol_notifications.get",
+            return_value="",
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_event",
+            side_effect=publish,
+        ):
+            self.assertTrue(send_library_patrol_notification(_projection()))
+            self.assertTrue(send_library_patrol_notification(recovered))
+
+        self.assertEqual(captured, [
+            NotificationImportance.ACTION,
+            NotificationImportance.RESULT,
+        ])
 
 
 if __name__ == "__main__":

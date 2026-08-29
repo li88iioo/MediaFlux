@@ -128,7 +128,8 @@ def _patrol_actions_configured() -> bool:
 
 def send_library_patrol_notification_result(projection: Any) -> TelegramSendResult:
     """把巡检结果交给统一通知中心，保留人工查询按钮。"""
-    event = build_library_patrol_event(projection)
+    safe = _validated_projection(projection)
+    event = build_library_patrol_event(safe)
     if event.actions and not _patrol_actions_configured():
         event = replace(event, actions=())
     from app.modules.telegram_notification_center import publish_notification_event
@@ -138,12 +139,16 @@ def send_library_patrol_notification_result(projection: Any) -> TelegramSendResu
 
     if not notifications_enabled():
         return TelegramSendResult(False, error="NotificationsDisabled", status_code=503)
-    fingerprint = build_patrol_result_fingerprint(projection)
+    fingerprint = build_patrol_result_fingerprint(safe)
     outcome = publish_notification_event(
         f"agent-library-patrol:{fingerprint}",
         event,
         topic=NotificationTopic.AGENT,
-        importance=NotificationImportance.ACTION,
+        importance=(
+            NotificationImportance.RESULT
+            if safe["patrol_status"] == "up_to_date"
+            else NotificationImportance.ACTION
+        ),
     )
     return TelegramSendResult(
         ok=bool(outcome),

@@ -26,8 +26,12 @@ from app.notifier import (
     NotificationEvent,
     TelegramSendResult,
     render_event,
+    telegram_text_length,
 )
-from app.repositories.telegram_notifications import get_notification
+from app.repositories.telegram_notifications import (
+    claim_due_notifications,
+    get_notification,
+)
 from app.routes.api import save_config
 from tests.support import IsolatedDatabaseTestCase
 
@@ -58,6 +62,45 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         restored = deserialize_notification_event(serialize_notification_event(event))
         self.assertEqual(restored, event)
         self.assertEqual(restored.actions[0].callback_data, "orgc:token:0")
+
+    def test_serialization_converges_dynamic_objects_to_safe_strings(self) -> None:
+        restored = deserialize_notification_event(serialize_notification_event(
+            NotificationEvent(
+                Path("/tmp/poster"),
+                fields=(("路径", Path("/tmp/media")),),
+                lines=(Path("/tmp/line"),),
+            )
+        ))
+
+        self.assertEqual(restored.title, "/tmp/poster")
+        self.assertEqual(restored.fields, (("路径", "/tmp/media"),))
+        self.assertEqual(restored.lines, ("/tmp/line",))
+
+    def test_invalid_and_oversized_logical_keys_are_safely_bounded(self) -> None:
+        invalid = publish_notification_event(
+            "   ", NotificationEvent("无效"),
+            topic=NotificationTopic.SYSTEM, chat_id="100", deliver_now=False,
+        )
+        self.assertFalse(invalid.accepted)
+        self.assertEqual(invalid.status, "invalid_key")
+
+        raw_key = "payload:" + ('{"title":"敏感示例"}' * 200)
+        bounded = publish_notification_event(
+            raw_key, NotificationEvent("有效"),
+            topic=NotificationTopic.SYSTEM, chat_id="100", deliver_now=False,
+        )
+        self.assertTrue(bounded.accepted)
+        self.assertLessEqual(len(bounded.event_key.encode("utf-8")), 160)
+        self.assertNotIn("title", bounded.event_key)
+        self.assertNotIn("敏感示例", bounded.event_key)
+
+        thread = publish_notification_thread(
+            raw_key, NotificationEvent("线程"),
+            topic=NotificationTopic.SYSTEM, chat_id="100", deliver_now=False,
+        )
+        thread_row = get_notification(thread.event_key)
+        self.assertTrue(str(thread_row["thread_key"]).startswith("sha256:"))
+        self.assertNotIn("敏感示例", str(thread_row["thread_key"]))
 
     @patch("app.modules.telegram_notification_center.send_event_result")
     def test_one_shot_event_is_idempotent(self, sender) -> None:
@@ -250,8 +293,41 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertTrue(result.delivered)
         delivered_event = sender.call_args.args[0]
         self.assertEqual(delivered_event.image_url, "")
-        self.assertLessEqual(len(render_event(delivered_event)), 3800)
+        self.assertLessEqual(telegram_text_length(render_event(delivered_event)), 3800)
         self.assertIn("完整详情请在 Web", str(delivered_event.footer))
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_thread_with_non_bmp_text_is_bounded_by_utf16_units(self, sender) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=94)
+        result = publish_notification_thread(
+            "system:emoji-thread",
+            NotificationEvent("😀" * 500, lines=(("😀" * 3000),)),
+            topic=NotificationTopic.SYSTEM,
+            chat_id="100",
+        )
+
+        self.assertTrue(result.delivered)
+        delivered_event = sender.call_args.args[0]
+        self.assertLessEqual(telegram_text_length(render_event(delivered_event)), 3800)
+
+    def test_long_action_label_is_normalized_without_losing_action(self) -> None:
+        result = publish_notification_event(
+            "long-action-label",
+            NotificationEvent(
+                "待确认",
+                actions=(NotificationAction("😀" * 80, "orgc:token:0"),),
+            ),
+            topic=NotificationTopic.CONFIRMATION,
+            importance=NotificationImportance.ACTION,
+            chat_id="100",
+            deliver_now=False,
+        )
+
+        self.assertTrue(result.accepted)
+        row = get_notification(result.event_key)
+        restored = deserialize_notification_event(row["event_json"])
+        self.assertEqual(restored.actions[0].callback_data, "orgc:token:0")
+        self.assertEqual(telegram_text_length(restored.actions[0].label), 64)
 
     @patch("app.modules.telegram_notification_center.send_event_result")
     def test_action_event_with_only_invalid_buttons_is_rejected(self, sender) -> None:
@@ -285,6 +361,172 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["attempts"], 1)
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_corrupt_persisted_event_fails_once_without_retry(self, sender) -> None:
+        result = publish_notification_event(
+            "corrupt-event",
+            NotificationEvent("稍后损坏"),
+            topic=NotificationTopic.SYSTEM,
+            chat_id="100",
+            deliver_now=False,
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE telegram_notification_outbox SET event_json='{',"
+                "next_attempt_at=? WHERE event_key=?",
+                (db.now(), result.event_key),
+            )
+
+        self.assertFalse(drain_telegram_notifications(event_key=result.event_key))
+        row = get_notification(result.event_key)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["attempts"], 1)
+        self.assertIn("InvalidEventPayload", row["last_error"])
+        sender.assert_not_called()
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_structurally_corrupt_payload_fails_once_without_retry(self, sender) -> None:
+        result = publish_notification_event(
+            "corrupt-event-shape",
+            NotificationEvent("稍后损坏"),
+            topic=NotificationTopic.SYSTEM,
+            chat_id="100",
+            deliver_now=False,
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE telegram_notification_outbox "
+                "SET event_json=?,next_attempt_at=? WHERE event_key=?",
+                ('{"title":"损坏","lines":1}', db.now(), result.event_key),
+            )
+
+        self.assertFalse(drain_telegram_notifications(event_key=result.event_key))
+        row = get_notification(result.event_key)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["attempts"], 1)
+        self.assertIn("InvalidEventPayload", row["last_error"])
+        sender.assert_not_called()
+
+    @patch("app.modules.telegram_notification_center.edit_event_result")
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_legacy_caption_thread_falls_back_to_new_text_message(
+        self, sender, editor,
+    ) -> None:
+        editor.return_value = TelegramSendResult(
+            ok=False,
+            status_code=400,
+            error="Bad Request: there is no text in the message to edit",
+            message_id=41,
+        )
+        sender.return_value = TelegramSendResult(ok=True, message_id=42)
+
+        result = publish_notification_thread(
+            "legacy-caption",
+            NotificationEvent("迁移后的文本终态"),
+            topic=NotificationTopic.CONFIRMATION,
+            importance=NotificationImportance.RESULT,
+            chat_id="100",
+            preferred_message_id=41,
+        )
+
+        self.assertTrue(result.delivered)
+        editor.assert_called_once()
+        sender.assert_called_once()
+        self.assertEqual(get_notification(result.event_key)["message_id"], 42)
+
+    def test_recovery_retries_known_edits_but_quarantines_unknown_first_send(self) -> None:
+        first_send = publish_notification_event(
+            "interrupted-first-send",
+            NotificationEvent("首次发送"),
+            topic=NotificationTopic.SYSTEM,
+            chat_id="100",
+            deliver_now=False,
+        )
+        edit = publish_notification_thread(
+            "interrupted-edit",
+            NotificationEvent("线程编辑"),
+            topic=NotificationTopic.SYSTEM,
+            chat_id="100",
+            preferred_message_id=77,
+            deliver_now=False,
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE telegram_notification_outbox SET status='sending' "
+                "WHERE event_key IN (?,?)",
+                (first_send.event_key, edit.event_key),
+            )
+
+        self.assertEqual(notification_center.recover_notifications(), 2)
+        unknown_row = get_notification(first_send.event_key)
+        retry_row = get_notification(edit.event_key)
+        self.assertEqual(unknown_row["status"], "outcome_unknown")
+        self.assertEqual(unknown_row["last_error"], "DeliveryOutcomeUnknown")
+        self.assertEqual(retry_row["status"], "retry_wait")
+        self.assertEqual(retry_row["last_error"], "ProcessInterrupted")
+
+    def test_stale_lease_quarantines_unknown_first_send_but_reclaims_known_edit(self) -> None:
+        first_send = publish_notification_event(
+            "stale-first-send",
+            NotificationEvent("首次发送"),
+            topic=NotificationTopic.SYSTEM,
+            chat_id="100",
+            deliver_now=False,
+        )
+        edit = publish_notification_thread(
+            "stale-edit",
+            NotificationEvent("线程编辑"),
+            topic=NotificationTopic.SYSTEM,
+            chat_id="100",
+            preferred_message_id=88,
+            deliver_now=False,
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE telegram_notification_outbox SET status='sending',"
+                "updated_at='2000-01-01 00:00:00' WHERE event_key IN (?,?)",
+                (first_send.event_key, edit.event_key),
+            )
+
+        claimed = claim_due_notifications(limit=10)
+
+        self.assertEqual([row["event_key"] for row in claimed], [edit.event_key])
+        unknown_row = get_notification(first_send.event_key)
+        self.assertEqual(unknown_row["status"], "outcome_unknown")
+        self.assertEqual(unknown_row["last_error"], "DeliveryOutcomeUnknown")
+        self.assertEqual(unknown_row["lease_generation"], 1)
+        self.assertEqual(claimed[0]["message_id"], 88)
+
+    def test_periodic_purge_is_throttled_for_long_running_dispatcher(self) -> None:
+        with patch.object(notification_center, "_next_purge_at", 0.0), patch.object(
+            notification_center.time,
+            "monotonic",
+            side_effect=[100.0, 101.0, 100.0 + notification_center._PURGE_INTERVAL_SECONDS + 1],
+        ), patch.object(
+            notification_center, "purge_notifications", return_value=3,
+        ) as purge:
+            self.assertEqual(notification_center._maybe_purge_notifications(), 3)
+            self.assertEqual(notification_center._maybe_purge_notifications(), 0)
+            self.assertEqual(notification_center._maybe_purge_notifications(), 3)
+
+        self.assertEqual(purge.call_count, 2)
+
+    def test_media_detail_bounding_uses_logarithmic_render_search(self) -> None:
+        from app.modules import telegram_media_projection as projection
+
+        blocks = tuple(f"媒体 {index} " + ("x" * 80) for index in range(2048))
+        original_render = projection.render_event
+        with patch.object(
+            projection, "render_event", wraps=original_render,
+        ) as renderer:
+            event = projection.attach_bounded_media_details(
+                NotificationEvent("整理完成"), blocks,
+            )
+
+        self.assertLess(renderer.call_count, 20)
+        self.assertTrue(event.lines)
+        self.assertIn("未展开", event.lines[-1])
 
     @patch("app.modules.telegram_notification_center.edit_event_result")
     @patch("app.modules.telegram_notification_center.send_event_result")

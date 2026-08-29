@@ -1,6 +1,7 @@
 """Agent 下载后媒体库复核的结构化安全通知。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import unicodedata
 
@@ -143,15 +144,19 @@ def notify_download_verification_terminal_result(
     from app.modules.telegram_notification_policy import (
         NotificationImportance, NotificationTopic,
     )
-    event = build_download_verification_event(**payload)
-    digest = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    safe_payload_json = dump_download_verification_payload(**payload)
+    safe_payload = load_download_verification_payload(safe_payload_json)
+    event = build_download_verification_event(**safe_payload)
+    digest = hashlib.sha256(
+        f"{owner}\x1f{safe_payload_json}".encode("utf-8")
+    ).hexdigest()
     outcome = publish_notification_event(
-        f"agent-download-verification:{owner}:{digest}",
+        f"agent-download-verification:{digest}",
         event,
         topic=NotificationTopic.AGENT,
         importance=(
             NotificationImportance.RESULT
-            if str(payload.get("status") or "") == "visible"
+            if str(safe_payload.get("status") or "") == "visible"
             else NotificationImportance.ERROR
         ),
         chat_id=target,

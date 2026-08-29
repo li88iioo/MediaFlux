@@ -4,7 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from dataclasses import asdict, dataclass, replace
+import time
+from dataclasses import dataclass, replace
 
 from app.logger import get_logger
 from app.modules.telegram_notification_policy import (
@@ -20,6 +21,8 @@ from app.notifier import (
     notification_target_chat_id,
     render_event,
     send_event_result,
+    telegram_text_length,
+    truncate_telegram_text,
 )
 from app.repositories.telegram_notifications import (
     claim_due_notifications,
@@ -43,6 +46,11 @@ _dispatch_thread: threading.Thread | None = None
 _dispatch_accepting = False
 _delivery_lock = threading.Lock()
 _THREAD_MESSAGE_LIMIT = 3800
+_MAX_LOGICAL_KEY_BYTES = 240
+_PURGE_INTERVAL_SECONDS = 6 * 60 * 60
+_PURGE_RETRY_SECONDS = 60
+_maintenance_lock = threading.Lock()
+_next_purge_at = 0.0
 
 
 @dataclass(frozen=True)
@@ -58,33 +66,67 @@ class NotificationPublishResult:
 
 
 def serialize_notification_event(event: NotificationEvent) -> str:
-    return json.dumps(asdict(event), ensure_ascii=False, separators=(",", ":"))
+    """序列化固定安全投影；动态展示值统一收敛为字符串。"""
+    payload = {
+        "title": str(event.title or ""),
+        "fields": [
+            [str(label or ""), str(value or "")]
+            for label, value in tuple(event.fields or ())
+        ],
+        "lines": [str(item or "") for item in tuple(event.lines or ())],
+        "image_url": str(event.image_url or ""),
+        "footer": str(event.footer or ""),
+        "actions": [
+            {
+                "label": str(action.label or ""),
+                "callback_data": str(action.callback_data or ""),
+            }
+            for action in tuple(event.actions or ())
+        ],
+        "layout": str(event.layout or "default"),
+        "field_emojis": bool(event.field_emojis),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def deserialize_notification_event(payload: str) -> NotificationEvent:
     try:
         data = json.loads(str(payload or "{}"))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError("Telegram 通知数据损坏") from exc
     if not isinstance(data, dict):
         raise ValueError("Telegram 通知数据损坏")
+
+    raw_fields = data.get("fields", [])
+    raw_lines = data.get("lines", [])
+    raw_actions = data.get("actions", [])
+    raw_fields = [] if raw_fields is None else raw_fields
+    raw_lines = [] if raw_lines is None else raw_lines
+    raw_actions = [] if raw_actions is None else raw_actions
+    if (
+        not isinstance(raw_fields, list)
+        or not isinstance(raw_lines, list)
+        or not isinstance(raw_actions, list)
+        or any(not isinstance(item, list) or len(item) != 2 for item in raw_fields)
+        or any(not isinstance(item, dict) for item in raw_actions)
+    ):
+        raise ValueError("Telegram 通知数据损坏")
+
     fields = tuple(
         (str(item[0] or ""), str(item[1] or ""))
-        for item in (data.get("fields") or [])
-        if isinstance(item, (list, tuple)) and len(item) == 2
+        for item in raw_fields
     )
     actions = tuple(
         NotificationAction(
             label=str(item.get("label") or ""),
             callback_data=str(item.get("callback_data") or ""),
         )
-        for item in (data.get("actions") or [])
-        if isinstance(item, dict)
+        for item in raw_actions
     )
     return NotificationEvent(
         title=str(data.get("title") or "Telegram 通知"),
         fields=fields,
-        lines=tuple(str(item or "") for item in (data.get("lines") or [])),
+        lines=tuple(str(item or "") for item in raw_lines),
         image_url=str(data.get("image_url") or ""),
         footer=str(data.get("footer") or ""),
         actions=actions,
@@ -111,10 +153,22 @@ def _scope_digest(chat_id: str) -> str:
     return hashlib.sha256(str(chat_id or "default").encode("utf-8")).hexdigest()[:16]
 
 
-def _event_key(kind: str, topic: str, logical_key: str, chat_id: str) -> str:
+def _bounded_logical_key(logical_key: object) -> str:
     normalized = str(logical_key or "").strip()
     if not normalized:
         raise ValueError("Telegram 通知幂等键不能为空")
+    try:
+        encoded = normalized.encode("utf-8")
+    except UnicodeEncodeError:
+        encoded = normalized.encode("utf-8", errors="surrogatepass")
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    if len(encoded) > _MAX_LOGICAL_KEY_BYTES:
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    return normalized
+
+
+def _event_key(kind: str, topic: str, logical_key: str, chat_id: str) -> str:
+    normalized = _bounded_logical_key(logical_key)
     return f"tg:{kind}:{topic}:{normalized}:{_scope_digest(chat_id)}"
 
 
@@ -153,45 +207,61 @@ def _edit_can_fallback_to_new_message(result: TelegramSendResult) -> bool:
         "message can't be edited",
         "message can not be edited",
         "message identifier is not specified",
+        "there is no text in the message to edit",
+        "message has no text",
+        "message is not a text message",
         "messagetoolongforedit",
     ))
 
 
-def _is_valid_action(action: NotificationAction) -> bool:
-    label = str(action.label or "").strip()
+def _normalize_action(action: NotificationAction) -> NotificationAction | None:
+    label = truncate_telegram_text(str(action.label or "").strip(), 64)
     callback_data = str(action.callback_data or "").strip()
-    return bool(
-        label
-        and callback_data
-        and len(callback_data.encode("utf-8")) <= 64
+    if not label or not callback_data or len(callback_data.encode("utf-8")) > 64:
+        return None
+    return NotificationAction(label=label, callback_data=callback_data)
+
+
+def _normalized_actions(actions) -> tuple[NotificationAction, ...]:
+    normalized = tuple(
+        candidate
+        for action in tuple(actions or ())
+        if (candidate := _normalize_action(action)) is not None
     )
+    return normalized
 
 
 def _bounded_thread_event(event: NotificationEvent) -> NotificationEvent:
     """保证生命周期线程始终可由单条纯文本消息原位更新。"""
-    valid_actions = tuple(action for action in event.actions if _is_valid_action(action))
+    valid_actions = _normalized_actions(event.actions)
     bounded = replace(event, image_url="", actions=valid_actions)
-    if len(render_event(bounded)) <= _THREAD_MESSAGE_LIMIT:
+    if telegram_text_length(render_event(bounded)) <= _THREAD_MESSAGE_LIMIT:
         return bounded
 
     clipped = replace(
         bounded,
-        title=str(bounded.title or "Telegram 通知")[:180],
+        title=truncate_telegram_text(bounded.title or "Telegram 通知", 180),
         fields=tuple(
-            (str(label or "")[:64], str(value or "")[:520])
+            (
+                truncate_telegram_text(label, 64),
+                truncate_telegram_text(value, 520),
+            )
             for label, value in tuple(bounded.fields or ())[:16]
         ),
-        lines=tuple(str(line or "")[:700] for line in tuple(bounded.lines or ())[:12]),
-        footer=str(bounded.footer or "")[:360],
+        lines=tuple(
+            truncate_telegram_text(line, 700)
+            for line in tuple(bounded.lines or ())[:12]
+        ),
+        footer=truncate_telegram_text(bounded.footer, 360),
     )
     truncation_note = "内容过长已截断，完整详情请在 Web 运行记录中查看。"
     lines = list(clipped.lines)
     fields = list(clipped.fields)
-    while lines and len(render_event(replace(
+    while lines and telegram_text_length(render_event(replace(
         clipped, lines=tuple(lines), footer=truncation_note,
     ))) > _THREAD_MESSAGE_LIMIT:
         lines.pop()
-    while fields and len(render_event(replace(
+    while fields and telegram_text_length(render_event(replace(
         clipped, fields=tuple(fields), lines=tuple(lines), footer=truncation_note,
     ))) > _THREAD_MESSAGE_LIMIT:
         fields.pop()
@@ -231,10 +301,10 @@ def _dispatch_item(item: dict) -> bool:
     try:
         event = deserialize_notification_event(str(item.get("event_json") or ""))
     except ValueError as exc:
-        retry_notification(
+        fail_notification(
             notification_id,
             lease_generation=generation,
-            error=type(exc).__name__,
+            error=f"InvalidEventPayload:{type(exc).__name__}",
         )
         return False
 
@@ -327,13 +397,25 @@ def _publish(
     deliver_now: bool = True,
 ) -> NotificationPublishResult:
     normalized_importance = NotificationImportance(_importance(importance))
+    normalized_topic = _topic(topic)
     target = notification_target_chat_id(chat_id)
     if not target:
         return NotificationPublishResult(False, status="unconfigured")
-    normalized_topic = _topic(topic)
-    key = _event_key(
-        "thread" if thread else "event", normalized_topic, logical_key, target
-    )
+    try:
+        normalized_logical_key = _bounded_logical_key(logical_key)
+        key = _event_key(
+            "thread" if thread else "event",
+            normalized_topic,
+            normalized_logical_key,
+            target,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "拒绝无效 Telegram 通知幂等键 topic=%s type=%s",
+            normalized_topic,
+            type(exc).__name__,
+        )
+        return NotificationPublishResult(False, status="invalid_key")
     existing = get_notification(key) if thread else None
     continuation = bool(
         existing
@@ -351,24 +433,38 @@ def _publish(
         allowed = bool(thread and continuation and notifications_enabled())
     if not allowed:
         return NotificationPublishResult(False, status="disabled")
-    if event.actions:
-        valid_actions = tuple(action for action in event.actions if _is_valid_action(action))
-        if not valid_actions:
-            logger.error("拒绝没有有效按钮的 Telegram 操作通知 topic=%s", normalized_topic)
-            return NotificationPublishResult(
-                False, status="invalid_actions", event_key=key,
-            )
-        if valid_actions != tuple(event.actions):
-            event = replace(event, actions=valid_actions)
-    if thread:
-        event = _bounded_thread_event(event)
+    try:
+        if event.actions:
+            valid_actions = _normalized_actions(event.actions)
+            if not valid_actions:
+                logger.error(
+                    "拒绝没有有效按钮的 Telegram 操作通知 topic=%s",
+                    normalized_topic,
+                )
+                return NotificationPublishResult(
+                    False, status="invalid_actions", event_key=key,
+                )
+            if valid_actions != tuple(event.actions):
+                event = replace(event, actions=valid_actions)
+        if thread:
+            event = _bounded_thread_event(event)
+        event_json = serialize_notification_event(event)
+    except Exception as exc:
+        logger.warning(
+            "拒绝无法序列化的 Telegram 通知 topic=%s type=%s",
+            normalized_topic,
+            type(exc).__name__,
+        )
+        return NotificationPublishResult(
+            False, status="invalid_event", event_key=key,
+        )
     row = upsert_notification(
         key,
-        thread_key=str(logical_key or "") if thread else "",
+        thread_key=normalized_logical_key if thread else "",
         topic=normalized_topic,
         importance=normalized_importance.value,
         chat_id=target,
-        event_json=serialize_notification_event(event),
+        event_json=event_json,
         preferred_message_id=int(preferred_message_id or 0),
         replace=thread,
     )
@@ -436,9 +532,29 @@ def publish_notification_thread(
     )
 
 
+def _maybe_purge_notifications(*, force: bool = False) -> int:
+    """为长期运行实例节流清理终态记录，失败后短间隔重试。"""
+    global _next_purge_at
+    now = time.monotonic()
+    with _maintenance_lock:
+        if not force and now < _next_purge_at:
+            return 0
+        _next_purge_at = now + _PURGE_INTERVAL_SECONDS
+    try:
+        return purge_notifications()
+    except Exception:
+        with _maintenance_lock:
+            _next_purge_at = min(
+                _next_purge_at,
+                time.monotonic() + _PURGE_RETRY_SECONDS,
+            )
+        raise
+
+
 def _dispatch_loop() -> None:
     while not _dispatch_stop.is_set():
         try:
+            _maybe_purge_notifications()
             if drain_telegram_notifications(limit=20):
                 continue
         except Exception as exc:
@@ -464,7 +580,7 @@ def start_telegram_notification_dispatcher() -> None:
         _dispatch_accepting = True
         _dispatch_stop.clear()
         recover_notifications()
-        purge_notifications()
+        _maybe_purge_notifications(force=True)
         _dispatch_thread = threading.Thread(
             target=_dispatch_loop,
             name="telegram-notification-outbox",

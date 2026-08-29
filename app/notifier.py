@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
@@ -31,7 +32,34 @@ _MESSAGE_LIMIT = 4000
 _CAPTION_LIMIT = 1000
 _HTML_TOKEN_RE = re.compile(r"<[^>]+>|&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);")
 _TAG_RE = re.compile(r"<\s*(/?)\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>")
-_LEADING_EMOJI_RE = re.compile(r"^[\U0001F000-\U0001FAFF\u2600-\u27BF]")
+_LEADING_EMOJI_RE = re.compile(
+    r"^[\U0001F000-\U0001FAFF\u2100-\u214F\u2300-\u23FF\u2600-\u27BF\u2B00-\u2BFF]"
+)
+
+
+def telegram_text_length(value: object) -> int:
+    """返回 Telegram 文本边界使用的 UTF-16 code unit 数量。
+
+    Telegram 的消息实体偏移以 UTF-16 code unit 计数。统一使用同一保守
+    边界可避免非 BMP emoji 在 Python ``len`` 下被低估，最终被 API 拒绝。
+    """
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in str(value or ""))
+
+
+def truncate_telegram_text(value: object, limit: int) -> str:
+    """在不拆分 Unicode code point 的前提下截断到 Telegram 文本边界。"""
+    maximum = max(0, int(limit or 0))
+    text = str(value or "")
+    if not text or maximum <= 0:
+        return ""
+    used = 0
+    end = 0
+    for end, char in enumerate(text, start=1):
+        width = 2 if ord(char) > 0xFFFF else 1
+        if used + width > maximum:
+            return text[:end - 1]
+        used += width
+    return text
 
 
 def _notification_log_title(text: object) -> str:
@@ -92,7 +120,15 @@ _FIELD_EMOJI = {
 
 
 def _has_leading_emoji(value: object) -> bool:
-    return bool(_LEADING_EMOJI_RE.match(str(value or "").lstrip()))
+    text = str(value or "").lstrip()
+    if not text:
+        return False
+    # 兼容 ⏳、⏭、⬇、ℹ 等位于传统 emoji 区段之外的 Unicode 符号，
+    # 避免已经带状态图标的标题再次被 decorate_title 加前缀。
+    return bool(
+        _LEADING_EMOJI_RE.match(text)
+        or unicodedata.category(text[0]).startswith("S")
+    )
 
 
 def decorate_title(title: object) -> str:
@@ -102,7 +138,10 @@ def decorate_title(title: object) -> str:
     lowered = text.lower()
     if any(word in text for word in ("失败", "错误", "异常")):
         emoji = "❌"
-    elif any(word in text for word in ("待确认", "需确认", "部分", "未启动", "警告")):
+    elif any(word in text for word in (
+        "待确认", "需确认", "需要处理", "需处理", "待处理", "部分",
+        "未启动", "未完成", "无法", "警告", "停止", "中断", "取消",
+    )):
         emoji = "⚠️"
     elif any(word in text for word in ("完成", "成功")):
         emoji = "✅"
@@ -571,11 +610,15 @@ def _split_long_line(line: str, limit: int) -> list[str]:
     for token in tokens:
         next_stack = _tag_transition(stack, token) if token.startswith("<") else list(stack)
         suffix = _close_tags(next_stack)
-        if current and len(current) + len(token) + len(suffix) > limit and len(current) > prefix_length:
+        if (
+            current
+            and telegram_text_length(current + token + suffix) > limit
+            and telegram_text_length(current) > prefix_length
+        ):
             current += _close_tags(stack)
             chunks.append(current)
             current = _open_tags(stack)
-            prefix_length = len(current)
+            prefix_length = telegram_text_length(current)
         # 极端超长纯文本 token 不存在（普通文本逐字符拆分）；超长标签保持原子性。
         current += token
         stack = next_stack
@@ -595,7 +638,7 @@ def _has_oversized_html_tag(text: str, limit: int) -> bool:
         closing_overhead = 0
         if tag and not tag.group(1) and not token.rstrip().endswith("/>"):
             closing_overhead = len(tag.group(2)) + 3
-        if len(token) + closing_overhead > limit:
+        if telegram_text_length(token) + closing_overhead > limit:
             return True
     return False
 
@@ -607,16 +650,20 @@ def split_message(text: str, limit: int = _MESSAGE_LIMIT) -> list[str]:
     text = str(text or "")
     if _has_oversized_html_tag(text, limit):
         text = html.escape(text)
-    if len(text) <= limit:
+    if telegram_text_length(text) <= limit:
         return [text]
 
     chunks: list[str] = []
     current = ""
     for line in text.splitlines():
-        pieces = [line] if len(line) <= limit else _split_long_line(line, limit)
+        pieces = (
+            [line]
+            if telegram_text_length(line) <= limit
+            else _split_long_line(line, limit)
+        )
         for piece in pieces:
             candidate = f"{current}\n{piece}" if current else piece
-            if current and len(candidate) > limit:
+            if current and telegram_text_length(candidate) > limit:
                 chunks.append(current)
                 current = piece
             else:
@@ -635,7 +682,7 @@ def _event_markup(event: NotificationEvent):
 
         markup = types.InlineKeyboardMarkup(row_width=1)
         for action in actions:
-            label = str(action.label or "").strip()[:64]
+            label = truncate_telegram_text(str(action.label or "").strip(), 64)
             callback_data = str(action.callback_data or "").strip()
             if (
                 not label

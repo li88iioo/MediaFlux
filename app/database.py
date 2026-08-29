@@ -2827,8 +2827,12 @@ def init_db() -> None:
             )
             conn.execute(
                 "UPDATE telegram_notification_outbox "
-                "SET status='retry_wait',lease_generation=lease_generation+1,"
-                "next_attempt_at=?,updated_at=? WHERE status='sending'",
+                "SET status=CASE WHEN COALESCE(message_id,0)>0 "
+                "THEN 'retry_wait' ELSE 'outcome_unknown' END,"
+                "lease_generation=lease_generation+1,next_attempt_at=?,"
+                "last_error=CASE WHEN COALESCE(message_id,0)>0 "
+                "THEN 'ProcessInterrupted' ELSE 'DeliveryOutcomeUnknown' END,"
+                "updated_at=? WHERE status='sending'",
                 (timestamp, timestamp),
             )
             conn.execute(

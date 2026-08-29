@@ -140,6 +140,12 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
 
         self.assertTrue(sent)
         publisher.assert_called_once()
+        logical_key = publisher.call_args.args[0]
+        self.assertTrue(logical_key.startswith("agent-download-verification:"))
+        self.assertLess(len(logical_key), 128)
+        self.assertNotIn("tg:v1", logical_key)
+        self.assertNotIn("The Show", logical_key)
+        self.assertNotIn("title", logical_key)
         self.assertEqual(publisher.call_args.kwargs["chat_id"], "100")
         self.assertEqual(publisher.call_args.args[1].fields[0], ("媒体", "The Show"))
 

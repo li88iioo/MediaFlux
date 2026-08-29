@@ -183,9 +183,20 @@ def claim_due_notifications(
         _ensure_schema(conn)
         conn.execute("BEGIN IMMEDIATE")
         stale_before = _future_stamp(-_LEASE_SECONDS, base_stamp=stamp)
+        # 首次发送没有远端 message_id，租约过期只代表本地失去结果，不能
+        # 据此认定 Telegram 未收到并盲目重发。先将这类记录隔离为结果未知；
+        # 已知 message_id 的线程编辑仍可安全重领并原位收敛。
+        conn.execute(
+            "UPDATE telegram_notification_outbox SET status='outcome_unknown',"
+            "lease_generation=lease_generation+1,last_error='DeliveryOutcomeUnknown',"
+            "updated_at=? WHERE status='sending' AND updated_at<=? "
+            "AND COALESCE(message_id,0)=0",
+            (stamp, stale_before),
+        )
         clauses = [
             "((status IN ('pending','retry_wait') AND next_attempt_at<=?) "
-            "OR (status='sending' AND updated_at<=?))"
+            "OR (status='sending' AND updated_at<=? "
+            "AND COALESCE(message_id,0)>0))"
         ]
         params: list[object] = [stamp, stale_before]
         if event_key:
@@ -402,13 +413,24 @@ def mark_outcome_unknown(
 
 
 def recover_notifications() -> int:
+    """恢复进程中断的租约，同时避免未知首次发送被盲目重放。
+
+    已知 ``message_id`` 的线程执行的是幂等编辑，可以安全重试；首次发送没有
+    远端消息身份，进程中断时无法判断 Telegram 是否已接收，必须保留为
+    ``outcome_unknown`` 供诊断，而不是制造重复通知。
+    """
     database = _database()
     stamp = database.now()
     with database.get_conn() as conn:
         _ensure_schema(conn)
         cur = conn.execute(
-            "UPDATE telegram_notification_outbox SET status='retry_wait',"
-            "lease_generation=lease_generation+1,next_attempt_at=?,updated_at=? "
+            "UPDATE telegram_notification_outbox SET "
+            "status=CASE WHEN COALESCE(message_id,0)>0 "
+            "THEN 'retry_wait' ELSE 'outcome_unknown' END,"
+            "lease_generation=lease_generation+1,next_attempt_at=?,"
+            "last_error=CASE WHEN COALESCE(message_id,0)>0 "
+            "THEN 'ProcessInterrupted' ELSE 'DeliveryOutcomeUnknown' END,"
+            "updated_at=? "
             "WHERE status='sending'",
             (stamp, stamp),
         )
