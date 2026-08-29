@@ -62,6 +62,57 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         ))
         return _accepted()
 
+    def test_directory_and_post_action_summary_reuse_one_thread(self) -> None:
+        calls = []
+        stats = self._completed_stats([{
+            "title": "超能立方",
+            "year": "2025",
+            "media_type": "tv",
+            "tmdb_id": "279182",
+            "season": 1,
+            "episode": 1,
+        }])
+        stats.pop("task_id", None)
+        rules = OrganizeRules(link_strm=True)
+
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda key, event, **kwargs: calls.append(
+                (key, event, kwargs)
+            ) or _accepted(),
+        ):
+            Organizer.notify_directory_results(
+                stats, rules, source_name="超能立方", chat_id="100",
+            )
+            stats["strm"] = {"ok": True, "message": "STRM 同步任务已启动"}
+            Organizer._notify_result(
+                stats, rules, source_name="超能立方", chat_id="100",
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(str(stats["task_id"]).startswith("directory-"))
+        self.assertEqual(calls[0][0], calls[1][0])
+        self.assertNotIn("legacy-", calls[1][0])
+        self.assertIn(("STRM", "等待后处理"), calls[0][1].fields)
+        self.assertIn(("STRM", "已排队"), calls[1][1].fields)
+
+    def test_skipped_directory_never_claims_strm_is_waiting(self) -> None:
+        calls = []
+        stats = self._completed_stats([])
+        stats.update({"total": 1, "moved": 0, "skipped": 1})
+
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda key, event, **kwargs: calls.append(event) or _accepted(),
+        ):
+            Organizer.notify_directory_results(
+                stats, OrganizeRules(link_strm=True), source_name="暗芝居", chat_id="100",
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn(("STRM", "未启用或无变更"), calls[0].fields)
+        self.assertIn(("媒体库", "未触发"), calls[0].fields)
+
     def test_single_media_task_uses_one_transaction_message(self) -> None:
         events = []
         stats = self._completed_stats([{

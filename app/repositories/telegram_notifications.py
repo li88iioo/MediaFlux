@@ -50,7 +50,7 @@ def _future_stamp(delay_seconds: int, *, base_stamp: str = "") -> str:
         base = datetime.strptime(str(base_stamp or ""), _STAMP_FORMAT)
     except (TypeError, ValueError):
         base = datetime.now()
-    return (base + timedelta(seconds=max(0, int(delay_seconds or 0)))).strftime(
+    return (base + timedelta(seconds=int(delay_seconds or 0))).strftime(
         _STAMP_FORMAT
     )
 

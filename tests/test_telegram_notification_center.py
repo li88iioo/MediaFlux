@@ -1,6 +1,7 @@
 """统一 Telegram 通知中心的幂等、线程更新与按钮保留契约。"""
 from __future__ import annotations
 
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +60,54 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertTrue(first.delivered)
         self.assertTrue(second.delivered)
         sender.assert_called_once()
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_inflight_delivery_is_not_reclaimed_by_parallel_drain(self, sender) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+        call_lock = threading.Lock()
+
+        def deliver(_event, **_kwargs):
+            nonlocal calls
+            with call_lock:
+                calls += 1
+                current = calls
+            if current == 1:
+                started.set()
+                release.wait(2.0)
+            return TelegramSendResult(ok=True, message_id=80 + current)
+
+        sender.side_effect = deliver
+        result = {}
+
+        def publish() -> None:
+            result["outcome"] = publish_notification_thread(
+                "local-media:12",
+                NotificationEvent("本地媒体整理失败"),
+                topic=NotificationTopic.LOCAL_MEDIA,
+                importance=NotificationImportance.ERROR,
+                chat_id="100",
+            )
+
+        worker = threading.Thread(target=publish)
+        worker.start()
+        self.assertTrue(started.wait(1.0))
+        try:
+            key = notification_thread_event_key(
+                "local-media:12", topic=NotificationTopic.LOCAL_MEDIA, chat_id="100",
+            )
+            self.assertFalse(drain_telegram_notifications(event_key=key))
+        finally:
+            release.set()
+            worker.join(2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(result["outcome"].delivered)
+        sender.assert_called_once()
+        row = get_notification(key)
+        self.assertEqual(row["lease_generation"], 1)
+        self.assertEqual(row["message_id"], 81)
 
     @patch("app.modules.telegram_notification_center.edit_event_result")
     @patch("app.modules.telegram_notification_center.send_event_result")

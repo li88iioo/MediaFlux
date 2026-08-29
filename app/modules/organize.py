@@ -2761,6 +2761,18 @@ class Organizer:
         return result
 
     @staticmethod
+    def _notification_downstream_labels(stats: dict) -> tuple[str, str]:
+        """把整理后处理结果统一映射为 STRM 与媒体库通知状态。"""
+        strm = stats.get("strm") if isinstance(stats.get("strm"), dict) else {}
+        if strm.get("ok"):
+            return "已排队", "等待 STRM 完成"
+        if strm.get("skipped"):
+            return "已跳过", "未触发"
+        if strm:
+            return "启动失败", "未触发"
+        return "未启用或无变更", "未触发"
+
+    @staticmethod
     def notify_directory_results(stats: dict, rules: OrganizeRules,
                                  source_name: str = "", chat_id: str = "") -> None:
         """目录刮削只发一条汇总；人工候选继续使用独立可更新按钮卡。"""
@@ -2768,22 +2780,46 @@ class Organizer:
             return
         try:
             from app.modules.telegram_organize_lifecycle import publish_organize_lifecycle
+            from app.notifier import safe_int
 
             task_id = str(
                 stats.get("task_id") or stats.get("operation_token") or ""
             ).strip() or f"directory-{time.time_ns()}"
+            # 目录刮削的首次汇总与随后 STRM 状态必须复用同一个线程。
+            # 写回 stats 后，trigger_post_actions() 的兼容汇总不会再生成 legacy-*。
+            stats["task_id"] = task_id
             groups, actionable_count = Organizer._validated_task_confirmation_groups(stats)
             notification_stats = {
                 **stats,
                 "notification_actionable_confirmation_files": actionable_count,
                 "notification_actionable_confirmation_groups": len(groups),
             }
+            unsafe_partial = bool(
+                stats.get("failed")
+                or stats.get("scan_errors")
+                or stats.get("replacement_cleanup_failed")
+                or stats.get("empty_dir_cleanup_failed")
+                or stats.get("source_dir_cleanup_failed")
+                or stats.get("audit_failures")
+            )
+            waiting_for_strm = bool(
+                rules.link_strm
+                and not stats.get("stopped")
+                and safe_int(stats.get("moved"), 0, minimum=0)
+                and (not unsafe_partial or stats.get("strm_changes"))
+            )
             publish_organize_lifecycle(
                 task_id, notification_stats, source_name=source_name or "目录刮削",
                 chat_id=chat_id,
                 topic_enabled=rules.notify_enabled and rules.library_notify,
-                strm_status="等待后处理" if rules.link_strm else "未启用",
-                media_refresh="等待 STRM 完成" if rules.link_strm else "未触发",
+                strm_status=(
+                    "等待后处理" if waiting_for_strm
+                    else "未启用或无变更" if rules.link_strm
+                    else "未启用"
+                ),
+                media_refresh=(
+                    "等待 STRM 完成" if waiting_for_strm else "未触发"
+                ),
             )
             Organizer._deliver_task_confirmation_groups(
                 groups, rules, source_name=source_name, chat_id=chat_id,
@@ -2804,21 +2840,12 @@ class Organizer:
 
             task_id = str(stats.get("task_id") or "").strip()
             if not task_id:
-                # 兼容旧插件直接调用；正式任务始终携带稳定 task_id。
+                # 兼容旧插件直接调用；同一 stats 被重复调用时仍复用线程。
                 task_id = f"legacy-{time.time_ns()}"
-            strm = stats.get("strm") if isinstance(stats.get("strm"), dict) else {}
-            if strm.get("ok"):
-                strm_status = "已排队"
-                refresh_status = "等待 STRM 完成"
-            elif strm.get("skipped"):
-                strm_status = "已跳过"
-                refresh_status = "未触发"
-            elif strm:
-                strm_status = "启动失败"
-                refresh_status = "未触发"
-            else:
-                strm_status = "未启用或无变更"
-                refresh_status = "未触发"
+                stats["task_id"] = task_id
+            strm_status, refresh_status = Organizer._notification_downstream_labels(
+                stats
+            )
             groups, actionable_count = (
                 Organizer._validated_task_confirmation_groups(stats)
             )
@@ -3017,11 +3044,17 @@ class Organizer:
         try:
             from app.modules.telegram_organize_lifecycle import publish_organize_lifecycle
 
-            task_id = str(stats.get("task_id") or "").strip() or f"legacy-{time.time_ns()}"
+            task_id = str(stats.get("task_id") or "").strip()
+            if not task_id:
+                task_id = f"legacy-{time.time_ns()}"
+                stats["task_id"] = task_id
+            strm_status, media_refresh = Organizer._notification_downstream_labels(
+                stats
+            )
             publish_organize_lifecycle(
                 task_id, stats, source_name=source_name, chat_id=chat_id,
                 topic_enabled=rules.notify_enabled and rules.library_notify,
-                strm_status="未启用或无变更", media_refresh="未触发",
+                strm_status=strm_status, media_refresh=media_refresh,
             )
         except Exception as exc:
             logger.warning("整理通知失败 type=%s", type(exc).__name__)
