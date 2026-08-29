@@ -97,6 +97,30 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         db.upsert_local_library_target(source_id, category, str(target_root), owner="admin")
         return source_id
 
+    def test_dynamis_b_global_filename_uses_shared_clean_title_in_local_inspection(self):
+        from app.modules.scraper import TMDBScraper
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "dynamis-downloads"
+            target_root = root / "dynamis-anime"
+            source_root.mkdir()
+            target_root.mkdir()
+            filename = (
+                "[Dynamis One] Ever Night - 06 "
+                "(B-Global Donghua 1920x832 HEVC AAC MKV) [B2088D0F].mkv"
+            )
+            (source_root / filename).write_bytes(b"video")
+            source_id = self._source(source_root, target_root, "anime")
+
+            inspection = LocalMediaService(scraper=TMDBScraper()).inspect_source(
+                "admin", source_id, source_root,
+            )
+
+        self.assertEqual(inspection["suggested_query"], "Ever Night")
+        self.assertEqual(inspection["media_type"], "tv")
+        self.assertEqual(inspection["parsed_episode"], 6)
+
     def test_movie_preview_uses_independent_media_directory_and_organizer_naming(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source_root = root / "downloads"; target_root = root / "movies"

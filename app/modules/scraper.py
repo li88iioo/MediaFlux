@@ -1324,6 +1324,13 @@ def _bracket_content(token: str) -> str:
     return text
 
 
+def _strip_trailing_checksum(value: str) -> str:
+    """在 GuessIt/年份提取前移除尾部 CRC，避免十六进制片段伪装成年份。"""
+    text = str(value or "")
+    checksum = _CHECKSUM_SUFFIX.search(text)
+    return text[:checksum.start()].rstrip() if checksum else text
+
+
 def _is_valid_bracket_release_date(value: str) -> bool:
     match = _BRACKET_RELEASE_DATE.fullmatch(str(value or "").strip())
     if not match:
@@ -1373,10 +1380,12 @@ def _is_bracket_noise(content: str) -> bool:
     token_source = compact
     # 频道/播出源缩写本身可能是标题的一部分，只有同一括号同时包含
     # “台标 + 分辨率 + 编解码”三类证据时才把台标归一化为技术噪声。
-    # 这样可清理 ``(BS-NTV 1440x1080 MPEG2 AAC)``，同时保留
-    # ``[NBN TV]``、``[BS-NTV Documentary]`` 等可能的真实标题片段。
+    # 这样既可清理 ``(BS-NTV 1440x1080 MPEG2 AAC)``，也可处理
+    # ``(B-Global Donghua 1920x832 HEVC AAC MKV)``；单独的 Donghua
+    # 或不含完整技术证据的括号仍会保留，避免误删正式标题。
     broadcaster_prefix = re.match(
-        r"(?i)^(?:BS[ ._-]?(?:NTV|11)|AT[ ._-]?X|NBN(?:[ ._-]?TV)?|"
+        r"(?i)^(?:B[ ._-]?GLOBAL(?:[ ._-]+DONGHUA)?|"
+        r"BS[ ._-]?(?:NTV|11)|AT[ ._-]?X|NBN(?:[ ._-]?TV)?|"
         r"NTV|NHK|TBS|TOKYO[ ._-]?MX|MX)(?=$|[\s,;+/＆&._-]+)",
         token_source,
     )
@@ -1827,7 +1836,8 @@ def _folder_context(
             or is_special_directory_name(parse_part)
         ):
             continue
-        info = _guessit_info(parse_part)
+        identity_part = _strip_trailing_checksum(parse_part)
+        info = _guessit_info(identity_part)
         explicit_episode = _extract_episode(parse_part)
         guessed_episode = (
             explicit_episode
@@ -1843,7 +1853,7 @@ def _folder_context(
                 or len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", group_text)) >= 3
             ):
                 guessed_title = group_text
-        match = _YEAR_TOKEN.search(parse_part)
+        match = _YEAR_TOKEN.search(identity_part)
         implicit_folder_season, implicit_folder_span = _implicit_season_hint(
             parse_part,
             episode_context=episode_context or guessed_episode is not None,
@@ -1897,10 +1907,11 @@ def extract_recognition_context(filename: str, parent_path: str = "") -> Recogni
     parse_name = _strip_explicit_tmdb_markers(raw_name)
     parse_parent_path = _strip_explicit_tmdb_markers_from_path(raw_parent_path)
     stem = strip_media_file_suffix(parse_name)
-    guessed = _guessit_info(stem)
+    identity_stem = _strip_trailing_checksum(stem)
+    guessed = _guessit_info(identity_stem)
     guessed_title = str(guessed.get("title") or "").strip()
     guessed_year = _position_number(guessed.get("year"))
-    year_tokens = [match.group(1) for match in _YEAR_TOKEN.finditer(stem)]
+    year_tokens = [match.group(1) for match in _YEAR_TOKEN.finditer(identity_stem)]
     filename_year = str(guessed_year or (year_tokens[-1] if year_tokens else ""))
     explicit_episode = _extract_episode(stem)
     guessed_episode = _position_number(guessed.get("episode"))

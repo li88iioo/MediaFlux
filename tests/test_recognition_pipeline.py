@@ -457,33 +457,77 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
                 "[shincaps] Hidarikiki no Eren - 06 "
                 "(BS-NTV 1440x1080 MPEG2 AAC).ts",
                 "Hidarikiki no Eren",
+                ["shincaps"],
             ),
             (
                 "[shincaps] BLEACH Sennen Kessen-hen ~Kashin-tan~ - 02 "
                 "(AT-X 1440x1080 MPEG2 AAC).ts",
                 "BLEACH Sennen Kessen hen ~Kashin tan~",
+                ["shincaps"],
             ),
             (
                 "[shincaps] Azur Lane Bisoku Zenshin! Ni!! - 06 "
                 "(BS11 1920x1080 MPEG2 AAC).ts",
                 "Azur Lane Bisoku Zenshin!",
+                ["shincaps"],
             ),
             (
                 "[shincaps] Sample Broadcast Show - 01 "
                 "(NBN TV 1080p HEVC AAC).ts",
                 "Sample Broadcast Show",
+                ["shincaps"],
+            ),
+            (
+                "[Dynamis One] Ever Night - 06 "
+                "(B-Global Donghua 1920x832 HEVC AAC MKV) [B2088D0F].mkv",
+                "Ever Night",
+                [],
             ),
         )
 
-        for filename, expected_title in cases:
+        for filename, expected_title, expected_candidate_groups in cases:
             with self.subTest(filename=filename):
                 context = scraper.extract_recognition_context(filename)
                 self.assertEqual(context.normalized_title, expected_title)
                 self.assertEqual(
                     context.cleaned_components["candidate_release_groups"],
-                    ["shincaps"],
+                    expected_candidate_groups,
                 )
                 self.assertNotIn("MPEG2", context.normalized_title)
+
+    def test_b_global_donghua_release_keeps_title_and_absolute_episode_clean(self):
+        scraper = self.recognition_module()
+        parser = scraper.TMDBScraper()
+        files = (
+            (6, "B2088D0F"),
+            (7, "4FD19EAF"),
+            (18, "314B281E"),
+            (19, "6CE52CDF"),
+        )
+
+        for episode, checksum in files:
+            filename = (
+                f"[Dynamis One] Ever Night - {episode:02d} "
+                f"(B-Global Donghua 1920x832 HEVC AAC MKV) [{checksum}].mkv"
+            )
+            with self.subTest(filename=filename):
+                context = scraper.extract_recognition_context(filename, "")
+                parsed = _parse_fields(parser, filename)
+
+                self.assertEqual(context.normalized_title, "Ever Night")
+                self.assertEqual((context.season, context.episode), (None, episode))
+                self.assertEqual(parsed["title"], "Ever Night")
+                self.assertEqual((parsed["season"], parsed["episode"]), (None, episode))
+                self.assertEqual(parser.clean_title(filename), "Ever Night")
+                self.assertEqual(context.filename_year, "")
+                self.assertIn(checksum, context.cleaned_components["checksums"])
+                self.assertIn(
+                    "[Dynamis One]", context.cleaned_components["release_prefixes"]
+                )
+
+        self.assertFalse(scraper._is_bracket_noise("B-Global Donghua"))
+        self.assertFalse(scraper._is_bracket_noise("B-Global Donghua 1920x832"))
+        self.assertFalse(scraper._is_bracket_noise("B-Global Donghua HEVC AAC MKV"))
 
     def test_stylized_romaji_ni_second_season_is_fail_closed_and_tmdb_verifiable(self):
         scraper = self.recognition_module()

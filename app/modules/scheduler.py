@@ -48,6 +48,24 @@ def _source_local_dir(strm_root: str, source: dict[str, str]) -> str:
     return str(target)
 
 
+def _normalize_selected_source_ids(value: object) -> list[str]:
+    """把来源选择收敛为稳定列表，兼容旧排队状态中的布尔值。"""
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, str):
+        candidates = [value]
+    else:
+        try:
+            candidates = list(value)
+        except TypeError:
+            candidates = [value]
+    return list(dict.fromkeys(
+        str(item or "").strip()
+        for item in candidates
+        if str(item or "").strip()
+    ))
+
+
 def _request_ids(options: dict[str, object]) -> list[int]:
     return [
         int(item) for item in options.get("download_request_ids", [])
@@ -487,6 +505,18 @@ class STRMScheduler:
                         "full" if "full" in {current_mode, incoming_mode}
                         else incoming_mode
                     )
+                elif key == "selected_source_ids":
+                    incoming_ids = _normalize_selected_source_ids(value)
+                    if key not in pending:
+                        pending[key] = incoming_ids
+                    else:
+                        current_ids = _normalize_selected_source_ids(pending.get(key))
+                        # 空列表表示“不限定来源”；任一批次不限定时，合并任务也必须
+                        # 覆盖全部来源，不能错误缩窄到另一批次的局部范围。
+                        pending[key] = (
+                            list(dict.fromkeys([*current_ids, *incoming_ids]))
+                            if current_ids and incoming_ids else []
+                        )
                 else:
                     pending[key] = bool(value)
             try:
@@ -582,11 +612,7 @@ class STRMScheduler:
                 pending_is_persisted_queue = bool(
                     pending_snapshot.get("persisted_queue_only")
                 )
-            selected_ids = list(dict.fromkeys(
-                str(item or "").strip()
-                for item in (selected_source_ids or [])
-                if str(item or "").strip()
-            ))
+            selected_ids = _normalize_selected_source_ids(selected_source_ids)
             resolved_chat_id = str(chat_id or "").strip()
             notification_scope_enabled = bool(
                 notify_override is not False
@@ -1408,11 +1434,9 @@ class STRMScheduler:
             if error:
                 raise ValueError(error)
             configured_sources = self._source_dirs()
-            selected_source_ids = {
-                str(item or "").strip()
-                for item in options.get("selected_source_ids", [])
-                if str(item or "").strip()
-            }
+            selected_source_ids = set(_normalize_selected_source_ids(
+                options.get("selected_source_ids")
+            ))
             sources = (
                 [
                     source for source in configured_sources
@@ -1725,7 +1749,7 @@ class STRMScheduler:
                     request_id, strm_status="failed", strm_error=error_text[:500],
                     strm_finished_at=db.now(),
                 )
-            logger.error("STRM 任务失败 trigger=%s: %s", trigger_type, error_text)
+            logger.exception("STRM 任务失败 trigger=%s: %s", trigger_type, error_text)
             if lease_heartbeat:
                 lease_heartbeat.stop()
                 lease_heartbeat = None

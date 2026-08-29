@@ -891,9 +891,64 @@ class StrmSchedulerRobustnessTests(IsolatedDatabaseTestCase):
         trigger_type, options = captured[0]
         self.assertEqual(trigger_type, "organize")
         self.assertEqual(options["chat_ids"], ["100", "200"])
+        self.assertEqual(options["selected_source_ids"], [])
         self.assertEqual(
             {item["file_id"] for item in options["organize_changes"]},
             {"first", "second"},
+        )
+
+    def test_organize_queue_merges_selected_source_ids_without_boolean_coercion(self) -> None:
+        from app.modules.scheduler import STRMScheduler
+
+        scheduler = STRMScheduler()
+        started = threading.Event()
+        captured: list[dict] = []
+
+        def fake_start(_trigger_type: str, options: dict) -> dict:
+            captured.append(dict(options))
+            scheduler._run_lock.release()
+            started.set()
+            return {"ok": True, "message": "started"}
+
+        with patch.object(
+            scheduler, "_persist_change_targets", return_value=True,
+        ), patch.object(
+            db, "reschedule_strm_change_targets",
+            side_effect=lambda changes, **_kwargs: len(db.group_changes_by_target(changes)),
+        ), patch.object(
+            scheduler, "_start_locked_worker", side_effect=fake_start,
+        ):
+            scheduler.trigger(
+                "organize", debounce_seconds=0.12,
+                selected_source_ids=["source-a"],
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "first", "action": "upsert",
+                }],
+            )
+            scheduler.trigger(
+                "organize", debounce_seconds=0.12,
+                selected_source_ids=["source-b", "source-a"],
+                organize_changes=[{
+                    "source_id": "archive", "kind": "video",
+                    "file_id": "second", "action": "upsert",
+                }],
+            )
+            self.assertTrue(started.wait(timeout=1.0))
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            captured[0]["selected_source_ids"], ["source-a", "source-b"]
+        )
+
+    def test_legacy_boolean_selected_source_scope_is_treated_as_unscoped(self) -> None:
+        from app.modules.scheduler import _normalize_selected_source_ids
+
+        self.assertEqual(_normalize_selected_source_ids(False), [])
+        self.assertEqual(_normalize_selected_source_ids(True), [])
+        self.assertEqual(
+            _normalize_selected_source_ids(["source-a", "source-a", "source-b"]),
+            ["source-a", "source-b"],
         )
 
     def test_existing_quiet_window_absorbs_non_debounced_organize_trigger(self) -> None:

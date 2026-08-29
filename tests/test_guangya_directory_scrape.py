@@ -186,6 +186,35 @@ class _ParsingScraper:
 
 
 class DirectoryMediaInspectorTests(unittest.TestCase):
+    def test_dynamis_b_global_filename_uses_shared_clean_title_in_guangya_inspection(self):
+        from app.modules.directory_media import DirectoryMediaInspector
+
+        filename = (
+            "[Dynamis One] Ever Night - 06 "
+            "(B-Global Donghua 1920x832 HEVC AAC MKV) [B2088D0F].mkv"
+        )
+        tree = {
+            "incoming": [_file("episode", filename, "incoming")],
+            "archive": [],
+        }
+        infos = {
+            "incoming": _dir("incoming", "tv"),
+            "archive": _dir("archive", "媒体库"),
+            "episode": tree["incoming"][0],
+        }
+
+        inspection = DirectoryMediaInspector(
+            client=_TreeClient(tree, infos),
+            scraper=TMDBScraper(),
+        ).inspect(
+            "incoming",
+            OrganizeRules(target_dir_id="archive", small_file_mb=0),
+        )
+
+        self.assertEqual(inspection.suggested_query, "Ever Night")
+        self.assertEqual(inspection.media_type, "tv")
+        self.assertEqual(inspection.videos[0].episode, 6)
+
     def test_movie_versions_are_one_media_group(self):
         from app.modules.directory_media import DirectoryMediaInspector
 
