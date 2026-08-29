@@ -473,7 +473,8 @@ class MediaCardTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         rendered = notifier.render_event(sent[0])
         self.assertIn("光鸭整理部分完成", rendered)
-        self.assertNotIn("缺集", rendered)
+        self.assertNotIn("🧩 缺集", rendered)
+        self.assertIn("暂不生成最终缺集结论", rendered)
         self.assertIn("跳过 1", rendered)
 
     def test_scan_incomplete_task_does_not_claim_final_missing_episodes(self):

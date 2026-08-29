@@ -12,6 +12,10 @@ from app.modules.telegram_notification_policy import (
     NotificationImportance,
     NotificationTopic,
 )
+from app.modules.telegram_media_projection import (
+    attach_bounded_media_details,
+    build_media_detail_blocks,
+)
 from app.notifier import NotificationEvent, safe_int
 
 
@@ -40,34 +44,6 @@ def _counts(stats: Mapping[str, object]) -> dict[str, int]:
             )
     return counts
 
-
-def _media_lines(stats: Mapping[str, object]) -> tuple[str, ...]:
-    rows = [item for item in (stats.get("media_items") or []) if isinstance(item, Mapping)]
-    grouped: dict[tuple[str, str, str, int], set[int]] = {}
-    for item in rows:
-        title = str(item.get("title") or "未识别媒体").strip()
-        year = str(item.get("year") or "").strip()
-        media_type = str(item.get("media_type") or "").strip().lower()
-        season = safe_int(item.get("season"), 0, minimum=0)
-        episode = safe_int(item.get("episode"), 0, minimum=0)
-        grouped.setdefault((title, year, media_type, season), set())
-        if episode:
-            grouped[(title, year, media_type, season)].add(episode)
-    lines: list[str] = []
-    for (title, year, media_type, season), episodes in list(grouped.items())[:6]:
-        suffix = f" ({year})" if year else ""
-        if media_type == "tv" and season:
-            suffix += f" · S{season:02d}"
-            if episodes:
-                ordered = sorted(episodes)
-                if len(ordered) <= 4:
-                    suffix += " · " + ", ".join(f"E{value:02d}" for value in ordered)
-                else:
-                    suffix += f" · {len(ordered)} 集"
-        lines.append(f"• {title}{suffix}")
-    if len(grouped) > len(lines):
-        lines.append(f"…另有 {len(grouped) - len(lines)} 项媒体")
-    return tuple(lines)
 
 
 def _replace_field(
@@ -189,13 +165,19 @@ def build_organize_lifecycle_event(
     if confirmation_label:
         fields.append(("人工确认", confirmation_label))
     fields.extend((("STRM", strm_status), ("媒体库", media_refresh)))
-    return NotificationEvent(
+    event = NotificationEvent(
         title,
         fields=tuple(fields),
-        lines=_media_lines(stats),
         footer=footer,
         layout="relaxed",
         field_emojis=False,
+    )
+    return attach_bounded_media_details(
+        event,
+        build_media_detail_blocks(
+            tuple(stats.get("media_items") or ()),
+            inventory_final=not bool(attention or stopped),
+        ),
     )
 
 

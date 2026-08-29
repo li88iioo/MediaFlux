@@ -14,6 +14,10 @@ from app.modules.telegram_notification_policy import (
     NotificationImportance,
     NotificationTopic,
 )
+from app.modules.telegram_media_projection import (
+    attach_bounded_media_details,
+    build_media_detail_blocks,
+)
 from app.notifier import NotificationEvent, safe_int
 
 _STATUS_LABELS = {
@@ -139,34 +143,6 @@ def _overall_state(row, *, verification_status: str = "") -> str:
     return "processing"
 
 
-def _media_lines(stats: Mapping[str, object] | None) -> tuple[str, ...]:
-    if not isinstance(stats, Mapping):
-        return ()
-    rows = [item for item in (stats.get("media_items") or []) if isinstance(item, Mapping)]
-    lines: list[str] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in rows:
-        title = str(item.get("title") or "未识别媒体").strip()
-        year = str(item.get("year") or "").strip()
-        media_type = str(item.get("media_type") or "").strip().lower()
-        key = (title.casefold(), year, media_type)
-        if key in seen:
-            continue
-        seen.add(key)
-        season = safe_int(item.get("season"), 0, minimum=0)
-        episode = safe_int(item.get("episode"), 0, minimum=0)
-        suffix = f" ({year})" if year else ""
-        if media_type == "tv" and season:
-            suffix += f" · S{season:02d}"
-            if episode:
-                suffix += f"E{episode:02d}"
-        lines.append(f"• {title}{suffix}")
-        if len(lines) >= 4:
-            break
-    if len(seen) > len(lines):
-        lines.append(f"…另有 {len(seen) - len(lines)} 项媒体")
-    return tuple(lines)
-
 
 def _previous_field(event: NotificationEvent | None, label: str) -> str:
     if event is None:
@@ -220,7 +196,22 @@ def build_download_lifecycle_event(
             str(verification_result or _label(verification_status)).strip(),
         ))
 
-    lines = _media_lines(stats) or (previous.lines if previous is not None else ())
+    media_blocks = build_media_detail_blocks(
+        tuple((stats or {}).get("media_items") or ()),
+        inventory_final=not bool(
+            stats
+            and (
+                stats.get("stopped")
+                or stats.get("scan_errors")
+                or stats.get("scan_limited")
+                or stats.get("scan_complete") is False
+                or safe_int(stats.get("need_confirm"), 0, minimum=0)
+                or safe_int(stats.get("skipped"), 0, minimum=0)
+                or safe_int(stats.get("failed"), 0, minimum=0)
+            )
+        ),
+    )
+    lines = media_blocks or (previous.lines if previous is not None else ())
     errors: list[str] = []
     for key in ("error", "local_import_error", "organize_error", "strm_error"):
         value = str(_value(row, key, "") or "").strip()
@@ -233,14 +224,14 @@ def build_download_lifecycle_event(
         footer = errors[0] if errors else "本次链路存在未完成阶段，请查看 Web 运行记录。"
     elif state == "processing":
         footer = "后续阶段会更新本条消息，无需重复提交。"
-    return NotificationEvent(
+    event = NotificationEvent(
         title,
         fields=tuple(fields),
-        lines=tuple(lines),
         footer=footer,
         layout="relaxed",
         field_emojis=False,
     )
+    return attach_bounded_media_details(event, lines)
 
 
 def publish_download_lifecycle(
