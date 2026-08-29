@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-08-29
+
+### Added
+- 新增统一媒体库映射工作台，可在同一页面为 STRM 子目录与本地归档分类绑定 Jellyfin/Emby 媒体库、容器路径和服务器可见路径，并通过受限目录浏览器选择挂载目录（[`d0ee96f`](https://github.com/li88iioo/MediaFlux/commit/d0ee96f)）。
+- 本地手动整理补齐目录级识别、外部候选线索、季集编号模式持久化、媒体参数探测及多版本替换计划；预览与执行复用同一编号规则，并在来源或既有目标变化时安全拒绝或回滚（[`d0ee96f`](https://github.com/li88iioo/MediaFlux/commit/d0ee96f)）。
+
+### Changed
+- Agent Web 与 Telegram 统一采用面向用户的自然语言结果投影，推荐查询支持年份、地区与类型约束，并减少内部检查状态、原始工具结构和无效后续提示对会话的干扰（[`0a39e1e`](https://github.com/li88iioo/MediaFlux/commit/0a39e1e)、[`483437a`](https://github.com/li88iioo/MediaFlux/commit/483437a)、[`8d1eee1`](https://github.com/li88iioo/MediaFlux/commit/8d1eee1)）。
+- Agent Web 工作区移除重复的常用任务与欢迎卡，改为稳定的空会话输入态，并收敛标题、阴影、按钮和继续会话交互，使首次会话与历史会话保持一致（[`6c69b3e`](https://github.com/li88iioo/MediaFlux/commit/6c69b3e)、[`7f7e46e`](https://github.com/li88iioo/MediaFlux/commit/7f7e46e)）。
+
+### Fixed
+- 修复包含站点包装、集号和发布组信息的剧集文件名清洗不完整，导致标题或季集位置识别偏差的问题（[`021e1f1`](https://github.com/li88iioo/MediaFlux/commit/021e1f1)）。
+- 修复统一媒体库映射并发保存时数据库绑定与 `user.env` 可能互相覆盖的问题；保存操作现跨线程/进程串行，配置冲突会回滚绑定并返回明确状态，同时显式释放媒体服务器探测连接（[`b14b867`](https://github.com/li88iioo/MediaFlux/commit/b14b867)）。
+
 ## [0.1.8] - 2026-08-28
 
 ### Added
@@ -167,7 +181,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/li88iioo/MediaFlux/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/li88iioo/MediaFlux/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/li88iioo/MediaFlux/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/li88iioo/MediaFlux/compare/v0.1.5...v0.1.6
