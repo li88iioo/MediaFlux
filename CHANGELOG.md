@@ -17,6 +17,9 @@
 ### Fixed
 - 修复包含站点包装、集号和发布组信息的剧集文件名清洗不完整，导致标题或季集位置识别偏差的问题（[`021e1f1`](https://github.com/li88iioo/MediaFlux/commit/021e1f1)）。
 - 修复统一媒体库映射并发保存时数据库绑定与 `user.env` 可能互相覆盖的问题；保存操作现跨线程/进程串行，配置冲突会回滚绑定并返回明确状态，同时显式释放媒体服务器探测连接（[`b14b867`](https://github.com/li88iioo/MediaFlux/commit/b14b867)）。
+- 修复非全屏桌面窗口、iPad 与窄屏下固定保存栏、侧边栏退出入口及设置双栏可能被窗口边界裁切的问题，并统一共享工作台的平板响应断点（[`aca32fe`](https://github.com/li88iioo/MediaFlux/commit/aca32fe)）。
+- 修复本地媒体删除快照中的纳秒时间及文件系统标识经浏览器 JSON 往返后发生整数舍入，导致 Docker/NAS 部署误报“条目在读取后发生变化”的问题（[`aca32fe`](https://github.com/li88iioo/MediaFlux/commit/aca32fe)）。
+- 修复媒体反代客户端切源、取消播放或离开页面时 `ClientDisconnect` 被错误记录为 Uvicorn ASGI 异常堆栈的问题（[`aca32fe`](https://github.com/li88iioo/MediaFlux/commit/aca32fe)）。
 
 ## [0.1.8] - 2026-08-28
 
