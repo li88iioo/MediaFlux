@@ -14,12 +14,14 @@
 - Telegram 媒体通知统一为紧凑、分段且信息完整的富文本布局，恢复入库媒体、文件、STRM 与媒体库刷新明细，同时减少重复终态与链路噪声（[`8763dd2`](https://github.com/li88iioo/MediaFlux/commit/8763dd2)、[`bb3f99c`](https://github.com/li88iioo/MediaFlux/commit/bb3f99c)）。
 - 运行时生命周期统一采用关闭门控、在途任务排空和有界缓存；Web 刷新保留旧数据并呈现部分失败，整理轮询改为可见性感知重试，订阅媒体库映射改为批量读取，Docker 非 root 数据目录仅在首次或显式请求时递归迁移权限；后续可靠性收敛进一步补齐数据库隔离、异步资源回收、任务恢复、媒体反代与下载边界以及刷新态稳定性（[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)、[`0b9bd05`](https://github.com/li88iioo/MediaFlux/commit/0b9bd05)、[`b20da18`](https://github.com/li88iioo/MediaFlux/commit/b20da18)、[`c604b4a`](https://github.com/li88iioo/MediaFlux/commit/c604b4a)、[`c3c8a8d`](https://github.com/li88iioo/MediaFlux/commit/c3c8a8d)、[`5f2a987`](https://github.com/li88iioo/MediaFlux/commit/5f2a987)）。
 - 资源检索补齐 BTBTLA 新旧页面解析与原生翻页、Nyaa 镜像翻页识别和 1LOU 超时降级；下线 AnimeTosho，并在读取旧配置时安全忽略残留站点 ID（[`b667719`](https://github.com/li88iioo/MediaFlux/commit/b667719)）。
+- Docker 工作流在普通 `main` 提交仅执行完整测试与 amd64 冒烟验证，多架构构建、镜像发布和 GitHub Release 仅由正式版本标签触发，减少无标签构建的重复资源消耗（[`74a71ae`](https://github.com/li88iioo/MediaFlux/commit/74a71ae)）。
 
 ### Fixed
 - 修复整理联动 STRM 在变化目标合并时把布尔值当作可迭代对象，导致 `'bool' object is not iterable`；同时加强发布名清洗与队列合并边界（[`50aaf85`](https://github.com/li88iioo/MediaFlux/commit/50aaf85)）。
 - 修复 Telegram 终态编辑失败时重复补发、投递结果未知时盲目重放、旧 revision 覆盖新状态，以及输入状态早于候选卡更新消失的问题（[`9a41d6f`](https://github.com/li88iioo/MediaFlux/commit/9a41d6f)、[`0636477`](https://github.com/li88iioo/MediaFlux/commit/0636477)、[`0f2de1d`](https://github.com/li88iioo/MediaFlux/commit/0f2de1d)、[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)）。
 - 修复本地媒体移动提交后收尾异常可能错误恢复 qB、配置文件与 STRM 退役状态可能分裂、发现/索引/反代客户端关机泄漏、持久缓存无界增长，以及 Chromium 首次打开目录菜单时被自身 resize/scroll 立即关闭的问题（[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)）。
 - 发布流水线现拒绝用不同提交覆盖既有精确版本镜像或 GitHub Release，保持正式版本标签与制品不可变（[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)）。
+- 修复 Python 3.13/部分文件系统快速替换 SQLite 数据库时 inode 被复用，导致连接误用旧 WAL 协商缓存并使发布测试失败的问题；文件代际现同时校验纳秒级 ctime（[`74a71ae`](https://github.com/li88iioo/MediaFlux/commit/74a71ae)）。
 
 ## [0.1.9] - 2026-08-29
 
