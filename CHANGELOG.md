@@ -12,7 +12,8 @@
 
 ### Changed
 - Telegram 媒体通知统一为紧凑、分段且信息完整的富文本布局，恢复入库媒体、文件、STRM 与媒体库刷新明细，同时减少重复终态与链路噪声（[`8763dd2`](https://github.com/li88iioo/MediaFlux/commit/8763dd2)、[`bb3f99c`](https://github.com/li88iioo/MediaFlux/commit/bb3f99c)）。
-- 运行时生命周期统一采用关闭门控、在途任务排空和有界缓存；Web 刷新保留旧数据并呈现部分失败，整理轮询改为可见性感知重试，订阅媒体库映射改为批量读取，Docker 非 root 数据目录仅在首次或显式请求时递归迁移权限（[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)）。
+- 运行时生命周期统一采用关闭门控、在途任务排空和有界缓存；Web 刷新保留旧数据并呈现部分失败，整理轮询改为可见性感知重试，订阅媒体库映射改为批量读取，Docker 非 root 数据目录仅在首次或显式请求时递归迁移权限；后续可靠性收敛进一步补齐数据库隔离、异步资源回收、任务恢复、媒体反代与下载边界以及刷新态稳定性（[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)、[`0b9bd05`](https://github.com/li88iioo/MediaFlux/commit/0b9bd05)、[`b20da18`](https://github.com/li88iioo/MediaFlux/commit/b20da18)、[`c604b4a`](https://github.com/li88iioo/MediaFlux/commit/c604b4a)、[`c3c8a8d`](https://github.com/li88iioo/MediaFlux/commit/c3c8a8d)、[`5f2a987`](https://github.com/li88iioo/MediaFlux/commit/5f2a987)）。
+- 资源检索补齐 BTBTLA 新旧页面解析与原生翻页、Nyaa 镜像翻页识别和 1LOU 超时降级；下线 AnimeTosho，并在读取旧配置时安全忽略残留站点 ID（[`b667719`](https://github.com/li88iioo/MediaFlux/commit/b667719)）。
 
 ### Fixed
 - 修复整理联动 STRM 在变化目标合并时把布尔值当作可迭代对象，导致 `'bool' object is not iterable`；同时加强发布名清洗与队列合并边界（[`50aaf85`](https://github.com/li88iioo/MediaFlux/commit/50aaf85)）。
