@@ -398,6 +398,102 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("服务正在停止", result["error"])
 
+    def test_start_admission_failures_do_not_leak_the_admission_lock(self):
+        source = [{"id": "source", "name": "源目录"}]
+        rules = OrganizeRules(target_dir_id="target")
+
+        with self.subTest("invalid request id"):
+            manager = OrganizeTaskManager()
+            result = manager.start(
+                source, rules, download_request_ids=["not-an-integer"]
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("请求标识", result["error"])
+            self.assertTrue(manager._admission_lock.acquire(blocking=False))
+            manager._admission_lock.release()
+
+        with self.subTest("durable queue read failure"):
+            manager = OrganizeTaskManager()
+            with patch(
+                "app.modules.organize_tasks.count_pending_organize_operation_jobs",
+                side_effect=RuntimeError("database unavailable"),
+            ):
+                result = manager.start(source, rules)
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["retryable"])
+            self.assertTrue(manager._admission_lock.acquire(blocking=False))
+            manager._admission_lock.release()
+
+        with self.subTest("cross-process lock failure"):
+            manager = OrganizeTaskManager()
+            manager._lock = MagicMock()
+            manager._lock.acquire.side_effect = OSError("lock unavailable")
+            with patch(
+                "app.modules.organize_tasks.count_pending_organize_operation_jobs",
+                return_value=0,
+            ):
+                result = manager.start(source, rules)
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["retryable"])
+            self.assertTrue(manager._admission_lock.acquire(blocking=False))
+            manager._admission_lock.release()
+
+    def test_start_state_write_failure_releases_locks_and_owned_client(self):
+        manager = OrganizeTaskManager()
+        organizer = MagicMock()
+        client = MagicMock()
+        client.credential_generation = 7
+        client.logged_in = True
+        organizer.client = client
+
+        with patch(
+            "app.modules.organize_tasks.count_pending_organize_operation_jobs",
+            return_value=0,
+        ), patch(
+            "app.modules.organize_tasks.Organizer", return_value=organizer,
+        ), patch(
+            "app.modules.organize_tasks.db.get_download_request", return_value=None,
+        ), patch(
+            "app.modules.organize_tasks.db.add_task_run", return_value=101,
+        ), patch(
+            "app.modules.organize_tasks.db.update_download_request",
+            side_effect=[RuntimeError("database unavailable"), None],
+        ) as update_request, patch(
+            "app.modules.organize_tasks.db.finish_task_run",
+        ) as finish_run, patch(
+            "app.modules.organize_tasks._publish_download_lifecycles",
+        ) as publish_lifecycle, patch(
+            "app.modules.organize_tasks.threading.Thread",
+        ) as thread_factory:
+            result = manager.start(
+                [{"id": "source", "name": "源目录"}],
+                OrganizeRules(target_dir_id="target"),
+                download_request_ids=[91],
+                client=client,
+                take_client_ownership=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["error_code"], "thread_start_failed")
+        self.assertEqual(manager.task_status()["status"], "failed")
+        organizer.close.assert_called_once_with()
+        client.close.assert_called_once_with()
+        thread_factory.assert_not_called()
+        self.assertEqual(update_request.call_count, 2)
+        self.assertEqual(update_request.call_args_list[-1].kwargs["organize_status"], "queued")
+        self.assertEqual(
+            update_request.call_args_list[-1].kwargs["organize_error"],
+            "整理任务启动失败，可稍后重试",
+        )
+        finish_run.assert_called_once()
+        publish_lifecycle.assert_called_once_with([91])
+
+        self.assertTrue(manager._lock.acquire(blocking=False))
+        manager._lock.release()
+        self.assertTrue(manager._admission_lock.acquire(blocking=False))
+        manager._admission_lock.release()
+
     def test_per_file_failure_persists_partial_state(self):
         manager = OrganizeTaskManager()
         organizer = MagicMock()

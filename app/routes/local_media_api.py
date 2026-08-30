@@ -742,6 +742,21 @@ def retry_task(task_id: int, request: Request, data: dict | None = Body(default=
             retry_fields["numbering_mode"] = (
                 _text(payload, "numbering_mode", max_length=32) or "auto"
             )
+        confirm_interrupted_write = _boolean(
+            payload, "confirm_interrupted_write", False,
+        )
+        task = db.get_local_media_task(task_id, owner=_OWNER)
+        if (
+            task is not None
+            and db.is_interrupted_local_media_write_error(task.error)
+            and not confirm_interrupted_write
+        ):
+            return api_error(
+                "任务在本地写操作期间中断；请先人工核验文件及 qB 状态，"
+                "确认后再显式重试",
+                409,
+            )
+        retry_fields["confirm_interrupted_write"] = confirm_interrupted_write
         if not db.reset_local_media_task(task_id, owner=_OWNER, **retry_fields):
             return api_error("任务不存在或当前状态不可重试", 409)
         get_local_media_scheduler().reload()

@@ -17,6 +17,19 @@ from app.logger import get_logger
 logger = get_logger(__name__)
 
 
+def close_qbittorrent_client(client: object | None) -> None:
+    """尽力释放短生命周期 qB Client，不让清理异常覆盖业务结果。"""
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.warning("关闭 qBittorrent HTTP Client 失败 type=%s", type(exc).__name__)
+
+
 _QB_COMPLETE_STATES = frozenset({
     "uploading",
     "stalledup",

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
 
 from app import database as db
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.share_transfer import (
     create_share_request,
@@ -56,12 +56,13 @@ def inspect_share(request: Request, data: dict | None = Body(default=None)):
     share_url = str(data.get("url", "")).strip()
     if not share_url:
         return JSONResponse({"error": "请输入光鸭分享链接"}, status_code=400)
+    client = GuangYaClient()
     try:
         owner = _web_owner(request)
         preview = inspect_share_for_transfer(
             share_url,
             owner,
-            client=GuangYaClient(),
+            client=client,
             store=get_share_transfer_store(),
         )
         return {
@@ -77,6 +78,8 @@ def inspect_share(request: Request, data: dict | None = Body(default=None)):
         # 不记录原始 URL/异常正文，避免提取码、token 或 signed URL 进入日志。
         logger.warning("分享链接解析失败 (%s)", type(exc).__name__)
         return JSONResponse({"error": "分享链接解析失败，请检查链接或提取码"}, status_code=400)
+    finally:
+        close_guangya_client(client)
 
 
 @router.post("/restore")
@@ -92,6 +95,7 @@ def restore_share(request: Request, data: dict | None = Body(default=None)):
         return JSONResponse({"error": "至少选择一个文件"}, status_code=400)
     target_dir_id = str(data.get("target_dir_id", "0") or "0").strip()
     target_dir_name = str(data.get("target_dir_name", "根目录") or "根目录").strip()
+    client = GuangYaClient()
     try:
         result = create_share_request(
             preview_id,
@@ -101,7 +105,7 @@ def restore_share(request: Request, data: dict | None = Body(default=None)):
             target_name=target_dir_name,
             origin="web",
             tracker_chat_id="",
-            client=GuangYaClient(),
+            client=client,
             store=get_share_transfer_store(),
         )
     except ValueError as exc:
@@ -109,6 +113,8 @@ def restore_share(request: Request, data: dict | None = Body(default=None)):
     except Exception as exc:
         logger.warning("分享转存请求失败 (%s)", type(exc).__name__)
         return JSONResponse({"error": "分享转存失败，请稍后查看任务状态"}, status_code=502)
+    finally:
+        close_guangya_client(client)
     _remember_share_request(request, result.get("request_id"))
     if result.get("duplicate") and result.get("accepted"):
         return JSONResponse({

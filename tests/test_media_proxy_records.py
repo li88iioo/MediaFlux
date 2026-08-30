@@ -1072,6 +1072,10 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
     def test_logged_out_request_from_old_runtime_does_not_clear_replacement_cache(self):
         class LoggedOutClient:
             logged_in = False
+            close_calls = 0
+
+            def close(self):
+                type(self).close_calls += 1
 
         old_cache = media_proxy.SignedUrlCache()
         old_app = media_proxy.create_proxy_app(7, old_cache)
@@ -1103,6 +1107,7 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
 
             self.assertEqual(response.status_code, 503)
             self.assertEqual(replacement_cache.entry_count, 1)
+            self.assertEqual(LoggedOutClient.close_calls, 1)
         finally:
             with media_proxy._signed_url_caches_lock:
                 if previous is None:
@@ -1116,6 +1121,7 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
 
         class Client:
             calls = 0
+            close_calls = 0
             logged_in = True
             _raw = Raw()
 
@@ -1124,12 +1130,16 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
                 time.sleep(0.02)
                 return "https://signed.invalid/file?Expires=4102444800&token=secret"
 
+            def close(self):
+                self.__class__.close_calls += 1
+
         instance = {
             "id": 7,
             "enabled": 1,
             "upstream_url": "http://127.0.0.1:8096",
         }
         Client.calls = 0
+        Client.close_calls = 0
         with patch("app.modules.media_proxy._resolved_instance", return_value=instance), patch(
             "app.modules.media_proxy._client_is_authorized", new=AsyncMock(return_value=True)
         ), patch("app.modules.media_proxy.GuangYaClient", Client):
@@ -1139,6 +1149,7 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
 
         self.assertEqual((first.status_code, second.status_code), (302, 302))
         self.assertEqual(Client.calls, 1)
+        self.assertEqual(Client.close_calls, 2)
         rows = db.list_media_proxy_playback_records(instance_id=7)["items"]
         self.assertEqual(len(rows), 2)
         ordered_rows = list(reversed(rows))

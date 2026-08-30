@@ -12,8 +12,9 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.cli import main
@@ -212,12 +213,77 @@ class CliRuntimeTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"WEB_HOST": "0.0.0.0"}, clear=False), patch(
             "app.modules.first_run.needs_initialization", return_value=True
-        ), patch("app.main.create_app") as create_app, patch("app.cli.uvicorn.run") as run:
+        ), patch("app.cli.uvicorn.run") as run:
             exit_code = cli._start(None, 1258, None)
 
         self.assertEqual(exit_code, 2)
-        create_app.assert_not_called()
         run.assert_not_called()
+
+    def test_start_recovers_before_config_reads_and_holds_lifecycle_through_uvicorn(self) -> None:
+        import app.main
+        from app import cli, config
+        from app.modules import first_run
+
+        events: list[str] = []
+
+        @contextmanager
+        def lifecycle_guard(_paths):
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        web_app = SimpleNamespace(
+            state=SimpleNamespace(
+                release_startup_lifecycle_guard=lambda: events.append("app-release")
+            )
+        )
+        with patch(
+            "app.modules.backup.runtime_lifecycle_guard",
+            side_effect=lifecycle_guard,
+        ), patch(
+            "app.modules.backup.recover_pending_restore",
+            side_effect=lambda *_args, **_kwargs: events.append("recover") or True,
+        ), patch.object(
+            config,
+            "reload_after_restore",
+            side_effect=lambda: events.append("config-reload"),
+        ), patch.object(
+            first_run,
+            "refresh_startup_state_after_restore",
+            side_effect=lambda: events.append("first-run-refresh"),
+        ), patch.object(
+            first_run,
+            "resolve_bind_host",
+            side_effect=lambda _host: events.append("host") or "127.0.0.1",
+        ), patch.object(
+            config,
+            "flask_port",
+            side_effect=lambda: events.append("port") or 1258,
+        ), patch.object(
+            app.main, "app", web_app
+        ), patch.object(
+            cli.uvicorn,
+            "run",
+            side_effect=lambda *_args, **_kwargs: events.append("uvicorn"),
+        ):
+            self.assertEqual(cli._start(None, None, None), 0)
+
+        self.assertEqual(
+            events,
+            [
+                "lock-enter",
+                "recover",
+                "config-reload",
+                "first-run-refresh",
+                "host",
+                "port",
+                "uvicorn",
+                "app-release",
+                "lock-exit",
+            ],
+        )
 
     def test_initialized_start_uses_persisted_host_after_delayed_import(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -736,23 +802,27 @@ class CliRuntimeTests(unittest.TestCase):
         import app.main
         from app import cli
 
+        web_app = SimpleNamespace(state=SimpleNamespace())
+
         with patch.dict(
             os.environ,
             {"MEDIAFLUX_CONTAINER": "1"},
             clear=True,
         ), patch("app.modules.first_run.needs_initialization", return_value=True), patch(
-            "app.main.create_app", return_value=object()
-        ) as create_app, patch("app.cli.uvicorn.run") as run:
+            "app.main.app", web_app
+        ), patch("app.cli.uvicorn.run") as run:
             exit_code = cli._start(None, None, None)
 
         self.assertEqual(exit_code, 0)
-        create_app.assert_called_once_with(start_background=True)
+        self.assertIs(run.call_args.args[0], web_app)
         self.assertEqual(run.call_args.kwargs["host"], "0.0.0.0")
         self.assertEqual(run.call_args.kwargs["workers"], 1)
 
     def test_container_preseeded_credentials_can_start_without_manual_secret(self) -> None:
         import app.main
         from app import cli
+
+        web_app = SimpleNamespace(state=SimpleNamespace())
 
         with patch.dict(
             os.environ,
@@ -763,12 +833,12 @@ class CliRuntimeTests(unittest.TestCase):
             },
             clear=True,
         ), patch("app.modules.first_run.needs_initialization", return_value=False), patch(
-            "app.main.create_app", return_value=object()
-        ) as create_app, patch("app.cli.uvicorn.run") as run:
+            "app.main.app", web_app
+        ), patch("app.cli.uvicorn.run") as run:
             exit_code = cli._start(None, None, None)
 
         self.assertEqual(exit_code, 0)
-        create_app.assert_called_once_with(start_background=True)
+        self.assertIs(run.call_args.args[0], web_app)
         run.assert_called_once()
 
     def test_dockerfile_marks_container_and_uses_fixed_internal_healthcheck(self) -> None:

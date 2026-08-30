@@ -10,7 +10,7 @@ from typing import Any
 from app import config
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.organize import OrganizeRules, Organizer, organize_rules_snapshot
 from app.modules.organize_sources import normalize_organize_sources
@@ -90,11 +90,14 @@ def organize_confirmation_context(_arguments: dict[str, Any]) -> str:
     """绑定来源、规则与凭据世代；原始值不离开服务端。"""
     sources, rules, _error = _configured_inputs()
     client = GuangYaClient()
-    return _serialize_organize_context(
-        sources,
-        rules,
-        _credential_generation(client),
-    )
+    try:
+        return _serialize_organize_context(
+            sources,
+            rules,
+            _credential_generation(client),
+        )
+    finally:
+        close_guangya_client(client)
 
 
 def _credential_generation(client: GuangYaClient) -> int:
@@ -133,10 +136,13 @@ def _serialize_organize_clean_empty_context(
 def organize_clean_empty_confirmation_context(_arguments: dict[str, Any]) -> str:
     """绑定整理来源与凭据世代；原始内容仅保存在服务端确认票据中。"""
     client = GuangYaClient()
-    return _serialize_organize_clean_empty_context(
-        _configured_sources(),
-        _credential_generation(client),
-    )
+    try:
+        return _serialize_organize_clean_empty_context(
+            _configured_sources(),
+            _credential_generation(client),
+        )
+    finally:
+        close_guangya_client(client)
 
 
 def _task_running() -> bool:
@@ -161,38 +167,41 @@ def _preview_data(
         if str(source.get("id") or "").strip()
     }
 
-    for source in sources:
-        if remaining <= 0:
-            break
-        source_rules = rules.for_source(str(source.get("id") or ""))
-        plans, stats = organizer.organize(
-            source["id"],
-            source_rules,
-            dry_run=True,
-            max_files=remaining,
-            post_actions=False,
-            protected_source_ids=protected_source_ids,
-        )
-        for key in _PREVIEW_STATS_KEYS:
-            aggregate[key] += _bounded_int(stats.get(key))
-        errors = stats.get("scan_errors")
-        if isinstance(errors, list):
-            scan_error_count += min(len(errors), _PREVIEW_FILE_LIMIT)
-        remaining -= _bounded_int(stats.get("total"), _PREVIEW_FILE_LIMIT)
+    try:
+        for source in sources:
+            if remaining <= 0:
+                break
+            source_rules = rules.for_source(str(source.get("id") or ""))
+            plans, stats = organizer.organize(
+                source["id"],
+                source_rules,
+                dry_run=True,
+                max_files=remaining,
+                post_actions=False,
+                protected_source_ids=protected_source_ids,
+            )
+            for key in _PREVIEW_STATS_KEYS:
+                aggregate[key] += _bounded_int(stats.get(key))
+            errors = stats.get("scan_errors")
+            if isinstance(errors, list):
+                scan_error_count += min(len(errors), _PREVIEW_FILE_LIMIT)
+            remaining -= _bounded_int(stats.get("total"), _PREVIEW_FILE_LIMIT)
 
-        for plan in plans:
-            action = str(getattr(plan, "action", "") or "").strip().lower()
-            if action in action_counts:
-                action_counts[action] += 1
-            match = getattr(plan, "match", None)
-            title = str(getattr(match, "title", "") or "").strip()
-            if title and len(samples) < _PREVIEW_SAMPLE_LIMIT:
-                samples.append({
-                    "title": title[:160],
-                    "year": str(getattr(match, "year", "") or "")[:8],
-                    "media_type": str(getattr(match, "media_type", "") or "")[:16],
-                    "action": action if action in action_counts else "skip",
-                })
+            for plan in plans:
+                action = str(getattr(plan, "action", "") or "").strip().lower()
+                if action in action_counts:
+                    action_counts[action] += 1
+                match = getattr(plan, "match", None)
+                title = str(getattr(match, "title", "") or "").strip()
+                if title and len(samples) < _PREVIEW_SAMPLE_LIMIT:
+                    samples.append({
+                        "title": title[:160],
+                        "year": str(getattr(match, "year", "") or "")[:8],
+                        "media_type": str(getattr(match, "media_type", "") or "")[:16],
+                        "action": action if action in action_counts else "skip",
+                    })
+    finally:
+        organizer.close()
 
     data = {
         "source_count": len(sources),
@@ -300,13 +309,17 @@ def _organize_preview_snapshot(
 
 def _organize_preview(*, for_confirmation: bool) -> ToolResult:
     sources, rules, config_error = _configured_inputs()
-    return _organize_preview_snapshot(
-        sources,
-        rules,
-        config_error,
-        GuangYaClient(),
-        for_confirmation=for_confirmation,
-    )
+    client = GuangYaClient()
+    try:
+        return _organize_preview_snapshot(
+            sources,
+            rules,
+            config_error,
+            client,
+            for_confirmation=for_confirmation,
+        )
+    finally:
+        close_guangya_client(client)
 
 
 def preview_guangya_organize(_arguments: dict[str, Any]) -> ToolResult:
@@ -323,20 +336,23 @@ def prepare_guangya_organize_run_once(
     """用同一配置与凭据世代快照生成预检结果和确认上下文。"""
     sources, rules, config_error = _configured_inputs()
     client = GuangYaClient()
-    return (
-        _organize_preview_snapshot(
-            sources,
-            rules,
-            config_error,
-            client,
-            for_confirmation=True,
-        ),
-        _serialize_organize_context(
-            sources,
-            rules,
-            _credential_generation(client),
-        ),
-    )
+    try:
+        return (
+            _organize_preview_snapshot(
+                sources,
+                rules,
+                config_error,
+                client,
+                for_confirmation=True,
+            ),
+            _serialize_organize_context(
+                sources,
+                rules,
+                _credential_generation(client),
+            ),
+        )
+    finally:
+        close_guangya_client(client)
 
 
 def _preview_guangya_organize_clean_empty_sources(
@@ -358,34 +374,39 @@ def _preview_guangya_organize_clean_empty_sources(
             error="请等待当前整理任务结束后再清理空目录。",
             suggestions=["可询问：查看光鸭整理进度。"],
         )
+    owned_client = client is None
     client = client or GuangYaClient()
-    if not client.logged_in:
+    try:
+        if not client.logged_in:
+            return ToolResult(
+                ok=False,
+                status="not_configured",
+                summary="光鸭账号尚未连接",
+                error="请先连接光鸭账号。",
+            )
+        if not _supports_atomic_empty_directory_delete(client):
+            return ToolResult(
+                ok=False,
+                status="unsupported",
+                summary="当前光鸭 Provider 暂不支持安全清理空目录",
+                error="Provider 未提供带版本与空目录复核的回收站删除能力，系统已拒绝执行。",
+                suggestions=["可先运行整理预览；待 Provider 支持条件删除后再清理空目录。"],
+            )
         return ToolResult(
-            ok=False,
-            status="not_configured",
-            summary="光鸭账号尚未连接",
-            error="请先连接光鸭账号。",
+            ok=True,
+            status="preview",
+            summary="确认后将清理全部已配置整理来源中的空目录",
+            data={"source_count": len(sources)},
+            evidence=[Evidence(
+                "guangya_organizer",
+                "仅通过 Provider 的原子条件删除处理版本匹配的空子目录；来源根目录受保护，操作进入光鸭回收站。",
+                _now(),
+            )],
+            suggestions=["确认前请核对当前整理来源配置，并避免同时从其他客户端向来源目录写入内容。"],
         )
-    if not _supports_atomic_empty_directory_delete(client):
-        return ToolResult(
-            ok=False,
-            status="unsupported",
-            summary="当前光鸭 Provider 暂不支持安全清理空目录",
-            error="Provider 未提供带版本与空目录复核的回收站删除能力，系统已拒绝执行。",
-            suggestions=["可先运行整理预览；待 Provider 支持条件删除后再清理空目录。"],
-        )
-    return ToolResult(
-        ok=True,
-        status="preview",
-        summary="确认后将清理全部已配置整理来源中的空目录",
-        data={"source_count": len(sources)},
-        evidence=[Evidence(
-            "guangya_organizer",
-            "仅通过 Provider 的原子条件删除处理版本匹配的空子目录；来源根目录受保护，操作进入光鸭回收站。",
-            _now(),
-        )],
-        suggestions=["确认前请核对当前整理来源配置，并避免同时从其他客户端向来源目录写入内容。"],
-    )
+    finally:
+        if owned_client:
+            close_guangya_client(client)
 
 
 def prepare_guangya_organize_clean_empty(
@@ -394,13 +415,16 @@ def prepare_guangya_organize_clean_empty(
     """从同一来源快照生成预检与确认上下文。"""
     sources = _configured_sources()
     client = GuangYaClient()
-    return (
-        _preview_guangya_organize_clean_empty_sources(sources, client),
-        _serialize_organize_clean_empty_context(
-            sources,
-            _credential_generation(client),
-        ),
-    )
+    try:
+        return (
+            _preview_guangya_organize_clean_empty_sources(sources, client),
+            _serialize_organize_clean_empty_context(
+                sources,
+                _credential_generation(client),
+            ),
+        )
+    finally:
+        close_guangya_client(client)
 
 
 def preview_guangya_organize_clean_empty(_arguments: dict[str, Any]) -> ToolResult:
@@ -412,6 +436,7 @@ def _clean_empty_guangya_organize_sources(
     sources: list[dict[str, str]],
     *,
     expected_credential_generation: int | None = None,
+    client: GuangYaClient | None = None,
 ) -> ToolResult:
     if not sources:
         return ToolResult(
@@ -420,73 +445,78 @@ def _clean_empty_guangya_organize_sources(
             summary="未配置可清理的光鸭整理来源",
             error="请先在网盘整理页面配置来源目录。",
         )
-    client = GuangYaClient()
-    if not client.logged_in:
-        return ToolResult(
-            ok=False,
-            status="not_configured",
-            summary="光鸭账号尚未连接",
-            error="请先连接光鸭账号。",
+    owned_client = client is None
+    client = client or GuangYaClient()
+    try:
+        if not client.logged_in:
+            return ToolResult(
+                ok=False,
+                status="not_configured",
+                summary="光鸭账号尚未连接",
+                error="请先连接光鸭账号。",
+            )
+
+        if not _supports_atomic_empty_directory_delete(client):
+            return ToolResult(
+                ok=False,
+                status="unsupported",
+                summary="当前光鸭 Provider 暂不支持安全清理空目录",
+                error="Provider 未提供带版本与空目录复核的回收站删除能力，系统已拒绝执行。",
+            )
+
+        if (
+            expected_credential_generation is not None
+            and _credential_generation(client) != expected_credential_generation
+        ):
+            raise AgentToolError("光鸭登录凭据已变化，请重新预检", code="confirmation_stale")
+
+        result = get_organize_manager().clean_empty(sources, client=client)
+        if not result.get("ok"):
+            error = str(result.get("error") or "").strip()
+            conflict = error in {
+                "网盘整理任务正在运行",
+                "服务正在停止，暂不接受新的整理操作",
+            }
+            return ToolResult(
+                ok=False,
+                status="conflict" if conflict else "unavailable",
+                summary="光鸭空目录清理未执行",
+                error=(
+                    "已有整理任务运行中，请稍后重试。"
+                    if conflict
+                    else "暂时无法清理空目录，请稍后重试。"
+                ),
+                suggestions=["可询问：查看光鸭整理进度。"] if conflict else [],
+            )
+
+        cleaned = _bounded_int(result.get("cleaned"))
+        failures = _bounded_int(result.get("scan_failures")) + _bounded_int(
+            result.get("delete_failures")
         )
-
-    if not _supports_atomic_empty_directory_delete(client):
+        partial = bool(result.get("partial")) or failures > 0
         return ToolResult(
-            ok=False,
-            status="unsupported",
-            summary="当前光鸭 Provider 暂不支持安全清理空目录",
-            error="Provider 未提供带版本与空目录复核的回收站删除能力，系统已拒绝执行。",
-        )
-
-    if (
-        expected_credential_generation is not None
-        and _credential_generation(client) != expected_credential_generation
-    ):
-        raise AgentToolError("光鸭登录凭据已变化，请重新预检", code="confirmation_stale")
-
-    result = get_organize_manager().clean_empty(sources, client=client)
-    if not result.get("ok"):
-        error = str(result.get("error") or "").strip()
-        conflict = error in {
-            "网盘整理任务正在运行",
-            "服务正在停止，暂不接受新的整理操作",
-        }
-        return ToolResult(
-            ok=False,
-            status="conflict" if conflict else "unavailable",
-            summary="光鸭空目录清理未执行",
-            error=(
-                "已有整理任务运行中，请稍后重试。"
-                if conflict
-                else "暂时无法清理空目录，请稍后重试。"
+            ok=True,
+            status="partial" if partial else "completed",
+            summary=(
+                f"光鸭空目录清理部分完成：清理 {cleaned} 个目录，{failures} 项未完成"
+                if partial
+                else f"光鸭空目录清理完成，共清理 {cleaned} 个目录"
             ),
-            suggestions=["可询问：查看光鸭整理进度。"] if conflict else [],
+            data={"cleaned": cleaned, "source_count": len(sources), "failed": failures},
+            evidence=[Evidence(
+                "guangya_organizer",
+                "已清理空子目录；结果仅保留汇总计数，不返回目录标识、名称或路径。",
+                _now(),
+            )],
+            suggestions=(
+                ["部分目录扫描或删除失败，请检查光鸭连接与权限后重新预检。"]
+                if partial
+                else ["可继续运行整理预览，确认来源中是否有待整理媒体。"]
+            ),
         )
-
-    cleaned = _bounded_int(result.get("cleaned"))
-    failures = _bounded_int(result.get("scan_failures")) + _bounded_int(
-        result.get("delete_failures")
-    )
-    partial = bool(result.get("partial")) or failures > 0
-    return ToolResult(
-        ok=True,
-        status="partial" if partial else "completed",
-        summary=(
-            f"光鸭空目录清理部分完成：清理 {cleaned} 个目录，{failures} 项未完成"
-            if partial
-            else f"光鸭空目录清理完成，共清理 {cleaned} 个目录"
-        ),
-        data={"cleaned": cleaned, "source_count": len(sources), "failed": failures},
-        evidence=[Evidence(
-            "guangya_organizer",
-            "已清理空子目录；结果仅保留汇总计数，不返回目录标识、名称或路径。",
-            _now(),
-        )],
-        suggestions=(
-            ["部分目录扫描或删除失败，请检查光鸭连接与权限后重新预检。"]
-            if partial
-            else ["可继续运行整理预览，确认来源中是否有待整理媒体。"]
-        ),
-    )
+    finally:
+        if owned_client:
+            close_guangya_client(client)
 
 
 def clean_empty_guangya_organize_sources(_arguments: dict[str, Any]) -> ToolResult:
@@ -501,16 +531,20 @@ def clean_empty_guangya_organize_sources_confirmed(
     """重新读取一次当前快照并校验指纹；票据中不保存来源路径原文。"""
     sources = _configured_sources()
     client = GuangYaClient()
-    credential_generation = _credential_generation(client)
-    current_context = _serialize_organize_clean_empty_context(
-        sources, credential_generation
-    )
-    if not secrets.compare_digest(current_context, str(expected_context or "")):
-        raise AgentToolError("整理来源配置已变化，请重新预检", code="confirmation_stale")
-    return _clean_empty_guangya_organize_sources(
-        sources,
-        expected_credential_generation=credential_generation,
-    )
+    try:
+        credential_generation = _credential_generation(client)
+        current_context = _serialize_organize_clean_empty_context(
+            sources, credential_generation
+        )
+        if not secrets.compare_digest(current_context, str(expected_context or "")):
+            raise AgentToolError("整理来源配置已变化，请重新预检", code="confirmation_stale")
+        return _clean_empty_guangya_organize_sources(
+            sources,
+            expected_credential_generation=credential_generation,
+            client=client,
+        )
+    finally:
+        close_guangya_client(client)
 
 
 def _organize_stop_context_payload() -> dict[str, Any]:
@@ -646,43 +680,50 @@ def _run_guangya_organize_once(
     config_error: str,
     client: GuangYaClient,
 ) -> ToolResult:
-    if config_error:
-        return ToolResult(
-            ok=False,
-            status="not_configured",
-            summary="光鸭整理配置尚不完整",
-            error=config_error,
+    transferred = False
+    try:
+        if config_error:
+            return ToolResult(
+                ok=False,
+                status="not_configured",
+                summary="光鸭整理配置尚不完整",
+                error=config_error,
+            )
+        if not client.logged_in:
+            return ToolResult(
+                ok=False,
+                status="not_configured",
+                summary="光鸭账号尚未连接",
+                error="请先连接光鸭账号。",
+            )
+        result = get_organize_manager().start(
+            sources,
+            rules,
+            trigger_type="manual",
+            client=client,
+            expected_credential_generation=_credential_generation(client),
+            take_client_ownership=True,
         )
-    if not client.logged_in:
+        if not result.get("ok"):
+            return ToolResult(
+                ok=False,
+                status="conflict",
+                summary="光鸭整理任务未启动",
+                error="已有整理任务运行中，请稍后重试。",
+                suggestions=["可询问：查看光鸭整理进度。"],
+            )
+        transferred = True
         return ToolResult(
-            ok=False,
-            status="not_configured",
-            summary="光鸭账号尚未连接",
-            error="请先连接光鸭账号。",
-        )
-    result = get_organize_manager().start(
-        sources,
-        rules,
-        trigger_type="manual",
-        client=client,
-        expected_credential_generation=_credential_generation(client),
-    )
-    if not result.get("ok"):
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="光鸭整理任务未启动",
-            error="已有整理任务运行中，请稍后重试。",
+            ok=True,
+            status="accepted",
+            summary="光鸭整理任务已提交",
+            data={"trigger_type": "manual", "source_count": len(sources)},
+            evidence=[Evidence("guangya_organizer", "已提交后台整理；未返回目录或任务标识。", _now())],
             suggestions=["可询问：查看光鸭整理进度。"],
         )
-    return ToolResult(
-        ok=True,
-        status="accepted",
-        summary="光鸭整理任务已提交",
-        data={"trigger_type": "manual", "source_count": len(sources)},
-        evidence=[Evidence("guangya_organizer", "已提交后台整理；未返回目录或任务标识。", _now())],
-        suggestions=["可询问：查看光鸭整理进度。"],
-    )
+    finally:
+        if not transferred:
+            close_guangya_client(client)
 
 
 def run_guangya_organize_once(_arguments: dict[str, Any]) -> ToolResult:
@@ -703,11 +744,15 @@ def run_guangya_organize_once_confirmed(
     """确认执行前复核配置与凭据世代，拒绝跨账号复用旧票据。"""
     sources, rules, config_error = _configured_inputs()
     client = GuangYaClient()
-    current_context = _serialize_organize_context(
-        sources,
-        rules,
-        _credential_generation(client),
-    )
-    if not secrets.compare_digest(current_context, str(expected_context or "")):
-        raise AgentToolError("光鸭整理配置或登录凭据已变化，请重新预检", code="confirmation_stale")
+    try:
+        current_context = _serialize_organize_context(
+            sources,
+            rules,
+            _credential_generation(client),
+        )
+        if not secrets.compare_digest(current_context, str(expected_context or "")):
+            raise AgentToolError("光鸭整理配置或登录凭据已变化，请重新预检", code="confirmation_stale")
+    except Exception:
+        close_guangya_client(client)
+        raise
     return _run_guangya_organize_once(sources, rules, config_error, client)

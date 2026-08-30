@@ -24,7 +24,7 @@ from difflib import SequenceMatcher
 from typing import Callable
 
 from app import database as db
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.config import get, get_bool, get_int
 from app.database import add_organize_log, add_organize_log_items, get_media_probe_cache
 from app.logger import get_logger, log_throttled
@@ -785,8 +785,11 @@ class Organizer:
         self, client: GuangYaClient = None, scraper: TMDBScraper = None, *,
         traversal_limits: tuple[int, int, int] | None = None,
     ):
-        self.client = client or GuangYaClient()
-        self.scraper = scraper or TMDBScraper()
+        self._owns_client = client is None
+        self._owns_scraper = scraper is None
+        self.client = client if client is not None else GuangYaClient()
+        self.scraper = scraper if scraper is not None else TMDBScraper()
+        self._closed = False
         self._traversal_limits = traversal_limits or (
             max(8, min(get_int("GY_ORGANIZE_MAX_SCAN_DEPTH", DEFAULT_TRAVERSAL_MAX_DEPTH), 512)),
             max(100, min(get_int("GY_ORGANIZE_MAX_SCAN_DIRS", DEFAULT_TRAVERSAL_MAX_DIRS), 500_000)),
@@ -799,6 +802,36 @@ class Organizer:
         self._media_probe_cache_checked: set[tuple[str, str, int]] = set()
         self._probe_budget = None
         self._nsfw_recognizers: dict[tuple[str, str, str, int], object] = {}
+
+    def close(self) -> None:
+        """释放 Organizer 内部创建的长连接，注入依赖仍由调用方管理。"""
+        if self._closed:
+            return
+        self._closed = True
+        recognizers = list(self._nsfw_recognizers.values())
+        self._nsfw_recognizers.clear()
+        for recognizer in recognizers:
+            close = getattr(recognizer, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭 MetaTube 识别器失败 type=%s",
+                        type(exc).__name__,
+                    )
+        if self._owns_scraper:
+            close = getattr(self.scraper, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭 TMDB Scraper 失败 type=%s",
+                        type(exc).__name__,
+                    )
+        if self._owns_client:
+            close_guangya_client(self.client)
 
     @staticmethod
     def _parse_exts(raw: str, defaults: set[str]) -> set[str]:

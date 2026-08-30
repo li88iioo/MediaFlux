@@ -16,7 +16,7 @@ from app.agent.async_bridge import (
 )
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.indexers.downloads import (
     DownloadRequestCreationError,
     InvalidDownloadData,
@@ -331,10 +331,14 @@ def _target_readiness(target: str) -> dict[str, bool]:
     if target in {"qb", "both"}:
         readiness["qb"] = bool(str(config.get("QB_URL", "") or "").strip())
     if target in {"guangya", "both"}:
+        client = None
         try:
-            readiness["guangya"] = bool(GuangYaClient().logged_in)
+            client = GuangYaClient()
+            readiness["guangya"] = bool(client.logged_in)
         except Exception:
             readiness["guangya"] = False
+        finally:
+            close_guangya_client(client)
     return readiness
 
 

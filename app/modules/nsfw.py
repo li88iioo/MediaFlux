@@ -428,7 +428,20 @@ class MetaTubeClient:
         self.endpoint = endpoint
         self.token = str(token or "").strip()
         self.timeout = max(2.0, min(float(timeout or 8.0), 30.0))
+        self._owns_session = session is None
         self.session = session or requests.Session()
+        self._closed = False
+
+    def close(self) -> None:
+        """释放内部创建的 requests Session；注入 Session 仍由调用方管理。"""
+        if self._closed:
+            return
+        self._closed = True
+        if not self._owns_session:
+            return
+        close = getattr(self.session, "close", None)
+        if callable(close):
+            close()
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json", "User-Agent": "MediaFlux/MetaTube"}
@@ -597,6 +610,14 @@ class NsfwRecognizer:
     ) -> None:
         self.client = MetaTubeClient(endpoint, token, timeout=timeout, session=session)
         self.strip_domains = str(strip_domains or "")
+        self._closed = False
+
+    def close(self) -> None:
+        """幂等释放识别器持有的 MetaTube 客户端。"""
+        if self._closed:
+            return
+        self._closed = True
+        self.client.close()
 
     def candidates(self, value: str) -> list[Candidate]:
         identifier = extract_nsfw_identifier(value, self.strip_domains)

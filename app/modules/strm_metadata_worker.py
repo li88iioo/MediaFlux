@@ -41,7 +41,6 @@ class STRMMetadataWorker:
         self._last_error_type = ""
         self._completed_session = 0
         self._failed_session = 0
-        self._changed_paths: list[str] = []
         self._last_refresh_at: float | None = None
         self._refresh_retry_pending = False
 
@@ -254,10 +253,6 @@ class STRMMetadataWorker:
             finally:
                 STRM_OPERATION_LOCK.release()
             if settled == "completed":
-                path = str(result.get("path") or "")
-                if path:
-                    if path not in self._changed_paths:
-                        self._changed_paths.append(path)
                 with self._state_lock:
                     self._consecutive_failures = 0
                     self._last_error_type = ""
@@ -323,8 +318,7 @@ class STRMMetadataWorker:
                 self._current_job_id = 0
 
     def _flush_media_refresh(self, *, force: bool) -> None:
-        durable_paths = db.list_strm_metadata_refresh_paths(limit=20000)
-        paths = list(dict.fromkeys([*durable_paths, *self._changed_paths]))
+        paths = db.list_strm_metadata_refresh_paths(limit=20000)
         if not paths:
             return
         batch_size = max(
@@ -360,8 +354,7 @@ class STRMMetadataWorker:
             return
         # 统一刷新队列已持久接管这些路径；后续媒体服务器失败只重试刷新，
         # 不再让元数据 worker 重复提交同一变化。
-        db.acknowledge_strm_metadata_refresh_paths(durable_paths)
-        self._changed_paths = [path for path in self._changed_paths if path not in paths]
+        db.acknowledge_strm_metadata_refresh_paths(paths)
         self._refresh_retry_pending = False
 
 

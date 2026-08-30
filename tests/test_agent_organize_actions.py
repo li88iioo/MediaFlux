@@ -743,6 +743,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         manager.start.assert_called_once_with(
             sources, rules, trigger_type="manual", client=client,
             expected_credential_generation=7,
+            take_client_ownership=True,
         )
         serialized = str(result.to_dict())
         for secret in (
@@ -1234,6 +1235,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
                 trigger_type="manual",
                 client=current["client"],
                 expected_credential_generation=7,
+                take_client_ownership=True,
             )
 
             replay = self.client.post(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -49,6 +50,16 @@ class SettingsUpdateCheckTests(unittest.TestCase):
             self.assertIn("telemetryStatusBadge", response.text)
             self.assertIn("telemetryCheckUpdateBtn", response.text)
             self.assertIn("data-current-version", response.text)
+
+
+    def test_update_badge_restore_is_generation_guarded(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "app/static/js/settings.js").read_text(encoding="utf-8")
+        self.assertIn("let updateCheckGeneration=0", source)
+        self.assertIn("let updateBadgeRestoreTimer=null", source)
+        self.assertIn("clearUpdateBadgeRestore()", source)
+        self.assertIn("window.clearTimeout(updateBadgeRestoreTimer)", source)
+        self.assertIn("if(generation!==updateCheckGeneration)return", source)
+        self.assertIn("const defaultUpdateBadge=", source)
 
 
 if __name__ == "__main__":

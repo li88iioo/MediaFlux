@@ -98,57 +98,81 @@ def _start(host: str | None, port: int | None, data_dir: str | None) -> int:
     _enforce_packaged_production_mode()
     _configure_start_paths(data_dir)
 
-    # 仅在运行目录配置完成后导入，避免配置、数据库和日志提前绑定默认路径。
-    from app import config
-    from app.logger import get_logger
+    # 启动、pending restore 与整个 Uvicorn 生命周期共享同一把独占锁。
+    # 必须在 config/first_run/app.main 首次读取 user.env 前恢复，否则会把
+    # 恢复前的端口、首启状态或会话密钥冻结到当前进程。
+    from app.modules.backup import recover_pending_restore, runtime_lifecycle_guard
 
-    # 在任何配置读取或首次运行检查前安装脱敏 handler，避免启动早期异常旁路。
-    get_logger(__name__)
+    paths = get_runtime_paths()
+    with runtime_lifecycle_guard(paths):
+        recovered = recover_pending_restore(paths, lifecycle_lock_held=True)
 
-    external_host = os.getenv("WEB_HOST", "")
-    requested_host = host if host is not None else (external_host or None)
-    from app.modules.first_run import (
-        UnsafeFirstRunBindingError,
-        resolve_bind_host,
-    )
+        # 仅在运行目录配置和恢复完成后导入路径/配置消费者。
+        from app import config
+        from app.logger import get_logger
 
-    try:
-        effective_host = resolve_bind_host(requested_host)
-    except UnsafeFirstRunBindingError as exc:
-        print(f"MediaFlux refused unsafe first-run binding: {exc}", file=sys.stderr)
-        return 2
+        if recovered:
+            config.reload_after_restore()
+            from app.modules import first_run
 
-    from app.main import create_app
+            first_run.refresh_startup_state_after_restore()
 
-    effective_port = port if port is not None else config.flask_port()
-    app = create_app(start_background=True)
+        # 在任何配置读取或首次运行检查前安装脱敏 handler，避免启动早期异常旁路。
+        get_logger(__name__)
 
-    pid_file = get_runtime_paths().data_dir / "mediaflux.pid"
-    try:
-        pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(str(os.getpid()), encoding="utf-8")
-    except OSError:
-        pass
-
-    try:
-        uvicorn.run(
-            app,
-            host=effective_host,
-            port=effective_port,
-            workers=1,
-            reload=False,
-            log_level="info",
-            log_config=None,
-            access_log=False,
+        external_host = os.getenv("WEB_HOST", "")
+        requested_host = host if host is not None else (external_host or None)
+        from app.modules.first_run import (
+            UnsafeFirstRunBindingError,
+            resolve_bind_host,
         )
-    finally:
+
         try:
-            if pid_file.is_file() and pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
-                pid_file.unlink(missing_ok=True)
+            effective_host = resolve_bind_host(requested_host)
+        except UnsafeFirstRunBindingError as exc:
+            print(f"MediaFlux refused unsafe first-run binding: {exc}", file=sys.stderr)
+            return 2
+
+        from app.main import app as web_app
+
+        effective_port = port if port is not None else config.flask_port()
+        pid_file = paths.data_dir / "mediaflux.pid"
+        try:
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(os.getpid()), encoding="utf-8")
         except OSError:
             pass
 
-    return 0
+        try:
+            uvicorn.run(
+                web_app,
+                host=effective_host,
+                port=effective_port,
+                workers=1,
+                reload=False,
+                log_level="info",
+                log_config=None,
+                access_log=False,
+            )
+        finally:
+            # Uvicorn 在进入 lifespan 前失败或测试替换 uvicorn.run 时，也必须
+            # 释放应用构造期的启动预留锁；正常 shutdown 后该回调是幂等的。
+            release_guard = getattr(
+                getattr(web_app, "state", None),
+                "release_startup_lifecycle_guard",
+                None,
+            )
+            if callable(release_guard):
+                release_guard()
+            try:
+                if (
+                    pid_file.is_file()
+                    and pid_file.read_text(encoding="utf-8").strip() == str(os.getpid())
+                ):
+                    pid_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return 0
 
 
 def _status(port: int | None = None) -> int:

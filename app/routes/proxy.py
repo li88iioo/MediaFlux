@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger, log_throttled
 from app.modules.media_proxy import (
     PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
@@ -60,6 +60,7 @@ def play_gy(
             return JSONResponse({"error": "播放文件大小无效"}, status_code=400)
         if content_length < 0:
             return JSONResponse({"error": "播放文件大小无效"}, status_code=400)
+    client = None
     try:
         client = GuangYaClient()
         if not client.logged_in:
@@ -178,3 +179,5 @@ def play_gy(
             "playgy 异常 type=%s", type(exc).__name__,
         )
         return JSONResponse({"error": "光鸭播放地址获取失败"}, status_code=500)
+    finally:
+        close_guangya_client(client)

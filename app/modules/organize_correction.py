@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 
 from app import config, database as db
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.logger import get_logger
 from app.modules.organize import (
     OrganizeRules,
@@ -65,9 +65,31 @@ class AppliedTransition:
 class OrganizeCorrectionService:
     def __init__(self, client: GuangYaClient | None = None,
                  scraper: TMDBScraper | None = None):
-        self.client = client or GuangYaClient()
-        self.scraper = scraper or TMDBScraper()
+        self._owns_client = client is None
+        self._owns_scraper = scraper is None
+        self.client = client if client is not None else GuangYaClient()
+        self.scraper = scraper if scraper is not None else TMDBScraper()
         self.organizer = Organizer(client=self.client, scraper=self.scraper)
+        self._closed = False
+
+    def close(self) -> None:
+        """释放纠偏服务内部创建的客户端，保留注入依赖所有权。"""
+        if self._closed:
+            return
+        self._closed = True
+        self.organizer.close()
+        if self._owns_scraper:
+            close = getattr(self.scraper, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭整理纠偏 TMDB Scraper 失败 type=%s",
+                        type(exc).__name__,
+                    )
+        if self._owns_client:
+            close_guangya_client(self.client)
 
     @staticmethod
     def _row_dict(row) -> dict:

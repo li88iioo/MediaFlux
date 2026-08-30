@@ -862,15 +862,33 @@ def update_runtime_env_file(
     """CAS 发布配置，并只把本次非部署覆盖项应用到当前进程。"""
     global _cache
     normalized = {str(key): str(value) for key, value in updates.items()}
+    target = Path(path)
+
+    def publish() -> EnvUpdateResult:
+        global _cache
+        with _lock:
+            if any(has_external_override(key) for key in normalized):
+                raise ExternalConfigOverrideError("目标配置由运行环境覆盖")
+            result = update_env_file(target, normalized, expected=expected)
+            if target == Path(ENV_FILE):
+                _cache = dict(result.data)
+            for key, value in normalized.items():
+                os.environ[key] = value
+            return result
+
+    if target != Path(ENV_FILE):
+        return publish()
+    from app.modules.backup import config_snapshot_guard
+
+    with config_snapshot_guard(PATHS):
+        return publish()
+
+
+def reload_after_restore() -> None:
+    """恢复事务替换 user.env 后丢弃旧的进程内文件快照。"""
+    global _cache
     with _lock:
-        if any(has_external_override(key) for key in normalized):
-            raise ExternalConfigOverrideError("目标配置由运行环境覆盖")
-        result = update_env_file(path, normalized, expected=expected)
-        if Path(path) == Path(ENV_FILE):
-            _cache = dict(result.data)
-        for key, value in normalized.items():
-            os.environ[key] = value
-        return result
+        _cache = None
 
 
 def set_and_save(updates: dict[str, str]) -> None:

@@ -236,9 +236,28 @@ class LocalMediaService:
         *,
         inspection_store: _InspectionStore | None = None,
     ) -> None:
+        self._owns_scraper = scraper is None
+        self._closed = False
         self.scraper = scraper or TMDBScraper()
         self.organizer = Organizer(client=object(), scraper=self.scraper)
         self.inspections = inspection_store or _InspectionStore()
+
+    def close(self) -> None:
+        """幂等释放服务内部创建的识别客户端与缓存识别器。"""
+        if self._closed:
+            return
+        self._closed = True
+        self.organizer.close()
+        if self._owns_scraper:
+            close = getattr(self.scraper, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭本地媒体 TMDB Scraper 失败 type=%s",
+                        type(exc).__name__,
+                    )
 
     def inspect_source(self, owner: str, source_id: int, path: Path | str) -> dict[str, Any]:
         source = db.get_local_media_source(source_id, owner=owner)
@@ -1821,3 +1840,12 @@ def get_local_media_service() -> LocalMediaService:
         if _service is None:
             _service = LocalMediaService()
         return _service
+
+
+def close_local_media_service() -> None:
+    """关闭并移除 Web/Agent 共用的本地媒体服务。"""
+    global _service
+    with _service_lock:
+        service, _service = _service, None
+    if service is not None:
+        service.close()

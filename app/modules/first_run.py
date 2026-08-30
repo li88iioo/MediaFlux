@@ -93,6 +93,13 @@ def _reset_startup_state_for_tests() -> None:
         _startup_state = _capture_startup_state()
 
 
+def refresh_startup_state_after_restore() -> None:
+    """恢复事务替换配置后，重新冻结首启状态。"""
+    global _startup_state
+    with _state_lock:
+        _startup_state = _capture_startup_state()
+
+
 def needs_initialization() -> bool:
     """返回进程启动前是否不存在任何可识别的既有安装状态。"""
     return _startup_snapshot().needs_initialization
@@ -182,11 +189,14 @@ def initialize_admin(username: str, password: str) -> None:
             "WEB_SECRET_KEY": get_web_secret(),
         }
         try:
-            result = config.update_env_file(
-                state.paths.env_file,
-                updates,
-                expected=state.env_bytes,
-            )
+            from app.modules.backup import config_snapshot_guard
+
+            with config_snapshot_guard(state.paths):
+                result = config.update_env_file(
+                    state.paths.env_file,
+                    updates,
+                    expected=state.env_bytes,
+                )
         except (OSError, UnicodeError, config.AtomicPublishError) as exc:
             # 任意存储/发布异常后都重新捕获真实状态，避免 setup/login 生命周期卡死。
             _startup_state = _capture_startup_state(state.paths)

@@ -38,6 +38,7 @@ from app.clients.openai_compatible import (
 )
 from app.indexers.errors import IndexerError
 from app.indexers.http import FixedHostHttpClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger, redact_sensitive_text
 from app.modules import gcid_import
 from app.modules.gcid_manifest import ManifestValidationError, validate_manifest
@@ -52,6 +53,17 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/tools")
 
 _TMDB_DRAFT_TEST_HOSTS = {"api.themoviedb.org", "api.tmdb.org"}
+
+
+def _close_scraper(scraper: object | None) -> None:
+    """兼容测试替身并避免清理异常覆盖 API 业务结果。"""
+    close = getattr(scraper, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.warning("关闭 TMDB Scraper 失败 type=%s", type(exc).__name__)
 
 
 def _safe_name(name: str) -> str:
@@ -250,8 +262,8 @@ def scrape_preview(request: Request, data: dict | None = Body(default=None)):
     parent_path = str(data.get("parent_path") or "").strip()[:4096]
     if not filename:
         return api_error("请输入文件名", 400)
+    scraper = TMDBScraper()
     try:
-        scraper = TMDBScraper()
         result = scraper.match(filename, parent_path) if parent_path else scraper.match(filename)
         release_parse = scraper.parse_media(filename, parent_path, result)
         parsed: dict[str, object] = {
@@ -308,6 +320,8 @@ def scrape_preview(request: Request, data: dict | None = Body(default=None)):
     except Exception as exc:
         logger.error("刮削预览失败 type=%s", type(exc).__name__)
         return api_error(str(exc), 500)
+    finally:
+        _close_scraper(scraper)
 
 
 def _build_naming_preview(
@@ -362,17 +376,20 @@ def scrape_confirm(request: Request, data: dict | None = Body(default=None)):
     ] if isinstance(data.get("rejected_tmdb_ids") or [], list) else []
     if not raw_name or not tmdb_id:
         return api_error("缺少文件名或 tmdb_id", 400)
+    scraper = TMDBScraper()
     try:
         confirm_kwargs = {"parent_path": parent_path}
         if rejected_tmdb_ids:
             confirm_kwargs["rejected_tmdb_ids"] = rejected_tmdb_ids
-        TMDBScraper().confirm(
+        scraper.confirm(
             raw_name, tmdb_id, title, year, media_type, **confirm_kwargs,
         )
         return api_response({"success": True})
     except Exception as exc:
         logger.error("映射锁定失败 type=%s", type(exc).__name__)
         return api_error(str(exc), 500)
+    finally:
+        _close_scraper(scraper)
 
 
 @router.get("/locks")
@@ -419,7 +436,11 @@ def _validate_tmdb_regex_target(
         resolved_type = str(media_type_hint or "").strip().lower()
         if resolved_type not in {"movie", "tv"}:
             resolved_type = extract_recognition_context(filename, parent_path).media_type
-    match = TMDBScraper().match_from_tmdb(tmdb_id, resolved_type)
+    scraper = TMDBScraper()
+    try:
+        match = scraper.match_from_tmdb(tmdb_id, resolved_type)
+    finally:
+        _close_scraper(scraper)
     if match.status != "matched" or not match.tmdb_id:
         type_label = "剧集" if resolved_type == "tv" else "电影"
         logger.warning(
@@ -609,9 +630,8 @@ def export_gcid_manifest(request: Request, data: dict | None = Body(default=None
     source_name = str(data.get("source_name") or "").strip()[:200]
     if not source_dir_id or len(source_dir_id) > 128:
         return api_error("请选择有效的源目录", 400)
+    client = None
     try:
-        from app.clients.guangya import GuangYaClient
-
         client = GuangYaClient()
         if not client.logged_in:
             return api_error("光鸭未登录", 503)
@@ -633,6 +653,8 @@ def export_gcid_manifest(request: Request, data: dict | None = Body(default=None
     except Exception as exc:
         logger.error("GCID 清单导出失败 type=%s", type(exc).__name__)
         return api_error("GCID 清单导出失败", 502)
+    finally:
+        close_guangya_client(client)
 
 
 @router.post("/gcid/validate")

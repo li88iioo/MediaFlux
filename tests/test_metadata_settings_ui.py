@@ -27,11 +27,13 @@ def test_metadata_settings_tmdb_test_and_stable_status_contract():
         assert marker in panel
 
     assert "fetch('/api/tools/tmdb/test'" in script
-    assert "tmdb-connection-status is-testing" in script
-    assert "tmdb-connection-status is-ok" in script
-    assert "tmdb-connection-status is-error" in script
-    assert "tmdb-connection-status is-idle" in script
-    assert "testTmdbBtn.disabled = false;" in script
+    assert "setTmdbConnectionState('testing'" in script
+    assert "setTmdbConnectionState('ok'" in script
+    assert "setTmdbConnectionState('error'" in script
+    assert "setTmdbConnectionState('idle'" in script
+    assert "tmdbRequestGate=createDraftRequestGate" in script
+    assert "signal:ticket.signal" in script
+    assert "testTmdbBtn.disabled=false" in script
     assert ".tmdb-test-btn" in css
     assert "min-height: 42px;" in css
     assert "height: 42px;" in css

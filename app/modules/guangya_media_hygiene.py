@@ -234,161 +234,166 @@ def build_media_hygiene_plan(
         "GY_ORGANIZE_METADATA_EXTS", DEFAULT_ORGANIZE_METADATA_EXTS
     )
     recognizer = _configured_recognizer(strip_domains) if enrich_metadata else None
+    try:
 
-    cache: dict[str, list[GuangYaFile]] = {}
-    target, parent_path = _resolve_path(client, target_path, cache)
-    if not target.is_dir:
-        raise GuangYaRenamePlanError("媒体名称清理目前只支持精确目录路径")
+        cache: dict[str, list[GuangYaFile]] = {}
+        target, parent_path = _resolve_path(client, target_path, cache)
+        if not target.is_dir:
+            raise GuangYaRenamePlanError("媒体名称清理目前只支持精确目录路径")
 
-    nodes: dict[str, _DirectoryNode] = {
-        str(target.file_id): _DirectoryNode(target, target_path, parent_path)
-    }
-    queue = deque([str(target.file_id)])
-    scanned_items = 0
-    scanned_dirs = 0
-    while queue:
-        directory_id = queue.popleft()
-        node = nodes[directory_id]
-        scanned_dirs += 1
-        if scanned_dirs > _MAX_SCANNED_DIRS:
-            raise GuangYaRenamePlanError("媒体名称清理目录数量超过安全上限")
-        items = _cached_list_dir(client, cache, directory_id)
-        for child in items:
-            scanned_items += 1
-            if scanned_items > _MAX_SCANNED_ITEMS:
-                raise GuangYaRenamePlanError("媒体名称清理项目数量超过安全上限")
-            if child.is_dir:
-                if recursive:
-                    child_path = node.path.rstrip("/") + "/" + child.name
-                    nodes[str(child.file_id)] = _DirectoryNode(
-                        child, child_path, node.path
-                    )
-                    node.children.append(str(child.file_id))
-                    queue.append(str(child.file_id))
+        nodes: dict[str, _DirectoryNode] = {
+            str(target.file_id): _DirectoryNode(target, target_path, parent_path)
+        }
+        queue = deque([str(target.file_id)])
+        scanned_items = 0
+        scanned_dirs = 0
+        while queue:
+            directory_id = queue.popleft()
+            node = nodes[directory_id]
+            scanned_dirs += 1
+            if scanned_dirs > _MAX_SCANNED_DIRS:
+                raise GuangYaRenamePlanError("媒体名称清理目录数量超过安全上限")
+            items = _cached_list_dir(client, cache, directory_id)
+            for child in items:
+                scanned_items += 1
+                if scanned_items > _MAX_SCANNED_ITEMS:
+                    raise GuangYaRenamePlanError("媒体名称清理项目数量超过安全上限")
+                if child.is_dir:
+                    if recursive:
+                        child_path = node.path.rstrip("/") + "/" + child.name
+                        nodes[str(child.file_id)] = _DirectoryNode(
+                            child, child_path, node.path
+                        )
+                        node.children.append(str(child.file_id))
+                        queue.append(str(child.file_id))
+                    continue
+                node.files.append(child)
+
+        canonical_cache: dict[str, tuple[str, bool]] = {}
+        changes: list[tuple[GuangYaFile, str, str]] = []
+        direct_codes: dict[str, set[str]] = defaultdict(set)
+        unidentified_video_dirs: set[str] = set()
+        video_counts: dict[str, int] = defaultdict(int)
+        video_rows: dict[str, list[tuple[GuangYaFile, str, str]]] = defaultdict(list)
+        no_change = 0
+        unidentified_videos = 0
+        metadata_enriched = 0
+        video_renames = 0
+        companion_renames = 0
+        directory_renames = 0
+
+        for directory_id, node in nodes.items():
+            for item in node.files:
+                if _extension(item) not in video_exts:
+                    continue
+                video_counts[directory_id] += 1
+                identifier = extract_nsfw_identifier(item.name, strip_domains)
+                if identifier is None:
+                    unidentified_videos += 1
+                    unidentified_video_dirs.add(directory_id)
+                    continue
+                code = normalize_code(identifier.code)
+                direct_codes[directory_id].add(code)
+                canonical, enriched = _canonical_stem(
+                    code,
+                    recognizer=recognizer,
+                    lookup_name=item.name,
+                    cache=canonical_cache,
+                )
+                metadata_enriched += int(enriched)
+                target_name = f"{canonical}.{_extension(item)}"
+                video_rows[directory_id].append((item, code, target_name))
+                if _contains_domain(_stem(item), strip_domains):
+                    if target_name != item.name:
+                        changes.append((item, node.path, target_name))
+                        video_renames += 1
+                    else:
+                        no_change += 1
+
+        # 只有同目录唯一视频且伴随文件自身也带同一番号时才联动，避免跨作品误配。
+        for directory_id, rows in video_rows.items():
+            if len(rows) != 1 or video_counts.get(directory_id, 0) != 1:
                 continue
-            node.files.append(child)
-
-    canonical_cache: dict[str, tuple[str, bool]] = {}
-    changes: list[tuple[GuangYaFile, str, str]] = []
-    direct_codes: dict[str, set[str]] = defaultdict(set)
-    unidentified_video_dirs: set[str] = set()
-    video_counts: dict[str, int] = defaultdict(int)
-    video_rows: dict[str, list[tuple[GuangYaFile, str, str]]] = defaultdict(list)
-    no_change = 0
-    unidentified_videos = 0
-    metadata_enriched = 0
-    video_renames = 0
-    companion_renames = 0
-    directory_renames = 0
-
-    for directory_id, node in nodes.items():
-        for item in node.files:
-            if _extension(item) not in video_exts:
-                continue
-            video_counts[directory_id] += 1
-            identifier = extract_nsfw_identifier(item.name, strip_domains)
-            if identifier is None:
-                unidentified_videos += 1
-                unidentified_video_dirs.add(directory_id)
-                continue
-            code = normalize_code(identifier.code)
-            direct_codes[directory_id].add(code)
-            canonical, enriched = _canonical_stem(
-                code,
-                recognizer=recognizer,
-                lookup_name=item.name,
-                cache=canonical_cache,
-            )
-            metadata_enriched += int(enriched)
-            target_name = f"{canonical}.{_extension(item)}"
-            video_rows[directory_id].append((item, code, target_name))
-            if _contains_domain(_stem(item), strip_domains):
-                if target_name != item.name:
-                    changes.append((item, node.path, target_name))
-                    video_renames += 1
-                else:
+            video, code, video_target = rows[0]
+            canonical_base = video_target.rsplit(".", 1)[0]
+            node = nodes[directory_id]
+            for item in node.files:
+                ext = _extension(item)
+                if item.file_id == video.file_id or ext not in metadata_exts:
+                    continue
+                identifier = extract_nsfw_identifier(item.name, strip_domains)
+                if identifier is None or normalize_code(identifier.code) != code:
+                    continue
+                if not _contains_domain(_stem(item), strip_domains):
+                    continue
+                suffix = _companion_suffix(item)
+                target_name = f"{canonical_base}{suffix}.{ext}"
+                if target_name == item.name:
                     no_change += 1
+                    continue
+                changes.append((item, node.path, target_name))
+                companion_renames += 1
 
-    # 只有同目录唯一视频且伴随文件自身也带同一番号时才联动，避免跨作品误配。
-    for directory_id, rows in video_rows.items():
-        if len(rows) != 1 or video_counts.get(directory_id, 0) != 1:
-            continue
-        video, code, video_target = rows[0]
-        canonical_base = video_target.rsplit(".", 1)[0]
-        node = nodes[directory_id]
-        for item in node.files:
-            ext = _extension(item)
-            if item.file_id == video.file_id or ext not in metadata_exts:
+        # 自底向上汇总作品番号；目录自身必须也带同一番号和域名污染才会改名。
+        subtree_codes: dict[str, set[str]] = {}
+        subtree_has_unidentified_video: dict[str, bool] = {}
+        for directory_id in reversed(list(nodes)):
+            node = nodes[directory_id]
+            codes = set(direct_codes.get(directory_id, set()))
+            has_unidentified_video = directory_id in unidentified_video_dirs
+            for child_id in node.children:
+                codes.update(subtree_codes.get(child_id, set()))
+                has_unidentified_video = bool(
+                    has_unidentified_video
+                    or subtree_has_unidentified_video.get(child_id, False)
+                )
+            subtree_codes[directory_id] = codes
+            subtree_has_unidentified_video[directory_id] = has_unidentified_video
+            if (
+                len(codes) != 1
+                or has_unidentified_video
+                or not _contains_domain(node.item.name, strip_domains)
+            ):
                 continue
-            identifier = extract_nsfw_identifier(item.name, strip_domains)
+            identifier = extract_nsfw_identifier(node.item.name, strip_domains)
+            code = next(iter(codes))
             if identifier is None or normalize_code(identifier.code) != code:
                 continue
-            if not _contains_domain(_stem(item), strip_domains):
-                continue
-            suffix = _companion_suffix(item)
-            target_name = f"{canonical_base}{suffix}.{ext}"
-            if target_name == item.name:
+            canonical, _enriched = canonical_cache[code]
+            if canonical == node.item.name:
                 no_change += 1
                 continue
-            changes.append((item, node.path, target_name))
-            companion_renames += 1
+            changes.append((node.item, node.parent_path, canonical))
+            directory_renames += 1
 
-    # 自底向上汇总作品番号；目录自身必须也带同一番号和域名污染才会改名。
-    subtree_codes: dict[str, set[str]] = {}
-    subtree_has_unidentified_video: dict[str, bool] = {}
-    for directory_id in reversed(list(nodes)):
-        node = nodes[directory_id]
-        codes = set(direct_codes.get(directory_id, set()))
-        has_unidentified_video = directory_id in unidentified_video_dirs
-        for child_id in node.children:
-            codes.update(subtree_codes.get(child_id, set()))
-            has_unidentified_video = bool(
-                has_unidentified_video
-                or subtree_has_unidentified_video.get(child_id, False)
+        if len(changes) > safe_limit:
+            raise GuangYaRenamePlanError(
+                f"媒体名称清理匹配超过本次上限 {safe_limit} 个，请缩小目录或提高 limit"
             )
-        subtree_codes[directory_id] = codes
-        subtree_has_unidentified_video[directory_id] = has_unidentified_video
-        if (
-            len(codes) != 1
-            or has_unidentified_video
-            or not _contains_domain(node.item.name, strip_domains)
-        ):
-            continue
-        identifier = extract_nsfw_identifier(node.item.name, strip_domains)
-        code = next(iter(codes))
-        if identifier is None or normalize_code(identifier.code) != code:
-            continue
-        canonical, _enriched = canonical_cache[code]
-        if canonical == node.item.name:
-            no_change += 1
-            continue
-        changes.append((node.item, node.parent_path, canonical))
-        directory_renames += 1
-
-    if len(changes) > safe_limit:
-        raise GuangYaRenamePlanError(
-            f"媒体名称清理匹配超过本次上限 {safe_limit} 个，请缩小目录或提高 limit"
+        return build_explicit_rename_plan(
+            client,
+            owner=owner,
+            target=target_path,
+            changes=changes,
+            cache=cache,
+            scanned_items=scanned_items,
+            scanned_dirs=scanned_dirs,
+            no_change=no_change,
+            limit=safe_limit,
+            extra_stats={
+                "identified_video_count": sum(len(rows) for rows in video_rows.values()),
+                "unidentified_video_count": unidentified_videos,
+                "video_rename_count": video_renames,
+                "companion_rename_count": companion_renames,
+                "directory_rename_count": directory_renames,
+                "metadata_enriched_count": metadata_enriched,
+            },
+            transform={
+                "enrich_metadata": "1" if enrich_metadata else "0",
+                "metatube_configured": "1" if recognizer is not None else "0",
+            },
         )
-    return build_explicit_rename_plan(
-        client,
-        owner=owner,
-        target=target_path,
-        changes=changes,
-        cache=cache,
-        scanned_items=scanned_items,
-        scanned_dirs=scanned_dirs,
-        no_change=no_change,
-        limit=safe_limit,
-        extra_stats={
-            "identified_video_count": sum(len(rows) for rows in video_rows.values()),
-            "unidentified_video_count": unidentified_videos,
-            "video_rename_count": video_renames,
-            "companion_rename_count": companion_renames,
-            "directory_rename_count": directory_renames,
-            "metadata_enriched_count": metadata_enriched,
-        },
-        transform={
-            "enrich_metadata": "1" if enrich_metadata else "0",
-            "metatube_configured": "1" if recognizer is not None else "0",
-        },
-    )
+    finally:
+        close = getattr(recognizer, "close", None)
+        if callable(close):
+            close()

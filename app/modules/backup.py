@@ -199,14 +199,17 @@ def create_backup(
     include_settings: bool = True,
 ) -> Path:
     """创建原子 ZIP，并与恢复/启动期迁移串行。"""
-    with _backup_operation_guard(paths):
-        return _create_backup_unlocked(
-            paths,
-            output=output,
-            reason=reason,
-            source_connection=source_connection,
-            include_settings=include_settings,
-        )
+    # 固定锁序：配置快照 -> 备份/恢复。配置发布只持有前者，恢复在
+    # runtime lifecycle 独占期只持有后者，因此不会形成反向锁序。
+    with config_snapshot_guard(paths):
+        with _backup_operation_guard(paths):
+            return _create_backup_unlocked(
+                paths,
+                output=output,
+                reason=reason,
+                source_connection=source_connection,
+                include_settings=include_settings,
+            )
 
 
 def _safe_archive_name(name: str) -> str:
@@ -611,6 +614,20 @@ def _backup_operation_guard(paths: RuntimePaths):
         lock.release()
 
 
+@contextmanager
+def config_snapshot_guard(paths: RuntimePaths):
+    """串行配置发布与包含配置的备份快照。"""
+    from app.modules.process_lock import CrossProcessLock
+
+    lock = CrossProcessLock("config-snapshot", directory=paths.data_dir)
+    if not lock.acquire(blocking=True):  # pragma: no cover - blocking lock returns true or raises
+        raise BackupError("另一个配置保存或备份任务正在运行")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 _RUNTIME_LIFECYCLE_REGISTRY_LOCK = threading.RLock()
 _RUNTIME_LIFECYCLE_REGISTRY: dict[tuple[int, str], dict[str, Any]] = {}
 
@@ -672,10 +689,12 @@ def _exclusive_runtime_lifecycle_guard(paths: RuntimePaths):
 
 @contextmanager
 def _offline_restore_guard(paths: RuntimePaths):
-    # 固定顺序：服务生命周期锁 -> 备份恢复操作锁，避免交叉死锁。
+    # 固定顺序：服务生命周期 -> 配置快照 -> 备份恢复，避免恢复 user.env
+    # 与配置发布并发，也不与在线备份形成反向锁序。
     with _exclusive_runtime_lifecycle_guard(paths):
-        with _backup_operation_guard(paths):
-            yield
+        with config_snapshot_guard(paths):
+            with _backup_operation_guard(paths):
+                yield
 
 
 def recover_pending_restore(
@@ -685,8 +704,9 @@ def recover_pending_restore(
 ) -> bool:
     """在数据库打开前恢复被中断的多文件恢复事务。"""
     if lifecycle_lock_held:
-        with _backup_operation_guard(paths):
-            return _recover_pending_restore_unlocked(paths)
+        with config_snapshot_guard(paths):
+            with _backup_operation_guard(paths):
+                return _recover_pending_restore_unlocked(paths)
     with _offline_restore_guard(paths):
         return _recover_pending_restore_unlocked(paths)
 

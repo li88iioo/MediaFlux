@@ -37,7 +37,7 @@ from app.clients.ai_recognition import (
     AIReleaseGroupInput,
     AIReleaseGroupResult,
 )
-from app.clients.tmdb import TMDBClient
+from app.clients.tmdb import TMDBClient, close_tmdb_client
 from app.config import get, get_bool
 from app.discovery.models import ProviderRateLimited, ProviderTimeout, ProviderUnavailable
 from app.logger import get_logger, redact_sensitive_text
@@ -3392,6 +3392,15 @@ def _build_verified_automatic_identity_proof(
 class TMDBScraper:
     supports_parent_path = True
 
+
+    def close(self) -> None:
+        """释放内部创建的 TMDB Client；注入 Client 仍由调用方管理。"""
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_client:
+            close_tmdb_client(self.client)
+
     @staticmethod
     def validate_position(
         detail: dict, media_type: str, season: int | None, episode: int | None,
@@ -3404,7 +3413,9 @@ class TMDBScraper:
         return _tmdb_position_error(validation)
 
     def __init__(self, client: TMDBClient | None = None):
+        self._owns_client = client is None
         self.client = client or TMDBClient()
+        self._closed = False
         self.api_key = str(getattr(self.client, "api_key", "") or "")
         self.base_url = str(getattr(self.client, "base_url", "") or "").rstrip("/")
         self.match_mode = get("TMDB_MATCH_MODE", "strict")  # strict / loose
@@ -7255,4 +7266,8 @@ class TMDBScraper:
 
 def deterministic_recognize(filename: str, parent_path: str = "") -> RecognitionResult:
     """兼容函数入口；现有调用只传 filename 时仍可工作。"""
-    return TMDBScraper().deterministic_recognize(filename, parent_path)
+    scraper = TMDBScraper()
+    try:
+        return scraper.deterministic_recognize(filename, parent_path)
+    finally:
+        scraper.close()

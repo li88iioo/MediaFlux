@@ -10,7 +10,7 @@ from typing import Any
 from app import config
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.organize_scheduler import OrganizeScheduler, get_organize_scheduler
 
@@ -48,6 +48,7 @@ def guangya_connection_status_arguments(arguments: dict[str, Any]) -> dict[str, 
 
 def get_guangya_connection_status(_arguments: dict[str, Any]) -> ToolResult:
     """只验证凭据是否存在以及最小只读请求是否可达，不刷新或返回凭据。"""
+    client = None
     try:
         client = GuangYaClient()
         configured = bool(client.logged_in)
@@ -71,6 +72,8 @@ def get_guangya_connection_status(_arguments: dict[str, Any]) -> ToolResult:
             )],
             suggestions=["可稍后重试，或到光鸭账号页重新校验连接。"],
         )
+    finally:
+        close_guangya_client(client)
 
     if not configured:
         return ToolResult(

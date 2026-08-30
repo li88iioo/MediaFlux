@@ -63,6 +63,33 @@ class BackupTests(unittest.TestCase):
 
         self.assertLess(events.index("recover"), events.index("secret"))
 
+    def test_background_app_holds_startup_lifecycle_until_lifespan_or_launcher_releases(self) -> None:
+        from app import main
+
+        events: list[str] = []
+
+        @contextmanager
+        def lifecycle_guard(_paths):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        with patch(
+            "app.modules.backup.runtime_lifecycle_guard",
+            side_effect=lifecycle_guard,
+        ), patch(
+            "app.modules.backup.recover_pending_restore",
+            return_value=False,
+        ), patch.object(main, "_secret_key", return_value="test-secret"):
+            app = main.create_app(start_background=True)
+            self.assertEqual(events, ["enter"])
+            app.state.release_startup_lifecycle_guard()
+            app.state.release_startup_lifecycle_guard()
+
+        self.assertEqual(events, ["enter", "exit"])
+
     def test_runtime_lifecycle_is_reentrant_within_process_but_keeps_file_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_paths(Path(directory))
@@ -122,6 +149,135 @@ class BackupTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertTrue(finished.is_set())
             self.assertTrue(result[0].is_file())
+
+    def test_pending_restore_uses_fixed_lifecycle_config_backup_lock_order(self) -> None:
+        from app.modules import backup as backup_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_paths(Path(directory))
+            events: list[str] = []
+
+            @contextmanager
+            def guard(label: str):
+                events.append(f"{label}-enter")
+                try:
+                    yield
+                finally:
+                    events.append(f"{label}-exit")
+
+            with patch.object(
+                backup_module,
+                "_exclusive_runtime_lifecycle_guard",
+                side_effect=lambda _paths: guard("lifecycle"),
+            ), patch.object(
+                backup_module,
+                "config_snapshot_guard",
+                side_effect=lambda _paths: guard("config"),
+            ), patch.object(
+                backup_module,
+                "_backup_operation_guard",
+                side_effect=lambda _paths: guard("backup"),
+            ):
+                self.assertFalse(recover_pending_restore(paths))
+
+        self.assertEqual(
+            events,
+            [
+                "lifecycle-enter",
+                "config-enter",
+                "backup-enter",
+                "backup-exit",
+                "config-exit",
+                "lifecycle-exit",
+            ],
+        )
+
+    def test_config_publish_waits_until_database_and_env_backup_snapshot_complete(self) -> None:
+        from app import config as app_config
+        from app.modules import backup as backup_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_paths(Path(directory))
+            paths.ensure_writable_dirs()
+            connection = sqlite3.connect(paths.database_path)
+            connection.execute("CREATE TABLE sample(value TEXT)")
+            connection.execute("INSERT INTO sample VALUES ('old')")
+            connection.commit()
+            connection.close()
+            paths.env_file.write_text("BACKUP_LOCK_TEST='old' # mediaflux-literal\n", encoding="utf-8")
+            expected = paths.env_file.read_bytes()
+            snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            database_write_started = threading.Event()
+            config_finished = threading.Event()
+            archive_paths: list[Path] = []
+            original_snapshot = backup_module._sqlite_backup_bytes
+
+            def slow_snapshot(*args, **kwargs):
+                snapshot_started.set()
+                self.assertTrue(release_snapshot.wait(2))
+                return original_snapshot(*args, **kwargs)
+
+            def run_backup() -> None:
+                archive_paths.append(create_backup(paths, reason="consistent"))
+
+            def publish_config() -> None:
+                writer = sqlite3.connect(paths.database_path, timeout=2)
+                try:
+                    writer.execute("UPDATE sample SET value='new'")
+                    database_write_started.set()
+                    app_config.update_runtime_env_file(
+                        paths.env_file,
+                        {"BACKUP_LOCK_TEST": "new"},
+                        expected=expected,
+                    )
+                    writer.commit()
+                    config_finished.set()
+                finally:
+                    writer.close()
+
+            previous = os.environ.pop("BACKUP_LOCK_TEST", None)
+            try:
+                with patch.object(app_config, "PATHS", paths), patch.object(
+                    app_config, "ENV_FILE", paths.env_file
+                ), patch.object(
+                    app_config, "_STARTUP_ENV_OVERRIDES", frozenset()
+                ), patch.object(
+                    backup_module, "_sqlite_backup_bytes", side_effect=slow_snapshot
+                ):
+                    backup_thread = threading.Thread(target=run_backup)
+                    backup_thread.start()
+                    self.assertTrue(snapshot_started.wait(2))
+                    config_thread = threading.Thread(target=publish_config)
+                    config_thread.start()
+                    self.assertTrue(database_write_started.wait(2))
+                    time.sleep(0.05)
+                    self.assertFalse(config_finished.is_set())
+                    release_snapshot.set()
+                    backup_thread.join(2)
+                    config_thread.join(2)
+            finally:
+                if previous is None:
+                    os.environ.pop("BACKUP_LOCK_TEST", None)
+                else:
+                    os.environ["BACKUP_LOCK_TEST"] = previous
+
+            self.assertFalse(backup_thread.is_alive())
+            self.assertFalse(config_thread.is_alive())
+            self.assertTrue(config_finished.is_set())
+            with zipfile.ZipFile(archive_paths[0]) as archive:
+                self.assertEqual(archive.read("config/user.env"), expected)
+                archived_database = Path(directory) / "archived.db"
+                archived_database.write_bytes(archive.read("database/mediaflux.db"))
+            archived = sqlite3.connect(archived_database)
+            try:
+                self.assertEqual(
+                    archived.execute("SELECT value FROM sample").fetchone()[0],
+                    "old",
+                )
+            finally:
+                archived.close()
+            self.assertIn("BACKUP_LOCK_TEST='new'", paths.env_file.read_text(encoding="utf-8"))
 
     def test_create_verify_and_restore_preserves_sqlite_env_and_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

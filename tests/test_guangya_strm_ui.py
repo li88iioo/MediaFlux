@@ -82,7 +82,10 @@ class GuangyaStrmUiTests(unittest.TestCase):
         self.assertIn("伴随元数据同步已关闭 · 队列暂停", self.template)
         self.assertIn("`队列 ${metadataPending} 项", self.template)
         self.assertIn("metadataQueue.enabled===false", self.template)
-        self.assertIn("const shouldPoll=!!s.running||(metadataPending>0&&metadataQueue.enabled!==false)", self.template)
+        self.assertIn("statusShouldPoll=!!s.running||(metadataPending>0&&metadataQueue.enabled!==false)", self.template)
+        self.assertIn("function canPollStatus(){return activeStrmTab==='schedule'&&!document.hidden&&statusShouldPoll;}", self.template)
+        self.assertIn("window.setTimeout(pollStatus,delay)", self.template)
+        self.assertNotIn("setInterval(loadStatus", self.template)
 
 
 if __name__ == "__main__":

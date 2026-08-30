@@ -4,6 +4,37 @@
     const panels=[...document.querySelectorAll('[data-settings-panel]')];
     const lockModal=createAppModal(document.getElementById('tmdbLocksModal'));
     const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const isAbortError=error=>error?.name==='AbortError';
+    function createDraftRequestGate(readDraft,onInvalidate){
+        let generation=0;
+        let controller=null;
+        const fingerprint=()=>JSON.stringify(readDraft());
+        return {
+            begin(){
+                controller?.abort();
+                controller=new AbortController();
+                return {generation:++generation,fingerprint:fingerprint(),signal:controller.signal};
+            },
+            isCurrent(ticket){return ticket?.generation===generation&&ticket.fingerprint===fingerprint();},
+            finish(ticket){
+                if(!this.isCurrent(ticket))return false;
+                controller=null;
+                return true;
+            },
+            invalidate(){
+                generation+=1;
+                controller?.abort();
+                controller=null;
+                onInvalidate?.();
+            },
+        };
+    }
+    function bindDraftInvalidation(fields,gate){
+        fields.filter(Boolean).forEach(field=>{
+            field.addEventListener('input',gate.invalidate);
+            field.addEventListener('change',gate.invalidate);
+        });
+    }
     const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','1lou','animetosho','tpb','sukebei'];
     const DEFAULT_INDEXER_SITES=INDEXER_SITE_ORDER.slice(0,6);
     const indexerSiteBox=form.querySelector('[data-indexer-site-box]');
@@ -177,11 +208,10 @@
         window.renderLucideIcons?.(agentModelPickerList);
     }
 
-    openAgentModelPickerButton?.addEventListener('click',()=>{
+    openAgentModelPickerButton?.addEventListener('click',event=>{
         if(agentModelSearchInput) agentModelSearchInput.value='';
         renderAgentModelPickerList('');
-        agentModelPickerModal.open();
-        setTimeout(()=>{ agentModelSearchInput?.focus(); }, 120);
+        agentModelPickerModal.open(event.currentTarget,{initialFocus:agentModelSearchInput});
     });
 
     agentModelSearchInput?.addEventListener('input', (e)=>{
@@ -203,8 +233,8 @@
     }
     function setAgentModelActionsBusy(activeButton,busy){
         [fetchAgentModelsButton,testAgentModelButton,openAgentModelPickerButton].forEach(button=>{if(button) button.disabled=busy;});
-        activeButton.classList.toggle('is-loading',busy);
-        activeButton.setAttribute('aria-busy',busy?'true':'false');
+        activeButton?.classList.toggle('is-loading',busy);
+        activeButton?.setAttribute('aria-busy',busy?'true':'false');
     }
     function getAgentModelDraft(){
         const panel=form.querySelector('[data-settings-panel="agent"]');
@@ -216,14 +246,27 @@
             timeout_seconds:Number(panel.querySelector('[data-key="AGENT_LLM_TIMEOUT_SECONDS"]').value),
         };
     }
-    fetchAgentModelsButton?.addEventListener('click',async()=>{
+    let agentModelActiveButton=null;
+    const agentModelRequestGate=createDraftRequestGate(getAgentModelDraft,()=>{
+        if(agentModelActiveButton)setAgentModelActionsBusy(agentModelActiveButton,false);
+        agentModelActiveButton=null;
+        renderAgentModelCapabilities(null);
+        setAgentModelState('配置已变化，请重新获取或测试','idle');
+    });
+    bindDraftInvalidation([
+        ...form.querySelectorAll('[data-settings-panel="agent"] [data-key^="AGENT_LLM_"]'),
+    ],agentModelRequestGate);
+    fetchAgentModelsButton?.addEventListener('click',async event=>{
         const draft=getAgentModelDraft();
         if(!draft.base_url){setAgentModelState('请先填写 API Base URL','error');form.querySelector('[data-key="AGENT_LLM_API_URL"]').focus();return;}
-        setAgentModelActionsBusy(fetchAgentModelsButton,true);setAgentModelState('正在读取 Provider 模型列表…','testing');
+        const ticket=agentModelRequestGate.begin();
+        agentModelActiveButton=event.currentTarget;
+        setAgentModelActionsBusy(agentModelActiveButton,true);setAgentModelState('正在读取 Provider 模型列表…','testing');
         try{
-            const response=await fetch('/api/tools/ai/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:draft.base_url,api_key:draft.api_key,protocol:draft.protocol})});
+            const response=await fetch('/api/tools/ai/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:draft.base_url,api_key:draft.api_key,protocol:draft.protocol}),signal:ticket.signal});
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'模型列表读取失败');
+            if(!agentModelRequestGate.isCurrent(ticket))return;
             cachedAgentModels=Array.isArray(data.models)?data.models:[];
             const list=document.getElementById('agentLlmModelOptions');
             if(list) list.replaceChildren(...cachedAgentModels.map(name=>{const option=document.createElement('option');option.value=name;return option;}));
@@ -232,20 +275,23 @@
                 if(window.showToast) window.showToast(`已获取 ${cachedAgentModels.length} 个可用模型，请点选`, 'success', 2500);
                 if(agentModelSearchInput) agentModelSearchInput.value='';
                 renderAgentModelPickerList('');
-                agentModelPickerModal.open();
+                agentModelPickerModal.open(agentModelActiveButton,{initialFocus:agentModelSearchInput});
             }
-        }catch(error){setAgentModelState(error.message||'模型列表读取失败','error');}
-        finally{setAgentModelActionsBusy(fetchAgentModelsButton,false);}
+        }catch(error){if(agentModelRequestGate.isCurrent(ticket)&&!isAbortError(error))setAgentModelState(error.message||'模型列表读取失败','error');}
+        finally{if(agentModelRequestGate.finish(ticket)){setAgentModelActionsBusy(agentModelActiveButton,false);agentModelActiveButton=null;}}
     });
-    testAgentModelButton?.addEventListener('click',async()=>{
+    testAgentModelButton?.addEventListener('click',async event=>{
         const draft=getAgentModelDraft();
         if(!draft.base_url){setAgentModelState('请先填写 API Base URL','error');form.querySelector('[data-key="AGENT_LLM_API_URL"]').focus();return;}
         if(!draft.model){setAgentModelState('请先输入或选择模型名称','error');document.getElementById('agentLlmModel').focus();return;}
-        setAgentModelActionsBusy(testAgentModelButton,true);setAgentModelState('正在验证结构化输出、工具调用与流式输出…','testing');renderAgentModelCapabilities(null,{testing:true});
+        const ticket=agentModelRequestGate.begin();
+        agentModelActiveButton=event.currentTarget;
+        setAgentModelActionsBusy(agentModelActiveButton,true);setAgentModelState('正在验证结构化输出、工具调用与流式输出…','testing');renderAgentModelCapabilities(null,{testing:true});
         try{
-            const response=await fetch('/api/tools/ai/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draft)});
+            const response=await fetch('/api/tools/ai/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draft),signal:ticket.signal});
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'模型连接测试失败');
+            if(!agentModelRequestGate.isCurrent(ticket))return;
             const protocol=agentProtocolLabels[data.protocol]||data.protocol||'模型服务';
             const capabilities=data.capabilities&&typeof data.capabilities==='object'?data.capabilities:{structured_output:true,tool_calling:false,streaming:false};
             renderAgentModelCapabilities(capabilities);
@@ -256,8 +302,8 @@
                     : `连接正常，但部分 Agent 能力不可用 · ${protocol} · ${data.elapsed_ms||0} ms`,
                 fullyCapable?'success':'warning'
             );
-        }catch(error){renderAgentModelCapabilities(null);setAgentModelState(error.message||'模型连接测试失败','error');}
-        finally{setAgentModelActionsBusy(testAgentModelButton,false);}
+        }catch(error){if(agentModelRequestGate.isCurrent(ticket)&&!isAbortError(error)){renderAgentModelCapabilities(null);setAgentModelState(error.message||'模型连接测试失败','error');}}
+        finally{if(agentModelRequestGate.finish(ticket)){setAgentModelActionsBusy(agentModelActiveButton,false);agentModelActiveButton=null;}}
     });
 
     const testQbButton=document.getElementById('testQbBtn');
@@ -297,67 +343,97 @@
         if(state==='clear'||state==='empty')return '';
         return field.value;
     }
+    const qbPanel=form.querySelector('[data-settings-panel="downloads"]');
+    const qbUrlField=qbPanel?.querySelector('[data-key="QB_URL"]');
+    const qbUsernameField=qbPanel?.querySelector('[data-key="QB_USERNAME"]');
+    const qbPasswordField=qbPanel?.querySelector('[data-key="QB_PASSWORD"]');
+    const qbApiKeyField=qbPanel?.querySelector('[data-key="QB_API_KEY"]');
+    const getQbDraft=()=>({
+        url:qbUrlField?.value.trim()||'',
+        username:qbUsernameField?.value.trim()||'',
+        password:qbSecretDraft(qbPasswordField),
+        api_key:qbSecretDraft(qbApiKeyField),
+    });
+    const setQbBusy=busy=>{
+        if(!testQbButton)return;
+        testQbButton.disabled=busy;
+        testQbButton.classList.toggle('is-loading',busy);
+        testQbButton.setAttribute('aria-busy',busy?'true':'false');
+    };
+    const qbRequestGate=createDraftRequestGate(getQbDraft,()=>{
+        setQbBusy(false);
+        setQbConnectionState('idle','配置已变化，请重新测试','配置已变化，请重新测试','待重测');
+    });
+    bindDraftInvalidation([qbUrlField,qbUsernameField,qbPasswordField,qbApiKeyField],qbRequestGate);
     testQbButton?.addEventListener('click',async()=>{
-        const panel=form.querySelector('[data-settings-panel="downloads"]');
-        const urlField=panel.querySelector('[data-key="QB_URL"]');
-        const usernameField=panel.querySelector('[data-key="QB_USERNAME"]');
-        const passwordField=panel.querySelector('[data-key="QB_PASSWORD"]');
-        const apiKeyField=panel.querySelector('[data-key="QB_API_KEY"]');
-        if(!urlField.value.trim()){
+        const draft=getQbDraft();
+        if(!draft.url){
             setQbConnectionState('error','请填写 WebUI 地址','请先填写 qB WebUI 地址','缺少地址');
-            urlField.focus();
+            qbUrlField?.focus();
             return;
         }
-        testQbButton.disabled=true;
-        testQbButton.classList.add('is-loading');
-        testQbButton.setAttribute('aria-busy','true');
+        const ticket=qbRequestGate.begin();
+        setQbBusy(true);
         setQbConnectionState('testing','连接测试中…','正在验证网络、认证与 Web API','测试中…');
         try{
             const response=await fetch('/api/downloads/qb/test',{
                 method:'POST',
                 headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({
-                    url:urlField.value.trim(),
-                    username:usernameField.value.trim(),
-                    password:qbSecretDraft(passwordField),
-                    api_key:qbSecretDraft(apiKeyField),
-                }),
+                body:JSON.stringify(draft),
+                signal:ticket.signal,
             });
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'qBittorrent 连接测试失败');
+            if(!qbRequestGate.isCurrent(ticket))return;
             const auth=data.auth_mode==='api_key'?'API Key':'密码';
             const version=String(data.app_version||'未知版本').replace(/^v/i,'');
             const latency=data.latency_ms||0;
             const versionLabel=version==='未知版本'?version:`v${version}`;
             setQbConnectionState('success',`已连接 · ${versionLabel} · ${auth} · ${latency} ms`,`qBittorrent ${versionLabel} · ${auth}认证 · 延迟 ${latency} ms`,`已连接 · ${latency} ms`);
         }catch(error){
-            const message=error.message||'qBittorrent 连接测试失败';
-            setQbConnectionState('error',message,message,'连接失败');
-        }finally{
-            testQbButton.disabled=false;
-            testQbButton.classList.remove('is-loading');
-            testQbButton.setAttribute('aria-busy','false');
-        }
+            if(qbRequestGate.isCurrent(ticket)&&!isAbortError(error)){
+                const message=error.message||'qBittorrent 连接测试失败';
+                setQbConnectionState('error',message,message,'连接失败');
+            }
+        }finally{if(qbRequestGate.finish(ticket))setQbBusy(false);}
     });
 
+    const telegramPanel=form.querySelector('[data-settings-panel="telegram"]');
+    const telegramState=telegramPanel?.querySelector('[data-settings-state]');
+    const testTelegramButton=document.getElementById('testTelegramBtn');
+    const tgTokenField=telegramPanel?.querySelector('[data-key="TG_BOT_TOKEN"]');
+    const tgChatIdField=telegramPanel?.querySelector('[data-key="TG_CHAT_ID"]');
     const tgConnectionBadge=document.getElementById('tgConnectionBadge');
-    document.getElementById('testTelegramBtn').addEventListener('click',async()=>{
-        const panel=form.querySelector('[data-settings-panel="telegram"]');const state=panel.querySelector('[data-settings-state]');const button=document.getElementById('testTelegramBtn');button.disabled=true;state.className='';state.textContent='正在发送测试消息...';
+    const getTelegramDraft=()=>({token:tgTokenField?.value||'',chat_id:tgChatIdField?.value||''});
+    const telegramRequestGate=createDraftRequestGate(getTelegramDraft,()=>{
+        if(testTelegramButton)testTelegramButton.disabled=false;
+        if(telegramState){telegramState.className='';telegramState.textContent='配置已变化，请重新测试';}
+        if(tgConnectionBadge){tgConnectionBadge.className='telemetry-status-badge is-idle';tgConnectionBadge.dataset.tone='idle';tgConnectionBadge.textContent='待重测';}
+    });
+    bindDraftInvalidation([tgTokenField,tgChatIdField],telegramRequestGate);
+    testTelegramButton?.addEventListener('click',async()=>{
+        const draft=getTelegramDraft();
+        const ticket=telegramRequestGate.begin();
+        testTelegramButton.disabled=true;
+        telegramState.className='';telegramState.textContent='正在发送测试消息...';
         if(tgConnectionBadge){tgConnectionBadge.className='telemetry-status-badge';tgConnectionBadge.dataset.tone='testing';tgConnectionBadge.textContent='测试中…';}
         try{
-            const response=await fetch('/api/telegram/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:panel.querySelector('[data-key="TG_BOT_TOKEN"]').value,chat_id:panel.querySelector('[data-key="TG_CHAT_ID"]').value})});
+            const response=await fetch('/api/telegram/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draft),signal:ticket.signal});
             const data=await response.json();
             if(!response.ok)throw new Error(data.error||'发送失败');
-            state.className='is-success';
-            state.textContent=data.status||'测试消息已发送';
+            if(!telegramRequestGate.isCurrent(ticket))return;
+            telegramState.className='is-success';
+            telegramState.textContent=data.status||'测试消息已发送';
             if(tgConnectionBadge){tgConnectionBadge.className='telemetry-status-badge';delete tgConnectionBadge.dataset.tone;tgConnectionBadge.innerHTML='<span class="telemetry-dot"></span>已连通';}
         }
         catch(error){
-            state.className='is-error';
-            state.textContent=error.message;
-            if(tgConnectionBadge){tgConnectionBadge.className='telemetry-status-badge is-error';tgConnectionBadge.dataset.tone='error';tgConnectionBadge.textContent='测试失败';}
+            if(telegramRequestGate.isCurrent(ticket)&&!isAbortError(error)){
+                telegramState.className='is-error';
+                telegramState.textContent=error.message;
+                if(tgConnectionBadge){tgConnectionBadge.className='telemetry-status-badge is-error';tgConnectionBadge.dataset.tone='error';tgConnectionBadge.textContent='测试失败';}
+            }
         }
-        finally{button.disabled=false;}
+        finally{if(telegramRequestGate.finish(ticket))testTelegramButton.disabled=false;}
     });
 
     function syncTelemetryWidgets(){
@@ -427,11 +503,31 @@
     const checkUpdateBtn = document.getElementById('telemetryCheckUpdateBtn');
     const statusBadge = document.getElementById('telemetryStatusBadge');
     if(checkUpdateBtn && statusBadge){
+        const defaultUpdateBadge={html:statusBadge.innerHTML,className:statusBadge.className,title:checkUpdateBtn.title};
+        let updateCheckGeneration=0;
+        let updateBadgeRestoreTimer=null;
+        const clearUpdateBadgeRestore=()=>{
+            if(updateBadgeRestoreTimer!==null)window.clearTimeout(updateBadgeRestoreTimer);
+            updateBadgeRestoreTimer=null;
+        };
+        const scheduleUpdateBadgeRestore=generation=>{
+            clearUpdateBadgeRestore();
+            updateBadgeRestoreTimer=window.setTimeout(()=>{
+                if(generation!==updateCheckGeneration)return;
+                statusBadge.className=defaultUpdateBadge.className;
+                delete statusBadge.dataset.tone;
+                statusBadge.innerHTML=defaultUpdateBadge.html;
+                checkUpdateBtn.title=defaultUpdateBadge.title;
+                updateBadgeRestoreTimer=null;
+                window.renderLucideIcons?.(statusBadge);
+            },3000);
+        };
         checkUpdateBtn.addEventListener('click', async()=>{
             if(checkUpdateBtn.disabled) return;
+            const generation=++updateCheckGeneration;
+            clearUpdateBadgeRestore();
             checkUpdateBtn.disabled = true;
             checkUpdateBtn.classList.add('is-checking');
-            const originalBadgeHtml = statusBadge.innerHTML;
             statusBadge.dataset.tone = 'testing';
             statusBadge.textContent = '检查中…';
             try{
@@ -440,6 +536,7 @@
                 if(!res.ok || !data.success){
                     throw new Error(data.error || '检查更新失败');
                 }
+                if(generation!==updateCheckGeneration)return;
                 const update = data.update || {};
                 if(update.update_available){
                     const newVer = update.latest_version ? `v${update.latest_version.replace(/^v/i, '')}` : '新版本';
@@ -452,28 +549,21 @@
                     statusBadge.className = 'telemetry-status-badge is-idle';
                     statusBadge.dataset.tone = 'idle';
                     statusBadge.textContent = '已是最新版';
-                    setTimeout(()=>{
-                        statusBadge.className = 'telemetry-status-badge';
-                        delete statusBadge.dataset.tone;
-                        statusBadge.innerHTML = originalBadgeHtml;
-                        window.renderLucideIcons?.(statusBadge);
-                    }, 3000);
+                    scheduleUpdateBadgeRestore(generation);
                 }
             }catch(err){
+                if(generation!==updateCheckGeneration)return;
                 window.showToast?.(err?.message || '检查更新失败', 'error', 5200);
                 statusBadge.className = 'telemetry-status-badge is-error';
                 statusBadge.dataset.tone = 'error';
                 statusBadge.textContent = '检查失败';
-                setTimeout(()=>{
-                    statusBadge.className = 'telemetry-status-badge';
-                    delete statusBadge.dataset.tone;
-                    statusBadge.innerHTML = originalBadgeHtml;
-                    window.renderLucideIcons?.(statusBadge);
-                }, 3000);
+                scheduleUpdateBadgeRestore(generation);
             }finally{
-                checkUpdateBtn.disabled = false;
-                checkUpdateBtn.classList.remove('is-checking');
-                window.renderLucideIcons?.(statusBadge);
+                if(generation===updateCheckGeneration){
+                    checkUpdateBtn.disabled = false;
+                    checkUpdateBtn.classList.remove('is-checking');
+                    window.renderLucideIcons?.(statusBadge);
+                }
             }
         });
     }
@@ -559,54 +649,43 @@
         finally{button.disabled=false;}
     });
 
-    const testTmdbBtn = document.getElementById('testTmdbBtn');
-    if (testTmdbBtn) {
-        testTmdbBtn.addEventListener('click', async () => {
-            const state = document.getElementById('tmdbConnectionState');
-            const apiKeyInput = document.getElementById('tmdbApiKeyInput');
-            const apiUrlInput = document.getElementById('tmdbApiUrlInput');
-            testTmdbBtn.disabled = true;
-            if (state) {
-                state.className = 'tmdb-connection-status is-testing';
-                state.innerHTML = '<i data-lucide="loader-circle"></i><span>正在测试 TMDB API 连通性...</span>';
-                window.renderLucideIcons?.(state);
-            }
-            try {
-                const response = await fetch('/api/tools/tmdb/test', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        api_key: apiKeyInput?.value || '',
-                        api_url: apiUrlInput?.value || ''
-                    })
-                });
-                const data = await response.json();
-                if (!response.ok) throw new Error(data.error || '连接测试失败');
-                if (state) {
-                    state.className = 'tmdb-connection-status is-ok';
-                    state.innerHTML = `<i data-lucide="check-circle"></i><span>${escapeHtml(data.message || '连接正常')}</span>`;
-                    window.renderLucideIcons?.(state);
-                }
-            } catch (error) {
-                if (state) {
-                    state.className = 'tmdb-connection-status is-error';
-                    state.innerHTML = `<i data-lucide="alert-circle"></i><span>${escapeHtml(error.message || '连接失败')}</span>`;
-                    window.renderLucideIcons?.(state);
-                }
-            } finally {
-                testTmdbBtn.disabled = false;
-            }
-        });
-    }
-
-    const resetTmdbConnectionState = () => {
-        const state = document.getElementById('tmdbConnectionState');
-        if (!state || state.classList.contains('is-testing')) return;
-        state.className = 'tmdb-connection-status is-idle';
-        state.innerHTML = '<span>TMDB 连接状态</span>';
+    const testTmdbBtn=document.getElementById('testTmdbBtn');
+    const tmdbConnectionState=document.getElementById('tmdbConnectionState');
+    const tmdbApiKeyInput=document.getElementById('tmdbApiKeyInput');
+    const tmdbApiUrlInput=document.getElementById('tmdbApiUrlInput');
+    const getTmdbDraft=()=>({api_key:tmdbApiKeyInput?.value||'',api_url:tmdbApiUrlInput?.value||''});
+    const setTmdbConnectionState=(tone,message,iconName='')=>{
+        if(!tmdbConnectionState)return;
+        tmdbConnectionState.className=`tmdb-connection-status is-${tone}`;
+        tmdbConnectionState.innerHTML=iconName
+            ? `<i data-lucide="${iconName}"></i><span>${escapeHtml(message)}</span>`
+            : `<span>${escapeHtml(message)}</span>`;
+        window.renderLucideIcons?.(tmdbConnectionState);
     };
-    ['tmdbApiKeyInput', 'tmdbApiUrlInput'].forEach(id => {
-        document.getElementById(id)?.addEventListener('input', resetTmdbConnectionState);
+    const tmdbRequestGate=createDraftRequestGate(getTmdbDraft,()=>{
+        if(testTmdbBtn)testTmdbBtn.disabled=false;
+        setTmdbConnectionState('idle','配置已变化，请重新测试');
+    });
+    bindDraftInvalidation([tmdbApiKeyInput,tmdbApiUrlInput],tmdbRequestGate);
+    testTmdbBtn?.addEventListener('click',async()=>{
+        const draft=getTmdbDraft();
+        const ticket=tmdbRequestGate.begin();
+        testTmdbBtn.disabled=true;
+        setTmdbConnectionState('testing','正在测试 TMDB API 连通性...','loader-circle');
+        try{
+            const response=await fetch('/api/tools/tmdb/test',{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify(draft),
+                signal:ticket.signal,
+            });
+            const data=await response.json();
+            if(!response.ok)throw new Error(data.error||'连接测试失败');
+            if(!tmdbRequestGate.isCurrent(ticket))return;
+            setTmdbConnectionState('ok',data.message||'连接正常','check-circle');
+        }catch(error){
+            if(tmdbRequestGate.isCurrent(ticket)&&!isAbortError(error))setTmdbConnectionState('error',error.message||'连接失败','alert-circle');
+        }finally{if(tmdbRequestGate.finish(ticket))testTmdbBtn.disabled=false;}
     });
 
     document.querySelectorAll('.preset-chip[data-preset-url]').forEach(btn => {

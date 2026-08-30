@@ -35,6 +35,30 @@ from app.private_files import protect_private_file
 
 logger = get_logger(__name__)
 
+
+def close_guangya_client(client: object | None) -> None:
+    """尽力释放短生命周期光鸭 Client，不让清理异常覆盖业务结果。"""
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.warning("关闭光鸭 HTTP Client 失败 type=%s", type(exc).__name__)
+
+
+def _close_raw_client(raw: object | None) -> None:
+    """释放登录前临时 SDK Client；兼容没有 close 的测试替身。"""
+    close = getattr(raw, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            logger.warning("关闭光鸭 SDK Client 失败 type=%s", type(exc).__name__)
+
+
 TOKEN_FILE = PATHS.token_file
 TOKEN_EXPIRY_MIN = 1_577_836_800  # 2020-01-01T00:00:00Z
 TOKEN_EXPIRY_MAX = 4_102_444_800  # 2100-01-01T00:00:00Z
@@ -1161,16 +1185,22 @@ class GuangYaClient:
         """初始化短信登录，返回可能需要的 captcha 信息。"""
         Raw = _load_raw()
         tmp = Raw()
-        res = tmp.login_sms_init(phone)
-        return res if isinstance(res, dict) else {"raw": str(res)}
+        try:
+            res = tmp.login_sms_init(phone)
+            return res if isinstance(res, dict) else {"raw": str(res)}
+        finally:
+            _close_raw_client(tmp)
 
     def send_sms(self, phone: str, captcha_token: str = "") -> dict:
         """发送短信验证码。需先 login_init 拿到 captcha_token。
         发送验证码是登录前操作，用未登录的新实例（self.raw 要求已登录）。"""
         Raw = _load_raw()
         tmp = Raw()
-        res = tmp.login_sms_send(phone, captcha_token)
-        return res if isinstance(res, dict) else {"raw": str(res)}
+        try:
+            res = tmp.login_sms_send(phone, captcha_token)
+            return res if isinstance(res, dict) else {"raw": str(res)}
+        finally:
+            _close_raw_client(tmp)
 
     def login(self, phone: str, code: str, verification_id: str = "",
               captcha_token: str = "") -> bool:
@@ -1182,33 +1212,44 @@ class GuangYaClient:
         """
         Raw = _load_raw()
         tmp = Raw()
-        username = phone if phone.startswith("+") else f"+86 {phone}"
-        if verification_id:
-            v = tmp.login_sms_verify(
-                verification_id=verification_id, verification_code=code
-            )
-            vtoken = ""
-            if isinstance(v, dict):
-                vtoken = v.get("verification_token") or v.get("token") or ""
-            if not vtoken:
-                raise RuntimeError(f"verify 未返回 verification_token: {v}")
-            tmp.login_sms_signin(
-                verification_code=code,
-                verification_token=vtoken,
-                username=username,
-                captcha_token=captcha_token,
-            )
-        else:
-            tmp.login_sms(username, get_code=lambda: code)
-        with self._token_lock:
-            with _acquire_process_lock(self._token_process_lock):
-                # 登录是一次凭据替换：先同步当前持久世代与指纹，再原子写入并递增。
-                self._token_generation = _token_generation(self.token_file)
-                self._credential_fingerprint = _token_file_fingerprint(self.token_file)
-                self._raw = tmp
-                self._install_refresh_hook()
-                self._write_token_locked()
-                self._advance_credentials_after_rotation()
+        installed = False
+        previous = None
+        try:
+            username = phone if phone.startswith("+") else f"+86 {phone}"
+            if verification_id:
+                v = tmp.login_sms_verify(
+                    verification_id=verification_id, verification_code=code
+                )
+                vtoken = ""
+                if isinstance(v, dict):
+                    vtoken = v.get("verification_token") or v.get("token") or ""
+                if not vtoken:
+                    raise RuntimeError(f"verify 未返回 verification_token: {v}")
+                tmp.login_sms_signin(
+                    verification_code=code,
+                    verification_token=vtoken,
+                    username=username,
+                    captcha_token=captcha_token,
+                )
+            else:
+                tmp.login_sms(username, get_code=lambda: code)
+            with self._token_lock:
+                with _acquire_process_lock(self._token_process_lock):
+                    # 登录是一次凭据替换：先同步当前持久世代与指纹，再原子写入并递增。
+                    self._token_generation = _token_generation(self.token_file)
+                    self._credential_fingerprint = _token_file_fingerprint(self.token_file)
+                    previous = self._raw
+                    self._raw = tmp
+                    installed = True
+                    self._install_refresh_hook()
+                    self._write_token_locked()
+                    self._advance_credentials_after_rotation()
+        finally:
+            if installed:
+                if previous is not None and previous is not tmp:
+                    _close_raw_client(previous)
+            else:
+                _close_raw_client(tmp)
         logger.info("光鸭登录成功 phone=%s****%s", phone[:3], phone[-4:])
         return True
 
@@ -1383,11 +1424,14 @@ class GuangYaClient:
         return list(self.iter_dir(parent_id))
 
     def close(self) -> None:
-        """释放 SDK 底层 httpx 连接池；外部传入客户端由调用方管理。"""
-        raw = self._raw
-        close = getattr(raw, "close", None)
-        if callable(close):
-            close()
+        """幂等释放 SDK 底层 httpx 连接池。"""
+        with self._token_lock:
+            raw = self._raw
+            if raw is None:
+                return
+            _close_raw_client(raw)
+            if self._raw is raw:
+                self._raw = None
 
     def create_dir(self, name: str, parent_id: str = "0") -> str:
         res = self.raw.fs_create_dir(

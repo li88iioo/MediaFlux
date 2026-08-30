@@ -322,13 +322,16 @@ def clear_organize_log_records(request: Request, data: dict | None = Body(defaul
 @router.get("/organize/{log_id}")
 def organize_log_detail(log_id: int, request: Request):
     require_api_login(request)
+    service = OrganizeCorrectionService()
     try:
-        return OrganizeCorrectionService().detail(log_id)
+        return service.detail(log_id)
     except LookupError as exc:
         return api_error(str(exc), 404)
     except Exception as exc:
         logger.error("整理日志详情失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error("整理日志详情读取失败", 500)
+    finally:
+        service.close()
 
 
 @router.post("/organize/{log_id}/recognition/search")
@@ -340,9 +343,10 @@ def organize_recognition_search(log_id: int, request: Request,
     media_type = str(data.get("media_type") or "").strip()
     if media_type and media_type not in {"movie", "tv"}:
         return api_error("media_type 仅支持 movie 或 tv", 400)
+    service = OrganizeCorrectionService()
     try:
         return {
-            "candidates": OrganizeCorrectionService().search_candidates(
+            "candidates": service.search_candidates(
                 log_id, str(data.get("query") or "").strip(),
                 str(data.get("year") or "").strip(), media_type,
             )
@@ -354,6 +358,8 @@ def organize_recognition_search(log_id: int, request: Request,
     except Exception as exc:
         logger.error("整理日志识别搜索失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 502)
+    finally:
+        service.close()
 
 
 @router.post("/organize/{log_id}/tmdb/search")
@@ -364,9 +370,10 @@ def organize_tmdb_search(log_id: int, request: Request,
     media_type = str(data.get("media_type") or "").strip()
     if media_type and media_type not in {"movie", "tv"}:
         return api_error("media_type 仅支持 movie 或 tv", 400)
+    service = OrganizeCorrectionService()
     try:
         return {
-            "candidates": OrganizeCorrectionService().search_tmdb(
+            "candidates": service.search_tmdb(
                 log_id, str(data.get("query") or "").strip(),
                 str(data.get("year") or "").strip(), media_type,
             )
@@ -378,6 +385,8 @@ def organize_tmdb_search(log_id: int, request: Request,
     except Exception as exc:
         logger.error("整理日志 TMDB 搜索失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 502)
+    finally:
+        service.close()
 
 
 def _optional_position(data: dict, key: str, *, minimum: int) -> int | None:
@@ -407,8 +416,9 @@ def preview_reorganize(log_id: int, request: Request,
     media_type = str(data.get("media_type") or "").strip()
     if provider not in {"tmdb", "metatube", "clean_title"} or not external_id or media_type not in {"movie", "tv"}:
         return api_error("请选择有效的媒体候选", 400)
+    service = OrganizeCorrectionService()
     try:
-        return OrganizeCorrectionService().preview_reorganize(
+        return service.preview_reorganize(
             log_id, tmdb_id, media_type,
             str(data.get("title") or "").strip(), str(data.get("year") or "").strip(),
             _optional_position(data, "season", minimum=0),
@@ -422,6 +432,8 @@ def preview_reorganize(log_id: int, request: Request,
     except Exception as exc:
         logger.error("整理纠偏预览失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 502)
+    finally:
+        service.close()
 
 
 def _operation_payload(data: dict) -> tuple[str, int]:
@@ -459,11 +471,24 @@ def _batch_operation_payload(data: dict) -> tuple[str, list[dict]]:
     return action, entries
 
 
+def _closing_operation(service: OrganizeCorrectionService, callback):
+    """把纠偏服务所有权交给后台回调，并在任意终态释放内部客户端。"""
+    def run():
+        try:
+            return callback()
+        finally:
+            service.close()
+
+    return run
+
+
 @router.post("/organize/batch")
 def run_organize_batch(request: Request, data: dict | None = Body(default=None)):
     """对已选择的剧集日志执行批量改名、回退或删除。"""
     require_api_login(request)
     data = data or {}
+    service = None
+    transferred = False
     try:
         action, entries = _batch_operation_payload(data)
         confirm_text = str(data.get("confirm") or "")
@@ -480,10 +505,14 @@ def run_organize_batch(request: Request, data: dict | None = Body(default=None))
         }
         result = get_organize_manager().start_operation(
             labels[action], f"{len(entries)} 条剧集日志",
-            lambda: service.run_batch(action, entries, confirm_text),
+            _closing_operation(
+                service,
+                lambda: service.run_batch(action, entries, confirm_text),
+            ),
         )
         if not result["ok"]:
             return api_error(result["error"], 409)
+        transferred = True
         return {**result, "action": action, "count": len(entries)}
     except LookupError as exc:
         return api_error(str(exc), 404)
@@ -492,6 +521,9 @@ def run_organize_batch(request: Request, data: dict | None = Body(default=None))
     except Exception as exc:
         logger.error("剧集批量操作提交失败 type=%s", type(exc).__name__)
         return api_error(str(exc), 409)
+    finally:
+        if service is not None and not transferred:
+            service.close()
 
 
 @router.post("/organize/{log_id}/reorganize")
@@ -499,6 +531,8 @@ def run_reorganize(log_id: int, request: Request,
                    data: dict | None = Body(default=None)):
     require_api_login(request)
     data = data or {}
+    service = None
+    transferred = False
     try:
         token, version = _operation_payload(data)
         service = OrganizeCorrectionService()
@@ -519,14 +553,19 @@ def run_reorganize(log_id: int, request: Request,
             return api_error("光鸭未登录，无法重新整理", 503)
         result = get_organize_manager().start_operation(
             "重新整理", f"日志 {log_id}",
-            lambda: service.reorganize(
-                log_id, token, version, tmdb_id, media_type,
-                str(data.get("title") or "").strip(), str(data.get("year") or "").strip(),
-                season, episode, provider=provider, external_id=external_id,
+            _closing_operation(
+                service,
+                lambda: service.reorganize(
+                    log_id, token, version, tmdb_id, media_type,
+                    str(data.get("title") or "").strip(),
+                    str(data.get("year") or "").strip(),
+                    season, episode, provider=provider, external_id=external_id,
+                ),
             ),
         )
         if not result["ok"]:
             return api_error(result["error"], 409)
+        transferred = True
         return {**result, "operation_token": token}
     except LookupError as exc:
         return api_error(str(exc), 404)
@@ -535,6 +574,9 @@ def run_reorganize(log_id: int, request: Request,
     except Exception as exc:
         logger.error("重新整理提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)
+    finally:
+        if service is not None and not transferred:
+            service.close()
 
 
 @router.post("/organize/{log_id}/return-to-source")
@@ -542,6 +584,8 @@ def return_to_source(log_id: int, request: Request,
                      data: dict | None = Body(default=None)):
     require_api_login(request)
     data = data or {}
+    service = None
+    transferred = False
     try:
         token, version = _operation_payload(data)
         service = OrganizeCorrectionService()
@@ -552,10 +596,14 @@ def return_to_source(log_id: int, request: Request,
             return api_error("光鸭未登录，无法送回源目录", 503)
         result = get_organize_manager().start_operation(
             "送回源目录", f"日志 {log_id}",
-            lambda: service.return_to_source(log_id, token, version),
+            _closing_operation(
+                service,
+                lambda: service.return_to_source(log_id, token, version),
+            ),
         )
         if not result["ok"]:
             return api_error(result["error"], 409)
+        transferred = True
         return {**result, "operation_token": token}
     except LookupError as exc:
         return api_error(str(exc), 404)
@@ -564,6 +612,9 @@ def return_to_source(log_id: int, request: Request,
     except Exception as exc:
         logger.error("送回源目录提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)
+    finally:
+        if service is not None and not transferred:
+            service.close()
 
 
 @router.post("/organize/{log_id}/revert")
@@ -572,6 +623,8 @@ def revert_organize(log_id: int, request: Request,
     """按持久化操作步骤回退最近一次重整；不再从路径猜测原文件名。"""
     require_api_login(request)
     data = data or {}
+    service = None
+    transferred = False
     try:
         token, version = _operation_payload(data)
         service = OrganizeCorrectionService()
@@ -582,10 +635,14 @@ def revert_organize(log_id: int, request: Request,
             return api_error("光鸭未登录，无法回退", 503)
         result = get_organize_manager().start_operation(
             "回退最近操作", f"日志 {log_id}",
-            lambda: service.revert_latest(log_id, token, version),
+            _closing_operation(
+                service,
+                lambda: service.revert_latest(log_id, token, version),
+            ),
         )
         if not result["ok"]:
             return api_error(result["error"], 409)
+        transferred = True
         return {**result, "operation_token": token}
     except LookupError as exc:
         return api_error(str(exc), 404)
@@ -594,6 +651,9 @@ def revert_organize(log_id: int, request: Request,
     except Exception as exc:
         logger.error("回退整理提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)
+    finally:
+        if service is not None and not transferred:
+            service.close()
 
 
 @router.delete("/organize/{log_id}")
@@ -601,6 +661,8 @@ def delete_organize_group(log_id: int, request: Request,
                           data: dict | None = Body(default=None)):
     require_api_login(request)
     data = data or {}
+    service = None
+    transferred = False
     try:
         token, version = _operation_payload(data)
         service = OrganizeCorrectionService()
@@ -613,12 +675,16 @@ def delete_organize_group(log_id: int, request: Request,
             return api_error("光鸭未登录，无法删除", 503)
         result = get_organize_manager().start_operation(
             "删除媒体组", f"日志 {log_id}",
-            lambda: service.delete_group(
-                log_id, token, version, str(data.get("confirm") or "")
+            _closing_operation(
+                service,
+                lambda: service.delete_group(
+                    log_id, token, version, str(data.get("confirm") or "")
+                ),
             ),
         )
         if not result["ok"]:
             return api_error(result["error"], 409)
+        transferred = True
         return {**result, "operation_token": token}
     except LookupError as exc:
         return api_error(str(exc), 404)
@@ -627,3 +693,6 @@ def delete_organize_group(log_id: int, request: Request,
     except Exception as exc:
         logger.error("删除媒体组提交失败 log=%s type=%s", log_id, type(exc).__name__)
         return api_error(str(exc), 409)
+    finally:
+        if service is not None and not transferred:
+            service.close()

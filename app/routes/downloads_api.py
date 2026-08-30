@@ -8,7 +8,11 @@ from fastapi import APIRouter, Body, Query, Request
 
 from app import config
 from app import database as db
-from app.clients.qbittorrent import QBConnectionTestError, QBittorrentClient
+from app.clients.qbittorrent import (
+    QBConnectionTestError,
+    QBittorrentClient,
+    close_qbittorrent_client,
+)
 from app.logger import get_logger, log_throttled, redact_sensitive_text
 from app.modules.download_dispatcher import (
     SUPPORTED_TARGETS,
@@ -265,6 +269,8 @@ def test_qb_connection(request: Request, data: object = Body(default=None)):
         versions = client.test_connection()
     except QBConnectionTestError as exc:
         return api_error(_QB_TEST_ERRORS.get(exc.code, _QB_TEST_ERRORS["connection"]), 502)
+    finally:
+        close_qbittorrent_client(client)
     latency_ms = max(1, round((time.perf_counter() - started) * 1000))
     return api_response({
         "success": True,
@@ -288,6 +294,7 @@ def overview(request: Request):
             "error": "未连接到 qBittorrent",
         },
     }
+    client = None
     try:
         client = _qb()
         if client is not None:
@@ -310,6 +317,8 @@ def overview(request: Request):
             "error_code": "connection_failed",
             "error": "连接失败，请检查地址、认证信息和网络",
         })
+    finally:
+        close_qbittorrent_client(client)
     return api_response(result)
 
 
@@ -595,6 +604,7 @@ def qb_action(action: str, request: Request, data: dict | None = Body(default=No
     except ValueError as exc:
         return api_error(str(exc), 400)
     joined_hashes = "|".join(hashes)
+    client = None
     try:
         client = _qb()
         if client is None:
@@ -614,3 +624,5 @@ def qb_action(action: str, request: Request, data: dict | None = Body(default=No
     except Exception as exc:
         logger.error("qB 任务操作失败 action=%s type=%s", action, type(exc).__name__)
         return api_error("连接失败，请检查地址、认证信息和网络", 502)
+    finally:
+        close_qbittorrent_client(client)

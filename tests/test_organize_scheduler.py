@@ -353,7 +353,7 @@ class OrganizeSchedulerTests(unittest.TestCase):
         organize.start.assert_called_once_with()
         organize.stop.assert_called_once_with()
         local_media.start.assert_called_once_with()
-        local_media.stop.assert_called_once_with()
+        local_media.shutdown.assert_called_once_with()
         media_refresh.start.assert_called_once_with()
         media_refresh.stop.assert_called_once_with()
         verification.start.assert_called_once_with()

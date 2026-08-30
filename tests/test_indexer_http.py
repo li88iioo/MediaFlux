@@ -292,6 +292,38 @@ class IndexerHttpTests(unittest.IsolatedAsyncioTestCase):
             "https://www.example.com/search/two",
         ])
 
+    async def test_browser_client_close_failure_retains_session_for_retry(self):
+        class FailOnceSession(FakeCurlSession):
+            def __init__(self):
+                super().__init__([FakeCurlResponse(url="https://www.example.com/")])
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("simulated close failure")
+                super().close()
+
+        session = FailOnceSession()
+        client = BrowserImpersonatingHttpClient(
+            allowed_hosts={"www.example.com"},
+            resolver=PUBLIC_DNS,
+            session_factory=lambda: session,
+        )
+        self.client = client
+        await client.get("https://www.example.com/")
+
+        with self.assertRaisesRegex(RuntimeError, "simulated close failure"):
+            await client.aclose()
+        self.assertIs(client._session, session)
+        self.assertEqual(session.close_calls, 1)
+
+        await client.aclose()
+        self.assertIsNone(client._session)
+        self.assertTrue(session.closed)
+        self.assertEqual(session.close_calls, 2)
+        self.client = None
+
     async def test_browser_client_injects_configured_cookies_into_private_session(self):
         session = FakeCurlSession([FakeCurlResponse(url="https://www.example.com/")])
         client = BrowserImpersonatingHttpClient(

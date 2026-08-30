@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from app import config, database as db
+from app.clients.guangya import close_guangya_client
 from app.logger import get_logger
 from app.modules.organize import OrganizeRules, Organizer
 from app.modules.organize_results import build_organize_result, read_organize_result
@@ -264,20 +265,58 @@ class OrganizeTaskManager:
         download_request_ids: list[int] | None = None,
         client: Any | None = None,
         expected_credential_generation: int | None = None,
+        take_client_ownership: bool = False,
     ) -> dict:
         if not sources:
             return {"ok": False, "error": "至少选择一个源目录"}
+        try:
+            request_ids = list(dict.fromkeys(
+                int(item) for item in (download_request_ids or [])
+            ))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "下载请求标识无效"}
+        task_id = uuid.uuid4().hex
+        owns_client = client is None or bool(take_client_ownership)
+
         self._admission_lock.acquire()
         with self._state_lock:
             if self._shutting_down:
                 self._admission_lock.release()
                 return {"ok": False, "error": "服务正在停止，暂不接受新的整理任务"}
-            if self._operation_queue or count_pending_organize_operation_jobs() > 0:
+            try:
+                pending_operation = count_pending_organize_operation_jobs() > 0
+            except Exception as exc:
+                self._admission_lock.release()
+                logger.warning(
+                    "检查光鸭持久化操作队列失败 type=%s",
+                    type(exc).__name__,
+                )
+                return {
+                    "ok": False,
+                    "error": "无法检查网盘整理任务状态",
+                    "retryable": True,
+                }
+            if self._operation_queue or pending_operation:
                 self._admission_lock.release()
                 return {"ok": False, "error": "网盘整理任务正在运行"}
-        if not self._lock.acquire(blocking=False):
+        try:
+            acquired = self._lock.acquire(blocking=False)
+        except Exception as exc:
+            self._admission_lock.release()
+            logger.warning(
+                "获取光鸭整理互斥锁失败 type=%s",
+                type(exc).__name__,
+            )
+            return {
+                "ok": False,
+                "error": "无法检查网盘整理任务状态",
+                "retryable": True,
+            }
+        if not acquired:
             self._admission_lock.release()
             return {"ok": False, "error": "网盘整理任务正在运行"}
+        validator = None
+        validation_succeeded = False
         try:
             validator = Organizer(client=client) if client is not None else Organizer()
             if client is None:
@@ -295,6 +334,7 @@ class OrganizeTaskManager:
                 validator._validate_target_outside_source(
                     source["id"], rules.target_dir_id
                 )
+            validation_succeeded = True
         except DirectoryScrapePublicError as exc:
             self._lock.release()
             self._admission_lock.release()
@@ -304,72 +344,85 @@ class OrganizeTaskManager:
             self._admission_lock.release()
             logger.error("整理目录边界校验失败", exc_info=True)
             return {"ok": False, "error": "无法校验光鸭整理目录"}
-        task_id = uuid.uuid4().hex
-        request_ids = list(dict.fromkeys(int(item) for item in (download_request_ids or [])))
-        resolved_chat_id = str(chat_id or "").strip()
-        if not resolved_chat_id and request_ids:
+        finally:
+            if validator is not None:
+                if validation_succeeded and owns_client:
+                    # 校验器把内部创建的光鸭 Client 移交给后台任务；
+                    # 自身的 TMDB/MetaTube 资源仍在当前调用中释放。
+                    try:
+                        validator._owns_client = False
+                    except Exception:
+                        pass
+                close = getattr(validator, "close", None)
+                if callable(close):
+                    close()
+        run_id = 0
+        task_initialized = False
+        try:
+            resolved_chat_id = str(chat_id or "").strip()
+            if not resolved_chat_id and request_ids:
+                try:
+                    request_row = db.get_download_request(request_ids[0])
+                except Exception as exc:
+                    # 通知上下文是可选信息；数据库短暂不可读不应在已取得跨进程
+                    # 锁后中断任务并泄漏锁。后续状态写入仍按各自错误边界处理。
+                    logger.warning(
+                        "读取整理任务通知上下文失败 request=%s type=%s",
+                        request_ids[0],
+                        type(exc).__name__,
+                    )
+                    request_row = None
+                if request_row is not None:
+                    resolved_chat_id = str(request_row["chat_id"] or "").strip()
+            chat_id = resolved_chat_id
+            initial_result = build_organize_result(
+                {},
+                status="running",
+                source_results=sources,
+                task_id=task_id,
+            )
+            initial_result["source_count"] = len(sources)
+            run_payload = json.dumps(initial_result, ensure_ascii=False, default=str)
             try:
-                request_row = db.get_download_request(request_ids[0])
+                run_id = db.add_task_run(
+                    "guangya_organize", trigger_type, result=run_payload
+                )
             except Exception as exc:
-                # 通知上下文是可选信息；数据库短暂不可读不应在已取得跨进程
-                # 锁后中断任务并泄漏锁。后续状态写入仍按各自错误边界处理。
+                run_id = 0
                 logger.warning(
-                    "读取整理任务通知上下文失败 request=%s type=%s",
-                    request_ids[0],
+                    "创建整理任务运行记录失败 task_id=%s type=%s",
+                    task_id,
                     type(exc).__name__,
                 )
-                request_row = None
-            if request_row is not None:
-                resolved_chat_id = str(request_row["chat_id"] or "").strip()
-        chat_id = resolved_chat_id
-        initial_result = build_organize_result(
-            {},
-            status="running",
-            source_results=sources,
-            task_id=task_id,
-        )
-        initial_result["source_count"] = len(sources)
-        run_payload = json.dumps(initial_result, ensure_ascii=False, default=str)
-        try:
-            run_id = db.add_task_run(
-                "guangya_organize", trigger_type, result=run_payload
-            )
-        except Exception as exc:
-            run_id = 0
-            logger.warning(
-                "创建整理任务运行记录失败 task_id=%s type=%s",
-                task_id,
-                type(exc).__name__,
-            )
-        self._cancel_event.clear()
-        with self._state_lock:
-            self._task = {
-                "id": task_id,
-                "run_id": run_id,
-                "status": "running",
-                "message": "整理任务已启动",
-                "stoppable": True,
-                "sources": sources,
-                "rules": rules,
-                "chat_id": str(chat_id or "").strip(),
-                "current_source": "",
-                "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "finished_at": "",
-                "stats": {},
-                "error": "",
-                "trigger_type": trigger_type,
-                "notification_sent": False,
-            }
-        for request_id in request_ids:
-            db.update_download_request(
-                request_id, organize_started=1, organize_task_id=task_id,
-                organize_run_id=run_id or None, organize_status="running",
-                organize_attempts=0, organize_next_retry_at=None,
-                organize_error="", organize_finished_at=None,
-                strm_status="pending", strm_error="", strm_finished_at=None,
-            )
-        _publish_download_lifecycles(request_ids)
-        try:
+            self._cancel_event.clear()
+            with self._state_lock:
+                self._task = {
+                    "id": task_id,
+                    "run_id": run_id,
+                    "status": "running",
+                    "message": "整理任务已启动",
+                    "stoppable": True,
+                    "sources": sources,
+                    "rules": rules,
+                    "chat_id": str(chat_id or "").strip(),
+                    "current_source": "",
+                    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "finished_at": "",
+                    "stats": {},
+                    "error": "",
+                    "trigger_type": trigger_type,
+                    "notification_sent": False,
+                }
+            task_initialized = True
+            for request_id in request_ids:
+                db.update_download_request(
+                    request_id, organize_started=1, organize_task_id=task_id,
+                    organize_run_id=run_id or None, organize_status="running",
+                    organize_attempts=0, organize_next_retry_at=None,
+                    organize_error="", organize_finished_at=None,
+                    strm_status="pending", strm_error="", strm_finished_at=None,
+                )
+            _publish_download_lifecycles(request_ids)
             worker = threading.Thread(
                 target=self._run,
                 args=(
@@ -382,6 +435,7 @@ class OrganizeTaskManager:
                     str(trigger_type or "manual").strip().lower(),
                     client,
                     expected_credential_generation,
+                    owns_client,
                 ),
                 name=f"organize-{task_id[:8]}",
                 daemon=False,
@@ -390,28 +444,31 @@ class OrganizeTaskManager:
                 self._worker = worker
             worker.start()
         except Exception:
-            logger.exception("启动光鸭整理线程失败 task_id=%s", task_id)
+            logger.exception("启动光鸭整理任务失败 task_id=%s", task_id)
+            if owns_client:
+                close_guangya_client(client)
             finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with self._state_lock:
                 self._worker = None
-                self._task.update({
-                    "status": "failed",
-                    "message": "整理任务启动失败",
-                    "error": "整理任务启动失败",
-                    "stoppable": False,
-                    "finished_at": finished_at,
-                })
+                if task_initialized:
+                    self._task.update({
+                        "status": "failed",
+                        "message": "整理任务启动失败",
+                        "error": "整理任务启动失败",
+                        "stoppable": False,
+                        "finished_at": finished_at,
+                    })
             try:
                 for request_id in request_ids:
                     try:
                         db.update_download_request(
                             request_id, organize_started=0, organize_status="queued",
                             organize_attempts=1, organize_next_retry_at=None,
-                            organize_error="整理任务线程启动失败，可稍后重试",
+                            organize_error="整理任务启动失败，可稍后重试",
                             strm_status="pending", strm_error="",
                         )
                     except Exception:
-                        logger.exception("记录整理线程启动失败请求状态异常 request=%s", request_id)
+                        logger.exception("记录整理任务启动失败请求状态异常 request=%s", request_id)
                 _publish_download_lifecycles(request_ids)
                 if run_id:
                     try:
@@ -431,8 +488,10 @@ class OrganizeTaskManager:
                     except Exception:
                         logger.exception("记录整理任务启动失败状态异常 task_id=%s", task_id)
             finally:
-                self._lock.release()
-                self._admission_lock.release()
+                try:
+                    self._lock.release()
+                finally:
+                    self._admission_lock.release()
             return {"ok": False, "error": "整理任务启动失败", "retryable": True, "error_code": "thread_start_failed"}
         self._admission_lock.release()
         return {
@@ -642,6 +701,7 @@ class OrganizeTaskManager:
                     return {"ok": False, "error": "网盘整理任务正在运行"}
             if not self._lock.acquire(blocking=False):
                 return {"ok": False, "error": "网盘整理任务正在运行"}
+            organizer = None
             try:
                 total = 0
                 details = []
@@ -701,6 +761,9 @@ class OrganizeTaskManager:
                     "sources": details,
                 }
             finally:
+                close = getattr(organizer, "close", None)
+                if callable(close):
+                    close()
                 self._lock.release()
 
     def start_operation(
@@ -1462,10 +1525,12 @@ class OrganizeTaskManager:
         trigger_type: str = "manual",
         client: Any | None = None,
         expected_credential_generation: int | None = None,
+        owns_client: bool = False,
     ) -> None:
         aggregate: dict[str, object] = {}
         source_results = []
         current_source = ""
+        organizer = None
         try:
             if not _credential_snapshot_is_current(client, expected_credential_generation):
                 raise RuntimeError("光鸭登录凭据已变化，已拒绝执行整理")
@@ -1787,6 +1852,11 @@ class OrganizeTaskManager:
                         "result": structured_result,
                     })
         finally:
+            close = getattr(organizer, "close", None)
+            if callable(close):
+                close()
+            if owns_client:
+                close_guangya_client(client)
             with self._state_lock:
                 if (
                     str(self._task.get("id") or "") == task_id

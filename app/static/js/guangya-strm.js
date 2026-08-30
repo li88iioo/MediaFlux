@@ -38,6 +38,12 @@
     const failureNextBtn=document.getElementById('strmFailureNext');
     let failurePage=1;const FAILURE_PAGE_SIZE=120;let failureTotalPages=1;let failureTotalCount=0;
     let sources=[];let pollTimer=null;let diagnosticSnapshot=null;let diagnosticLoading=false;let diagnosticCleanupBusy=false;let failureSnapshot=[];let failureSummary={};let failureLoading=false;let failureRetrying=false;let selectedFailures=new Set();let failureRequestGeneration=0;let failureAbortController=null;
+    const STRM_STATUS_POLL_MS=2500;
+    const STRM_STATUS_RETRY_MS=5000;
+    let statusShouldPoll=false;
+    let statusRequestSerial=0;
+    let statusAbortController=null;
+    let lastStatusProgressText='';
     const strmTabs=[...document.querySelectorAll('.strm-tab-btn')];
     const strmPanels=[...document.querySelectorAll('.strm-tab-panel')];
     const validStrmTabs=new Set(strmTabs.map(button=>button.dataset.tab));
@@ -69,7 +75,12 @@
             window.history.replaceState(window.history.state,'',`${url.pathname}${url.search}${url.hash}`);
         }
         if(document.documentElement?.dataset)delete document.documentElement.dataset.strmInitialTab;
-        if(strmConfigReady)void ensureStrmTabLoaded(normalized);
+        if(normalized!=='schedule')stopStatusPolling({abort:true});
+        if(strmConfigReady){
+            const alreadyLoaded=strmLoadedTabs.has(normalized);
+            void ensureStrmTabLoaded(normalized);
+            if(normalized==='schedule'&&alreadyLoaded)void loadStatus();
+        }
     }
 
     function ensureStrmTabLoaded(tab){
@@ -374,7 +385,9 @@
         const completed=Math.max(0,Number(progress.completed||0));
         const total=Math.max(0,Number(progress.total||0));
         const percent=Math.max(0,Math.min(100,Number(progress.percent||0)));
-        document.getElementById('strmProgressStage').textContent=metadataActive?'STRM 已完成 · 元数据后台处理中':metadataPaused?'伴随元数据同步已关闭 · 队列暂停':String(progress.detail||progress.stage||(s.running?'正在同步':'等待任务'));
+        const progressStage=document.getElementById('strmProgressStage');
+        progressStage.textContent=metadataActive?'STRM 已完成 · 元数据后台处理中':metadataPaused?'伴随元数据同步已关闭 · 队列暂停':String(progress.detail||progress.stage||(s.running?'正在同步':'等待任务'));
+        lastStatusProgressText=progressStage.textContent;
         document.getElementById('strmProgressCount').textContent=metadataActive||metadataPaused?`队列 ${metadataPending} 项${Number(metadataQueue.retry_wait||0)>0?` · ${Number(metadataQueue.retry_wait)} 项等待重试`:''}`:`${completed} / ${total} · ${percent}%`;
         document.getElementById('strmProgressBar').style.transform=`scaleX(${metadataActive||metadataPaused?1:percent/100})`;
         const dot=document.getElementById('strmStatusDot');
@@ -385,11 +398,68 @@
         runStrmFullBtn.innerHTML=s.running?'<i data-lucide="loader-2" class="spin"></i>校准中...':'<i data-lucide="scan-search"></i>完整校准';
         syncBaseUrlRefreshFromStatus(s);
         window.renderLucideIcons?.(runStrmFullBtn.parentElement);
-        const shouldPoll=!!s.running||(metadataPending>0&&metadataQueue.enabled!==false);
-        if(shouldPoll&&!pollTimer)pollTimer=setInterval(loadStatus,2500);
-        if(!shouldPoll&&pollTimer){clearInterval(pollTimer);pollTimer=null;}
+        statusShouldPoll=!!s.running||(metadataPending>0&&metadataQueue.enabled!==false);
+        if(!statusShouldPoll)clearStatusPoll();
     }
-    async function loadStatus(){try{const response=await fetch('/api/strm/schedule');const data=await response.json();if(!response.ok)throw new Error(data.error||'状态读取失败');renderStatus(data);}catch(error){setTag('状态读取失败','var(--warning)');document.getElementById('strmNextRun').textContent=error.message||'状态读取失败';}}
+    function clearStatusPoll(){
+        if(pollTimer!==null)window.clearTimeout(pollTimer);
+        pollTimer=null;
+    }
+    function stopStatusPolling({abort=false}={}){
+        clearStatusPoll();
+        if(abort&&statusAbortController){
+            statusAbortController.abort();
+            statusAbortController=null;
+        }
+    }
+    function canPollStatus(){return activeStrmTab==='schedule'&&!document.hidden&&statusShouldPoll;}
+    function scheduleStatusPoll(delay=STRM_STATUS_POLL_MS){
+        clearStatusPoll();
+        if(!canPollStatus())return;
+        pollTimer=window.setTimeout(pollStatus,delay);
+    }
+    function renderStatusSyncError(){
+        const progressStage=document.getElementById('strmProgressStage');
+        if(!progressStage)return;
+        const stable=lastStatusProgressText||progressStage.textContent||'尚未取得同步状态';
+        if(!lastStatusProgressText)lastStatusProgressText=stable;
+        progressStage.textContent=`${stable} · 状态同步失败，重试中`;
+    }
+    async function loadStatus({background=false}={}){
+        const serial=++statusRequestSerial;
+        statusAbortController?.abort();
+        const controller=new AbortController();
+        statusAbortController=controller;
+        try{
+            const response=await fetch('/api/strm/schedule',{signal:controller.signal});
+            if(!response.ok)throw new Error(`状态接口返回 ${response.status||'非 2xx'}`);
+            const data=await response.json();
+            if(!data||typeof data!=='object'||Array.isArray(data))throw new Error('状态接口响应无效');
+            if(serial!==statusRequestSerial)return {ok:true,stale:true};
+            renderStatus(data);
+            scheduleStatusPoll();
+            return {ok:true,data};
+        }catch(error){
+            if(error?.name==='AbortError'||serial!==statusRequestSerial)return {ok:false,stale:true,error};
+            if(background&&lastStatusProgressText)renderStatusSyncError();
+            else{
+                setTag('状态读取失败','var(--warning)');
+                document.getElementById('strmNextRun').textContent=error.message||'状态读取失败';
+            }
+            return {ok:false,error};
+        }finally{
+            if(serial===statusRequestSerial)statusAbortController=null;
+        }
+    }
+    async function pollStatus(){
+        pollTimer=null;
+        const result=await loadStatus({background:true});
+        if(!result.ok&&!result.stale)scheduleStatusPoll(STRM_STATUS_RETRY_MS);
+    }
+    document.addEventListener?.('visibilitychange',()=>{
+        if(document.hidden)stopStatusPolling({abort:true});
+        else if(activeStrmTab==='schedule'&&strmConfigReady)void loadStatus({background:true});
+    });
     function getDiagnosticValue(data, key){
         if(!data||!key)return 0;
         if(key in data)return data[key];
@@ -801,7 +871,7 @@
     document.querySelectorAll('[data-video-ext-preset]').forEach(btn=>btn.addEventListener('click',()=>videoTagInput.setTagsFromString(btn.dataset.videoExtPreset)));
 
     let debounce;cron.addEventListener('input',()=>{clearTimeout(debounce);debounce=setTimeout(validateCron,350);});
-    document.getElementById('refreshStrmStatusBtn').addEventListener('click',loadStatus);
+    document.getElementById('refreshStrmStatusBtn').addEventListener('click',()=>loadStatus());
     diagnosticRefreshBtn.addEventListener('click',loadIndexDiagnostics);
     diagnosticCleanupBtn.addEventListener('click',cleanupConfirmedTestIndexes);
     document.getElementById('refreshStrmFailuresBtn').addEventListener('click',()=>loadFailures(failurePage));

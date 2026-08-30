@@ -9,8 +9,13 @@ import time
 from datetime import datetime, timedelta
 
 from app import database as db
-from app.clients.guangya import GuangYaClient
-from app.clients.qbittorrent import QBittorrentClient, TorrentTask, is_qb_torrent_complete
+from app.clients.guangya import GuangYaClient, close_guangya_client
+from app.clients.qbittorrent import (
+    QBittorrentClient,
+    TorrentTask,
+    close_qbittorrent_client,
+    is_qb_torrent_complete,
+)
 from app.config import get
 from app.defaults import (
     DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS,
@@ -560,6 +565,7 @@ class DownloadTracker:
         if not staging_id:
             self._fail_settle(row, "下载隔离目录缺失，无法确认文件是否落稳")
             return False
+        client = None
         try:
             client = GuangYaClient()
             if not client.logged_in:
@@ -578,6 +584,8 @@ class DownloadTracker:
         except Exception as exc:
             self._schedule_settle(row, observed=0, snapshot="", error=f"读取隔离目录失败: {type(exc).__name__}")
             return False
+        finally:
+            close_guangya_client(client)
 
         expected = max(0, int(self._row_value(row, "gy_expected_file_count", 0) or 0))
         previous = str(self._row_value(row, "gy_settle_snapshot", "") or "")
@@ -692,11 +700,37 @@ class DownloadTracker:
         parent_id = str(self._row_value(row, "gy_staging_parent_dir", "") or "0")
         expected_name = str(self._row_value(row, "gy_staging_name", "") or "")
         if not staging_id or not expected_name:
-            self._retain_staging_without_organize(row, "暂存目录身份信息不完整，未自动移动")
+            self._retain_staging_without_organize(
+                row,
+                "暂存目录身份信息不完整，未自动移动",
+            )
             return True
 
+        client = GuangYaClient()
         try:
-            client = GuangYaClient()
+            return self._finalize_staging_without_organize_with_client(
+                row,
+                client,
+                request_id=request_id,
+                staging_id=staging_id,
+                parent_id=parent_id,
+                expected_name=expected_name,
+            )
+        finally:
+            close_guangya_client(client)
+
+    def _finalize_staging_without_organize_with_client(
+        self,
+        row,
+        client: GuangYaClient,
+        *,
+        request_id: int,
+        staging_id: str,
+        parent_id: str,
+        expected_name: str,
+    ) -> bool:
+        """使用调用期客户端完成暂存目录收口。"""
+        try:
             if not client.logged_in:
                 raise RuntimeError("光鸭未登录")
             info = client.file_info(staging_id)
@@ -1033,22 +1067,27 @@ class DownloadTracker:
 
     @staticmethod
     def _qb_tasks() -> tuple[bool, list]:
+        client = None
         try:
             if not get("QB_URL", "").strip():
                 return False, []
-            return True, QBittorrentClient(
+            client = QBittorrentClient(
                 url=get("QB_URL"), username=get("QB_USERNAME"),
                 password=get("QB_PASSWORD"), api_key=get("QB_API_KEY"),
-            ).list_torrents()
+            )
+            return True, client.list_torrents()
         except Exception as exc:
             log_throttled(
                 logger, logging.WARNING, f"download-tracker-qb:{type(exc).__name__}",
                 "下载跟踪读取 qB 失败 type=%s", type(exc).__name__,
             )
             return False, []
+        finally:
+            close_qbittorrent_client(client)
 
     @staticmethod
     def _gy_tasks() -> tuple[bool, list[dict]]:
+        client = None
         try:
             client = GuangYaClient()
             if not client.logged_in:
@@ -1060,6 +1099,8 @@ class DownloadTracker:
                 "下载跟踪读取光鸭失败 type=%s", type(exc).__name__,
             )
             return False, []
+        finally:
+            close_guangya_client(client)
 
     @staticmethod
     def _row_value(row, key: str, default=None):

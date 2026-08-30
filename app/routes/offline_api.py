@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
 
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.modules.offline import (
     OfflinePreviewStore,
     OfflineRules,
@@ -32,12 +32,16 @@ def preview(request: Request, data: dict | None = Body(default=None)):
     data = data or {}
     rules_data = data.get("rules") if isinstance(data.get("rules"), dict) else None
     rules = OfflineRules.from_mapping(rules_data) if rules_data is not None else OfflineRules.from_config()
-    result = preview_offline_selection(
-        str(data.get("url", "")),
-        title=str(data.get("title", "")),
-        rules=rules,
-        client=GuangYaClient(),
-    )
+    client = GuangYaClient()
+    try:
+        result = preview_offline_selection(
+            str(data.get("url", "")),
+            title=str(data.get("title", "")),
+            rules=rules,
+            client=client,
+        )
+    finally:
+        close_guangya_client(client)
     if result.get("allowed") and not result.get("ok"):
         return JSONResponse(result, status_code=400)
     if result.get("ok"):
@@ -78,15 +82,19 @@ def submit(request: Request, data: dict | None = Body(default=None)):
         indexes = validate_preview_indexes(snapshot, indexes)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    result = submit_offline_selection(
-        snapshot.url,
-        selected_indexes=indexes,
-        title=snapshot.title,
-        rules=snapshot.rules,
-        client=GuangYaClient(),
-        expected_target_dir_id=snapshot.target_dir_id,
-        expected_target_dir_name=snapshot.target_dir_name,
-    )
+    client = GuangYaClient()
+    try:
+        result = submit_offline_selection(
+            snapshot.url,
+            selected_indexes=indexes,
+            title=snapshot.title,
+            rules=snapshot.rules,
+            client=client,
+            expected_target_dir_id=snapshot.target_dir_id,
+            expected_target_dir_name=snapshot.target_dir_name,
+        )
+    finally:
+        close_guangya_client(client)
     if result.get("decision"):
         decision = result["decision"]
         if (

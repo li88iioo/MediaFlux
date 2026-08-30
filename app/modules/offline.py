@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import urlparse
 
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.naming import sanitize_name
@@ -376,190 +376,194 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
         )
     if not decision.allowed:
         return {"ok": False, "decision": decision.as_dict(), "error": decision.reason}
+    owned_client = client is None
     client = client or GuangYaClient()
-    if not client.logged_in:
-        return {"ok": False, "decision": decision.as_dict(), "error": "光鸭未登录"}
-
     try:
-        resolution = _resolve_offline_manifest(
-            client,
-            url,
-            decision.protocol,
-            torrent_data=torrent_data,
-        )
-        files = resolution.files
-        choices = build_offline_file_choices(files, rules)
-    except Exception as exc:
-        return {
-            "ok": False, "decision": decision.as_dict(),
-            "error": f"光鸭资源解析失败，未创建整单任务: {exc}",
-        }
+        if not client.logged_in:
+            return {"ok": False, "decision": decision.as_dict(), "error": "光鸭未登录"}
 
-    manifest_unverifiable = not choices or _resolver_excluded_only(files)
-    if decision.protocol == "magnet" and manifest_unverifiable:
-        unresolved_error = (
-            f"种子文件未解析到可验证文件列表（尝试 {resolution.attempts} 次），"
-            if torrent_data else
-            f"磁力资源连续 {resolution.attempts} 次未解析到可验证文件列表，"
-        )
-        return {
-            "ok": False, "decision": decision.as_dict(),
-            "resolve_attempts": resolution.attempts,
-            "resolve_diagnostic": resolution.diagnostic,
-            "error": (
-                f"{unresolved_error}已阻止整单下载；请稍后重试或更换资源。"
-            ),
-        }
-
-    selected = [int(item["index"]) for item in choices if item.get("selected")]
-    if choices and not selected:
-        detail = "；".join(
-            f"{item.get('name') or item.get('index')}: {item.get('exclude_reason') or '不符合规则'}"
-            for item in choices[:5]
-        )
-        return {
-            "ok": False, "decision": decision.as_dict(),
-            "resolve_attempts": resolution.attempts,
-            "selected_count": 0, "excluded_count": len(choices),
-            "error": "资源中没有符合仅视频规则的文件" + (f"（{detail}）" if detail else ""),
-        }
-
-    staging_id = ""
-    staging_name = ""
-    effective = decision
-    if isolate_task:
-        staging_name = _offline_staging_name(title, task_key)
         try:
-            staging_id = str(client.create_dir(staging_name, decision.target_dir_id) or "")
+            resolution = _resolve_offline_manifest(
+                client,
+                url,
+                decision.protocol,
+                torrent_data=torrent_data,
+            )
+            files = resolution.files
+            choices = build_offline_file_choices(files, rules)
         except Exception as exc:
             return {
                 "ok": False, "decision": decision.as_dict(),
-                "error": f"创建任务隔离目录失败: {exc}",
+                "error": f"光鸭资源解析失败，未创建整单任务: {exc}",
             }
-        if not staging_id:
+
+        manifest_unverifiable = not choices or _resolver_excluded_only(files)
+        if decision.protocol == "magnet" and manifest_unverifiable:
+            unresolved_error = (
+                f"种子文件未解析到可验证文件列表（尝试 {resolution.attempts} 次），"
+                if torrent_data else
+                f"磁力资源连续 {resolution.attempts} 次未解析到可验证文件列表，"
+            )
             return {
                 "ok": False, "decision": decision.as_dict(),
-                "error": "创建任务隔离目录失败",
+                "resolve_attempts": resolution.attempts,
+                "resolve_diagnostic": resolution.diagnostic,
+                "error": (
+                    f"{unresolved_error}已阻止整单下载；请稍后重试或更换资源。"
+                ),
             }
-        effective = OfflineDecision(
-            True, decision.protocol, staging_id,
-            f"{decision.target_dir_name} / {staging_name}",
-            "使用任务隔离目录", decision.matched_keyword,
-        )
 
-    try:
-        if choices:
-            created = client.add_offline_selection(url, effective.target_dir_id, selected)
-            ok = bool(created.get("ok"))
-            task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
-            completed_batches = int(created.get("completed_batches") or 0)
-            partial_success = bool(created.get("partial_success") or task_ids or completed_batches)
-            outcome_unknown = bool(created.get("outcome_unknown"))
-            tracking_incomplete = bool(created.get("tracking_incomplete"))
-            staging_cleanup_status = "pending" if staging_id else ""
-            staging_cleanup_error = ""
-            # 云端离线任务为异步写入；只要已有任一批次被接受，就不能依据
-            # “目录当前为空”删除 staging。结果未知/跟踪信息不完整同样意味着
-            # 服务端可能已受理请求，必须保留目录供 tracker 与人工核验。
-            if not ok and not partial_success and not outcome_unknown and not tracking_incomplete:
+        selected = [int(item["index"]) for item in choices if item.get("selected")]
+        if choices and not selected:
+            detail = "；".join(
+                f"{item.get('name') or item.get('index')}: {item.get('exclude_reason') or '不符合规则'}"
+                for item in choices[:5]
+            )
+            return {
+                "ok": False, "decision": decision.as_dict(),
+                "resolve_attempts": resolution.attempts,
+                "selected_count": 0, "excluded_count": len(choices),
+                "error": "资源中没有符合仅视频规则的文件" + (f"（{detail}）" if detail else ""),
+            }
+
+        staging_id = ""
+        staging_name = ""
+        effective = decision
+        if isolate_task:
+            staging_name = _offline_staging_name(title, task_key)
+            try:
+                staging_id = str(client.create_dir(staging_name, decision.target_dir_id) or "")
+            except Exception as exc:
+                return {
+                    "ok": False, "decision": decision.as_dict(),
+                    "error": f"创建任务隔离目录失败: {exc}",
+                }
+            if not staging_id:
+                return {
+                    "ok": False, "decision": decision.as_dict(),
+                    "error": "创建任务隔离目录失败",
+                }
+            effective = OfflineDecision(
+                True, decision.protocol, staging_id,
+                f"{decision.target_dir_name} / {staging_name}",
+                "使用任务隔离目录", decision.matched_keyword,
+            )
+
+        try:
+            if choices:
+                created = client.add_offline_selection(url, effective.target_dir_id, selected)
+                ok = bool(created.get("ok"))
+                task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
+                completed_batches = int(created.get("completed_batches") or 0)
+                partial_success = bool(created.get("partial_success") or task_ids or completed_batches)
+                outcome_unknown = bool(created.get("outcome_unknown"))
+                tracking_incomplete = bool(created.get("tracking_incomplete"))
+                staging_cleanup_status = "pending" if staging_id else ""
+                staging_cleanup_error = ""
+                # 云端离线任务为异步写入；只要已有任一批次被接受，就不能依据
+                # “目录当前为空”删除 staging。结果未知/跟踪信息不完整同样意味着
+                # 服务端可能已受理请求，必须保留目录供 tracker 与人工核验。
+                if not ok and not partial_success and not outcome_unknown and not tracking_incomplete:
+                    staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
+                        client, staging_id
+                    )
+                elif not ok and staging_id:
+                    staging_cleanup_status = "retained"
+                    staging_cleanup_error = "提交结果待核对，已保留隔离目录"
+                common = {
+                    "decision": effective.as_dict(),
+                    "selection_mode": "files",
+                    "unverified_manifest": False,
+                    "resolve_attempts": resolution.attempts,
+                    "selected_count": len(selected),
+                    "excluded_count": max(0, len(choices) - len(selected)),
+                    "task_ids": task_ids,
+                    "batch_count": int(created.get("batch_count") or 0),
+                    "completed_batches": completed_batches,
+                    "partial_success": partial_success,
+                    "outcome_unknown": outcome_unknown,
+                    "tracking_incomplete": tracking_incomplete,
+                    "staging": {
+                        "id": staging_id,
+                        "parent_id": str(decision.target_dir_id or "0"),
+                        "name": staging_name if isolate_task else "",
+                        "isolated": bool(staging_id),
+                        "cleanup_status": staging_cleanup_status,
+                        "cleanup_error": staging_cleanup_error,
+                    },
+                }
+                if not ok:
+                    return {
+                        "ok": False, **common,
+                        "error": str(created.get("error") or "光鸭任务创建失败"),
+                    }
+                return {"ok": True, **common, "error": ""}
+
+            # HTTP/ED2K 的上游响应可能只描述单文件而没有文件树，保留兼容提交；
+            # 磁力已在上方强制要求可验证 fileIndexes。
+            created = client.add_offline_task(
+                url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
+            )
+            outcome_unknown = False
+            tracking_incomplete = False
+            if isinstance(created, dict):
+                ok = bool(created.get("ok"))
+                task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
+                batch_count = int(created.get("batch_count") or (1 if ok else 0))
+                create_error = str(created.get("error") or "")
+                outcome_unknown = bool(created.get("outcome_unknown"))
+                tracking_incomplete = bool(created.get("tracking_incomplete"))
+            else:
+                ok = bool(created)
+                task_ids = []
+                batch_count = 1 if ok else 0
+                create_error = ""
+            if not ok and not outcome_unknown and not tracking_incomplete:
                 staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
                     client, staging_id
                 )
             elif not ok and staging_id:
                 staging_cleanup_status = "retained"
                 staging_cleanup_error = "提交结果待核对，已保留隔离目录"
-            common = {
-                "decision": effective.as_dict(),
-                "selection_mode": "files",
+            else:
+                staging_cleanup_status = "pending" if staging_id else ""
+                staging_cleanup_error = ""
+            return {
+                "ok": ok, "decision": effective.as_dict(),
+                "selection_mode": "legacy",
                 "unverified_manifest": False,
                 "resolve_attempts": resolution.attempts,
-                "selected_count": len(selected),
-                "excluded_count": max(0, len(choices) - len(selected)),
-                "task_ids": task_ids,
-                "batch_count": int(created.get("batch_count") or 0),
-                "completed_batches": completed_batches,
-                "partial_success": partial_success,
+                "selected_count": 0, "excluded_count": len(choices),
+                "task_ids": task_ids, "batch_count": batch_count,
                 "outcome_unknown": outcome_unknown,
                 "tracking_incomplete": tracking_incomplete,
+                "staging": {"id": staging_id, "parent_id": str(decision.target_dir_id or "0"),
+                            "name": staging_name, "isolated": bool(staging_id),
+                            "cleanup_status": staging_cleanup_status,
+                            "cleanup_error": staging_cleanup_error},
+                "error": "" if ok else (create_error or "光鸭任务创建失败"),
+            }
+        except Exception as exc:
+            # 请求异常无法证明服务端未受理；宁可保留空目录供后续核验，也不能
+            # 删除一个远端可能仍会异步写入的任务目标。
+            cleanup_status = "retained" if staging_id else ""
+            cleanup_error = "提交结果待核对，已保留隔离目录" if staging_id else ""
+            return {
+                "ok": False, "decision": effective.as_dict(),
                 "staging": {
                     "id": staging_id,
                     "parent_id": str(decision.target_dir_id or "0"),
-                    "name": staging_name if isolate_task else "",
+                    "name": staging_name,
                     "isolated": bool(staging_id),
-                    "cleanup_status": staging_cleanup_status,
-                    "cleanup_error": staging_cleanup_error,
+                    "cleanup_status": cleanup_status,
+                    "cleanup_error": cleanup_error,
                 },
+                "outcome_unknown": True,
+                "error": f"光鸭任务创建失败: {exc}",
             }
-            if not ok:
-                return {
-                    "ok": False, **common,
-                    "error": str(created.get("error") or "光鸭任务创建失败"),
-                }
-            return {"ok": True, **common, "error": ""}
-
-        # HTTP/ED2K 的上游响应可能只描述单文件而没有文件树，保留兼容提交；
-        # 磁力已在上方强制要求可验证 fileIndexes。
-        created = client.add_offline_task(
-            url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
-        )
-        outcome_unknown = False
-        tracking_incomplete = False
-        if isinstance(created, dict):
-            ok = bool(created.get("ok"))
-            task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
-            batch_count = int(created.get("batch_count") or (1 if ok else 0))
-            create_error = str(created.get("error") or "")
-            outcome_unknown = bool(created.get("outcome_unknown"))
-            tracking_incomplete = bool(created.get("tracking_incomplete"))
-        else:
-            ok = bool(created)
-            task_ids = []
-            batch_count = 1 if ok else 0
-            create_error = ""
-        if not ok and not outcome_unknown and not tracking_incomplete:
-            staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
-                client, staging_id
-            )
-        elif not ok and staging_id:
-            staging_cleanup_status = "retained"
-            staging_cleanup_error = "提交结果待核对，已保留隔离目录"
-        else:
-            staging_cleanup_status = "pending" if staging_id else ""
-            staging_cleanup_error = ""
-        return {
-            "ok": ok, "decision": effective.as_dict(),
-            "selection_mode": "legacy",
-            "unverified_manifest": False,
-            "resolve_attempts": resolution.attempts,
-            "selected_count": 0, "excluded_count": len(choices),
-            "task_ids": task_ids, "batch_count": batch_count,
-            "outcome_unknown": outcome_unknown,
-            "tracking_incomplete": tracking_incomplete,
-            "staging": {"id": staging_id, "parent_id": str(decision.target_dir_id or "0"),
-                        "name": staging_name, "isolated": bool(staging_id),
-                        "cleanup_status": staging_cleanup_status,
-                        "cleanup_error": staging_cleanup_error},
-            "error": "" if ok else (create_error or "光鸭任务创建失败"),
-        }
-    except Exception as exc:
-        # 请求异常无法证明服务端未受理；宁可保留空目录供后续核验，也不能
-        # 删除一个远端可能仍会异步写入的任务目标。
-        cleanup_status = "retained" if staging_id else ""
-        cleanup_error = "提交结果待核对，已保留隔离目录" if staging_id else ""
-        return {
-            "ok": False, "decision": effective.as_dict(),
-            "staging": {
-                "id": staging_id,
-                "parent_id": str(decision.target_dir_id or "0"),
-                "name": staging_name,
-                "isolated": bool(staging_id),
-                "cleanup_status": cleanup_status,
-                "cleanup_error": cleanup_error,
-            },
-            "outcome_unknown": True,
-            "error": f"光鸭任务创建失败: {exc}",
-        }
-
+    finally:
+        if owned_client:
+            close_guangya_client(client)
 
 
 def preview_offline_selection(url: str, title: str = "", client: GuangYaClient | None = None,
@@ -577,29 +581,34 @@ def preview_offline_selection(url: str, title: str = "", client: GuangYaClient |
     }
     if not decision.allowed:
         return result
+    owned_client = client is None
     client = client or GuangYaClient()
-    if not client.logged_in:
-        result["error"] = "光鸭未登录"
-        return result
     try:
-        resolution = _resolve_offline_manifest(client, url, decision.protocol)
-        choices = build_offline_file_choices(resolution.files, rules)
-    except Exception as exc:
-        result["error"] = f"光鸭资源解析失败: {exc}"
+        if not client.logged_in:
+            result["error"] = "光鸭未登录"
+            return result
+        try:
+            resolution = _resolve_offline_manifest(client, url, decision.protocol)
+            choices = build_offline_file_choices(resolution.files, rules)
+        except Exception as exc:
+            result["error"] = f"光鸭资源解析失败: {exc}"
+            return result
+        if decision.protocol == "magnet" and not choices:
+            result["resolve_attempts"] = resolution.attempts
+            result["resolve_diagnostic"] = resolution.diagnostic
+            result["error"] = "磁力资源未解析到可验证的文件列表"
+            return result
+        result.update({
+            "ok": True,
+            "has_file_tree": bool(choices),
+            "files": choices,
+            "default_selected_indexes": [item["index"] for item in choices if item["selected"]],
+            "error": "",
+        })
         return result
-    if decision.protocol == "magnet" and not choices:
-        result["resolve_attempts"] = resolution.attempts
-        result["resolve_diagnostic"] = resolution.diagnostic
-        result["error"] = "磁力资源未解析到可验证的文件列表"
-        return result
-    result.update({
-        "ok": True,
-        "has_file_tree": bool(choices),
-        "files": choices,
-        "default_selected_indexes": [item["index"] for item in choices if item["selected"]],
-        "error": "",
-    })
-    return result
+    finally:
+        if owned_client:
+            close_guangya_client(client)
 
 
 def submit_offline_selection(url: str, selected_indexes: list[int] | None,
@@ -618,112 +627,117 @@ def submit_offline_selection(url: str, selected_indexes: list[int] | None,
         or decision.target_dir_name != str(expected_target_dir_name)
     ):
         return {**base, "error": "预览目标已变化，请重新解析"}
+    owned_client = client is None
     client = client or GuangYaClient()
-    if not client.logged_in:
-        return {**base, "error": "光鸭未登录"}
     try:
-        resolution = _resolve_offline_manifest(client, url, decision.protocol)
-        files = resolution.files
-    except Exception as exc:
-        return {**base, "error": f"光鸭资源解析失败: {exc}"}
-
-    try:
-        requested = _normalize_selected_indexes(selected_indexes or [])
-    except ValueError as exc:
-        return {**base, "error": str(exc)}
-
-    if not files:
-        if decision.protocol == "magnet":
-            return {**base, "resolve_attempts": resolution.attempts, "resolve_diagnostic": resolution.diagnostic, "error": "磁力资源未解析到可验证的文件列表"}
-        if requested:
-            return {**base, "error": "资源没有可验证的文件列表，请重新预览"}
+        if not client.logged_in:
+            return {**base, "error": "光鸭未登录"}
         try:
-            created = client.add_offline_task(
-                url=url,
-                target_dir_id=decision.target_dir_id,
-                task_type=decision.protocol,
-            )
+            resolution = _resolve_offline_manifest(client, url, decision.protocol)
+            files = resolution.files
         except Exception as exc:
-            # 旧式 HTTP/ED2K 接口没有可复核的文件树；请求一旦发出，连接异常
-            # 无法证明上游未创建任务。标记为结果未知，阻止调用方立即重复提交。
+            return {**base, "error": f"光鸭资源解析失败: {exc}"}
+
+        try:
+            requested = _normalize_selected_indexes(selected_indexes or [])
+        except ValueError as exc:
+            return {**base, "error": str(exc)}
+
+        if not files:
+            if decision.protocol == "magnet":
+                return {**base, "resolve_attempts": resolution.attempts, "resolve_diagnostic": resolution.diagnostic, "error": "磁力资源未解析到可验证的文件列表"}
+            if requested:
+                return {**base, "error": "资源没有可验证的文件列表，请重新预览"}
+            try:
+                created = client.add_offline_task(
+                    url=url,
+                    target_dir_id=decision.target_dir_id,
+                    task_type=decision.protocol,
+                )
+            except Exception as exc:
+                # 旧式 HTTP/ED2K 接口没有可复核的文件树；请求一旦发出，连接异常
+                # 无法证明上游未创建任务。标记为结果未知，阻止调用方立即重复提交。
+                return {
+                    **base,
+                    "error": f"光鸭任务创建结果待核对: {exc}",
+                    "outcome_unknown": True,
+                    "review_required": True,
+                }
+            if isinstance(created, dict):
+                ok = bool(created.get("ok"))
+                task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
+                batch_count = int(created.get("batch_count") or (1 if ok else 0))
+                create_error = str(created.get("error") or "")
+            else:
+                ok = bool(created)
+                task_ids = []
+                batch_count = 1 if ok else 0
+                create_error = ""
             return {
                 **base,
-                "error": f"光鸭任务创建结果待核对: {exc}",
-                "outcome_unknown": True,
-                "review_required": True,
+                "ok": ok,
+                "error": "" if ok else (create_error or "光鸭任务创建失败"),
+                "selection_mode": "legacy",
+                "selected_count": 0,
+                "task_ids": task_ids,
+                "batch_count": batch_count,
             }
-        if isinstance(created, dict):
-            ok = bool(created.get("ok"))
-            task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
-            batch_count = int(created.get("batch_count") or (1 if ok else 0))
-            create_error = str(created.get("error") or "")
-        else:
-            ok = bool(created)
-            task_ids = []
-            batch_count = 1 if ok else 0
-            create_error = ""
-        return {
-            **base,
-            "ok": ok,
-            "error": "" if ok else (create_error or "光鸭任务创建失败"),
-            "selection_mode": "legacy",
-            "selected_count": 0,
-            "task_ids": task_ids,
-            "batch_count": batch_count,
-        }
 
-    if not requested:
-        return {**base, "error": "至少选择一个文件"}
-    available = {int(item["index"]) for item in files}
-    invalid = [index for index in requested if index not in available]
-    if invalid:
-        return {**base, "error": f"选择中包含不存在的文件索引: {', '.join(map(str, invalid))}"}
-    choices = build_offline_file_choices(files, rules)
-    allowed = {int(item["index"]) for item in choices if item.get("selected")}
-    forbidden = [index for index in requested if index not in allowed]
-    if forbidden:
-        reasons = {
-            int(item["index"]): str(item.get("exclude_reason") or "不符合下载规则")
-            for item in choices
-        }
-        detail = "；".join(f"{index}: {reasons.get(index, '不符合下载规则')}" for index in forbidden)
-        return {**base, "error": f"选择中包含被下载规则排除的文件: {detail}"}
-    try:
-        created = client.add_offline_selection(url, decision.target_dir_id, requested)
-    except Exception as exc:
-        return {**base, "error": f"光鸭任务创建失败: {exc}"}
-    if not created.get("ok", True):
+        if not requested:
+            return {**base, "error": "至少选择一个文件"}
+        available = {int(item["index"]) for item in files}
+        invalid = [index for index in requested if index not in available]
+        if invalid:
+            return {**base, "error": f"选择中包含不存在的文件索引: {', '.join(map(str, invalid))}"}
+        choices = build_offline_file_choices(files, rules)
+        allowed = {int(item["index"]) for item in choices if item.get("selected")}
+        forbidden = [index for index in requested if index not in allowed]
+        if forbidden:
+            reasons = {
+                int(item["index"]): str(item.get("exclude_reason") or "不符合下载规则")
+                for item in choices
+            }
+            detail = "；".join(f"{index}: {reasons.get(index, '不符合下载规则')}" for index in forbidden)
+            return {**base, "error": f"选择中包含被下载规则排除的文件: {detail}"}
+        try:
+            created = client.add_offline_selection(url, decision.target_dir_id, requested)
+        except Exception as exc:
+            return {**base, "error": f"光鸭任务创建失败: {exc}"}
+        if not created.get("ok", True):
+            return {
+                **base,
+                "partial_success": bool(created.get("partial_success")),
+                "outcome_unknown": bool(created.get("outcome_unknown")),
+                "tracking_incomplete": bool(created.get("tracking_incomplete")),
+                "selection_mode": "files",
+                "selected_count": int(created.get("selected_count", len(requested))),
+                "completed_batches": int(created.get("completed_batches", 0)),
+                "task_ids": list(created.get("task_ids") or []),
+                "completed_indexes": list(created.get("completed_indexes") or []),
+                "remaining_indexes": list(created.get("remaining_indexes") or requested),
+                "failed_batch": created.get("failed_batch"),
+                "batch_count": int(created.get("batch_count", 0)),
+                "error": str(created.get("error") or "光鸭任务创建失败"),
+            }
         return {
             **base,
-            "partial_success": bool(created.get("partial_success")),
-            "outcome_unknown": bool(created.get("outcome_unknown")),
+            "ok": True,
+            "partial_success": False,
+            "outcome_unknown": False,
             "tracking_incomplete": bool(created.get("tracking_incomplete")),
+            "error": "",
             "selection_mode": "files",
             "selected_count": int(created.get("selected_count", len(requested))),
-            "completed_batches": int(created.get("completed_batches", 0)),
             "task_ids": list(created.get("task_ids") or []),
-            "completed_indexes": list(created.get("completed_indexes") or []),
-            "remaining_indexes": list(created.get("remaining_indexes") or requested),
-            "failed_batch": created.get("failed_batch"),
             "batch_count": int(created.get("batch_count", 0)),
-            "error": str(created.get("error") or "光鸭任务创建失败"),
+            "completed_batches": int(created.get("completed_batches", created.get("batch_count", 0))),
+            "completed_indexes": list(created.get("completed_indexes") or requested),
+            "remaining_indexes": [],
+            "failed_batch": None,
         }
-    return {
-        **base,
-        "ok": True,
-        "partial_success": False,
-        "outcome_unknown": False,
-        "tracking_incomplete": bool(created.get("tracking_incomplete")),
-        "error": "",
-        "selection_mode": "files",
-        "selected_count": int(created.get("selected_count", len(requested))),
-        "task_ids": list(created.get("task_ids") or []),
-        "batch_count": int(created.get("batch_count", 0)),
-        "completed_batches": int(created.get("completed_batches", created.get("batch_count", 0))),
-        "completed_indexes": list(created.get("completed_indexes") or requested),
-        "remaining_indexes": [],
-        "failed_batch": None,
-    }
+    finally:
+        if owned_client:
+            close_guangya_client(client)
 
 
 def rules_summary(rules: OfflineRules | None = None) -> dict:

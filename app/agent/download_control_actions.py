@@ -12,7 +12,11 @@ from app import config
 from app.agent.download_actions import _bounded_progress, _safe_state, _safe_title
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
-from app.clients.qbittorrent import QBittorrentClient, TorrentTask
+from app.clients.qbittorrent import (
+    QBittorrentClient,
+    TorrentTask,
+    close_qbittorrent_client,
+)
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -98,28 +102,49 @@ def _fingerprint(snapshot: dict[str, Any]) -> str:
 
 
 def _capture(arguments: dict[str, str], *, action: str) -> tuple[QBittorrentClient, TorrentTask, dict[str, Any]]:
+    client = None
     try:
         client = _client()
         tasks = client.list_torrents()
+        requested = _normalize_name(arguments["task_name"]).casefold()
+        matches = [
+            task for task in tasks
+            if _normalize_name(task.name).casefold() == requested
+        ]
+        if not matches:
+            raise AgentToolError(
+                "没有找到名称完全匹配的下载任务",
+                code="precondition_failed",
+            )
+        if len(matches) != 1:
+            raise AgentToolError(
+                "存在多个同名下载任务，请在下载任务页操作",
+                code="precondition_failed",
+            )
+        task = matches[0]
+        state = _safe_state(task.state)
+        if action == "pause" and state in _PAUSED_STATES:
+            raise AgentToolError("该下载任务已经暂停", code="precondition_failed")
+        if action == "resume" and state not in _PAUSED_STATES:
+            raise AgentToolError(
+                "该下载任务当前不是暂停状态",
+                code="precondition_failed",
+            )
+        return client, task, _task_snapshot(task, action=action)
     except AgentToolError:
+        close_qbittorrent_client(client)
         raise
     except Exception as exc:
-        logger.warning("Agent qB 任务预检失败 action=%s type=%s", action, type(exc).__name__)
-        raise AgentToolError("暂时无法读取 qBittorrent 队列", code="precondition_failed") from exc
-
-    requested = _normalize_name(arguments["task_name"]).casefold()
-    matches = [task for task in tasks if _normalize_name(task.name).casefold() == requested]
-    if not matches:
-        raise AgentToolError("没有找到名称完全匹配的下载任务", code="precondition_failed")
-    if len(matches) != 1:
-        raise AgentToolError("存在多个同名下载任务，请在下载任务页操作", code="precondition_failed")
-    task = matches[0]
-    state = _safe_state(task.state)
-    if action == "pause" and state in _PAUSED_STATES:
-        raise AgentToolError("该下载任务已经暂停", code="precondition_failed")
-    if action == "resume" and state not in _PAUSED_STATES:
-        raise AgentToolError("该下载任务当前不是暂停状态", code="precondition_failed")
-    return client, task, _task_snapshot(task, action=action)
+        close_qbittorrent_client(client)
+        logger.warning(
+            "Agent qB 任务预检失败 action=%s type=%s",
+            action,
+            type(exc).__name__,
+        )
+        raise AgentToolError(
+            "暂时无法读取 qBittorrent 队列",
+            code="precondition_failed",
+        ) from exc
 
 
 def _preview(snapshot: dict[str, Any], *, action: str) -> ToolResult:
@@ -146,8 +171,11 @@ def _preview(snapshot: dict[str, Any], *, action: str) -> ToolResult:
 
 
 def _prepare(arguments: dict[str, str], *, action: str) -> tuple[ToolResult, str]:
-    _client_value, _task, snapshot = _capture(arguments, action=action)
-    return _preview(snapshot, action=action), _fingerprint(snapshot)
+    client, _task, snapshot = _capture(arguments, action=action)
+    try:
+        return _preview(snapshot, action=action), _fingerprint(snapshot)
+    finally:
+        close_qbittorrent_client(client)
 
 
 def _confirmed(arguments: dict[str, str], expected_context: str, *, action: str) -> ToolResult:
@@ -160,44 +188,58 @@ def _confirmed(arguments: dict[str, str], expected_context: str, *, action: str)
             summary="下载任务状态已变化，请重新预检",
             error=exc.safe_message,
         )
-    if not secrets.compare_digest(_fingerprint(snapshot), str(expected_context or "")):
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="下载任务状态已变化，请重新预检",
-            error="确认快照已失效。",
-        )
-
     try:
-        if action == "pause":
-            client.pause_torrents(task.hash)
-        elif action == "resume":
-            client.resume_torrents(task.hash)
-        else:
-            # 安全边界：Agent 删除永远只移除任务，不删除数据文件。
-            client.delete_torrents(task.hash, delete_files=False)
-    except Exception as exc:
-        logger.warning("Agent qB 任务操作失败 action=%s type=%s", action, type(exc).__name__)
-        return ToolResult(
-            ok=False,
-            status="unavailable",
-            summary="qBittorrent 暂时无法完成该操作",
-            error="下载器操作失败，请稍后重试。",
-        )
+        if not secrets.compare_digest(
+            _fingerprint(snapshot),
+            str(expected_context or ""),
+        ):
+            return ToolResult(
+                ok=False,
+                status="conflict",
+                summary="下载任务状态已变化，请重新预检",
+                error="确认快照已失效。",
+            )
 
-    copy = _ACTIONS[action]
-    return ToolResult(
-        ok=True,
-        status="completed",
-        summary=copy["completed_summary"],
-        data={"operation": action, "affected": 1, "delete_files": False if action == "delete" else None},
-        evidence=[Evidence(
-            "qbittorrent",
-            "已使用一次性确认票据执行单任务操作；审计结果不包含 hash、路径或凭据。",
-            _now(),
-        )],
-        suggestions=["可再次询问：检查下载队列状态。"],
-    )
+        try:
+            if action == "pause":
+                client.pause_torrents(task.hash)
+            elif action == "resume":
+                client.resume_torrents(task.hash)
+            else:
+                # 安全边界：Agent 删除永远只移除任务，不删除数据文件。
+                client.delete_torrents(task.hash, delete_files=False)
+        except Exception as exc:
+            logger.warning(
+                "Agent qB 任务操作失败 action=%s type=%s",
+                action,
+                type(exc).__name__,
+            )
+            return ToolResult(
+                ok=False,
+                status="unavailable",
+                summary="qBittorrent 暂时无法完成该操作",
+                error="下载器操作失败，请稍后重试。",
+            )
+
+        copy = _ACTIONS[action]
+        return ToolResult(
+            ok=True,
+            status="completed",
+            summary=copy["completed_summary"],
+            data={
+                "operation": action,
+                "affected": 1,
+                "delete_files": False if action == "delete" else None,
+            },
+            evidence=[Evidence(
+                "qbittorrent",
+                "已使用一次性确认票据执行单任务操作；审计结果不包含 hash、路径或凭据。",
+                _now(),
+            )],
+            suggestions=["可再次询问：检查下载队列状态。"],
+        )
+    finally:
+        close_qbittorrent_client(client)
 
 
 def _unconfirmed(_arguments: dict[str, str]) -> ToolResult:

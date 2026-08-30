@@ -388,13 +388,23 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
             index = db.list_strm_index(f"guangya-meta:{source_id}")
             self.assertEqual([item["file_id"] for item in index], ["meta"])
 
-    def test_media_refresh_failure_keeps_changed_paths_until_retry_succeeds(self):
+    def test_media_refresh_failure_keeps_durable_outbox_until_retry_succeeds(self):
         from unittest.mock import patch
 
         from app.modules.strm_metadata_worker import STRMMetadataWorker
 
+        db.enqueue_strm_metadata_jobs([_job()])
+        claimed = db.claim_due_strm_metadata_jobs(owner="worker")[0]
+        path = "/strm/Movie/Movie.nfo"
+        db.complete_strm_metadata_job(
+            claimed["id"],
+            expected_owner="worker",
+            expected_lease_generation=claimed["lease_generation"],
+            expected_revision=claimed["revision"],
+            refresh_path=path,
+        )
         worker = STRMMetadataWorker()
-        worker._changed_paths = ["/strm/Movie/Movie.nfo", "/strm/Movie/Movie.nfo"]
+        self.assertFalse(hasattr(worker, "_changed_paths"))
         with patch(
             "app.modules.strm_metadata_worker.get_int",
             side_effect=lambda key, default=0: {
@@ -406,21 +416,16 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
             side_effect=[{"Jellyfin": "failed"}, {"Jellyfin": "queued"}],
         ) as refresh:
             worker._flush_media_refresh(force=True)
-            self.assertEqual(worker._changed_paths, [
-                "/strm/Movie/Movie.nfo", "/strm/Movie/Movie.nfo",
-            ])
+            self.assertEqual(db.list_strm_metadata_refresh_paths(), [path])
             self.assertTrue(worker._refresh_retry_pending)
 
             # 进程停止或显式 flush 必须立即重试，不能因普通批处理节流丢失刷新。
             worker._flush_media_refresh(force=True)
 
         self.assertEqual(refresh.call_count, 2)
-        self.assertEqual(
-            refresh.call_args_list[0].args[0],
-            ["/strm/Movie/Movie.nfo"],
-        )
+        self.assertEqual(refresh.call_args_list[0].args[0], [path])
         self.assertTrue(refresh.call_args_list[0].kwargs["immediate"])
-        self.assertEqual(worker._changed_paths, [])
+        self.assertEqual(db.list_strm_metadata_refresh_paths(), [])
         self.assertFalse(worker._refresh_retry_pending)
 
     def test_new_worker_replays_durable_media_refresh_after_restart(self):

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import hmac
 import os
+import threading
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 
@@ -414,7 +416,7 @@ def stop_background_services() -> bool:
     try:
         from app.modules.local_media_scheduler import get_local_media_scheduler
 
-        local_media_scheduler_stopped = bool(get_local_media_scheduler().stop())
+        local_media_scheduler_stopped = bool(get_local_media_scheduler().shutdown())
     except Exception as exc:
         local_media_scheduler_stopped = False
         logger.warning("停止本地媒体调度器失败 type=%s", type(exc).__name__)
@@ -491,12 +493,43 @@ def create_app(*, start_background: bool = False) -> FastAPI:
     # 完成恢复，否则本进程会拿着恢复前后的混合快照运行到下一次重启。
     from app.modules.backup import recover_pending_restore, runtime_lifecycle_guard
 
-    with runtime_lifecycle_guard(config.PATHS):
-        recover_pending_restore(config.PATHS, lifecycle_lock_held=True)
-    secret_key = _secret_key()
+    startup_guard = runtime_lifecycle_guard(config.PATHS) if start_background else None
+    startup_guard_state_lock = threading.Lock()
+    startup_guard_released = startup_guard is None
+
+    def release_startup_guard() -> None:
+        nonlocal startup_guard_released
+        with startup_guard_state_lock:
+            if startup_guard_released:
+                return
+            startup_guard_released = True
+        assert startup_guard is not None
+        startup_guard.__exit__(None, None, None)
+
+    if startup_guard is not None:
+        startup_guard.__enter__()
+    try:
+        if startup_guard is not None:
+            recovered = recover_pending_restore(
+                config.PATHS,
+                lifecycle_lock_held=True,
+            )
+        else:
+            with runtime_lifecycle_guard(config.PATHS):
+                recovered = recover_pending_restore(
+                    config.PATHS,
+                    lifecycle_lock_held=True,
+                )
+        if recovered:
+            config.reload_after_restore()
+            first_run.refresh_startup_state_after_restore()
+        secret_key = _secret_key()
+    except BaseException:
+        release_startup_guard()
+        raise
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI):
+    async def runtime_lifespan(_app: FastAPI):
         _app.state.ready = False
         with runtime_lifecycle_guard(config.PATHS):
             database.init_db()
@@ -595,6 +628,8 @@ def create_app(*, start_background: bool = False) -> FastAPI:
 
                 from app.discovery.service import shutdown_discovery_service
                 from app.discovery.search import shutdown_discovery_search_service
+                from app.modules.directory_scrape import close_directory_scrape_service
+                from app.modules.local_media_service import close_local_media_service
                 from app.routes.discovery_image import close_poster_session
                 from app.indexers.runtime import (
                     shutdown_indexer_service,
@@ -606,6 +641,8 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                         for label, closer in (
                             ("discovery", shutdown_discovery_service),
                             ("discovery-search", shutdown_discovery_search_service),
+                            ("directory-scrape", close_directory_scrape_service),
+                            ("local-media", close_local_media_service),
                         ):
                             try:
                                 closer()
@@ -672,9 +709,22 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                             previous_exception_handler
                         )
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            async with runtime_lifespan(_app):
+                yield
+        finally:
+            release_startup_guard()
+
     app = FastAPI(title="MediaFlux", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.background_services_enabled = start_background
     app.state.ready = False
+    app.state.release_startup_lifecycle_guard = release_startup_guard
+    if startup_guard is not None:
+        # 应用对象在进入 lifespan 前即被启动器拒绝或测试丢弃时，也要在
+        # 解释器模块拆卸前释放文件锁；回调本身幂等。
+        atexit.register(release_startup_guard)
     app.add_middleware(AgentBodyLimitMiddleware)
     app.add_middleware(SecurityMiddleware)
     app.add_middleware(
@@ -790,16 +840,19 @@ def run(*, host: str | None = None, port: int | None = None) -> None:
     effective_host = _resolve_bind_host(host)
     effective_port = config.flask_port() if port is None else port
     logger.info(f"MediaFlux FastAPI 启动于 {effective_host}:{effective_port}")
-    uvicorn.run(
-        app,
-        host=effective_host,
-        port=effective_port,
-        workers=1,
-        reload=False,
-        log_level="info",
-        log_config=None,
-        access_log=False,
-    )
+    try:
+        uvicorn.run(
+            app,
+            host=effective_host,
+            port=effective_port,
+            workers=1,
+            reload=False,
+            log_level="info",
+            log_config=None,
+            access_log=False,
+        )
+    finally:
+        app.state.release_startup_lifecycle_guard()
 
 
 app = create_app(start_background=True)

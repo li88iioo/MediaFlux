@@ -5,7 +5,12 @@ from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
 
 from app import config
-from app.clients.guangya import GuangYaClient, TOKEN_EXPIRY_MAX, TOKEN_EXPIRY_MIN
+from app.clients.guangya import (
+    GuangYaClient,
+    TOKEN_EXPIRY_MAX,
+    TOKEN_EXPIRY_MIN,
+    close_guangya_client,
+)
 from app.logger import get_logger
 from app.modules.directory_scrape_errors import (
     DirectoryScrapePublicError,
@@ -89,11 +94,14 @@ def capabilities(request: Request):
 def refresh_token(request: Request):
     """显式刷新 Token，并仅返回脱敏后的持久化状态。"""
     require_api_login(request)
+    client = GuangYaClient()
     try:
-        return _safe_token_status(GuangYaClient().refresh_now())
+        return _safe_token_status(client.refresh_now())
     except Exception as exc:
         logger.error(f"光鸭 token 显式刷新失败: {type(exc).__name__}")
         return JSONResponse({"error": "光鸭 token 刷新失败"}, status_code=409)
+    finally:
+        close_guangya_client(client)
 
 
 @router.post("/token/validate")
@@ -101,17 +109,24 @@ def validate_token(request: Request):
     """通过最小只读目录请求校验当前 Token。"""
     require_api_login(request)
     client = GuangYaClient()
-    valid = client.validate()
-    return _safe_token_status(client.token_status(valid=valid))
+    try:
+        valid = client.validate()
+        return _safe_token_status(client.token_status(valid=valid))
+    finally:
+        close_guangya_client(client)
 
 
 @router.post("/token/clear")
 def clear_token(request: Request):
     """清除内存与磁盘 Token。"""
     require_api_login(request)
-    status = _safe_token_status(GuangYaClient().clear_tokens())
-    _clear_signed_url_caches()
-    return status
+    client = GuangYaClient()
+    try:
+        status = _safe_token_status(client.clear_tokens())
+        _clear_signed_url_caches()
+        return status
+    finally:
+        close_guangya_client(client)
 
 
 @router.post("/send_sms")
@@ -145,6 +160,8 @@ def send_sms(request: Request, data: dict | None = Body(default=None)):
     except Exception as e:
         logger.error("发送验证码失败 type=%s", type(e).__name__)
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        close_guangya_client(c)
 
 
 @router.post("/login")
@@ -171,6 +188,8 @@ def login(request: Request, data: dict | None = Body(default=None)):
     except Exception as e:
         logger.error("光鸭登录失败 type=%s", type(e).__name__)
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        close_guangya_client(c)
 
 
 @router.get("/dirs")
@@ -178,13 +197,17 @@ def list_dirs(request: Request, parent_id: str = "0"):
     """目录浏览（给选择器用）。?parent_id=xxx，默认根目录。"""
     require_api_login(request)
     c = GuangYaClient()
-    if not c.logged_in:
-        return JSONResponse({"error": "光鸭未登录"}, status_code=503)
     try:
+        if not c.logged_in:
+            return JSONResponse({"error": "光鸭未登录"}, status_code=503)
         from app.modules.organize import Organizer, OrganizeRules
 
         rules = OrganizeRules.from_config()
-        video_exts = Organizer(client=c).video_exts(rules)
+        organizer = Organizer(client=c)
+        try:
+            video_exts = organizer.video_exts(rules)
+        finally:
+            organizer.close()
         files = c.list_dir(parent_id)
         return [
             {
@@ -210,6 +233,8 @@ def list_dirs(request: Request, parent_id: str = "0"):
     except Exception as exc:
         logger.error(f"光鸭目录读取失败: {type(exc).__name__}")
         return JSONResponse({"error": "光鸭目录读取失败"}, status_code=500)
+    finally:
+        close_guangya_client(c)
 
 
 @router.post("/delete-item")
@@ -235,6 +260,8 @@ def delete_item(request: Request, data: dict | None = Body(default=None)):
     except Exception as exc:
         logger.error("光鸭删除项目失败: %s", type(exc).__name__)
         return JSONResponse({"error": "光鸭删除项目失败"}, status_code=500)
+    finally:
+        close_guangya_client(client)
 
 
 def _normalize_sources(data: dict) -> list[dict[str, str]]:

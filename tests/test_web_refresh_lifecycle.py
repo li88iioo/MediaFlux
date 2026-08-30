@@ -205,5 +205,222 @@ class OrganizeStatusPollingLifecycleTests(unittest.TestCase):
         self.assertIn("Promise.allSettled", (ROOT / "app/static/js/local-media.js").read_text(encoding="utf-8"))
 
 
+class StrmStatusPollingLifecycleTests(unittest.TestCase):
+    def test_status_polling_is_single_flight_and_preserves_last_good_state(self):
+        source = (ROOT / "app/static/js/guangya-strm.js").read_text(encoding="utf-8")
+        status_block = _extract(
+            source,
+            "    function clearStatusPoll(){",
+            "\n    function getDiagnosticValue",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            const progress = {{textContent: '最近状态'}};
+            let visibilityHandler = null;
+            const document = {{
+              hidden: false,
+              getElementById: (id) => id === 'strmProgressStage' ? progress : {{textContent: ''}},
+              addEventListener: (name, handler) => {{if (name === 'visibilitychange') visibilityHandler = handler;}},
+            }};
+            const timers = [];
+            const window = {{
+              setTimeout: (fn, delay) => {{timers.push({{fn, delay}}); return timers.length;}},
+              clearTimeout: () => {{}},
+            }};
+            const STRM_STATUS_POLL_MS = 2500;
+            const STRM_STATUS_RETRY_MS = 5000;
+            let pollTimer = null;
+            let statusShouldPoll = true;
+            let statusRequestSerial = 0;
+            let statusAbortController = null;
+            let lastStatusProgressText = '最近状态';
+            let activeStrmTab = 'schedule';
+            let strmConfigReady = true;
+            const setTag = () => {{throw new Error('background failure must preserve the stable tag');}};
+            const renderStatus = () => {{statusShouldPoll = true; lastStatusProgressText = '最近状态'; progress.textContent = '最近状态';}};
+            let fetchImpl;
+            const fetch = (...args) => fetchImpl(...args);
+            {status_block}
+            (async () => {{
+              const pending = [];
+              fetchImpl = (_url, options) => new Promise((resolve, reject) => {{
+                const error = new Error('aborted');
+                error.name = 'AbortError';
+                options.signal.addEventListener('abort', () => reject(error), {{once: true}});
+                pending.push({{resolve, signal: options.signal}});
+              }});
+              const first = loadStatus({{background: true}});
+              const second = loadStatus({{background: true}});
+              assert.equal(pending[0].signal.aborted, true);
+              pending[1].resolve({{ok: true, status: 200, json: async () => ({{running: true}})}});
+              assert.equal((await second).ok, true);
+              assert.equal((await first).stale, true);
+              assert.equal(timers.at(-1).delay, STRM_STATUS_POLL_MS);
+
+              fetchImpl = async () => ({{ok: false, status: 503, json: async () => ({{}})}});
+              await pollStatus();
+              assert.match(progress.textContent, /状态同步失败，重试中/);
+              assert.equal(timers.at(-1).delay, STRM_STATUS_RETRY_MS);
+
+              document.hidden = true;
+              visibilityHandler();
+              assert.equal(pollTimer, null);
+            }})().catch((error) => {{console.error(error); process.exit(1);}});
+            """
+        )
+        _run_node(script)
+
+
+class SettingsDraftLifecycleTests(unittest.TestCase):
+    def test_draft_gate_aborts_and_invalidates_stale_results(self):
+        source = (ROOT / "app/static/js/settings.js").read_text(encoding="utf-8")
+        gate_block = _extract(
+            source,
+            "    const isAbortError=",
+            "\n    const INDEXER_SITE_ORDER",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            {gate_block}
+            let draft = {{url: 'https://old.example'}};
+            let invalidations = 0;
+            const handlers = {{}};
+            const field = {{addEventListener: (name, handler) => {{handlers[name] = handler;}}}};
+            const gate = createDraftRequestGate(() => draft, () => {{invalidations += 1;}});
+            bindDraftInvalidation([field], gate);
+            const oldTicket = gate.begin();
+            draft = {{url: 'https://new.example'}};
+            handlers.input();
+            assert.equal(oldTicket.signal.aborted, true);
+            assert.equal(gate.isCurrent(oldTicket), false);
+            assert.equal(invalidations, 1);
+            const currentTicket = gate.begin();
+            assert.equal(gate.isCurrent(currentTicket), true);
+            assert.equal(gate.finish(currentTicket), true);
+            """
+        )
+        _run_node(script)
+
+        self.assertIn("agentModelRequestGate=createDraftRequestGate", source)
+        self.assertIn("qbRequestGate=createDraftRequestGate", source)
+        self.assertIn("telegramRequestGate=createDraftRequestGate", source)
+        self.assertIn("tmdbRequestGate=createDraftRequestGate", source)
+        self.assertGreaterEqual(source.count("signal:ticket.signal"), 5)
+
+
+class AppModalFocusLifecycleTests(unittest.TestCase):
+    def test_modal_cancels_late_focus_traps_tab_and_restores_trigger(self):
+        source = (ROOT / "app/static/js/app.js").read_text(encoding="utf-8")
+        modal_block = _extract(
+            source,
+            "    window.createAppModal = function (modal) {",
+            "\n\n    const confirmModal",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            const frames = [];
+            let keydownHandler = null;
+            const makeFocusable = (name) => ({{
+              name, hidden: false, isConnected: true,
+              getAttribute: () => null,
+              focus: () => {{document.activeElement = elements[name];}},
+            }});
+            const elements = {{first: null, last: null, trigger: null}};
+            elements.first = makeFocusable('first');
+            elements.last = makeFocusable('last');
+            elements.trigger = makeFocusable('trigger');
+            const dialog = {{
+              querySelectorAll: () => [elements.first, elements.last],
+              querySelector: () => elements.first,
+              contains: (element) => element === elements.first || element === elements.last,
+              hasAttribute: () => true,
+              setAttribute: () => {{}},
+              focus: () => {{document.activeElement = dialog;}},
+            }};
+            const body = {{classList: {{add: () => {{}}, remove: () => {{}}}}, appendChild: () => {{}}}};
+            const document = {{
+              body,
+              activeElement: elements.trigger,
+              addEventListener: (name, handler) => {{if (name === 'keydown') keydownHandler = handler;}},
+            }};
+            const modal = {{
+              hidden: true,
+              parentElement: body,
+              querySelector: () => dialog,
+              querySelectorAll: () => [],
+              addEventListener: () => {{}},
+            }};
+            const requestAnimationFrame = (callback) => {{frames.push(callback); return frames.length;}};
+            const window = {{}};
+            {modal_block}
+            const lifecycle = window.createAppModal(modal);
+            lifecycle.open(elements.trigger, {{initialFocus: elements.first}});
+            lifecycle.close();
+            frames.shift()();
+            assert.equal(document.activeElement, elements.trigger);
+
+            lifecycle.open(elements.trigger, {{initialFocus: elements.first}});
+            frames.shift()();
+            assert.equal(document.activeElement, elements.first);
+            document.activeElement = elements.last;
+            let prevented = false;
+            keydownHandler({{key: 'Tab', shiftKey: false, preventDefault: () => {{prevented = true;}}, stopPropagation: () => {{}}}});
+            assert.equal(prevented, true);
+            assert.equal(document.activeElement, elements.first);
+            keydownHandler({{key: 'Escape', shiftKey: false, preventDefault: () => {{}}, stopPropagation: () => {{}}}});
+            assert.equal(modal.hidden, true);
+            assert.equal(document.activeElement, elements.trigger);
+            """
+        )
+        _run_node(script)
+
+
+class AgentTranscriptLifecycleTests(unittest.TestCase):
+    def test_transcript_pruning_keeps_latest_and_active_message(self):
+        source = (ROOT / "app/static/js/agent.js").read_text(encoding="utf-8")
+        prune_block = _extract(
+            source,
+            "    function transcriptMessageMustRemain",
+            "\n    function appendUserMessage",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            const MAX_TRANSCRIPT_MESSAGES = 120;
+            const confirmationTimers = new Map();
+            let activeQuery = null;
+            const transcript = {{children: []}};
+            const clearConfirmationTimer = () => {{}};
+            const message = (id) => {{
+              const item = {{
+                id,
+                classList: {{contains: (name) => name === 'agent-message'}},
+                querySelector: () => null,
+                querySelectorAll: () => [],
+                remove: () => {{transcript.children.splice(transcript.children.indexOf(item), 1);}},
+              }};
+              return item;
+            }};
+            {prune_block}
+            transcript.children = Array.from({{length: 122}}, (_, index) => message(index));
+            pruneTranscript({{preserve: [transcript.children.at(-1)]}});
+            assert.equal(transcript.children.length, 120);
+            assert.equal(transcript.children[0].id, 2);
+            assert.equal(transcript.children.at(-1).id, 121);
+
+            transcript.children = Array.from({{length: 121}}, (_, index) => message(index));
+            activeQuery = {{pending: transcript.children[0]}};
+            pruneTranscript({{preserve: [transcript.children.at(-1)]}});
+            assert.equal(transcript.children.length, 120);
+            assert.equal(transcript.children[0].id, 0);
+            assert.equal(transcript.children.some((item) => item.id === 1), false);
+            """
+        )
+        _run_node(script)
+
+
 if __name__ == "__main__":
     unittest.main()

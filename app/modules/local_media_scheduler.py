@@ -65,6 +65,7 @@ class LocalMediaScheduler:
     def __init__(self, *, owner: str = "admin", interval: float = 10.0, service=None, qb_factory=None, clock=None):
         self.owner = owner
         self.interval = max(0.2, float(interval))
+        self._owns_service = service is None
         self.service = service or LocalMediaService()
         self.qb_factory = qb_factory or self._default_qb_client
         # ``clock`` 仅为旧调用签名保留；目录定时轮询已经移除。
@@ -108,6 +109,21 @@ class LocalMediaScheduler:
         with self._guard:
             if self._thread is thread and stopped:
                 self._thread = None
+        return stopped
+
+    def shutdown(self, timeout: float = 30.0) -> bool:
+        """终止调度线程，并仅释放调度器内部创建的本地媒体服务。"""
+        stopped = self.stop(timeout=timeout)
+        if stopped and self._owns_service:
+            close = getattr(self.service, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭本地媒体调度服务失败 type=%s",
+                        type(exc).__name__,
+                    )
         return stopped
 
     def reload(self) -> None:

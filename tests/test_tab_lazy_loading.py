@@ -56,7 +56,9 @@ class TabLazyLoadingTests(unittest.TestCase):
         self.assertNotIn("if(normalizedDownloadView!=='issues')loadIssues(1)", self.downloads)
 
     def test_strm_secondary_panels_load_after_config_and_activation(self) -> None:
-        self.assertIn("if(strmConfigReady)void ensureStrmTabLoaded(normalized)", self.strm)
+        self.assertIn("if(strmConfigReady){", self.strm)
+        self.assertIn("void ensureStrmTabLoaded(normalized)", self.strm)
+        self.assertIn("if(normalized==='schedule'&&alreadyLoaded)void loadStatus()", self.strm)
         self.assertIn("if(tab==='schedule')return Promise.all([validateCron(),loadStatus()])", self.strm)
         self.assertIn("if(tab==='diagnostics')return Promise.all([loadIndexDiagnostics(),loadFailures()])", self.strm)
         self.assertIn("void ensureStrmTabLoaded(activeStrmTab)", self.strm)

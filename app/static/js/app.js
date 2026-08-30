@@ -790,21 +790,71 @@
         // 容器而非浏览器视口定位，长页面中会出现在当前可视区域下方。
         if (modal.parentElement !== document.body) document.body.appendChild(modal);
         const dialog = modal.querySelector('[role="dialog"]');
+        const focusableSelector = [
+            'a[href]', 'button:not([disabled])', 'input:not([disabled]):not([type="hidden"])',
+            'select:not([disabled])', 'textarea:not([disabled])', '[tabindex]:not([tabindex="-1"])',
+        ].join(',');
         let returnFocus = null;
-        function close() {
+        let focusGeneration = 0;
+        function focusableElements() {
+            if (!dialog) return [];
+            return [...dialog.querySelectorAll(focusableSelector)].filter((element) => (
+                !element.hidden
+                && element.getAttribute('aria-hidden') !== 'true'
+                && !element.closest?.('[hidden], [aria-hidden="true"]')
+            ));
+        }
+        function resolveInitialFocus(initialFocus) {
+            if (typeof initialFocus === 'string') return dialog?.querySelector(initialFocus);
+            return initialFocus || focusableElements()[0] || dialog;
+        }
+        function close({restoreFocus = true} = {}) {
+            focusGeneration += 1;
             modal.hidden = true;
             document.body.classList.remove('modal-open');
-            returnFocus?.focus?.();
+            const target = returnFocus;
+            returnFocus = null;
+            if (restoreFocus && target?.isConnected !== false) target?.focus?.({preventScroll: true});
         }
-        function open(trigger) {
+        function open(trigger, {initialFocus = null} = {}) {
+            const generation = ++focusGeneration;
             returnFocus = trigger || document.activeElement;
             modal.hidden = false;
             document.body.classList.add('modal-open');
-            requestAnimationFrame(() => dialog?.querySelector('button, input, select, textarea, a[href]')?.focus());
+            requestAnimationFrame(() => {
+                if (generation !== focusGeneration || modal.hidden) return;
+                resolveInitialFocus(initialFocus)?.focus?.({preventScroll: true});
+            });
         }
-        modal.querySelectorAll('[data-modal-close]').forEach((button) => button.addEventListener('click', close));
+        modal.querySelectorAll('[data-modal-close]').forEach((button) => button.addEventListener('click', () => close()));
         modal.addEventListener('click', (event) => { if (event.target === modal) close(); });
-        document.addEventListener('keydown', (event) => { if (!modal.hidden && event.key === 'Escape') close(); });
+        document.addEventListener('keydown', (event) => {
+            if (modal.hidden) return;
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                close();
+                return;
+            }
+            if (event.key !== 'Tab' || !dialog) return;
+            const focusable = focusableElements();
+            if (!focusable.length) {
+                event.preventDefault();
+                if (!dialog.hasAttribute('tabindex')) dialog.setAttribute('tabindex', '-1');
+                dialog.focus({preventScroll: true});
+                return;
+            }
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            const active = document.activeElement;
+            if (event.shiftKey && (active === first || !dialog.contains(active))) {
+                event.preventDefault();
+                last.focus({preventScroll: true});
+            } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+                event.preventDefault();
+                first.focus({preventScroll: true});
+            }
+        });
         return {open, close};
     };
 

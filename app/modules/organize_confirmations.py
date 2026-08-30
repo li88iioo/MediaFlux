@@ -14,7 +14,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta
 
 from app import database as db
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.config import get
 from app.logger import get_logger
 from app.modules.directory_scrape import FixedMatchScraper, ScopedGuangYaClient
@@ -1049,80 +1049,89 @@ def _resolve_guangya_confirmation_candidate(
     external_id = _candidate_external_id(candidate)
     media_type = str(candidate.get("media_type") or "").strip().lower()
     scraper = TMDBScraper()
-    if provider == "tmdb":
-        tmdb_id = str(candidate.get("tmdb_id") or "").strip()
-        if not tmdb_id or media_type not in {"movie", "tv"}:
-            raise ValueError("TMDB 候选媒体参数无效")
-        try:
-            detail = scraper.get_detail_with_credits(tmdb_id, media_type)
-            match = scraper.match_from_tmdb(tmdb_id, media_type)
-        except Exception as exc:
-            raise ConfirmationRetryableError(
-                "TMDB 服务暂时不可用，请稍后重试"
-            ) from exc
-        if not detail or not match.tmdb_id or match.need_confirm:
-            raise ConfirmationRetryableError(
-                "TMDB 候选暂时无法确认，请稍后重试"
+    try:
+        if provider == "tmdb":
+            tmdb_id = str(candidate.get("tmdb_id") or "").strip()
+            if not tmdb_id or media_type not in {"movie", "tv"}:
+                raise ValueError("TMDB 候选媒体参数无效")
+            try:
+                detail = scraper.get_detail_with_credits(tmdb_id, media_type)
+                match = scraper.match_from_tmdb(tmdb_id, media_type)
+            except Exception as exc:
+                raise ConfirmationRetryableError(
+                    "TMDB 服务暂时不可用，请稍后重试"
+                ) from exc
+            if not detail or not match.tmdb_id or match.need_confirm:
+                raise ConfirmationRetryableError(
+                    "TMDB 候选暂时无法确认，请稍后重试"
+                )
+        elif provider == "metatube":
+            if media_type != "movie" or not external_id:
+                raise ValueError("MetaTube 候选媒体参数无效")
+            if not rules.nsfw_exclusive:
+                raise ValueError("当前来源不是成人专用来源，已拒绝 MetaTube 候选")
+            if not str(rules.nsfw_metatube_endpoint or "").strip():
+                raise ValueError("MetaTube 服务地址未配置")
+            recognizer = None
+            try:
+                recognizer = NsfwRecognizer(
+                    rules.nsfw_metatube_endpoint,
+                    rules.nsfw_metatube_token,
+                    strip_domains=rules.nsfw_strip_domains,
+                    timeout=rules.nsfw_timeout_seconds,
+                )
+                match, detail = recognizer.resolve(external_id)
+            except MetaTubeError as exc:
+                raise ConfirmationRetryableError(
+                    "MetaTube 服务暂时不可用，请稍后重试"
+                ) from exc
+            finally:
+                close = getattr(recognizer, "close", None)
+                if callable(close):
+                    close()
+            _validate_metatube_confirmation_identity(payload, detail, rules)
+        elif provider == "clean_title":
+            if media_type != "movie" or not external_id:
+                raise ValueError("清洗标题候选参数无效")
+            if not rules.nsfw_exclusive:
+                raise ValueError("当前来源不是成人专用来源，已拒绝清洗标题入库")
+            seed = next((
+                str(item.get("name") or "")
+                for item in (payload.get("files") or [])
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ), str(payload.get("directory") or ""))
+            fallback = build_clean_title_candidate(seed, rules.nsfw_strip_domains)
+            if fallback is None:
+                raise ValueError("待确认文件未提取到有效番号，不能清洗标题入库")
+            resolved_id = str(fallback.get("external_id") or "").strip()
+            if normalize_code(external_id) != normalize_code(resolved_id):
+                raise ValueError("清洗标题候选番号与待确认文件不一致")
+            # 标题由服务端根据原始文件重新生成，不能信任回传候选中的可修改文本。
+            title = str(fallback.get("title") or resolved_id).strip()
+            detail = {
+                **dict(fallback.get("metadata") or {}),
+                "number": resolved_id,
+                "title": title,
+                "fallback": True,
+            }
+            match = MatchResult(
+                title=title,
+                media_type="movie",
+                confidence=1.0,
+                provider="clean_title",
+                external_id=resolved_id,
+                metadata=detail,
+                status="matched",
             )
-    elif provider == "metatube":
-        if media_type != "movie" or not external_id:
-            raise ValueError("MetaTube 候选媒体参数无效")
-        if not rules.nsfw_exclusive:
-            raise ValueError("当前来源不是成人专用来源，已拒绝 MetaTube 候选")
-        if not str(rules.nsfw_metatube_endpoint or "").strip():
-            raise ValueError("MetaTube 服务地址未配置")
-        try:
-            recognizer = NsfwRecognizer(
-                rules.nsfw_metatube_endpoint,
-                rules.nsfw_metatube_token,
-                strip_domains=rules.nsfw_strip_domains,
-                timeout=rules.nsfw_timeout_seconds,
-            )
-            match, detail = recognizer.resolve(external_id)
-        except MetaTubeError as exc:
-            raise ConfirmationRetryableError(
-                "MetaTube 服务暂时不可用，请稍后重试"
-            ) from exc
-        _validate_metatube_confirmation_identity(payload, detail, rules)
-    elif provider == "clean_title":
-        if media_type != "movie" or not external_id:
-            raise ValueError("清洗标题候选参数无效")
-        if not rules.nsfw_exclusive:
-            raise ValueError("当前来源不是成人专用来源，已拒绝清洗标题入库")
-        seed = next((
-            str(item.get("name") or "")
-            for item in (payload.get("files") or [])
-            if isinstance(item, dict) and str(item.get("name") or "").strip()
-        ), str(payload.get("directory") or ""))
-        fallback = build_clean_title_candidate(seed, rules.nsfw_strip_domains)
-        if fallback is None:
-            raise ValueError("待确认文件未提取到有效番号，不能清洗标题入库")
-        resolved_id = str(fallback.get("external_id") or "").strip()
-        if normalize_code(external_id) != normalize_code(resolved_id):
-            raise ValueError("清洗标题候选番号与待确认文件不一致")
-        # 标题由服务端根据原始文件重新生成，不能信任回传候选中的可修改文本。
-        title = str(fallback.get("title") or resolved_id).strip()
-        detail = {
-            **dict(fallback.get("metadata") or {}),
-            "number": resolved_id,
-            "title": title,
-            "fallback": True,
-        }
-        match = MatchResult(
-            title=title,
-            media_type="movie",
-            confidence=1.0,
-            provider="clean_title",
-            external_id=resolved_id,
-            metadata=detail,
-            status="matched",
-        )
-    else:
-        raise ValueError("候选媒体来源无效")
-    match.locked = True
-    match.need_confirm = False
-    match.matched_by = "telegram_confirmation"
-    return scraper, match, detail, provider
+        else:
+            raise ValueError("候选媒体来源无效")
+        match.locked = True
+        match.need_confirm = False
+        match.matched_by = "telegram_confirmation"
+        return scraper, match, detail, provider
+    except Exception:
+        scraper.close()
+        raise
 
 
 def _record_confirmation_learning(
@@ -1444,6 +1453,9 @@ def _execute_guangya_confirmation(
 ) -> dict:
     # running 状态由 claim_queued_organize_confirmation 原子授予；worker 不得
     # 无条件重新取得所有权，否则重启恢复后的 failed 终态会被迟到执行覆盖。
+    client = None
+    scraper = None
+    organizer = None
     try:
         source_dir_id = str(payload.get("source_dir_id") or "").strip()
         current_rules = OrganizeRules.from_config().for_source(source_dir_id)
@@ -1629,6 +1641,14 @@ def _execute_guangya_confirmation(
                 payload, status="failed", error=message,
             )
         raise
+    finally:
+        close = getattr(organizer, "close", None)
+        if callable(close):
+            close()
+        close = getattr(scraper, "close", None)
+        if callable(close):
+            close()
+        close_guangya_client(client)
 
 
 def confirmation_event(

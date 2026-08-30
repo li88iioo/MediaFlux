@@ -276,6 +276,86 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual((retried.season_override, retried.episode_override), (2, 7))
         self.assertEqual(retried.numbering_mode, "season_continuous")
 
+    def test_interrupted_write_retry_requires_explicit_confirmation(self):
+        source_id = db.create_local_media_source(
+            name="interrupted-write", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/interrupted-write", owner="admin",
+        )
+        task_id = db.create_local_media_task(
+            source_id, "", "/tmp/interrupted-write/Movie.mkv", owner="admin",
+        )
+        db.add_local_media_task_item(
+            task_id, "/tmp/interrupted-write/Movie.mkv",
+            "/tmp/library/Movie.mkv", role="video", owner="admin",
+        )
+        db.update_local_media_task(task_id, owner="admin", status="moving")
+
+        db.init_db()
+
+        recovered = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(recovered.status, "requires_manual")
+        self.assertTrue(db.is_interrupted_local_media_write_error(recovered.error))
+        self.assertFalse(recovered.completed_at)
+        self.assertFalse(db.reset_local_media_task(task_id, owner="admin"))
+        self.assertEqual(len(db.list_local_media_task_items(task_id, owner="admin")), 1)
+
+        self.assertTrue(db.reset_local_media_task(
+            task_id, owner="admin", confirm_interrupted_write=True,
+        ))
+        self.assertEqual(
+            db.get_local_media_task(task_id, owner="admin").status,
+            "waiting_stable",
+        )
+        self.assertEqual(db.list_local_media_task_items(task_id, owner="admin"), [])
+
+    def test_init_db_keeps_all_postwrite_interruptions_for_manual_review(self):
+        source_id = db.create_local_media_source(
+            name="postwrite", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/postwrite", owner="admin",
+        )
+        task_ids = []
+        for status in ("moving", "verifying", "refreshing", "rolling_back"):
+            task_id = db.create_local_media_task(
+                source_id, "", f"/tmp/postwrite/{status}.mkv", owner="admin",
+            )
+            db.add_local_media_task_item(
+                task_id, f"/tmp/postwrite/{status}.mkv",
+                f"/tmp/library/{status}.mkv", role="video", owner="admin",
+            )
+            db.update_local_media_task(task_id, owner="admin", status=status)
+            task_ids.append(task_id)
+
+        db.init_db()
+
+        for task_id in task_ids:
+            recovered = db.get_local_media_task(task_id, owner="admin")
+            self.assertEqual(recovered.status, "requires_manual")
+            self.assertTrue(db.is_interrupted_local_media_write_error(recovered.error))
+            self.assertEqual(
+                len(db.list_local_media_task_items(task_id, owner="admin")), 1,
+            )
+
+    def test_init_db_keeps_prewrite_interruptions_retryable(self):
+        source_id = db.create_local_media_source(
+            name="prewrite", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/prewrite", owner="admin",
+        )
+        task_ids = []
+        for status in ("recognizing", "planned"):
+            task_id = db.create_local_media_task(
+                source_id, "", f"/tmp/prewrite/{status}.mkv", owner="admin",
+            )
+            db.update_local_media_task(task_id, owner="admin", status=status)
+            task_ids.append(task_id)
+
+        db.init_db()
+
+        for task_id in task_ids:
+            recovered = db.get_local_media_task(task_id, owner="admin")
+            self.assertEqual(recovered.status, "failed")
+            self.assertIn("可重试", recovered.error)
+            self.assertTrue(db.reset_local_media_task(task_id, owner="admin"))
+
     def test_task_recognition_summary_round_trip_is_versioned(self):
         source_id = db.create_local_media_source(
             name="recognition-summary", qb_profile="", qb_path_prefix="",

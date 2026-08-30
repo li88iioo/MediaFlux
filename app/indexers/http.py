@@ -415,10 +415,16 @@ class BrowserImpersonatingHttpClient:
 
     async def aclose(self) -> None:
         async with self._lock:
-            session, self._session = self._session, None
-            self._warmed = False
-        if session is not None:
+            session = self._session
+            if session is None:
+                self._warmed = False
+                return
+            # close 失败时保留同一个 session，供 IndexerService 的下一轮
+            # aclose 真正重试；关闭期间继续持锁，禁止并发 get 创建替代会话。
             await asyncio.to_thread(session.close)
+            if self._session is session:
+                self._session = None
+            self._warmed = False
 
     async def get(
         self,

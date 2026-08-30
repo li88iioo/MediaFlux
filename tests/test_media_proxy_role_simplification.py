@@ -544,6 +544,123 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "媒体反代热重载失败 type=%s", "RuntimeError"
         )
 
+    def test_threadsafe_submission_failure_closes_unscheduled_coroutines(self):
+        from app.modules import media_proxy
+
+        manager = media_proxy.MediaProxyManager()
+        manager._loop = MagicMock()
+        manager._loop.is_closed.return_value = False
+        manager._loop.is_running.return_value = True
+        reconcile = MagicMock()
+        restart = MagicMock()
+
+        with patch.object(
+            manager, "reconcile", new=MagicMock(return_value=reconcile)
+        ), patch.object(
+            manager, "restart_instance", new=MagicMock(return_value=restart)
+        ), patch.object(
+            media_proxy.asyncio,
+            "run_coroutine_threadsafe",
+            side_effect=RuntimeError("Event loop is closed"),
+        ):
+            self.assertFalse(manager.request_reconcile())
+            self.assertFalse(manager.request_restart(9))
+
+        reconcile.close.assert_called_once_with()
+        restart.close.assert_called_once_with()
+
+    async def test_upstream_pool_retains_only_failed_clients_for_retry(self):
+        from app.modules import media_proxy
+
+        class Client:
+            def __init__(self, *, fail_once: bool):
+                self.fail_once = fail_once
+                self.close_calls = 0
+
+            async def aclose(self):
+                self.close_calls += 1
+                if self.fail_once and self.close_calls == 1:
+                    raise RuntimeError("simulated close failure")
+
+        pool = media_proxy._UpstreamClientPool()
+        failed = Client(fail_once=True)
+        closed = Client(fail_once=False)
+        failed_key = ("http", "failed.invalid", 80)
+        closed_key = ("http", "closed.invalid", 80)
+        pool._clients = {failed_key: failed, closed_key: closed}
+
+        with self.assertRaisesRegex(RuntimeError, "1 个客户端关闭失败"):
+            await pool.aclose()
+        self.assertEqual(pool._clients, {failed_key: failed})
+        self.assertEqual(closed.close_calls, 1)
+
+        await pool.aclose()
+        self.assertEqual(pool._clients, {})
+        self.assertEqual(failed.close_calls, 2)
+
+    async def test_stop_runtime_retries_pool_retained_by_lifespan_failure(self):
+        from app.modules import media_proxy
+
+        class FailOnceClient:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def aclose(self):
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("simulated close failure")
+
+        pool = media_proxy._UpstreamClientPool()
+        client = FailOnceClient()
+        pool._clients[("http", "upstream.invalid", 80)] = client
+        with self.assertRaises(RuntimeError):
+            await pool.aclose()
+
+        task = asyncio.create_task(asyncio.sleep(0))
+        await task
+        runtime = media_proxy.ProxyRuntime(
+            instance_id=12,
+            bind=("127.0.0.1", 18102),
+            server=MagicMock(),
+            task=task,
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+            upstream_clients=pool,
+        )
+        with patch.object(media_proxy, "_release_signed_url_cache"):
+            await media_proxy.MediaProxyManager._stop_runtime(runtime)
+
+        self.assertEqual(client.close_calls, 2)
+        self.assertEqual(pool._clients, {})
+
+
+    async def test_manager_stop_retains_failed_runtime_for_retry(self):
+        from app.modules import media_proxy
+
+        manager = media_proxy.MediaProxyManager()
+        runtime = media_proxy.ProxyRuntime(
+            instance_id=13,
+            bind=("127.0.0.1", 18103),
+            server=MagicMock(),
+            task=MagicMock(),
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+        )
+        manager._runtimes = {13: runtime}
+
+        with patch.object(
+            manager,
+            "_stop_runtime",
+            new=AsyncMock(side_effect=[RuntimeError("simulated close failure"), None]),
+        ) as stop_runtime:
+            with self.assertRaisesRegex(RuntimeError, "1 个媒体反代实例关闭失败"):
+                await manager.stop()
+            self.assertEqual(manager._runtimes, {13: runtime})
+
+            await manager.stop()
+
+        self.assertEqual(manager._runtimes, {})
+        self.assertEqual(stop_runtime.await_count, 2)
 
     async def test_manager_stop_cancellation_cleans_all_snapshotted_runtimes(self):
         from app.modules import media_proxy

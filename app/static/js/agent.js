@@ -21,6 +21,7 @@
     const MIN_PENDING_MS = 320;
     const AGENT_CANCEL_TIMEOUT_MS = 1500;
     const MAX_RENDERED_ITEMS = 8;
+    const MAX_TRANSCRIPT_MESSAGES = 120;
     const MAX_GENERIC_SECTIONS = 4;
     const confirmationTimers = new Map();
     let conversationGeneration = 0;
@@ -1756,10 +1757,33 @@
         return {article, body};
     }
 
+    function transcriptMessageMustRemain(message,preserved){
+        if(preserved.has(message)||message===activeQuery?.pending)return true;
+        if(message.querySelector('.agent-pending, .agent-streaming'))return true;
+        return [...message.querySelectorAll('.agent-confirmation-card')].some(card=>(
+            confirmationTimers.has(card)||[...card.querySelectorAll('button')].some(button=>!button.disabled)
+        ));
+    }
+
+    function pruneTranscript({preserve=[]}={}){
+        const messages=[...transcript.children].filter(message=>message.classList?.contains('agent-message'));
+        let excess=messages.length-MAX_TRANSCRIPT_MESSAGES;
+        if(excess<=0)return;
+        const preserved=new Set(preserve.filter(Boolean));
+        for(const message of messages){
+            if(excess<=0)break;
+            if(transcriptMessageMustRemain(message,preserved))continue;
+            message.querySelectorAll('.agent-confirmation-card').forEach(clearConfirmationTimer);
+            message.remove();
+            excess-=1;
+        }
+    }
+
     function appendUserMessage(message) {
         const view = createMessage('user', 'YOU', 'user-round');
         view.body.append(node('p', '', message));
         transcript.append(view.article);
+        pruneTranscript({preserve:[view.article]});
         syncConversationLayout();
         refreshIcons(view.article);
         if (window.MFAnim && typeof window.MFAnim.popIn === 'function') {
@@ -1775,6 +1799,7 @@
         card.append(node('strong', '', '正在选择工具并核对数据…'), node('div', 'agent-pending-line'));
         view.body.append(card);
         transcript.append(view.article);
+        pruneTranscript({preserve:[view.article]});
         syncConversationLayout();
         refreshIcons(view.article);
         if (window.MFAnim && typeof window.MFAnim.popIn === 'function') {
@@ -1865,6 +1890,7 @@
         if (!pendingNode?.isConnected) {
             const view = createMessage('assistant', label, iconName);
             transcript.append(view.article);
+            pruneTranscript({preserve:[view.article]});
             syncConversationLayout();
             return view;
         }
@@ -1929,6 +1955,7 @@
         } else {
             view.body.append(resultCard);
         }
+        pruneTranscript({preserve:[view.article]});
         refreshIcons(view.article);
         if (!streamingCard && window.MFAnim && typeof window.MFAnim.popIn === 'function' && !restoringHistory) {
             window.MFAnim.popIn(resultCard, { duration: 0.22, y: 6 });
@@ -1973,6 +2000,7 @@
         const retryActions = createRetryActions(draft);
         if (retryActions) card.append(retryActions);
         view.body.append(card);
+        pruneTranscript({preserve:[view.article]});
         refreshIcons(view.article);
         if (window.MFAnim && typeof window.MFAnim.shake === 'function') {
             window.MFAnim.shake(card, { intensity: 6, duration: 0.32 });
@@ -2041,6 +2069,7 @@
         if (body) {
             body.replaceChildren(node('span', 'agent-message-label', 'MEDIAFLUX AGENT'), card);
         }
+        pruneTranscript({preserve:[article]});
         refreshIcons(article);
         scrollToLatest();
         announceResponseStatus('Agent 任务已停止，结果未写入会话历史。');

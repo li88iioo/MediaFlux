@@ -575,6 +575,47 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         scheduler.start.assert_called_once_with()
         scheduler.enqueue_manual_scan_candidates.assert_called_once_with(silent=True)
 
+    def test_interrupted_write_retry_requires_explicit_confirmation(self):
+        csrf = self.login(); headers = {"X-CSRF-Token": csrf}
+        source_id = db.create_local_media_source(
+            name="本地下载", qb_profile="", qb_path_prefix="",
+            local_root=str(self.local_root), owner="admin",
+        )
+        task_id = db.create_local_media_task(
+            source_id, "", str(self.local_root / "Movie.mkv"), owner="admin",
+        )
+        db.add_local_media_task_item(
+            task_id, str(self.local_root / "Movie.mkv"),
+            str(self.movie_target / "Movie.mkv"), role="video", owner="admin",
+        )
+        db.update_local_media_task(
+            task_id, owner="admin", status="requires_manual",
+            error=(
+                f"{db.LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX}，"
+                "文件及 qB 状态需人工核验"
+            ),
+        )
+
+        with patch("app.routes.local_media_api.get_local_media_scheduler") as scheduler:
+            blocked = self.client.post(
+                f"/api/local-media/tasks/{task_id}/retry",
+                json={}, headers=headers,
+            )
+            confirmed = self.client.post(
+                f"/api/local-media/tasks/{task_id}/retry",
+                json={"confirm_interrupted_write": True}, headers=headers,
+            )
+
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertIn("人工核验", blocked.json()["error"])
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertEqual(
+            db.get_local_media_task(task_id, owner="admin").status,
+            "waiting_stable",
+        )
+        self.assertEqual(db.list_local_media_task_items(task_id, owner="admin"), [])
+        scheduler.return_value.reload.assert_called_once_with()
+
     def test_requires_manual_directory_task_displays_the_specific_failed_episode(self):
         self.login()
         source_id = db.create_local_media_source(

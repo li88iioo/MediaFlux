@@ -40,6 +40,19 @@ _wal_mode_cache: dict[str, tuple[int, int]] = {}
 _configured_test_mode = False
 SCHEMA_VERSION = 13
 
+LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = (
+    "上次进程在本地媒体写操作期间中断"
+)
+_LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
+    "上次进程在本地媒体识别或计划期间中断，已释放为可重试"
+)
+
+
+def is_interrupted_local_media_write_error(error: object) -> bool:
+    """识别必须先人工核验、不能直接普通重试的启动恢复错误。"""
+    return str(error or "").startswith(LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX)
+
+
 _SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
 _sqlite_contention_lock = threading.Lock()
 _sqlite_contention_counts = {
@@ -2769,11 +2782,22 @@ def init_db() -> None:
             )
             conn.execute(
                 "UPDATE local_media_tasks SET status='failed',"
-                "error=CASE WHEN COALESCE(error,'')='' "
-                "THEN '上次进程在本地媒体写操作期间中断，文件及 qB 状态需人工核验后重试' "
-                "ELSE error END,completed_at=COALESCE(completed_at,?),updated_at=? "
-                "WHERE status IN ('recognizing','planned','moving','verifying','refreshing','rolling_back')",
-                (timestamp, timestamp),
+                "error=CASE WHEN COALESCE(error,'')='' THEN ? ELSE error END,"
+                "completed_at=COALESCE(completed_at,?),updated_at=? "
+                "WHERE status IN ('recognizing','planned')",
+                (_LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR, timestamp, timestamp),
+            )
+            conn.execute(
+                "UPDATE local_media_tasks SET status='requires_manual',"
+                "error=CASE WHEN COALESCE(error,'')='' THEN ? "
+                "ELSE ? || '；原错误：' || substr(error,1,350) END,"
+                "completed_at=NULL,updated_at=? "
+                "WHERE status IN ('moving','verifying','refreshing','rolling_back')",
+                (
+                    f"{LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX}，文件及 qB 状态需人工核验",
+                    LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX,
+                    timestamp,
+                ),
             )
             conn.execute(
                 "UPDATE local_media_operation_steps SET status='failed',"
@@ -7132,6 +7156,7 @@ def reset_local_media_task(
     season_override: int | None = None,
     episode_override: int | None = None,
     numbering_mode: str | None = None,
+    confirm_interrupted_write: bool = False,
 ) -> bool:
     import uuid
 
@@ -7183,9 +7208,21 @@ def reset_local_media_task(
     if normalized_numbering_mode is not None:
         assignments.append("numbering_mode=?")
         params.append(normalized_numbering_mode)
-    params.extend([int(task_id), _local_media_owner(owner)])
+    safe_owner = _local_media_owner(owner)
+    params.extend([int(task_id), safe_owner])
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT status,error FROM local_media_tasks WHERE id=? AND owner=?",
+            (int(task_id), safe_owner),
+        ).fetchone()
+        if current is None or str(current["status"] or "") not in {"failed", "requires_manual"}:
+            return False
+        if (
+            is_interrupted_local_media_write_error(current["error"])
+            and not bool(confirm_interrupted_write)
+        ):
+            return False
         cur = conn.execute(
             f"UPDATE local_media_tasks SET {', '.join(assignments)} "
             "WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",

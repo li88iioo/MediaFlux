@@ -352,6 +352,8 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "app.discovery.search.shutdown_discovery_search_service"
         ), patch(
+            "app.modules.directory_scrape.close_directory_scrape_service"
+        ) as close_directory_scrape, patch(
             "app.indexers.runtime.shutdown_indexer_service", new=AsyncMock()
         ):
             app = create_app(start_background=True)
@@ -363,6 +365,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(stop_threads[0], owner_thread)
         proxy.start.assert_awaited_once_with()
         proxy.stop.assert_awaited_once_with()
+        close_directory_scrape.assert_called_once_with()
         start_probe_runtime.assert_called_once_with()
         stop_probe_runtime.assert_called_once_with(5.0)
 
@@ -397,6 +400,8 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ) as shutdown_discovery, patch(
             "app.discovery.search.shutdown_discovery_search_service"
         ) as shutdown_search, patch(
+            "app.modules.directory_scrape.close_directory_scrape_service"
+        ) as close_directory_scrape, patch(
             "app.indexers.runtime.shutdown_indexer_service", new=shutdown
         ):
             app = create_app(start_background=True)
@@ -408,6 +413,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         shutdown.assert_not_awaited()
         shutdown_discovery.assert_not_called()
         shutdown_search.assert_not_called()
+        close_directory_scrape.assert_not_called()
         proxy.stop.assert_awaited_once_with()
 
 

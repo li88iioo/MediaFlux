@@ -9,7 +9,7 @@ from time import monotonic
 from typing import Callable
 
 from app import config, database as db
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.logger import get_logger
 from app.modules.directory_media import DirectoryInspection, DirectoryMediaInspector
 from app.modules.directory_scrape_errors import (
@@ -513,12 +513,45 @@ class DirectoryScrapeService:
         store: DirectoryScrapeStore | None = None,
         rules_loader: Callable[[], OrganizeRules] = OrganizeRules.from_config,
     ) -> None:
-        self.client = client or GuangYaClient()
-        self.scraper = scraper or TMDBScraper()
+        self._owns_client = client is None
+        self._owns_scraper = scraper is None
+        self.client = client if client is not None else GuangYaClient()
+        self.scraper = scraper if scraper is not None else TMDBScraper()
         self.store = store or get_directory_scrape_store()
+        self._closed = False
         self.rules_loader = rules_loader
         self._cached_nsfw_key: tuple[str, str, str, int] | None = None
         self._cached_nsfw_recognizer = None
+
+    def close(self) -> None:
+        """释放全局目录刮削服务持有的内部客户端。"""
+        if self._closed:
+            return
+        self._closed = True
+        recognizer = self._cached_nsfw_recognizer
+        self._cached_nsfw_recognizer = None
+        self._cached_nsfw_key = None
+        close = getattr(recognizer, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                logger.warning(
+                    "关闭目录刮削 MetaTube 识别器失败 type=%s",
+                    type(exc).__name__,
+                )
+        if self._owns_scraper:
+            close = getattr(self.scraper, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭目录刮削 TMDB Scraper 失败 type=%s",
+                        type(exc).__name__,
+                    )
+        if self._owns_client:
+            close_guangya_client(self.client)
 
     def _nsfw_recognizer(self, rules: OrganizeRules):
         if not rules.nsfw_enabled or not str(rules.nsfw_metatube_endpoint or "").strip():
@@ -531,6 +564,18 @@ class DirectoryScrapeService:
         )
         if self._cached_nsfw_key == key and self._cached_nsfw_recognizer is not None:
             return self._cached_nsfw_recognizer
+        previous = self._cached_nsfw_recognizer
+        self._cached_nsfw_key = None
+        self._cached_nsfw_recognizer = None
+        close = getattr(previous, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                logger.warning(
+                    "关闭旧目录刮削 MetaTube 识别器失败 type=%s",
+                    type(exc).__name__,
+                )
         from app.modules.nsfw import NsfwRecognizer
         try:
             recognizer = NsfwRecognizer(
@@ -1890,3 +1935,13 @@ def get_directory_scrape_service() -> DirectoryScrapeService:
         if _service is None:
             _service = DirectoryScrapeService(store=_store)
         return _service
+
+
+def close_directory_scrape_service() -> None:
+    """关闭并释放全局目录刮削服务；下次访问会按最新配置重建。"""
+    global _service
+    with _service_lock:
+        service = _service
+        _service = None
+    if service is not None:
+        service.close()

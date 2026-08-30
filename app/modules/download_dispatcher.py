@@ -11,7 +11,11 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from app import database as db
-from app.clients.qbittorrent import QBittorrentClient, QBTorrentExportError
+from app.clients.qbittorrent import (
+    QBittorrentClient,
+    QBTorrentExportError,
+    close_qbittorrent_client,
+)
 from app.config import get
 from app.indexers.providers.base import magnet_infohash
 from app.logger import get_logger
@@ -392,6 +396,8 @@ def _export_qb_torrent_for_resubmit(row, torrent_id: str) -> bytes | None:
             request_id,
             type(exc).__name__,
         )
+    finally:
+        close_qbittorrent_client(client)
     return None
 
 
@@ -1069,25 +1075,28 @@ def _submit_qb(row) -> dict[str, Any]:
     save_path = get("TG_QB_SAVE_PATH", get("RSS_QB_SAVE_PATH", ""))
     torrents = row["torrent_data"] if row["kind"] == "torrent" else None
     urls = "" if torrents else str(row["source_value"] or "")
-    result = client.add_torrent_detailed(
-        urls=urls, save_path=save_path, category=category, torrents=torrents,
-    )
-    failure_code = str(result.failure_code or "")
-    error = ""
-    if not result.ok:
-        error = (
-            "qB 已接收请求的结果无法确认，请等待系统核验，勿直接重复提交"
-            if failure_code == "qb_outcome_unknown"
-            else "qB 提交失败"
+    try:
+        result = client.add_torrent_detailed(
+            urls=urls, save_path=save_path, category=category, torrents=torrents,
         )
-    return {
-        "ok": bool(result.ok),
-        "task_id": result.task_ids[0] if result.task_ids else torrent_identity(row),
-        "task_ids": list(result.task_ids),
-        "failure_code": failure_code,
-        "retryable": bool(result.retryable),
-        "error": error,
-    }
+        failure_code = str(result.failure_code or "")
+        error = ""
+        if not result.ok:
+            error = (
+                "qB 已接收请求的结果无法确认，请等待系统核验，勿直接重复提交"
+                if failure_code == "qb_outcome_unknown"
+                else "qB 提交失败"
+            )
+        return {
+            "ok": bool(result.ok),
+            "task_id": result.task_ids[0] if result.task_ids else torrent_identity(row),
+            "task_ids": list(result.task_ids),
+            "failure_code": failure_code,
+            "retryable": bool(result.retryable),
+            "error": error,
+        }
+    finally:
+        close_qbittorrent_client(client)
 
 
 def _submit_guangya(row, *, target_dir_id: str = "", target_dir_name: str = "") -> dict[str, Any]:

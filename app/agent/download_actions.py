@@ -10,7 +10,12 @@ import unicodedata
 from app import config, database as db
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
-from app.clients.qbittorrent import QBittorrentClient, TorrentTask, TransferInfo
+from app.clients.qbittorrent import (
+    QBittorrentClient,
+    TorrentTask,
+    TransferInfo,
+    close_qbittorrent_client,
+)
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -258,6 +263,7 @@ def diagnose_download_queue(_arguments: dict[str, Any]) -> ToolResult:
             suggestions=["请补充 API Key，或同时配置用户名与密码。"],
         )
 
+    client = None
     try:
         client = QBittorrentClient(
             url=values["url"],
@@ -279,6 +285,8 @@ def diagnose_download_queue(_arguments: dict[str, Any]) -> ToolResult:
             suggestions=["请检查 qBittorrent 服务、认证信息和网络后重试。"],
             error="下载器当前不可用。",
         )
+    finally:
+        close_qbittorrent_client(client)
 
     counts = {
         "total": 0,
