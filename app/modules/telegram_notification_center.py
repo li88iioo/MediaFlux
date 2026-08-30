@@ -107,6 +107,7 @@ def serialize_notification_event(event: NotificationEvent) -> str:
         ],
         "layout": str(event.layout or "default"),
         "field_emojis": bool(event.field_emojis),
+        "state": str(event.state or ""),
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -154,6 +155,7 @@ def deserialize_notification_event(payload: str) -> NotificationEvent:
         actions=actions,
         layout=str(data.get("layout") or "default"),
         field_emojis=bool(data.get("field_emojis", True)),
+        state=str(data.get("state") or ""),
     )
 
 
@@ -337,7 +339,9 @@ def _dispatch_item(item: dict) -> bool:
     claimed_revision = int(item["revision"])
     if not _allows_dispatch(item):
         suppress_notification(
-            notification_id, lease_generation=generation,
+            notification_id,
+            lease_generation=generation,
+            claimed_revision=claimed_revision,
             reason="NotificationPolicyDisabled",
         )
         return True
@@ -347,6 +351,7 @@ def _dispatch_item(item: dict) -> bool:
         fail_notification(
             notification_id,
             lease_generation=generation,
+            claimed_revision=claimed_revision,
             error=f"InvalidEventPayload:{type(exc).__name__}",
         )
         return False
@@ -354,12 +359,16 @@ def _dispatch_item(item: dict) -> bool:
     chat_id = str(item.get("chat_id") or "")
     message_id = int(item.get("message_id") or 0)
     outcome: TelegramSendResult
+    fallback_to_new_message = False
     try:
         if message_id > 0:
             outcome = edit_event_result(
                 event, chat_id=chat_id, message_id=message_id,
             )
             if not outcome.ok and _edit_can_fallback_to_new_message(outcome):
+                # 旧消息身份已被 Telegram 明确拒绝；后续新发送若结果未知，
+                # 绝不能继续沿用旧 message_id 或自动重放。
+                fallback_to_new_message = True
                 outcome = send_event_result(event, chat_id=chat_id or None)
         else:
             outcome = send_event_result(event, chat_id=chat_id or None)
@@ -376,7 +385,11 @@ def _dispatch_item(item: dict) -> bool:
             notification_id,
             lease_generation=generation,
             claimed_revision=claimed_revision,
-            message_id=int(outcome.message_id or message_id or 0),
+            message_id=int(
+                outcome.message_id
+                or (0 if fallback_to_new_message else message_id)
+                or 0
+            ),
         )
     if outcome.outcome_unknown:
         mark_outcome_unknown(
@@ -384,21 +397,30 @@ def _dispatch_item(item: dict) -> bool:
             lease_generation=generation,
             claimed_revision=claimed_revision,
             error=outcome.error or "OutcomeUnknown",
-            message_id=int(outcome.message_id or message_id or 0),
+            message_id=int(
+                outcome.message_id
+                or (0 if fallback_to_new_message else message_id)
+                or 0
+            ),
+            clear_message_id=fallback_to_new_message,
         )
         return False
     if 400 <= int(outcome.status_code or 0) < 500 and int(outcome.status_code) not in {408, 429}:
         fail_notification(
             notification_id,
             lease_generation=generation,
+            claimed_revision=claimed_revision,
             error=outcome.error or "TelegramRequestRejected",
+            clear_message_id=fallback_to_new_message,
         )
         return False
     retry_notification(
         notification_id,
         lease_generation=generation,
+        claimed_revision=claimed_revision,
         error=outcome.error or "TelegramUnavailable",
         retry_after_seconds=outcome.retry_after_seconds,
+        clear_message_id=fallback_to_new_message,
     )
     return False
 

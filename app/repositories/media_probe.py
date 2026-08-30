@@ -2,10 +2,20 @@
 from __future__ import annotations
 
 import json
+import logging
+import threading
+import time
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from types import ModuleType
+
+
+logger = logging.getLogger(__name__)
+_PROBE_CACHE_MAINTENANCE_INTERVAL_SECONDS = 3600.0
+_probe_cache_maintenance_lock = threading.Lock()
+_probe_cache_next_maintenance = 0.0
 
 
 def _database() -> "ModuleType":
@@ -158,6 +168,68 @@ def get_media_probe_cache_many(
     return result
 
 
+def prune_media_probe_cache(
+    *,
+    expired_before: str | None = None,
+    retention_days: int = 180,
+    max_rows: int = 100_000,
+    batch_size: int = 5_000,
+) -> int:
+    """分批清理长期未更新和最旧探测缓存，保留近期内容指纹复用价值。"""
+    if expired_before is None:
+        cutoff = datetime.now(UTC) - timedelta(days=max(1, int(retention_days)))
+        expired_before = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    row_limit = max(1, int(max_rows))
+    delete_limit = max(1, int(batch_size))
+    deleted = 0
+    with _database().get_conn() as conn:
+        cursor = conn.execute(
+            "DELETE FROM media_probe_cache WHERE file_id IN ("
+            "SELECT file_id FROM media_probe_cache WHERE updated_at < ? "
+            "ORDER BY updated_at, file_id LIMIT ?"
+            ")",
+            (str(expired_before), delete_limit),
+        )
+        deleted += max(0, int(cursor.rowcount or 0))
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM media_probe_cache"
+        ).fetchone()[0])
+        overflow = max(0, total - row_limit)
+        if overflow:
+            cursor = conn.execute(
+                "DELETE FROM media_probe_cache WHERE file_id IN ("
+                "SELECT file_id FROM media_probe_cache "
+                "ORDER BY updated_at, file_id LIMIT ?"
+                ")",
+                (min(overflow, delete_limit),),
+            )
+            deleted += max(0, int(cursor.rowcount or 0))
+    return deleted
+
+
+def _maybe_prune_media_probe_cache() -> None:
+    global _probe_cache_next_maintenance
+    now = time.monotonic()
+    if now < _probe_cache_next_maintenance:
+        return
+    if not _probe_cache_maintenance_lock.acquire(blocking=False):
+        return
+    try:
+        now = time.monotonic()
+        if now < _probe_cache_next_maintenance:
+            return
+        # 清理失败时仍限频，避免数据库异常期间放大写入故障。
+        _probe_cache_next_maintenance = (
+            now + _PROBE_CACHE_MAINTENANCE_INTERVAL_SECONDS
+        )
+        try:
+            prune_media_probe_cache()
+        except Exception as exc:  # pragma: no cover - 日志兜底，不影响探测缓存写入
+            logger.warning("媒体探测缓存清理失败: %s", exc)
+    finally:
+        _probe_cache_maintenance_lock.release()
+
+
 def upsert_media_probe_cache(file_id: str, etag: str, size: int, payload: str) -> None:
     database = _database()
     with database.get_conn() as conn:
@@ -169,6 +241,7 @@ def upsert_media_probe_cache(file_id: str, etag: str, size: int, payload: str) -
                 str(file_id), str(etag or ""), int(size or 0), str(payload), database.now(),
             ),
         )
+    _maybe_prune_media_probe_cache()
 
 
 def upsert_media_probe_failure_cache(
@@ -203,4 +276,5 @@ def upsert_media_probe_failure_cache(
                 normalized_payload, database.now(),
             ),
         )
-        return True
+    _maybe_prune_media_probe_cache()
+    return True

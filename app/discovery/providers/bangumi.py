@@ -1,10 +1,10 @@
 """Bangumi Calendar/Subject 媒体探索 Provider。"""
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from datetime import datetime
 import threading
 import time
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -100,8 +100,29 @@ class BangumiProvider(DiscoveryProvider):
         self._calendar_payload: list[Any] | None = None
         self._calendar_expires_at = 0.0
         self._calendar_is_stale = False
+        self._close_lock = threading.Lock()
+        self._closed = False
+
+    def _ensure_open(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                raise ProviderUnavailable("Bangumi 数据源已关闭")
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        with self._calendar_lock:
+            self._calendar_payload = None
+            self._calendar_expires_at = 0.0
+            self._calendar_is_stale = False
+        close = getattr(self.session, "close", None)
+        if callable(close):
+            close()
 
     def _get(self, path: str, *, expected_type: type) -> Any:
+        self._ensure_open()
         try:
             response = self.session.get(
                 f"{self.base_url}{path}",
@@ -145,6 +166,7 @@ class BangumiProvider(DiscoveryProvider):
         page: int,
         filters: dict[str, Any] | None,
     ) -> DiscoveryPage:
+        self._ensure_open()
         category = str(category or "").strip().lower()
         if category not in {"weekly", "calendar", "today"}:
             raise ProviderInvalidResponse("不支持的 Bangumi 分类")

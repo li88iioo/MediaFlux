@@ -29,8 +29,12 @@
     let sources=[];
     let nsfwSourceIds=[];
     let pollTimer=null;
-    let scheduleTimer=null;
     let lastStatusRenderKey='';
+    let lastStatusDetailText='';
+    let lastScheduleLastText='';
+    const STATUS_ACTIVE_POLL_MS=2000;
+    const STATUS_IDLE_POLL_MS=30000;
+    const STATUS_RETRY_POLL_MS=5000;
     let configReady=false;
     let statusRequestSerial=0;
     let organizeActionBusy=false;
@@ -763,10 +767,13 @@
         else if(schedule.config_error)next.textContent=`调度暂停：${schedule.config_error}`;
         else if(!schedule.cron_valid)next.textContent='调度暂停：Cron 必须是标准 5 段格式';
         else next.textContent=schedule.next_run?`下次运行：${schedule.next_run}`:'正在计算下次运行时间';
-        const result=schedule.last_result||{};if(!Object.keys(result).length)return;
-        const outcome={started:'已启动',completed:'已完成',failed:'失败',stopped:'已停止',skipped:'已跳过'}[result.outcome]||result.outcome||'未知';
-        const stats=result.stats||{};const counts=Object.keys(stats).length?` · 移动 ${stats.moved||0} / 跳过 ${stats.skipped||0} / 失败 ${stats.failed||0}`:'';
-        last.textContent=`最近结果：${outcome}${result.finished_at||result.started_at?` · ${result.finished_at||result.started_at}`:''}${counts}${result.message?` · ${result.message}`:''}`;
+        const result=schedule.last_result||{};
+        if(Object.keys(result).length){
+            const outcome={started:'已启动',completed:'已完成',failed:'失败',stopped:'已停止',skipped:'已跳过'}[result.outcome]||result.outcome||'未知';
+            const stats=result.stats||{};const counts=Object.keys(stats).length?` · 移动 ${stats.moved||0} / 跳过 ${stats.skipped||0} / 失败 ${stats.failed||0}`:'';
+            last.textContent=`最近结果：${outcome}${result.finished_at||result.started_at?` · ${result.finished_at||result.started_at}`:''}${counts}${result.message?` · ${result.message}`:''}`;
+        }
+        lastScheduleLastText=last.textContent;
     }
     function renderGroupProgress(data){
         // 组级进度只做局部文本更新：运行期间元素始终占位，避免出现/消失造成布局跳动。
@@ -790,7 +797,32 @@
         if(el.hidden)el.hidden=false;
         if(el.textContent!==text)el.textContent=text;
     }
+    function clearStatusSyncError(){
+        if(isRules){
+            const last=document.getElementById('organizeScheduleLast');
+            if(last&&lastScheduleLastText)last.textContent=lastScheduleLastText;
+            return;
+        }
+        const detail=document.getElementById('organizeStatusDetail');
+        if(detail&&lastStatusDetailText)detail.textContent=lastStatusDetailText;
+    }
+    function renderStatusSyncError(){
+        if(isRules){
+            const last=document.getElementById('organizeScheduleLast');
+            if(!last)return;
+            const stable=lastScheduleLastText||last.textContent||'尚未取得调度状态';
+            if(!lastScheduleLastText)lastScheduleLastText=stable;
+            last.textContent=`${stable} · 状态同步失败，重试中`;
+            return;
+        }
+        const detail=document.getElementById('organizeStatusDetail');
+        if(!detail)return;
+        const stable=lastStatusDetailText||detail.textContent||'尚未取得整理状态';
+        if(!lastStatusDetailText)lastStatusDetailText=stable;
+        detail.textContent=`${stable} · 状态同步失败，重试中`;
+    }
     function renderStatus(data){
+        clearStatusSyncError();
         const renderKey=JSON.stringify({
             status:data.status||'',message:data.message||'',error:data.error||'',
             current_source:data.current_source||'',stats:data.stats||{},schedule:data.schedule||{},
@@ -820,15 +852,54 @@
 
         const stats=data.stats||{};
         document.getElementById('organizeStatusTitle').textContent=data.message||'暂无任务';
-        document.getElementById('organizeStatusDetail').textContent=data.error||`${data.current_source||''}${Object.keys(stats).length?` · 已移动 ${stats.moved||0} · 跳过 ${stats.skipped||0} · 失败 ${stats.failed||0}`:' · 建议先预览识别结果再执行'}`;
+        const detail=document.getElementById('organizeStatusDetail');
+        detail.textContent=data.error||`${data.current_source||''}${Object.keys(stats).length?` · 已移动 ${stats.moved||0} · 跳过 ${stats.skipped||0} · 失败 ${stats.failed||0}`:' · 建议先预览识别结果再执行'}`;
+        lastStatusDetailText=detail.textContent;
 
         document.getElementById('runOrganizeBtn').disabled=organizeActionBusy||running;
         document.getElementById('stopOrganizeBtn').disabled=organizeActionBusy||!running;
         document.getElementById('cleanEmptyBtn').disabled=organizeActionBusy||running;
-        if(!running&&pollTimer){clearInterval(pollTimer);pollTimer=null;}
     }
-    async function loadStatus(){const serial=++statusRequestSerial;try{const response=await fetch('/api/guangya/organize/status');const data=await response.json();if(serial===statusRequestSerial)renderStatus(data);}catch(_){} }
-    function startPolling(){loadStatus();if(!pollTimer)pollTimer=setInterval(loadStatus,2000);}
+    async function loadStatus(){
+        const serial=++statusRequestSerial;
+        try{
+            const response=await fetch('/api/guangya/organize/status');
+            if(!response.ok)throw new Error(`状态接口返回 ${response.status||'非 2xx'}`);
+            const data=await response.json();
+            if(!data||typeof data!=='object'||Array.isArray(data)||typeof data.status!=='string'||!data.status){
+                throw new Error('状态接口响应无效');
+            }
+            if(serial!==statusRequestSerial)return {ok:true,stale:true};
+            renderStatus(data);
+            return {ok:true,data};
+        }catch(error){
+            if(serial===statusRequestSerial)renderStatusSyncError();
+            return {ok:false,error};
+        }
+    }
+    function clearStatusPoll(){
+        if(pollTimer!==null)window.clearTimeout(pollTimer);
+        pollTimer=null;
+    }
+    function scheduleStatusPoll(delay){
+        clearStatusPoll();
+        if(document.hidden)return;
+        pollTimer=window.setTimeout(pollStatus,delay);
+    }
+    async function pollStatus(){
+        pollTimer=null;
+        const result=await loadStatus();
+        const delay=!result.ok
+            ?STATUS_RETRY_POLL_MS
+            :(result.stale||organizeStatusRunning?STATUS_ACTIVE_POLL_MS:STATUS_IDLE_POLL_MS);
+        scheduleStatusPoll(delay);
+    }
+    function startPolling(){scheduleStatusPoll(0);}
+    document.addEventListener('visibilitychange',()=>{
+        if(document.hidden)clearStatusPoll();
+        else startPolling();
+    });
+
 
 
     document.getElementById('saveOrganizeConfigBtn').addEventListener('click',saveConfig);
@@ -878,8 +949,7 @@
         });
         finishConfigLoad(true);updateDependencies();syncNsfwPanel({collapseWhenDisabled:true});
     }).catch(()=>{updateDependencies();syncNsfwPanel({collapseWhenDisabled:true});finishConfigLoad(false);});
-    loadStatus();
-    if(!scheduleTimer)scheduleTimer=setInterval(loadStatus,30000);
+    startPolling();
     }else{
     document.getElementById('addOrganizeSourceBtn').addEventListener('click',()=>pickDirectory('source'));
     document.getElementById('pickOrganizeTargetBtn').addEventListener('click',()=>pickDirectory('target'));
@@ -897,6 +967,6 @@
         }
         finishConfigLoad(true);
     }).catch(()=>{renderSources();renderTarget('','');finishConfigLoad(false);});
-    loadStatus().then(()=>{if(!['IDLE','空闲','已完成','DONE','部分完成','PARTIAL','已停止','STOPPED','失败','FAILED'].includes(document.getElementById('organizeStateTag')?.textContent?.trim()))startPolling();});
+    startPolling();
     }
 })();

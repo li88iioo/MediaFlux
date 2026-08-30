@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -10,8 +11,17 @@ from urllib.parse import urlsplit
 import requests
 
 from app import config as app_config
-from app.discovery.models import ProviderInvalidResponse, ProviderNotConfigured, ProviderUnavailable
-from app.discovery.providers.base import DEFAULT_TIMEOUT, TimeoutValue, map_request_error, response_json
+from app.discovery.models import (
+    ProviderInvalidResponse,
+    ProviderNotConfigured,
+    ProviderUnavailable,
+)
+from app.discovery.providers.base import (
+    DEFAULT_TIMEOUT,
+    TimeoutValue,
+    map_request_error,
+    response_json,
+)
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -76,6 +86,8 @@ class TMDBClient:
         self.timeout = timeout
         self.retries = max(0, min(int(retries), 2))
         self.session = session or requests.Session()
+        self._close_lock = threading.Lock()
+        self._closed = False
 
         proxy = (
             _config_get(config, "PROXY_URL") if proxy_url is None else str(proxy_url or "")
@@ -92,6 +104,9 @@ class TMDBClient:
         deadline_at: float | None = None,
         retries: int | None = None,
     ) -> dict[str, Any]:
+        with self._close_lock:
+            if self._closed:
+                raise ProviderUnavailable("TMDB Client 已关闭")
         if self.config_error:
             raise ProviderNotConfigured(self.config_error)
         if not self.api_key:
@@ -165,6 +180,15 @@ class TMDBClient:
         if not normalized.isascii() or not normalized.isdigit() or not 1 <= len(normalized) <= 10:
             raise ValueError("TMDB ID 必须是 1 到 10 位数字")
         return normalized
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        close = getattr(self.session, "close", None)
+        if callable(close):
+            close()
 
     def detail(
         self,

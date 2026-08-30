@@ -117,6 +117,9 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("imagetools create --tag", promote)
         self.assertIn('test "$promoted_digest" = "$promotion_digest"', promote)
         self.assertIn("Reuse previously verified immutable tag", promote)
+        self.assertIn("belongs to a different commit; refusing overwrite", promote)
+        self.assertIn("exists but cannot be verified; refusing overwrite", promote)
+        self.assertGreaterEqual(promote.count("exit 1"), 2)
         self.assertIn("existing-exact-manifest.json", promote)
         self.assertIn('platform_digest=$(jq -r', promote)
         self.assertIn('$IMAGE_REPOSITORY@$platform_digest', promote)
@@ -154,6 +157,15 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("GIT_SHA=${{ steps.context.outputs.source_sha }}", self.text)
         self.assertIn("SOURCE_DATE_EPOCH=${{ steps.context.outputs.source_date_epoch }}", self.text)
         self.assertIn("ARG SOURCE_DATE_EPOCH", Path("Dockerfile").read_text(encoding="utf-8"))
+
+    def test_existing_release_assets_are_only_replaced_for_same_commit(self) -> None:
+        publish = self.text.split("      - name: Publish GitHub Release", 1)[1]
+        self.assertIn('gh release download "$VERSION_REF"', publish)
+        self.assertIn("--pattern BUILD-INFO.json", publish)
+        self.assertIn("EXISTING_RELEASE_SHA=$(jq -r '.commit // empty'", publish)
+        self.assertIn('"$EXISTING_RELEASE_SHA" != "$EXPECTED_SHA"', publish)
+        self.assertIn("refusing asset overwrite", publish)
+        self.assertIn("has no verifiable BUILD-INFO.json; refusing overwrite", publish)
 
     def test_release_assets_reuse_commit_epoch_for_annotated_tags(self) -> None:
         publish = self.text.split("      - name: Publish GitHub Release", 1)[1]

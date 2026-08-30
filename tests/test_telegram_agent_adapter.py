@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
+import requests
+
 from app import database as db
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.operation_coordinator import reset_agent_operation_state_for_tests
@@ -136,6 +138,13 @@ class _RichDraftBot(_Bot):
         return SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=77)
 
 
+class _TelegramEditRejected(RuntimeError):
+    result_json = {
+        "error_code": 400,
+        "description": "Bad Request: message can't be edited",
+    }
+
+
 class _PlainDraftBot(_Bot):
     def __init__(self):
         super().__init__()
@@ -169,11 +178,31 @@ class _RichFinalFallbackBot(_RichDraftBot):
         self.sent = []
 
     def send_rich_message(self, chat_id, rich_message, **kwargs):
-        raise RuntimeError("rich finalization unavailable")
+        raise requests.ConnectTimeout("rich finalization unavailable")
 
     def send_message(self, chat_id, text, **kwargs):
         self.sent.append((chat_id, text, kwargs))
         return SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=79)
+
+
+class _RichFinalReadTimeoutBot(_RichDraftBot):
+    def __init__(self):
+        super().__init__()
+        self.plain_messages = []
+
+    def send_rich_message(self, chat_id, rich_message, **kwargs):
+        self.rich_messages.append((chat_id, rich_message, kwargs))
+        raise requests.ReadTimeout("response lost after rich send")
+
+    def send_message(self, chat_id, text, **kwargs):
+        self.plain_messages.append((chat_id, text, kwargs))
+        return SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=79)
+
+
+class _PlainFinalReadTimeoutBot(_PlainDraftBot):
+    def send_message(self, chat_id, text, **kwargs):
+        self.sent.append((chat_id, text, kwargs))
+        raise requests.ReadTimeout("response lost after plain send")
 
 
 class _EditStreamBot(_Bot):
@@ -192,7 +221,7 @@ class _FailingEditStreamBot(_EditStreamBot):
         self.deleted = []
 
     def edit_message_text(self, text, chat_id, message_id, **kwargs):
-        raise RuntimeError("edit unavailable")
+        raise _TelegramEditRejected("edit unavailable")
 
     def delete_message(self, chat_id, message_id):
         self.deleted.append((chat_id, message_id))
@@ -208,11 +237,11 @@ class _CallbackEditFallbackBot(_Bot):
 
     def edit_message_text(self, text, chat_id, message_id, **kwargs):
         self.edit_attempts.append((text, chat_id, message_id, kwargs))
-        raise RuntimeError("edit unavailable")
+        raise _TelegramEditRejected("edit unavailable")
 
     def send_message(self, chat_id, text, **kwargs):
         if self.offline:
-            raise RuntimeError("send unavailable")
+            raise requests.ConnectTimeout("send unavailable")
         self.sent.append((chat_id, text, kwargs))
         return SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=81)
 
@@ -3349,6 +3378,50 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(recorded["presentation"]["status"], "interrupted")
         self.assertEqual(state_commits, ["检查下载队列"])
 
+    def test_interrupted_rich_read_timeout_never_falls_back_to_plain_or_reply(self):
+        bot = _RichFinalReadTimeoutBot()
+        service = Mock()
+        service.query.return_value = {
+            "mode": "answer",
+            "tool_call": {
+                "name": "downloads.diagnose_queue",
+                "arguments": {},
+            },
+            "result": {
+                "ok": True,
+                "summary": "不应在中断后重放这个摘要",
+                "suggestions": [],
+                "evidence": [],
+            },
+        }
+
+        async def broken_stream(*_args, **_kwargs):
+            yield "已经生成一部分安全回答。"
+            raise ProviderStreamError("upstream interrupted")
+
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.stream_tool_answer", broken_stream
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_conversation"
+        ):
+            self.assertTrue(
+                handle_agent_message(bot, _RichTelebot, _message("检查下载队列"))
+            )
+
+        self.assertEqual(len(bot.rich_messages), 1)
+        self.assertEqual(bot.plain_messages, [])
+        self.assertEqual(bot.replies, [])
+
     def test_message_never_publishes_unsafe_provider_delta(self):
         bot = _RichDraftBot()
         service = Mock()
@@ -3625,6 +3698,63 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(len(bot.sent), 1)
         self.assertIn("检查完成", bot.sent[0][1])
         self.assertNotIn("Agent 已完成", bot.sent[0][1])
+        self.assertEqual(bot.replies, [])
+
+    def test_rich_final_read_timeout_never_falls_back_to_plain_or_reply(self):
+        bot = _RichFinalReadTimeoutBot()
+        service = Mock()
+        service.query.return_value = {
+            "mode": "answer",
+            "result": {
+                "ok": True,
+                "summary": "检查完成",
+                "suggestions": [],
+                "evidence": [],
+            },
+        }
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ):
+            self.assertTrue(handle_agent_message(bot, _RichTelebot, _message()))
+
+        self.assertEqual(len(bot.rich_messages), 1)
+        self.assertEqual(bot.plain_messages, [])
+        self.assertEqual(bot.replies, [])
+
+    def test_plain_final_read_timeout_never_falls_back_to_reply(self):
+        bot = _PlainFinalReadTimeoutBot()
+        service = Mock()
+        service.query.return_value = {
+            "mode": "answer",
+            "result": {
+                "ok": True,
+                "summary": "检查完成",
+                "suggestions": [],
+                "evidence": [],
+            },
+        }
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ):
+            self.assertTrue(handle_agent_message(bot, _Telebot, _message()))
+
+        self.assertEqual(len(bot.sent), 1)
         self.assertEqual(bot.replies, [])
 
     def test_message_falls_back_to_editing_one_placeholder(self):

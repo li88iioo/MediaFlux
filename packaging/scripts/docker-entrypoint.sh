@@ -51,9 +51,19 @@ if [ "$current_uid" != "$puid" ]; then
     usermod --non-unique --uid "$puid" --gid "$pgid" mediaflux
 fi
 
-# 数据库目录体积小且完全由 MediaFlux 管理，可以安全自动修复；STRM 大库默认
-# 只修复挂载根目录，避免每次启动递归遍历数万文件。
-chown -R "$puid:$pgid" /app/db
+# 首次切换到某组 PUID/PGID 时迁移 MediaFlux 自有数据目录；后续启动只修复
+# 三个固定目录，避免日志、缓存或备份增长后每次都递归扫描整棵挂载树。
+data_owner_marker="/app/db/.mediaflux-owner-${puid}-${pgid}"
+if [ ! -f "$data_owner_marker" ] || is_enabled "${MEDIAFLUX_FIX_DATA_PERMISSIONS:-0}"; then
+    chown -R "$puid:$pgid" /app/db
+    rm -f /app/db/.mediaflux-owner-*
+    : > "$data_owner_marker"
+    chown "$puid:$pgid" "$data_owner_marker"
+else
+    chown "$puid:$pgid" /app/db /app/db/cache /app/db/logs
+fi
+
+# STRM 大库默认只修复挂载根目录；显式迁移时才递归处理。
 chown "$puid:$pgid" /data/strm
 if is_enabled "${MEDIAFLUX_FIX_STRM_PERMISSIONS:-0}"; then
     chown -R "$puid:$pgid" /data/strm

@@ -34,6 +34,12 @@ _TERMINAL_DELIVERY_FAILURES = frozenset({
     "outcome_unknown",
     "suppressed",
 })
+_TERMINAL_LIFECYCLE_STATES = frozenset({
+    "completed",
+    "partial",
+    "failed",
+    "stopped",
+})
 
 
 def _field_value(event: NotificationEvent, label: str) -> str:
@@ -45,7 +51,12 @@ def _field_value(event: NotificationEvent, label: str) -> str:
 
 
 def organize_lifecycle_downstream_settled(event: NotificationEvent) -> bool:
-    """STRM 已离开排队/运行态；媒体库字段会在同一 revision 一并回写。"""
+    """按持久机器状态判断终态；仅为升级前 outbox 保留文案兼容。"""
+    state = str(event.state or "").strip().lower()
+    if state:
+        return state in _TERMINAL_LIFECYCLE_STATES
+    # 兼容升级前已经持久化、尚未送达且没有 state 字段的事件。新事件不得
+    # 依赖展示文案驱动状态机。
     strm_status = _field_value(event, "STRM")
     return bool(strm_status and strm_status not in _PENDING_STRM_STATES)
 
@@ -240,11 +251,22 @@ def build_organize_lifecycle_event(
     if confirmation_label:
         fields.append(("人工确认", confirmation_label))
     fields.extend((("STRM", strm_status), ("媒体库", media_refresh)))
+    if stopped:
+        lifecycle_state = "stopped"
+    elif str(strm_status or "").strip() in _PENDING_STRM_STATES:
+        lifecycle_state = "queued"
+    elif counts["failed"] and str(strm_status or "").strip() == "未执行":
+        lifecycle_state = "failed"
+    elif attention:
+        lifecycle_state = "partial"
+    else:
+        lifecycle_state = "completed"
     event = NotificationEvent(
         title,
         fields=tuple(fields),
         footer=footer,
         layout="relaxed",
+        state=lifecycle_state,
     )
     return attach_bounded_media_details(
         event,
@@ -329,6 +351,7 @@ def update_organize_lifecycle_downstream(
         actions=previous.actions,
         layout=previous.layout,
         field_emojis=previous.field_emojis,
+        state="partial" if partial or error else "completed",
     )
     return publish_notification_thread(
         thread_key,

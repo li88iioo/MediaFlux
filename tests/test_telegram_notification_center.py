@@ -31,7 +31,11 @@ from app.notifier import (
 )
 from app.repositories.telegram_notifications import (
     claim_due_notifications,
+    fail_notification,
     get_notification,
+    retry_notification,
+    suppress_notification,
+    upsert_notification,
 )
 from app.routes.api import save_config
 from tests.support import IsolatedDatabaseTestCase
@@ -59,6 +63,7 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
             actions=(NotificationAction("确认", "orgc:token:0"),),
             layout="relaxed",
             field_emojis=False,
+            state="running",
         )
         restored = deserialize_notification_event(serialize_notification_event(event))
         self.assertEqual(restored, event)
@@ -277,6 +282,158 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertEqual(final["status"], "sent")
         self.assertEqual(final["delivered_revision"], 3)
         self.assertEqual(editor.call_count, 2)
+
+    def test_stale_permanent_failure_requeues_newer_revision(self) -> None:
+        event_key = "test:stale-failure"
+        upsert_notification(
+            event_key,
+            thread_key="organize:stale-failure",
+            topic="organize",
+            importance="result",
+            chat_id="100",
+            event_json=serialize_notification_event(NotificationEvent("revision 1")),
+            replace=True,
+        )
+        claimed = claim_due_notifications(limit=1, event_key=event_key)[0]
+        upsert_notification(
+            event_key,
+            thread_key="organize:stale-failure",
+            topic="organize",
+            importance="result",
+            chat_id="100",
+            event_json=serialize_notification_event(NotificationEvent("revision 2")),
+            replace=True,
+        )
+
+        self.assertTrue(fail_notification(
+            claimed["id"],
+            lease_generation=claimed["lease_generation"],
+            claimed_revision=claimed["revision"],
+            error="TelegramRequestRejected",
+        ))
+        row = get_notification(event_key)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["revision"], 2)
+        self.assertEqual(row["attempts"], 0)
+
+    def test_stale_suppression_does_not_consume_newer_revision(self) -> None:
+        event_key = "test:stale-suppression"
+        upsert_notification(
+            event_key,
+            thread_key="organize:stale-suppression",
+            topic="organize",
+            importance="detail",
+            chat_id="100",
+            event_json=serialize_notification_event(NotificationEvent("revision 1")),
+            replace=True,
+        )
+        claimed = claim_due_notifications(limit=1, event_key=event_key)[0]
+        upsert_notification(
+            event_key,
+            thread_key="organize:stale-suppression",
+            topic="organize",
+            importance="result",
+            chat_id="100",
+            event_json=serialize_notification_event(NotificationEvent("revision 2")),
+            replace=True,
+        )
+
+        self.assertTrue(suppress_notification(
+            claimed["id"],
+            lease_generation=claimed["lease_generation"],
+            claimed_revision=claimed["revision"],
+        ))
+        row = get_notification(event_key)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["revision"], 2)
+        self.assertEqual(row["delivered_revision"], 0)
+
+    def test_retry_exhaustion_does_not_fail_newer_revision(self) -> None:
+        event_key = "test:stale-retry"
+        upsert_notification(
+            event_key,
+            thread_key="organize:stale-retry",
+            topic="organize",
+            importance="result",
+            chat_id="100",
+            event_json=serialize_notification_event(NotificationEvent("revision 1")),
+            replace=True,
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE telegram_notification_outbox SET attempts=6 WHERE event_key=?",
+                (event_key,),
+            )
+        claimed = claim_due_notifications(limit=1, event_key=event_key)[0]
+        upsert_notification(
+            event_key,
+            thread_key="organize:stale-retry",
+            topic="organize",
+            importance="result",
+            chat_id="100",
+            event_json=serialize_notification_event(NotificationEvent("revision 2")),
+            replace=True,
+        )
+
+        status = retry_notification(
+            claimed["id"],
+            lease_generation=claimed["lease_generation"],
+            claimed_revision=claimed["revision"],
+            error="TelegramUnavailable",
+        )
+        self.assertEqual(status, "pending")
+        row = get_notification(event_key)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["revision"], 2)
+        self.assertEqual(row["attempts"], 0)
+
+    @patch("app.modules.telegram_notification_center.edit_event_result")
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_unknown_fallback_send_drops_stale_message_identity_and_never_replays(
+        self, sender, editor,
+    ) -> None:
+        sender.side_effect = [
+            TelegramSendResult(ok=True, message_id=193),
+            TelegramSendResult(ok=False, status_code=408, error="ReadTimeout"),
+        ]
+        editor.return_value = TelegramSendResult(
+            ok=False,
+            status_code=400,
+            error="Bad Request: message to edit not found",
+        )
+        thread_key = "organize:fallback-unknown"
+        first = publish_notification_thread(
+            thread_key,
+            NotificationEvent("initial"),
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+        )
+        self.assertTrue(first.delivered)
+
+        second = publish_notification_thread(
+            thread_key,
+            NotificationEvent("terminal"),
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+        )
+        self.assertTrue(second.accepted)
+        self.assertFalse(second.delivered)
+        row = get_notification(second.event_key)
+        self.assertEqual(row["status"], "outcome_unknown")
+        self.assertEqual(int(row["message_id"] or 0), 0)
+
+        publish_notification_thread(
+            thread_key,
+            NotificationEvent("newer terminal"),
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+        )
+        row = get_notification(second.event_key)
+        self.assertEqual(row["status"], "outcome_unknown")
+        self.assertEqual(row["revision"], 3)
+        self.assertEqual(int(row["message_id"] or 0), 0)
+        self.assertEqual(sender.call_count, 2)
+        self.assertEqual(editor.call_count, 1)
 
     @patch("app.modules.telegram_notification_center.send_event_result")
     def test_thread_is_bounded_to_one_editable_text_message(self, sender) -> None:

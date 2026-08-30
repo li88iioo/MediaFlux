@@ -111,8 +111,13 @@ def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
                 else NotificationImportance.RESULT
             ),
         )
-        # 用户主动关闭全局通知属于消费策略，不应让旧 outbox 无限重试。
-        accepted = bool(outcome) or not notifications_enabled()
+        # 全局开关或通知等级主动抑制都属于已执行的消费策略；旧 outbox
+        # 不应把同一条被策略拒绝的结果反复移交和重试。
+        accepted = (
+            bool(outcome)
+            or str(outcome.status or "") in {"disabled", "suppressed"}
+            or not notifications_enabled()
+        )
         if accepted:
             if not mark_notification_sent(item["id"], lease_generation=generation):
                 delivered = False

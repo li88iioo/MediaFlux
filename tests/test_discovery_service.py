@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -19,8 +21,18 @@ from app.discovery.models import (
     ProviderRateLimited,
     ProviderUnavailable,
 )
-from app.discovery.registry import ProviderRegistry, list_filter_definitions, list_section_definitions, validate_filters, validate_request
-from app.discovery.service import DiscoveryService, get_discovery_service, shutdown_discovery_service
+from app.discovery.registry import (
+    ProviderRegistry,
+    list_filter_definitions,
+    list_section_definitions,
+    validate_filters,
+    validate_request,
+)
+from app.discovery.service import (
+    DiscoveryService,
+    get_discovery_service,
+    shutdown_discovery_service,
+)
 
 
 class FakeProvider:
@@ -28,6 +40,9 @@ class FakeProvider:
 
     def __init__(self):
         self.calls = 0
+        self.detail_calls = 0
+        self.close_calls = 0
+        self.closed = threading.Event()
         self.error = None
 
     def list_items(self, category, media_type, page, filters):
@@ -42,7 +57,12 @@ class FakeProvider:
         )
 
     def get_detail(self, external_id, media_type):
+        self.detail_calls += 1
         return MediaCard(provider="tmdb", external_id=external_id, media_type=media_type, title="Detail")
+
+    def close(self):
+        self.close_calls += 1
+        self.closed.set()
 
     def health(self):
         return ProviderHealth(name="tmdb", status="healthy")
@@ -175,6 +195,19 @@ class DiscoveryRegistryTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_registry_close_is_idempotent_and_rejects_future_access(self):
+        provider = FakeProvider()
+        registry = ProviderRegistry({"tmdb": provider, "alias": provider})
+
+        registry.close()
+        registry.close()
+
+        self.assertEqual(provider.close_calls, 1)
+        with self.assertRaises(ProviderUnavailable):
+            registry.get("tmdb")
+        with self.assertRaises(ProviderUnavailable):
+            registry.register(provider)
+
 
 class DiscoveryServiceTests(unittest.TestCase):
     def setUp(self):
@@ -196,6 +229,7 @@ class DiscoveryServiceTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        self.service.shutdown(timeout_seconds=0.5)
         self.db_patch.stop()
         self.temp.cleanup()
 
@@ -336,6 +370,115 @@ class DiscoveryServiceTests(unittest.TestCase):
 
         self.assertTrue(page.stale)
         self.assertEqual(self.provider.calls, 1)
+
+    def test_shutdown_is_bounded_and_late_refresh_cannot_publish_state(self):
+        service = DiscoveryService(
+            registry=self.registry, cache=self.cache, cache_ttl_seconds=60,
+            stale_ttl_seconds=300,
+        )
+        service.list_items("tmdb", "popular", "movie", 1, {})
+        initial = self.cache.get(
+            self.cache.make_key("tmdb", "popular", "movie", 1, {})
+        ).payload
+        self.now += timedelta(seconds=61)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_refresh(category, media_type, page, filters):
+            del category, filters
+            self.provider.calls += 1
+            started.set()
+            release.wait(2)
+            return DiscoveryPage(
+                items=[MediaCard(
+                    provider="tmdb", external_id=str(page), media_type=media_type,
+                    title="Late refresh",
+                )],
+                page=page, has_more=False, provider=ProviderHealth(name="tmdb"),
+            )
+
+        self.provider.list_items = blocking_refresh
+        stale = service.list_items("tmdb", "popular", "movie", 1, {})
+        self.assertTrue(stale.stale)
+        self.assertTrue(started.wait(1))
+
+        shutdown_started = time.monotonic()
+        self.assertFalse(service.shutdown(timeout_seconds=0.02))
+        self.assertLess(time.monotonic() - shutdown_started, 0.5)
+        self.assertFalse(self.provider.closed.is_set())
+
+        release.set()
+        self.assertTrue(self.provider.closed.wait(1))
+        current = self.cache.get(
+            self.cache.make_key("tmdb", "popular", "movie", 1, {})
+        ).payload
+        self.assertEqual(current, initial)
+        self.assertFalse(service._pending_refreshes)
+        self.assertFalse(service._refresh_cooldowns)
+        self.assertTrue(service.shutdown(timeout_seconds=0.5))
+        self.assertEqual(self.provider.close_calls, 1)
+
+    def test_shutdown_timeout_is_not_blocked_by_synchronous_submitter(self):
+        submit_started = threading.Event()
+        release_submit = threading.Event()
+
+        def blocking_submit(callback):
+            submit_started.set()
+            release_submit.wait(2)
+            callback()
+
+        service = DiscoveryService(
+            registry=self.registry, cache=self.cache, cache_ttl_seconds=60,
+            stale_ttl_seconds=300, refresh_submit=blocking_submit,
+        )
+        service.list_items("tmdb", "popular", "movie", 1, {})
+        self.now += timedelta(seconds=61)
+        pages = []
+        request = threading.Thread(
+            target=lambda: pages.append(
+                service.list_items("tmdb", "popular", "movie", 1, {})
+            )
+        )
+        request.start()
+        self.assertTrue(submit_started.wait(1))
+
+        shutdown_started = time.monotonic()
+        self.assertFalse(service.shutdown(timeout_seconds=0.02))
+        self.assertLess(time.monotonic() - shutdown_started, 0.5)
+
+        release_submit.set()
+        request.join(1)
+        self.assertFalse(request.is_alive())
+        self.assertTrue(pages[0].stale)
+        self.assertEqual(self.provider.calls, 1)
+        self.assertTrue(self.provider.closed.wait(1))
+        self.assertTrue(service.shutdown(timeout_seconds=0.5))
+
+    def test_closed_service_rejects_new_network_work_without_default_executor(self):
+        scraper_called = threading.Event()
+        scraper = SimpleNamespace(
+            search_candidates=lambda *_args, **_kwargs: scraper_called.set() or []
+        )
+        service = DiscoveryService(
+            registry=self.registry, cache=self.cache, scraper_factory=lambda: scraper,
+        )
+        self.assertTrue(service.shutdown(timeout_seconds=0.5))
+
+        with self.assertRaises(ProviderUnavailable):
+            service.list_items("tmdb", "popular", "movie", 99, {})
+        with self.assertRaises(ProviderUnavailable):
+            service.get_detail("tmdb", "movie", "99")
+        with self.assertRaises(ProviderUnavailable):
+            asyncio.run(
+                service.map_to_tmdb_async(
+                    "douban", "closed-1", "movie", "Closed", "2026"
+                )
+            )
+
+        self.assertEqual(self.provider.calls, 0)
+        self.assertEqual(self.provider.detail_calls, 0)
+        self.assertFalse(scraper_called.is_set())
+        self.assertEqual(self.provider.close_calls, 1)
 
     def test_error_cache_preserves_structured_provider_error(self):
         self.provider.error = ProviderRateLimited("slow down", retry_after=42)

@@ -42,6 +42,7 @@
         selectedCandidate: null,
         preview: null,
         menuReturnFocus: null,
+        menuOpenedAt: 0,
         requestVersion: 0,
         searchController: null,
         previewController: null,
@@ -129,6 +130,17 @@
         state.activeAction?.setAttribute('aria-expanded', 'false');
         if (restoreFocus) state.menuReturnFocus?.focus({preventScroll: true});
         state.menuReturnFocus = null;
+        state.menuOpenedAt = 0;
+    }
+
+    function closeMenuAfterViewportChange(event) {
+        // 聚焦或显示刚打开的菜单时，部分 Chromium/WebView 会派发一次可信的
+        // scroll/resize。仅忽略这种浏览器自身事件；程序主动派发的事件仍应关闭菜单。
+        const isInitialBrowserEvent = event?.isTrusted
+            && !menu.hidden
+            && performance.now() - state.menuOpenedAt < 160;
+        if (isInitialBrowserEvent) return;
+        closeMenu();
     }
 
     function viewportBounds() {
@@ -206,6 +218,7 @@
         state.menuReturnFocus = action;
         action.setAttribute('aria-expanded', 'true');
         configureMenu(item);
+        state.menuOpenedAt = performance.now();
         positionMenu(event, anchorToButton);
         menu.querySelector('[role="menuitem"]:not([hidden])')?.focus({preventScroll: true});
     }
@@ -1218,10 +1231,10 @@
         if (!menu.hidden) closeMenu({restoreFocus: true});
         else if (!modal.hidden) closeModal();
     });
-    window.addEventListener('resize', () => closeMenu());
-    window.visualViewport?.addEventListener('scroll', closeMenu);
-    window.visualViewport?.addEventListener('resize', closeMenu);
-    document.addEventListener('scroll', () => closeMenu(), true);
+    window.addEventListener('resize', closeMenuAfterViewportChange);
+    window.visualViewport?.addEventListener('scroll', closeMenuAfterViewportChange);
+    window.visualViewport?.addEventListener('resize', closeMenuAfterViewportChange);
+    document.addEventListener('scroll', closeMenuAfterViewportChange, true);
     modal.addEventListener('click', (event) => {
         const paneButton = event.target.closest('[data-scrape-mobile-pane]');
         if (paneButton) {

@@ -1,9 +1,10 @@
 """API 路由：看板数据、配置读写。日志查询已迁移到 logs_api 蓝图。"""
 from __future__ import annotations
 
-from typing import Any
 import re
+import threading
 import time
+from typing import Any
 
 import requests
 from fastapi import APIRouter, Body, Request
@@ -25,6 +26,7 @@ logger = get_logger(__name__)
 
 
 _CONFIG_MASK = "********"
+_CONFIG_SAVE_TRANSACTION_LOCK = threading.RLock()
 _CLEARABLE_SECRET_KEYS = frozenset({
     "TG_BOT_TOKEN",
     "AGENT_LLM_API_KEY",
@@ -1365,46 +1367,101 @@ def save_config(request: Request, data: Any = Body(default=None)):
         )
         return {"success": True}
 
+    changed_keys = frozenset(persisted_updates)
+    previous_values = {key: config.get(key, "") for key in changed_keys}
     persist_started = time.perf_counter()
     agent_transition_changed = bool(
-        {"AGENT_ENABLED", "TG_AGENT_ENABLED"} & persisted_updates.keys()
+        {"AGENT_ENABLED", "TG_AGENT_ENABLED"} & changed_keys
     )
-    try:
-        if agent_transition_changed:
-            from app.agent.feature_gate import (
-                agent_runtime_transition,
-                invalidate_agent_runtime_generation,
-            )
+    strm_reconcile_required = bool(
+        new_strm_sources is not None and "GY_STRM_SOURCE_DIRS" in changed_keys
+    )
 
-            with agent_runtime_transition():
+    def publish_config_updates() -> list[str]:
+        nonlocal config_persisted
+        if strm_reconcile_required:
+            from app import database as db
+
+            new_ids = {str(item["id"]) for item in new_strm_sources or []}
+            retired_sources = [
+                (
+                    str(source["id"]),
+                    str(source.get("name") or source["id"]),
+                    old_strm_root,
+                )
+                for source in old_strm_sources
+                if str(source["id"]) not in new_ids
+            ]
+            with db.reconcile_strm_retired_sources_transaction(
+                sorted(new_ids),
+                retired_sources,
+            ) as reconciled_ids:
                 config.set_and_save(persisted_updates)
-                if "AGENT_ENABLED" in persisted_updates:
-                    invalidate_agent_runtime_generation()
-        else:
-            config.set_and_save(persisted_updates)
+                config_persisted = True
+            return list(reconciled_ids)
+        config.set_and_save(persisted_updates)
+        config_persisted = True
+        return []
+
+    retired_source_ids: list[str] = []
+    config_persisted = False
+    try:
+        with _CONFIG_SAVE_TRANSACTION_LOCK:
+            if agent_transition_changed:
+                from app.agent.feature_gate import agent_runtime_transition
+
+                with agent_runtime_transition():
+                    retired_source_ids = publish_config_updates()
+            else:
+                retired_source_ids = publish_config_updates()
     except (config.AtomicPublishError, OSError) as exc:
         return config_write_api_error(
             exc,
             logger=logger,
             operation="save_settings",
         )
+    except Exception as exc:
+        rollback_succeeded = not config_persisted
+        if config_persisted:
+            try:
+                with _CONFIG_SAVE_TRANSACTION_LOCK:
+                    config.set_and_save(previous_values)
+                rollback_succeeded = True
+            except Exception as rollback_exc:
+                logger.critical(
+                    "STRM 来源配置一致性回滚失败 db_error=%s rollback_error=%s",
+                    type(exc).__name__,
+                    type(rollback_exc).__name__,
+                )
+        operation = "STRM 来源退役状态" if strm_reconcile_required else "配置"
+        logger.error(
+            "%s保存失败 type=%s config_rolled_back=%s",
+            operation,
+            type(exc).__name__,
+            rollback_succeeded,
+        )
+        if rollback_succeeded:
+            return api_error(f"{operation}保存失败，配置未变更，请稍后重试", 500)
+        return api_error(
+            "配置与 STRM 来源状态可能不一致，自动回滚失败；请重启服务并重新保存",
+            500,
+        )
     persist_ms = max(1, round((time.perf_counter() - persist_started) * 1000))
 
-    retired_source_ids: list[str] = []
-    if new_strm_sources is not None and "GY_STRM_SOURCE_DIRS" in updates:
-        new_ids = {str(item["id"]) for item in new_strm_sources}
-        from app import database as db
+    warnings: list[str] = []
+    restart_required = False
+    if "AGENT_ENABLED" in changed_keys:
+        try:
+            from app.agent.feature_gate import invalidate_agent_runtime_generation
 
-        db.cancel_strm_retired_sources(sorted(new_ids))
-        for source in old_strm_sources:
-            source_id = str(source["id"])
-            if source_id in new_ids:
-                continue
-            db.enqueue_strm_retired_source(
-                source_id, str(source.get("name") or source_id), old_strm_root
+            invalidate_agent_runtime_generation()
+        except Exception as exc:
+            warnings.append("Agent 配置已保存，但运行时切换未完成；重启后生效")
+            restart_required = True
+            logger.warning(
+                "Agent 运行代次更新失败 type=%s", type(exc).__name__
             )
-            retired_source_ids.append(source_id)
-    if _AI_RECOGNITION_KEYS & updates.keys():
+    if _AI_RECOGNITION_KEYS & changed_keys:
         try:
             from app.modules.ai_recognition_governance import (
                 clear_ai_recognition_governance,
@@ -1420,7 +1477,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         "TAVILY_TIMEOUT_SECONDS",
         "TAVILY_CACHE_TTL_SECONDS",
     }
-    if recognition_web_runtime_keys & updates.keys():
+    if recognition_web_runtime_keys & changed_keys:
         try:
             from app.modules.recognition_web_hints import (
                 clear_recognition_web_hint_cache,
@@ -1431,22 +1488,29 @@ def save_config(request: Request, data: Any = Body(default=None)):
             logger.warning(
                 "整理标题线索缓存重置失败 type=%s", type(exc).__name__
             )
-    if {"LOGIN_WALLPAPER_MODE", "TMDB_API_KEY"} & updates.keys():
-        from app.modules.login_wallpaper import schedule_login_wallpaper_refresh
-
-        schedule_login_wallpaper_refresh(force=True)
-    if _DISCOVERY_RUNTIME_KEYS & updates.keys():
-        from app.discovery.service import shutdown_discovery_service
-        from app.discovery.search import shutdown_discovery_search_service
-
-        shutdown_discovery_service()
-        shutdown_discovery_search_service()
+    if {"LOGIN_WALLPAPER_MODE", "TMDB_API_KEY"} & changed_keys:
         try:
+            from app.modules.login_wallpaper import schedule_login_wallpaper_refresh
+
+            schedule_login_wallpaper_refresh(force=True)
+        except Exception as exc:
+            logger.warning("登录壁纸后台刷新失败 type=%s", type(exc).__name__)
+    if _DISCOVERY_RUNTIME_KEYS & changed_keys:
+        try:
+            from app.discovery.search import shutdown_discovery_search_service
+            from app.discovery.service import shutdown_discovery_service
             from app.modules.recognition_hints import clear_recognition_hint_cache
+
+            shutdown_discovery_service()
+            shutdown_discovery_search_service()
             clear_recognition_hint_cache()
-        except Exception:
-            logger.warning("自动识别线索缓存重置失败", exc_info=True)
-    if any(key.startswith("INDEXER_") for key in updates):
+        except Exception as exc:
+            warnings.append("发现页配置已保存，但运行中实例未能热更新；重启后生效")
+            restart_required = True
+            logger.warning(
+                "发现页运行时配置热更新失败 type=%s", type(exc).__name__
+            )
+    if any(key.startswith("INDEXER_") for key in changed_keys):
         try:
             from app.indexers.runtime import (
                 run_indexer_awaitable_sync,
@@ -1458,6 +1522,8 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 timeout_seconds=_INDEXER_RUNTIME_REFRESH_TIMEOUT_SECONDS,
             )
         except Exception as exc:
+            warnings.append("Web 索引器配置已保存，但运行中实例未能热更新；重启后生效")
+            restart_required = True
             logger.warning(
                 "Web Indexer 配置热更新失败 type=%s", type(exc).__name__
             )
@@ -1469,17 +1535,19 @@ def save_config(request: Request, data: Any = Body(default=None)):
             if not shutdown_telegram_indexer_worker(
                 timeout=_INDEXER_RUNTIME_REFRESH_TIMEOUT_SECONDS
             ):
+                warnings.append("Telegram 索引器配置已保存，但热更新超时；重启后生效")
+                restart_required = True
                 logger.warning("Telegram Indexer 配置热更新超时")
         except Exception as exc:
+            warnings.append("Telegram 索引器配置已保存，但运行中实例未能热更新；重启后生效")
+            restart_required = True
             logger.warning(
                 "Telegram Indexer 配置热更新失败 type=%s", type(exc).__name__
             )
     bot_restart_ms = 0
-    warnings: list[str] = []
     background_services_enabled = getattr(
         request.app.state, "background_services_enabled", False
     )
-    changed_keys = persisted_updates.keys()
     bot_connection_keys = {"TG_BOT_TOKEN", "TG_CHAT_ID"}
     bot_agent_menu_keys = {"AGENT_ENABLED", "TG_AGENT_ENABLED"}
     if bot_connection_keys & changed_keys:
@@ -1494,6 +1562,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
                         "请稍后重试或重启 MediaFlux 服务"
                     )
                     warnings.append(warning)
+                    restart_required = True
                     logger.warning("Telegram Bot 配置热更新未完成：旧 polling 仍在退出")
             else:
                 from app.notifier import reset
@@ -1504,6 +1573,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 "Telegram Bot 配置已保存，但运行中实例热更新失败；"
                 "请稍后重试或重启 MediaFlux 服务"
             )
+            restart_required = True
             logger.warning("Telegram Bot 配置热更新失败 type=%s", type(exc).__name__)
         finally:
             bot_restart_ms = max(1, round((time.perf_counter() - bot_restart_started) * 1000))
@@ -1533,20 +1603,29 @@ def save_config(request: Request, data: Any = Body(default=None)):
         "JELLYFIN_ENABLED", "JELLYFIN_URL", "JELLYFIN_API_KEY", "JELLYFIN_USER_ID",
         "EMBY_ENABLED", "EMBY_URL", "EMBY_TOKEN", "EMBY_USER_ID",
     }
-    if media_proxy_keys & updates.keys():
+    if media_proxy_keys & changed_keys:
         manager = getattr(request.app.state, "media_proxy_manager", None)
         if manager is not None and getattr(request.app.state, "background_services_enabled", False):
             try:
-                manager.request_reconcile()
+                if not manager.request_reconcile():
+                    warnings.append(
+                        "媒体反代配置已保存，但运行中实例未接受热更新；重启后生效"
+                    )
+                    restart_required = True
             except Exception as exc:
+                warnings.append("媒体反代配置已保存，但运行中实例未能热更新；重启后生效")
+                restart_required = True
                 logger.warning("媒体反代配置热加载失败 type=%s", type(exc).__name__)
-    strm_keys = {key for key in updates if key.startswith("STRM_") or key.startswith("GY_STRM_")}
-    organize_keys = {key for key in updates if key.startswith("GY_ORGANIZE_")}
+    strm_keys = {
+        key for key in changed_keys
+        if key.startswith(("STRM_", "GY_STRM_"))
+    }
+    organize_keys = {key for key in changed_keys if key.startswith("GY_ORGANIZE_")}
     agent_patrol_keys = {
-        key for key in updates if key.startswith("AGENT_LIBRARY_PATROL_")
+        key for key in changed_keys if key.startswith("AGENT_LIBRARY_PATROL_")
     }
     agent_download_verification_keys = {
-        key for key in persisted_updates
+        key for key in changed_keys
         if key.startswith("AGENT_DOWNLOAD_VERIFICATION_")
     }
     if strm_keys:
@@ -1564,14 +1643,18 @@ def save_config(request: Request, data: Any = Body(default=None)):
                         result.get("error", "任务繁忙"),
                     )
         except Exception as exc:
+            warnings.append("STRM 调度配置已保存，但运行中调度器未能热更新；重启后生效")
+            restart_required = True
             logger.warning("STRM 调度配置热加载失败: %s", exc)
     if organize_keys:
         try:
             from app.modules.organize_scheduler import get_organize_scheduler
             get_organize_scheduler().reload()
         except Exception as exc:
+            warnings.append("整理调度配置已保存，但运行中调度器未能热更新；重启后生效")
+            restart_required = True
             logger.warning("整理调度配置热加载失败: %s", exc)
-        if _NSFW_ORGANIZE_KEYS & updates.keys():
+        if _NSFW_ORGANIZE_KEYS & changed_keys:
             try:
                 from app.modules.nsfw import clear_nsfw_cache
                 clear_nsfw_cache()
@@ -1587,6 +1670,8 @@ def save_config(request: Request, data: Any = Body(default=None)):
 
             get_agent_library_patrol_scheduler().reload(immediate=False)
         except Exception as exc:
+            warnings.append("Agent 巡检配置已保存，但运行中调度器未能热更新；重启后生效")
+            restart_required = True
             logger.warning(
                 "Agent 全库缺集巡检配置热加载失败 type=%s",
                 type(exc).__name__,
@@ -1601,16 +1686,26 @@ def save_config(request: Request, data: Any = Body(default=None)):
 
             get_download_library_verification_scheduler().reload()
         except Exception as exc:
-            logger.warning(
-                "Agent 下载后媒体库复核配置热加载失败 type=%s",
-                type(exc).__name__,
-            )
-    if "DOWNLOAD_TORRENT_RETENTION_DAYS" in persisted_updates:
+            if getattr(request.app.state, "background_services_enabled", False):
+                warnings.append("下载后复核配置已保存，但运行中调度器未能热更新；重启后生效")
+                restart_required = True
+                logger.warning(
+                    "Agent 下载后媒体库复核配置热加载失败 type=%s",
+                    type(exc).__name__,
+                )
+            else:
+                logger.debug(
+                    "后台服务未启动，跳过下载后媒体库复核调度器热加载结果 type=%s",
+                    type(exc).__name__,
+                )
+    if "DOWNLOAD_TORRENT_RETENTION_DAYS" in changed_keys:
         try:
             from app.modules.download_tracker import get_download_tracker
 
             get_download_tracker().reload(reset_torrent_cleanup=True)
         except Exception as exc:
+            warnings.append("种子保留期配置已保存，但下载跟踪器未能热更新；重启后生效")
+            restart_required = True
             logger.warning(
                 "原始种子保留期配置热加载失败 type=%s",
                 type(exc).__name__,
@@ -1622,7 +1717,9 @@ def save_config(request: Request, data: Any = Body(default=None)):
     )
     result: dict[str, object] = {"success": True}
     if warnings:
-        result["warnings"] = warnings
+        result["warnings"] = list(dict.fromkeys(warnings))
+    if restart_required:
+        result["restart_required"] = True
     return result
 
 

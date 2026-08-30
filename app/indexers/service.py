@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import Awaitable, Callable, Iterable, cast
+from typing import cast
 
 from app.logger import get_logger
 
@@ -31,8 +32,8 @@ from .models import (
 from .providers.base import magnet_infohash
 from .query_plan import build_site_queries
 from .ranking import annotate_clusters, rank_item
-from .release import parse_indexer_release_position
 from .registry import IndexerRegistry
+from .release import parse_indexer_release_position
 from .result_store import IndexerResultStore
 
 logger = get_logger(__name__)
@@ -104,13 +105,17 @@ class IndexerService:
         self._breaker_lock = threading.RLock()
         self._breaker_states: dict[str, _BreakerState] = {}
         self._runtime_lock = threading.RLock()
+        self._runtime_condition = threading.Condition(self._runtime_lock)
         self._inflight: dict[
             tuple[asyncio.AbstractEventLoop, tuple[object, ...]],
-            asyncio.Task[AggregatedIndexerResult],
+            asyncio.Task[object],
         ] = {}
         self._loop_semaphores: dict[
             asyncio.AbstractEventLoop, asyncio.Semaphore
         ] = {}
+        self._closing = False
+        self._closed = False
+        self._close_complete = threading.Event()
 
     async def search(
         self,
@@ -176,12 +181,14 @@ class IndexerService:
         ranking_context: IndexerMediaSearchRequest | None,
         sort_mode: str,
     ) -> AggregatedIndexerResult:
+        self._ensure_open()
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
         loop = asyncio.get_running_loop()
         inflight_key = (loop, cache_key)
-        with self._runtime_lock:
+        with self._runtime_condition:
+            self._ensure_open_locked()
             task = self._inflight.get(inflight_key)
             created = task is None
             if task is None:
@@ -197,15 +204,16 @@ class IndexerService:
                 self._inflight[inflight_key] = task
 
                 def cleanup(
-                    done_task: asyncio.Task[AggregatedIndexerResult],
+                    done_task: asyncio.Task[object],
                     key=inflight_key,
                 ) -> None:
-                    with self._runtime_lock:
+                    with self._runtime_condition:
                         if self._inflight.get(key) is done_task:
                             self._inflight.pop(key, None)
                         active_loops = {active_key[0] for active_key in self._inflight}
                         if key[0] not in active_loops:
                             self._loop_semaphores.pop(key[0], None)
+                        self._runtime_condition.notify_all()
 
                 task.add_done_callback(cleanup)
         result = await asyncio.shield(task)
@@ -249,24 +257,31 @@ class IndexerService:
             for site_id in selected
         }
         total_timeout_seconds = self.total_timeout_seconds + self._maximum_timeout_overhead(selected)
-        done, pending = await asyncio.wait(tasks.values(), timeout=total_timeout_seconds)
-        outcome_by_site: dict[str, _ProviderOutcome] = {}
-        for task in done:
-            outcome = task.result()
-            outcome_by_site[outcome.site_id] = outcome
-        if pending:
-            pending_sites = {site_id for site_id, task in tasks.items() if task in pending}
-            for task in pending:
+        try:
+            done, pending = await asyncio.wait(tasks.values(), timeout=total_timeout_seconds)
+            outcome_by_site: dict[str, _ProviderOutcome] = {}
+            for task in done:
+                outcome = task.result()
+                outcome_by_site[outcome.site_id] = outcome
+            if pending:
+                pending_sites = {site_id for site_id, task in tasks.items() if task in pending}
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for site_id in pending_sites:
+                    queries = plans.get(site_id, ())
+                    outcome_by_site[site_id] = _ProviderOutcome(
+                        site_id=site_id,
+                        error=self._public_error(site_id, IndexerTimeout("total search timeout")),
+                        query=queries[0] if queries else "",
+                        attempts=0,
+                    )
+        finally:
+            unfinished = tuple(task for task in tasks.values() if not task.done())
+            for task in unfinished:
                 task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for site_id in pending_sites:
-                queries = plans.get(site_id, ())
-                outcome_by_site[site_id] = _ProviderOutcome(
-                    site_id=site_id,
-                    error=self._public_error(site_id, IndexerTimeout("total search timeout")),
-                    query=queries[0] if queries else "",
-                    attempts=0,
-                )
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
 
         candidates: list[tuple[int, int, IndexerItem]] = []
         succeeded: list[str] = []
@@ -392,6 +407,7 @@ class IndexerService:
         return result.clone(cached=False)
 
     async def resolve(self, result_id: str) -> ResolvedDownload:
+        self._ensure_open()
         stored_result = self.result_store.get(result_id)
         site_id = stored_result.site_id
         if site_id not in self.registry.ids() or site_id not in self.enabled_site_ids:
@@ -399,19 +415,36 @@ class IndexerService:
         if stored_result.download_state not in {"ready", "resolvable"}:
             raise IndexerInvalidResponse("stored result is not downloadable")
         adapter = self.registry.get(site_id)
+        loop = asyncio.get_running_loop()
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise IndexerUnavailable("indexer resolve task is unavailable")
+        operation_key = (loop, ("resolve", result_id, id(current_task)))
+        with self._runtime_condition:
+            self._ensure_open_locked()
+            self._inflight[operation_key] = cast(asyncio.Task[object], current_task)
         try:
-            resolved = await asyncio.wait_for(
-                adapter.resolve(stored_result),
-                timeout=self.site_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            raise IndexerTimeout() from exc
-        except asyncio.CancelledError:
-            raise
-        except IndexerError as exc:
-            raise type(exc)(public_message=exc.public_message) from None
-        except Exception as exc:
-            raise IndexerUnavailable() from exc
+            try:
+                resolved = await asyncio.wait_for(
+                    adapter.resolve(stored_result),
+                    timeout=self.site_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise IndexerTimeout() from exc
+            except asyncio.CancelledError:
+                raise
+            except IndexerError as exc:
+                raise type(exc)(public_message=exc.public_message) from None
+            except Exception as exc:
+                raise IndexerUnavailable() from exc
+        finally:
+            with self._runtime_condition:
+                if self._inflight.get(operation_key) is current_task:
+                    self._inflight.pop(operation_key, None)
+                active_loops = {active_key[0] for active_key in self._inflight}
+                if loop not in active_loops:
+                    self._loop_semaphores.pop(loop, None)
+                self._runtime_condition.notify_all()
         if not isinstance(resolved, ResolvedDownload):
             raise IndexerInvalidResponse("provider returned an invalid resolved download")
         if resolved.kind not in stored_result.download_kinds:
@@ -423,7 +456,78 @@ class IndexerService:
         return resolved
 
     async def aclose(self) -> None:
-        await self.registry.aclose()
+        with self._runtime_condition:
+            if self._closed:
+                return
+            if self._closing:
+                wait_for_owner = True
+            else:
+                self._closing = True
+                wait_for_owner = False
+
+        if wait_for_owner:
+            await asyncio.to_thread(self._close_complete.wait)
+            return
+
+        try:
+            graceful_timeout = min(0.25, max(0.05, self.site_timeout_seconds))
+            drained = await asyncio.to_thread(
+                self._wait_for_inflight,
+                graceful_timeout,
+            )
+            if not drained:
+                self._cancel_inflight()
+                cancel_timeout = max(
+                    1.0,
+                    min(5.0, self.total_timeout_seconds),
+                )
+                drained = await asyncio.to_thread(
+                    self._wait_for_inflight,
+                    cancel_timeout,
+                )
+            if not drained:
+                raise RuntimeError(
+                    "索引器仍有任务未退出，为避免关闭正在使用的上游客户端，本次未关闭 registry"
+                )
+            await self.registry.aclose()
+        finally:
+            with self._runtime_condition:
+                self._closed = True
+                self._runtime_condition.notify_all()
+            self._close_complete.set()
+
+    def _ensure_open(self) -> None:
+        with self._runtime_lock:
+            self._ensure_open_locked()
+
+    def _ensure_open_locked(self) -> None:
+        if self._closing or self._closed:
+            raise IndexerUnavailable("indexer service is shutting down")
+
+    def _wait_for_inflight(self, timeout_seconds: float) -> bool:
+        deadline = perf_counter() + max(0.0, float(timeout_seconds))
+        with self._runtime_condition:
+            while any(not task.done() for task in self._inflight.values()):
+                remaining = deadline - perf_counter()
+                if remaining <= 0:
+                    return False
+                self._runtime_condition.wait(timeout=remaining)
+            return True
+
+    def _cancel_inflight(self) -> None:
+        with self._runtime_lock:
+            pending = tuple(
+                (loop, task)
+                for (loop, _cache_key), task in self._inflight.items()
+                if not task.done()
+            )
+        for loop, task in pending:
+            if loop.is_closed():
+                continue
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                logger.warning("取消 Indexer 任务失败：所属事件循环已关闭")
 
     def media_site_route(
         self,

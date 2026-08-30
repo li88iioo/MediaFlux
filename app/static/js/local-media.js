@@ -48,6 +48,7 @@
     let externalHintsRequestSerial = 0;
     let inspectionRequestSerial = 0;
     let hasLoadedLocalMedia = false;
+    const loadedResources = {sources: false, tasks: false, items: false};
     let refreshing = false;
     let refreshQueued = false;
     let queuedManualRefresh = false;
@@ -155,16 +156,21 @@
         });
     }
 
-    function renderInitialLoadFailure(message) {
+    function renderInitialResourceFailure(resource, message) {
         const text = esc(message || '无法读取本地媒体数据，请稍后重试。');
-        $('lmSourceGrid').innerHTML = `<div class="lm-empty-state is-error"><div class="lm-empty-icon is-error"><i data-lucide="alert-circle"></i></div><strong>来源读取失败</strong><p>${text}</p></div>`;
-        $('lmReviewList').innerHTML = `<div class="lm-empty-state is-error"><div class="lm-empty-icon is-error"><i data-lucide="alert-circle"></i></div><strong>待确认任务读取失败</strong><p>${text}</p></div>`;
-        $('lmTaskList').innerHTML = `<tr class="is-empty-row"><td colspan="7" class="table-empty"><div class="lm-table-empty-wrap"><i data-lucide="alert-circle"></i><span>整理日志读取失败：${text}</span></div></td></tr>`;
-        $('lmMediaItems').innerHTML = `<div class="lm-empty-state is-error"><div class="lm-empty-icon is-error"><i data-lucide="alert-circle"></i></div><strong>本地条目读取失败</strong><p>${text}</p></div>`;
-        icons($('lmSourceGrid'));
-        icons($('lmReviewList'));
-        icons($('lmTaskList'));
-        icons($('lmMediaItems'));
+        if (resource === 'sources') {
+            $('lmSourceGrid').innerHTML = `<div class="lm-empty-state is-error"><div class="lm-empty-icon is-error"><i data-lucide="alert-circle"></i></div><strong>来源读取失败</strong><p>${text}</p></div>`;
+            icons($('lmSourceGrid'));
+            return;
+        }
+        if (resource === 'tasks') {
+            $('lmReviewList').innerHTML = `<div class="lm-empty-state is-error"><div class="lm-empty-icon is-error"><i data-lucide="alert-circle"></i></div><strong>待确认任务读取失败</strong><p>${text}</p></div>`;
+            $('lmTaskList').innerHTML = `<tr class="is-empty-row"><td colspan="7" class="table-empty"><div class="lm-table-empty-wrap"><i data-lucide="alert-circle"></i><span>整理日志读取失败：${text}</span></div></td></tr>`;
+            icons($('lmReviewList'));
+            icons($('lmTaskList'));
+            return;
+        }
+        renderInitialMediaItemsFailure(message);
     }
 
     function renderInitialMediaItemsFailure(message) {
@@ -666,6 +672,7 @@
         refreshing = true;
         let manualIndicatorVisible = false;
         refreshPromise = (async () => {
+            let lastOutcome = null;
             try {
                 while (refreshQueued) {
                     const currentManual = queuedManualRefresh;
@@ -680,43 +687,107 @@
                         setBusy($('lmRefreshBtn'), true, '刷新中');
                         document.querySelector('.lm-page')?.setAttribute('aria-busy', 'true');
                     }
-                    try {
-                        const shouldLoadItems = currentTab === 'manual' || currentManual;
-                        const itemRequestSerial = mediaBrowseRequestSerial;
-                        const [sourceData, taskData, itemData] = await Promise.all([
-                            api('/api/local-media/sources'),
-                            api('/api/local-media/tasks'),
-                            shouldLoadItems ? api(mediaItemsUrl()) : Promise.resolve(null),
-                        ]);
-                        sources = sourceData.sources || [];
-                        tasks = taskData.tasks || [];
-                        const canApplyItems = itemData && itemRequestSerial === mediaBrowseRequestSerial;
-                        if (canApplyItems) applyMediaItemData(itemData);
-                        const firstLoad = !hasLoadedLocalMedia;
-                        await settleInitialLoading();
-                        const animate = firstLoad || currentManual;
-                        renderSources(false, animate);
-                        renderTasks(false, animate);
-                        if (canApplyItems) renderMediaItems(false, animate);
-                        hasLoadedLocalMedia = true;
-                        setRefreshFailure();
-                        if (currentManual && window.appAlert) {
+
+                    const shouldLoadItems = currentTab === 'manual' || currentManual;
+                    const itemRequestSerial = mediaBrowseRequestSerial;
+                    const names = shouldLoadItems ? ['sources', 'tasks', 'items'] : ['sources', 'tasks'];
+                    const settled = await Promise.allSettled([
+                        api('/api/local-media/sources'),
+                        api('/api/local-media/tasks'),
+                        ...(shouldLoadItems ? [api(mediaItemsUrl())] : []),
+                    ]);
+                    const resources = {};
+                    names.forEach((name, index) => {
+                        const result = settled[index];
+                        resources[name] = result.status === 'fulfilled'
+                            ? {ok: true, applied: false}
+                            : {ok: false, applied: false, error: result.reason instanceof Error
+                                ? result.reason : new Error(String(result.reason || '请求失败'))};
+                    });
+                    if (!shouldLoadItems) resources.items = {ok: true, applied: false, requested: false};
+
+                    const sourceResult = settled[0];
+                    if (sourceResult.status === 'fulfilled') {
+                        if (Array.isArray(sourceResult.value?.sources)) {
+                            sources = sourceResult.value.sources;
+                            loadedResources.sources = true;
+                            resources.sources.applied = true;
+                        } else {
+                            resources.sources.ok = false;
+                            resources.sources.error = new Error('媒体来源响应结构无效');
+                        }
+                    }
+                    const taskResult = settled[1];
+                    if (taskResult.status === 'fulfilled') {
+                        if (Array.isArray(taskResult.value?.tasks)) {
+                            tasks = taskResult.value.tasks;
+                            loadedResources.tasks = true;
+                            resources.tasks.applied = true;
+                        } else {
+                            resources.tasks.ok = false;
+                            resources.tasks.error = new Error('整理日志响应结构无效');
+                        }
+                    }
+                    if (shouldLoadItems) {
+                        const itemResult = settled[2];
+                        if (itemResult.status === 'fulfilled') {
+                            if (!Array.isArray(itemResult.value?.items)) {
+                                resources.items.ok = false;
+                                resources.items.error = new Error('本地媒体条目响应结构无效');
+                            } else if (itemRequestSerial === mediaBrowseRequestSerial) {
+                                applyMediaItemData(itemResult.value);
+                                loadedResources.items = true;
+                                resources.items.applied = true;
+                            } else {
+                                resources.items.ok = false;
+                                resources.items.stale = true;
+                                resources.items.error = new Error('浏览位置已变化，本次条目结果未应用');
+                            }
+                        }
+                    }
+
+                    await settleInitialLoading();
+                    const firstLoad = !hasLoadedLocalMedia;
+                    const animate = firstLoad || currentManual;
+                    if (resources.sources.applied) renderSources(false, animate);
+                    else if (!loadedResources.sources) {
+                        renderInitialResourceFailure('sources', resources.sources.error?.message);
+                    }
+                    if (resources.tasks.applied) renderTasks(false, animate);
+                    else if (!loadedResources.tasks) {
+                        renderInitialResourceFailure('tasks', resources.tasks.error?.message);
+                    }
+                    if (resources.items.applied) renderMediaItems(false, animate);
+                    else if (shouldLoadItems && !resources.items.ok && !loadedResources.items) {
+                        renderInitialResourceFailure('items', resources.items.error?.message);
+                    }
+
+                    hasLoadedLocalMedia = Object.values(loadedResources).some(Boolean);
+                    const errors = names
+                        .map((name) => resources[name])
+                        .filter((result) => !result.ok)
+                        .map((result) => result.error);
+                    const refreshError = errors.length
+                        ? new Error(errors.map((error) => error.message).join('；'))
+                        : null;
+                    setRefreshFailure(refreshError);
+                    lastOutcome = {
+                        ok: errors.length === 0,
+                        partial: errors.length > 0 && errors.length < names.length,
+                        resources,
+                        errors,
+                    };
+                    if (currentManual && window.appAlert) {
+                        if (lastOutcome.ok) {
                             appAlert({type: 'success', title: '已刷新', message: '媒体来源、整理日志和本地条目已更新。'});
-                        }
-                    } catch (error) {
-                        await settleInitialLoading();
-                        if (!hasLoadedLocalMedia) {
-                            renderInitialLoadFailure(error.message);
-                        } else if (currentTab === 'manual'
-                            && document.querySelector('#lmMediaItems .lm-initial-loading')) {
-                            renderInitialMediaItemsFailure(error.message);
-                        }
-                        setRefreshFailure(error);
-                        if (currentManual && window.appAlert) {
-                            appAlert({type: 'error', title: '读取失败', message: error.message});
+                        } else if (lastOutcome.partial) {
+                            appAlert({type: 'warning', title: '部分刷新完成', message: `${refreshError.message}；已保留未更新区域的原有数据。`});
+                        } else {
+                            appAlert({type: 'error', title: '读取失败', message: refreshError.message});
                         }
                     }
                 }
+                return lastOutcome;
             } finally {
                 refreshing = false;
                 if (manualIndicatorVisible) {
@@ -1597,8 +1668,19 @@
         const button = $('lmRefreshItemsBtn');
         setBusy(button, true, '刷新中');
         try {
-            await loadAll(false);
-            appAlert({type: 'success', title: '条目已刷新', message: `当前共 ${mediaItems.length} 个本地媒体条目。`});
+            const outcome = await loadAll(false);
+            const itemResult = outcome?.resources?.items;
+            if (itemResult?.ok && itemResult.applied) {
+                appAlert({type: 'success', title: '条目已刷新', message: `当前共 ${mediaItems.length} 个本地媒体条目。`});
+            } else if (itemResult?.stale || itemResult?.requested === false) {
+                appAlert({type: 'warning', title: '条目未更新', message: '浏览位置已变化，已保留当前条目，请再次刷新。'});
+            } else {
+                appAlert({
+                    type: 'error',
+                    title: '条目刷新失败',
+                    message: `${itemResult?.error?.message || '无法读取本地媒体条目'}；已保留原有条目。`,
+                });
+            }
         } finally {
             setBusy(button, false, '刷新条目');
         }

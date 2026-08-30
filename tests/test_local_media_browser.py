@@ -108,9 +108,11 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
             "season: confirmedContext.season",
             "episode: confirmedContext.episode",
             "rules_snapshot: confirmedPreview.rules_snapshot",
-            "if (!hasLoadedLocalMedia) {",
+            "const firstLoad = !hasLoadedLocalMedia",
+            "hasLoadedLocalMedia = Object.values(loadedResources).some(Boolean)",
             "await settleInitialLoading()",
-            "renderInitialLoadFailure(error.message)",
+            "function renderInitialResourceFailure(resource, message)",
+            "renderInitialResourceFailure('sources', resources.sources.error?.message)",
             "if (currentManual && window.appAlert)",
         ):
             self.assertIn(contract, js)

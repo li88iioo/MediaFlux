@@ -1238,6 +1238,7 @@ def _execute_local_media_confirmation(
 ) -> dict:
     claimed_task = False
     task_id = safe_int(payload.get("local_task_id"), 0, minimum=0)
+    qb_client = None
     try:
         if task_id <= 0:
             raise ValueError("本地媒体确认任务无效，请前往 Web 重新处理")
@@ -1328,19 +1329,26 @@ def _execute_local_media_confirmation(
                     task_id, owner=str(payload.get("owner") or "admin")
                 )
                 if current is not None and current.status == "recognizing":
+                    failure_status = (
+                        "requires_manual"
+                        if bool(getattr(exc, "requires_manual", False))
+                        else "failed"
+                    )
                     db.update_local_media_task(
                         task_id,
                         owner=current.owner,
-                        status="failed",
+                        status=failure_status,
                         error=message,
                     )
                     current = db.get_local_media_task(task_id, owner=current.owner)
-                if current is not None and current.status == "failed":
+                if current is not None and current.status in {
+                    "failed", "requires_manual"
+                }:
                     db.update_download_request_for_local_media_task(
                         task_id,
-                        "failed",
+                        current.status,
                         error=message,
-                        resolve_manual=True,
+                        resolve_manual=current.status == "failed",
                     )
             except Exception:
                 logger.warning(
@@ -1376,6 +1384,17 @@ def _execute_local_media_confirmation(
             message_id=_confirmation_message_id(payload), terminal=True, error=True,
         )
         raise
+    finally:
+        close = getattr(qb_client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as close_exc:
+                logger.warning(
+                    "关闭本地媒体确认 qB 客户端失败 task=%s type=%s",
+                    task_id,
+                    type(close_exc).__name__,
+                )
 
 
 def _execute_confirmation(

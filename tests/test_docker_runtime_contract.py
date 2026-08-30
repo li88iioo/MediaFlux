@@ -178,12 +178,24 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("USER mediaflux", self.dockerfile)
         self.assertIn('exec gosu "$puid:$pgid" "$@"', self.entrypoint)
         self.assertIn('chown -R "$puid:$pgid" /app/db', self.entrypoint)
+        self.assertIn('data_owner_marker="/app/db/.mediaflux-owner-${puid}-${pgid}"', self.entrypoint)
+        self.assertIn("MEDIAFLUX_FIX_DATA_PERMISSIONS", self.entrypoint)
+        self.assertEqual(self.entrypoint.count('chown -R "$puid:$pgid" /app/db'), 1)
         self.assertIn('chown "$puid:$pgid" /data/strm', self.entrypoint)
         self.assertNotIn("/media/downloads", self.entrypoint)
         self.assertNotIn("/media/library", self.entrypoint)
         self.assertIn("MEDIAFLUX_RUN_AS_ROOT", self.entrypoint)
         self.assertIn("MEDIAFLUX_FIX_STRM_PERMISSIONS", self.entrypoint)
         self.assertIn("rm -rf /var/lib/apt/lists/*", self.dockerfile)
+
+    def test_non_root_permission_contract_is_consistent_in_user_docs(self) -> None:
+        deploy = (self.ROOT / "docs" / "部署指南.md").read_text(encoding="utf-8")
+        faq = (self.ROOT / "docs" / "常见问题.md").read_text(encoding="utf-8")
+        for text in (deploy, faq, self.dev_env_example):
+            self.assertIn("MEDIAFLUX_FIX_DATA_PERMISSIONS", text)
+            self.assertIn("MEDIAFLUX_FIX_STRM_PERMISSIONS", text)
+        self.assertIn("入口脚本**永不递归改权**", deploy)
+        self.assertIn("不要同时配置 Compose 的 `user:`", deploy)
 
     def test_production_deployment_requires_no_env_file(self) -> None:
         self.assertFalse((self.ROOT / ".env.example").exists())

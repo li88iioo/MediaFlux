@@ -4,16 +4,24 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
-from typing import Any, Callable
+from typing import Any
 
 from app import config, database
 from app.discovery.cache import CacheLookup, DiscoveryCache
 from app.discovery.models import (
-    DiscoveryPage, MediaCard, ProviderAuthenticationError, ProviderError,
-    ProviderInvalidResponse, ProviderNotConfigured, ProviderRateLimited, ProviderTimeout,
+    DiscoveryPage,
+    MediaCard,
+    ProviderAuthenticationError,
+    ProviderError,
+    ProviderInvalidResponse,
+    ProviderNotConfigured,
+    ProviderRateLimited,
+    ProviderTimeout,
     ProviderUnavailable,
 )
 from app.discovery.registry import (
@@ -24,6 +32,9 @@ from app.discovery.registry import (
     validate_filters,
     validate_request,
 )
+
+_DISCOVERY_CLOSED_MESSAGE = "探索服务已关闭，请重试"
+_DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 _ERROR_TYPES = {
     "authentication": ProviderAuthenticationError,
@@ -54,22 +65,118 @@ class DiscoveryService:
             self.cache_ttl_seconds,
             int(stale_ttl_seconds or config.get_int("DISCOVERY_STALE_TTL_SECONDS", 604800)),
         )
-        self._refresh_guard = threading.Lock()
+        self._refresh_guard = threading.Condition(threading.RLock())
         self._pending_refreshes: set[str] = set()
         self._refresh_cooldowns: dict[str, float] = {}
+        self._inflight_futures: set[Future[Any]] = set()
+        self._active_network_operations = 0
+        self._active_submissions = 0
         self._refresh_clock = refresh_clock or time.monotonic
         self._refresh_cooldown_seconds = 30.0
-        self._shutdown = False
-        self._executor: ThreadPoolExecutor | None = None
-        if refresh_submit is None:
-            self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="discovery-refresh")
-            self._refresh_submit = self._executor.submit
-        else:
-            self._refresh_submit = refresh_submit
+        self._closed = False
+        # 映射与默认后台刷新始终共用专用有界 executor；即使测试或嵌入方
+        # 注入了 refresh_submit，异步映射也不能退回 asyncio 默认线程池。
+        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=3, thread_name_prefix="discovery-refresh"
+        )
+        self._refresh_submit = refresh_submit
         if scraper_factory is None:
             from app.modules.scraper import TMDBScraper
             scraper_factory = TMDBScraper
         self._scraper_factory = scraper_factory
+
+    @staticmethod
+    def _closed_error() -> ProviderUnavailable:
+        return ProviderUnavailable(_DISCOVERY_CLOSED_MESSAGE)
+
+    def _lifecycle_drained_locked(self) -> bool:
+        return (
+            not self._inflight_futures
+            and self._active_network_operations == 0
+            and self._active_submissions == 0
+        )
+
+    @contextmanager
+    def _network_operation(self) -> Iterator[None]:
+        with self._refresh_guard:
+            if self._closed:
+                raise self._closed_error()
+            self._active_network_operations += 1
+        try:
+            yield
+        finally:
+            close_registry = False
+            with self._refresh_guard:
+                self._active_network_operations -= 1
+                self._refresh_guard.notify_all()
+                close_registry = self._closed and self._lifecycle_drained_locked()
+            if close_registry:
+                self.registry.close()
+
+    def _future_finished(self, future: Future[Any]) -> None:
+        close_registry = False
+        with self._refresh_guard:
+            self._inflight_futures.discard(future)
+            self._refresh_guard.notify_all()
+            close_registry = self._closed and self._lifecycle_drained_locked()
+        if close_registry:
+            self.registry.close()
+
+    def _track_future_locked(self, future: Future[Any]) -> None:
+        self._inflight_futures.add(future)
+        future.add_done_callback(self._future_finished)
+
+    def _submit_refresh(self, callback: Callable[[], None]) -> bool:
+        with self._refresh_guard:
+            if self._closed:
+                return False
+            if self._refresh_submit is None:
+                executor = self._executor
+                if executor is None:
+                    return False
+                try:
+                    submitted = executor.submit(callback)
+                except RuntimeError:
+                    return False
+                self._track_future_locked(submitted)
+                return True
+            submit = self._refresh_submit
+            self._active_submissions += 1
+
+        submitted: Any = None
+        succeeded = False
+        try:
+            submitted = submit(callback)
+            succeeded = True
+        except RuntimeError:
+            succeeded = False
+        finally:
+            close_registry = False
+            with self._refresh_guard:
+                if succeeded and isinstance(submitted, Future):
+                    self._track_future_locked(submitted)
+                self._active_submissions -= 1
+                self._refresh_guard.notify_all()
+                close_registry = self._closed and self._lifecycle_drained_locked()
+            if close_registry:
+                self.registry.close()
+        return succeeded
+
+    def _submit_mapping(self, callback: Callable[[], dict[str, Any]]) -> Future[dict[str, Any]]:
+        with self._refresh_guard:
+            if self._closed or self._executor is None:
+                raise self._closed_error()
+            future = self._executor.submit(callback)
+            self._track_future_locked(future)
+            return future
+
+    def _write_cache_if_open(self, callback: Callable[[], None]) -> None:
+        # 把 closed 检查与 SQLite 写入放在同一个很短的临界区，保证 shutdown
+        # 一旦发布 closed 状态，旧代任务不会再落盘成功或错误缓存。
+        with self._refresh_guard:
+            if self._closed:
+                raise self._closed_error()
+            callback()
 
     def list_sections(self) -> list[dict[str, Any]]:
         return list_section_definitions()
@@ -116,26 +223,31 @@ class DiscoveryService:
 
     def _fetch_and_store(self, cache_key: str, provider: str, category: str,
                          media_type: str, page: int, filters: dict[str, str]) -> DiscoveryPage:
-        adapter = self.registry.get(provider)
-        try:
-            result = adapter.list_items(category, media_type, page, filters)
-        except ProviderError as exc:
-            self.cache.set_error(
-                cache_key, provider, exc.safe_message, ttl_seconds=30,
-                code=exc.code, status_code=exc.status_code, retry_after=exc.retry_after,
-            )
-            raise
-        if not isinstance(result, DiscoveryPage):
-            raise TypeError("Provider must return DiscoveryPage")
-        payload = replace(result, cached=False, stale=False).to_dict()
-        self.cache.set_success(
-            cache_key,
-            provider,
-            payload,
-            ttl_seconds=self._provider_ttl(provider),
-            stale_seconds=self.stale_ttl_seconds,
-        )
-        return replace(result, cached=False, stale=False)
+        with self._network_operation():
+            adapter = self.registry.get(provider)
+            try:
+                result = adapter.list_items(category, media_type, page, filters)
+            except ProviderError as exc:
+                error_values = (
+                    exc.safe_message, exc.code, exc.status_code, exc.retry_after,
+                )
+                self._write_cache_if_open(lambda: self.cache.set_error(
+                    cache_key, provider, error_values[0], ttl_seconds=30,
+                    code=error_values[1], status_code=error_values[2],
+                    retry_after=error_values[3],
+                ))
+                raise
+            if not isinstance(result, DiscoveryPage):
+                raise TypeError("Provider must return DiscoveryPage")
+            payload = replace(result, cached=False, stale=False).to_dict()
+            self._write_cache_if_open(lambda: self.cache.set_success(
+                cache_key,
+                provider,
+                payload,
+                ttl_seconds=self._provider_ttl(provider),
+                stale_seconds=self.stale_ttl_seconds,
+            ))
+            return replace(result, cached=False, stale=False)
 
     @staticmethod
     def _cached_error(lookup: CacheLookup) -> ProviderError:
@@ -149,7 +261,7 @@ class DiscoveryService:
         with self._refresh_guard:
             now = self._refresh_clock()
             retry_at = self._refresh_cooldowns.get(cache_key, 0.0)
-            if self._shutdown or cache_key in self._pending_refreshes or retry_at > now:
+            if self._closed or cache_key in self._pending_refreshes or retry_at > now:
                 return
             self._refresh_cooldowns.pop(cache_key, None)
             self._pending_refreshes.add(cache_key)
@@ -162,17 +274,19 @@ class DiscoveryService:
                 )
             finally:
                 with self._refresh_guard:
-                    if refreshed:
-                        self._refresh_cooldowns.pop(cache_key, None)
-                    else:
-                        self._refresh_cooldowns[cache_key] = (
-                            self._refresh_clock() + self._refresh_cooldown_seconds
-                        )
+                    # shutdown 已发布 closed 后，旧代任务只能完成自身清理，
+                    # 不得重新写入 cooldown 或其它可观察运行时状态。
+                    if not self._closed:
+                        if refreshed:
+                            self._refresh_cooldowns.pop(cache_key, None)
+                        else:
+                            self._refresh_cooldowns[cache_key] = (
+                                self._refresh_clock() + self._refresh_cooldown_seconds
+                            )
                     self._pending_refreshes.discard(cache_key)
+                    self._refresh_guard.notify_all()
 
-        try:
-            self._refresh_submit(refresh)
-        except RuntimeError:
+        if not self._submit_refresh(refresh):
             with self._refresh_guard:
                 self._pending_refreshes.discard(cache_key)
 
@@ -205,19 +319,40 @@ class DiscoveryService:
         ]
         return replace(page, items=items, cached=cached, stale=stale)
 
-    def shutdown(self) -> None:
+    def shutdown(
+        self, timeout_seconds: float = _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         with self._refresh_guard:
-            self._shutdown = True
+            self._closed = True
             self._pending_refreshes.clear()
             self._refresh_cooldowns.clear()
-        executor, self._executor = self._executor, None
+            executor, self._executor = self._executor, None
+            futures = tuple(self._inflight_futures)
+            self._refresh_guard.notify_all()
+
+        for future in futures:
+            future.cancel()
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+
+        with self._refresh_guard:
+            while not self._lifecycle_drained_locked():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._refresh_guard.wait(timeout=remaining)
+            drained = self._lifecycle_drained_locked()
+
+        if drained:
+            self.registry.close()
+        return drained
 
     def get_detail(self, provider: str, media_type: str, external_id: str) -> MediaCard | None:
         if media_type not in {"movie", "tv"}:
             raise ValueError("媒体类型无效")
-        return self.registry.get(provider).get_detail(str(external_id), media_type)
+        with self._network_operation():
+            return self.registry.get(provider).get_detail(str(external_id), media_type)
 
     @staticmethod
     def add_watchlist(card: MediaCard) -> None:
@@ -248,7 +383,8 @@ class DiscoveryService:
                 "confirmed": True,
                 "candidates": [],
             }
-        candidates = self._scraper_factory().search_candidates(title, year, media_type)
+        with self._network_operation():
+            candidates = self._scraper_factory().search_candidates(title, year, media_type)
         serialized = [self._candidate_dict(candidate) for candidate in candidates]
         return {
             "tmdb_id": "",
@@ -308,7 +444,8 @@ class DiscoveryService:
         requested_id = str(tmdb_id or "").strip()
         if not requested_id.isdigit() or not 1 <= len(requested_id) <= 10:
             raise ValueError("TMDB ID 无效")
-        match = self._scraper_factory().match_from_tmdb(requested_id, media_type)
+        with self._network_operation():
+            match = self._scraper_factory().match_from_tmdb(requested_id, media_type)
         if bool(getattr(match, "need_confirm", True)) or str(getattr(match, "tmdb_id", "")) != requested_id:
             raise ValueError("无法核验所选 TMDB 映射")
         return {
@@ -365,7 +502,8 @@ class DiscoveryService:
             confirmed_year=confirmed_year,
         )
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, callback)
+        future = self._submit_mapping(callback)
+        return await asyncio.wrap_future(future, loop=loop)
 
     @staticmethod
     def _candidate_dict(candidate: Any) -> dict[str, Any]:

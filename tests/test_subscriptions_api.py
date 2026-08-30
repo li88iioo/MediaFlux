@@ -129,6 +129,38 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 404, response.text)
         scoped_service.download_candidate.assert_not_awaited()
 
+    def test_watchlist_uses_one_batched_external_mapping_lookup(self) -> None:
+        headers = self.login()
+        rows = [{
+            "provider": "bangumi",
+            "external_id": str(index),
+            "media_type": "tv",
+            "title": f"动画 {index}",
+            "year": "2026",
+            "poster_key": "",
+            "created_at": "2026-08-30 12:00:00",
+        } for index in range(500)]
+        discovery = Mock()
+        discovery.list_watchlist.return_value = rows
+        service = Mock()
+        service.list_subscriptions.return_value = []
+        with patch(
+            "app.routes.subscriptions_api.get_discovery_service",
+            return_value=discovery,
+        ), patch(
+            "app.routes.subscriptions_api.get_media_subscription_service",
+            return_value=service,
+        ), patch(
+            "app.routes.subscriptions_api.db.list_media_external_ids",
+            return_value={},
+        ) as batch_lookup:
+            response = self.client.get("/api/subscriptions/watchlist", headers=headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()), 500)
+        batch_lookup.assert_called_once()
+        self.assertEqual(len(batch_lookup.call_args.args[0]), 500)
+
     def test_watchlist_subscription_requires_confirmed_tmdb_mapping(self) -> None:
         headers = self.login()
         watchlist = [{
@@ -150,6 +182,9 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         service.list_subscriptions.return_value = []
         with patch("app.routes.subscriptions_api.get_discovery_service", return_value=discovery), patch(
             "app.routes.subscriptions_api.get_media_subscription_service", return_value=service
+        ), patch(
+            "app.routes.subscriptions_api.db.get_media_watchlist",
+            return_value=watchlist[0],
         ), patch("app.routes.subscriptions_api._wake_scheduler"):
             pending = self.client.post(
                 "/api/subscriptions/media/from-watchlist",
@@ -173,6 +208,9 @@ class SubscriptionAPITests(IsolatedDatabaseTestCase):
         })
         with patch("app.routes.subscriptions_api.get_discovery_service", return_value=discovery), patch(
             "app.routes.subscriptions_api.get_media_subscription_service", return_value=service
+        ), patch(
+            "app.routes.subscriptions_api.db.get_media_watchlist",
+            return_value=watchlist[0],
         ), patch("app.routes.subscriptions_api._wake_scheduler"):
             created = self.client.post(
                 "/api/subscriptions/media/from-watchlist",
@@ -346,6 +384,11 @@ class SubscriptionMappingAsyncContractTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 subscriptions_api, "get_discovery_service", return_value=discovery
             ),
+            patch.object(
+                subscriptions_api.db,
+                "get_media_watchlist",
+                return_value=self._watchlist()[0],
+            ),
         ):
             task = asyncio.create_task(
                 subscriptions_api.create_from_watchlist(
@@ -391,6 +434,11 @@ class SubscriptionMappingAsyncContractTests(unittest.IsolatedAsyncioTestCase):
             patch.object(subscriptions_api, "require_api_login"),
             patch.object(
                 subscriptions_api, "get_discovery_service", return_value=discovery
+            ),
+            patch.object(
+                subscriptions_api.db,
+                "get_media_watchlist",
+                return_value=self._watchlist()[0],
             ),
             patch.object(
                 subscriptions_api,

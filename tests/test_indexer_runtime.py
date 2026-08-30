@@ -335,6 +335,11 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "app.modules.media_proxy.get_media_proxy_manager", return_value=proxy
         ), patch(
+            "app.modules.media_proxy.start_signed_media_probe_runtime"
+        ) as start_probe_runtime, patch(
+            "app.modules.media_proxy.shutdown_signed_media_probe_runtime",
+            return_value=True,
+        ) as stop_probe_runtime, patch(
             "app.indexers.runtime.bind_indexer_event_loop"
         ), patch(
             "app.indexers.runtime.unbind_indexer_event_loop"
@@ -358,6 +363,8 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(stop_threads[0], owner_thread)
         proxy.start.assert_awaited_once_with()
         proxy.stop.assert_awaited_once_with()
+        start_probe_runtime.assert_called_once_with()
+        stop_probe_runtime.assert_called_once_with(5.0)
 
     async def test_application_lifespan_keeps_shutdown_gate_when_workers_do_not_stop(self):
         from app.main import create_app

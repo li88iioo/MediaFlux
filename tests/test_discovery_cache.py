@@ -202,6 +202,60 @@ class DiscoveryCacheTests(unittest.TestCase):
         )
         self.assertEqual(self.cache.get(key).status, "miss")
 
+    def test_purge_removes_expired_entries_and_caps_oldest_rows(self):
+        with database.get_conn() as conn:
+            rows = [
+                (
+                    "expired", "tmdb", "{}", "2026-01-01 00:00:00",
+                    "2026-01-02 00:00:00", "2026-01-03 00:00:00",
+                ),
+                (
+                    "old-live", "tmdb", "{}", "2026-06-01 00:00:00",
+                    "2026-12-01 00:00:00", "2026-12-02 00:00:00",
+                ),
+                (
+                    "new-live", "tmdb", "{}", "2026-07-01 00:00:00",
+                    "2026-12-01 00:00:00", "2026-12-02 00:00:00",
+                ),
+            ]
+            conn.executemany(
+                "INSERT INTO discovery_cache("
+                "cache_key,provider,payload,fetched_at,expires_at,stale_until"
+                ") VALUES(?,?,?,?,?,?)",
+                rows,
+            )
+
+        deleted = database.purge_discovery_cache(
+            "2026-07-25 12:00:00", max_rows=1, batch_size=10
+        )
+
+        self.assertEqual(deleted, 2)
+        with database.get_conn() as conn:
+            remaining = [
+                row["cache_key"]
+                for row in conn.execute(
+                    "SELECT cache_key FROM discovery_cache ORDER BY cache_key"
+                )
+            ]
+        self.assertEqual(remaining, ["new-live"])
+
+    def test_cache_maintenance_is_rate_limited(self):
+        with patch.object(database, "purge_discovery_cache") as purge:
+            self.cache.set_success(
+                "one", "tmdb", {"items": []},
+                ttl_seconds=60, stale_seconds=120,
+            )
+            self.cache.set_success(
+                "two", "tmdb", {"items": []},
+                ttl_seconds=60, stale_seconds=120,
+            )
+            self.assertEqual(purge.call_count, 1)
+
+            self.now += timedelta(hours=1, seconds=1)
+            self.cache.set_error("three", "tmdb", "timeout")
+
+        self.assertEqual(purge.call_count, 2)
+
     def test_singleflight_serializes_same_key(self):
         entered: list[str] = []
         first_ready = threading.Event()

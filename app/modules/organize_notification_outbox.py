@@ -73,6 +73,9 @@ def deliver_organize_notification(
         outcome = _send(text, chat_id, image_url=image_url)
         if outcome.ok:
             return True
+        if outcome.outcome_unknown:
+            logger.warning("整理通知投递结果未知，停止自动重放")
+            return False
     except Exception as exc:
         logger.warning("整理通知投递异常 type=%s", type(exc).__name__)
     enqueue_organize_notification(
@@ -111,6 +114,7 @@ def drain_organize_notifications(*, limit: int = 20) -> bool:
         except Exception as exc:
             outcome = TelegramSendResult(
                 ok=False, error=f"{type(exc).__name__}: Telegram 投递异常",
+                status_code=503,
             )
             logger.warning(
                 "整理通知投递异常 key=%s type=%s",
@@ -128,6 +132,17 @@ def drain_organize_notifications(*, limit: int = 20) -> bool:
                 )
             continue
         delivered = False
+        if outcome.outcome_unknown:
+            # 旧队列没有 Telegram message_id，结果未知时无法安全重放；以已消费
+            # 状态结束租约，避免重启后制造重复整理汇总。
+            consumed = mark_organize_notification_sent(
+                item["id"], expected_lease_generation=generation,
+            )
+            logger.warning(
+                "整理通知投递结果未知，停止自动重放 key=%s consumed=%s",
+                item["idempotency_key"], consumed,
+            )
+            continue
         state = retry_organize_notification(
             item["id"],
             expected_lease_generation=generation,

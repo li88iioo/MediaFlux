@@ -82,7 +82,8 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
         self.assertIn("function finishConfigLoad(success)", html)
         self.assertIn("if(!configReady)return", html)
         self.assertIn("const serial=++statusRequestSerial", html)
-        self.assertIn("if(serial===statusRequestSerial)renderStatus(data)", html)
+        self.assertIn("if(serial!==statusRequestSerial)return {ok:true,stale:true}", html)
+        self.assertIn("renderStatus(data)", html)
         self.assertIn("if(organizeActionBusy)return", html)
 
     def test_metatube_enabled_state_is_server_rendered_without_expand_shift(self):

@@ -2937,9 +2937,10 @@ from app.repositories.agent_web_search import (  # noqa: E402
 
 # ===== 媒体探测缓存 =====
 # 兼容门面：调用方继续使用 app.database.*；批量读取保持单连接契约。
-from app.repositories.media_probe import (  # noqa: E402
+from app.repositories.media_probe import (  # noqa: E402, F401
     get_media_probe_cache,
     get_media_probe_cache_many,
+    prune_media_probe_cache,
     upsert_media_probe_cache,
     upsert_media_probe_failure_cache,
 )
@@ -4288,6 +4289,49 @@ def _ensure_strm_retired_sources_table(conn: sqlite3.Connection) -> None:
         "updated_at TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,"
         "last_error TEXT DEFAULT '')"
     )
+
+
+@contextmanager
+def reconcile_strm_retired_sources_transaction(
+    active_source_ids: Iterable[object],
+    retired_sources: Iterable[tuple[object, object, object]],
+):
+    """在调用方配置发布期间暂存 STRM 来源退役变更。
+
+    调用方必须在 ``with`` 块内完成配置文件发布。配置发布抛错时，SQLite
+    变更随上下文一并回滚；只有配置发布成功且上下文正常退出后才提交退役队列。
+    """
+    active_ids = tuple(
+        dict.fromkeys(str(item).strip() for item in active_source_ids if str(item).strip())
+    )
+    normalized_retired: dict[str, tuple[str, str]] = {}
+    for raw_id, raw_name, raw_root in retired_sources:
+        source_id = str(raw_id).strip()
+        if not source_id or source_id in active_ids:
+            continue
+        normalized_retired[source_id] = (
+            str(raw_name or source_id),
+            str(raw_root or ""),
+        )
+
+    timestamp = now()
+    with get_conn() as conn:
+        _ensure_strm_retired_sources_table(conn)
+        if active_ids:
+            placeholders = ",".join("?" for _ in active_ids)
+            conn.execute(
+                f"DELETE FROM strm_retired_sources WHERE source_id IN ({placeholders})",
+                active_ids,
+            )
+        for source_id, (source_name, strm_root) in normalized_retired.items():
+            conn.execute(
+                "INSERT INTO strm_retired_sources(source_id,source_name,strm_root,queued_at,"
+                "updated_at,attempts,last_error) VALUES(?,?,?,?,?,0,'') "
+                "ON CONFLICT(source_id) DO UPDATE SET source_name=excluded.source_name,"
+                "strm_root=excluded.strm_root,updated_at=excluded.updated_at,last_error=''",
+                (source_id, source_name, strm_root, timestamp, timestamp),
+            )
+        yield list(normalized_retired)
 
 
 def enqueue_strm_retired_source(source_id: str, source_name: str, strm_root: str) -> None:
@@ -5802,7 +5846,7 @@ def get_agent_persistent_health_summary() -> dict[str, dict[str, object]]:
 
 # ===== 媒体探索缓存、跨来源映射与收藏 =====
 # 兼容门面：外部调用和测试继续使用 app.database.*；实现已按业务域拆分。
-from app.repositories.discovery import (  # noqa: E402
+from app.repositories.discovery import (  # noqa: E402, F401
     add_media_watchlist,
     confirm_media_external_id_if_unchanged,
     delete_media_watchlist,
@@ -5810,8 +5854,10 @@ from app.repositories.discovery import (  # noqa: E402
     get_media_external_id,
     get_media_watchlist,
     get_media_watchlist_by_id,
+    list_media_external_ids,
     list_media_watchlist,
     list_media_watchlist_keys,
+    purge_discovery_cache,
     update_discovery_cache_error,
     upsert_discovery_cache,
     upsert_media_external_id,

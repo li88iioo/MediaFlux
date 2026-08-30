@@ -51,6 +51,17 @@ def _bencode(value) -> bytes:
 
 
 class QBittorrent523IdentityTests(unittest.TestCase):
+    def test_close_is_idempotent(self):
+        client = QBittorrentClient("http://qb.invalid", api_key="token")
+        close = Mock()
+        client._session.close = close
+
+        client.close()
+        client.close()
+
+        close.assert_called_once_with()
+        self.assertTrue(client._closed)
+
     def test_connection_test_uses_api_key_without_password_login(self):
         client = QBittorrentClient("http://qb.invalid", api_key="token")
         client._session.post = Mock()

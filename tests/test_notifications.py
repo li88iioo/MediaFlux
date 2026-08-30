@@ -111,6 +111,7 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.status_code, 503)
         self.assertFalse(result.outcome_unknown)
+        self.assertTrue(result.retryable)
 
     def test_read_timeout_is_marked_as_unknown_delivery(self):
         result = notifier._telegram_send_error(notifier.requests.ReadTimeout("read"))
@@ -118,6 +119,44 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.status_code, 408)
         self.assertTrue(result.outcome_unknown)
+        self.assertFalse(result.retryable)
+
+    def test_shared_delivery_helper_treats_unchanged_edit_as_success(self):
+        class TelegramUnchanged(RuntimeError):
+            result_json = {
+                "error_code": 400,
+                "description": "Bad Request: message is not modified",
+            }
+
+        result, value = notifier.call_telegram_delivery(
+            lambda: (_ for _ in ()).throw(TelegramUnchanged("unchanged")),
+            message_id=42,
+            edit=True,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.message_id, 42)
+        self.assertIsNone(value)
+
+    def test_edit_fallback_requires_an_explicit_telegram_rejection(self):
+        rejected = notifier.TelegramSendResult(
+            ok=False,
+            status_code=400,
+            error="Bad Request: message can't be edited",
+            message_id=42,
+        )
+        unknown = notifier._telegram_send_error(
+            notifier.requests.ReadTimeout("read")
+        )
+
+        self.assertTrue(notifier.telegram_edit_fallback_allowed(rejected))
+        self.assertFalse(notifier.telegram_edit_fallback_allowed(unknown))
+
+    def test_notification_machine_state_is_not_rendered(self):
+        event = notifier.NotificationEvent("测试通知", state="running")
+
+        self.assertEqual(event.state, "running")
+        self.assertNotIn("running", notifier.render_event(event))
 
     def test_http_exception_preserves_response_status_code(self):
         class TelegramHTTPError(RuntimeError):

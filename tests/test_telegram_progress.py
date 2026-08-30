@@ -4,6 +4,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import requests
+
 from app import database as db
 from app.bot import handlers as bot_handlers
 from app.bot.progress import (
@@ -68,6 +70,20 @@ class _EditBot:
         return True
 
 
+class _TelegramEditRejected(RuntimeError):
+    result_json = {
+        "error_code": 400,
+        "description": "Bad Request: message can't be edited",
+    }
+
+
+class _TelegramMessageNotModified(RuntimeError):
+    result_json = {
+        "error_code": 400,
+        "description": "Bad Request: message is not modified",
+    }
+
+
 class _FailingFinalEditBot(_EditBot):
     def __init__(self):
         super().__init__()
@@ -76,7 +92,7 @@ class _FailingFinalEditBot(_EditBot):
     def edit_message_text(self, text, chat_id, message_id, **kwargs):
         self.edit_calls += 1
         if self.edit_calls >= 1:
-            raise RuntimeError("edit unavailable")
+            raise _TelegramEditRejected("edit unavailable")
         return super().edit_message_text(text, chat_id, message_id, **kwargs)
 
 
@@ -84,10 +100,10 @@ class _OfflineAfterBeginBot(_EditBot):
     def send_message(self, chat_id, text, **kwargs):
         if not self.messages:
             return super().send_message(chat_id, text, **kwargs)
-        raise RuntimeError("offline")
+        raise requests.ConnectTimeout("offline")
 
     def edit_message_text(self, text, chat_id, message_id, **kwargs):
-        raise RuntimeError("offline")
+        raise requests.ConnectTimeout("offline")
 
 
 class _FailingDeleteBot(_EditBot):
@@ -201,7 +217,7 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
 
         class RecoveryBot(_RichBot):
             def edit_message_text(self, *_args, **_kwargs):
-                raise RuntimeError("message is no longer editable")
+                raise _TelegramEditRejected("message is no longer editable")
 
         bot = RecoveryBot()
         self.assertEqual(recover_stale_operations(bot, _TELEBOT), 1)
@@ -344,6 +360,20 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
         self.assertEqual(rows[0]["id"], "operation-0")
         self.assertEqual(rows[-1]["id"], "operation-50")
 
+    def test_pending_operations_have_a_hard_capacity_with_newest_retained(self):
+        for index in range(270):
+            _register_pending({
+                "id": f"bounded-{index:03d}",
+                "chat_id": "100",
+                "label": f"任务 {index}",
+                "started_at": index + 1,
+            })
+
+        rows = json.loads(db.kv_get("telegram_pending_operations_v1", "[]"))
+        self.assertEqual(len(rows), 256)
+        self.assertEqual(rows[0]["id"], "bounded-014")
+        self.assertEqual(rows[-1]["id"], "bounded-269")
+
     def test_final_edit_failure_falls_back_to_new_message(self):
         bot = _FailingFinalEditBot()
         progress = TelegramProgress(bot, _TELEBOT, "100", "RSS 刷新", timeout_seconds=60)
@@ -353,6 +383,80 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
         self.assertTrue(progress.finish("<b>RSS 刷新完成</b>"))
         self.assertEqual(bot.messages[-1][1], "<b>RSS 刷新完成</b>")
         self.assertEqual(bot.deleted, [("100", 21)])
+        self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
+
+    def test_final_edit_read_timeout_never_sends_a_fallback(self):
+        class ReadTimeoutBot(_EditBot):
+            def edit_message_text(self, *_args, **_kwargs):
+                raise requests.ReadTimeout("response lost after edit")
+
+        bot = ReadTimeoutBot()
+        progress = TelegramProgress(
+            bot, _TELEBOT, "100", "RSS 刷新", timeout_seconds=60,
+        )
+        progress.begin("刷新中")
+
+        self.assertFalse(progress.finish("<b>RSS 刷新完成</b>"))
+        self.assertTrue(progress.terminal_outcome_unknown)
+        self.assertEqual(len(bot.messages), 1)
+        self.assertEqual(bot.deleted, [])
+        self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
+
+    def test_edit_rejection_fallback_read_timeout_is_not_replayed(self):
+        class FallbackReadTimeoutBot(_FailingFinalEditBot):
+            def send_message(self, chat_id, text, **kwargs):
+                if not self.messages:
+                    return super().send_message(chat_id, text, **kwargs)
+                self.messages.append((chat_id, text, kwargs))
+                raise requests.ReadTimeout("response lost after fallback send")
+
+        bot = FallbackReadTimeoutBot()
+        progress = TelegramProgress(
+            bot, _TELEBOT, "100", "RSS 刷新", timeout_seconds=60,
+        )
+        progress.begin("刷新中")
+
+        self.assertFalse(progress.finish("<b>RSS 刷新完成</b>"))
+        self.assertTrue(progress.terminal_outcome_unknown)
+        self.assertEqual(len(bot.messages), 2)
+        self.assertEqual(bot.deleted, [])
+        self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
+
+    def test_message_not_modified_is_an_idempotent_terminal_success(self):
+        class UnchangedBot(_EditBot):
+            def edit_message_text(self, *_args, **_kwargs):
+                raise _TelegramMessageNotModified("already final")
+
+        bot = UnchangedBot()
+        progress = TelegramProgress(
+            bot, _TELEBOT, "100", "RSS 刷新", timeout_seconds=60,
+        )
+        progress.begin("刷新中")
+
+        self.assertTrue(progress.finish("刷新中"))
+        self.assertEqual(len(bot.messages), 1)
+        self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
+
+    def test_runtime_retry_is_not_scheduled_for_unknown_edit(self):
+        class ReadTimeoutBot(_EditBot):
+            def edit_message_text(self, *_args, **_kwargs):
+                raise requests.ReadTimeout("response lost after edit")
+
+        bot = ReadTimeoutBot()
+        source = SimpleNamespace(chat=SimpleNamespace(id="100"), message_id=44)
+        with patch("app.bot.progress.schedule_terminal_delivery_retry") as retry:
+            delivered = deliver_terminal_to_existing_message(
+                bot,
+                _TELEBOT,
+                source,
+                "<b>操作完成</b>",
+                label="Agent 操作结果",
+                runtime_retry=True,
+            )
+
+        self.assertFalse(delivered)
+        retry.assert_not_called()
+        self.assertEqual(bot.messages, [])
         self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
 
     def test_bind_task_run_updates_only_the_existing_pending_operation(self):

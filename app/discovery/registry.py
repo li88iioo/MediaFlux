@@ -1,12 +1,16 @@
 """探索 Provider 注册表、栏目定义与筛选白名单。"""
 from __future__ import annotations
 
-from copy import deepcopy
 import re
+import threading
+from copy import deepcopy
 from typing import Any
 
 from app import config
-from app.discovery.models import ProviderNotConfigured
+from app.discovery.models import ProviderNotConfigured, ProviderUnavailable
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 _SECTION_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {"key": "tmdb-trending-week", "title": "本周流行", "provider": "tmdb", "category": "trending_week", "media_type": "all"},
@@ -247,22 +251,54 @@ def list_filter_definitions(provider: str, media_type: str) -> dict[str, Any]:
 
 class ProviderRegistry:
     def __init__(self, providers: dict[str, Any] | None = None):
-        self._providers = {str(name).lower(): provider for name, provider in (providers or {}).items()}
+        self._providers = {
+            str(name).lower(): provider for name, provider in (providers or {}).items()
+        }
+        self._lock = threading.RLock()
+        self._closed = False
 
     def register(self, provider: Any) -> None:
         name = str(getattr(provider, "name", "") or "").lower()
         if not name:
             raise ValueError("Provider name is required")
-        self._providers[name] = provider
+        with self._lock:
+            if self._closed:
+                raise ProviderUnavailable("探索数据源注册表已关闭")
+            self._providers[name] = provider
 
     def get(self, name: str) -> Any:
-        provider = self._providers.get(str(name or "").lower())
+        with self._lock:
+            if self._closed:
+                raise ProviderUnavailable("探索数据源注册表已关闭")
+            provider = self._providers.get(str(name or "").lower())
         if provider is None:
             raise ProviderNotConfigured("数据源未配置")
         return provider
 
     def names(self) -> list[str]:
-        return sorted(self._providers)
+        with self._lock:
+            return sorted(self._providers)
+
+    def close(self) -> None:
+        """幂等关闭所有唯一 Provider；单个关闭失败不阻塞其余资源释放。"""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            providers = tuple({id(provider): provider for provider in self._providers.values()}.values())
+
+        for provider in providers:
+            close = getattr(provider, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:  # pragma: no cover - defensive shutdown isolation
+                logger.warning(
+                    "关闭探索数据源失败 provider=%s error=%s",
+                    getattr(provider, "name", type(provider).__name__),
+                    exc,
+                )
 
 
 def build_default_registry() -> ProviderRegistry:

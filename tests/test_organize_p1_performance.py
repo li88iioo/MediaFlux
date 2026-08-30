@@ -461,6 +461,36 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
         self.assertTrue(process.terminated)
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_probe_cache_prune_removes_expired_and_caps_oldest_rows(self):
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM media_probe_cache")
+            conn.executemany(
+                "INSERT INTO media_probe_cache("
+                "file_id,etag,size,payload,updated_at"
+                ") VALUES(?,?,?,?,?)",
+                [
+                    ("expired", "e1", 1, "{}", "2026-01-01 00:00:00"),
+                    ("old-live", "e2", 2, "{}", "2026-06-01 00:00:00"),
+                    ("new-live", "e3", 3, "{}", "2026-07-01 00:00:00"),
+                ],
+            )
+
+        deleted = db.prune_media_probe_cache(
+            expired_before="2026-05-01 00:00:00",
+            max_rows=1,
+            batch_size=10,
+        )
+
+        self.assertEqual(deleted, 2)
+        with db.get_conn() as conn:
+            remaining = [
+                row["file_id"]
+                for row in conn.execute(
+                    "SELECT file_id FROM media_probe_cache ORDER BY file_id"
+                )
+            ]
+        self.assertEqual(remaining, ["new-live"])
+
     def test_batch_probe_cache_uses_one_connection_and_strict_versions(self):
         db.upsert_media_probe_cache("one", "etag-1", 100, '{"resolution":"1080p"}')
         db.upsert_media_probe_cache("two", "etag-2", 200, '{"resolution":"2160p"}')

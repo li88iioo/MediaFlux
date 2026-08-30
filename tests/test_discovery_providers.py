@@ -53,6 +53,7 @@ class FakeSession:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls = []
+        self.close_calls = 0
         self.proxies = {}
 
     def get(self, url, **kwargs):
@@ -63,6 +64,9 @@ class FakeSession:
         if isinstance(response, Exception):
             raise response
         return response
+
+    def close(self):
+        self.close_calls += 1
 
 
 class CapturingDoubanPublicSession(requests.Session):
@@ -1121,6 +1125,43 @@ class BangumiProviderTests(unittest.TestCase):
         provider, _ = self.make_provider(FakeResponse({"items": []}))
         with self.assertRaises(ProviderInvalidResponse):
             provider.list_items("weekly", "tv", 1, {})
+
+
+class ProviderLifecycleTests(unittest.TestCase):
+    def test_tmdb_provider_close_is_idempotent_and_blocks_requests(self):
+        session = FakeSession()
+        provider = TMDBProvider(client=TMDBClient(api_key="key", session=session))
+
+        provider.close()
+        provider.close()
+
+        self.assertEqual(session.close_calls, 1)
+        with self.assertRaises(ProviderUnavailable):
+            provider.list_items("popular", "movie", 1, {})
+
+    def test_bangumi_provider_close_is_idempotent_and_blocks_cached_reads(self):
+        session = FakeSession()
+        provider = BangumiProvider(session=session)
+        provider._calendar_payload = []
+
+        provider.close()
+        provider.close()
+
+        self.assertEqual(session.close_calls, 1)
+        self.assertIsNone(provider._calendar_payload)
+        with self.assertRaises(ProviderUnavailable):
+            provider.list_items("calendar", "tv", 1, {})
+
+    def test_douban_provider_close_deduplicates_shared_session(self):
+        session = FakeSession()
+        provider = DoubanProvider(enabled=True, session=session)
+
+        provider.close()
+        provider.close()
+
+        self.assertEqual(session.close_calls, 1)
+        with self.assertRaises(ProviderUnavailable):
+            provider.list_items("movie_hot", "movie", 1, {})
 
 
 class TMDBScraperCompatibilityTests(unittest.TestCase):

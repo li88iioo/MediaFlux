@@ -456,6 +456,10 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
                     "admin", inspection["inspection_id"], tmdb_id="1", media_type="movie",
                     rules_snapshot=preview["rules_snapshot"],
                 )
+                with self.assertRaisesRegex(
+                    LocalMediaServiceError, "检查记录不存在或已过期"
+                ):
+                    service.preview("admin", inspection["inspection_id"])
                 self.assertTrue(db.claim_local_media_task(
                     task_id, expected="waiting_stable", owner="admin"
                 ))

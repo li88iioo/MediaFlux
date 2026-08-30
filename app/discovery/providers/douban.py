@@ -30,7 +30,11 @@ from app.discovery.models import (
     ProviderTimeout,
     ProviderUnavailable,
 )
-from app.discovery.providers.base import DEFAULT_TIMEOUT, DiscoveryProvider, TimeoutValue
+from app.discovery.providers.base import (
+    DEFAULT_TIMEOUT,
+    DiscoveryProvider,
+    TimeoutValue,
+)
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -258,6 +262,38 @@ class DoubanProvider(DiscoveryProvider):
         self._fallback_breakers: dict[str, tuple[int, float]] = {}
         # 熔断检查与实际网络请求之间也要单飞，避免并发首探重复请求/日志。
         self._fallback_in_flight: set[str] = set()
+        self._close_lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            clients = (self.public_client, self._frodo_client, self._authenticated_client)
+            self._frodo_client = None
+            self._authenticated_client = None
+
+        resources: list[Any] = []
+        for client in clients:
+            if client is None:
+                continue
+            session = getattr(client, "session", None)
+            resources.append(session if session is not None else client)
+        resources.append(self.session)
+
+        seen: set[int] = set()
+        for resource in resources:
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:  # pragma: no cover - defensive shutdown isolation
+                logger.warning("关闭豆瓣客户端资源失败 error=%s", exc)
 
     def _load_dbcl2(self) -> None:
         """每次调用都对齐当前配置值：用户在设置中更新 Cookie 必须免重启生效。"""
@@ -292,6 +328,9 @@ class DoubanProvider(DiscoveryProvider):
         )
 
     def _ensure_enabled(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                raise ProviderUnavailable("豆瓣数据源已关闭")
         if not self.enabled:
             raise ProviderNotConfigured("豆瓣探索 Provider 未启用")
 

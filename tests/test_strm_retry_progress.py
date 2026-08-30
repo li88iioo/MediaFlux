@@ -8,7 +8,7 @@ import textwrap
 import unittest
 from contextlib import chdir
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
@@ -663,6 +663,93 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
             "app.modules.strm.get",
             side_effect=lambda key, default="": values.get(key, default),
         )
+
+    @staticmethod
+    def _runtime(root: str, source_id: str = "source-owned") -> dict:
+        return {
+            "base_url": "http://mediaflux.invalid",
+            "strm_root": root,
+            "sources": [{
+                "id": source_id,
+                "name": "Owned Client Source",
+                "rel_prefix": "",
+                "source_key": f"guangya:{source_id}",
+                "metadata_source_key": f"guangya-meta:{source_id}",
+            }],
+        }
+
+    def test_retry_closes_internally_created_client_on_success(self):
+        failure_id = self._failure(
+            "source-owned", "Owned Client Source", "missing", "Missing.mkv"
+        )
+        client = Mock()
+        lookup = strm_module._RetryLookupResult(
+            located={},
+            directories=1,
+            entries=0,
+            scan_incomplete=True,
+            scan_limit_reason="directory_error",
+            stopped=False,
+        )
+        with tempfile.TemporaryDirectory() as root, patch(
+            "app.modules.strm.GuangYaClient", return_value=client
+        ), patch(
+            "app.modules.strm._locate_retry_files", return_value=lookup
+        ):
+            result = strm_module.retry_strm_failures(
+                [failure_id],
+                "manual",
+                runtime_config=self._runtime(root),
+            )
+
+        self.assertEqual(result["deferred"], 1)
+        client.close.assert_called_once_with()
+
+    def test_retry_closes_internally_created_client_on_exception(self):
+        failure_id = self._failure(
+            "source-owned", "Owned Client Source", "broken", "Broken.mkv"
+        )
+        client = Mock()
+        with tempfile.TemporaryDirectory() as root, patch(
+            "app.modules.strm.GuangYaClient", return_value=client
+        ), patch(
+            "app.modules.strm._locate_retry_files",
+            side_effect=RuntimeError("injected locate failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected locate failure"):
+                strm_module.retry_strm_failures(
+                    [failure_id],
+                    "manual",
+                    runtime_config=self._runtime(root),
+                )
+
+        client.close.assert_called_once_with()
+
+    def test_retry_does_not_close_injected_client(self):
+        failure_id = self._failure(
+            "source-owned", "Owned Client Source", "external", "External.mkv"
+        )
+        client = Mock()
+        lookup = strm_module._RetryLookupResult(
+            located={},
+            directories=1,
+            entries=0,
+            scan_incomplete=True,
+            scan_limit_reason="directory_error",
+            stopped=False,
+        )
+        with tempfile.TemporaryDirectory() as root, patch(
+            "app.modules.strm._locate_retry_files", return_value=lookup
+        ):
+            result = strm_module.retry_strm_failures(
+                [failure_id],
+                "manual",
+                client=client,
+                runtime_config=self._runtime(root),
+            )
+
+        self.assertEqual(result["deferred"], 1)
+        client.close.assert_not_called()
 
     def test_scheduler_uses_the_shared_duplicate_name_source_plan(self):
         from app.modules import scheduler as scheduler_module

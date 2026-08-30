@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -57,11 +58,15 @@ from app.modules.media_server_path_mapping import (
 )
 from app.modules.scraper import MatchResult, TMDBScraper
 from app.config import get, get_bool
+from app.logger import get_logger
 from app.modules.special_media import (
     is_special_media_name,
     is_special_path,
     special_parent_context,
 )
+
+
+logger = get_logger(__name__)
 
 _SERVER_ONLY_RULE_FIELDS = {
     "nsfw_enabled",
@@ -77,6 +82,12 @@ _SERVER_ONLY_RULE_FIELDS = {
 
 class LocalMediaServiceError(RuntimeError):
     """可安全显示的本地媒体业务错误。"""
+
+
+class LocalMediaPostMoveError(LocalMediaServiceError):
+    """移动已提交或回滚不完整；上层必须保持人工核验语义。"""
+
+    requires_manual = True
 
 
 @dataclass(frozen=True)
@@ -110,30 +121,101 @@ class _Inspection:
 
 
 class _InspectionStore:
-    def __init__(self, ttl_seconds: int = 1800) -> None:
-        self.ttl_seconds = ttl_seconds
-        self._records: dict[str, _Inspection] = {}
+    def __init__(
+        self,
+        ttl_seconds: int = 1800,
+        *,
+        max_records: int = 64,
+        max_snapshot_entries: int = 40_000,
+    ) -> None:
+        self.ttl_seconds = max(1, int(ttl_seconds))
+        self.max_records = max(1, int(max_records))
+        self.max_snapshot_entries = max(1, int(max_snapshot_entries))
+        self._records: OrderedDict[str, _Inspection] = OrderedDict()
+        self._scope_ids: dict[tuple[str, int, str], str] = {}
+        self._snapshot_entries = 0
         self._lock = threading.RLock()
 
+    @staticmethod
+    def _scope_key(record: _Inspection) -> tuple[str, int, str]:
+        return (
+            str(record.owner),
+            int(record.source_id),
+            str(record.selected_path),
+        )
+
+    def _remove_locked(self, inspection_id: str) -> _Inspection | None:
+        record = self._records.pop(str(inspection_id), None)
+        if record is None:
+            return None
+        self._snapshot_entries = max(
+            0, self._snapshot_entries - len(record.snapshots)
+        )
+        scope_key = self._scope_key(record)
+        if self._scope_ids.get(scope_key) == str(inspection_id):
+            self._scope_ids.pop(scope_key, None)
+        return record
+
     def put(self, record: _Inspection) -> str:
+        snapshot_count = len(record.snapshots)
+        if snapshot_count > self.max_snapshot_entries:
+            raise LocalMediaServiceError("检查结果过大，请缩小目录范围后重试")
         inspection_id = uuid.uuid4().hex
         with self._lock:
             self._prune_locked()
+            previous_id = self._scope_ids.get(self._scope_key(record))
+            if previous_id:
+                self._remove_locked(previous_id)
             self._records[inspection_id] = record
+            self._scope_ids[self._scope_key(record)] = inspection_id
+            self._snapshot_entries += snapshot_count
+            while (
+                len(self._records) > self.max_records
+                or self._snapshot_entries > self.max_snapshot_entries
+            ):
+                oldest_id = next(iter(self._records))
+                self._remove_locked(oldest_id)
         return inspection_id
 
     def get(self, owner: str, inspection_id: str) -> _Inspection:
         with self._lock:
             self._prune_locked()
-            record = self._records.get(str(inspection_id))
+            normalized_id = str(inspection_id)
+            record = self._records.get(normalized_id)
             if record is None or record.owner != str(owner):
                 raise LocalMediaServiceError("检查记录不存在或已过期")
+            self._records.move_to_end(normalized_id)
             return record
+
+    def discard(self, owner: str, inspection_id: str) -> bool:
+        with self._lock:
+            self._prune_locked()
+            normalized_id = str(inspection_id)
+            record = self._records.get(normalized_id)
+            if record is None or record.owner != str(owner):
+                return False
+            self._remove_locked(normalized_id)
+            return True
+
+    def consume(self, owner: str, inspection_id: str) -> _Inspection:
+        with self._lock:
+            self._prune_locked()
+            normalized_id = str(inspection_id)
+            record = self._records.get(normalized_id)
+            if record is None or record.owner != str(owner):
+                raise LocalMediaServiceError("检查记录不存在或已过期")
+            consumed = self._remove_locked(normalized_id)
+            assert consumed is not None
+            return consumed
 
     def _prune_locked(self) -> None:
         deadline = time.time() - self.ttl_seconds
-        for key in [key for key, value in self._records.items() if value.created_at < deadline]:
-            self._records.pop(key, None)
+        expired = [
+            key for key, value in self._records.items()
+            if value.created_at < deadline
+        ]
+        for key in expired:
+            self._remove_locked(key)
 
 
 _CATEGORY_KEYS = {
@@ -1412,6 +1494,46 @@ class LocalMediaService:
                     pass
         return warnings
 
+    @staticmethod
+    def _committed_move_failure_message(
+        exc: Exception, moved_targets: list[str], *, rollback_incomplete: bool = False,
+    ) -> str:
+        if rollback_incomplete:
+            prefix = "本地媒体移动失败且回滚不完整，文件状态需要人工核验"
+        else:
+            prefix = "本地媒体文件已完成移动，但后续收尾失败，已禁止自动恢复 qB"
+        error_text = str(exc or type(exc).__name__).strip() or type(exc).__name__
+        message = f"{prefix}：{error_text}"
+        if moved_targets:
+            visible = moved_targets[:10]
+            suffix = "、".join(visible)
+            if len(moved_targets) > len(visible):
+                suffix += f" 等 {len(moved_targets)} 项"
+            message += f"；已移动目标：{suffix}"
+        return message[:4000]
+
+    @staticmethod
+    def _persist_committed_move_failure(
+        owner: str, task_id: int, diagnostic: str,
+    ) -> None:
+        try:
+            db.update_local_media_task(
+                task_id,
+                owner=owner,
+                status="requires_manual",
+                warning=diagnostic,
+                error=diagnostic,
+                completed_at=None,
+            )
+        except Exception as persist_exc:
+            # 原始失败可能正是数据库瞬时异常；仍尽最大努力记录，且绝不能
+            # 因二次落库失败转而恢复已提交移动任务的 qB。
+            logger.error(
+                "持久化本地媒体提交后异常失败 task=%s type=%s",
+                task_id,
+                type(persist_exc).__name__,
+            )
+
     def execute_task(self, owner: str, task_id: int, *, qb_client=None) -> dict[str, Any]:
         task = db.get_local_media_task(task_id, owner=owner)
         if task is None:
@@ -1421,6 +1543,8 @@ class LocalMediaService:
             raise LocalMediaServiceError("本地媒体来源不存在")
         rules = self._restore_rules_snapshot(task.rules_snapshot) if task.rules_snapshot else OrganizeRules.from_config()
         paused = False
+        move_committed = False
+        committed_targets: list[str] = []
         try:
             if task.qb_hash and qb_client is None:
                 raise LocalMediaServiceError("qB 任务缺少可用客户端，已拒绝移动源文件")
@@ -1508,6 +1632,10 @@ class LocalMediaService:
                     [Path(item.path) for item in db.list_local_library_targets(task.source_id, owner=owner)],
                     task_id=task_id, owner=owner, operation_token=task.operation_token,
                 ).execute(executable_plans)
+                # LocalMoveTransaction 只有在全部移动完成并完成内部校验后才返回。
+                # 从此处开始，任何异常都属于提交后收尾失败，绝不能恢复 qB。
+                move_committed = True
+                committed_targets = [str(item.target) for item in result.moved]
             else:
                 result = MoveTransactionResult(status="completed")
             db.update_local_media_task(task_id, owner=owner, status="verifying")
@@ -1574,12 +1702,30 @@ class LocalMediaService:
                 ],
             }
         except Exception as exc:
+            rollback_incomplete = bool(getattr(exc, "rollback_errors", None))
+            if move_committed or rollback_incomplete:
+                diagnostic = self._committed_move_failure_message(
+                    exc,
+                    committed_targets,
+                    rollback_incomplete=rollback_incomplete,
+                )
+                self._persist_committed_move_failure(owner, task_id, diagnostic)
+                raise LocalMediaPostMoveError(diagnostic) from exc
             if paused and task.qb_hash and qb_client is not None:
                 try:
                     qb_client.resume_torrents(task.qb_hash)
                 except Exception as resume_exc:
                     exc = LocalMediaServiceError(f"{exc}；qB 恢复失败: {resume_exc}")
-            db.update_local_media_task(task_id, owner=owner, status="failed", error=str(exc))
+            try:
+                db.update_local_media_task(
+                    task_id, owner=owner, status="failed", error=str(exc)
+                )
+            except Exception as persist_exc:
+                logger.error(
+                    "持久化本地媒体提交前异常失败 task=%s type=%s",
+                    task_id,
+                    type(persist_exc).__name__,
+                )
             raise
 
     def create_manual_task(
@@ -1619,13 +1765,17 @@ class LocalMediaService:
             normalized_snapshot = self._serialize_rules_snapshot(
                 self._restore_rules_snapshot(rules_snapshot)
             )
-        return db.prepare_manual_local_media_task(
+        task_id = db.prepare_manual_local_media_task(
             inspection.source_id, str(inspection.selected_path), owner=owner,
             tmdb_id=str(tmdb_id or "").strip(), media_type=effective_type,
             rules_snapshot=normalized_snapshot, season_override=season_override,
             episode_override=episode_override,
             numbering_mode=normalized_numbering_mode,
         )
+        # 检查快照已转化为持久化任务，继续保留只会重复占用大量路径/
+        # inode 快照内存。数据库写入成功后再消费，失败时仍允许用户重试。
+        self.inspections.discard(owner, inspection_id)
+        return task_id
 
     def execute_preview(self, owner: str, inspection_id: str, preview: dict[str, Any]) -> MoveTransactionResult:
         inspection = self.inspections.get(owner, inspection_id)
@@ -1637,15 +1787,19 @@ class LocalMediaService:
             item for item in preview["_move_plans"] if item.action != "skip"
         ]
         if not executable_plans:
-            return MoveTransactionResult(
+            result = MoveTransactionResult(
                 status="completed",
                 warnings=["按冲突策略保留现有文件，没有需要移动的项目"],
             )
+            self.inspections.discard(owner, inspection_id)
+            return result
         targets = db.list_local_library_targets(inspection.source_id, owner=owner)
         transaction = LocalMoveTransaction(
             [inspection.root], [Path(item.path) for item in targets], owner=owner,
         )
-        return transaction.execute(executable_plans)
+        result = transaction.execute(executable_plans)
+        self.inspections.discard(owner, inspection_id)
+        return result
 
 
 _service: LocalMediaService | None = None

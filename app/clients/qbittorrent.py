@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -109,6 +110,16 @@ class QBittorrentClient:
         self.api_key = api_key
         self.timeout = timeout
         self._session = requests.Session()
+        self._close_lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        """幂等释放当前客户端拥有的 requests 连接池。"""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._session.close()
 
     def _headers(self) -> dict[str, str]:
         h = {"Accept": "application/json"}

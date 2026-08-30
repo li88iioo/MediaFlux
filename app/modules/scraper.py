@@ -16,6 +16,7 @@ import re
 import threading
 import time
 import unicodedata
+from collections import OrderedDict
 from datetime import date
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
@@ -111,6 +112,8 @@ _TMDB_CIRCUIT_THRESHOLD = 3
 _TMDB_CIRCUIT_COOLDOWN_SECONDS = 60.0
 _AI_RESULT_CACHE_TTL_SECONDS = 300.0
 _AI_FAILURE_CACHE_TTL_SECONDS = 5.0
+_AI_FAILURE_CACHE_LIMIT = 128
+_RECOGNITION_DETAIL_CACHE_LIMIT = 128
 _AI_FAILURE_GENERIC = "generic"
 _AI_FAILURE_PROVIDER = "provider"
 _AI_FAILURE_UNAVAILABLE = "unavailable"
@@ -3410,7 +3413,9 @@ class TMDBScraper:
         self._last_search_cache_hit = False
         self._last_search_empty_cache_hit = False
         self._search_outcome_local = threading.local()
-        self._recognition_detail_cache: dict[tuple[str, str], dict] = {}
+        self._recognition_detail_cache: OrderedDict[
+            tuple[str, str], dict
+        ] = OrderedDict()
         self._recognition_detail_failures: set[tuple[str, str]] = set()
         self._detail_cache: dict[tuple[str, str], dict] = {}
         self._credits_detail_cache: dict[tuple[str, str], dict] = {}
@@ -3428,8 +3433,12 @@ class TMDBScraper:
         self._release_group_ai_cache: dict[str, tuple[float, AIReleaseGroupResult]] = {}
         self._ai_inflight: dict[str, threading.Event] = {}
         self._release_group_ai_inflight: dict[str, threading.Event] = {}
-        self._ai_failure_cache: dict[str, tuple[float, str, str]] = {}
-        self._release_group_ai_failure_cache: dict[str, tuple[float, str, str]] = {}
+        self._ai_failure_cache: OrderedDict[
+            str, tuple[float, str, str]
+        ] = OrderedDict()
+        self._release_group_ai_failure_cache: OrderedDict[
+            str, tuple[float, str, str]
+        ] = OrderedDict()
         self._performance_counters = {
             "tmdb_search_requests": 0,
             "tmdb_search_cache_hits": 0,
@@ -3511,6 +3520,76 @@ class TMDBScraper:
             if key not in cache and len(cache) >= _TMDB_FAILURE_CACHE_LIMIT:
                 cache.pop(next(iter(cache)))
             cache[key] = (now, str(message or "")[:500])
+
+    def _remember_recognition_detail(
+        self, key: tuple[str, str], detail: dict, *, failed: bool,
+    ) -> None:
+        with self._tmdb_state_lock:
+            self._recognition_detail_cache.pop(key, None)
+            self._recognition_detail_cache[key] = dict(detail)
+            if failed:
+                self._recognition_detail_failures.add(key)
+            else:
+                self._recognition_detail_failures.discard(key)
+            while (
+                len(self._recognition_detail_cache)
+                > _RECOGNITION_DETAIL_CACHE_LIMIT
+            ):
+                evicted_key, _value = self._recognition_detail_cache.popitem(
+                    last=False
+                )
+                self._recognition_detail_failures.discard(evicted_key)
+
+    def _cached_recognition_detail(
+        self, key: tuple[str, str],
+    ) -> tuple[bool, dict, bool]:
+        with self._tmdb_state_lock:
+            detail = self._recognition_detail_cache.get(key)
+            if detail is None and key not in self._recognition_detail_cache:
+                return False, {}, False
+            self._recognition_detail_cache.move_to_end(key)
+            return (
+                True,
+                dict(detail or {}),
+                key in self._recognition_detail_failures,
+            )
+
+    @staticmethod
+    def _active_ai_failure(
+        cache: OrderedDict[str, tuple[float, str, str]],
+        key: str,
+        now: float,
+    ) -> tuple[float, str, str] | None:
+        failed = cache.get(key)
+        if failed is None:
+            return None
+        if now - failed[0] > _AI_FAILURE_CACHE_TTL_SECONDS:
+            cache.pop(key, None)
+            return None
+        cache.move_to_end(key)
+        return failed
+
+    @staticmethod
+    def _remember_ai_failure(
+        cache: OrderedDict[str, tuple[float, str, str]],
+        key: str,
+        error: str,
+        kind: str,
+        *,
+        now: float | None = None,
+    ) -> None:
+        current = time.monotonic() if now is None else float(now)
+        expired = [
+            item_key
+            for item_key, value in cache.items()
+            if current - value[0] > _AI_FAILURE_CACHE_TTL_SECONDS
+        ]
+        for item_key in expired:
+            cache.pop(item_key, None)
+        cache.pop(key, None)
+        cache[key] = (current, str(error or "")[:500], str(kind or ""))
+        while len(cache) > _AI_FAILURE_CACHE_LIMIT:
+            cache.popitem(last=False)
 
     def _publish_search_outcome(self, outcome: _SearchOutcome) -> None:
         """发布兼容诊断字段；识别管线使用线程内 outcome，避免并发串扰。"""
@@ -4384,36 +4463,34 @@ class TMDBScraper:
         if not tmdb_id:
             return candidate, False
         key = (media_type, tmdb_id)
-        if key not in self._recognition_detail_cache:
+        cached, detail, detail_failed = self._cached_recognition_detail(key)
+        if not cached:
             try:
                 detail_method = getattr(
                     self.client, "detail_with_alternative_titles", None
                 )
                 if callable(detail_method):
-                    detail = detail_method(tmdb_id, media_type)
+                    raw_detail = detail_method(tmdb_id, media_type)
                 else:
-                    detail = self.client.detail(tmdb_id, media_type)
-                if isinstance(detail, dict):
-                    self._recognition_detail_cache[key] = dict(detail)
-                    self._recognition_detail_failures.discard(key)
-                else:
-                    self._recognition_detail_cache[key] = {}
-                    self._recognition_detail_failures.add(key)
-                self._remember_detail(
-                    self._detail_cache, key, self._recognition_detail_cache[key]
+                    raw_detail = self.client.detail(tmdb_id, media_type)
+                detail_failed = not isinstance(raw_detail, dict)
+                detail = dict(raw_detail) if isinstance(raw_detail, dict) else {}
+                self._remember_recognition_detail(
+                    key, detail, failed=detail_failed
                 )
+                self._remember_detail(self._detail_cache, key, detail)
             except Exception as exc:
                 logger.warning(
                     "TMDB 候选别名补全失败 tmdb=%s type=%s error=%s",
                     tmdb_id, media_type, type(exc).__name__,
                 )
-                self._recognition_detail_cache[key] = {}
-                self._recognition_detail_failures.add(key)
-        detail = self._recognition_detail_cache[key]
+                detail = {}
+                detail_failed = True
+                self._remember_recognition_detail(key, detail, failed=True)
         if not detail:
             # ``{}`` 可以是客户端成功返回的空对象；它代表没有补充别名，
             # 但覆盖请求已完成。只有异常或非字典响应才是不完整覆盖。
-            return candidate, key not in self._recognition_detail_failures
+            return candidate, not detail_failed
         merged = dict(candidate)
         for field_name in (
             "name", "title", "original_name", "original_title",
@@ -4425,7 +4502,7 @@ class TMDBScraper:
         for alias_field in ("alternative_titles", "translations"):
             if detail.get(alias_field):
                 merged[alias_field] = detail[alias_field]
-        return merged, key not in self._recognition_detail_failures
+        return merged, not detail_failed
 
     def _attach_unique_target_season_year_evidence(
         self,
@@ -5628,10 +5705,11 @@ class TMDBScraper:
                     self._performance_counters["ai_cache_hits"] += 1
                     return cached[1]
                 self._ai_result_cache.pop(cache_key, None)
-                failed = self._ai_failure_cache.get(cache_key)
-                if failed and current - failed[0] <= _AI_FAILURE_CACHE_TTL_SECONDS:
+                failed = self._active_ai_failure(
+                    self._ai_failure_cache, cache_key, current
+                )
+                if failed:
                     raise _ai_failure_error_type(failed[2])(failed[1])
-                self._ai_failure_cache.pop(cache_key, None)
 
                 in_flight = self._ai_inflight.get(cache_key)
                 if in_flight is None:
@@ -5669,8 +5747,9 @@ class TMDBScraper:
                 result = ai_client.recognize(ai_input)
             except AIRecognitionError as exc:
                 with self._ai_lock:
-                    self._ai_failure_cache[cache_key] = (
-                        time.monotonic(),
+                    self._remember_ai_failure(
+                        self._ai_failure_cache,
+                        cache_key,
                         redact_sensitive_text(exc)[:500],
                         _ai_failure_kind(exc),
                     )
@@ -5680,8 +5759,11 @@ class TMDBScraper:
             except Exception as exc:
                 safe_error = redact_sensitive_text(exc)[:500] or type(exc).__name__
                 with self._ai_lock:
-                    self._ai_failure_cache[cache_key] = (
-                        time.monotonic(), safe_error, _AI_FAILURE_GENERIC
+                    self._remember_ai_failure(
+                        self._ai_failure_cache,
+                        cache_key,
+                        safe_error,
+                        _AI_FAILURE_GENERIC,
                     )
                     self._ai_inflight.pop(cache_key, None)
                     in_flight.set()
@@ -5724,10 +5806,11 @@ class TMDBScraper:
                     self._performance_counters["ai_cache_hits"] += 1
                     return cached[1]
                 self._release_group_ai_cache.pop(cache_key, None)
-                failed = self._release_group_ai_failure_cache.get(cache_key)
-                if failed and current - failed[0] <= _AI_FAILURE_CACHE_TTL_SECONDS:
+                failed = self._active_ai_failure(
+                    self._release_group_ai_failure_cache, cache_key, current
+                )
+                if failed:
                     raise _ai_failure_error_type(failed[2])(failed[1])
-                self._release_group_ai_failure_cache.pop(cache_key, None)
 
                 in_flight = self._release_group_ai_inflight.get(cache_key)
                 if in_flight is None:
@@ -5766,8 +5849,11 @@ class TMDBScraper:
             except AIRecognitionError as exc:
                 safe_error = redact_sensitive_text(exc)[:500]
                 with self._ai_lock:
-                    self._release_group_ai_failure_cache[cache_key] = (
-                        time.monotonic(), safe_error, _ai_failure_kind(exc)
+                    self._remember_ai_failure(
+                        self._release_group_ai_failure_cache,
+                        cache_key,
+                        safe_error,
+                        _ai_failure_kind(exc),
                     )
                     self._release_group_ai_inflight.pop(cache_key, None)
                     in_flight.set()
@@ -5775,8 +5861,11 @@ class TMDBScraper:
             except Exception as exc:
                 safe_error = redact_sensitive_text(exc)[:500] or type(exc).__name__
                 with self._ai_lock:
-                    self._release_group_ai_failure_cache[cache_key] = (
-                        time.monotonic(), safe_error, _AI_FAILURE_GENERIC
+                    self._remember_ai_failure(
+                        self._release_group_ai_failure_cache,
+                        cache_key,
+                        safe_error,
+                        _AI_FAILURE_GENERIC,
                     )
                     self._release_group_ai_inflight.pop(cache_key, None)
                     in_flight.set()

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
@@ -19,6 +20,8 @@ import shutil
 import threading
 import time
 import uuid
+from collections import deque
+from collections.abc import Callable, Iterator
 from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
@@ -26,10 +29,9 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
-from collections import deque
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote, urlencode
-from typing import Callable, Optional
 
 import requests
 from urllib3.util import Retry
@@ -42,6 +44,28 @@ from app.modules.process_lock import CrossProcessLock
 from app.modules.strm_notifications import append_change, relative_change
 
 logger = get_logger(__name__)
+
+
+@contextmanager
+def _guangya_client_scope(
+    client: GuangYaClient | None,
+) -> Iterator[GuangYaClient]:
+    """仅释放当前调用内部创建的光鸭客户端。"""
+    owned_client = client is None
+    runtime_client = client or GuangYaClient()
+    try:
+        yield runtime_client
+    finally:
+        if owned_client:
+            close = getattr(runtime_client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭 STRM 光鸭客户端失败 type=%s",
+                        type(exc).__name__,
+                    )
 
 
 def _iter_client_dir(
@@ -1172,15 +1196,15 @@ def _install_metadata_candidate(
         raise
 
 
-def prepare_strm_metadata_job(
+def _prepare_strm_metadata_job_with_client(
     job: dict[str, object],
     strm_root: str,
     *,
-    client: Optional[GuangYaClient] = None,
+    client: GuangYaClient,
     should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
-    """在不持有 STRM 写锁时校验远端快照并下载到临时文件。"""
-    runtime_client = client or GuangYaClient()
+    """使用已确定所有权的客户端准备一个元数据任务。"""
+    runtime_client = client
     file_id = str(job.get("file_id") or "")
     if not file_id:
         raise ValueError("元数据任务缺少 file_id")
@@ -1211,6 +1235,23 @@ def prepare_strm_metadata_job(
         download_url=url, should_stop=should_stop,
     )
     return {"file": remote, "rel_dir": rel_dir, "prepared": prepared}
+
+
+def prepare_strm_metadata_job(
+    job: dict[str, object],
+    strm_root: str,
+    *,
+    client: GuangYaClient | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, object]:
+    """在不持有 STRM 写锁时校验远端快照并下载到临时文件。"""
+    with _guangya_client_scope(client) as runtime_client:
+        return _prepare_strm_metadata_job_with_client(
+            job,
+            strm_root,
+            client=runtime_client,
+            should_stop=should_stop,
+        )
 
 
 def commit_strm_metadata_job(
@@ -3176,34 +3217,34 @@ def _retry_strm_failures_locked(
     result["matched"] = len(rows)
     if not rows:
         return result
-    client = client or GuangYaClient()
-    lookup = _locate_retry_files(
-        client,
-        runtime["sources"],
-        {str(row["file_id"]) for row in rows},
-        should_stop=should_stop,
-    )
-    result.update({
-        "scan_incomplete": lookup.scan_incomplete,
-        "scan_limit_reason": lookup.scan_limit_reason,
-        "scan_directories": lookup.directories,
-        "scan_entries": lookup.entries,
-        "stopped": lookup.stopped,
-        "stop_stage": "scan" if lookup.stopped else "",
-    })
-    progress = _BoundedProgress(on_progress)
-    progress.emit("retry", 0, len(rows), "重试失败项")
-    _process_claimed_strm_failures(
-        rows,
-        client=client,
-        runtime=runtime,
-        lookup=lookup,
-        result=result,
-        progress=progress,
-        progress_offset=0,
-        progress_total=len(rows),
-    )
-    return result
+    with _guangya_client_scope(client) as runtime_client:
+        lookup = _locate_retry_files(
+            runtime_client,
+            runtime["sources"],
+            {str(row["file_id"]) for row in rows},
+            should_stop=should_stop,
+        )
+        result.update({
+            "scan_incomplete": lookup.scan_incomplete,
+            "scan_limit_reason": lookup.scan_limit_reason,
+            "scan_directories": lookup.directories,
+            "scan_entries": lookup.entries,
+            "stopped": lookup.stopped,
+            "stop_stage": "scan" if lookup.stopped else "",
+        })
+        progress = _BoundedProgress(on_progress)
+        progress.emit("retry", 0, len(rows), "重试失败项")
+        _process_claimed_strm_failures(
+            rows,
+            client=runtime_client,
+            runtime=runtime,
+            lookup=lookup,
+            result=result,
+            progress=progress,
+            progress_offset=0,
+            progress_total=len(rows),
+        )
+        return result
 
 
 def retry_strm_failures(
@@ -3269,41 +3310,48 @@ def retry_all_strm_failures(
                 return {**result, "ok": False, "error": config_error}
         else:
             runtime = deepcopy(runtime_config)
-        client = client or GuangYaClient()
-        lookup = _locate_retry_files(
-            client,
-            runtime["sources"],
-            {file_id for _, file_id in snapshot},
-            should_stop=should_stop,
-        )
-        result.update({
-            "scan_incomplete": lookup.scan_incomplete,
-            "scan_limit_reason": lookup.scan_limit_reason,
-            "scan_directories": lookup.directories,
-            "scan_entries": lookup.entries,
-            "stopped": lookup.stopped,
-            "stop_stage": "scan" if lookup.stopped else "",
-        })
-        progress = _BoundedProgress(on_progress)
-        total = len(snapshot)
-        progress.emit("retry", 0, total, "重试失败项")
-        for offset in range(0, total, 1000):
-            batch = snapshot[offset:offset + 1000]
-            rows = db.claim_strm_failures([failure_id for failure_id, _ in batch], limit=1000)
-            result["batches"] += 1
-            result["matched"] += len(rows)
-            _process_claimed_strm_failures(
-                rows,
-                client=client,
-                runtime=runtime,
-                lookup=lookup,
-                result=result,
-                progress=progress,
-                progress_offset=offset,
-                progress_total=total,
+        with _guangya_client_scope(client) as runtime_client:
+            lookup = _locate_retry_files(
+                runtime_client,
+                runtime["sources"],
+                {file_id for _, file_id in snapshot},
+                should_stop=should_stop,
             )
-            progress.emit("retry", min(offset + len(batch), total), total, "重试失败项")
-        return result
+            result.update({
+                "scan_incomplete": lookup.scan_incomplete,
+                "scan_limit_reason": lookup.scan_limit_reason,
+                "scan_directories": lookup.directories,
+                "scan_entries": lookup.entries,
+                "stopped": lookup.stopped,
+                "stop_stage": "scan" if lookup.stopped else "",
+            })
+            progress = _BoundedProgress(on_progress)
+            total = len(snapshot)
+            progress.emit("retry", 0, total, "重试失败项")
+            for offset in range(0, total, 1000):
+                batch = snapshot[offset:offset + 1000]
+                rows = db.claim_strm_failures(
+                    [failure_id for failure_id, _ in batch], limit=1000
+                )
+                result["batches"] += 1
+                result["matched"] += len(rows)
+                _process_claimed_strm_failures(
+                    rows,
+                    client=runtime_client,
+                    runtime=runtime,
+                    lookup=lookup,
+                    result=result,
+                    progress=progress,
+                    progress_offset=offset,
+                    progress_total=total,
+                )
+                progress.emit(
+                    "retry",
+                    min(offset + len(batch), total),
+                    total,
+                    "重试失败项",
+                )
+            return result
     finally:
         STRM_OPERATION_LOCK.release()
 

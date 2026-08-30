@@ -419,43 +419,46 @@ jobs:
             | awk '$1 == "Digest:" {print $2; exit}' || true)
           if [[ -n "$existing_digest" && "$existing_digest" != "$IMAGE_DIGEST" ]]; then
             docker buildx imagetools inspect "$exact" --raw > "$RUNNER_TEMP/existing-exact-manifest.json"
-            if jq -e '
+            if ! jq -e '
               [.manifests[].platform | "\(.os)/\(.architecture)"] as $platforms
               | ($platforms | index("linux/amd64")) != null
                 and ($platforms | index("linux/arm64")) != null
             ' "$RUNNER_TEMP/existing-exact-manifest.json" >/dev/null 2>&1; then
-              reusable=true
-              for platform_arch in "linux/amd64:x86_64" "linux/arm64:aarch64"; do
-                platform=${platform_arch%%:*}
-                expected_arch=${platform_arch##*:}
-                safe_arch=${platform#linux/}
-                platform_digest=$(jq -r \
-                  --arg os linux --arg arch "$safe_arch" \
-                  '.manifests[] | select(.platform.os == $os and .platform.architecture == $arch) | .digest' \
-                  "$RUNNER_TEMP/existing-exact-manifest.json")
-                if [[ -z "$platform_digest" || "$platform_digest" == null ]]; then
-                  reusable=false
-                  break
-                fi
-                docker run --rm --platform "$platform" --entrypoint python \
-                  "$IMAGE_REPOSITORY@$platform_digest" mediaflux.py version --json \
-                  > "$RUNNER_TEMP/existing-exact-$safe_arch-version.json" 2>/dev/null || true
-                if ! jq -e \
-                  --arg version "$VERSION" \
-                  --arg sha "$EXPECTED_SHA" \
-                  --arg arch "$expected_arch" \
-                  '.version == $version and .arch == $arch and .package == "docker" and .commit == $sha' \
-                  "$RUNNER_TEMP/existing-exact-$safe_arch-version.json" >/dev/null 2>&1; then
-                  echo "Immutable version tag $exact on registry does not match current commit $EXPECTED_SHA; promoting candidate $IMAGE_DIGEST" >&2
-                  reusable=false
-                  break
-                fi
-              done
-              if [[ "$reusable" == "true" ]]; then
-                promotion_digest="$existing_digest"
-                echo "Reuse previously verified immutable tag $exact at $promotion_digest"
-              fi
+              echo "Immutable version tag $exact exists but cannot be verified; refusing overwrite" >&2
+              exit 1
             fi
+            reusable=true
+            for platform_arch in "linux/amd64:x86_64" "linux/arm64:aarch64"; do
+              platform=${platform_arch%%:*}
+              expected_arch=${platform_arch##*:}
+              safe_arch=${platform#linux/}
+              platform_digest=$(jq -r \
+                --arg os linux --arg arch "$safe_arch" \
+                '.manifests[] | select(.platform.os == $os and .platform.architecture == $arch) | .digest' \
+                "$RUNNER_TEMP/existing-exact-manifest.json")
+              if [[ -z "$platform_digest" || "$platform_digest" == null ]]; then
+                reusable=false
+                break
+              fi
+              docker run --rm --platform "$platform" --entrypoint python \
+                "$IMAGE_REPOSITORY@$platform_digest" mediaflux.py version --json \
+                > "$RUNNER_TEMP/existing-exact-$safe_arch-version.json" 2>/dev/null || true
+              if ! jq -e \
+                --arg version "$VERSION" \
+                --arg sha "$EXPECTED_SHA" \
+                --arg arch "$expected_arch" \
+                '.version == $version and .arch == $arch and .package == "docker" and .commit == $sha' \
+                "$RUNNER_TEMP/existing-exact-$safe_arch-version.json" >/dev/null 2>&1; then
+                reusable=false
+                break
+              fi
+            done
+            if [[ "$reusable" != "true" ]]; then
+              echo "Immutable version tag $exact belongs to a different commit; refusing overwrite with $IMAGE_DIGEST" >&2
+              exit 1
+            fi
+            promotion_digest="$existing_digest"
+            echo "Reuse previously verified immutable tag $exact at $promotion_digest"
           fi
 
           tags=("$exact")
@@ -537,7 +540,22 @@ jobs:
           if jq -e '.prerelease == true' "$RUNNER_TEMP/BUILD-INFO.json" >/dev/null; then
             PRERELEASE=(--prerelease)
           fi
-          if ! gh release view "$VERSION_REF" >/dev/null 2>&1; then
+          if gh release view "$VERSION_REF" >/dev/null 2>&1; then
+            EXISTING_RELEASE="$RUNNER_TEMP/existing-release"
+            rm -rf "$EXISTING_RELEASE"
+            mkdir -p "$EXISTING_RELEASE"
+            if ! gh release download "$VERSION_REF" \
+              --pattern BUILD-INFO.json --dir "$EXISTING_RELEASE"; then
+              echo "Existing release $VERSION_REF has no verifiable BUILD-INFO.json; refusing overwrite" >&2
+              exit 1
+            fi
+            EXISTING_RELEASE_SHA=$(jq -r '.commit // empty' \
+              "$EXISTING_RELEASE/BUILD-INFO.json")
+            if [[ "$EXISTING_RELEASE_SHA" != "$EXPECTED_SHA" ]]; then
+              echo "Existing release $VERSION_REF belongs to $EXISTING_RELEASE_SHA, not $EXPECTED_SHA; refusing asset overwrite" >&2
+              exit 1
+            fi
+          else
             gh release create "$VERSION_REF" \
               --title "MediaFlux $VERSION_REF" \
               --notes-file "$RELEASE_ASSETS/RELEASE-NOTES.txt" \

@@ -13,8 +13,9 @@ import os
 import re
 import threading
 import unicodedata
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Mapping, Optional, Sequence
+from typing import Any, Optional
 
 import requests
 
@@ -253,6 +254,8 @@ class NotificationEvent:
     actions: Sequence[NotificationAction] = field(default_factory=tuple)
     layout: str = "default"
     field_emojis: bool = True
+    # 供 lifecycle/outbox 保存机器状态；展示层不得依赖或渲染该字段。
+    state: str = ""
 
 
 @dataclass(frozen=True)
@@ -275,6 +278,16 @@ class TelegramSendResult:
                 self.partially_delivered
                 or int(self.status_code or 0) in {0, 408}
             )
+        )
+
+    @property
+    def retryable(self) -> bool:
+        """明确未送达且适合自动重试；结果未知永远不能盲目重放。"""
+        status = int(self.status_code or 0)
+        return bool(
+            not self.ok
+            and not self.outcome_unknown
+            and (status == 429 or status >= 500)
         )
 
 
@@ -981,6 +994,68 @@ def _telegram_message_is_unchanged(exc: Exception) -> bool:
     )
 
 
+def call_telegram_delivery(
+    operation: Callable[[], Any],
+    *,
+    message_id: int = 0,
+    edit: bool = False,
+) -> tuple[TelegramSendResult, Any | None]:
+    """执行一次 Telegram 终态调用，并统一保留结果未知与消息身份语义。
+
+    ``edit=True`` 时，Telegram 返回“内容未变化”属于幂等成功。调用方只能在
+    :func:`telegram_edit_fallback_allowed` 明确允许时把编辑降级为新消息；
+    ReadTimeout 等结果未知不得继续发送第二条消息。
+    """
+    try:
+        resolved_message_id = max(0, int(message_id or 0))
+    except (TypeError, ValueError):
+        resolved_message_id = 0
+    try:
+        value = operation()
+    except Exception as exc:
+        if edit and _telegram_message_is_unchanged(exc):
+            return TelegramSendResult(
+                ok=True, message_id=resolved_message_id,
+            ), None
+        result = _telegram_send_error(exc)
+        return TelegramSendResult(
+            ok=False,
+            retry_after_seconds=result.retry_after_seconds,
+            error=result.error,
+            status_code=result.status_code,
+            partially_delivered=result.partially_delivered,
+            message_id=resolved_message_id if edit else int(result.message_id or 0),
+        ), None
+
+    delivered_message_id = resolved_message_id
+    try:
+        candidate = getattr(value, "message_id", 0)
+        if not isinstance(candidate, bool):
+            delivered_message_id = int(candidate or delivered_message_id or 0)
+    except (TypeError, ValueError):
+        pass
+    return TelegramSendResult(
+        ok=True, message_id=delivered_message_id,
+    ), value
+
+
+def telegram_edit_fallback_allowed(result: TelegramSendResult) -> bool:
+    """仅在 Telegram 明确拒绝编辑时允许改发新消息。"""
+    if result.ok or result.outcome_unknown or int(result.status_code or 0) != 400:
+        return False
+    description = str(result.error or "").casefold()
+    return any(marker in description for marker in (
+        "message to edit not found",
+        "message can't be edited",
+        "message can not be edited",
+        "message identifier is not specified",
+        "there is no text in the message to edit",
+        "message has no text",
+        "message is not a text message",
+        "messagetoolongforedit",
+    ))
+
+
 def edit_event_result(
     event: NotificationEvent, *, chat_id: str, message_id: int | str
 ) -> TelegramSendResult:
@@ -1002,28 +1077,20 @@ def edit_event_result(
             ok=False, error="MessageTooLongForEdit", status_code=400,
             message_id=resolved_message_id,
         )
-    try:
-        bot.edit_message_text(
+    result, _value = call_telegram_delivery(
+        lambda: bot.edit_message_text(
             text, target, resolved_message_id, reply_markup=_event_markup(event)
-        )
-        return TelegramSendResult(ok=True, message_id=resolved_message_id)
-    except Exception as exc:
-        if _telegram_message_is_unchanged(exc):
-            logger.debug("Telegram 原位消息已是目标内容，按幂等成功处理")
-            return TelegramSendResult(ok=True, message_id=resolved_message_id)
-        result = _telegram_send_error(exc)
-        logger.warning(
-            "Telegram 原位更新失败 type=%s status=%s",
-            type(exc).__name__, result.status_code or "-",
-        )
-        return TelegramSendResult(
-            ok=False,
-            retry_after_seconds=result.retry_after_seconds,
-            error=result.error,
-            status_code=result.status_code,
-            partially_delivered=result.partially_delivered,
-            message_id=resolved_message_id,
-        )
+        ),
+        message_id=resolved_message_id,
+        edit=True,
+    )
+    if result.ok:
+        return result
+    logger.warning(
+        "Telegram 原位更新失败 status=%s error=%s",
+        result.status_code or "-", result.error,
+    )
+    return result
 
 
 def edit_event(

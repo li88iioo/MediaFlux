@@ -1,11 +1,18 @@
 """TMDB 媒体探索 Provider。"""
 from __future__ import annotations
 
+import threading
 from typing import Any
 from urllib.parse import urlsplit
 
 from app.clients.tmdb import TMDBClient
-from app.discovery.models import DiscoveryPage, MediaCard, ProviderHealth, ProviderInvalidResponse
+from app.discovery.models import (
+    DiscoveryPage,
+    MediaCard,
+    ProviderHealth,
+    ProviderInvalidResponse,
+    ProviderUnavailable,
+)
 from app.discovery.providers.base import DiscoveryProvider
 
 _DISCOVER_FILTERS = {
@@ -44,6 +51,22 @@ class TMDBProvider(DiscoveryProvider):
 
     def __init__(self, client: TMDBClient | None = None):
         self.client = client or TMDBClient()
+        self._close_lock = threading.Lock()
+        self._closed = False
+
+    def _ensure_open(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                raise ProviderUnavailable("TMDB 数据源已关闭")
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
     def list_items(
         self,
@@ -52,6 +75,7 @@ class TMDBProvider(DiscoveryProvider):
         page: int,
         filters: dict[str, Any] | None,
     ) -> DiscoveryPage:
+        self._ensure_open()
         category = str(category or "").strip().lower()
         media_type = str(media_type or "").strip().lower()
         page = max(1, int(page))
@@ -97,6 +121,7 @@ class TMDBProvider(DiscoveryProvider):
         )
 
     def get_detail(self, external_id: str, media_type: str) -> MediaCard:
+        self._ensure_open()
         media_type = "tv" if media_type == "tv" else "movie"
         payload = self.client.detail(str(external_id or ""), media_type)
         card = self._card(payload, media_type)

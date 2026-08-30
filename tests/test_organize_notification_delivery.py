@@ -123,10 +123,14 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
 
     def test_lifecycle_waits_for_terminal_revision_to_be_delivered(self) -> None:
         pending = NotificationEvent(
-            "整理完成", fields=(("STRM", "已排队"), ("媒体库", "等待 STRM 完成")),
+            "整理完成",
+            fields=(("STRM", "已排队"), ("媒体库", "等待 STRM 完成")),
+            state="queued",
         )
         terminal = NotificationEvent(
-            "整理完成", fields=(("STRM", "完成"), ("媒体库", "Jellyfin 已排队")),
+            "整理完成",
+            fields=(("STRM", "完成"), ("媒体库", "Jellyfin 已排队")),
+            state="completed",
         )
         snapshots = (
             NotificationThreadSnapshot(pending, "sent", 1, 1, 91),
@@ -153,6 +157,29 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertEqual(cancel_event.wait.call_count, 2)
         self.assertFalse(organize_lifecycle_downstream_settled(pending))
         self.assertTrue(organize_lifecycle_downstream_settled(terminal))
+
+    def test_typed_unknown_state_is_fail_closed(self) -> None:
+        event = NotificationEvent(
+            "整理完成",
+            fields=(("STRM", "完成"),),
+            state="future-state",
+        )
+        self.assertFalse(organize_lifecycle_downstream_settled(event))
+
+    def test_lifecycle_builder_sets_machine_state(self) -> None:
+        pending = build_organize_lifecycle_event(
+            self._completed_stats([]),
+            source_name="来源",
+            strm_status="已排队",
+        )
+        completed = build_organize_lifecycle_event(
+            self._completed_stats([]),
+            source_name="来源",
+            strm_status="未启用",
+            media_refresh="未触发",
+        )
+        self.assertEqual(pending.state, "queued")
+        self.assertEqual(completed.state, "completed")
 
     def test_single_media_task_uses_one_transaction_message(self) -> None:
         events = []

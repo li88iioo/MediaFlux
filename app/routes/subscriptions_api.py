@@ -54,13 +54,17 @@ def _optional_bool(value: str) -> bool | None:
     raise MediaSubscriptionError("enabled 查询参数无效")
 
 
-def _watchlist_row(row: dict[str, Any], subscription_map: dict[tuple[str, str], dict[str, Any]]) -> dict[str, Any]:
+def _watchlist_row(
+    row: dict[str, Any],
+    subscription_map: dict[tuple[str, str], dict[str, Any]],
+    external_id_map: dict[tuple[str, str, str], Any],
+) -> dict[str, Any]:
     provider = str(row.get("provider") or "")
     external_id = str(row.get("external_id") or "")
     media_type = str(row.get("media_type") or "")
     tmdb_id = external_id if provider == "tmdb" else ""
     if not tmdb_id:
-        mapping = db.get_media_external_id(provider, external_id, media_type)
+        mapping = external_id_map.get((provider, external_id, media_type))
         if mapping is not None and bool(mapping["confirmed"]):
             tmdb_id = str(mapping["tmdb_id"] or "")
     subscription = subscription_map.get((tmdb_id, media_type)) if tmdb_id else None
@@ -228,7 +232,19 @@ def list_watchlist(request: Request):
         for item in subscriptions
     }
     rows = [dict(row) for row in get_discovery_service().list_watchlist()]
-    return api_response([_watchlist_row(row, subscription_map) for row in rows])
+    external_id_map = db.list_media_external_ids([
+        (
+            str(row.get("provider") or ""),
+            str(row.get("external_id") or ""),
+            str(row.get("media_type") or ""),
+        )
+        for row in rows
+        if str(row.get("provider") or "") != "tmdb"
+    ])
+    return api_response([
+        _watchlist_row(row, subscription_map, external_id_map)
+        for row in rows
+    ])
 
 
 @router.post("/media/from-watchlist")
@@ -249,16 +265,8 @@ async def create_from_watchlist(request: Request, data: Any = Body(default=None)
         if not external_id or len(external_id) > 128 or any(char.isspace() for char in external_id):
             raise MediaSubscriptionError("收藏媒体 ID 无效")
 
-        watchlist_item = next(
-            (
-                item
-                for item in get_discovery_service().list_watchlist()
-                if str(item.get("provider") or "") == provider
-                and str(item.get("external_id") or "") == external_id
-                and str(item.get("media_type") or "") == media_type
-            ),
-            None,
-        )
+        watchlist_row = db.get_media_watchlist(provider, external_id, media_type)
+        watchlist_item = dict(watchlist_row) if watchlist_row is not None else None
         if watchlist_item is None:
             raise MediaSubscriptionError(
                 "收藏清单中不存在该媒体", status_code=404, code="not_found"

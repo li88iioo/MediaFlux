@@ -11,11 +11,15 @@ from app.indexers.errors import (
     IndexerUnavailable,
     IndexerValidationError,
 )
-from app.indexers.models import IndexerItem, IndexerMediaSearchRequest, IndexerPage, ResolvedDownload
+from app.indexers.models import (
+    IndexerItem,
+    IndexerMediaSearchRequest,
+    IndexerPage,
+    ResolvedDownload,
+)
 from app.indexers.registry import IndexerRegistry
 from app.indexers.result_store import IndexerResultStore
 from app.indexers.service import IndexerService
-
 
 HASH = "0123456789abcdef0123456789abcdef01234567"
 
@@ -109,6 +113,43 @@ class TimeoutOverheadAdapter(FakeAdapter):
 
     def search_timeout_overhead_seconds(self):
         return self.overhead_seconds
+
+
+class ShutdownAwareAdapter(FakeAdapter):
+    def __init__(self, site_id, items):
+        super().__init__(site_id, items)
+        self.search_started = asyncio.Event()
+        self.search_finished = asyncio.Event()
+        self.resolve_started = asyncio.Event()
+        self.resolve_finished = asyncio.Event()
+
+    async def search(self, request):
+        self.calls += 1
+        self.search_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.search_finished.set()
+
+    async def resolve(self, stored_result):
+        self.resolve_calls.append(stored_result)
+        self.resolve_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.resolve_finished.set()
+
+
+class ShutdownAwareRegistry(IndexerRegistry):
+    def __init__(self, adapter: ShutdownAwareAdapter, *, finished: asyncio.Event):
+        super().__init__({adapter.site_id: adapter})
+        self.finished = finished
+        self.closed = False
+        self.closed_after_operation = False
+
+    async def aclose(self):
+        self.closed_after_operation = self.finished.is_set()
+        self.closed = True
 
 
 class QueryAwareAdapter(FakeAdapter):
@@ -936,6 +977,59 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(adapter.calls, 1)
         self.assertNotEqual(first.items[0].result_id, second.items[0].result_id)
+
+    async def test_close_cancels_inflight_search_before_registry_close(self):
+        adapter = ShutdownAwareAdapter("nyaa", [item("nyaa", "Frieren")])
+        registry = ShutdownAwareRegistry(adapter, finished=adapter.search_finished)
+        service = IndexerService(
+            registry=registry,
+            result_store=self.store,
+            clock=lambda: self.now,
+            cache_ttl_seconds=30,
+            site_timeout_seconds=1.0,
+            total_timeout_seconds=1.5,
+            max_results_per_site=2,
+            max_concurrency=2,
+        )
+        search_task = asyncio.create_task(service.search("Frieren", 1, ("nyaa",)))
+        await adapter.search_started.wait()
+
+        close_task = asyncio.create_task(service.aclose())
+        await asyncio.sleep(0)
+        with self.assertRaises(IndexerUnavailable):
+            await service.search("another", 1, ("nyaa",))
+        await close_task
+
+        with self.assertRaises(asyncio.CancelledError):
+            await search_task
+        self.assertTrue(registry.closed)
+        self.assertTrue(registry.closed_after_operation)
+
+    async def test_close_cancels_inflight_resolve_before_registry_close(self):
+        adapter = ShutdownAwareAdapter("nyaa", [item("nyaa", "Frieren")])
+        registry = ShutdownAwareRegistry(adapter, finished=adapter.resolve_finished)
+        service = IndexerService(
+            registry=registry,
+            result_store=self.store,
+            clock=lambda: self.now,
+            cache_ttl_seconds=30,
+            site_timeout_seconds=1.0,
+            total_timeout_seconds=1.5,
+            max_results_per_site=2,
+            max_concurrency=2,
+        )
+        result_id = self.store.put(
+            item("nyaa", "Frieren", magnet=f"magnet:?xt=urn:btih:{HASH}")
+        )
+        resolve_task = asyncio.create_task(service.resolve(result_id))
+        await adapter.resolve_started.wait()
+
+        await service.aclose()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await resolve_task
+        self.assertTrue(registry.closed)
+        self.assertTrue(registry.closed_after_operation)
 
 
 if __name__ == "__main__":

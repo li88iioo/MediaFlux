@@ -78,6 +78,56 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
         self.assertEqual(qb.calls, [("pause", "hash-1"), ("delete", "hash-1", False)])
         self.assertTrue(any("任务保持暂停" in item for item in result["warnings"]))
 
+
+    def test_post_commit_database_failure_keeps_qb_paused_and_requires_manual(self):
+        root, source, target, task_id, service = self._fixture()
+        self.addCleanup(root.cleanup)
+        qb = FakeQB()
+        original_update = db.update_local_media_task
+
+        def fail_verifying(*args, **kwargs):
+            if kwargs.get("status") == "verifying":
+                raise RuntimeError("injected post-commit db failure")
+            return original_update(*args, **kwargs)
+
+        with patch(
+            "app.modules.local_media_service.db.update_local_media_task",
+            side_effect=fail_verifying,
+        ):
+            with self.assertRaisesRegex(Exception, "已完成移动.*收尾失败"):
+                service.execute_task("admin", task_id, qb_client=qb)
+
+        self.assertEqual(qb.calls, [("pause", "hash-1")])
+        self.assertFalse((source / "Movie.2025.mkv").exists())
+        moved = list(target.rglob("*.mkv"))
+        self.assertEqual(len(moved), 1)
+        task = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(task.status, "requires_manual")
+        self.assertIn(str(moved[0]), task.error)
+
+    def test_post_commit_cleanup_failure_never_resumes_qb(self):
+        root, source, target, task_id, service = self._fixture()
+        self.addCleanup(root.cleanup)
+        qb = FakeQB()
+
+        with patch(
+            "app.modules.local_media_service.delete_cleanup_items",
+            side_effect=RuntimeError("injected cleanup failure"),
+        ):
+            with self.assertRaisesRegex(Exception, "已完成移动.*收尾失败"):
+                service.execute_task("admin", task_id, qb_client=qb)
+
+        self.assertEqual(
+            qb.calls,
+            [("pause", "hash-1"), ("delete", "hash-1", False)],
+        )
+        self.assertFalse((source / "Movie.2025.mkv").exists())
+        self.assertTrue(any(target.rglob("*.mkv")))
+        self.assertEqual(
+            db.get_local_media_task(task_id, owner="admin").status,
+            "requires_manual",
+        )
+
     def test_qb_task_without_client_fails_before_any_move(self):
         root, source, _target, task_id, service = self._fixture()
         self.addCleanup(root.cleanup)

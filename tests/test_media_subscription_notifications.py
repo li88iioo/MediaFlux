@@ -263,6 +263,31 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         self.assertNotIn("伪装 & <broken", body)
         self.assertNotIn("<broken", body)
 
+    def test_notification_level_suppression_consumes_legacy_outbox(self) -> None:
+        self._enable_rule(notify_on_satisfied=True)
+        self._finalize(status="satisfied", missing_count=0)
+        with patch(
+            "app.modules.telegram_notification_center.notification_target_chat_id",
+            return_value="100",
+        ), patch(
+            "app.modules.telegram_notification_policy.config.get_bool",
+            return_value=True,
+        ), patch(
+            "app.modules.telegram_notification_policy.config.get",
+            return_value="essential",
+        ), patch(
+            "app.modules.telegram_notification_center.send_event_result",
+        ) as send:
+            self.assertTrue(drain_media_subscription_notifications())
+
+        send.assert_not_called()
+        self.assertEqual(list_notification_outbox()[0]["status"], "sent")
+        with db.get_conn() as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM telegram_notification_outbox"
+            ).fetchone()[0]
+        self.assertEqual(total, 0)
+
     def test_retry_after_recovery_uses_lease_fence(self) -> None:
         self._enable_rule(notify_on_missing=True)
         self._finalize()

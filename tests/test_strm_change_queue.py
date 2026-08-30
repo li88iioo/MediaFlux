@@ -592,7 +592,9 @@ class ChangedPathProjectionTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM organize_notification_outbox")
         with patch(
             "app.notifier.send_result",
-            return_value=TelegramSendResult(ok=False, error="timeout"),
+            return_value=TelegramSendResult(
+                ok=False, error="temporary unavailable", status_code=503,
+            ),
         ):
             deliver_organize_notification("task:loop", "整理完成", chat_id="1")
         with db.get_conn() as conn:

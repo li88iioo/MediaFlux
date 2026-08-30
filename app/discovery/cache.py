@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from app import database
 from app.discovery.models import redact_provider_message
 
 _TIMESTAMP = "%Y-%m-%d %H:%M:%S"
+_CACHE_MAINTENANCE_INTERVAL = timedelta(hours=1)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,8 @@ class DiscoveryCache:
         self._locks: dict[str, threading.Lock] = {}
         self._lock_users: dict[str, int] = {}
         self._locks_guard = threading.Lock()
+        self._maintenance_lock = threading.Lock()
+        self._next_maintenance_at: datetime | None = None
 
     @staticmethod
     def make_key(
@@ -93,6 +98,23 @@ class DiscoveryCache:
             return CacheLookup("stale", payload, row["last_error"] or "")
         return CacheLookup("expired", None, row["last_error"] or "")
 
+    def _maybe_maintain(self, now: datetime) -> None:
+        if self._next_maintenance_at is not None and now < self._next_maintenance_at:
+            return
+        if not self._maintenance_lock.acquire(blocking=False):
+            return
+        try:
+            if self._next_maintenance_at is not None and now < self._next_maintenance_at:
+                return
+            # 即使清理失败也限频，避免数据库异常期间每次请求都叠加清理压力。
+            self._next_maintenance_at = now + _CACHE_MAINTENANCE_INTERVAL
+            try:
+                database.purge_discovery_cache(now.strftime(_TIMESTAMP))
+            except Exception as exc:  # pragma: no cover - 日志兜底，不影响业务写入
+                logger.warning("探索缓存清理失败: %s", exc)
+        finally:
+            self._maintenance_lock.release()
+
     def set_success(
         self,
         key: str,
@@ -114,6 +136,7 @@ class DiscoveryCache:
             (now + timedelta(seconds=stale)).strftime(_TIMESTAMP),
             "",
         )
+        self._maybe_maintain(now)
 
     def set_error(
         self, key: str, provider: str, error: str, *, ttl_seconds: int = 30,
@@ -128,6 +151,7 @@ class DiscoveryCache:
                 stale_until = now
             if stale_until > now:
                 database.update_discovery_cache_error(key, redact_provider_message(error))
+                self._maybe_maintain(now)
                 return
         ttl = max(1, int(ttl_seconds))
         database.upsert_discovery_cache(
@@ -144,6 +168,7 @@ class DiscoveryCache:
             redact_provider_message(error),
             status="error",
         )
+        self._maybe_maintain(now)
 
     @contextmanager
     def singleflight(self, key: str) -> Iterator[None]:

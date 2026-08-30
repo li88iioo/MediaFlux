@@ -14,7 +14,8 @@ import socket
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future as ConcurrentFuture
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -128,10 +129,67 @@ _native_android_auth_capacity = threading.BoundedSemaphore(
 _signed_media_probe_worker_capacity = threading.BoundedSemaphore(
     _SIGNED_MEDIA_PROBE_MAX_CONCURRENCY
 )
-_signed_media_probe_executor = ThreadPoolExecutor(
-    max_workers=_SIGNED_MEDIA_PROBE_MAX_CONCURRENCY,
-    thread_name_prefix="media-proxy-head",
-)
+
+
+class _SignedMediaProbeExecutorRuntime:
+    """进程级可重启线程池；关机时先停止准入，再有界等待存量任务。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._executor: ThreadPoolExecutor | None = None
+        self._futures: set[ConcurrentFuture[Any]] = set()
+        self._accepting = True
+
+    def start(self) -> None:
+        with self._lock:
+            self._accepting = True
+
+    def submit(self, func: Callable[..., Any]) -> ConcurrentFuture[Any]:
+        with self._lock:
+            if not self._accepting:
+                raise _SignedMediaProbeCapacityError
+            executor = self._executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=_SIGNED_MEDIA_PROBE_MAX_CONCURRENCY,
+                    thread_name_prefix="media-proxy-head",
+                )
+                self._executor = executor
+            future = executor.submit(func)
+            self._futures.add(future)
+
+        def forget(done_future: ConcurrentFuture[Any]) -> None:
+            with self._lock:
+                self._futures.discard(done_future)
+
+        future.add_done_callback(forget)
+        return future
+
+    def shutdown(self, timeout_seconds: float = 5.0) -> bool:
+        with self._lock:
+            self._accepting = False
+            executor, self._executor = self._executor, None
+            pending = tuple(future for future in self._futures if not future.done())
+        for future in pending:
+            future.cancel()
+        _done, unfinished = wait_futures(
+            pending,
+            timeout=max(0.0, float(timeout_seconds)),
+        )
+        if executor is not None:
+            executor.shutdown(wait=not unfinished, cancel_futures=True)
+        return not unfinished
+
+
+_signed_media_probe_runtime = _SignedMediaProbeExecutorRuntime()
+
+
+def start_signed_media_probe_runtime() -> None:
+    _signed_media_probe_runtime.start()
+
+
+def shutdown_signed_media_probe_runtime(timeout_seconds: float = 5.0) -> bool:
+    return _signed_media_probe_runtime.shutdown(timeout_seconds)
 _SIGNED_MEDIA_REQUEST_HEADERS = {
     "accept",
     "if-range",
@@ -4209,6 +4267,7 @@ def create_proxy_app(
     signed_urls: SignedUrlCache | None = None,
     playback_record_writer: PlaybackRecordWriter | None = None,
 ) -> FastAPI:
+    start_signed_media_probe_runtime()
     recorder = playback_record_writer or PlaybackRecordWriter(
         task_name=f"media-proxy-playback-records-{instance_id}"
     )
@@ -4257,7 +4316,6 @@ def create_proxy_app(
         """
         loop = asyncio.get_running_loop()
         worker_capacity = _signed_media_probe_worker_capacity
-        worker_executor = _signed_media_probe_executor
         capacity_deadline = (
             loop.time()
             + max(0.001, _SIGNED_MEDIA_PROBE_QUEUE_TIMEOUT_SECONDS)
@@ -4269,7 +4327,7 @@ def create_proxy_app(
             await asyncio.sleep(min(0.01, remaining))
 
         try:
-            worker_future = worker_executor.submit(
+            worker_future = _signed_media_probe_runtime.submit(
                 partial(func, *args, **kwargs)
             )
         except Exception:

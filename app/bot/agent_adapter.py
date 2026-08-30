@@ -92,6 +92,11 @@ from app.bot.progress import (
 from app.config import get
 from app.logger import get_logger
 from app.modules.web_secret import get_web_secret
+from app.notifier import (
+    TelegramSendResult,
+    call_telegram_delivery,
+    telegram_edit_fallback_allowed,
+)
 
 logger = get_logger(__name__)
 
@@ -164,8 +169,17 @@ class _StreamMessage:
 
 @dataclass(frozen=True)
 class _TelegramPublishResult:
-    sent: bool
+    transport: TelegramSendResult
     delivery: _StreamMessage | None = None
+    fallback_allowed: bool = False
+
+    @property
+    def sent(self) -> bool:
+        return self.transport.ok
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return self.transport.outcome_unknown
 
 
 @dataclass(frozen=True)
@@ -1781,18 +1795,42 @@ def _persist_agent_stream(
 ) -> _TelegramPublishResult:
     """把临时草稿固化为真实消息，并保留可供迟到清理的消息引用。"""
     edit_fallback = target.mode == "edit"
-    if edit_fallback:
-        sent = _update_agent_stream(
-            bot, telebot, target, rendered, reply_markup=reply_markup
+    if edit_fallback and target.message_id is not None:
+        kwargs: dict[str, Any] = {
+            "reply_markup": reply_markup,
+            "disable_web_page_preview": True,
+            "parse_mode": "HTML",
+        }
+        edit_result, _value = call_telegram_delivery(
+            lambda: bot.edit_message_text(
+                rendered,
+                target.chat_id,
+                target.message_id,
+                **kwargs,
+            ),
+            message_id=int(target.message_id),
+            edit=True,
         )
-        if sent:
-            return _TelegramPublishResult(sent=True, delivery=target)
+        if edit_result.ok:
+            return _TelegramPublishResult(
+                transport=edit_result, delivery=target,
+            )
+        if not telegram_edit_fallback_allowed(edit_result):
+            logger.info(
+                "Telegram Agent 终态编辑未安全降级 status=%s error=%s",
+                edit_result.status_code or "-", edit_result.error,
+            )
+            return _TelegramPublishResult(transport=edit_result)
+        logger.info(
+            "Telegram Agent 终态被明确拒绝编辑，改发新消息 error=%s",
+            edit_result.error,
+        )
 
     if target.mode == "rich_draft":
         send_rich = getattr(bot, "send_rich_message", None)
         rich = _rich_message(telebot, rendered)
         if callable(send_rich) and rich is not None:
-            kwargs: dict[str, Any] = {"reply_markup": reply_markup}
+            kwargs = {"reply_markup": reply_markup}
             if target.message_thread_id is not None:
                 kwargs["message_thread_id"] = target.message_thread_id
             reply_parameters = _rich_reply_parameters(
@@ -1800,22 +1838,35 @@ def _persist_agent_stream(
             )
             if reply_parameters is not None:
                 kwargs["reply_parameters"] = reply_parameters
-            try:
-                message = send_rich(target.chat_id, rich, **kwargs)
+            rich_result, message = call_telegram_delivery(
+                lambda: send_rich(target.chat_id, rich, **kwargs)
+            )
+            if rich_result.ok:
                 return _TelegramPublishResult(
-                    sent=True,
+                    transport=rich_result,
                     delivery=_delivery_from_message(
                         message, fallback_chat_id=target.chat_id
                     ),
                 )
-            except Exception as exc:
+            if rich_result.outcome_unknown:
                 logger.info(
-                    "Telegram Agent 富消息固化失败 type=%s", type(exc).__name__
+                    "Telegram Agent 富消息固化结果未知，停止连续发送 error=%s",
+                    rich_result.error,
                 )
+                return _TelegramPublishResult(transport=rich_result)
+            logger.info(
+                "Telegram Agent 富消息固化明确失败，降级普通消息 status=%s",
+                rich_result.status_code or "-",
+            )
 
     send_message = getattr(bot, "send_message", None)
     if not callable(send_message):
-        return _TelegramPublishResult(sent=False)
+        return _TelegramPublishResult(
+            transport=TelegramSendResult(
+                ok=False, error="TelegramSenderUnavailable", status_code=503,
+            ),
+            fallback_allowed=True,
+        )
     kwargs = {
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -1825,37 +1876,64 @@ def _persist_agent_stream(
         kwargs["reply_to_message_id"] = target.source_message_id
     if target.message_thread_id is not None:
         kwargs["message_thread_id"] = target.message_thread_id
-    try:
-        message = send_message(target.chat_id, rendered, **kwargs)
+    send_result, message = call_telegram_delivery(
+        lambda: send_message(target.chat_id, rendered, **kwargs)
+    )
+    if send_result.ok:
         result = _TelegramPublishResult(
-            sent=True,
+            transport=send_result,
             delivery=_delivery_from_message(
                 message, fallback_chat_id=target.chat_id
             ),
         )
         if edit_fallback:
-            # 最终编辑失败后会降级发送新消息；成功后删除旧占位，避免聊天中
-            # 同时残留“正在处理”和最终答案。删除失败不影响最终消息。
+            # 最终编辑明确失败后才会降级发送新消息；成功后删除旧占位，避免
+            # 聊天中同时残留“正在处理”和最终答案。
             _delete_stale_telegram_delivery(bot, target)
         return result
-    except Exception as exc:
-        logger.info("Telegram Agent 草稿固化失败 type=%s", type(exc).__name__)
-        return _TelegramPublishResult(sent=False)
+    if send_result.outcome_unknown:
+        logger.info(
+            "Telegram Agent 普通消息固化结果未知，停止 reply fallback error=%s",
+            send_result.error,
+        )
+        return _TelegramPublishResult(transport=send_result)
+    logger.info(
+        "Telegram Agent 普通消息固化明确失败 status=%s",
+        send_result.status_code or "-",
+    )
+    return _TelegramPublishResult(
+        transport=send_result, fallback_allowed=True,
+    )
 
 
 def _reply_agent_message(
     bot: Any, message: Any, rendered: str, **kwargs: Any
 ) -> _TelegramPublishResult:
-    sent = bot.reply_to(message, rendered, **kwargs)
+    result, sent = call_telegram_delivery(
+        lambda: bot.reply_to(message, rendered, **kwargs)
+    )
     chat_id, _source_message_id, _message_thread_id = _message_context(message)
     return _TelegramPublishResult(
-        sent=True,
+        transport=result,
         delivery=(
             _delivery_from_message(sent, fallback_chat_id=chat_id)
-            if chat_id is not None
+            if result.ok and chat_id is not None
             else None
         ),
     )
+
+
+def _fallback_agent_reply_if_safe(
+    bot: Any,
+    message: Any,
+    rendered: str,
+    result: _TelegramPublishResult,
+    **kwargs: Any,
+) -> _TelegramPublishResult:
+    """仅在前一投递明确未送达时，才降级到 caller reply。"""
+    if result.sent or result.outcome_unknown or not result.fallback_allowed:
+        return result
+    return _reply_agent_message(bot, message, rendered, **kwargs)
 
 
 def _delete_stale_telegram_delivery(
@@ -1891,7 +1969,12 @@ def _finish_agent_stream(
 ) -> _TelegramPublishResult:
     """更新一次阶段状态后立即固化最终结果，不阻塞 Telegram handler。"""
     if target is None:
-        return _TelegramPublishResult(sent=False)
+        return _TelegramPublishResult(
+            transport=TelegramSendResult(
+                ok=False, error="TelegramStreamUnavailable", status_code=503,
+            ),
+            fallback_allowed=True,
+        )
     if show_progress:
         _update_agent_stream(
             bot,
@@ -3775,10 +3858,8 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                         result = _persist_agent_stream(
                             bot, telebot, stream_target, rendered
                         )
-                        if result.sent:
-                            return result
-                        return _reply_agent_message(
-                            bot, message, rendered, parse_mode="HTML"
+                        return _fallback_agent_reply_if_safe(
+                            bot, message, rendered, result, parse_mode="HTML"
                         )
 
                     allowed, publish_result = publish_if_current(publish_interruption)
@@ -3892,12 +3973,11 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                 reply_markup=markup,
                 show_progress=False,
             )
-            if result.sent:
-                return result
-            return _reply_agent_message(
+            return _fallback_agent_reply_if_safe(
                 bot,
                 message,
                 rendered,
+                result,
                 reply_markup=markup,
                 parse_mode="HTML",
             )
@@ -3934,9 +4014,9 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             result = _finish_agent_stream(
                 bot, telebot, stream_target, rendered
             )
-            if result.sent:
-                return result
-            return _reply_agent_message(bot, message, rendered)
+            return _fallback_agent_reply_if_safe(
+                bot, message, rendered, result
+            )
 
         allowed, publish_result = publish_if_current(publish_tool_error)
         if not allowed and isinstance(publish_result, _TelegramPublishResult):
@@ -3955,9 +4035,9 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             result = _finish_agent_stream(
                 bot, telebot, stream_target, rendered
             )
-            if result.sent:
-                return result
-            return _reply_agent_message(bot, message, rendered)
+            return _fallback_agent_reply_if_safe(
+                bot, message, rendered, result
+            )
 
         allowed, publish_result = publish_if_current(publish_error)
         if not allowed and isinstance(publish_result, _TelegramPublishResult):

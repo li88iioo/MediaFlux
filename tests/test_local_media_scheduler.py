@@ -48,7 +48,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="fast", qb_profile="configured:qb", qb_path_prefix="/downloads/1",
                 local_root=str(fast_root), stable_seconds=300, owner="admin",
             )
-            service = FakeService(); qb = object()
+            service = FakeService(); qb = Mock()
             scheduler = LocalMediaScheduler(service=service, qb_factory=lambda: qb)
             first = scheduler.enqueue_completed_torrent(self.torrent("/downloads/1/Movie.mkv"))
             second = scheduler.enqueue_completed_torrent(self.torrent("/downloads/1/Movie.mkv"))
@@ -56,6 +56,86 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             self.assertEqual(db.get_local_media_task(first, owner="admin").source_id, fast_id)
             self.assertEqual(scheduler.run_once(), 1)
             self.assertEqual(service.calls, [("admin", first, qb)])
+            qb.close.assert_called_once_with()
+
+    def test_owned_qb_client_is_closed_when_task_execution_fails(self):
+        class FailingService:
+            @staticmethod
+            def execute_task(owner, task_id, qb_client=None):
+                del owner, task_id, qb_client
+                raise RuntimeError("injected execution failure")
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            movie = root / "Movie.mkv"
+            movie.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="qb-close-error",
+                qb_profile="configured:qb",
+                qb_path_prefix="/downloads",
+                local_root=str(root),
+                stable_seconds=0,
+                owner="admin",
+            )
+            task_id = db.create_local_media_task(
+                source_id,
+                "hash-close-error",
+                str(movie),
+                owner="admin",
+                trigger="qb_completed",
+            )
+            qb = Mock()
+            scheduler = LocalMediaScheduler(
+                service=FailingService(), qb_factory=lambda: qb
+            )
+
+            self.assertEqual(scheduler.run_once(), 0)
+
+            qb.close.assert_called_once_with()
+            self.assertEqual(
+                db.get_local_media_task(task_id, owner="admin").status, "failed"
+            )
+
+    def test_post_move_error_falls_back_to_requires_manual(self):
+        from app.modules.local_media_service import LocalMediaPostMoveError
+
+        class PostMoveFailingService:
+            @staticmethod
+            def execute_task(owner, task_id, qb_client=None):
+                del owner, task_id, qb_client
+                raise LocalMediaPostMoveError("移动已提交，收尾失败")
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            movie = root / "Movie.mkv"
+            movie.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="qb-post-move-error",
+                qb_profile="configured:qb",
+                qb_path_prefix="/downloads",
+                local_root=str(root),
+                stable_seconds=0,
+                owner="admin",
+            )
+            task_id = db.create_local_media_task(
+                source_id,
+                "hash-post-move-error",
+                str(movie),
+                owner="admin",
+                trigger="qb_completed",
+            )
+            qb = Mock()
+            scheduler = LocalMediaScheduler(
+                service=PostMoveFailingService(), qb_factory=lambda: qb
+            )
+
+            self.assertEqual(scheduler.run_once(), 0)
+
+            qb.close.assert_called_once_with()
+            self.assertEqual(
+                db.get_local_media_task(task_id, owner="admin").status,
+                "requires_manual",
+            )
 
     def test_completed_torrent_request_is_bound_before_scheduler_wakeup(self):
         with tempfile.TemporaryDirectory() as root_raw:

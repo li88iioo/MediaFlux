@@ -12,7 +12,10 @@ from app import database as db
 from app.clients.qbittorrent import QBittorrentClient, TorrentTask
 from app.config import get
 from app.logger import get_logger, log_throttled
-from app.modules.local_media_service import LocalMediaService
+from app.modules.local_media_service import (
+    LocalMediaPostMoveError,
+    LocalMediaService,
+)
 from app.modules.local_media_candidates import discover_local_media_candidates
 from app.modules.local_media_notifications import notify_local_media_task
 from app.modules.local_path_mapping import (
@@ -415,6 +418,7 @@ class LocalMediaScheduler:
             if key in self._path_locks:
                 return False
             self._path_locks.add(key)
+        qb_client = None
         try:
             # qB 已通过 API 的完成状态与进度双重确认；TG/Web 显式整理则由用户主动触发。
             # 直接交给服务层执行一次检查与预览复核，避免调度器额外预扫和固定等待；
@@ -428,8 +432,13 @@ class LocalMediaScheduler:
             current = db.get_local_media_task(task.id, owner=self.owner)
             terminal_statuses = {"completed", "requires_manual", "failed"}
             if current and current.status not in terminal_statuses:
+                failure_status = (
+                    "requires_manual"
+                    if isinstance(exc, LocalMediaPostMoveError)
+                    else "failed"
+                )
                 db.update_local_media_task(
-                    task.id, owner=self.owner, status="failed", error=str(exc),
+                    task.id, owner=self.owner, status=failure_status, error=str(exc),
                 )
                 current = db.get_local_media_task(task.id, owner=self.owner)
             logger.error("本地媒体任务执行失败 task=%s type=%s", task.id, type(exc).__name__)
@@ -479,6 +488,16 @@ class LocalMediaScheduler:
                     )
             return True
         finally:
+            close = getattr(qb_client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as close_exc:
+                    logger.warning(
+                        "关闭本地媒体 qB 客户端失败 task=%s type=%s",
+                        task.id,
+                        type(close_exc).__name__,
+                    )
             with self._guard:
                 self._path_locks.discard(key)
 

@@ -505,6 +505,67 @@ class TMDBPositionValidationTests(unittest.TestCase):
         self.assertFalse(result["required"])
 
 
+class ScraperCacheBoundsTests(unittest.TestCase):
+    def test_recognition_detail_cache_is_bounded_lru(self):
+        from app.modules.scraper import (
+            TMDBScraper,
+            _RECOGNITION_DETAIL_CACHE_LIMIT,
+        )
+
+        scraper = TMDBScraper(client=_TMDBClient())
+        for index in range(_RECOGNITION_DETAIL_CACHE_LIMIT + 5):
+            scraper._enrich_candidate_for_scoring(
+                {"id": str(index), "media_type": "movie"}, "movie"
+            )
+
+        self.assertEqual(
+            len(scraper._recognition_detail_cache),
+            _RECOGNITION_DETAIL_CACHE_LIMIT,
+        )
+        self.assertNotIn(("movie", "0"), scraper._recognition_detail_cache)
+        self.assertIn(
+            ("movie", str(_RECOGNITION_DETAIL_CACHE_LIMIT + 4)),
+            scraper._recognition_detail_cache,
+        )
+
+    def test_ai_failure_caches_prune_expired_and_evict_oldest(self):
+        import time
+
+        from app.modules.scraper import (
+            TMDBScraper,
+            _AI_FAILURE_CACHE_LIMIT,
+            _AI_FAILURE_CACHE_TTL_SECONDS,
+            _AI_FAILURE_GENERIC,
+        )
+
+        scraper = TMDBScraper(client=_TMDBClient())
+        now = time.monotonic()
+        for cache in (
+            scraper._ai_failure_cache,
+            scraper._release_group_ai_failure_cache,
+        ):
+            scraper._remember_ai_failure(
+                cache,
+                "expired",
+                "old",
+                _AI_FAILURE_GENERIC,
+                now=now - _AI_FAILURE_CACHE_TTL_SECONDS - 1,
+            )
+            for index in range(_AI_FAILURE_CACHE_LIMIT + 5):
+                scraper._remember_ai_failure(
+                    cache,
+                    f"key-{index}",
+                    f"error-{index}",
+                    _AI_FAILURE_GENERIC,
+                    now=now,
+                )
+
+            self.assertEqual(len(cache), _AI_FAILURE_CACHE_LIMIT)
+            self.assertNotIn("expired", cache)
+            self.assertNotIn("key-0", cache)
+            self.assertIn(f"key-{_AI_FAILURE_CACHE_LIMIT + 4}", cache)
+
+
 class AIFallbackPipelineTests(IsolatedDatabaseTestCase):
     @staticmethod
     def _ai_result(confidence: float = 0.95):

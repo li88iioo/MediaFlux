@@ -12,11 +12,18 @@ import secrets
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from functools import partial
+from typing import Any
 
 from app import database as db
 from app.logger import get_logger
+from app.notifier import (
+    TelegramSendResult,
+    call_telegram_delivery,
+    telegram_edit_fallback_allowed,
+)
 
 logger = get_logger(__name__)
 
@@ -28,6 +35,60 @@ _terminal_retry_lock = threading.RLock()
 _terminal_retry_stop = threading.Event()
 _terminal_retry_ids: set[str] = set()
 _terminal_retry_threads: set[threading.Thread] = set()
+_MAX_PENDING_OPERATIONS = 256
+_MAX_ACTIVE_OPERATIONS = 128
+_PENDING_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+def _pending_sort_key(row: dict[str, Any], position: int) -> tuple[int, int]:
+    for key in ("started_at", "deadline"):
+        try:
+            value = int(row.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value:
+            return value, position
+    return 0, position
+
+
+def _compact_pending_rows(
+    rows: Iterable[dict[str, Any]], *, now: int | None = None,
+) -> list[dict[str, Any]]:
+    """保留近期、活跃和终态优先记录，同时给持久 JSON 明确上限。"""
+    stamp = int(time.time()) if now is None else int(now)
+    deduplicated: dict[str, tuple[int, dict[str, Any]]] = {}
+    for position, raw in enumerate(rows):
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        operation_id = str(row.get("id") or "").strip()
+        if not operation_id:
+            continue
+        try:
+            expires_at = int(row.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
+        if expires_at and expires_at <= stamp:
+            continue
+        deduplicated[operation_id] = (position, row)
+
+    items = list(deduplicated.items())
+    if len(items) <= _MAX_PENDING_OPERATIONS:
+        return [row for _operation_id, (_position, row) in items]
+    with _active_lock:
+        active_ids = set(_active)
+    ranked = sorted(
+        items,
+        key=lambda item: (
+            str(item[0]) in active_ids,
+            bool(item[1][1].get("terminal_pending")),
+            _pending_sort_key(item[1][1], item[1][0]),
+        ),
+        reverse=True,
+    )
+    selected = ranked[:_MAX_PENDING_OPERATIONS]
+    selected.sort(key=lambda item: item[1][0])
+    return [row for _operation_id, (_position, row) in selected]
 
 
 def _load_pending() -> list[dict[str, Any]]:
@@ -35,19 +96,35 @@ def _load_pending() -> list[dict[str, Any]]:
         payload = json.loads(db.kv_get(_PENDING_KEY, "[]") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
-    return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+    rows = [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+    return _compact_pending_rows(rows)
 
 
 def _save_pending(items: list[dict[str, Any]]) -> None:
-    db.kv_set(_PENDING_KEY, json.dumps(items, ensure_ascii=False, separators=(",", ":")))
+    compacted = _compact_pending_rows(items)
+    if len(compacted) < len(items):
+        logger.warning(
+            "Telegram 挂起进度记录已按保留期或容量清理 removed=%s kept=%s",
+            len(items) - len(compacted),
+            len(compacted),
+        )
+    db.kv_set(
+        _PENDING_KEY,
+        json.dumps(compacted, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 def _register_pending(item: dict[str, Any]) -> None:
     try:
         with _pending_lock:
             rows = [row for row in _load_pending() if row.get("id") != item.get("id")]
-            rows.append(item)
-            # 运行中操作必须完整保留；静默截断会让异常重启后的早期任务失去收尾回执。
+            normalized = dict(item)
+            normalized.setdefault(
+                "expires_at", int(time.time()) + _PENDING_RETENTION_SECONDS
+            )
+            rows.append(normalized)
+            # 终态意图优先于普通运行记录；超过七天或容量上限后显式清理，
+            # 避免 settings_kv 与每次 JSON 编解码长期无界增长。
             _save_pending(rows)
     except Exception as exc:
         logger.info("Telegram 进度状态持久化失败 type=%s", type(exc).__name__)
@@ -151,6 +228,20 @@ def send_typing(
             pass
 
 
+def _register_active(operation: TelegramProgress) -> None:
+    with _active_lock:
+        _active[operation.operation_id] = operation
+        while len(_active) > _MAX_ACTIVE_OPERATIONS:
+            oldest_id = next(iter(_active))
+            if oldest_id == operation.operation_id and len(_active) == 1:
+                break
+            _active.pop(oldest_id, None)
+            logger.warning(
+                "Telegram 活跃进度注册表达到上限，已释放最早引用 operation=%s",
+                oldest_id,
+            )
+
+
 @dataclass
 class TelegramProgress:
     bot: Any
@@ -167,11 +258,18 @@ class TelegramProgress:
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _io_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _finished: bool = False
+    _terminal_result: TelegramSendResult | None = field(
+        default=None, init=False, repr=False,
+    )
 
     @property
     def finished_event(self) -> threading.Event:
         """供外部长链路等待感知进度已结束或服务正在停止。"""
         return self._stop
+
+    @property
+    def terminal_outcome_unknown(self) -> bool:
+        return bool(self._terminal_result and self._terminal_result.outcome_unknown)
 
     def begin(self, rendered: str) -> "TelegramProgress":
         source = self.source_message
@@ -232,8 +330,7 @@ class TelegramProgress:
             "started_at": int(time.time()),
             "deadline": int(time.time() + max(30.0, float(self.timeout_seconds))),
         })
-        with _active_lock:
-            _active[self.operation_id] = self
+        _register_active(self)
         threading.Thread(
             target=self._typing_heartbeat,
             name=f"tg-progress-{self.operation_id[:8]}",
@@ -267,6 +364,11 @@ class TelegramProgress:
                     f"<b>{html.escape(self.label)}状态等待超时</b>\n"
                     "后台任务可能仍在继续；完成后仍会发送结果，可使用 /status 查看运行状态。"
                 )
+                # 超时后不再由全局注册表强引用；任务最终仍可通过自身引用完成，
+                # 持久 pending 也会在重启时收尾。
+                with _active_lock:
+                    if _active.get(self.operation_id) is self:
+                        _active.pop(self.operation_id, None)
                 return
             send_typing(
                 self.bot, self.chat_id, message_thread_id=self.message_thread_id
@@ -291,6 +393,66 @@ class TelegramProgress:
         if callable(reply) and self.source_message is not None:
             return reply(self.source_message, rendered, **kwargs)
         return None
+
+    def _send_real_result(
+        self, rendered: str, *, reply_markup: Any = None,
+    ) -> TelegramSendResult:
+        sender = getattr(self.bot, "send_message", None)
+        reply = getattr(self.bot, "reply_to", None)
+        if not callable(sender) and not (
+            callable(reply) and self.source_message is not None
+        ):
+            return TelegramSendResult(
+                ok=False, error="TelegramSenderUnavailable", status_code=503,
+            )
+        result, value = call_telegram_delivery(
+            lambda: self._send_real(rendered, reply_markup=reply_markup)
+        )
+        if result.ok and value is None:
+            return TelegramSendResult(
+                ok=False, error="TelegramSendReturnedNoMessage", status_code=503,
+            )
+        return result
+
+    def _mark_terminal_attempt(self, operation: str, rendered: str) -> None:
+        _update_pending(
+            self.operation_id,
+            terminal_text=str(rendered),
+            terminal_pending=True,
+            terminal_delivery_state="sending",
+            terminal_operation=str(operation or "send"),
+        )
+
+    def _settle_terminal_result(
+        self, result: TelegramSendResult, rendered: str,
+    ) -> None:
+        self._terminal_result = result
+        if result.ok:
+            _remove_pending(self.operation_id)
+            return
+        if result.outcome_unknown:
+            logger.warning(
+                "Telegram 进度终态结果未知，停止自动重放 error=%s",
+                result.error or "OutcomeUnknown",
+            )
+            # 当前进程已确认本次发送结果未知；继续保留在“待恢复”队列会在
+            # 运行期或重启后制造重复终态。硬中断场景由发送前的 sending 标记
+            # 在 recover_stale_operations() 中同样隔离。
+            _remove_pending(self.operation_id)
+            return
+        if result.retryable:
+            _update_pending(
+                self.operation_id,
+                terminal_text=str(rendered),
+                terminal_pending=True,
+                terminal_delivery_state="retry_wait",
+            )
+            return
+        logger.warning(
+            "Telegram 进度终态被明确拒绝，停止无意义重试 status=%s error=%s",
+            result.status_code or "-", result.error or "DeliveryRejected",
+        )
+        _remove_pending(self.operation_id)
 
     def update(self, rendered: str) -> bool:
         with self._io_lock:
@@ -412,61 +574,63 @@ class TelegramProgress:
         with self._io_lock:
             if not self._claim_finished():
                 return False
-            success = False
-            try:
-                if self.mode == "edit" and self.message_id is not None:
-                    kwargs: dict[str, Any] = {
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": True,
-                    }
-                    if reply_markup is not None or clear_reply_markup:
-                        kwargs["reply_markup"] = reply_markup
-                    try:
-                        self.bot.edit_message_text(
-                            rendered, self.chat_id, self.message_id, **kwargs
-                        )
-                        success = True
-                    except Exception as exc:
-                        logger.info(
-                            "Telegram 进度消息编辑失败，降级为新消息 type=%s",
-                            type(exc).__name__,
-                        )
-                        success = self._send_real(
-                            rendered, reply_markup=reply_markup
-                        ) is not None
-                        if success:
-                            self._delete_placeholder()
-                elif self.mode == "rich_draft":
-                    sender = getattr(self.bot, "send_rich_message", None)
-                    rich = _rich_message(self.telebot, rendered)
-                    if callable(sender) and rich is not None:
-                        kwargs: dict[str, Any] = {}
-                        if reply_markup is not None:
-                            kwargs["reply_markup"] = reply_markup
-                        if self.message_thread_id is not None:
-                            kwargs["message_thread_id"] = self.message_thread_id
-                        sender(self.chat_id, rich, **kwargs)
-                        success = True
-                    else:
-                        success = self._send_real(rendered, reply_markup=reply_markup) is not None
-                    self._clear_draft()
-                else:
-                    success = self._send_real(rendered, reply_markup=reply_markup) is not None
-                    self._clear_draft()
-                    if self.mode == "reply" and success:
-                        self._delete_placeholder()
-            except Exception as exc:
-                logger.warning("Telegram 进度收尾失败 type=%s", type(exc).__name__)
-            finally:
-                if success:
-                    _remove_pending(self.operation_id)
-                else:
-                    _update_pending(
-                        self.operation_id,
-                        terminal_text=str(rendered),
-                        terminal_pending=True,
+            result = TelegramSendResult(
+                ok=False, error="TelegramSenderUnavailable", status_code=503,
+            )
+            if self.mode == "edit" and self.message_id is not None:
+                kwargs: dict[str, Any] = {
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }
+                if reply_markup is not None or clear_reply_markup:
+                    kwargs["reply_markup"] = reply_markup
+                self._mark_terminal_attempt("edit", rendered)
+                result, _value = call_telegram_delivery(
+                    lambda: self.bot.edit_message_text(
+                        rendered, self.chat_id, self.message_id, **kwargs
+                    ),
+                    message_id=int(self.message_id),
+                    edit=True,
+                )
+                if not result.ok and telegram_edit_fallback_allowed(result):
+                    logger.info(
+                        "Telegram 进度消息被明确拒绝编辑，降级为新消息 error=%s",
+                        result.error,
                     )
-            return success
+                    self._mark_terminal_attempt("send", rendered)
+                    result = self._send_real_result(
+                        rendered, reply_markup=reply_markup,
+                    )
+                    if result.ok:
+                        self._delete_placeholder()
+            elif self.mode == "rich_draft":
+                sender = getattr(self.bot, "send_rich_message", None)
+                rich = _rich_message(self.telebot, rendered)
+                self._mark_terminal_attempt("send", rendered)
+                if callable(sender) and rich is not None:
+                    kwargs = {}
+                    if reply_markup is not None:
+                        kwargs["reply_markup"] = reply_markup
+                    if self.message_thread_id is not None:
+                        kwargs["message_thread_id"] = self.message_thread_id
+                    result, _value = call_telegram_delivery(
+                        lambda: sender(self.chat_id, rich, **kwargs)
+                    )
+                else:
+                    result = self._send_real_result(
+                        rendered, reply_markup=reply_markup,
+                    )
+                self._clear_draft()
+            else:
+                self._mark_terminal_attempt("send", rendered)
+                result = self._send_real_result(
+                    rendered, reply_markup=reply_markup,
+                )
+                self._clear_draft()
+                if self.mode == "reply" and result.ok:
+                    self._delete_placeholder()
+            self._settle_terminal_result(result, rendered)
+            return result.ok
 
     def dismiss(self, fallback_text: str = "任务已完成。") -> bool:
         """仅移除临时进度，不把清理失败升级为需要重投的业务终态。
@@ -535,6 +699,8 @@ def deliver_terminal_to_existing_message(
         "deadline": stamp + 180,
         "terminal_text": str(rendered),
         "terminal_pending": True,
+        "terminal_delivery_state": "retry_wait",
+        "terminal_operation": "edit",
         "clear_reply_markup": True,
     })
     delivered = operation.finish(
@@ -542,7 +708,11 @@ def deliver_terminal_to_existing_message(
         reply_markup=reply_markup,
         clear_reply_markup=True,
     )
-    if not delivered and runtime_retry:
+    if (
+        not delivered
+        and runtime_retry
+        and not operation.terminal_outcome_unknown
+    ):
         schedule_terminal_delivery_retry(
             bot, telebot_module, operation.operation_id
         )
@@ -722,40 +892,104 @@ def recover_stale_operations(
             recovered_ids.add(operation_id)
             recovered += 1
             continue
+
+        delivery_state = str(row.get("terminal_delivery_state") or "")
+        terminal_operation = str(row.get("terminal_operation") or "")
+        if delivery_state == "outcome_unknown" or (
+            delivery_state == "sending" and terminal_operation == "send"
+        ):
+            # 新消息发送期间进程中断，无法判断 Telegram 是否已接收。宁可保留
+            # 用户当前视图，也不能在启动恢复中盲目制造第二条终态。
+            logger.warning(
+                "Telegram 中断终态结果未知，停止自动重放 operation=%s",
+                operation_id,
+            )
+            recovered_ids.add(operation_id)
+            recovered += 1
+            continue
+
         label = str(row.get("label") or "Telegram 任务")
         text = str(row.get("terminal_text") or "") or _task_run_recovery_text(row, label)
-        try:
-            delivered = False
-            message_id = row.get("message_id")
-            if message_id and callable(getattr(bot, "edit_message_text", None)):
-                try:
-                    edit_kwargs: dict[str, Any] = {"parse_mode": "HTML"}
-                    if bool(row.get("clear_reply_markup")):
-                        edit_kwargs["reply_markup"] = None
-                    bot.edit_message_text(
-                        text, chat_id, int(message_id), **edit_kwargs
-                    )
-                    delivered = True
-                except Exception as exc:
-                    logger.info(
-                        "Telegram 中断任务原消息不可编辑，改发新消息 type=%s",
-                        type(exc).__name__,
-                    )
-            if not delivered and callable(getattr(bot, "send_message", None)):
+        result = TelegramSendResult(
+            ok=False, error="TelegramSenderUnavailable", status_code=503,
+        )
+        message_id = row.get("message_id")
+        edit = getattr(bot, "edit_message_text", None)
+        if message_id and callable(edit):
+            edit_kwargs: dict[str, Any] = {"parse_mode": "HTML"}
+            if bool(row.get("clear_reply_markup")):
+                edit_kwargs["reply_markup"] = None
+            _update_pending(
+                operation_id,
+                terminal_text=text,
+                terminal_pending=True,
+                terminal_delivery_state="sending",
+                terminal_operation="edit",
+            )
+            result, _value = call_telegram_delivery(
+                partial(edit, text, chat_id, int(message_id), **edit_kwargs),
+                message_id=int(message_id),
+                edit=True,
+            )
+            if not result.ok and telegram_edit_fallback_allowed(result):
+                logger.info(
+                    "Telegram 中断任务原消息被明确拒绝编辑，改发新消息 error=%s",
+                    result.error,
+                )
+                result = TelegramSendResult(
+                    ok=False, error="TelegramSenderUnavailable", status_code=503,
+                )
+                message_id = None
+        else:
+            message_id = None
+
+        if message_id is None and not result.outcome_unknown:
+            sender = getattr(bot, "send_message", None)
+            if callable(sender):
                 send_kwargs: dict[str, Any] = {"parse_mode": "HTML"}
                 message_thread_id = _normalized_message_thread_id(
                     row.get("message_thread_id")
                 )
                 if message_thread_id is not None:
                     send_kwargs["message_thread_id"] = message_thread_id
-                bot.send_message(chat_id, text, **send_kwargs)
-                delivered = True
-            if not delivered:
-                continue
+                _update_pending(
+                    operation_id,
+                    terminal_text=text,
+                    terminal_pending=True,
+                    terminal_delivery_state="sending",
+                    terminal_operation="send",
+                )
+                result, _value = call_telegram_delivery(
+                    partial(sender, chat_id, text, **send_kwargs)
+                )
+
+        if result.ok:
             recovered_ids.add(operation_id)
             recovered += 1
-        except Exception as exc:
-            logger.info("Telegram 中断任务恢复通知失败 type=%s", type(exc).__name__)
+            continue
+        if result.outcome_unknown:
+            logger.warning(
+                "Telegram 中断任务终态结果未知，停止自动重放 operation=%s",
+                operation_id,
+            )
+            recovered_ids.add(operation_id)
+            recovered += 1
+            continue
+        if result.retryable:
+            _update_pending(
+                operation_id,
+                terminal_text=text,
+                terminal_pending=True,
+                terminal_delivery_state="retry_wait",
+            )
+            continue
+        logger.warning(
+            "Telegram 中断任务终态被明确拒绝 status=%s error=%s",
+            result.status_code or "-", result.error or "DeliveryRejected",
+        )
+        recovered_ids.add(operation_id)
+        recovered += 1
+
     if recovered_ids:
         try:
             with _pending_lock:

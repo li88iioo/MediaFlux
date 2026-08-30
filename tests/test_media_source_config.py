@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -102,6 +104,8 @@ class MediaConfigSaveTests(unittest.TestCase):
     def _save(self, payload):
         strm_scheduler = MagicMock()
         organize_scheduler = MagicMock()
+        reconcile = MagicMock()
+        reconcile.return_value.__enter__.return_value = []
         with patch("app.routes.api.require_api_login"), patch(
             "app.routes.api.config.set_and_save"
         ) as save, patch("app.services.clear_dashboard_cache"), patch(
@@ -109,6 +113,9 @@ class MediaConfigSaveTests(unittest.TestCase):
         ), patch(
             "app.modules.organize_scheduler.get_organize_scheduler",
             return_value=organize_scheduler,
+        ), patch(
+            "app.database.reconcile_strm_retired_sources_transaction",
+            reconcile,
         ):
             result = self.api.save_config(self.request, payload)
         return result, save, strm_scheduler, organize_scheduler
@@ -146,6 +153,53 @@ class MediaConfigSaveTests(unittest.TestCase):
         self.assertEqual(result, {"success": True})
         saved = save.call_args.args[0]
         self.assertEqual(json.loads(saved["GY_ORGANIZE_NSFW_SOURCE_IDS"]), ["11"])
+
+    def test_unchanged_strm_input_does_not_reload_strm_runtime(self):
+        current_strm = '[{"id":"33","name":"STRM"}]'
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": {
+                "GY_STRM_SOURCE_DIRS": current_strm,
+            }.get(key, default),
+        ):
+            result, save, strm_scheduler, organize_scheduler = self._save({
+                "GY_STRM_SOURCE_DIRS": current_strm,
+                "GY_ORGANIZE_SOURCE_DIRS": '[{"id":"11","name":"源一"}]',
+            })
+
+        self.assertEqual(result, {"success": True})
+        self.assertNotIn("GY_STRM_SOURCE_DIRS", save.call_args.args[0])
+        strm_scheduler.reload.assert_not_called()
+        organize_scheduler.reload.assert_called_once_with()
+
+    def test_retirement_commit_failure_restores_previous_config(self):
+        old_sources = '[{"id":"11","name":"旧来源"}]'
+
+        @contextmanager
+        def fail_after_publish(*_args, **_kwargs):
+            yield ["11"]
+            raise RuntimeError("commit failed")
+
+        with patch("app.routes.api.require_api_login"), patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": {
+                "GY_STRM_SOURCE_DIRS": old_sources,
+                "STRM_ROOT": "/data/strm",
+            }.get(key, default),
+        ), patch("app.routes.api.config.set_and_save") as save, patch(
+            "app.database.reconcile_strm_retired_sources_transaction",
+            side_effect=fail_after_publish,
+        ):
+            result = self.api.save_config(
+                self.request,
+                {"GY_STRM_SOURCE_DIRS": "[]"},
+            )
+
+        self.assertEqual(result.status_code, 500)
+        self.assertEqual(save.call_count, 2)
+        self.assertEqual(save.call_args_list[1].args[0], {
+            "GY_STRM_SOURCE_DIRS": old_sources,
+        })
 
     def test_advanced_media_server_mapping_is_validated_and_canonicalized(self):
         result, save, _, _ = self._save({
@@ -202,6 +256,39 @@ class MediaSourceUiContractTests(unittest.TestCase):
         self.assertIn("const selected = new Map", app_js)
         self.assertIn("已选择 ${selected.size} 个", app_js)
         self.assertIn("确认选择", app_js)
+
+
+class StrmRetirementTransactionTests(unittest.TestCase):
+    def test_reconcile_transaction_commits_and_rolls_back_as_one_unit(self):
+        from app import database as db
+
+        previous_path = db.DB_PATH
+        previous_test_mode = db._configured_test_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mediaflux.db"
+            try:
+                db.configure_database(path, test_mode=True)
+                with self.assertRaisesRegex(RuntimeError, "abort"):
+                    with db.reconcile_strm_retired_sources_transaction(
+                        [], [("11", "旧来源", "/data/strm")]
+                    ):
+                        raise RuntimeError("abort")
+                self.assertEqual(db.list_strm_retired_sources(), [])
+
+                with db.reconcile_strm_retired_sources_transaction(
+                    [], [("11", "旧来源", "/data/strm")]
+                ) as retired_ids:
+                    self.assertEqual(retired_ids, ["11"])
+                self.assertEqual(
+                    [row["source_id"] for row in db.list_strm_retired_sources()],
+                    ["11"],
+                )
+
+                with db.reconcile_strm_retired_sources_transaction(["11"], []):
+                    pass
+                self.assertEqual(db.list_strm_retired_sources(), [])
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
 
 
 if __name__ == "__main__":

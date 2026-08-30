@@ -216,7 +216,7 @@ class OrganizeNotificationOutboxTests(IsolatedDatabaseTestCase):
 
     def test_temporary_failure_is_retried_and_not_duplicated(self):
         sent: list[str] = []
-        with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=False, error="timeout")):
+        with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=False, error="timeout", status_code=503)):
             self.assertFalse(
                 deliver_organize_notification("task:b", "整理完成", chat_id="1")
             )
@@ -233,6 +233,43 @@ class OrganizeNotificationOutboxTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(sent, ["整理完成"])
         self.assertEqual(count_pending_organize_notifications(), 0)
+
+    def test_unknown_delivery_is_consumed_without_replay(self):
+        with patch(
+            "app.notifier.send_result",
+            return_value=TelegramSendResult(
+                ok=False, error="ReadTimeout", status_code=408,
+            ),
+        ):
+            self.assertFalse(
+                deliver_organize_notification(
+                    "task:unknown", "整理完成", chat_id="1"
+                )
+            )
+
+        row = dict(list_organize_notifications()[0])
+        self.assertEqual(row["status"], "sent")
+        self.assertEqual(count_pending_organize_notifications(), 0)
+        with patch("app.notifier.send_result") as sender:
+            self.assertTrue(
+                deliver_organize_notification(
+                    "task:unknown", "整理完成", chat_id="1"
+                )
+            )
+        sender.assert_not_called()
+
+    def test_one_shot_unknown_delivery_is_not_enqueued(self):
+        with patch(
+            "app.notifier.send_result",
+            return_value=TelegramSendResult(
+                ok=False, error="ReadTimeout", status_code=408,
+            ),
+        ):
+            self.assertFalse(
+                deliver_organize_notification("", "整理完成", chat_id="1")
+            )
+
+        self.assertEqual(list_organize_notifications(), [])
 
     def test_already_sent_event_is_never_sent_twice(self):
         with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=True)):
@@ -271,14 +308,14 @@ class OrganizeNotificationOutboxTests(IsolatedDatabaseTestCase):
         self.assertEqual(count_pending_organize_notifications(), 0)
 
     def test_keyless_failure_still_enqueues_a_unique_retry(self):
-        with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=False, error="timeout")):
+        with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=False, error="timeout", status_code=503)):
             deliver_organize_notification("", "无任务 ID 的通知", chat_id="1")
             deliver_organize_notification("", "无任务 ID 的通知", chat_id="1")
 
         self.assertEqual(count_pending_organize_notifications(), 2)
 
     def test_restart_recovers_interrupted_sending_events(self):
-        with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=False, error="timeout")):
+        with patch("app.notifier.send_result", return_value=TelegramSendResult(ok=False, error="timeout", status_code=503)):
             deliver_organize_notification("task:f", "整理完成", chat_id="1")
         with db.get_conn() as conn:
             conn.execute("UPDATE organize_notification_outbox SET status='sending'")

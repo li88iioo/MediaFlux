@@ -504,7 +504,11 @@ def create_app(*, start_background: bool = False) -> FastAPI:
 
             ensure_seed_knowledge()
             logger.info("数据库已初始化")
-            from app.modules.media_proxy import get_media_proxy_manager
+            from app.modules.media_proxy import (
+                get_media_proxy_manager,
+                shutdown_signed_media_probe_runtime,
+                start_signed_media_probe_runtime,
+            )
 
             proxy_manager = get_media_proxy_manager()
             _app.state.media_proxy_manager = proxy_manager
@@ -535,6 +539,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                 # 后台媒体订阅线程可能立即使用全局 Indexer；必须先绑定其唯一
                 # 异步运行循环，避免启动窗口内创建跨循环的 HTTP 客户端。
                 if start_background:
+                    start_signed_media_probe_runtime()
                     start_background_services()
                     await proxy_manager.start()
                 _app.state.ready = True
@@ -593,12 +598,29 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                         logger.warning(
                             "媒体订阅检查尚未收敛，本次关机跳过 discovery/indexer runtime 销毁"
                         )
+                    proxy_runtime_stopped = False
                     if start_background:
                         try:
                             await proxy_manager.stop()
+                            proxy_runtime_stopped = True
                         except Exception as exc:
                             logger.warning(
                                 "关闭媒体反代运行时失败 type=%s",
+                                type(exc).__name__,
+                            )
+                    if start_background and proxy_runtime_stopped:
+                        try:
+                            probe_runtime_stopped = await asyncio.to_thread(
+                                shutdown_signed_media_probe_runtime,
+                                5.0,
+                            )
+                            if not probe_runtime_stopped:
+                                logger.warning(
+                                    "媒体直链探测线程仍在收尾，已停止新任务准入"
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "关闭媒体直链探测线程池失败 type=%s",
                                 type(exc).__name__,
                             )
                 finally:

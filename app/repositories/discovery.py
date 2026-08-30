@@ -56,6 +56,41 @@ def update_discovery_cache_error(cache_key: str, last_error: str) -> None:
         )
 
 
+def purge_discovery_cache(
+    expired_before: str,
+    *,
+    max_rows: int = 10_000,
+    batch_size: int = 5_000,
+) -> int:
+    """分批清理过期和最旧探索缓存，避免持久缓存无界增长。"""
+    row_limit = max(1, int(max_rows))
+    delete_limit = max(1, int(batch_size))
+    deleted = 0
+    with _database().get_conn() as conn:
+        cursor = conn.execute(
+            "DELETE FROM discovery_cache WHERE cache_key IN ("
+            "SELECT cache_key FROM discovery_cache WHERE stale_until < ? "
+            "ORDER BY stale_until, cache_key LIMIT ?"
+            ")",
+            (str(expired_before), delete_limit),
+        )
+        deleted += max(0, int(cursor.rowcount or 0))
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM discovery_cache"
+        ).fetchone()[0])
+        overflow = max(0, total - row_limit)
+        if overflow:
+            cursor = conn.execute(
+                "DELETE FROM discovery_cache WHERE cache_key IN ("
+                "SELECT cache_key FROM discovery_cache "
+                "ORDER BY fetched_at, cache_key LIMIT ?"
+                ")",
+                (min(overflow, delete_limit),),
+            )
+            deleted += max(0, int(cursor.rowcount or 0))
+    return deleted
+
+
 def get_media_external_id(
     provider: str, external_id: str, media_type: str,
 ) -> sqlite3.Row | None:
@@ -64,6 +99,42 @@ def get_media_external_id(
             "SELECT * FROM media_external_ids WHERE provider=? AND external_id=? AND media_type=?",
             (str(provider), str(external_id), str(media_type)),
         ).fetchone()
+
+
+def list_media_external_ids(
+    identities: list[tuple[str, str, str]],
+) -> dict[tuple[str, str, str], sqlite3.Row]:
+    """在单个连接内批量读取跨来源映射，避免收藏列表逐条建连。"""
+    keys = list(dict.fromkeys(
+        (str(provider), str(external_id), str(media_type))
+        for provider, external_id, media_type in identities
+        if str(provider) and str(external_id) and str(media_type)
+    ))
+    if not keys:
+        return {}
+    result: dict[tuple[str, str, str], sqlite3.Row] = {}
+    # SQLite 常见变量上限为 999；每个 identity 使用三个绑定参数。
+    with _database().get_conn() as conn:
+        for offset in range(0, len(keys), 300):
+            chunk = keys[offset:offset + 300]
+            clauses = " OR ".join(
+                "(provider=? AND external_id=? AND media_type=?)"
+                for _ in chunk
+            )
+            params = tuple(value for key in chunk for value in key)
+            rows = conn.execute(
+                "SELECT * FROM media_external_ids WHERE " + clauses,
+                params,
+            ).fetchall()
+            result.update({
+                (
+                    str(row["provider"]),
+                    str(row["external_id"]),
+                    str(row["media_type"]),
+                ): row
+                for row in rows
+            })
+    return result
 
 
 def upsert_media_external_id(

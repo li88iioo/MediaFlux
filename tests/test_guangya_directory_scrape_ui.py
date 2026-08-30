@@ -573,6 +573,20 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
             """
         )
 
+    def test_menu_ignores_initial_browser_resize_then_closes_normally(self):
+        self._open_file_menu()
+
+        self.page.set_viewport_size({"width": 801, "height": 600})
+        self.assertIsNone(
+            self.page.get_attribute("#gyDirectoryContextMenu", "hidden")
+        )
+
+        self.page.wait_for_timeout(180)
+        self.page.set_viewport_size({"width": 802, "height": 600})
+        self.page.wait_for_function(
+            "() => document.getElementById('gyDirectoryContextMenu').hidden"
+        )
+
     def test_file_delete_confirms_once_calls_direct_api_and_reloads(self):
         self._open_file_menu()
         self.page.evaluate(
