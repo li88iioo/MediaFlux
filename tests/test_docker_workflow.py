@@ -38,6 +38,14 @@ class DockerWorkflowTests(unittest.TestCase):
             self.text,
         )
 
+    def test_multiarch_build_only_runs_for_version_tags(self) -> None:
+        build_job = self.text.split("  build:", 1)[1]
+        self.assertIn(
+            "if: startsWith(github.ref, 'refs/tags/v')",
+            build_job,
+        )
+        self.assertNotIn("if: github.event_name != 'pull_request'", build_job)
+
     def test_image_is_smoke_tested_before_multiarch_publish(self) -> None:
         self.assertIn("  smoke:", self.text)
         self.assertIn("docker build \\", self.text)

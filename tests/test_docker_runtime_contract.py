@@ -262,7 +262,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
 
     def test_release_workflow_fails_closed_before_publishing(self) -> None:
         for value in (
-            "if: github.event_name != 'pull_request'",
+            "if: startsWith(github.ref, 'refs/tags/v')",
             'git merge-base --is-ancestor "$BUILD_SHA" origin/main',
             'module._changelog_section(',
             'permissions:\n  contents: read',

@@ -212,7 +212,8 @@ jobs:
           docker rm --force mediaflux-v014-upgrade >/dev/null 2>&1 || true
 
   build:
-    if: github.event_name != 'pull_request'
+    # 普通 main 只执行 test + amd64 smoke；多架构候选与发布仅由版本标签触发。
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [test, smoke]
     runs-on: ubuntu-latest
     permissions:

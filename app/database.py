@@ -36,7 +36,7 @@ _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
-_wal_mode_cache: dict[str, tuple[int, int]] = {}
+_wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
 SCHEMA_VERSION = 13
 
@@ -1744,13 +1744,22 @@ def _protect_database_files(path: Path | None = None) -> None:
         )
 
 
-def _database_file_identity(path: Path) -> tuple[int, int] | None:
-    """返回足以识别数据库文件替换的轻量标识。"""
+def _database_file_identity(path: Path) -> tuple[int, int, int] | None:
+    """返回可识别同路径 inode 复用的轻量文件代际标识。
+
+    仅使用 ``st_dev``/``st_ino`` 会漏掉快速 unlink + recreate 后文件系统
+    立即复用 inode 的情况。加入纳秒级 ctime 后，数据库被替换时会重新
+    协商 WAL；普通 WAL 写入主要落在 sidecar，不增加连接热路径查询。
+    """
     try:
         metadata = path.stat()
     except OSError:
         return None
-    return int(metadata.st_dev), int(metadata.st_ino)
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_ctime_ns),
+    )
 
 
 def _ensure_wal_mode(conn: sqlite3.Connection, path: Path) -> None:
