@@ -333,6 +333,8 @@ _CHECKSUM_SUFFIX = re.compile(
     r"(?:[\[【](?P<bracket>[A-Fa-f0-9]{8,40})[\]】]|"
     r"\((?P<parenthesized>[A-Fa-f0-9]{8,40})\))\s*$"
 )
+_TMDB_ANIMATION_GENRE_ID = 16
+_EXPLICIT_DONGHUA_MARKER = re.compile(r"(?i)(?<![a-z0-9])donghua(?![a-z0-9])")
 _YEAR_TOKEN = re.compile(
     r"(?<![\dxX])((?:19|20)\d{2})(?!\d|[xX]\d{3,4})"
 )
@@ -2036,6 +2038,38 @@ def extract_recognition_context(filename: str, parent_path: str = "") -> Recogni
     )
 
 
+def _explicit_animation_source_marker(context: RecognitionContext) -> str:
+    """返回发布源明确声明的动画证据；普通标题和类型猜测不参与。"""
+    values = (
+        str(context.filename or ""),
+        str(context.parent_path or ""),
+        *(
+            str(item or "")
+            for items in (context.cleaned_components or {}).values()
+            for item in (items or ())
+        ),
+    )
+    for value in values:
+        match = _EXPLICIT_DONGHUA_MARKER.search(value)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _tmdb_genre_ids(candidate: dict) -> set[int]:
+    """兼容 TMDB 搜索 ``genre_ids`` 与详情 ``genres`` 两种结构。"""
+    values: list[object] = list(candidate.get("genre_ids") or ())
+    for genre in candidate.get("genres") or ():
+        values.append(genre.get("id") if isinstance(genre, dict) else genre)
+    genre_ids: set[int] = set()
+    for value in values:
+        try:
+            genre_ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return genre_ids
+
+
 def _enclosed_high_season_fallback_context(
     context: RecognitionContext,
 ) -> RecognitionContext | None:
@@ -2098,6 +2132,7 @@ def _enclosed_high_season_fallback_context(
 
 
 _SOURCE_LOW_INFORMATION_FOLDERS_KEY = "source_low_information_folder_titles"
+_SOURCE_EXPLICIT_ANIMATION_MARKERS_KEY = "source_explicit_animation_markers"
 
 
 def _source_low_information_folder_titles(
@@ -2115,7 +2150,7 @@ def _source_low_information_folder_titles(
 def _inherit_source_query_provenance(
     context: RecognitionContext, source_context: RecognitionContext | None,
 ) -> None:
-    """保留预处理前的低信息目录来源，但不把它重新加入普通查询。"""
+    """保留预处理前会影响安全决策的来源证据。"""
     if source_context is None:
         return
     cleaned = {
@@ -2127,6 +2162,12 @@ def _inherit_source_query_provenance(
     weak_folders.extend(_source_low_information_folder_titles(source_context))
     if weak_folders:
         cleaned[_SOURCE_LOW_INFORMATION_FOLDERS_KEY] = _unique_text(weak_folders)
+    animation_marker = _explicit_animation_source_marker(source_context)
+    if animation_marker:
+        cleaned[_SOURCE_EXPLICIT_ANIMATION_MARKERS_KEY] = _unique_text((
+            *cleaned.get(_SOURCE_EXPLICIT_ANIMATION_MARKERS_KEY, []),
+            animation_marker,
+        ))
     context.cleaned_components = cleaned
 
 
@@ -4817,6 +4858,8 @@ class TMDBScraper:
                 metadata={"search_attempts": [dict(item) for item in search_attempts]},
             )
 
+        animation_marker = _explicit_animation_source_marker(context)
+        animation_filtered_count = 0
         initial_scores = [
             score_candidate(context, raw) for raw in raw_candidates.values()
         ]
@@ -4837,9 +4880,22 @@ class TMDBScraper:
             # 所属系列首播更早。仅在显式 SxxExx 且当前候选均未达阈值时，
             # 再用原始查询补一次无年份搜索；结果仍进入完整歧义门禁。
             collect("")
-            initial_scores = [
-                score_candidate(context, raw) for raw in raw_candidates.values()
-            ]
+
+        if animation_marker:
+            animation_candidates = {
+                key: raw
+                for key, raw in raw_candidates.items()
+                if _TMDB_ANIMATION_GENRE_ID in _tmdb_genre_ids(raw)
+            }
+            if animation_candidates:
+                animation_filtered_count = (
+                    len(raw_candidates) - len(animation_candidates)
+                )
+                raw_candidates = animation_candidates
+
+        initial_scores = [
+            score_candidate(context, raw) for raw in raw_candidates.values()
+        ]
         needs_alias_validation = (
             len(raw_candidates) >= 2
             and any(_eligible_latin_alias_query(query) for query in queries)
@@ -4952,12 +5008,7 @@ class TMDBScraper:
                 score_breakdown=breakdown,
                 provider="tmdb",
                 external_id=str(raw.get("id") or ""),
-                metadata={
-                    "genre_ids": [
-                        int(value) for value in (raw.get("genre_ids") or [])
-                        if str(value).isdigit()
-                    ],
-                },
+                metadata={"genre_ids": sorted(_tmdb_genre_ids(raw))},
             ))
 
         best = candidates[0]
@@ -4967,6 +5018,15 @@ class TMDBScraper:
         decision_constraints = list(
             best.score_breakdown.rejected_constraints if best.score_breakdown else []
         )
+        best_genre_ids = _tmdb_genre_ids(scored[0][1])
+        animation_verified = bool(
+            not animation_marker
+            or _TMDB_ANIMATION_GENRE_ID in best_genre_ids
+        )
+        if animation_marker and not animation_verified:
+            decision_constraints.append("animation_evidence_mismatch")
+            if "animation_evidence_mismatch" not in rejected_constraints:
+                rejected_constraints.append("animation_evidence_mismatch")
         if search_only_variant_used:
             decision_constraints.append("search_only_variant")
             if "search_only_variant" not in rejected_constraints:
@@ -5045,6 +5105,19 @@ class TMDBScraper:
                 **(
                     {"target_season_year_evidence": selected_season_year_evidence}
                     if selected_season_year_evidence is not None else {}
+                ),
+                **(
+                    {
+                        "content_kind_evidence": {
+                            "source": "explicit_donghua_marker",
+                            "marker": animation_marker,
+                            "required_genre_id": _TMDB_ANIMATION_GENRE_ID,
+                            "candidate_genre_ids": sorted(best_genre_ids),
+                            "verified": animation_verified,
+                            "filtered_non_animation_candidates": animation_filtered_count,
+                        }
+                    }
+                    if animation_marker else {}
                 ),
                 "recognition_evidence": {
                     "matched_query": str(
@@ -5208,6 +5281,8 @@ class TMDBScraper:
                 result.error = "标题信息量不足，候选结果需要人工确认"
             elif decision.get("reason") == "low_information_variant_match":
                 result.error = "候选仅命中低信息目录或标题变体，无法证明与文件主标题一致，需要人工确认"
+            elif decision.get("reason") == "animation_evidence_mismatch":
+                result.error = "源文件包含 Donghua 动画标记，但 TMDB 候选不是动画条目，需要人工确认"
             elif decision.get("reason") == "ambiguous_romaji_alias":
                 result.error = "同一罗马字/拉丁别名命中多个 TMDB 条目，需要人工确认"
             elif decision.get("reason") == "ambiguous_near_tie":

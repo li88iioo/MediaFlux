@@ -65,6 +65,28 @@ class NotificationPublishResult:
         return self.accepted
 
 
+@dataclass(frozen=True)
+class NotificationThreadSnapshot:
+    """通知线程的期望内容与真实投递进度快照。"""
+
+    event: NotificationEvent
+    status: str
+    revision: int
+    delivered_revision: int
+    message_id: int
+    last_error: str = ""
+
+    @property
+    def current_revision_delivered(self) -> bool:
+        """最新 revision 已原位送达，而不是仅写入 outbox。"""
+        return bool(
+            self.status == "sent"
+            and self.revision > 0
+            and self.delivered_revision >= self.revision
+            and self.message_id > 0
+        )
+
+
 def serialize_notification_event(event: NotificationEvent) -> str:
     """序列化固定安全投影；动态展示值统一收敛为字符串。"""
     payload = {
@@ -188,14 +210,35 @@ def get_notification_thread_event(
     topic: NotificationTopic | str,
     chat_id: str = "",
 ) -> NotificationEvent | None:
+    snapshot = get_notification_thread_snapshot(
+        thread_key, topic=topic, chat_id=chat_id,
+    )
+    return snapshot.event if snapshot is not None else None
+
+
+def get_notification_thread_snapshot(
+    thread_key: str,
+    *,
+    topic: NotificationTopic | str,
+    chat_id: str = "",
+) -> NotificationThreadSnapshot | None:
+    """读取线程最新内容及其是否已经真实送达 Telegram。"""
     key = notification_thread_event_key(thread_key, topic=topic, chat_id=chat_id)
     row = get_notification(key)
     if row is None:
         return None
     try:
-        return deserialize_notification_event(str(row.get("event_json") or ""))
+        event = deserialize_notification_event(str(row.get("event_json") or ""))
     except ValueError:
         return None
+    return NotificationThreadSnapshot(
+        event=event,
+        status=str(row.get("status") or ""),
+        revision=max(0, int(row.get("revision") or 0)),
+        delivered_revision=max(0, int(row.get("delivered_revision") or 0)),
+        message_id=max(0, int(row.get("message_id") or 0)),
+        last_error=str(row.get("last_error") or ""),
+    )
 
 
 def _edit_can_fallback_to_new_message(result: TelegramSendResult) -> bool:

@@ -10,7 +10,7 @@ import time
 from app import database as db
 from app.logger import get_logger, log_throttled
 from app.modules.rss import RSSEngine, rss_subscription_refresh_revision
-from app.notifier import NotificationEvent
+from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 
 logger = get_logger(__name__)
 _MAX_CONCURRENT_REFRESHES = 4
@@ -84,8 +84,13 @@ class RSSScheduler:
                 f"rss-alert:{sub_id}:{digest}",
                 NotificationEvent(
                     "⚠️ RSS 周期任务需要处理",
-                    fields=(("订阅", name), *tuple(fields)),
+                    fields=(
+                        ("订阅", name),
+                        NOTIFICATION_SECTION_BREAK,
+                        *tuple(fields),
+                    ),
                     footer="相同问题只提醒一次；恢复后再次发生会重新提醒。",
+                    layout="relaxed",
                 ),
                 topic=NotificationTopic.RSS,
                 importance=NotificationImportance.ERROR,

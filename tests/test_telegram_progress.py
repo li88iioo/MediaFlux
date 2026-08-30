@@ -136,13 +136,31 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
         ))
         self.assertEqual(
             bot.rich_messages[-1][1],
-            "<p><b>搜索完成</b></p>"
+            "<p><b>搜索完成</b></p><br>"
             "<p><b>状态</b>  已完成<br><b>概览</b>  2 个来源</p>",
         )
         self.assertEqual(bot.rich_drafts[-1][2], "")
         self.assertEqual(bot.text_drafts, [])
         self.assertFalse(progress.update("不应覆盖终态"))
         self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
+
+    def test_rich_terminal_preserves_report_spacing_and_quote_block(self):
+        bot = _RichBot()
+        progress = TelegramProgress(bot, _TELEBOT, "100", "STRM 同步", timeout_seconds=60)
+        progress.begin("<b>同步中</b>")
+
+        self.assertTrue(progress.finish(
+            "<b>✅ 光鸭 STRM 同步全部完成</b>\n\n"
+            "- <b>状态：</b>✅ 同步完成\n\n"
+            "<blockquote>ℹ️ 清理明细已记录到 Web 运行记录。</blockquote>"
+        ))
+
+        self.assertEqual(
+            bot.rich_messages[-1][1],
+            "<p><b>✅ 光鸭 STRM 同步全部完成</b></p><br>"
+            "<p>- <b>状态：</b>✅ 同步完成</p><br>"
+            "<blockquote>ℹ️ 清理明细已记录到 Web 运行记录。</blockquote>",
+        )
 
     def test_progress_typing_stays_in_forum_topic(self):
         bot = _RichBot()

@@ -343,6 +343,23 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertTrue(notifier.decorate_title("本次同步未完成").startswith("⚠️"))
         self.assertTrue(notifier.decorate_title("本次同步无法完成").startswith("⚠️"))
 
+    def test_compact_report_uses_tight_fields_tree_block_and_safe_quote(self):
+        event = notifier.NotificationEvent(
+            "同步完成",
+            fields=(("状态", "✅ 完成"), ("来源概览", "└ • <目录>：无变化")),
+            footer="清理 <2> 条",
+            layout="compact_report",
+            field_emojis=False,
+        )
+
+        rendered = notifier.render_event(event)
+
+        self.assertIn("- <b>状态：</b>✅ 完成", rendered)
+        self.assertIn("- <b>来源概览：</b>\n  └ • &lt;目录&gt;：无变化", rendered)
+        self.assertIn(
+            "<blockquote>ℹ️ 清理 &lt;2&gt; 条</blockquote>", rendered,
+        )
+
     def test_long_escaped_event_never_splits_inside_html_entity_or_bold_tag(self):
         """若分段切断 HTML entity 或粗体标签，本测试必须失败。"""
         event_type = getattr(notifier, "NotificationEvent", None)
@@ -766,6 +783,9 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
         download_text = notifier.render_event(sent[0][0])
         review_text = notifier.render_event(sent[1][0])
         failure_text = notifier.render_event(sent[2][0])
+        self.assertEqual(sent[0][0].layout, "relaxed")
+        self.assertEqual(sent[1][0].layout, "relaxed")
+        self.assertEqual(sent[2][0].layout, "relaxed")
         self.assertIn("任务&lt;&amp;&gt;", download_text)
         self.assertEqual(sent[0][1]["chat_id"], "900")
         self.assertIn("需要人工核对", review_text)

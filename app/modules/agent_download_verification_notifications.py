@@ -10,7 +10,11 @@ from app.agent.owner_routes import (
     parse_telegram_owner_route,
     telegram_owner_route_is_currently_authorized,
 )
-from app.notifier import NotificationEvent, TelegramSendResult
+from app.notifier import (
+    NOTIFICATION_SECTION_BREAK,
+    NotificationEvent,
+    TelegramSendResult,
+)
 
 _RESULT_LABELS = {
     "visible": "目标剧集已在媒体库中可见",
@@ -98,17 +102,21 @@ def build_download_verification_event(
     normalized_result = result if result in _RESULT_LABELS else "inconclusive"
     target = f"S{max(1, int(season)):02d}E{max(1, int(episode)):02d}"
     fields = (
-        ("媒体", _safe_title(title)),
+        ("目标媒体", _safe_title(title)),
         ("目标集", target),
-        ("结果", _RESULT_LABELS[normalized_result]),
+        NOTIFICATION_SECTION_BREAK,
+        ("复核结果", _RESULT_LABELS[normalized_result]),
         ("复核次数", str(max(0, int(attempts)))),
     )
     if normalized_status == "visible":
-        return NotificationEvent("Agent 媒体库复核完成", fields=fields)
+        return NotificationEvent(
+            "Agent 媒体库复核完成", fields=fields, layout="relaxed",
+        )
     return NotificationEvent(
         "Agent 媒体库复核需要处理",
         fields=fields,
         footer="可在 Agent 中查询最近下载状态获取安全诊断。",
+        layout="relaxed",
     )
 
 

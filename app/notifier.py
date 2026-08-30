@@ -81,42 +81,100 @@ def _log_notification_fallback(text: object) -> None:
 
 _FIELD_EMOJI = {
     "任务": "🆔",
+    "任务编号": "🆔",
+    "队列": "🧾",
     "触发": "🚀",
     "触发方式": "🚀",
     "来源": "☁️",
+    "存储来源": "☁️",
+    "来源概览": "🧭",
+    "同步来源": "🧭",
     "范围": "📂",
-    "源目录": "📂",
-    "目录": "📂",
-    "路径": "📂",
+    "源目录": "📁",
+    "源文件目录": "📁",
+    "所在目录": "📁",
+    "目录": "📁",
+    "路径": "📁",
+    "本地目录": "📁",
     "分类": "🗂️",
+    "媒体": "🎬",
+    "目标媒体": "🎬",
+    "候选媒体": "🎬",
+    "候选": "🎯",
+    "类型": "🎞️",
+    "剧集": "📺",
+    "置信度": "📈",
+    "下载": "⬇️",
+    "本地下载": "⬇️",
+    "本地归档": "📥",
+    "入库复核": "🔍",
     "视频": "🎞️",
     "总视频": "🎞️",
     "媒体文件": "🎞️",
     "文件": "📄",
+    "涉及文件": "📄",
+    "目标文件": "📄",
     "版本": "🎛️",
     "体积": "💾",
     "本次": "📺",
     "本季": "📊",
+    "状态": "📌",
+    "处理状态": "📌",
+    "执行结果": "📊",
+    "结果": "📊",
+    "概览": "📋",
+    "扫描": "🔎",
+    "扫描范围": "🔎",
+    "扫描并发": "⚙️",
+    "云端请求": "🌐",
+    "请求延迟": "⏱️",
+    "整理": "📊",
+    "人工确认": "🤝",
     "缺集": "🧩",
     "说明": "ℹ️",
+    "附带说明": "💡",
     "已移动": "📥",
     "生成": "🧩",
     "STRM 变化": "🧩",
+    "STRM 状态": "🔗",
+    "STRM": "🔗",
     "元数据": "📎",
     "跳过": "⏭️",
     "需确认": "⚠️",
     "待确认原因": "⚠️",
     "失败": "❌",
     "错误": "❌",
+    "错误原因": "⚠️",
     "原因": "⚠️",
     "清理": "🧹",
-    "媒体库刷新": "🔄",
+    "媒体库刷新": "🎯",
+    "媒体库": "🎯",
+    "订阅": "📡",
+    "目标集": "📺",
+    "复核结果": "🔍",
+    "复核次数": "🔁",
+    "已核对剧集": "🔎",
+    "缺集剧集": "📺",
+    "已播缺集": "🧩",
+    "待补": "🧩",
+    "待补内容": "🧩",
+    "待核对": "⚠️",
+    "已提交": "🚀",
+    "成功": "✅",
+    "目录 ID": "🆔",
     "耗时": "⏱️",
+    "阶段耗时": "⏱️",
     "总耗时": "⏱️",
     "TMDB": "🎬",
+    "MetaTube": "🎞️",
+    "清洗标题": "🧹",
     "qBittorrent": "⬇️",
     "光鸭云盘": "☁️",
 }
+
+# ``fields`` 中的空二元组表示卡片分组留白。保持它是普通 tuple，确保事件在
+# SQLite/JSON 往返后仍能无损恢复，不需要为纯展示需求扩展持久化协议。
+NOTIFICATION_SECTION_BREAK: tuple[str, str] = ("", "")
 
 
 def _has_leading_emoji(value: object) -> bool:
@@ -527,17 +585,45 @@ def notification_target_chat_id(chat_id: Optional[str] = None) -> str:
 
 def render_event(event: NotificationEvent) -> str:
     """把结构化事件渲染为 Telegram HTML，并转义全部动态内容。"""
-    relaxed = str(event.layout or "default") == "relaxed"
+    layout = str(event.layout or "default")
+    compact_report = layout == "compact_report"
+    relaxed = layout in {"relaxed", "compact_report"}
     body = [f"<b>{html.escape(decorate_title(event.title))}</b>"]
     content_started = False
     for label, value in event.fields:
+        if relaxed and label in (None, "") and value in (None, ""):
+            if content_started and body[-1] != "":
+                body.append("")
+            continue
         if value in (None, ""):
             continue
         if relaxed and not content_started:
             body.append("")
         if relaxed:
-            safe_label = html.escape(str(label or "").strip())
-            body.append(f"<b>{safe_label}</b>  {html.escape(str(value))}")
+            label_text = (
+                decorate_field_label(label)
+                if event.field_emojis
+                else str(label or "").strip()
+            )
+            safe_label = html.escape(label_text)
+            safe_value = html.escape(str(value))
+            value_lines = safe_value.splitlines()
+            tree_value = bool(
+                compact_report
+                and value_lines
+                and value_lines[0].lstrip().startswith(("└", "├"))
+            )
+            if len(value_lines) <= 1 and not tree_value:
+                spacer = "" if compact_report else " "
+                body.append(f"- <b>{safe_label}：</b>{spacer}{safe_value}")
+            else:
+                body.append(f"- <b>{safe_label}：</b>")
+                if compact_report:
+                    body.extend(
+                        f"  {line}" if line else "" for line in value_lines
+                    )
+                else:
+                    body.extend(value_lines)
         else:
             label_text = (
                 decorate_field_label(label)
@@ -552,13 +638,25 @@ def render_event(event: NotificationEvent) -> str:
     ]
     if lines:
         if relaxed and (content_started or len(body) == 1):
-            body.append("")
+            if body[-1] != "":
+                body.append("")
         body.extend(lines)
         content_started = True
     if event.footer not in (None, ""):
         if relaxed and (content_started or len(body) == 1):
-            body.append("")
-        body.append(html.escape(str(event.footer)))
+            if body[-1] != "":
+                body.append("")
+        footer = str(event.footer)
+        if relaxed:
+            prefix = "" if _has_leading_emoji(footer) else "ℹ️ "
+            safe_footer = f"{prefix}{html.escape(footer)}"
+            body.append(
+                f"<blockquote>{safe_footer}</blockquote>"
+                if compact_report
+                else safe_footer
+            )
+        else:
+            body.append(html.escape(footer))
     return "\n".join(body)
 
 
@@ -1039,9 +1137,11 @@ def notify_gcid_import_started(*, task_id: int, file_count: int, total_size: int
                 ("任务", f"#{int(task_id)}"),
                 ("文件", f"{max(0, int(file_count))} 个"),
                 ("体积", _format_size(max(0, int(total_size)))),
+                NOTIFICATION_SECTION_BREAK,
                 ("状态", "正在导入"),
             ),
             footer="完成后会更新本条消息。",
+            layout="relaxed",
         ),
         topic=NotificationTopic.GCID,
         importance=NotificationImportance.RESULT,
@@ -1080,6 +1180,7 @@ def notify_gcid_import_finished(*, task_id: int, status: str, success_count: int
                 ("失败", f"{max(0, int(failed_count))} 个"),
             ),
             lines=tuple(lines),
+            layout="relaxed",
         ),
         topic=NotificationTopic.GCID,
         importance=(
@@ -1112,14 +1213,20 @@ def _publish_legacy_notification(
 
 def notify_organize_done(summary: str) -> None:
     _publish_legacy_notification(
-        "organize", NotificationEvent("光鸭整理完成", lines=(summary,)),
+        "organize",
+        NotificationEvent(
+            "光鸭整理完成", lines=(summary,), layout="relaxed",
+        ),
         topic="organize",
     )
 
 
 def notify_strm_done(summary: str) -> None:
     _publish_legacy_notification(
-        "strm", NotificationEvent("STRM 同步完成", lines=(summary,)),
+        "strm",
+        NotificationEvent(
+            "STRM 同步完成", lines=(summary,), layout="relaxed",
+        ),
         topic="strm",
     )
 
@@ -1131,6 +1238,7 @@ def notify_download(source: str, title: str, path: str) -> None:
         NotificationEvent(
             "下载完成",
             fields=(("来源", source), ("任务", title), ("文件", safe_name)),
+            layout="relaxed",
         ),
         topic="download",
     )

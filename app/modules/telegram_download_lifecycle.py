@@ -241,7 +241,6 @@ def build_download_lifecycle_event(
         fields=tuple(fields),
         footer=footer,
         layout="relaxed",
-        field_emojis=False,
     )
     return attach_bounded_media_details(event, lines)
 

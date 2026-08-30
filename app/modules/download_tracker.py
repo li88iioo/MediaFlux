@@ -965,6 +965,7 @@ class DownloadTracker:
                         "请勿重复提交；可在 Web 下载任务中继续核对。"
                         if event_status == "manual_review" else ""
                     ),
+                    layout="relaxed",
                 ),
                 topic=NotificationTopic.DOWNLOAD,
                 importance=(

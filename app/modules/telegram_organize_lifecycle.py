@@ -1,22 +1,97 @@
 """光鸭整理与后续 STRM/媒体库刷新的单消息事务投影。"""
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Mapping
 
+from app.modules.telegram_media_projection import (
+    attach_bounded_media_details,
+    build_media_detail_blocks,
+)
 from app.modules.telegram_notification_center import (
     NotificationPublishResult,
     get_notification_thread_event,
+    get_notification_thread_snapshot,
     publish_notification_thread,
 )
 from app.modules.telegram_notification_policy import (
     NotificationImportance,
     NotificationTopic,
 )
-from app.modules.telegram_media_projection import (
-    attach_bounded_media_details,
-    build_media_detail_blocks,
-)
 from app.notifier import NotificationEvent, safe_int
+
+_PENDING_STRM_STATES = frozenset({
+    "已排队",
+    "等待后处理",
+    "排队中",
+    "运行中",
+    "同步中",
+    "已触发",
+})
+_TERMINAL_DELIVERY_FAILURES = frozenset({
+    "failed",
+    "outcome_unknown",
+    "suppressed",
+})
+
+
+def _field_value(event: NotificationEvent, label: str) -> str:
+    return next((
+        str(value or "").strip()
+        for current_label, value in event.fields
+        if str(current_label or "").strip() == label
+    ), "")
+
+
+def organize_lifecycle_downstream_settled(event: NotificationEvent) -> bool:
+    """STRM 已离开排队/运行态；媒体库字段会在同一 revision 一并回写。"""
+    strm_status = _field_value(event, "STRM")
+    return bool(strm_status and strm_status not in _PENDING_STRM_STATES)
+
+
+def wait_for_organize_lifecycle_delivery(
+    task_id: str,
+    *,
+    chat_id: str = "",
+    timeout_seconds: float = 30 * 60,
+    poll_seconds: float = 0.5,
+    cancel_event: threading.Event | None = None,
+) -> bool:
+    """等待整理链路终态的最新 revision 真正送达 Telegram。
+
+    整理完成只代表 STRM 已排队，不能据此提前清除 ``typing``。只有同一
+    生命周期卡片写入 STRM/媒体库终态，且 outbox 确认最新 revision 已投递，
+    才允许调用方结束输入状态。
+    """
+    thread_key = f"organize:{str(task_id or '').strip()}"
+    if thread_key == "organize:":
+        return False
+    timeout = max(0.0, float(timeout_seconds or 0.0))
+    interval = max(0.05, min(float(poll_seconds or 0.5), 5.0))
+    deadline = time.monotonic() + timeout
+    while True:
+        snapshot = get_notification_thread_snapshot(
+            thread_key,
+            topic=NotificationTopic.ORGANIZE,
+            chat_id=chat_id,
+        )
+        if snapshot is not None:
+            settled = organize_lifecycle_downstream_settled(snapshot.event)
+            if settled and snapshot.current_revision_delivered:
+                return True
+            if settled and snapshot.status in _TERMINAL_DELIVERY_FAILURES:
+                return False
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        wait_seconds = min(interval, remaining)
+        if cancel_event is not None:
+            if cancel_event.wait(wait_seconds):
+                return False
+        else:
+            time.sleep(wait_seconds)
 
 
 def _counts(stats: Mapping[str, object]) -> dict[str, int]:
@@ -170,7 +245,6 @@ def build_organize_lifecycle_event(
         fields=tuple(fields),
         footer=footer,
         layout="relaxed",
-        field_emojis=False,
     )
     return attach_bounded_media_details(
         event,
@@ -207,7 +281,7 @@ def publish_organize_lifecycle(
     media_refresh: str = "等待 STRM 完成",
 ) -> NotificationPublishResult:
     return publish_notification_thread(
-        f"organize:{str(task_id)}",
+        f"organize:{task_id!s}",
         build_organize_lifecycle_event(
             stats,
             source_name=source_name,
@@ -231,7 +305,7 @@ def update_organize_lifecycle_downstream(
     error: str = "",
     topic_enabled: bool = True,
 ) -> NotificationPublishResult:
-    thread_key = f"organize:{str(task_id)}"
+    thread_key = f"organize:{task_id!s}"
     previous = get_notification_thread_event(
         thread_key, topic=NotificationTopic.ORGANIZE, chat_id=chat_id,
     )

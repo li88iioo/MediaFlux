@@ -8,7 +8,6 @@
 """
 from __future__ import annotations
 
-import html
 import logging
 import json
 import threading
@@ -2128,7 +2127,7 @@ class STRMScheduler:
         )
         return NotificationEvent(
             "⚠️ STRM 同步部分完成" if partial else "✅ STRM 同步完成",
-            fields=fields, lines=errors,
+            fields=fields, lines=errors, layout="relaxed",
         )
 
     @staticmethod
@@ -2188,6 +2187,7 @@ class STRMScheduler:
                     "本轮合并了多个整理请求；为避免跨来源暴露目录或文件信息，"
                     "详细结果请在 Web 运行记录中查看。",
                 ),),
+                layout="relaxed",
             )
             logger.warning(
                 "STRM 合并任务包含多个通知范围，已隐藏跨来源汇总详情 chats=%s default=%s silent=%s",
@@ -2289,7 +2289,8 @@ class STRMScheduler:
         if trigger_type != "telegram" and enabled:
             event = NotificationEvent(
                 "❌ STRM 同步失败",
-                fields=(("触发", trigger_type), ("错误", error[:500])),
+                fields=(("触发方式", trigger_type), ("错误原因", error[:500])),
+                layout="relaxed",
             )
             recipients, send_default, restricted = STRMScheduler._resolve_notification_scopes(
                 chat_ids,
@@ -2304,6 +2305,7 @@ class STRMScheduler:
                         "本轮合并了多个整理请求；为避免跨来源暴露错误详情，"
                         "请在 Web 运行记录中查看。",
                     ),),
+                    layout="relaxed",
                 )
             from app.modules.telegram_notification_center import publish_notification_event
             from app.modules.telegram_notification_policy import (

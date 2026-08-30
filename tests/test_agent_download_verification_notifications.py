@@ -29,7 +29,10 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
         )
 
         rendered = render_event(event)
+        self.assertEqual(event.layout, "relaxed")
         self.assertIn("Agent 媒体库复核完成", rendered)
+        self.assertIn("- <b>🎬 目标媒体：</b> The &lt;Show&gt;", rendered)
+        self.assertIn("S02E03\n\n- <b>🔍 复核结果：</b>", rendered)
         self.assertIn("The &lt;Show&gt;", rendered)
         self.assertIn("S02E03", rendered)
         self.assertIn("已在媒体库中可见", rendered)
@@ -147,7 +150,10 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
         self.assertNotIn("The Show", logical_key)
         self.assertNotIn("title", logical_key)
         self.assertEqual(publisher.call_args.kwargs["chat_id"], "100")
-        self.assertEqual(publisher.call_args.args[1].fields[0], ("媒体", "The Show"))
+        self.assertEqual(
+            publisher.call_args.args[1].fields[0],
+            ("目标媒体", "The Show"),
+        )
 
     def test_revoked_route_never_calls_sender(self):
         base = {

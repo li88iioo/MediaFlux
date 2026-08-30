@@ -22,6 +22,7 @@ from app.modules.rss import (
     validate_rss_source_urls,
 )
 from app.modules.rss_scheduler import RSSScheduler
+from app.notifier import render_event
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -516,6 +517,11 @@ class RSSRefreshGateTests(IsolatedDatabaseTestCase):
             scheduler._execute(sid, "download")
 
         self.assertEqual(publisher.call_count, 2)
+        event = publisher.call_args.args[1]
+        rendered = render_event(event)
+        self.assertEqual(event.layout, "relaxed")
+        self.assertIn("- <b>📡 订阅：</b>", rendered)
+        self.assertIn("\n\n- <b>📌 状态：</b>", rendered)
 
     def test_scheduler_retries_unresolved_alert_and_persists_delivery_signature(self):
         sid = self._subscription("scheduler-durable-alert")

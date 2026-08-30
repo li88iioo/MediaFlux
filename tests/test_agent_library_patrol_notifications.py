@@ -41,8 +41,12 @@ def _projection() -> dict:
 class AgentLibraryPatrolNotificationTests(unittest.TestCase):
     def test_event_contains_only_safe_projection_fields(self):
         projection = _projection()
-        rendered = render_event(build_library_patrol_event(projection))
+        event = build_library_patrol_event(projection)
+        rendered = render_event(event)
 
+        self.assertEqual(event.layout, "relaxed")
+        self.assertIn("- <b>🔎 已核对剧集：</b> 8", rendered)
+        self.assertIn("- <b>🧩 已播缺集：</b> 2", rendered)
         self.assertIn("The Show", rendered)
         self.assertIn("S02", rendered)
         self.assertIn("E03", rendered)
@@ -152,6 +156,7 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
         event = build_library_patrol_event(projection)
         self.assertEqual(event.lines, ())
         self.assertEqual(event.actions, ())
+        self.assertEqual(event.layout, "relaxed")
         self.assertIn("恢复正常", str(event.title))
 
     def test_recovery_is_result_while_available_updates_remain_actionable(self):

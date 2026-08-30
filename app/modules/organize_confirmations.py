@@ -32,7 +32,12 @@ from app.modules.organize import (
     restore_organize_rules_snapshot,
 )
 from app.modules.scraper import MatchResult, TMDBScraper
-from app.notifier import NotificationAction, NotificationEvent, safe_int
+from app.notifier import (
+    NOTIFICATION_SECTION_BREAK,
+    NotificationAction,
+    NotificationEvent,
+    safe_int,
+)
 
 logger = get_logger(__name__)
 _CONFIRMATION_TTL_HOURS = 24
@@ -128,7 +133,7 @@ def _candidate_display_name(candidate: dict, fallback: str = "待确认媒体") 
 def _safe_label(candidate: dict, index: int) -> str:
     if _candidate_provider(candidate) == "clean_title":
         code = _candidate_external_id(candidate)
-        return f"清洗标题后入库" + (f" · {code}" if code else "")
+        return "清洗标题后入库" + (f" · {code}" if code else "")
     title = _candidate_display_name(candidate, f"候选 {index + 1}")
     if len(title) > 18:
         title = f"{title[:17].rstrip()}…"
@@ -240,6 +245,24 @@ def publish_confirmation_event(
     return bool(result)
 
 
+def _terminal_status_label(value: object, *, media_library: bool = False) -> str:
+    """为确认卡的后续状态补充稳定、不过度重复的终态提示。"""
+    text = str(value or "").strip()
+    if not text or any(marker in text for marker in ("✅", "❌", "⚠️", "⏳", "⏭️", "🎯")):
+        return text
+    if any(marker in text for marker in ("失败", "错误", "未完成")):
+        return f"{text} ❌"
+    if any(marker in text for marker in ("部分", "警告", "需处理")):
+        return f"{text} ⚠️"
+    if any(marker in text for marker in ("排队", "等待", "运行中", "同步中")):
+        return f"{text} ⏳"
+    if "跳过" in text:
+        return f"{text} ⏭️"
+    if any(marker in text for marker in ("完成", "成功", "已刷新")):
+        return f"{text} {'🎯' if media_library else '✅'}"
+    return text
+
+
 def update_confirmation_lifecycle_downstream(
     token: str,
     *,
@@ -260,10 +283,16 @@ def update_confirmation_lifecycle_downstream(
     if previous is None:
         return False
     fields = list(previous.fields)
-    for label, value in (("STRM", strm_status), ("媒体库", media_refresh)):
+    updates = (
+        (("STRM 状态", "STRM"), "STRM 状态", _terminal_status_label(strm_status)),
+        (("媒体库刷新", "媒体库"), "媒体库刷新", _terminal_status_label(
+            media_refresh, media_library=True,
+        )),
+    )
+    for aliases, label, value in updates:
         replaced = False
         for index, (current_label, _current_value) in enumerate(fields):
-            if str(current_label) == label:
+            if str(current_label) in aliases:
                 fields[index] = (label, value)
                 replaced = True
                 break
@@ -483,8 +512,12 @@ def cancel_confirmation(
         resolved_message_id = 0
     terminal_event = NotificationEvent(
         "⏸️ 已暂不处理",
-        fields=(("目录", directory),),
-        footer="文件保持原位；需要时可重新执行整理生成新候选。",
+        fields=(
+            ("所在目录", directory),
+            NOTIFICATION_SECTION_BREAK,
+            ("处理状态", "文件保持原位（本次待确认状态已结束）"),
+            ("附带说明", "需要时可重新执行整理生成新候选。"),
+        ),
         layout="relaxed",
     )
     db.cancel_organize_confirmation(
@@ -522,14 +555,14 @@ def skip_confirmation(
     except (TypeError, ValueError):
         resolved_message_id = 0
     terminal_event = NotificationEvent(
-        "⏭️ 已跳过待确认项",
+        "⏭️ 跳过待确认项",
         fields=(
-            ("媒体", payload.get("identity") or "未识别媒体"),
-            ("目录", directory),
-            ("文件", f"{len(payload.get('files') or [])} 个视频"),
-        ),
-        footer=(
-            "文件保持原位，本次待确认状态已结束；以后重新执行整理时仍会再次尝试识别。"
+            ("目标媒体", payload.get("identity") or "未识别媒体"),
+            ("所在目录", directory),
+            NOTIFICATION_SECTION_BREAK,
+            ("涉及文件", f"{len(payload.get('files') or [])} 个视频"),
+            ("处理状态", "文件保持原位（本次待确认状态已结束）"),
+            ("附带说明", "以后重新执行整理时仍会再次尝试识别。"),
         ),
         layout="relaxed",
     )
@@ -596,8 +629,12 @@ def _dispatch_confirmation_token(token: str) -> dict:
         message = "确认任务数据损坏，请重新执行整理"
         failure_event = NotificationEvent(
             "❌ Telegram 确认整理失败",
-            fields=(("目录", str(row["directory_path"] or "/")),),
-            footer=f"{message}生成新候选。",
+            fields=(
+                ("所在目录", str(row["directory_path"] or "/")),
+                NOTIFICATION_SECTION_BREAK,
+                ("错误原因", message),
+            ),
+            footer="请重新执行整理生成新候选。",
             layout="relaxed",
         )
         chat_id = str(row["chat_id"] or "")
@@ -687,6 +724,7 @@ def _serialize_notification_event(event: NotificationEvent) -> str:
                 for action in event.actions
             ],
             "layout": str(event.layout or "default"),
+            "field_emojis": bool(event.field_emojis),
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -723,6 +761,7 @@ def _deserialize_notification_event(raw: object) -> NotificationEvent:
         footer=str(data.get("footer") or ""),
         actions=actions,
         layout=str(data.get("layout") or "default"),
+        field_emojis=bool(data.get("field_emojis", True)),
     )
 
 
@@ -1149,11 +1188,14 @@ def _confirmation_result_event(
     return NotificationEvent(
         "⚠️ 人工确认整理部分完成" if partial else "✅ 人工确认整理完成",
         fields=(
-            ("媒体", _candidate_display_name(candidate)),
-            ("目录", payload.get("directory") or payload.get("source_name") or "/"),
-            ("结果", f"已移动 {moved} · 元数据 {metadata} · 跳过 {skipped} · 失败 {failed}"),
-            ("STRM", strm_label),
-            ("媒体库", refresh_label),
+            ("目标媒体", _candidate_display_name(candidate)),
+            ("源文件目录", payload.get("directory") or payload.get("source_name") or "/"),
+            NOTIFICATION_SECTION_BREAK,
+            ("执行结果", f"已移动 {moved} · 元数据 {metadata} · 跳过 {skipped} · 失败 {failed}"),
+            ("STRM 状态", _terminal_status_label(strm_label)),
+            ("媒体库刷新", _terminal_status_label(
+                refresh_label, media_library=True,
+            )),
         ),
         layout="relaxed",
     )
@@ -1178,13 +1220,14 @@ def _local_confirmation_result_event(
     return NotificationEvent(
         "⚠️ 本地媒体确认整理部分完成" if partial else "✅ 本地媒体确认整理完成",
         fields=(
-            ("媒体", _candidate_display_name(candidate)),
-            ("来源", payload.get("source_name") or "本地媒体"),
-            ("结果", f"已移动 {moved} · 清理 {deleted} · 警告 {warnings}"),
-            ("媒体库", {
+            ("目标媒体", _candidate_display_name(candidate)),
+            ("存储来源", payload.get("source_name") or "本地媒体"),
+            NOTIFICATION_SECTION_BREAK,
+            ("执行结果", f"已移动 {moved} · 清理 {deleted} · 警告 {warnings}"),
+            ("媒体库刷新", _terminal_status_label({
                 "completed": "已刷新", "queued": "已排队",
                 "failed": "刷新失败", "skipped": "未启用",
-            }.get(refresh_status, "已处理")),
+            }.get(refresh_status, "已处理"), media_library=True)),
         ),
         layout="relaxed",
     )
@@ -1311,10 +1354,12 @@ def _execute_local_media_confirmation(
         failure_event = NotificationEvent(
             "❌ 本地媒体确认整理失败",
             fields=(
-                ("文件", payload.get("directory") or "本地媒体"),
-                ("候选", _candidate_display_name(candidate, "")),
+                ("目标文件", payload.get("directory") or "本地媒体"),
+                ("候选媒体", _candidate_display_name(candidate, "")),
+                NOTIFICATION_SECTION_BREAK,
+                ("错误原因", message),
             ),
-            footer=f"{message}\n\n请前往 Web 的本地媒体待确认页继续处理。",
+            footer="请前往 Web 的本地媒体待确认页继续处理。",
             layout="relaxed",
         )
         db.fail_organize_confirmation_with_delivery(
@@ -1535,13 +1580,15 @@ def _execute_guangya_confirmation(
         failure_event = NotificationEvent(
             "❌ Telegram 确认整理失败",
             fields=(
-                ("目录", payload.get("directory") or "/"),
-                ("候选", _candidate_display_name(candidate, "")),
+                ("所在目录", payload.get("directory") or "/"),
+                ("候选媒体", _candidate_display_name(candidate, "")),
+                NOTIFICATION_SECTION_BREAK,
+                ("错误原因", message),
             ),
-            footer=(message + (
-                "\n\n可点击下方按钮重试。"
-                if retryable else "\n\n请重新执行整理生成新候选。"
-            )),
+            footer=(
+                "可点击下方按钮重试。"
+                if retryable else "请重新执行整理生成新候选。"
+            ),
             actions=actions,
             layout="relaxed",
         )

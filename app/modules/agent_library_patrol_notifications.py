@@ -89,6 +89,7 @@ def build_library_patrol_event(projection: Any) -> NotificationEvent:
             "Agent 全库缺集巡检已恢复正常",
             fields=(("已核对剧集", str(safe["checked_series_count"])),),
             footer="本次巡检未发现已播缺集。",
+            layout="relaxed",
         )
 
     lines = tuple(_episode_text(item) for item in safe["options"][:_MAX_LINES])
@@ -108,6 +109,7 @@ def build_library_patrol_event(projection: Any) -> NotificationEvent:
             NotificationAction("查看巡检摘要", _PATROL_SUMMARY_CALLBACK),
             NotificationAction("为缺集找资源", _PATROL_RESOURCES_CALLBACK),
         ),
+        layout="relaxed",
     )
 
 

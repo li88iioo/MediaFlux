@@ -482,6 +482,7 @@ class GCIDImportNotificationTests(unittest.TestCase):
             )
         self.assertEqual(len(captured), 1)
         event = captured[0]
+        self.assertEqual(event.layout, "relaxed")
         self.assertEqual(len(event.lines), 3)
         rendered = json.dumps({
             "title": event.title,

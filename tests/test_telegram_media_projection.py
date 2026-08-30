@@ -31,15 +31,39 @@ def _episode_item(**overrides) -> dict:
 def test_media_projection_restores_complete_ingest_card_fields() -> None:
     block = build_media_detail_blocks([_episode_item()])[0]
 
-    assert "剧集入库：面包超人 (1988) · S01" in block
-    assert "本次  E01" in block
-    assert "本季  1 / 52 集" in block
-    assert "缺集  S01E02-S01E52" in block
-    assert "来源  光鸭云盘" in block
-    assert "分类  动漫 / 面包超人 (1988) {tmdb-56389} / Season 1" in block
-    assert "版本  1080p · WEB-DL" in block
-    assert "文件  1 个 · 932.79 MB" in block
-    assert "TMDB  56389" in block
+    assert block.startswith("📺 面包超人 (1988) · S01")
+    assert "剧集入库：" not in block
+    assert "- 📺 本次更新：E01" in block
+    assert "- 📊 本季进度：1 / 52 集" in block
+    assert "- 🧩 缺集情况：S01E02-S01E52" in block
+    assert "- ☁️ 存储来源：光鸭云盘" in block
+    assert "- 🗂️ 目录分类：动漫 / 面包超人 (1988) {tmdb-56389} / Season 1" in block
+    assert "- 🎛️ 规格版本：1080p · WEB-DL" in block
+    assert "- 📄 文件统计：1 个 · 932.79 MB" in block
+    assert "- 🎬 TMDB ID：56389" in block
+
+
+def test_media_projection_marks_complete_season_and_separates_media_blocks() -> None:
+    blocks = build_media_detail_blocks([
+        _episode_item(season_total=1, season_present_episodes=[1]),
+        _episode_item(
+            title="第二部作品",
+            tmdb_id="10002",
+            season_total=1,
+            season_present_episodes=[1],
+        ),
+    ])
+    event = attach_bounded_media_details(
+        NotificationEvent("整理完成", layout="relaxed", field_emojis=False),
+        blocks,
+    )
+    rendered = render_event(event)
+
+    assert "- 📊 本季进度：1 / 1 集（全） ✅" in rendered
+    assert "\n\n---\n\n📺 面包超人" in rendered
+    assert "\n\n---\n\n📺 第二部作品" in rendered
+    assert rendered.rstrip().endswith("---")
+    assert rendered.count("---") == 3
 
 
 def test_partial_organize_projection_keeps_progress_without_final_missing_list() -> None:
@@ -54,9 +78,9 @@ def test_partial_organize_projection_keeps_progress_without_final_missing_list()
     )
     rendered = render_event(event)
 
-    assert "本季  1 / 52 集" in rendered
+    assert "- 📊 本季进度：1 / 52 集" in rendered
     assert "暂不生成最终缺集结论" in rendered
-    assert "🧩 缺集" not in rendered
+    assert "🧩 缺集情况" not in rendered
 
 
 def test_media_projection_stays_editable_and_reports_omitted_groups() -> None:

@@ -216,8 +216,8 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
 
         body = render_event(send.call_args.args[0])
         self.assertIn("追更已自动提交下载", body)
-        self.assertIn("候选：</b>4 个", body)
-        self.assertIn("已提交：</b>2 项", body)
+        self.assertIn("- <b>🎯 候选：</b> 4 个", body)
+        self.assertIn("- <b>🚀 已提交：</b> 2 项", body)
 
     def test_missing_confirm_candidates_are_reported_as_actionable(self) -> None:
         self._enable_rule(notify_on_missing=True)
@@ -238,7 +238,7 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
 
         body = render_event(send.call_args.args[0])
         self.assertIn("追更候选待确认", body)
-        self.assertIn("候选：</b>3 个", body)
+        self.assertIn("- <b>🎯 候选：</b> 3 个", body)
         self.assertIn("媒体追更中确认", body)
 
     def test_notification_title_is_escaped_for_telegram_html(self) -> None:

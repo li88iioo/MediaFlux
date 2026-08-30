@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -16,7 +17,7 @@ from app.modules.organize import Organizer, OrganizeRules
 from app.modules.scheduler import STRMScheduler
 from app.modules.strm import sync_strm
 from app import notifier
-from app.notifier import NotificationEvent
+from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -160,22 +161,25 @@ class NotificationEmojiTests(unittest.TestCase):
         ))
 
         self.assertIn("<b>✅ 光鸭整理完成</b>", rendered)
-        self.assertIn("<b>📂 目录：</b>来源一", rendered)
+        self.assertIn("<b>📁 目录：</b>来源一", rendered)
         self.assertIn("<b>❌ 失败：</b>0", rendered)
         self.assertIn("<b>⏱️ 耗时：</b>1.2 秒", rendered)
 
-    def test_relaxed_layout_adds_whitespace_without_field_emoji_wall(self):
+    def test_relaxed_layout_renders_semantic_bullet_card(self):
         rendered = notifier.render_event(NotificationEvent(
             "⚠️ 发现需要确认的媒体",
-            fields=(("媒体", "不要欺负我，长瀞同学"), ("剧集", "第 2 季 · E01–E12")),
+            fields=(
+                ("媒体", "不要欺负我，长瀞同学"),
+                NOTIFICATION_SECTION_BREAK,
+                ("剧集", "第 2 季 · E01–E12"),
+            ),
             footer="匹配结果需要人工确认\n\n请选择下方候选继续整理。",
             layout="relaxed",
         ))
 
-        self.assertIn("</b>\n\n<b>媒体</b>  不要欺负我，长瀞同学", rendered)
-        self.assertIn("<b>剧集</b>  第 2 季 · E01–E12", rendered)
-        self.assertNotIn("📺 剧集", rendered)
-        self.assertIn("E01–E12\n\n匹配结果需要人工确认", rendered)
+        self.assertIn("</b>\n\n- <b>🎬 媒体：</b> 不要欺负我，长瀞同学", rendered)
+        self.assertIn("同学\n\n- <b>📺 剧集：</b> 第 2 季 · E01–E12", rendered)
+        self.assertIn("E01–E12\n\nℹ️ 匹配结果需要人工确认", rendered)
 
     def test_field_emoji_opt_out_preserves_compact_default_layout(self):
         rendered = notifier.render_event(NotificationEvent(
@@ -213,11 +217,14 @@ class NotificationEmojiTests(unittest.TestCase):
             "id": "task-1", "status": "completed", "current_source": "",
             "notification_sent": True,
         }
+        terminal_state = manager.task_result.return_value
         progress = Mock()
         handlers._task_lock.acquire()
         with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), patch.object(
             handlers, "send"
-        ) as send_mock:
+        ) as send_mock, patch.object(
+            handlers, "_await_organize_lifecycle"
+        ) as lifecycle_wait:
             handlers._do_organize(
                 "123", [{"id": "source", "name": "电影"}], "target", progress
             )
@@ -227,6 +234,30 @@ class NotificationEmojiTests(unittest.TestCase):
         progress.dismiss_source_message.assert_called_once_with()
         manager.task_result.assert_called_once_with("task-1")
         manager.task_status.assert_not_called()
+        lifecycle_wait.assert_called_once_with("123", terminal_state, progress)
+        progress.dismiss.assert_not_called()
+        progress.finish.assert_not_called()
+
+    def test_organize_progress_closes_only_after_latest_card_is_delivered(self):
+        from app.bot import handlers
+
+        progress = Mock()
+        progress.finished_event = threading.Event()
+        state = {"id": "task-lifecycle"}
+        with patch(
+            "app.modules.telegram_organize_lifecycle.wait_for_organize_lifecycle_delivery",
+            return_value=True,
+        ) as lifecycle_wait:
+            handlers._finish_organize_progress_when_lifecycle_settles(
+                "123", state, progress,
+            )
+
+        lifecycle_wait.assert_called_once_with(
+            "task-lifecycle",
+            chat_id="123",
+            timeout_seconds=handlers._ORGANIZE_LIFECYCLE_WAIT_SECONDS,
+            cancel_event=progress.finished_event,
+        )
         progress.dismiss.assert_called_once_with("光鸭整理已结束。")
         progress.finish.assert_not_called()
 
@@ -387,23 +418,27 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
         event = send_mock.call_args.args[0]
         self.assertIsInstance(event, NotificationEvent)
         self.assertEqual(event.title, "光鸭 STRM 同步全部完成")
-        self.assertEqual(event.layout, "relaxed")
+        self.assertEqual(event.layout, "compact_report")
+        self.assertFalse(event.field_emojis)
         fields = dict(event.fields)
-        self.assertEqual(fields["状态"], "✅ 同步完成")
-        self.assertEqual(fields["概览"], "1 个来源 · 2.40 秒")
-        self.assertEqual(fields["扫描"], "12 个目录 · 80 个文件")
+        self.assertEqual(fields["状态"], "✅ 同步完成（耗时 2.40s / 1 来源）")
+        self.assertEqual(fields["扫描"], "12 目录 · 80 文件")
         self.assertEqual(fields["STRM"], "2 新建 · 1 更新 · 5 跳过 · 0 失败")
         self.assertEqual(fields["元数据"], "4 更新 · 3 后台排队")
-        self.assertEqual(fields["清理"], "1 个无效 STRM · 1 个失效元数据 · 2 个空目录")
-        self.assertEqual(fields["媒体库"], "Jellyfin 成功")
-        self.assertEqual(event.lines[0], "来源概览")
-        self.assertIn("• 整理<&>：80 文件 · 2 新建 · 1 更新 · 5 跳过", event.lines[1])
-        self.assertIn("3 元数据排队 · 2.10 秒", event.lines[1])
+        self.assertEqual(fields["清理"], "🗑 1 无效 STRM ｜ 📁 2 空目录 ｜ 🗃 1 失效元数据")
+        self.assertEqual(fields["媒体库"], "Jellyfin 刷新成功 🎯")
+        self.assertIn("└ • 整理<&>：80 文件 · 2 新建 · 1 更新 · 5 跳过", fields["来源概览"])
+        self.assertIn("3 元数据排队 (2.10s)", fields["来源概览"])
         self.assertEqual(event.footer, "本轮 2 条清理明细已记录到 Web 运行记录。")
         rendered = notifier.render_event(event)
         self.assertIn("<b>✅ 光鸭 STRM 同步全部完成</b>", rendered)
-        self.assertIn("<b>媒体库</b>  Jellyfin 成功", rendered)
-        self.assertIn("整理&lt;&amp;&gt;", rendered)
+        self.assertIn("- <b>媒体库：</b>Jellyfin 刷新成功 🎯", rendered)
+        self.assertIn("- <b>来源概览：</b>\n  └ • 整理&lt;&amp;&gt;", rendered)
+        self.assertIn(
+            "<blockquote>ℹ️ 本轮 2 条清理明细已记录到 Web 运行记录。</blockquote>",
+            rendered,
+        )
+        self.assertNotIn("📌 状态", rendered)
         self.assertLess(len(rendered), 4000)
 
     def test_sync_command_folds_extra_sources_inside_the_same_report(self):
@@ -439,10 +474,14 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
 
         send_mock.assert_called_once()
         event = send_mock.call_args.args[0]
-        self.assertEqual(dict(event.fields)["概览"], "14 个来源 · 1.00 秒")
-        source_lines = [line for line in event.lines if line.startswith("• ")]
+        fields = dict(event.fields)
+        self.assertEqual(fields["状态"], "✅ 同步完成（耗时 1.00s / 14 来源）")
+        source_lines = [
+            line for line in fields["来源概览"].splitlines()
+            if line.startswith("└ • ")
+        ]
         self.assertEqual(len(source_lines), 12)
-        self.assertIn("另有 2 个来源已折叠", event.lines[-1])
+        self.assertIn("另有 2 个来源已折叠", fields["来源概览"].splitlines()[-1])
         self.assertLess(len(notifier.render_event(event)), 4000)
 
     def test_sync_command_keeps_cleanup_details_in_web_record_only(self):
@@ -481,7 +520,10 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
         send_mock.assert_called_once()
         event = send_mock.call_args.args[0]
         self.assertEqual(event.footer, "本轮 81 条清理明细已记录到 Web 运行记录。")
-        self.assertEqual(dict(event.fields)["清理"], "81 个无效 STRM · 0 个失效元数据 · 0 个空目录")
+        self.assertEqual(
+            dict(event.fields)["清理"],
+            "🗑 81 无效 STRM ｜ 📁 0 空目录 ｜ 🗃 0 失效元数据",
+        )
 
     def test_sync_command_finishes_progress_with_the_only_terminal_report(self):
         from app.bot import handlers
@@ -535,7 +577,7 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
                 handlers._task_lock.release()
 
         event = send_mock.call_args.args[0]
-        self.assertEqual(dict(event.fields)["状态"], "⚠️ 部分完成")
+        self.assertTrue(dict(event.fields)["状态"].startswith("⚠️ 部分完成（耗时"))
         self.assertTrue(any("为避免误删" in line for line in event.lines))
 
 

@@ -1,10 +1,18 @@
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.modules.organize import Organizer, OrganizeRules
-from app.modules.telegram_notification_center import NotificationPublishResult
-from app.modules.telegram_organize_lifecycle import build_organize_lifecycle_event
+from app.modules.telegram_notification_center import (
+    NotificationPublishResult,
+    NotificationThreadSnapshot,
+)
+from app.modules.telegram_organize_lifecycle import (
+    build_organize_lifecycle_event,
+    organize_lifecycle_downstream_settled,
+    wait_for_organize_lifecycle_delivery,
+)
+from app.notifier import NotificationEvent
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -112,6 +120,39 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn(("STRM", "未启用或无变更"), calls[0].fields)
         self.assertIn(("媒体库", "未触发"), calls[0].fields)
+
+    def test_lifecycle_waits_for_terminal_revision_to_be_delivered(self) -> None:
+        pending = NotificationEvent(
+            "整理完成", fields=(("STRM", "已排队"), ("媒体库", "等待 STRM 完成")),
+        )
+        terminal = NotificationEvent(
+            "整理完成", fields=(("STRM", "完成"), ("媒体库", "Jellyfin 已排队")),
+        )
+        snapshots = (
+            NotificationThreadSnapshot(pending, "sent", 1, 1, 91),
+            NotificationThreadSnapshot(terminal, "pending", 2, 1, 91),
+            NotificationThreadSnapshot(terminal, "sent", 2, 2, 91),
+        )
+        cancel_event = Mock()
+        cancel_event.wait.return_value = False
+
+        with patch(
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_snapshot",
+            side_effect=snapshots,
+        ) as snapshot_reader:
+            delivered = wait_for_organize_lifecycle_delivery(
+                "task-wait",
+                chat_id="100",
+                timeout_seconds=1,
+                poll_seconds=0.05,
+                cancel_event=cancel_event,
+            )
+
+        self.assertTrue(delivered)
+        self.assertEqual(snapshot_reader.call_count, 3)
+        self.assertEqual(cancel_event.wait.call_count, 2)
+        self.assertFalse(organize_lifecycle_downstream_settled(pending))
+        self.assertTrue(organize_lifecycle_downstream_settled(terminal))
 
     def test_single_media_task_uses_one_transaction_message(self) -> None:
         events = []

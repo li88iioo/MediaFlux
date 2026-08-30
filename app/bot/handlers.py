@@ -13,9 +13,9 @@
 """
 from __future__ import annotations
 
+import hmac
 import html
 import logging
-import hmac
 import threading
 import time
 
@@ -23,7 +23,13 @@ from app import database as db
 from app.bot.progress import TelegramProgress, send_typing
 from app.config import get, get_bool
 from app.logger import get_logger, log_throttled
-from app.notifier import NotificationEvent, get_bot, render_event, send_event
+from app.notifier import (
+    NOTIFICATION_SECTION_BREAK,
+    NotificationEvent,
+    get_bot,
+    render_event,
+    send_event,
+)
 
 # 保留模块级 send 名称，便于测试和兼容旧补丁。
 send = send_event
@@ -47,6 +53,7 @@ _task_lock = threading.Lock()
 _sync_running = False
 _organize_running = False
 _local_organize_running = False
+_ORGANIZE_LIFECYCLE_WAIT_SECONDS = 30 * 60
 
 
 
@@ -2136,11 +2143,11 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
         external_id_raw = str(candidate.get("external_id") or tmdb_id_raw).strip()
         if not provider and tmdb_id_raw:
             provider = "tmdb"
-        title = html.escape(str(
+        title = str(
             candidate.get("title") or external_id_raw or "候选媒体"
-        ))
-        year = html.escape(str(candidate.get("year") or ""))
-        external_id = html.escape(external_id_raw)
+        )
+        year = str(candidate.get("year") or "")
+        external_id = external_id_raw
         display = f"{title} ({year})" if year else title
         status = str(result.get("status") or "queued")
         replayed = bool(result.get("replayed"))
@@ -2163,29 +2170,36 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
             "成人内容" if provider in {"metatube", "clean_title"}
             else "剧集" if media_type == "tv" else "电影"
         )
-        scope_summary = html.escape(str(result.get("scope_summary") or ""))
-        source_name = html.escape(str(result.get("source_name") or result.get("directory") or ""))
+        scope_summary = str(result.get("scope_summary") or "")
+        source_name = str(result.get("source_name") or result.get("directory") or "")
         identity_label = (
             "MetaTube" if provider == "metatube"
             else "清洗标题" if provider == "clean_title"
             else "TMDB"
         )
-        detail_lines = [
-            f"<b>媒体</b>  {display}",
-            f"<b>类型</b>  {media_label}" + (f" · {scope_summary}" if scope_summary else ""),
-            f"<b>{identity_label}</b>  {external_id}",
-            f"<b>文件</b>  {int(result.get('file_count') or 0)} 个视频",
+        detail_fields: list[tuple[object, object]] = [
+            ("目标媒体", display),
+            (
+                "类型",
+                f"{media_label}" + (f" · {scope_summary}" if scope_summary else ""),
+            ),
+            (identity_label, external_id),
+            ("涉及文件", f"{int(result.get('file_count') or 0)} 个视频"),
         ]
         if source_name:
-            detail_lines.append(f"<b>来源</b>  {source_name}")
-        detail_lines.extend((
-            f"<b>队列</b>  {html.escape(str(result.get('task_id') or ''))}",
-            f"<b>状态</b>  {status_text}",
+            detail_fields.append(("存储来源", source_name))
+        detail_fields.extend((
+            NOTIFICATION_SECTION_BREAK,
+            ("队列", str(result.get("task_id") or "")),
+            ("处理状态", status_text),
         ))
         bot.edit_message_text(
-            f"✅ <b>已选择：{display}</b>\n\n"
-            + "\n".join(detail_lines)
-            + "\n\n可以继续选择其他待确认媒体，系统会按点击顺序串行整理。",
+            render_event(NotificationEvent(
+                f"✅ 已选择：{display}",
+                fields=tuple(detail_fields),
+                footer="可以继续选择其他待确认媒体，系统会按点击顺序串行整理。",
+                layout="relaxed",
+            )),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=None,
@@ -2485,9 +2499,9 @@ def _strm_seconds(stats: dict, key: str) -> float:
 
 def _strm_cleanup_text(stats: dict) -> str:
     return (
-        f"{_strm_count(stats, 'cleaned'):,} 个无效 STRM · "
-        f"{_strm_count(stats, 'metadata_cleaned'):,} 个失效元数据 · "
-        f"{_strm_count(stats, 'empty_dirs_cleaned'):,} 个空目录"
+        f"🗑 {_strm_count(stats, 'cleaned'):,} 无效 STRM ｜ "
+        f"📁 {_strm_count(stats, 'empty_dirs_cleaned'):,} 空目录 ｜ "
+        f"🗃 {_strm_count(stats, 'metadata_cleaned'):,} 失效元数据"
     )
 
 
@@ -2517,7 +2531,7 @@ def _strm_source_result_event(source: dict) -> NotificationEvent:
     source_seconds = scan_seconds + process_seconds + cleanup_seconds
     return NotificationEvent(
         "光鸭 STRM 同步结果",
-        field_emojis=False,
+        layout="relaxed",
         fields=(
             ("状态", _strm_result_status(stats)),
             ("目录 ID", str(source.get("id") or "未知")),
@@ -2569,8 +2583,8 @@ def _strm_source_report_line(source: dict) -> str:
         + _strm_seconds(stats, "metadata_elapsed_seconds")
         + _strm_seconds(stats, "cleanup_elapsed_seconds")
     )
-    details.append(f"{source_seconds:.2f} 秒")
-    return f"• {name}：{' · '.join(details)}"
+    display_name = f"#{name}" if name.isdigit() and not name.startswith("#") else name
+    return f"└ • {display_name}：{' · '.join(details)} ({source_seconds:.2f}s)"
 
 
 def _strm_summary_event(
@@ -2583,7 +2597,8 @@ def _strm_summary_event(
     refresh_text = "未启用或本轮无变化"
     if isinstance(refresh, dict) and refresh:
         refresh_text = " / ".join(
-            f"{name} {'成功' if ok else '失败'}" for name, ok in refresh.items()
+            f"{name} {'刷新成功 🎯' if ok else '刷新失败 ❌'}"
+            for name, ok in refresh.items()
         )
     try:
         elapsed = max(0.0, float(result.get("elapsed_seconds", 0) or 0.0))
@@ -2594,13 +2609,18 @@ def _strm_summary_event(
 
     lines: list[str] = []
     sources = [source for source in (source_results or []) if isinstance(source, dict)]
+    source_overview = ""
     if sources:
-        lines.append("来源概览")
         visible_sources = sources[:12]
-        lines.extend(_strm_source_report_line(source) for source in visible_sources)
+        source_lines = [
+            _strm_source_report_line(source) for source in visible_sources
+        ]
         omitted = len(sources) - len(visible_sources)
         if omitted:
-            lines.append(f"另有 {omitted:,} 个来源已折叠，完整结果请查看 Web 运行记录。")
+            source_lines.append(
+                f"另有 {omitted:,} 个来源已折叠，完整结果请查看 Web 运行记录。"
+            )
+        source_overview = "\n".join(source_lines)
     if stats.get("clean_skipped"):
         lines.append("部分来源检测到扫描或一致性异常；为避免误删，已跳过对应来源的失效清理。")
 
@@ -2613,33 +2633,40 @@ def _strm_summary_event(
     if removed_changes:
         footer = f"本轮 {removed_changes:,} 条清理明细已记录到 Web 运行记录。"
 
+    fields: list[tuple[object, object]] = [
+        (
+            "状态",
+            f"{_strm_result_status(stats, partial=partial, stopped=stopped)}"
+            f"（耗时 {elapsed:.2f}s / {source_count:,} 来源）",
+        ),
+        (
+            "扫描",
+            f"{_strm_count(stats, 'directories'):,} 目录 · "
+            f"{_strm_count(stats, 'scanned_files'):,} 文件",
+        ),
+        (
+            "STRM",
+            f"{_strm_count(stats, 'created'):,} 新建 · "
+            f"{_strm_count(stats, 'updated'):,} 更新 · "
+            f"{_strm_count(stats, 'skipped'):,} 跳过 · "
+            f"{_strm_count(stats, 'failed'):,} 失败",
+        ),
+        (
+            "元数据",
+            f"{_strm_count(stats, 'metadata_generated'):,} 更新 · "
+            f"{_strm_count(stats, 'metadata_queued'):,} 后台排队",
+        ),
+        ("清理", _strm_cleanup_text(stats)),
+        ("媒体库", refresh_text),
+    ]
+    if source_overview:
+        fields.append(("来源概览", source_overview))
+
     return NotificationEvent(
         "光鸭 STRM 同步全部完成" if not (partial or stopped) else "光鸭 STRM 同步结束",
+        layout="compact_report",
         field_emojis=False,
-        layout="relaxed",
-        fields=(
-            ("状态", _strm_result_status(stats, partial=partial, stopped=stopped)),
-            ("概览", f"{source_count:,} 个来源 · {elapsed:.2f} 秒"),
-            (
-                "扫描",
-                f"{_strm_count(stats, 'directories'):,} 个目录 · "
-                f"{_strm_count(stats, 'scanned_files'):,} 个文件",
-            ),
-            (
-                "STRM",
-                f"{_strm_count(stats, 'created'):,} 新建 · "
-                f"{_strm_count(stats, 'updated'):,} 更新 · "
-                f"{_strm_count(stats, 'skipped'):,} 跳过 · "
-                f"{_strm_count(stats, 'failed'):,} 失败",
-            ),
-            (
-                "元数据",
-                f"{_strm_count(stats, 'metadata_generated'):,} 更新 · "
-                f"{_strm_count(stats, 'metadata_queued'):,} 后台排队",
-            ),
-            ("清理", _strm_cleanup_text(stats)),
-            ("媒体库", refresh_text),
-        ),
+        fields=tuple(fields),
         lines=tuple(lines),
         footer=footer,
     )
@@ -2702,9 +2729,8 @@ def _do_sync(chat_id, progress_handle=None, sync_mode: str = "full"):
                 chat_id,
                 NotificationEvent(
                     "STRM 同步失败",
-                    field_emojis=False,
                     layout="relaxed",
-                    fields=(("错误", result.get("error", "未知错误")),),
+                    fields=(("错误原因", result.get("error", "未知错误")),),
                 ),
                 progress_handle,
             )
@@ -2722,9 +2748,8 @@ def _do_sync(chat_id, progress_handle=None, sync_mode: str = "full"):
             chat_id,
             NotificationEvent(
                 "STRM 同步失败",
-                field_emojis=False,
                 layout="relaxed",
-                fields=(("错误", e),),
+                fields=(("错误原因", e),),
             ),
             progress_handle,
         )
@@ -2754,6 +2779,46 @@ def _organize_terminal_progress(state: dict) -> str:
     if error:
         lines.append(f"说明：{html.escape(error[:500])}")
     return "\n".join(lines)
+
+
+def _finish_organize_progress_when_lifecycle_settles(
+    chat_id: object,
+    state: dict,
+    progress: TelegramProgress,
+) -> None:
+    """保持 typing，直到整理卡片的 STRM/媒体库终态真实送达。"""
+    from app.modules.telegram_organize_lifecycle import (
+        wait_for_organize_lifecycle_delivery,
+    )
+
+    task_id = str(state.get("id") or "").strip()
+    delivered = wait_for_organize_lifecycle_delivery(
+        task_id,
+        chat_id=str(chat_id),
+        timeout_seconds=_ORGANIZE_LIFECYCLE_WAIT_SECONDS,
+        cancel_event=progress.finished_event,
+    )
+    if progress.finished_event.is_set():
+        return
+    if delivered:
+        progress.dismiss("光鸭整理已结束。")
+        return
+    progress.finish(
+        "<b>光鸭整理已完成，结果卡仍在收尾</b>\n"
+        "STRM 或媒体库状态可能仍在后台更新；请稍后查看结果卡，"
+        "也可使用 /status 核对运行状态。"
+    )
+
+
+def _await_organize_lifecycle(
+    chat_id: object, state: dict, progress: TelegramProgress,
+) -> None:
+    """整理后台线程继续等待完整链路，避免进度与互斥状态过早结束。"""
+    progress.update(
+        "<b>光鸭整理已完成，正在收尾</b>\n"
+        "结果卡已生成，正在等待 STRM 与媒体库状态回写…"
+    )
+    _finish_organize_progress_when_lifecycle_settles(chat_id, state, progress)
 
 
 def _detach_organize_confirmation(
@@ -2954,7 +3019,6 @@ def _local_organize_event(summary: dict) -> NotificationEvent:
         lines.append("下载目录中暂未发现可整理的媒体候选。")
     return NotificationEvent(
         "本地下载整理部分完成" if attention else "本地下载整理完成",
-        field_emojis=False,
         layout="relaxed",
         fields=(
             ("状态", "需要处理" if attention else "整理完成"),
@@ -3037,7 +3101,6 @@ def _all_organize_event(cloud_state: dict, local_summary: dict) -> NotificationE
         )
     return NotificationEvent(
         "全部整理部分完成" if attention else "全部整理完成",
-        field_emojis=False,
         layout="relaxed",
         fields=(
             ("状态", "需要处理" if attention else "全部完成"),
@@ -3118,14 +3181,18 @@ def _do_organize(
         )
         if progress is not None:
             if state.get("notification_sent"):
-                progress.dismiss("光鸭整理已结束。")
+                _await_organize_lifecycle(chat_id, state, progress)
             else:
                 progress.finish(_organize_terminal_progress(state))
         elif str(state.get("status") or "") == "failed":
             send(
                 NotificationEvent(
                     "整理失败",
-                    fields=(("错误", str(state.get("error") or "任务未能正常启动")),),
+                    fields=((
+                        "错误原因",
+                        str(state.get("error") or "任务未能正常启动"),
+                    ),),
+                    layout="relaxed",
                 ),
                 chat_id=str(chat_id),
             )
@@ -3134,7 +3201,14 @@ def _do_organize(
         if progress is not None:
             progress.finish("<b>光鸭整理失败</b>\n任务未能正常启动，请查看日志后重试。")
         else:
-            send(NotificationEvent("整理失败", fields=(("错误", "任务未能正常启动"),)), chat_id=str(chat_id))
+            send(
+                NotificationEvent(
+                    "整理失败",
+                    fields=(("错误原因", "任务未能正常启动"),),
+                    layout="relaxed",
+                ),
+                chat_id=str(chat_id),
+            )
     finally:
         _organize_running = False
         if _task_lock.locked():
@@ -3159,7 +3233,14 @@ def _do_organize_local(chat_id, progress: TelegramProgress | None = None) -> Non
         if progress is not None:
             progress.finish("<b>本地下载整理失败</b>\n任务执行异常，请查看日志后重试。")
         else:
-            send(NotificationEvent("本地下载整理失败"), chat_id=str(chat_id))
+            send(
+                NotificationEvent(
+                    "本地下载整理失败",
+                    fields=(("错误原因", "任务执行异常，请查看日志后重试"),),
+                    layout="relaxed",
+                ),
+                chat_id=str(chat_id),
+            )
     finally:
         _local_organize_running = False
         if _task_lock.locked():
@@ -3222,7 +3303,14 @@ def _do_organize_all(
         if progress is not None:
             progress.finish("<b>全部整理失败</b>\n任务执行异常，请查看日志后重试。")
         else:
-            send(NotificationEvent("全部整理失败"), chat_id=str(chat_id))
+            send(
+                NotificationEvent(
+                    "全部整理失败",
+                    fields=(("错误原因", "任务执行异常，请查看日志后重试"),),
+                    layout="relaxed",
+                ),
+                chat_id=str(chat_id),
+            )
     finally:
         _organize_running = False
         _local_organize_running = False

@@ -12,6 +12,7 @@ from app.modules import telegram_notification_center as notification_center
 from app.modules.telegram_notification_center import (
     deserialize_notification_event,
     drain_telegram_notifications,
+    get_notification_thread_snapshot,
     notification_thread_event_key,
     publish_notification_event,
     publish_notification_thread,
@@ -566,6 +567,60 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["delivered_revision"], 2)
         self.assertEqual(row["status"], "sent")
 
+    @patch("app.modules.telegram_notification_center.edit_event_result")
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_thread_snapshot_distinguishes_queued_and_delivered_revisions(
+        self, sender, editor,
+    ) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=43)
+        editor.return_value = TelegramSendResult(ok=True, message_id=43)
+        thread_key = "organize:snapshot"
+
+        first = publish_notification_thread(
+            thread_key,
+            NotificationEvent("整理完成", fields=(("STRM", "已排队"),)),
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+            deliver_now=False,
+        )
+        queued = get_notification_thread_snapshot(
+            thread_key, topic=NotificationTopic.ORGANIZE, chat_id="100",
+        )
+        self.assertTrue(first.queued)
+        self.assertIsNotNone(queued)
+        self.assertFalse(queued.current_revision_delivered)
+        self.assertEqual(queued.revision, 1)
+        self.assertEqual(queued.delivered_revision, 0)
+
+        self.assertTrue(drain_telegram_notifications(event_key=first.event_key))
+        delivered = get_notification_thread_snapshot(
+            thread_key, topic=NotificationTopic.ORGANIZE, chat_id="100",
+        )
+        self.assertTrue(delivered.current_revision_delivered)
+
+        second = publish_notification_thread(
+            thread_key,
+            NotificationEvent("整理完成", fields=(("STRM", "完成"),)),
+            topic=NotificationTopic.ORGANIZE,
+            chat_id="100",
+            deliver_now=False,
+        )
+        updating = get_notification_thread_snapshot(
+            thread_key, topic=NotificationTopic.ORGANIZE, chat_id="100",
+        )
+        self.assertTrue(second.queued)
+        self.assertFalse(updating.current_revision_delivered)
+        self.assertEqual(updating.revision, 2)
+        self.assertEqual(updating.delivered_revision, 1)
+
+        self.assertTrue(drain_telegram_notifications(event_key=second.event_key))
+        final = get_notification_thread_snapshot(
+            thread_key, topic=NotificationTopic.ORGANIZE, chat_id="100",
+        )
+        self.assertTrue(final.current_revision_delivered)
+        self.assertEqual(final.revision, 2)
+        self.assertEqual(final.delivered_revision, 2)
+
     def test_global_switch_rejects_proactive_event_without_creating_outbox(self) -> None:
         with patch(
             "app.modules.telegram_notification_policy.config.get_bool",
@@ -688,8 +743,8 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         sender.assert_called_once()
         editor.assert_called_once()
         final_event = editor.call_args.args[0]
-        self.assertIn(("STRM", "完成"), final_event.fields)
-        self.assertIn(("媒体库", "Jellyfin 完成"), final_event.fields)
+        self.assertIn(("STRM 状态", "完成 ✅"), final_event.fields)
+        self.assertIn(("媒体库刷新", "Jellyfin 完成 🎯"), final_event.fields)
         self.assertEqual(final_event.actions, ())
 
     @patch("app.modules.telegram_notification_center.edit_event_result")

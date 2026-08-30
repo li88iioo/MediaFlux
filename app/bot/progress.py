@@ -94,17 +94,30 @@ def _rich_html(rendered: str) -> str:
 
     paragraphs: list[str] = []
     lines: list[str] = []
+
+    def flush_lines() -> None:
+        if not lines:
+            return
+        paragraph = "<br>".join(lines)
+        paragraphs.append(
+            paragraph
+            if len(lines) == 1
+            and paragraph.startswith("<blockquote")
+            and paragraph.endswith("</blockquote>")
+            else f"<p>{paragraph}</p>"
+        )
+        lines.clear()
+
     normalized = str(rendered).replace("\r\n", "\n").replace("\r", "\n")
     for line in normalized.split("\n"):
         if line.strip():
             lines.append(line)
             continue
-        if lines:
-            paragraphs.append(f"<p>{'<br>'.join(lines)}</p>")
-            lines = []
-    if lines:
-        paragraphs.append(f"<p>{'<br>'.join(lines)}</p>")
-    return "".join(paragraphs)
+        flush_lines()
+    flush_lines()
+    # Rich Message 的相邻块只会换行，不会保留源文本中的空白行。
+    # 在段落之间补一个显式 <br>，使标题、正文和引用块保持一行呼吸空间。
+    return "<br>".join(paragraphs)
 
 
 def _rich_message(telebot: Any, rendered: str) -> Any | None:
@@ -154,6 +167,11 @@ class TelegramProgress:
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _io_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _finished: bool = False
+
+    @property
+    def finished_event(self) -> threading.Event:
+        """供外部长链路等待感知进度已结束或服务正在停止。"""
+        return self._stop
 
     def begin(self, rendered: str) -> "TelegramProgress":
         source = self.source_message

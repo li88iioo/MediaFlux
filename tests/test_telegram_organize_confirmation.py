@@ -57,7 +57,11 @@ class ConfirmationTerminalNotificationTests(unittest.TestCase):
         )
 
         self.assertIn("部分完成", event.title)
-        self.assertIn(("STRM", "已排队"), event.fields)
+        self.assertIn(("STRM 状态", "已排队 ⏳"), event.fields)
+        rendered = notifier.render_event(event)
+        self.assertIn("- <b>🎬 目标媒体：</b> 测试剧集", rendered)
+        self.assertIn("- <b>📁 源文件目录：</b> /待确认", rendered)
+        self.assertIn("待确认\n\n- <b>📊 执行结果：</b>", rendered)
 
     def test_local_refresh_failure_is_not_reported_as_full_success(self):
         event = _local_confirmation_result_event(
@@ -70,7 +74,7 @@ class ConfirmationTerminalNotificationTests(unittest.TestCase):
         )
 
         self.assertIn("部分完成", event.title)
-        self.assertIn(("媒体库", "刷新失败"), event.fields)
+        self.assertIn(("媒体库刷新", "刷新失败 ❌"), event.fields)
 
 
 class ConfirmationGroupingTests(unittest.TestCase):
@@ -368,6 +372,14 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             result = skip_confirmation(token, chat_id="100", message_id=77)
         publish.assert_called_once()
         self.assertEqual(publish.call_args.kwargs["message_id"], 77)
+        event = publish.call_args.args[0]
+        rendered = notifier.render_event(event)
+        self.assertEqual(event.title, "⏭️ 跳过待确认项")
+        self.assertIn("- <b>🎬 目标媒体：</b> UNKNOWN-001", rendered)
+        self.assertIn("- <b>📁 所在目录：</b> UNKNOWN-001", rendered)
+        self.assertIn("UNKNOWN-001\n\n- <b>📄 涉及文件：</b> 1 个视频", rendered)
+        self.assertIn("- <b>📌 处理状态：</b> 文件保持原位", rendered)
+        self.assertIn("- <b>💡 附带说明：</b> 以后重新执行整理时仍会再次尝试识别。", rendered)
 
         self.assertTrue(result["skipped"])
         self.assertEqual(db.get_organize_confirmation(token)["status"], "cancelled")
@@ -707,7 +719,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["error"], result["error"])
         self.assertIsNone(db.get_organize_confirmation_delivery(token))
         event = published[-1]
-        self.assertIn("确认任务数据损坏", event.footer)
+        self.assertIn(("错误原因", "确认任务数据损坏，请重新执行整理"), event.fields)
+        self.assertIn("重新执行整理", event.footer)
         self.assertEqual(event.actions, ())
 
     def test_transient_worker_failure_releases_and_sends_retry_button(self):
@@ -1162,8 +1175,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
 
         rendered = notifier.render_event(event)
         self.assertEqual(event.layout, "relaxed")
-        self.assertIn("<b>剧集</b>  第 2 季 · E04 · 共 1 个视频", rendered)
-        self.assertIn("需要人工确认\n\n请选择候选继续整理，或跳过此组。", rendered)
+        self.assertIn("- <b>📺 剧集：</b> 第 2 季 · E04 · 共 1 个视频", rendered)
+        self.assertIn("ℹ️ 需要人工确认\n\n请选择候选继续整理，或跳过此组。", rendered)
         self.assertIn("TMDB 105556 · 剧集 · 动漫 · 匹配 88% · 支持 1 个文件", rendered)
         self.assertIn("不要欺负我，长瀞同学 (2021)", rendered)
         self.assertIn("TMDB 105556", str(event.actions[0].label))
@@ -1418,7 +1431,7 @@ class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):
         self.assertTrue(request["local_import_completed_at"])
         self.assertEqual(db.get_organize_confirmation(token)["status"], "completed")
         self.assertIn("本地媒体确认整理完成", published[-1].title)
-        self.assertIn(("媒体库", "已刷新"), published[-1].fields)
+        self.assertIn(("媒体库刷新", "已刷新 🎯"), published[-1].fields)
 
     def test_local_confirmation_failure_settles_linked_download_request(self):
         request_id, _created = db.create_download_request(
@@ -1633,9 +1646,9 @@ class TelegramCallbackTests(unittest.TestCase):
         self.assertEqual(bot.answers[0][0][1], "已加入整理队列")
         edited = bot.edits[0][0][0]
         self.assertIn("已选择：不要欺负我，长瀞同学 (2021)", edited)
-        self.assertIn("<b>类型</b>  剧集 · 第 2 季 · E13 · 共 11 个视频", edited)
-        self.assertIn("<b>文件</b>  11 个视频", edited)
-        self.assertIn("<b>来源</b>  1/待确认目录", edited)
+        self.assertIn("- <b>🎞️ 类型：</b> 剧集 · 第 2 季 · E13 · 共 11 个视频", edited)
+        self.assertIn("- <b>📄 涉及文件：</b> 11 个视频", edited)
+        self.assertIn("- <b>☁️ 存储来源：</b> 1/待确认目录", edited)
         self.assertIn("等待执行 · 前方 2 项", edited)
         self.assertIn("继续选择其他待确认媒体", edited)
         self.assertIsNone(bot.edits[0][1]["reply_markup"])

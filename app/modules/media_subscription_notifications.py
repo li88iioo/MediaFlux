@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from app.agent.result_projection import sanitize_public_text
 from app.logger import get_logger
-from app.notifier import NotificationEvent
+from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 from app.repositories.media_experience import (
     claim_due_notifications,
     mark_notification_sent,
@@ -23,7 +23,11 @@ def _event(item: dict) -> NotificationEvent:
         candidates = max(0, int(payload.get("candidate_count") or 0))
         submitted = max(0, int(payload.get("auto_submitted") or 0))
         action = str(payload.get("action") or "notify").strip().lower()
-        fields = [("媒体", title), ("待补", f"{missing} 项")]
+        fields = [
+            ("目标媒体", title),
+            NOTIFICATION_SECTION_BREAK,
+            ("待补内容", f"{missing} 项"),
+        ]
         if candidates:
             fields.append(("候选", f"{candidates} 个"))
         if submitted:
@@ -32,6 +36,7 @@ def _event(item: dict) -> NotificationEvent:
                 "✅ 追更已自动提交下载",
                 fields=tuple(fields),
                 footer="下载与后续入库状态会继续由对应任务通知更新。",
+                layout="relaxed",
             )
         if action == "confirm" and candidates:
             footer = "已找到候选，请在媒体追更中确认后再提交下载。"
@@ -46,23 +51,31 @@ def _event(item: dict) -> NotificationEvent:
             heading,
             fields=tuple(fields),
             footer=footer,
+            layout="relaxed",
         )
     if event_type == "satisfied":
         return NotificationEvent(
             "✅ 追更已满足",
-            fields=(("媒体", title), ("状态", "当前没有检测到缺失内容")),
+            fields=(
+                ("目标媒体", title),
+                NOTIFICATION_SECTION_BREAK,
+                ("状态", "当前没有检测到缺失内容"),
+            ),
+            layout="relaxed",
         )
     if event_type == "inconclusive":
         reason = sanitize_public_text(payload.get("summary"), limit=220)
         return NotificationEvent(
             "⚠️ 追更检查无法得出结论",
-            fields=(("媒体", title),),
+            fields=(("目标媒体", title),),
             footer=reason or "请检查媒体服务器连接、媒体库映射与 TMDB 数据后重试。",
+            layout="relaxed",
         )
     return NotificationEvent(
         "⚠️ 追更检查异常",
-        fields=(("媒体", title),),
+        fields=(("目标媒体", title),),
         footer="本轮检查未能完成，可稍后重试。",
+        layout="relaxed",
     )
 
 

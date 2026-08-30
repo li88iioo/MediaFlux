@@ -529,6 +529,16 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
         self.assertFalse(scraper._is_bracket_noise("B-Global Donghua 1920x832"))
         self.assertFalse(scraper._is_bracket_noise("B-Global Donghua HEVC AAC MKV"))
 
+        source_context = scraper.extract_recognition_context(
+            "[Dynamis One] Ever Night - 06 "
+            "(B-Global Donghua 1920x832 HEVC AAC MKV) [B2088D0F].mkv"
+        )
+        processed_context = scraper.extract_recognition_context("Ever Night - 06.mkv")
+        scraper._inherit_source_query_provenance(processed_context, source_context)
+        self.assertEqual(
+            scraper._explicit_animation_source_marker(processed_context), "Donghua",
+        )
+
     def test_stylized_romaji_ni_second_season_is_fail_closed_and_tmdb_verifiable(self):
         scraper = self.recognition_module()
         filename = (
@@ -2154,6 +2164,99 @@ class _QueryDeterministicClient(_DeterministicClient):
 
 
 class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
+    def test_explicit_donghua_marker_selects_animation_homonym_for_all_samples(self):
+        scraper_module = self.recognition_module()
+        shared_alias = "Ever Night"
+        client = _DeterministicClient(
+            [
+                {
+                    "id": 83612,
+                    "name": "将夜",
+                    "original_name": "将夜",
+                    "first_air_date": "2018-10-31",
+                    "media_type": "tv",
+                    "genre_ids": [10759, 18, 10765],
+                },
+                {
+                    "id": 282136,
+                    "name": "将夜",
+                    "original_name": "将夜",
+                    "first_air_date": "2026-04-23",
+                    "media_type": "tv",
+                    "genre_ids": [16, 10759, 18],
+                },
+            ],
+            {
+                "83612": {
+                    "id": 83612,
+                    "name": "将夜",
+                    "original_name": "将夜",
+                    "first_air_date": "2018-10-31",
+                    "genres": [{"id": 18, "name": "剧情"}],
+                    "alternative_titles": {"results": [{"title": shared_alias}]},
+                    "seasons": [{"season_number": 1, "episode_count": 60}],
+                },
+                "282136": {
+                    "id": 282136,
+                    "name": "将夜",
+                    "original_name": "将夜",
+                    "first_air_date": "2026-04-23",
+                    "genres": [{"id": 16, "name": "动画"}],
+                    "alternative_titles": {"results": [{"title": shared_alias}]},
+                    "seasons": [{"season_number": 1, "episode_count": 20}],
+                },
+            },
+        )
+        tmdb = scraper_module.TMDBScraper(client=client)
+        files = (
+            (6, "B2088D0F"),
+            (7, "4FD19EAF"),
+            (18, "314B281E"),
+            (19, "6CE52CDF"),
+        )
+
+        for episode, checksum in files:
+            filename = (
+                f"[Dynamis One] Ever Night - {episode:02d} "
+                f"(B-Global Donghua 1920x832 HEVC AAC MKV) [{checksum}].mkv"
+            )
+            with self.subTest(filename=filename):
+                result = tmdb.deterministic_recognize(filename, "1")
+
+                self.assertEqual(result.status, "matched")
+                self.assertFalse(result.need_confirm)
+                self.assertEqual(result.tmdb_id, "282136")
+                self.assertEqual({item.tmdb_id for item in result.candidates}, {"282136"})
+                evidence = result.metadata["content_kind_evidence"]
+                self.assertTrue(evidence["verified"])
+                self.assertEqual(evidence["required_genre_id"], 16)
+                self.assertEqual(evidence["filtered_non_animation_candidates"], 1)
+
+    def test_explicit_donghua_marker_fails_closed_without_animation_candidate(self):
+        scraper_module = self.recognition_module()
+        client = _DeterministicClient([{
+            "id": 83612,
+            "name": "Ever Night",
+            "original_name": "Ever Night",
+            "first_air_date": "2018-10-31",
+            "media_type": "tv",
+            "genre_ids": [10759, 18, 10765],
+        }])
+
+        result = scraper_module.TMDBScraper(client=client).deterministic_recognize(
+            "[Dynamis One] Ever Night - 06 "
+            "(B-Global Donghua 1920x832 HEVC AAC MKV) [B2088D0F].mkv",
+            "1",
+        )
+
+        self.assertEqual(result.status, "low_confidence")
+        self.assertTrue(result.need_confirm)
+        self.assertEqual(
+            result.threshold_decision["reason"], "animation_evidence_mismatch",
+        )
+        self.assertIn("Donghua 动画标记", result.error)
+        self.assertFalse(result.metadata["content_kind_evidence"]["verified"])
+
     def test_virgin_punk_matches_tmdb_translation_alias(self):
         scraper_module = self.recognition_module()
         client = _DeterministicClient([{

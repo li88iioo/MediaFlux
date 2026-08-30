@@ -37,9 +37,12 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
             }],
         })
         rendered = render_event(event)
+        self.assertEqual(event.layout, "relaxed")
         self.assertIn("本地媒体整理完成", rendered)
         self.assertIn("封神第二部：战火西岐.2025.1080p.mkv", rendered)
-        self.assertIn("1 个确认垃圾文件", rendered)
+        self.assertIn("清理 1 个确认垃圾文件", rendered)
+        self.assertIn("<b>🆔 任务编号：</b>", rendered)
+        self.assertIn("<b>📄 目标文件：</b> file.mkv", rendered)
         self.assertNotIn("/media/", rendered)
         self.assertNotIn("/downloads/", rendered)
 
@@ -55,8 +58,8 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
             "media_refresh_status": "failed",
         }))
         self.assertIn("本地媒体整理部分完成", rendered)
-        self.assertIn("媒体库刷新：</b>失败（需处理）", rendered)
-        self.assertNotIn("媒体库刷新：</b>完成", rendered)
+        self.assertIn("媒体库刷新：</b> 刷新失败（需处理） ❌", rendered)
+        self.assertNotIn("媒体库刷新：</b> 刷新完成", rendered)
 
     def test_unrelated_warning_does_not_change_successful_refresh_status(self):
         task = db.get_local_media_task(self.task_id, owner="admin")
@@ -68,7 +71,7 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
             "warnings": ["qB 任务移除失败"],
             "media_refresh_status": "completed",
         }))
-        self.assertIn("媒体库刷新：</b>完成", rendered)
+        self.assertIn("媒体库刷新：</b> 刷新完成 🎯", rendered)
         self.assertNotIn("完成（有警告）", rendered)
 
     def test_requires_manual_event_contains_reason_and_candidate(self):
@@ -210,6 +213,24 @@ class LocalMediaNotificationTests(IsolatedDatabaseTestCase):
         self.assertNotIn("C:\\Media", failed)
         self.assertIn("1 条警告", completed)
         self.assertIn("任务详情", failed)
+
+    def test_failure_event_uses_grouped_operational_card(self):
+        task = db.get_local_media_task(self.task_id, owner="admin")
+        source = db.get_local_media_source(self.source_id, owner="admin")
+
+        rendered = render_event(build_local_media_event(
+            task,
+            source,
+            {"status": "failed"},
+            error="源文件不存在或已被其他任务移动",
+        ))
+
+        self.assertIn("<b>❌ 本地媒体整理失败</b>", rendered)
+        self.assertIn("- <b>🆔 任务编号：</b>", rendered)
+        self.assertIn("- <b>🚀 触发方式：</b> 手动整理", rendered)
+        self.assertIn("- <b>☁️ 存储来源：</b> qB 下载", rendered)
+        self.assertIn("qB 下载\n\n- <b>📄 目标文件：</b> file.mkv", rendered)
+        self.assertIn("- <b>⚠️ 错误原因：</b> 源文件已不存在", rendered)
 
 
 if __name__ == "__main__":

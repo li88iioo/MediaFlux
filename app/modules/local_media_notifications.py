@@ -1,14 +1,13 @@
 """本地媒体整理的结构化 Telegram 通知。只展示文件名，不泄露本地绝对路径。"""
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, Mapping
 
 from app import config
 from app import database as db
 from app.agent.result_projection import sanitize_public_text
 from app.logger import get_logger
-from app.notifier import NotificationEvent
+from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 from app.sensitive_data import redact_sensitive_text
 
 logger = get_logger(__name__)
@@ -58,11 +57,13 @@ def build_local_media_event(
     """根据任务终态生成一条可安全发送的通知。"""
     payload = result or {}
     status = str(_value(payload, "status", getattr(task, "status", "")) or "")
+    target_name = _basename(task.content_path) or "未命名条目"
     fields: list[tuple[object, object]] = [
-        ("任务", f"#{task.id}"),
+        ("任务编号", f"#{task.id}"),
         ("触发方式", _TRIGGER_LABELS.get(task.trigger, task.trigger)),
-        ("来源", source.name if source else "已删除来源"),
-        ("文件", _basename(task.content_path)),
+        ("存储来源", source.name if source else "已删除来源"),
+        NOTIFICATION_SECTION_BREAK,
+        ("目标文件", target_name),
     ]
     lines: list[str] = []
 
@@ -76,14 +77,17 @@ def build_local_media_event(
         if not refresh_status:
             refresh_status = "failed" if any("刷新失败" in item or "未刷新媒体库" in item for item in warnings) else "completed"
         refresh_label = {
-            "completed": "完成",
-            "queued": "已排队（合并刷新）",
-            "failed": "失败（需处理）",
+            "completed": "刷新完成 🎯",
+            "queued": "已排队（合并刷新） ⏳",
+            "failed": "刷新失败（需处理） ❌",
             "skipped": "未启用",
         }.get(refresh_status, "状态未知")
         fields.extend((
-            ("已移动", f"{len(moved)} 个文件"),
-            ("清理", f"{len(deleted)} 个确认垃圾文件"),
+            (
+                "执行结果",
+                f"已移动 {len(moved)} · "
+                f"清理 {len(deleted)} 个确认垃圾文件 · 警告 {len(warnings)}",
+            ),
             ("媒体库刷新", refresh_label),
         ))
         media = list(_value(payload, "media", []) or [])
@@ -105,7 +109,9 @@ def build_local_media_event(
         title = "✅ 本地媒体整理完成"
         if refresh_status == "failed":
             title = "⚠️ 本地媒体整理部分完成"
-        return NotificationEvent(title, fields=tuple(fields), lines=tuple(lines))
+        return NotificationEvent(
+            title, fields=tuple(fields), lines=tuple(lines), layout="relaxed",
+        )
 
     preview = _value(payload, "preview", {})
     if status == "requires_manual":
@@ -158,13 +164,18 @@ def build_local_media_event(
         )
 
     if status == "planned":
-        return NotificationEvent("ℹ️ 本地媒体预览完成", fields=tuple(fields))
+        fields.append(("处理状态", "预览已生成，尚未执行文件操作"))
+        return NotificationEvent(
+            "ℹ️ 本地媒体预览完成", fields=tuple(fields), layout="relaxed",
+        )
 
     fields.append((
-        "错误",
+        "错误原因",
         _safe_error_summary(error or getattr(task, "error", "")),
     ))
-    return NotificationEvent("❌ 本地媒体整理失败", fields=tuple(fields))
+    return NotificationEvent(
+        "❌ 本地媒体整理失败", fields=tuple(fields), layout="relaxed",
+    )
 
 
 def notify_local_media_task(
