@@ -40,6 +40,8 @@ _TERMINAL_LIFECYCLE_STATES = frozenset({
     "failed",
     "stopped",
 })
+_CONFIRMATION_ROLLUP_VERSION = 1
+_INCOMPLETE_MEDIA_STATUS_MARKER = "暂不生成最终缺集结论"
 
 
 def _field_value(event: NotificationEvent, label: str) -> str:
@@ -131,6 +133,90 @@ def _counts(stats: Mapping[str, object]) -> dict[str, int]:
     return counts
 
 
+def _scan_incomplete(stats: Mapping[str, object]) -> bool:
+    return bool(
+        stats.get("scan_errors")
+        or stats.get("scan_limited")
+        or stats.get("scan_complete") is False
+    )
+
+
+def _summary_label(counts: Mapping[str, int], *, expired: int = 0) -> str:
+    summary = [f"视频 {safe_int(counts.get('total'), 0, minimum=0)}"]
+    labels = (
+        ("moved", "入库"),
+        ("metadata", "元数据"),
+        ("confirm", "待确认"),
+        ("skipped", "跳过"),
+        ("failed", "失败"),
+    )
+    for key, label in labels:
+        value = safe_int(counts.get(key), 0, minimum=0)
+        if value:
+            summary.append(f"{label} {value}")
+    if expired:
+        summary.append(f"过期未处理 {safe_int(expired, 0, minimum=0)}")
+    return " · ".join(summary)
+
+
+def build_organize_confirmation_rollup(
+    stats: Mapping[str, object],
+) -> dict[str, object]:
+    """生成可随候选卡持久化的最小任务基线，不复制媒体详情。"""
+    counts = _counts(stats)
+    return {
+        "version": _CONFIRMATION_ROLLUP_VERSION,
+        **counts,
+        "actionable_files": safe_int(
+            stats.get("notification_actionable_confirmation_files"),
+            0,
+            minimum=0,
+        ),
+        "actionable_groups": safe_int(
+            stats.get("notification_actionable_confirmation_groups"),
+            0,
+            minimum=0,
+        ),
+        "stopped": bool(stats.get("stopped")),
+        "scan_incomplete": _scan_incomplete(stats),
+    }
+
+
+def _event_downstream_failed(event: NotificationEvent) -> bool:
+    values = (
+        _field_value(event, "STRM"),
+        _field_value(event, "媒体库"),
+    )
+    return bool(
+        event.title.startswith("⚠️ 光鸭整理链路")
+        or any(
+            marker in value
+            for value in values
+            for marker in ("失败", "错误", "未完成")
+        )
+    )
+
+
+def _confirmation_media_lines(
+    lines: tuple[str, ...], *, inventory_final: bool,
+) -> tuple[str, ...]:
+    """确认全部成功后移除已失效的“仍待确认”说明。
+
+    原汇总只持久化了已入库媒体的有界文本投影，无法安全重算整个季库存；
+    因此这里只删除已经确定不成立的状态行，不猜测缺集或改写其它统计。
+    """
+    if not inventory_final:
+        return lines
+    settled: list[str] = []
+    for block in lines:
+        filtered = "\n".join(
+            line for line in str(block).splitlines()
+            if _INCOMPLETE_MEDIA_STATUS_MARKER not in line
+        )
+        if filtered.strip():
+            settled.append(filtered)
+    return tuple(settled)
+
 
 def _replace_field(
     fields: tuple[tuple[object, object], ...], label: str, value: str,
@@ -158,30 +244,22 @@ def build_organize_lifecycle_event(
 ) -> NotificationEvent:
     counts = _counts(stats)
     stopped = bool(stats.get("stopped"))
-    scan_incomplete = bool(
-        stats.get("scan_errors")
-        or stats.get("scan_limited")
-        or stats.get("scan_complete") is False
+    scan_incomplete = _scan_incomplete(stats)
+    non_confirmation_attention = bool(
+        stopped or scan_incomplete or counts["skipped"] or counts["failed"]
     )
     attention = bool(
-        stopped or scan_incomplete or counts["confirm"]
-        or counts["skipped"] or counts["failed"]
+        non_confirmation_attention or counts["confirm"]
     )
     title = (
         "⏹️ 光鸭整理已停止"
-        if stopped else ("⚠️ 光鸭整理部分完成" if attention else "✅ 光鸭整理完成")
+        if stopped
+        else (
+            "⏳ 光鸭整理等待人工确认"
+            if counts["confirm"] and not non_confirmation_attention
+            else ("⚠️ 光鸭整理部分完成" if attention else "✅ 光鸭整理完成")
+        )
     )
-    summary = [f"视频 {counts['total']}"]
-    if counts["moved"]:
-        summary.append(f"入库 {counts['moved']}")
-    if counts["metadata"]:
-        summary.append(f"元数据 {counts['metadata']}")
-    if counts["confirm"]:
-        summary.append(f"待确认 {counts['confirm']}")
-    if counts["skipped"]:
-        summary.append(f"跳过 {counts['skipped']}")
-    if counts["failed"]:
-        summary.append(f"失败 {counts['failed']}")
     footer = ""
     confirmation_label = ""
     if counts["confirm"]:
@@ -246,7 +324,7 @@ def build_organize_lifecycle_event(
         footer = "本次存在跳过或失败项目，请查看 Web 整理日志。"
     fields: list[tuple[object, object]] = [
         ("来源", source_name),
-        ("整理", " · ".join(summary)),
+        ("整理", _summary_label(counts)),
     ]
     if confirmation_label:
         fields.append(("人工确认", confirmation_label))
@@ -274,6 +352,137 @@ def build_organize_lifecycle_event(
             tuple(stats.get("media_items") or ()),
             inventory_final=not bool(attention or stopped),
         ),
+    )
+
+
+def update_organize_lifecycle_confirmations(
+    task_id: str,
+    *,
+    chat_id: str = "",
+    baseline: Mapping[str, object],
+    outcomes: Mapping[str, object],
+    topic_enabled: bool = True,
+) -> NotificationPublishResult:
+    """全部 Telegram 候选收口后，一次性回写原整理汇总。"""
+    thread_key = f"organize:{task_id!s}"
+    previous = get_notification_thread_event(
+        thread_key, topic=NotificationTopic.ORGANIZE, chat_id=chat_id,
+    )
+    if previous is None:
+        return NotificationPublishResult(False, status="missing_thread")
+
+    base = {
+        key: safe_int(baseline.get(key), 0, minimum=0)
+        for key in ("total", "moved", "metadata", "confirm", "skipped", "failed")
+    }
+    resolved_files = min(
+        base["confirm"],
+        safe_int(outcomes.get("resolved_files"), 0, minimum=0),
+    )
+    counts = {
+        "total": base["total"],
+        "moved": base["moved"] + safe_int(
+            outcomes.get("moved"), 0, minimum=0,
+        ),
+        "metadata": base["metadata"] + safe_int(
+            outcomes.get("metadata"), 0, minimum=0,
+        ),
+        "confirm": max(0, base["confirm"] - resolved_files),
+        "skipped": base["skipped"] + safe_int(
+            outcomes.get("skipped"), 0, minimum=0,
+        ),
+        "failed": base["failed"] + safe_int(
+            outcomes.get("failed"), 0, minimum=0,
+        ),
+    }
+    expired = safe_int(outcomes.get("expired"), 0, minimum=0)
+    handled_groups = safe_int(outcomes.get("groups"), 0, minimum=0)
+    expected_groups = max(
+        handled_groups,
+        safe_int(baseline.get("actionable_groups"), 0, minimum=0),
+    )
+    confirmation_parts = [f"已处理 {handled_groups} / {expected_groups}"]
+    for key, label in (
+        ("moved", "入库"),
+        ("skipped", "跳过"),
+        ("failed", "失败"),
+        ("expired", "过期"),
+    ):
+        value = safe_int(outcomes.get(key), 0, minimum=0)
+        if value:
+            confirmation_parts.append(f"{label} {value}")
+    if counts["confirm"]:
+        confirmation_parts.append(f"Web 待处理 {counts['confirm']}")
+
+    fields = _replace_field(
+        previous.fields, "整理", _summary_label(counts, expired=expired),
+    )
+    fields = _replace_field(fields, "人工确认", " · ".join(confirmation_parts))
+    stopped = bool(baseline.get("stopped"))
+    scan_incomplete = bool(baseline.get("scan_incomplete"))
+    downstream_failed = _event_downstream_failed(previous)
+    attention = bool(
+        stopped
+        or scan_incomplete
+        or counts["confirm"]
+        or counts["skipped"]
+        or counts["failed"]
+        or expired
+        or downstream_failed
+    )
+    if stopped:
+        title = "⏹️ 光鸭整理已停止"
+    elif attention:
+        title = "⚠️ 光鸭整理部分完成"
+    else:
+        title = "✅ 光鸭整理完成"
+
+    if counts["confirm"]:
+        footer = (
+            f"Telegram 候选已处理；仍有 {counts['confirm']} 个项目保留在 Web "
+            "待确认队列。"
+        )
+    elif expired:
+        footer = (
+            f"{expired} 个候选超过 24 小时未确认，文件保持原位；"
+            "重新执行整理可再次识别。"
+        )
+    elif counts["skipped"] or counts["failed"]:
+        footer = "人工确认已结束；跳过或失败项目可在 Web 整理日志中查看。"
+    else:
+        footer = "人工确认已全部完成；任务汇总已更新。"
+
+    strm_status = _field_value(previous, "STRM")
+    if stopped:
+        lifecycle_state = "stopped"
+    elif strm_status in _PENDING_STRM_STATES:
+        lifecycle_state = "queued"
+    elif attention:
+        lifecycle_state = "partial"
+    else:
+        lifecycle_state = "completed"
+    event = NotificationEvent(
+        title,
+        fields=fields,
+        lines=_confirmation_media_lines(
+            previous.lines, inventory_final=not attention,
+        ),
+        footer=footer,
+        actions=previous.actions,
+        layout=previous.layout,
+        field_emojis=previous.field_emojis,
+        state=lifecycle_state,
+    )
+    return publish_notification_thread(
+        thread_key,
+        event,
+        topic=NotificationTopic.ORGANIZE,
+        importance=(
+            NotificationImportance.ERROR if attention
+            else NotificationImportance.RESULT
+        ),
+        chat_id=chat_id,
+        topic_enabled=topic_enabled,
     )
 
 
@@ -343,6 +552,16 @@ def update_organize_lifecycle_downstream(
         importance = NotificationImportance.ERROR
         if error:
             footer = str(error)[:260]
+    elif title.startswith("⏳"):
+        importance = NotificationImportance.ACTION
+    if title.startswith("⏹️"):
+        lifecycle_state = "stopped"
+    elif str(strm_status or "").strip() in _PENDING_STRM_STATES:
+        lifecycle_state = "queued"
+    elif partial or error or title.startswith(("⚠️", "⏳")):
+        lifecycle_state = "partial"
+    else:
+        lifecycle_state = "completed"
     event = NotificationEvent(
         title,
         fields=fields,
@@ -351,7 +570,7 @@ def update_organize_lifecycle_downstream(
         actions=previous.actions,
         layout=previous.layout,
         field_emojis=previous.field_emojis,
-        state="partial" if partial or error else "completed",
+        state=lifecycle_state,
     )
     return publish_notification_thread(
         thread_key,

@@ -38,7 +38,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = (
     "上次进程在本地媒体写操作期间中断"
@@ -215,6 +215,8 @@ CREATE TABLE IF NOT EXISTS organize_confirmations (
     selected_index INTEGER,
     queued_at TEXT,
     task_id TEXT DEFAULT '',
+    organize_task_id TEXT DEFAULT '',
+    rollup_applied INTEGER NOT NULL DEFAULT 0 CHECK(rollup_applied IN (0,1)),
     result_json TEXT DEFAULT '',
     error TEXT DEFAULT '',
     expires_at TEXT NOT NULL,
@@ -226,6 +228,8 @@ CREATE INDEX IF NOT EXISTS idx_organize_confirmations_status_expiry
     ON organize_confirmations(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_organize_confirmations_fingerprint
     ON organize_confirmations(fingerprint, id DESC);
+CREATE INDEX IF NOT EXISTS idx_organize_confirmations_organize_task
+    ON organize_confirmations(organize_task_id, id);
 
 CREATE TABLE IF NOT EXISTS organize_confirmation_delivery_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2383,6 +2387,35 @@ def _migrate_media_subscription_notification_outbox_v13(
     )
 
 
+def _migrate_organize_confirmation_rollup_v14(
+    conn: sqlite3.Connection,
+) -> None:
+    """关联人工确认与原整理任务，并记录汇总回写终态。"""
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(organize_confirmations)")
+    }
+    if not columns:
+        # 极早期/损坏开发库可能只有版本号而没有该表；后续正式 schema
+        # 基线会创建完整结构，这里不能提前对不存在的列创建索引。
+        return
+    if "organize_task_id" not in columns:
+        conn.execute(
+            "ALTER TABLE organize_confirmations ADD COLUMN "
+            "organize_task_id TEXT DEFAULT ''"
+        )
+    if "rollup_applied" not in columns:
+        conn.execute(
+            "ALTER TABLE organize_confirmations ADD COLUMN "
+            "rollup_applied INTEGER NOT NULL DEFAULT 0 "
+            "CHECK(rollup_applied IN (0,1))"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_organize_confirmations_organize_task "
+        "ON organize_confirmations(organize_task_id,id)"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2397,6 +2430,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     10: _migrate_local_media_numbering_mode_v11,
     11: _migrate_telegram_notification_outbox_v12,
     12: _migrate_media_subscription_notification_outbox_v13,
+    13: _migrate_organize_confirmation_rollup_v14,
 }
 
 
@@ -2702,15 +2736,12 @@ def init_db() -> None:
                 "UPDATE organize_confirmations SET status='failed',"
                 "error=CASE WHEN COALESCE(error,'')='' "
                 "THEN '上次进程在 Telegram 确认整理执行期间中断，请重新执行整理' "
-                "ELSE error END,completed_at=COALESCE(completed_at,?),updated_at=? "
-                "WHERE status='running'",
+                "ELSE error END,completed_at=COALESCE(completed_at,?),"
+                "rollup_applied=0,updated_at=? WHERE status='running'",
                 (timestamp, timestamp),
             )
-            conn.execute(
-                "UPDATE organize_confirmations SET status='expired',updated_at=? "
-                "WHERE status='pending' AND expires_at<=?",
-                (timestamp, timestamp),
-            )
+            # pending 候选由 Telegram 确认调度器统一过期并投递终态卡片；
+            # 这里提前改状态会让卡片与父任务汇总失去主动收口机会。
             conn.execute(
                 "UPDATE organize_log SET status='interrupted',error=CASE "
                 "WHEN COALESCE(error,'')='' THEN '上次进程在云端写操作期间中断，必须重新核验快照' "
@@ -5065,6 +5096,7 @@ def create_organize_confirmation(
     directory_path: str,
     payload: dict,
     expires_at: str,
+    organize_task_id: str = "",
 ) -> int:
     """持久化一组 Telegram 整理候选，并使同指纹旧按钮失效。"""
     timestamp = now()
@@ -5072,19 +5104,26 @@ def create_organize_confirmation(
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
-            "UPDATE organize_confirmations SET status='expired',updated_at=? "
+            "UPDATE organize_confirmations SET status='expired',"
+            "result_json=?,error='新的候选卡已替代本次确认',"
+            "completed_at=COALESCE(completed_at,?),rollup_applied=0,updated_at=? "
             "WHERE fingerprint=? AND status='pending'",
-            (timestamp, str(fingerprint)),
+            (
+                json.dumps({"resolution": "superseded"}, ensure_ascii=False),
+                timestamp,
+                timestamp,
+                str(fingerprint),
+            ),
         )
         cursor = conn.execute(
             "INSERT INTO organize_confirmations("
             "token,fingerprint,chat_id,source_name,directory_path,payload_json,status,"
-            "expires_at,created_at,updated_at"
-            ") VALUES(?,?,?,?,?,?,'pending',?,?,?)",
+            "organize_task_id,rollup_applied,expires_at,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,'pending',?,0,?,?,?)",
             (
                 str(token), str(fingerprint), str(chat_id or ""),
                 str(source_name or ""), str(directory_path or ""), encoded,
-                str(expires_at), timestamp, timestamp,
+                str(organize_task_id or ""), str(expires_at), timestamp, timestamp,
             ),
         )
         return int(cursor.lastrowid)
@@ -5096,6 +5135,61 @@ def get_organize_confirmation(token: str) -> sqlite3.Row | None:
             "SELECT * FROM organize_confirmations WHERE token=?",
             (str(token or ""),),
         ).fetchone()
+
+
+def list_organize_confirmations_for_task(
+    organize_task_id: str, *, chat_id: str = ""
+) -> list[sqlite3.Row]:
+    """返回同一整理汇总关联的全部确认记录。"""
+    task_id = str(organize_task_id or "").strip()
+    if not task_id:
+        return []
+    params: list[object] = [task_id]
+    chat_clause = ""
+    if str(chat_id or "").strip():
+        chat_clause = " AND chat_id=?"
+        params.append(str(chat_id or "").strip())
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM organize_confirmations WHERE organize_task_id=?"
+            + chat_clause
+            + " ORDER BY id ASC",
+            params,
+        ).fetchall()
+
+
+def list_unapplied_organize_confirmation_tasks(limit: int = 50) -> list[sqlite3.Row]:
+    """列出有终态但尚未回写原汇总的父任务，供启动恢复与定时收口。"""
+    resolved_limit = max(1, min(int(limit or 50), 500))
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT organize_task_id,chat_id,MIN(id) AS first_id "
+            "FROM organize_confirmations WHERE organize_task_id<>'' "
+            "AND rollup_applied=0 AND status IN ('completed','failed','expired','cancelled') "
+            "GROUP BY organize_task_id,chat_id ORDER BY first_id ASC LIMIT ?",
+            (resolved_limit,),
+        ).fetchall()
+
+
+def mark_organize_confirmation_rollup_applied(
+    organize_task_id: str, *, chat_id: str = ""
+) -> int:
+    """标记父任务当前全部确认记录已经投影到整理汇总。"""
+    task_id = str(organize_task_id or "").strip()
+    if not task_id:
+        return 0
+    params: list[object] = [now(), task_id]
+    chat_clause = ""
+    if str(chat_id or "").strip():
+        chat_clause = " AND chat_id=?"
+        params.append(str(chat_id or "").strip())
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE organize_confirmations SET rollup_applied=1,updated_at=? "
+            "WHERE organize_task_id=?" + chat_clause,
+            params,
+        )
+        return int(cursor.rowcount)
 
 
 def bind_organize_confirmation_message(
@@ -5160,8 +5254,15 @@ def claim_organize_confirmation(
         expired = str(row["expires_at"] or "") <= timestamp
         if expired:
             conn.execute(
-                "UPDATE organize_confirmations SET status='expired',updated_at=? WHERE id=?",
-                (timestamp, int(row["id"])),
+                "UPDATE organize_confirmations SET status='expired',selected_index=NULL,"
+                "queued_at=NULL,task_id='',result_json=?,error='确认操作已过期',"
+                "completed_at=?,rollup_applied=0,updated_at=? WHERE id=?",
+                (
+                    json.dumps({"resolution": "expired"}, ensure_ascii=False),
+                    timestamp,
+                    timestamp,
+                    int(row["id"]),
+                ),
             )
             claimed = None
         else:
@@ -5187,6 +5288,7 @@ def cancel_organize_confirmation(
     event_json: str = "",
     message_id: int | None = None,
     enqueue_delivery: bool = True,
+    resolution: str = "cancelled",
 ) -> sqlite3.Row:
     """原子取消待确认任务，并可在同一事务写入终态回执。"""
     timestamp = now()
@@ -5205,8 +5307,15 @@ def cancel_organize_confirmation(
             raise ValueError("该确认操作已处理")
         if str(row["expires_at"] or "") <= timestamp:
             conn.execute(
-                "UPDATE organize_confirmations SET status='expired',updated_at=? WHERE id=?",
-                (timestamp, int(row["id"])),
+                "UPDATE organize_confirmations SET status='expired',selected_index=NULL,"
+                "queued_at=NULL,task_id='',result_json=?,error='确认操作已过期',"
+                "completed_at=?,rollup_applied=0,updated_at=? WHERE id=?",
+                (
+                    json.dumps({"resolution": "expired"}, ensure_ascii=False),
+                    timestamp,
+                    timestamp,
+                    int(row["id"]),
+                ),
             )
             cancelled = None
         else:
@@ -5215,7 +5324,10 @@ def cancel_organize_confirmation(
                 "queued_at=NULL,task_id='',result_json=?,error='',completed_at=?,updated_at=? "
                 "WHERE id=? AND status='pending'",
                 (
-                    json.dumps({"cancelled": True}, ensure_ascii=False),
+                    json.dumps(
+                        {"cancelled": True, "resolution": str(resolution or "cancelled")},
+                        ensure_ascii=False,
+                    ),
                     timestamp,
                     timestamp,
                     int(row["id"]),
@@ -5241,33 +5353,63 @@ def cancel_organize_confirmation(
 
 
 def expire_queued_organize_confirmations() -> int:
-    """原子失效已经超过确认窗口、但尚未开始执行的排队任务。"""
+    """兼容旧调用：用户已点击的 queued 项不再受候选窗口限制。"""
+    return 0
+
+
+def expire_pending_organize_confirmations(
+    *, token: str = "", limit: int = 100
+) -> list[sqlite3.Row]:
+    """原子失效到期但从未被用户选择的候选，并返回真实终态行。"""
     timestamp = now()
+    resolved_limit = max(1, min(int(limit or 100), 500))
     with get_conn() as conn:
-        cursor = conn.execute(
-            "UPDATE organize_confirmations SET status='expired',error='确认操作已过期',"
-            "completed_at=?,updated_at=? WHERE status='queued' AND expires_at<=?",
-            (timestamp, timestamp, timestamp),
+        conn.execute("BEGIN IMMEDIATE")
+        params: list[object] = [timestamp]
+        token_clause = ""
+        if str(token or "").strip():
+            token_clause = " AND token=?"
+            params.append(str(token or "").strip())
+        params.append(resolved_limit)
+        rows = conn.execute(
+            "SELECT id FROM organize_confirmations WHERE status='pending' "
+            "AND expires_at<=?" + token_clause + " ORDER BY expires_at ASC,id ASC LIMIT ?",
+            params,
+        ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            "UPDATE organize_confirmations SET status='expired',selected_index=NULL,"
+            "queued_at=NULL,task_id='',result_json=?,error='确认操作已过期',"
+            "completed_at=?,rollup_applied=0,updated_at=? "
+            f"WHERE id IN ({placeholders}) AND status='pending'",
+            (
+                json.dumps({"resolution": "expired"}, ensure_ascii=False),
+                timestamp,
+                timestamp,
+                *ids,
+            ),
         )
-        return int(cursor.rowcount)
+        return conn.execute(
+            f"SELECT * FROM organize_confirmations WHERE id IN ({placeholders}) "
+            "AND status='expired' ORDER BY id ASC",
+            ids,
+        ).fetchall()
 
 
 def get_next_queued_organize_confirmation() -> sqlite3.Row | None:
-    """返回最早且仍在有效期内的 Telegram 整理任务。"""
-    expire_queued_organize_confirmations()
-    timestamp = now()
+    """返回最早的已确认 Telegram 整理任务；入队后不再按候选 TTL 失效。"""
     with get_conn() as conn:
         return conn.execute(
-            "SELECT * FROM organize_confirmations WHERE status='queued' AND expires_at>? "
-            "ORDER BY COALESCE(queued_at,created_at) ASC,id ASC LIMIT 1",
-            (timestamp,),
+            "SELECT * FROM organize_confirmations WHERE status='queued' "
+            "ORDER BY COALESCE(queued_at,created_at) ASC,id ASC LIMIT 1"
         ).fetchone()
 
 
 def get_organize_confirmation_queue_position(row_id: int) -> int:
     """按用户点击入队时间返回前方任务数量，并计入当前运行项。"""
-    expire_queued_organize_confirmations()
-    timestamp = now()
     with get_conn() as conn:
         target = conn.execute(
             "SELECT id,COALESCE(queued_at,created_at) AS queue_time "
@@ -5278,11 +5420,11 @@ def get_organize_confirmation_queue_position(row_id: int) -> int:
             return 0
         row = conn.execute(
             "SELECT COUNT(*) AS total FROM organize_confirmations "
-            "WHERE id<>? AND (status='running' OR (status='queued' AND expires_at>? AND ("
+            "WHERE id<>? AND (status='running' OR (status='queued' AND ("
             "COALESCE(queued_at,created_at)<? OR "
             "(COALESCE(queued_at,created_at)=? AND id<?))))",
             (
-                int(row_id), timestamp, str(target["queue_time"] or ""),
+                int(row_id), str(target["queue_time"] or ""),
                 str(target["queue_time"] or ""), int(row_id),
             ),
         ).fetchone()
@@ -5290,19 +5432,14 @@ def get_organize_confirmation_queue_position(row_id: int) -> int:
 
 
 def claim_queued_organize_confirmation(token: str) -> sqlite3.Row | None:
-    """原子领取一个已排队确认；跨进程竞争时仅一个调度器成功。"""
+    """原子领取一个已排队确认；已选择任务不再因等待跨过 TTL 而失效。"""
     timestamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "UPDATE organize_confirmations SET status='expired',error='确认操作已过期',"
-            "completed_at=?,updated_at=? WHERE token=? AND status='queued' AND expires_at<=?",
-            (timestamp, timestamp, str(token or ""), timestamp),
-        )
         cursor = conn.execute(
             "UPDATE organize_confirmations SET status='running',error='',updated_at=? "
-            "WHERE token=? AND status='queued' AND expires_at>?",
-            (timestamp, str(token or ""), timestamp),
+            "WHERE token=? AND status='queued'",
+            (timestamp, str(token or "")),
         )
         if cursor.rowcount != 1:
             return None
@@ -5399,7 +5536,8 @@ def complete_organize_confirmation_with_delivery(
         conn.execute("BEGIN IMMEDIATE")
         cursor = conn.execute(
             "UPDATE organize_confirmations SET status='completed',result_json=?,error='',"
-            "completed_at=?,updated_at=? WHERE token=? AND status='running'",
+            "completed_at=?,rollup_applied=0,updated_at=? "
+            "WHERE token=? AND status='running'",
             (str(result_json or "{}"), timestamp, timestamp, str(token or "")),
         )
         if cursor.rowcount != 1:
@@ -5424,6 +5562,7 @@ def fail_organize_confirmation_with_delivery(
     message_id: int | None,
     retryable: bool,
     enqueue_delivery: bool = True,
+    retry_expires_at: str = "",
 ) -> None:
     """原子保存失败/可重试状态与待投递回执。"""
     timestamp = now()
@@ -5432,14 +5571,22 @@ def fail_organize_confirmation_with_delivery(
         if retryable:
             cursor = conn.execute(
                 "UPDATE organize_confirmations SET status='pending',selected_index=NULL,"
-                "queued_at=NULL,task_id='',error=?,completed_at=NULL,updated_at=? "
+                "queued_at=NULL,task_id='',error=?,completed_at=NULL,rollup_applied=0,"
+                "expires_at=CASE WHEN ?<>'' THEN ? ELSE expires_at END,updated_at=? "
                 "WHERE token=? AND status IN ('queued','running')",
-                (str(error or ""), timestamp, str(token or "")),
+                (
+                    str(error or ""),
+                    str(retry_expires_at or ""),
+                    str(retry_expires_at or ""),
+                    timestamp,
+                    str(token or ""),
+                ),
             )
         else:
             cursor = conn.execute(
                 "UPDATE organize_confirmations SET status='failed',error=?,completed_at=?,"
-                "updated_at=? WHERE token=? AND status IN ('queued','running')",
+                "rollup_applied=0,updated_at=? "
+                "WHERE token=? AND status IN ('queued','running')",
                 (str(error or ""), timestamp, timestamp, str(token or "")),
             )
         if cursor.rowcount != 1:

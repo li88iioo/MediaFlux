@@ -8,8 +8,11 @@ from app.modules.telegram_notification_center import (
     NotificationThreadSnapshot,
 )
 from app.modules.telegram_organize_lifecycle import (
+    build_organize_confirmation_rollup,
     build_organize_lifecycle_event,
     organize_lifecycle_downstream_settled,
+    update_organize_lifecycle_confirmations,
+    update_organize_lifecycle_downstream,
     wait_for_organize_lifecycle_delivery,
 )
 from app.notifier import NotificationEvent
@@ -104,6 +107,53 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         self.assertIn(("STRM", "等待后处理"), calls[0][1].fields)
         self.assertIn(("STRM", "已排队"), calls[1][1].fields)
 
+    def test_post_action_update_preserves_existing_confirmation_summary(self) -> None:
+        stats = _stats_with_confirmation()
+        stats["strm"] = {"ok": True}
+        with patch(
+            "app.modules.telegram_organize_lifecycle.update_organize_lifecycle_downstream",
+            return_value=_accepted(),
+        ) as update, patch(
+            "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle"
+        ) as publish:
+            Organizer._notify_result(
+                stats, OrganizeRules(), source_name="来源", chat_id="100",
+            )
+
+        update.assert_called_once()
+        publish.assert_not_called()
+
+    def test_post_action_fallback_keeps_actionable_confirmation_counts(self) -> None:
+        stats = _stats_with_confirmation()
+        group = stats["confirmation_groups"][0]
+        group["source_parent_id"] = "parent-1"
+        group["files"][0].update({"parent_id": "parent-1", "size": 1})
+        published = []
+        with patch(
+            "app.modules.telegram_organize_lifecycle.update_organize_lifecycle_downstream",
+            return_value=NotificationPublishResult(False, status="missing_thread"),
+        ), patch(
+            "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle",
+            side_effect=lambda _task_id, payload, **_kwargs: (
+                published.append(payload) or _accepted()
+            ),
+        ):
+            Organizer._notify_result(
+                stats, OrganizeRules(), source_name="来源", chat_id="100",
+            )
+
+        self.assertEqual(len(published), 1)
+        projection = published[0]
+        self.assertEqual(
+            projection["notification_actionable_confirmation_files"], 1
+        )
+        self.assertEqual(
+            projection["notification_actionable_confirmation_groups"], 1
+        )
+        self.assertEqual(
+            projection["notification_candidate_confirmation_groups"], 1
+        )
+
     def test_skipped_directory_never_claims_strm_is_waiting(self) -> None:
         calls = []
         stats = self._completed_stats([])
@@ -180,6 +230,188 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(pending.state, "queued")
         self.assertEqual(completed.state, "completed")
+
+    def test_confirmation_only_task_uses_waiting_title(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "notification_actionable_confirmation_files": 1,
+            "notification_actionable_confirmation_groups": 1,
+            "notification_candidate_confirmation_groups": 1,
+        })
+
+        event = build_organize_lifecycle_event(
+            stats,
+            source_name="来源",
+            strm_status="完成",
+            media_refresh="Jellyfin 已刷新",
+        )
+
+        self.assertEqual(event.title, "⏳ 光鸭整理等待人工确认")
+        self.assertEqual(event.state, "partial")
+
+    def test_confirmation_rollup_promotes_summary_to_success(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "notification_actionable_confirmation_files": 1,
+            "notification_actionable_confirmation_groups": 1,
+        })
+        previous = build_organize_lifecycle_event(
+            stats,
+            source_name="来源",
+            strm_status="完成",
+            media_refresh="Jellyfin 已刷新",
+        )
+        published = []
+        with patch(
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
+            return_value=previous,
+        ), patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event) or _accepted()
+            ),
+        ):
+            result = update_organize_lifecycle_confirmations(
+                "task-confirmation",
+                chat_id="100",
+                baseline=build_organize_confirmation_rollup(stats),
+                outcomes={
+                    "groups": 1, "resolved_files": 1, "moved": 1,
+                    "metadata": 0, "skipped": 0, "failed": 0, "expired": 0,
+                },
+            )
+
+        self.assertTrue(result)
+        event = published[-1]
+        self.assertEqual(event.title, "✅ 光鸭整理完成")
+        self.assertEqual(event.state, "completed")
+        self.assertIn(("整理", "视频 1 · 入库 1"), event.fields)
+        self.assertIn(("人工确认", "已处理 1 / 1 · 入库 1"), event.fields)
+        self.assertIn("已全部完成", event.footer)
+
+    def test_successful_rollup_removes_stale_pending_inventory_status(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "total": 2,
+            "moved": 1,
+            "notification_actionable_confirmation_files": 1,
+            "notification_actionable_confirmation_groups": 1,
+            "media_items": [{
+                "title": "将夜",
+                "year": "2026",
+                "media_type": "tv",
+                "tmdb_id": "282136",
+                "season": 1,
+                "episode": 6,
+                "season_total": 20,
+                "season_present_episodes": [6],
+            }],
+        })
+        previous = build_organize_lifecycle_event(
+            stats,
+            source_name="来源",
+            strm_status="完成",
+            media_refresh="Jellyfin 已刷新",
+        )
+        self.assertTrue(any(
+            "暂不生成最终缺集结论" in line for line in previous.lines
+        ))
+
+        published = []
+        with patch(
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
+            return_value=previous,
+        ), patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event) or _accepted()
+            ),
+        ):
+            update_organize_lifecycle_confirmations(
+                "task-confirmation",
+                chat_id="100",
+                baseline=build_organize_confirmation_rollup(stats),
+                outcomes={
+                    "groups": 1, "resolved_files": 1, "moved": 1,
+                    "metadata": 0, "skipped": 0, "failed": 0, "expired": 0,
+                },
+            )
+
+        event = published[-1]
+        self.assertEqual(event.title, "✅ 光鸭整理完成")
+        self.assertFalse(any(
+            "暂不生成最终缺集结论" in line for line in event.lines
+        ))
+        self.assertTrue(any("将夜" in line for line in event.lines))
+
+    def test_expired_confirmation_rollup_is_explicit_and_terminal(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "notification_actionable_confirmation_files": 1,
+            "notification_actionable_confirmation_groups": 1,
+        })
+        previous = build_organize_lifecycle_event(
+            stats,
+            source_name="来源",
+            strm_status="完成",
+            media_refresh="Jellyfin 已刷新",
+        )
+        published = []
+        with patch(
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
+            return_value=previous,
+        ), patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event) or _accepted()
+            ),
+        ):
+            update_organize_lifecycle_confirmations(
+                "task-confirmation",
+                chat_id="100",
+                baseline=build_organize_confirmation_rollup(stats),
+                outcomes={
+                    "groups": 1, "resolved_files": 1, "moved": 0,
+                    "metadata": 0, "skipped": 0, "failed": 0, "expired": 1,
+                },
+            )
+
+        event = published[-1]
+        self.assertEqual(event.title, "⚠️ 光鸭整理部分完成")
+        self.assertEqual(event.state, "partial")
+        self.assertIn(("整理", "视频 1 · 过期未处理 1"), event.fields)
+        self.assertNotIn("待确认", dict(event.fields)["整理"])
+        self.assertIn("文件保持原位", event.footer)
+
+    def test_downstream_success_does_not_hide_pending_confirmation(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "notification_actionable_confirmation_files": 1,
+            "notification_actionable_confirmation_groups": 1,
+        })
+        previous = build_organize_lifecycle_event(
+            stats, source_name="来源", strm_status="已排队",
+        )
+        published = []
+        with patch(
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
+            return_value=previous,
+        ), patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event) or _accepted()
+            ),
+        ):
+            update_organize_lifecycle_downstream(
+                "task-confirmation",
+                chat_id="100",
+                strm_status="完成",
+                media_refresh="Jellyfin 已刷新",
+            )
+
+        event = published[-1]
+        self.assertEqual(event.title, "⏳ 光鸭整理等待人工确认")
+        self.assertEqual(event.state, "partial")
 
     def test_single_media_task_uses_one_transaction_message(self) -> None:
         events = []

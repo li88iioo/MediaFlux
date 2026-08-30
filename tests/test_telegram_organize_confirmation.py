@@ -5,7 +5,7 @@ import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -303,6 +303,118 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         payload = json.loads(row["payload_json"])
         self.assertEqual(payload["files"][0]["file_id"], "file-4")
         self.assertEqual(payload["candidates"][0]["genre_ids"], [16])
+
+    def test_confirmation_persists_parent_rollup_without_changing_fingerprint(self):
+        group = self._group()
+        group.update({
+            "organize_task_id": "organize-parent-1",
+            "organize_rollup": {
+                "version": 1, "total": 1, "moved": 0, "metadata": 0,
+                "confirm": 1, "skipped": 0, "failed": 0,
+                "actionable_files": 1, "actionable_groups": 1,
+                "stopped": False, "scan_incomplete": False,
+            },
+        })
+        first_actions = create_confirmation_actions(
+            group, OrganizeRules(), source_name="下载", chat_id="100",
+        )
+        first_token = first_actions[0].callback_data.split(":")[1]
+        first = db.get_organize_confirmation(first_token)
+        first_payload = json.loads(first["payload_json"])
+
+        group["organize_task_id"] = "organize-parent-2"
+        group["organize_rollup"]["total"] = 2
+        second_actions = create_confirmation_actions(
+            group, OrganizeRules(), source_name="下载", chat_id="100",
+        )
+        second_token = second_actions[0].callback_data.split(":")[1]
+        second = db.get_organize_confirmation(second_token)
+
+        self.assertEqual(first["organize_task_id"], "organize-parent-1")
+        self.assertEqual(first_payload["organize_rollup"]["actionable_groups"], 1)
+        self.assertEqual(db.get_organize_confirmation(first_token)["status"], "expired")
+        self.assertEqual(
+            json.loads(db.get_organize_confirmation(first_token)["result_json"])[
+                "resolution"
+            ],
+            "superseded",
+        )
+        self.assertEqual(second["organize_task_id"], "organize-parent-2")
+        self.assertEqual(second["status"], "pending")
+
+    def test_pending_expiry_closes_card_and_rolls_up_parent_once(self):
+        group = self._group()
+        group.update({
+            "organize_task_id": "organize-expiry",
+            "organize_rollup": {
+                "version": 1, "total": 1, "moved": 0, "metadata": 0,
+                "confirm": 1, "skipped": 0, "failed": 0,
+                "actionable_files": 1, "actionable_groups": 1,
+                "stopped": False, "scan_incomplete": False,
+            },
+        })
+        actions = create_confirmation_actions(
+            group, OrganizeRules(), source_name="下载", chat_id="100",
+        )
+        token = actions[0].callback_data.split(":")[1]
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_confirmations SET expires_at=? WHERE token=?",
+                (
+                    (datetime.now(timezone.utc).astimezone() - timedelta(minutes=1)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    token,
+                ),
+            )
+
+        expired_events = []
+        with patch(
+            "app.modules.organize_confirmations.publish_confirmation_event",
+            side_effect=lambda event, **_kwargs: expired_events.append(event) or True,
+        ), patch(
+            "app.modules.telegram_organize_lifecycle."
+            "update_organize_lifecycle_confirmations",
+            return_value=NotificationPublishResult(
+                True, delivered=True, status="sent"
+            ),
+        ) as update_parent:
+            expired = confirmation_module._expire_due_pending_confirmations()
+
+        row = db.get_organize_confirmation(token)
+        self.assertEqual(expired, 1)
+        self.assertEqual(row["status"], "expired")
+        self.assertEqual(row["rollup_applied"], 1)
+        self.assertEqual(expired_events[-1].title, "⌛ 人工确认已过期")
+        self.assertEqual(expired_events[-1].actions, ())
+        update_parent.assert_called_once()
+        outcomes = update_parent.call_args.kwargs["outcomes"]
+        self.assertEqual(outcomes["resolved_files"], 1)
+        self.assertEqual(outcomes["expired"], 1)
+
+    def test_queued_choice_survives_candidate_ttl(self):
+        actions = create_confirmation_actions(
+            self._group(), OrganizeRules(), source_name="下载", chat_id="100"
+        )
+        token = actions[0].callback_data.split(":")[1]
+        db.claim_organize_confirmation(token, chat_id="100", selected_index=0)
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_confirmations SET expires_at=? WHERE token=?",
+                (
+                    (datetime.now(timezone.utc).astimezone() - timedelta(minutes=1)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    token,
+                ),
+            )
+
+        queued = db.get_next_queued_organize_confirmation()
+        claimed = db.claim_queued_organize_confirmation(token)
+
+        self.assertEqual(queued["token"], token)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["status"], "running")
 
     def test_metatube_action_uses_provider_identity_and_source_rules(self):
         group = self._group()
@@ -638,7 +750,9 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         token = actions[0].callback_data.split(":")[1]
         result = cancel_confirmation(token, chat_id="100")
         self.assertTrue(result["cancelled"])
-        self.assertEqual(db.get_organize_confirmation(token)["status"], "cancelled")
+        cancelled = db.get_organize_confirmation(token)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(json.loads(cancelled["result_json"])["resolution"], "deferred")
         with self.assertRaisesRegex(ValueError, "已处理"):
             start_confirmation(token, 0, chat_id="100")
 
@@ -738,6 +852,16 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             "app.modules.organize_tasks.get_organize_manager", return_value=manager
         ):
             start_confirmation(token, 0, chat_id="100")
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_confirmations SET expires_at=? WHERE token=?",
+                (
+                    (datetime.now(timezone.utc).astimezone() - timedelta(minutes=1)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    token,
+                ),
+            )
         published = []
         with patch(
             "app.modules.organize_confirmations.OrganizeRules.from_config",
@@ -753,6 +877,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 callbacks[0]()
         row = db.get_organize_confirmation(token)
         self.assertEqual(row["status"], "pending")
+        self.assertGreater(str(row["expires_at"] or ""), db.now())
         event = published[-1]
         self.assertEqual(event.actions[0].callback_data, f"orgc:{token}:0")
         self.assertIn("重新尝试", str(event.actions[0].label))
@@ -1223,6 +1348,12 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(event.title, "⚠️ 待确认媒体 1/1")
         self.assertIn(("剧集", "第 2 季 · E04 · 共 1 个视频"), event.fields)
         self.assertTrue(event.actions)
+        token = event.actions[0].callback_data.split(":")[1]
+        row = db.get_organize_confirmation(token)
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(row["organize_task_id"], "task-grouped")
+        self.assertEqual(payload["organize_rollup"]["actionable_groups"], 1)
+        self.assertEqual(payload["organize_rollup"]["actionable_files"], 1)
 
     def test_directory_notification_creates_clickable_candidate_event(self):
         group = self._group()
@@ -1257,7 +1388,9 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertIn(("剧集", "第 2 季 · E04 · 共 1 个视频"), event.fields)
         self.assertEqual(len(event.actions), 2)
         token = event.actions[0].callback_data.split(":")[1]
-        self.assertEqual(db.get_organize_confirmation(token)["status"], "pending")
+        row = db.get_organize_confirmation(token)
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["organize_task_id"], "directory-confirmation")
 
 
 class LocalMediaConfirmationTests(IsolatedDatabaseTestCase):

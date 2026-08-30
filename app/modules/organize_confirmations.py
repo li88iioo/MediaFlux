@@ -10,8 +10,9 @@ import json
 import re
 import secrets
 import threading
+import time
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app import database as db
 from app.clients.guangya import GuangYaClient, close_guangya_client
@@ -43,6 +44,7 @@ logger = get_logger(__name__)
 _CONFIRMATION_TTL_HOURS = 24
 _MAX_CANDIDATES = 3
 _DISPATCH_POLL_SECONDS = 1.0
+_CONFIRMATION_MAINTENANCE_SECONDS = 5 * 60.0
 _DELIVERY_LEASE_SECONDS = 120
 _DELIVERY_RETRY_SECONDS = (2, 8, 30, 120, 600)
 _dispatch_guard = threading.Lock()
@@ -50,6 +52,10 @@ _dispatch_stop = threading.Event()
 _dispatch_wakeup = threading.Event()
 _dispatch_thread: threading.Thread | None = None
 _dispatch_accepting = False
+_rollup_guard = threading.Lock()
+_TERMINAL_CONFIRMATION_STATUSES = frozenset({
+    "completed", "failed", "expired", "cancelled",
+})
 
 
 class ConfirmationRetryableError(RuntimeError):
@@ -158,7 +164,18 @@ def _candidate_summary_lines(group: dict) -> tuple[str, ...]:
     return tuple(lines)
 
 def _fingerprint(payload: dict) -> str:
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    # 父任务/消息绑定只描述通知投影，不属于文件快照身份。重复发布同一
+    # 候选时必须继续替代旧按钮，不能因新的汇总 task_id 产生新指纹。
+    stable_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {
+            "organize_task_id", "organize_rollup", "_telegram_message_id",
+        }
+    }
+    encoded = json.dumps(
+        stable_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -188,6 +205,7 @@ def _persist_confirmation_actions(
         directory_path=str(payload.get("directory") or "/"),
         payload=payload,
         expires_at=_timestamp(datetime.now() + timedelta(hours=_CONFIRMATION_TTL_HOURS)),
+        organize_task_id=str(payload.get("organize_task_id") or ""),
     )
     actions = [
         NotificationAction(_safe_label(candidate, index), f"orgc:{token}:{index}")
@@ -350,6 +368,11 @@ def create_confirmation_actions(
         "candidates": candidates,
         "rules": organize_rules_snapshot(effective_rules),
     }
+    organize_task_id = str(group.get("organize_task_id") or "").strip()
+    organize_rollup = group.get("organize_rollup")
+    if organize_task_id and isinstance(organize_rollup, dict):
+        payload["organize_task_id"] = organize_task_id
+        payload["organize_rollup"] = dict(organize_rollup)
     return _persist_confirmation_actions(payload, chat_id=chat_id)
 
 
@@ -498,12 +521,239 @@ def _finalize_guangya_manual_logs(
         )
 
 
+def _decode_json_object(value: object) -> dict:
+    try:
+        decoded = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _latest_confirmation_rows(rows: list) -> list:
+    """同一父任务重复投递时只统计每个文件快照的最新候选卡。"""
+    latest: dict[str, object] = {}
+    for row in rows:
+        fingerprint = str(row["fingerprint"] or "").strip()
+        key = fingerprint or "token:" + str(row["token"] or "")
+        current = latest.get(key)
+        if current is None or int(row["id"]) > int(current["id"]):
+            latest[key] = row
+    return sorted(latest.values(), key=lambda item: int(item["id"]))
+
+
+def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
+    """在全部候选进入终态后，生成一次父任务汇总增量。"""
+    latest_rows = _latest_confirmation_rows(rows)
+    if not latest_rows:
+        return None
+
+    baseline: dict = {}
+    payloads: dict[int, dict] = {}
+    for row in reversed(latest_rows):
+        payload = _decode_json_object(row["payload_json"])
+        payloads[int(row["id"])] = payload
+        candidate = payload.get("organize_rollup")
+        if not baseline and isinstance(candidate, dict):
+            baseline = dict(candidate)
+    if safe_int(baseline.get("version"), 0, minimum=0) != 1:
+        return None
+
+    expected_groups = safe_int(
+        baseline.get("actionable_groups"), 0, minimum=0,
+    )
+    if expected_groups <= 0 or len(latest_rows) < expected_groups:
+        return None
+    # 一个 task_id 正常只发布一批候选。若兼容调用重复投递了更多记录，
+    # 以最新基线对应的最后一批为准，避免旧卡重复计数。
+    if len(latest_rows) > expected_groups:
+        latest_rows = latest_rows[-expected_groups:]
+    if any(
+        str(row["status"] or "") not in _TERMINAL_CONFIRMATION_STATUSES
+        for row in latest_rows
+    ):
+        return None
+
+    outcomes = {
+        "groups": len(latest_rows),
+        "resolved_files": 0,
+        "moved": 0,
+        "metadata": 0,
+        "skipped": 0,
+        "failed": 0,
+        "expired": 0,
+    }
+    for row in latest_rows:
+        payload = payloads.get(int(row["id"])) or _decode_json_object(
+            row["payload_json"]
+        )
+        file_count = len([
+            item for item in (payload.get("files") or [])
+            if isinstance(item, dict)
+        ])
+        outcomes["resolved_files"] += file_count
+        status = str(row["status"] or "")
+        result = _decode_json_object(row["result_json"])
+        if status == "completed":
+            outcomes["moved"] += safe_int(result.get("moved"), 0, minimum=0)
+            outcomes["metadata"] += safe_int(
+                result.get("metadata_moved"), 0, minimum=0,
+            )
+            outcomes["skipped"] += safe_int(
+                result.get("skipped"), 0, minimum=0,
+            )
+            outcomes["failed"] += safe_int(
+                result.get("failed"), 0, minimum=0,
+            )
+        elif status == "cancelled":
+            outcomes["skipped"] += file_count
+        elif status == "expired":
+            outcomes["expired"] += file_count
+        else:
+            outcomes["failed"] += file_count
+    return baseline, outcomes
+
+
+def _maybe_update_parent_organize_rollup(
+    organize_task_id: str, *, chat_id: str = "",
+) -> bool:
+    """幂等收口一条原始 /organize 汇总；未全部结束时保持不动。"""
+    parent_id = str(organize_task_id or "").strip()
+    if not parent_id:
+        return False
+    with _rollup_guard:
+        rows = db.list_organize_confirmations_for_task(
+            parent_id, chat_id=str(chat_id or ""),
+        )
+        if not rows or not any(not bool(row["rollup_applied"]) for row in rows):
+            return False
+        rollup = _confirmation_rollup(rows)
+        if rollup is None:
+            return False
+        baseline, outcomes = rollup
+        from app.modules.telegram_organize_lifecycle import (
+            update_organize_lifecycle_confirmations,
+        )
+
+        accepted = bool(update_organize_lifecycle_confirmations(
+            parent_id,
+            chat_id=str(chat_id or ""),
+            baseline=baseline,
+            outcomes=outcomes,
+        ))
+        if accepted:
+            db.mark_organize_confirmation_rollup_applied(
+                parent_id, chat_id=str(chat_id or ""),
+            )
+        return accepted
+
+
+def _reconcile_unapplied_parent_rollups(*, limit: int = 50) -> int:
+    updated = 0
+    for row in db.list_unapplied_organize_confirmation_tasks(limit=limit):
+        try:
+            if _maybe_update_parent_organize_rollup(
+                str(row["organize_task_id"] or ""),
+                chat_id=str(row["chat_id"] or ""),
+            ):
+                updated += 1
+        except Exception as exc:  # noqa: BLE001 - 单个父汇总失败不能中断维护循环。
+            logger.warning(
+                "人工确认父汇总恢复失败 task=%s type=%s",
+                str(row["organize_task_id"] or "")[:32],
+                type(exc).__name__,
+            )
+    return updated
+
+
+def _expired_confirmation_event(payload: dict, row) -> NotificationEvent:
+    directory = str(
+        payload.get("directory") or row["directory_path"] or "/"
+    )
+    file_count = len([
+        item for item in (payload.get("files") or []) if isinstance(item, dict)
+    ])
+    return NotificationEvent(
+        "⌛ 人工确认已过期",
+        fields=(
+            ("目标媒体", payload.get("identity") or "待确认媒体"),
+            ("所在目录", directory),
+            NOTIFICATION_SECTION_BREAK,
+            ("涉及文件", f"{file_count} 个视频"),
+            ("处理状态", "候选有效期已结束，文件保持原位"),
+            ("附带说明", "重新执行整理时会再次尝试识别。"),
+        ),
+        layout="relaxed",
+    )
+
+
+def _publish_expired_confirmation(row) -> None:
+    payload = _decode_json_object(row["payload_json"])
+    chat_id = str(row["chat_id"] or "")
+    token = str(row["token"] or "")
+    event = _expired_confirmation_event(payload, row)
+    if not publish_confirmation_event(
+        event,
+        chat_id=chat_id,
+        token=token,
+        message_id=_confirmation_message_id(payload),
+        terminal=True,
+    ):
+        logger.warning(
+            "Telegram 过期确认终态未被统一通知中心接纳 token=%s",
+            token[:6],
+        )
+    _finalize_guangya_manual_logs(
+        payload, status="skipped", error="人工确认已过期",
+    )
+    _maybe_update_parent_organize_rollup(
+        str(row["organize_task_id"] or ""), chat_id=chat_id,
+    )
+
+
+def _expire_due_pending_confirmations(
+    *, token: str = "", limit: int = 100,
+) -> int:
+    rows = db.expire_pending_organize_confirmations(token=token, limit=limit)
+    for row in rows:
+        try:
+            _publish_expired_confirmation(row)
+        except Exception as exc:  # noqa: BLE001 - 单卡投影失败不能阻塞其它过期项。
+            logger.warning(
+                "人工确认过期收口失败 token=%s type=%s",
+                str(row["token"] or "")[:6],
+                type(exc).__name__,
+            )
+    return len(rows)
+
+
+def _raise_if_confirmation_expired(row) -> None:
+    if (
+        str(row["status"] or "") == "pending"
+        and str(row["expires_at"] or "") <= db.now()
+    ):
+        _expire_due_pending_confirmations(
+            token=str(row["token"] or ""), limit=1,
+        )
+        raise ValueError("确认操作已过期，请重新执行整理")
+
+
+def _run_confirmation_maintenance() -> bool:
+    """低频处理未点击过期与进程中断后尚未回写的父汇总。"""
+    expired = _expire_due_pending_confirmations(limit=100)
+    _reconcile_unapplied_parent_rollups(limit=50)
+    return expired >= 100
+
+
 def cancel_confirmation(
     token: str, *, chat_id: str, message_id: int | str | None = None
 ) -> dict:
     current = db.get_organize_confirmation(token)
     if current is None:
         raise ValueError("确认操作不存在或已失效")
+    expected_chat = str(current["chat_id"] or "")
+    if expected_chat and expected_chat != str(chat_id or ""):
+        raise ValueError("确认操作不存在或已失效")
+    _raise_if_confirmation_expired(current)
     payload = _decode_row(current)
     directory = str(current["directory_path"] or "/")
     try:
@@ -526,6 +776,7 @@ def cancel_confirmation(
         event_json=_serialize_notification_event(terminal_event),
         message_id=resolved_message_id or None,
         enqueue_delivery=False,
+        resolution="deferred",
     )
     publish_confirmation_event(
         terminal_event, chat_id=chat_id, token=token,
@@ -534,6 +785,15 @@ def cancel_confirmation(
     _finalize_guangya_manual_logs(
         payload, status="skipped", error="用户选择暂不处理",
     )
+    try:
+        _maybe_update_parent_organize_rollup(
+            str(current["organize_task_id"] or ""), chat_id=str(chat_id or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - 终态已落库，汇总投影只做补偿。
+        logger.warning(
+            "人工确认暂不处理后父汇总更新失败 token=%s type=%s",
+            str(token)[:6], type(exc).__name__,
+        )
     return {"cancelled": True, "directory": directory}
 
 
@@ -544,6 +804,10 @@ def skip_confirmation(
     current = db.get_organize_confirmation(token)
     if current is None:
         raise ValueError("确认操作不存在或已失效")
+    expected_chat = str(current["chat_id"] or "")
+    if expected_chat and expected_chat != str(chat_id or ""):
+        raise ValueError("确认操作不存在或已失效")
+    _raise_if_confirmation_expired(current)
     payload = _decode_row(current)
     if _confirmation_kind(payload) != "guangya" or not bool(
         payload.get("allow_skip_terminal")
@@ -572,6 +836,7 @@ def skip_confirmation(
         event_json=_serialize_notification_event(terminal_event),
         message_id=resolved_message_id or None,
         enqueue_delivery=False,
+        resolution="skipped",
     )
     reason = "用户选择跳过：暂无可用元数据"
     _finalize_guangya_manual_logs(payload, status="skipped", error=reason)
@@ -585,6 +850,15 @@ def skip_confirmation(
         logger.warning(
             "Telegram 跳过确认终态未被统一通知中心接纳 token=%s",
             str(token)[:6],
+        )
+    try:
+        _maybe_update_parent_organize_rollup(
+            str(current["organize_task_id"] or ""), chat_id=str(chat_id or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - 终态已落库，汇总投影只做补偿。
+        logger.warning(
+            "人工确认跳过后父汇总更新失败 token=%s type=%s",
+            str(token)[:6], type(exc).__name__,
         )
     return {"skipped": True, "directory": directory}
 
@@ -663,6 +937,15 @@ def _dispatch_confirmation_token(token: str) -> dict:
             str(token)[:6],
             type(exc).__name__,
         )
+        try:
+            _maybe_update_parent_organize_rollup(
+                str(row["organize_task_id"] or ""), chat_id=chat_id,
+            )
+        except Exception as rollup_exc:  # noqa: BLE001 - 不覆盖已持久化失败终态。
+            logger.warning(
+                "损坏确认任务父汇总更新失败 token=%s type=%s",
+                str(token)[:6], type(rollup_exc).__name__,
+            )
         return {"ok": False, "claimed": True, "terminal": True, "error": message}
 
     from app.modules.organize_tasks import get_organize_manager
@@ -831,12 +1114,21 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
 
 
 def _confirmation_dispatch_loop() -> None:
+    next_maintenance_at = 0.0
     while not _dispatch_stop.is_set():
         try:
             # stop() 可能在 while 条件检查后立刻触发；查询前再次确认，
             # 避免测试库/应用资源已经开始释放时仍访问 SQLite。
             if _dispatch_stop.is_set():
                 break
+            now_monotonic = time.monotonic()
+            if now_monotonic >= next_maintenance_at:
+                has_expiry_backlog = _run_confirmation_maintenance()
+                next_maintenance_at = (
+                    now_monotonic
+                    if has_expiry_backlog
+                    else now_monotonic + _CONFIRMATION_MAINTENANCE_SECONDS
+                )
             if _dispatch_due_confirmation_delivery():
                 continue
             row = db.get_next_queued_organize_confirmation()
@@ -927,6 +1219,7 @@ def start_confirmation(
     expected_chat = str(preview["chat_id"] or "")
     if expected_chat and expected_chat != str(chat_id or ""):
         raise ValueError("确认操作不存在或已失效")
+    _raise_if_confirmation_expired(preview)
 
     payload = _decode_row(preview)
     candidates = list(payload.get("candidates") or [])
@@ -934,9 +1227,6 @@ def start_confirmation(
         raise ValueError("候选参数无效")
     candidate = dict(candidates[selected_index])
     status = str(preview["status"] or "pending")
-    if status == "queued" and str(preview["expires_at"] or "") <= db.now():
-        db.expire_queued_organize_confirmations()
-        raise ValueError("确认操作已过期，请重新执行整理")
 
     if status in {"queued", "running", "completed"}:
         if int(preview["selected_index"] if preview["selected_index"] is not None else -1) != selected_index:
@@ -973,6 +1263,15 @@ def start_confirmation(
                 ) | {"replayed": True}
             if str(current["status"] or "") in {"queued", "running"}:
                 raise ValueError("该媒体已选择其他候选，不能重复修改")
+        if current is not None and str(current["status"] or "") == "expired":
+            try:
+                _publish_expired_confirmation(current)
+            except Exception as exc:  # noqa: BLE001 - 数据库终态优先，通知异步补偿。
+                logger.warning(
+                    "人工确认点击过期收口失败 token=%s type=%s",
+                    str(token)[:6], type(exc).__name__,
+                )
+            raise ValueError("确认操作已过期，请重新执行整理")
         raise
     queue_id = f"queue-{int(row['id']):06d}"
     db.update_organize_confirmation(token, task_id=queue_id, error="")
@@ -1409,21 +1708,39 @@ def _execute_local_media_confirmation(
 def _execute_confirmation(
     token: str, payload: dict, candidate: dict, *, selected_index: int, chat_id: str
 ) -> dict:
-    if _confirmation_kind(payload) == "local_media":
-        return _execute_local_media_confirmation(
+    try:
+        if _confirmation_kind(payload) == "local_media":
+            return _execute_local_media_confirmation(
+                token,
+                payload,
+                candidate,
+                selected_index=selected_index,
+                chat_id=chat_id,
+            )
+        return _execute_guangya_confirmation(
             token,
             payload,
             candidate,
             selected_index=selected_index,
             chat_id=chat_id,
         )
-    return _execute_guangya_confirmation(
-        token,
-        payload,
-        candidate,
-        selected_index=selected_index,
-        chat_id=chat_id,
-    )
+    finally:
+        # 成功、不可重试失败都在各自执行器内先落终态；由唯一出口尝试
+        # 收口父汇总。可重试失败会回到 pending，因此不会提前更新汇总。
+        row = db.get_organize_confirmation(token)
+        if row is not None and str(row["status"] or "") in (
+            _TERMINAL_CONFIRMATION_STATUSES
+        ):
+            try:
+                _maybe_update_parent_organize_rollup(
+                    str(row["organize_task_id"] or ""),
+                    chat_id=str(row["chat_id"] or chat_id or ""),
+                )
+            except Exception as exc:  # noqa: BLE001 - 不让投影失败反转整理结果。
+                logger.warning(
+                    "人工确认执行后父汇总更新失败 token=%s type=%s",
+                    str(token)[:6], type(exc).__name__,
+                )
 
 
 def _natural_sort_key(value: str) -> tuple[object, ...]:
@@ -1446,6 +1763,28 @@ def _confirmed_multipart_overrides(payload: dict, files: list[dict]) -> dict[obj
         overrides[name] = index
         overrides[(directory, name)] = index
     return overrides
+
+
+def _confirmation_notification_threads(
+    token: str, payload: dict, *, chat_id: str,
+) -> list[dict[str, object]]:
+    threads: list[dict[str, object]] = [{
+        "topic": "confirmation",
+        "thread_key": f"confirmation:{token}",
+        "token": token,
+        "chat_id": str(chat_id or ""),
+        "topic_enabled": True,
+    }]
+    organize_task_id = str(payload.get("organize_task_id") or "").strip()
+    if organize_task_id:
+        threads.append({
+            "topic": "organize",
+            "thread_key": f"organize:{organize_task_id}",
+            "task_id": organize_task_id,
+            "chat_id": str(chat_id or ""),
+            "topic_enabled": True,
+        })
+    return threads
 
 
 def _execute_guangya_confirmation(
@@ -1564,13 +1903,9 @@ def _execute_guangya_confirmation(
                 chat_id=chat_id,
                 notify_result=False,
                 strm_debounce_seconds=confirm_debounce,
-                notification_threads=[{
-                    "topic": "confirmation",
-                    "thread_key": f"confirmation:{token}",
-                    "token": token,
-                    "chat_id": str(chat_id or ""),
-                    "topic_enabled": True,
-                }],
+                notification_threads=_confirmation_notification_threads(
+                    token, payload, chat_id=chat_id,
+                ),
             )
         except Exception as post_exc:
             warning = f"STRM 后处理启动失败：{post_exc}"
@@ -1587,6 +1922,22 @@ def _execute_guangya_confirmation(
                 partial=True,
                 error=warning,
             )
+            organize_task_id = str(
+                payload.get("organize_task_id") or ""
+            ).strip()
+            if organize_task_id:
+                from app.modules.telegram_organize_lifecycle import (
+                    update_organize_lifecycle_downstream,
+                )
+
+                update_organize_lifecycle_downstream(
+                    organize_task_id,
+                    chat_id=chat_id,
+                    strm_status="启动失败",
+                    media_refresh="未触发",
+                    partial=True,
+                    error=warning,
+                )
             logger.warning(
                 "人工确认整理已完成但后处理启动失败 token=%s type=%s",
                 token[:6],
@@ -1631,6 +1982,13 @@ def _execute_guangya_confirmation(
             message_id=_confirmation_message_id(payload),
             retryable=retryable,
             enqueue_delivery=False,
+            retry_expires_at=(
+                _timestamp(
+                    datetime.now(timezone.utc).astimezone()
+                    + timedelta(hours=_CONFIRMATION_TTL_HOURS)
+                )
+                if retryable else ""
+            ),
         )
         publish_confirmation_event(
             failure_event, chat_id=chat_id, token=token,
@@ -1664,12 +2022,19 @@ def confirmation_event(
         group, rules, source_name=source_name, chat_id=chat_id
     )
     reason = str(group.get("reason") or "匹配结果需要人工确认").strip()
+    expiry_hint = (
+        f"候选有效期为 {_CONFIRMATION_TTL_HOURS} 小时；到期未处理将自动结束，"
+        "源文件保持原位。"
+    )
     if list(group.get("candidates") or []):
-        footer = f"{reason}\n\n请选择候选继续整理，或跳过此组。"
+        footer = (
+            f"{reason}\n\n请选择候选继续整理，或跳过此组。"
+            f"\n\n{expiry_hint}"
+        )
     else:
         footer = (
             f"{reason}\n\n当前没有可用元数据。可跳过此组；文件保持原位，"
-            "本次待确认状态会结束。"
+            f"本次待确认状态会结束。\n\n{expiry_hint}"
         )
     return NotificationEvent(
         title=title,

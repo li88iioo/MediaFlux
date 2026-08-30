@@ -1446,7 +1446,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
 
         self.assertEqual({item.title for item in results}, {"first", "second"})
 
-    def test_queue_position_excludes_expired_queued_items(self):
+    def test_queue_position_keeps_user_selected_items_after_candidate_ttl(self):
         expired_at = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
         valid_at = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
         old_id = db.create_organize_confirmation(
@@ -1463,8 +1463,8 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
                 (db.now(), old_id, new_id),
             )
 
-        self.assertEqual(db.get_organize_confirmation_queue_position(new_id), 0)
-        self.assertEqual(db.get_organize_confirmation("old")["status"], "expired")
+        self.assertEqual(db.get_organize_confirmation_queue_position(new_id), 1)
+        self.assertEqual(db.get_organize_confirmation("old")["status"], "queued")
 
 
 if __name__ == "__main__":

@@ -2986,7 +2986,10 @@ class Organizer:
         if not rules.notify_enabled or not rules.library_notify:
             return
         try:
-            from app.modules.telegram_organize_lifecycle import publish_organize_lifecycle
+            from app.modules.telegram_organize_lifecycle import (
+                build_organize_confirmation_rollup,
+                publish_organize_lifecycle,
+            )
             from app.notifier import safe_int
 
             task_id = str(
@@ -2995,12 +2998,7 @@ class Organizer:
             # 目录刮削的首次汇总与随后 STRM 状态必须复用同一个线程。
             # 写回 stats 后，trigger_post_actions() 的兼容汇总不会再生成 legacy-*。
             stats["task_id"] = task_id
-            groups, actionable_count = Organizer._validated_task_confirmation_groups(stats)
-            notification_stats = {
-                **stats,
-                "notification_actionable_confirmation_files": actionable_count,
-                "notification_actionable_confirmation_groups": len(groups),
-            }
+            groups, notification_stats = Organizer._notification_projection(stats)
             unsafe_partial = bool(
                 stats.get("failed")
                 or stats.get("scan_errors")
@@ -3015,7 +3013,7 @@ class Organizer:
                 and safe_int(stats.get("moved"), 0, minimum=0)
                 and (not unsafe_partial or stats.get("strm_changes"))
             )
-            publish_organize_lifecycle(
+            summary_sent = bool(publish_organize_lifecycle(
                 task_id, notification_stats, source_name=source_name or "目录刮削",
                 chat_id=chat_id,
                 topic_enabled=rules.notify_enabled and rules.library_notify,
@@ -3027,9 +3025,14 @@ class Organizer:
                 media_refresh=(
                     "等待 STRM 完成" if waiting_for_strm else "未触发"
                 ),
-            )
+            ))
             Organizer._deliver_task_confirmation_groups(
                 groups, rules, source_name=source_name, chat_id=chat_id,
+                organize_task_id=task_id if summary_sent else "",
+                organize_rollup=(
+                    build_organize_confirmation_rollup(notification_stats)
+                    if summary_sent else None
+                ),
             )
         except Exception as exc:
             logger.warning("整理目录通知失败 type=%s", type(exc).__name__)
@@ -3042,6 +3045,7 @@ class Organizer:
             return False
         try:
             from app.modules.telegram_organize_lifecycle import (
+                build_organize_confirmation_rollup,
                 publish_organize_lifecycle,
             )
 
@@ -3053,20 +3057,7 @@ class Organizer:
             strm_status, refresh_status = Organizer._notification_downstream_labels(
                 stats
             )
-            groups, actionable_count = (
-                Organizer._validated_task_confirmation_groups(stats)
-            )
-            candidate_group_count = sum(
-                1 for group in groups if list(group.get("candidates") or [])
-            )
-            skip_only_group_count = len(groups) - candidate_group_count
-            notification_stats = {
-                **stats,
-                "notification_actionable_confirmation_files": actionable_count,
-                "notification_actionable_confirmation_groups": len(groups),
-                "notification_candidate_confirmation_groups": candidate_group_count,
-                "notification_skip_confirmation_groups": skip_only_group_count,
-            }
+            groups, notification_stats = Organizer._notification_projection(stats)
             summary_sent = bool(publish_organize_lifecycle(
                 task_id,
                 notification_stats,
@@ -3081,11 +3072,35 @@ class Organizer:
                 rules,
                 source_name=source_name,
                 chat_id=chat_id,
+                organize_task_id=task_id if summary_sent else "",
+                organize_rollup=(
+                    build_organize_confirmation_rollup(notification_stats)
+                    if summary_sent else None
+                ),
             )
             return bool(summary_sent and confirmations_sent)
         except Exception as exc:
             logger.warning("整理任务汇总通知失败 type=%s", type(exc).__name__)
             return False
+
+    @staticmethod
+    def _notification_projection(stats: dict) -> tuple[list[dict], dict]:
+        """统一生成汇总与候选卡使用的可操作确认统计。"""
+        groups, actionable_count = Organizer._validated_task_confirmation_groups(
+            stats
+        )
+        candidate_group_count = sum(
+            1 for group in groups if list(group.get("candidates") or [])
+        )
+        return groups, {
+            **stats,
+            "notification_actionable_confirmation_files": actionable_count,
+            "notification_actionable_confirmation_groups": len(groups),
+            "notification_candidate_confirmation_groups": candidate_group_count,
+            "notification_skip_confirmation_groups": (
+                len(groups) - candidate_group_count
+            ),
+        }
 
     @staticmethod
     def _validated_task_confirmation_groups(
@@ -3172,6 +3187,8 @@ class Organizer:
         *,
         source_name: str = "",
         chat_id: str = "",
+        organize_task_id: str = "",
+        organize_rollup: dict | None = None,
     ) -> bool:
         """发送独立候选卡；失败时保留已持久化任务并给出 Web 回退。"""
         if not groups:
@@ -3189,14 +3206,18 @@ class Organizer:
             elif group_source:
                 scope = group_source
             try:
+                confirmation_group = dict(group)
+                if organize_task_id and isinstance(organize_rollup, dict):
+                    confirmation_group["organize_task_id"] = str(organize_task_id)
+                    confirmation_group["organize_rollup"] = dict(organize_rollup)
                 event = confirmation_event(
                     f"⚠️ 待确认媒体 {index}/{len(groups)}",
                     {
-                        "媒体": str(group.get("identity") or "待确认媒体"),
-                        "剧集": Organizer._confirmation_scope_summary(group),
+                        "媒体": str(confirmation_group.get("identity") or "待确认媒体"),
+                        "剧集": Organizer._confirmation_scope_summary(confirmation_group),
                         "来源": scope,
                     },
-                    group,
+                    confirmation_group,
                     rules,
                     source_name=group_source,
                     chat_id=chat_id,
@@ -3249,7 +3270,10 @@ class Organizer:
         if not rules.notify_enabled or not rules.library_notify:
             return
         try:
-            from app.modules.telegram_organize_lifecycle import publish_organize_lifecycle
+            from app.modules.telegram_organize_lifecycle import (
+                publish_organize_lifecycle,
+                update_organize_lifecycle_downstream,
+            )
 
             task_id = str(stats.get("task_id") or "").strip()
             if not task_id:
@@ -3258,8 +3282,18 @@ class Organizer:
             strm_status, media_refresh = Organizer._notification_downstream_labels(
                 stats
             )
+            updated = update_organize_lifecycle_downstream(
+                task_id,
+                chat_id=chat_id,
+                strm_status=strm_status,
+                media_refresh=media_refresh,
+                topic_enabled=rules.notify_enabled and rules.library_notify,
+            )
+            if updated.status != "missing_thread":
+                return
+            _groups, notification_stats = Organizer._notification_projection(stats)
             publish_organize_lifecycle(
-                task_id, stats, source_name=source_name, chat_id=chat_id,
+                task_id, notification_stats, source_name=source_name, chat_id=chat_id,
                 topic_enabled=rules.notify_enabled and rules.library_notify,
                 strm_status=strm_status, media_refresh=media_refresh,
             )

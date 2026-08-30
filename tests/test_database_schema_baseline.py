@@ -61,6 +61,42 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertIn("idx_media_subscription_notification_due", indexes)
         self.assertIn("idx_media_subscription_notification_subscription", indexes)
 
+    def test_v13_confirmation_schema_gains_parent_rollup_columns(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                "CREATE TABLE organize_confirmations ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "token TEXT NOT NULL UNIQUE"
+                ");"
+                "INSERT INTO organize_confirmations(token) VALUES('keep-me');"
+            )
+
+            db._migrate_organize_confirmation_rollup_v14(conn)
+
+            columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(organize_confirmations)"
+                )
+            }
+            indexes = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA index_list(organize_confirmations)"
+                )
+            }
+            preserved = conn.execute(
+                "SELECT token,organize_task_id,rollup_applied "
+                "FROM organize_confirmations"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertTrue({"organize_task_id", "rollup_applied"}.issubset(columns))
+        self.assertIn("idx_organize_confirmations_organize_task", indexes)
+        self.assertEqual(preserved, ("keep-me", "", 0))
+
     def test_fresh_database_contains_complete_v10_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -92,6 +128,12 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(agent_action_history)")
             }
+            confirmation_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(organize_confirmations)"
+                )
+            }
             rss_indexes = {
                 str(row["name"]): int(row["unique"])
                 for row in conn.execute("PRAGMA index_list(rss_entries)")
@@ -118,6 +160,14 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertIn("confirmation_id", action_columns)
         self.assertEqual(rss_indexes.get("idx_rss_entries_item_guid"), 1)
         self.assertEqual(rss_indexes.get("idx_rss_entries_failure_retry"), 0)
+        self.assertTrue(
+            {"organize_task_id", "rollup_applied"}.issubset(
+                confirmation_columns
+            )
+        )
+        self.assertIn(
+            "idx_organize_confirmations_organize_task", schema_objects
+        )
         self.assertTrue({
             "media_title_aliases",
             "idx_media_title_alias_lookup",
