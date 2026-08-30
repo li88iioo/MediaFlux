@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-08-30
+
+### Added
+- 新增按来源目录启用的成人内容整理链路：仅处理显式指定的 NSFW 来源，支持番号清洗、MetaTube 多来源候选归并、同番号分段文件、Telegram/Web 人工确认，以及无元数据时“清洗标题后入库”的安全兜底；归档位置继续复用媒体库页面配置的真实分类目录（[`d7f12ab`](https://github.com/li88iioo/MediaFlux/commit/d7f12ab)）。
+- 新增统一 Telegram 通知中心与线程快照，整理、STRM、下载、RSS、Agent 等长任务可共享可恢复的消息身份、修订号和投递结果，并等待卡片更新完成后再结束输入状态（[`bb3f99c`](https://github.com/li88iioo/MediaFlux/commit/bb3f99c)、[`a7ca872`](https://github.com/li88iioo/MediaFlux/commit/a7ca872)）。
+
+### Changed
+- Telegram 媒体通知统一为紧凑、分段且信息完整的富文本布局，恢复入库媒体、文件、STRM 与媒体库刷新明细，同时减少重复终态与链路噪声（[`8763dd2`](https://github.com/li88iioo/MediaFlux/commit/8763dd2)、[`bb3f99c`](https://github.com/li88iioo/MediaFlux/commit/bb3f99c)）。
+- 运行时生命周期统一采用关闭门控、在途任务排空和有界缓存；Web 刷新保留旧数据并呈现部分失败，整理轮询改为可见性感知重试，订阅媒体库映射改为批量读取，Docker 非 root 数据目录仅在首次或显式请求时递归迁移权限（[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)）。
+
+### Fixed
+- 修复整理联动 STRM 在变化目标合并时把布尔值当作可迭代对象，导致 `'bool' object is not iterable`；同时加强发布名清洗与队列合并边界（[`50aaf85`](https://github.com/li88iioo/MediaFlux/commit/50aaf85)）。
+- 修复 Telegram 终态编辑失败时重复补发、投递结果未知时盲目重放、旧 revision 覆盖新状态，以及输入状态早于候选卡更新消失的问题（[`9a41d6f`](https://github.com/li88iioo/MediaFlux/commit/9a41d6f)、[`0636477`](https://github.com/li88iioo/MediaFlux/commit/0636477)、[`0f2de1d`](https://github.com/li88iioo/MediaFlux/commit/0f2de1d)、[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)）。
+- 修复本地媒体移动提交后收尾异常可能错误恢复 qB、配置文件与 STRM 退役状态可能分裂、发现/索引/反代客户端关机泄漏、持久缓存无界增长，以及 Chromium 首次打开目录菜单时被自身 resize/scroll 立即关闭的问题（[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)）。
+- 发布流水线现拒绝用不同提交覆盖既有精确版本镜像或 GitHub Release，保持正式版本标签与制品不可变（[`cb4957f`](https://github.com/li88iioo/MediaFlux/commit/cb4957f)）。
+
 ## [0.1.9] - 2026-08-29
 
 ### Added
@@ -184,7 +200,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/li88iioo/MediaFlux/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/li88iioo/MediaFlux/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/li88iioo/MediaFlux/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/li88iioo/MediaFlux/compare/v0.1.6...v0.1.7
