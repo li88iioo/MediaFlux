@@ -274,6 +274,39 @@ def _submission_has_unknown(results: dict[str, dict[str, Any]]) -> bool:
     )
 
 
+def _finalize_submission_state(
+    request_id: int,
+    claimed_targets: tuple[str, ...] | list[str],
+    updates: dict[str, Any],
+) -> tuple[str, str]:
+    committed_status = db.finalize_download_request_submission(
+        int(request_id), claimed_targets, **updates
+    )
+    if committed_status is not None:
+        return str(committed_status), ""
+
+    current = db.get_download_request(int(request_id))
+    current_status = str(current["status"] or "manual_review") if current else "manual_review"
+    notice = (
+        "下载后端返回结果时请求状态已被恢复或人工接管；"
+        "本次迟到结果未覆盖当前记录，请核对远端任务"
+    )
+    logger.warning(
+        "忽略下载提交迟到结果 request=%s targets=%s current_status=%s",
+        int(request_id),
+        ",".join(claimed_targets),
+        current_status,
+    )
+    return current_status, notice
+
+
+def _submission_log_error(result: dict[str, Any], late_notice: str) -> str:
+    error = str(result.get("error") or "")
+    if not late_notice:
+        return error
+    return f"{error}；{late_notice}" if error else late_notice
+
+
 def _public_dispatch_targets(value: Any) -> list[str]:
     if not isinstance(value, (list, tuple, set, frozenset)):
         return []
@@ -705,21 +738,30 @@ def dispatch_missing_targets(
     updates.update({"status": overall_status, "error": error})
     if overall_status in {"completed", "failed"}:
         updates["completed_at"] = db.now()
-    db.update_download_request_and_sync_media_admission(int(request_id), **updates)
+    overall_status, late_notice = _finalize_submission_state(
+        int(request_id), list(claimed), updates
+    )
 
     for source, result in results.items():
         db.add_download_log(
             source=source, title=title, path=source_value, request_id=int(request_id),
             backend_task_id=str(result.get("task_id") or ""),
             status=_backend_submission_status(source, result),
-            error=str(result.get("error") or ""),
+            error=_submission_log_error(result, late_notice),
         )
+    has_unknown = _submission_has_unknown(results)
+    if late_notice:
+        return {
+            "handled": True, "ok": False, "request_id": int(request_id),
+            "status": overall_status, "succeeded": succeeded, "failed": failed,
+            "results": results, "error": late_notice, "duplicate": False,
+            "outcome_unknown": True, "review_required": True, "stale_result": True,
+        }
     return {
         "handled": True, "ok": bool(succeeded), "request_id": int(request_id),
         "status": overall_status, "succeeded": succeeded, "failed": failed,
         "results": results, "error": error, "duplicate": False,
-        "outcome_unknown": _submission_has_unknown(results),
-        "review_required": _submission_has_unknown(results),
+        "outcome_unknown": has_unknown, "review_required": has_unknown,
     }
 
 def dispatch_request(request_id: int, targets: str, *,
@@ -791,7 +833,9 @@ def dispatch_request(request_id: int, targets: str, *,
         updates["gy_unverified_manifest"] = 1 if gy_result.get("unverified_manifest") else 0
     if status == "failed":
         updates["completed_at"] = db.now()
-    db.update_download_request_and_sync_media_admission(request_id, **updates)
+    status, late_notice = _finalize_submission_state(
+        request_id, list(results), updates
+    )
 
     for source, result in results.items():
         db.add_download_log(
@@ -801,8 +845,15 @@ def dispatch_request(request_id: int, targets: str, *,
             request_id=request_id,
             backend_task_id=str(result.get("task_id") or ""),
             status=_backend_submission_status(source, result),
-            error=str(result.get("error") or ""),
+            error=_submission_log_error(result, late_notice),
         )
+    if late_notice:
+        return {
+            "ok": False, "request_id": request_id, "status": status,
+            "succeeded": succeeded, "failed": failed, "results": results,
+            "error": late_notice, "outcome_unknown": True,
+            "review_required": True, "stale_result": True,
+        }
     return {
         "ok": bool(succeeded), "request_id": request_id, "status": status,
         "succeeded": succeeded, "failed": failed, "results": results,

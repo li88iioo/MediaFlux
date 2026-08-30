@@ -49,18 +49,18 @@ class GuangYaSubmissionOutcomeTests(unittest.TestCase):
         ), patch(
             "app.modules.download_dispatcher._submit_guangya", return_value=partial
         ), patch(
-            "app.database.update_download_request_and_sync_media_admission"
-        ) as update, patch("app.database.add_download_log") as add_log:
+            "app.database.finalize_download_request_submission", return_value="submitted"
+        ) as finalize, patch("app.database.add_download_log") as add_log:
             result = dispatch_request(91, "guangya")
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "submitted")
         self.assertTrue(result["outcome_unknown"])
         self.assertTrue(result["review_required"])
-        self.assertEqual(update.call_args.kwargs["gy_status"], "outcome_unknown")
-        self.assertEqual(update.call_args.kwargs["status"], "submitted")
-        self.assertNotIn("completed_at", update.call_args.kwargs)
-        self.assertEqual(json.loads(update.call_args.kwargs["gy_task_ids"]), ["gy-accepted"])
+        self.assertEqual(finalize.call_args.kwargs["gy_status"], "outcome_unknown")
+        self.assertEqual(finalize.call_args.kwargs["status"], "submitted")
+        self.assertNotIn("completed_at", finalize.call_args.kwargs)
+        self.assertEqual(json.loads(finalize.call_args.kwargs["gy_task_ids"]), ["gy-accepted"])
         self.assertEqual(add_log.call_args.kwargs["status"], "outcome_unknown")
 
     def test_dispatch_missing_target_preserves_partial_submission_as_outcome_unknown(self):
@@ -71,15 +71,15 @@ class GuangYaSubmissionOutcomeTests(unittest.TestCase):
         ), patch(
             "app.modules.download_dispatcher._submit_guangya", return_value=partial
         ), patch(
-            "app.database.update_download_request_and_sync_media_admission"
-        ) as update, patch("app.database.add_download_log") as add_log:
+            "app.database.finalize_download_request_submission", return_value="submitted"
+        ) as finalize, patch("app.database.add_download_log") as add_log:
             result = dispatch_missing_targets(92, "guangya")
 
         self.assertTrue(result["handled"])
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "submitted")
         self.assertTrue(result["outcome_unknown"])
-        self.assertEqual(update.call_args.kwargs["gy_status"], "outcome_unknown")
+        self.assertEqual(finalize.call_args.kwargs["gy_status"], "outcome_unknown")
         self.assertEqual(add_log.call_args.kwargs["status"], "outcome_unknown")
 
     def test_torrent_submission_passes_original_bytes_to_guangya_resolver(self):

@@ -124,7 +124,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertNotIn("data-cache-retention-days", downloads_ui)
         self.assertNotIn("qB Web API 导出原始种子", downloads_ui)
         self.assertNotIn("download-cache-backends", downloads_ui)
-        self.assertIn("window.loadAppConfig()", downloads_ui)
+        self.assertIn("window.loadAppConfig({signal:controller.signal})", downloads_ui)
         self.assertIn("window.saveAppConfig(torrentCachePolicyForm", downloads_ui)
         self.assertIn(".download-cache-actions .download-cache-action", downloads_styles)
         self.assertIn("height: 40px;", downloads_styles)

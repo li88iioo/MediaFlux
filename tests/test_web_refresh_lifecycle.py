@@ -204,6 +204,71 @@ class OrganizeStatusPollingLifecycleTests(unittest.TestCase):
         self.assertNotIn("setInterval(loadStatus", source)
         self.assertIn("Promise.allSettled", (ROOT / "app/static/js/local-media.js").read_text(encoding="utf-8"))
 
+    def test_config_save_serializes_requests_and_coalesces_while_busy(self):
+        source = (ROOT / "app/static/js/organize.js").read_text(encoding="utf-8")
+        save_block = _extract(
+            source,
+            "    function finishConfigLoad(success){",
+            "\n    async function preview(){",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            let saveCalls = 0;
+            let activeSaves = 0;
+            let maxActiveSaves = 0;
+            let statusLoads = 0;
+            const saveResolvers = [];
+            const button = {{
+              disabled: false,
+              attributes: {{}},
+              setAttribute(name, value) {{this.attributes[name] = String(value);}},
+            }};
+            const state = {{textContent: '', className: ''}};
+            const document = {{
+              getElementById: (id) => id === 'saveOrganizeConfigBtn' ? button : state,
+            }};
+            const workspace = {{}};
+            const sourceInput = null;
+            const isRules = false;
+            const extensionEditors = {{video: null, metadata: null}};
+            const configFieldLocks = [];
+            let configReady = true;
+            let configSaveBusy = false;
+            let configSaveQueued = false;
+            let configSavePromise = null;
+            const saveAppConfig = async () => {{
+              saveCalls += 1;
+              activeSaves += 1;
+              maxActiveSaves = Math.max(maxActiveSaves, activeSaves);
+              return new Promise((resolve) => saveResolvers.push(() => {{activeSaves -= 1; resolve({{}});}}));
+            }};
+            const loadStatus = async () => {{statusLoads += 1;}};
+            {save_block}
+            (async () => {{
+              const first = saveConfig();
+              const duplicate = saveConfig();
+              assert.equal(duplicate, first);
+              assert.equal(saveCalls, 1);
+              assert.equal(maxActiveSaves, 1);
+              assert.equal(button.disabled, true);
+              assert.equal(button.attributes['aria-busy'], 'true');
+              saveResolvers.shift()();
+              await new Promise(setImmediate);
+              assert.equal(saveCalls, 2);
+              assert.equal(activeSaves, 1);
+              assert.equal(maxActiveSaves, 1);
+              assert.equal(button.disabled, true);
+              saveResolvers.shift()();
+              await Promise.all([first, duplicate]);
+              assert.equal(statusLoads, 2);
+              assert.equal(button.disabled, false);
+              assert.equal(button.attributes['aria-busy'], 'false');
+            }})().catch((error) => {{console.error(error); process.exit(1);}});
+            """
+        )
+        _run_node(script)
+
 
 class StrmStatusPollingLifecycleTests(unittest.TestCase):
     def test_status_polling_is_single_flight_and_preserves_last_good_state(self):
@@ -388,6 +453,404 @@ class SettingsDraftLifecycleTests(unittest.TestCase):
         reload_call = dashboard.index("window.location.reload()", pending_branch)
         self.assertIn("return;", dashboard[pending_branch:reload_call])
 
+class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
+    def test_media_recent_ignores_old_body_after_newer_results_apply(self):
+        source = (ROOT / "app/templates/media_recent.html").read_text(encoding="utf-8")
+        block = _extract(
+            source,
+            "    const form=document.querySelector('[data-media-recent-filter]');",
+            "\n    form?.addEventListener('submit'",
+        )
+        script = textwrap.dedent(
+            """
+            const assert = require('node:assert/strict');
+            const makeClassList = () => ({add() {}, remove() {}, toggle() {}, contains() {return false;}});
+            let currentResults = {
+              name: 'initial', style: {}, classList: makeClassList(),
+              getBoundingClientRect: () => ({height: 120}),
+              replaceWith(next) {currentResults = next;},
+            };
+            const overview = {innerHTML: 'initial'};
+            const filterForm = {
+              classList: makeClassList(), setAttribute() {},
+              closest: () => ({classList: makeClassList()}), querySelector: () => null,
+            };
+            const documents = {};
+            for (const name of ['A', 'B']) {
+              const results = {name, style: {}, classList: makeClassList()};
+              documents[name] = {
+                querySelector(selector) {
+                  if (selector === '[data-media-recent-results]') return results;
+                  if (selector === '.media-recent-overview-copy small') return {innerHTML: name};
+                  return null;
+                },
+              };
+            }
+            const document = {
+              querySelector(selector) {
+                if (selector === '[data-media-recent-filter]') return filterForm;
+                if (selector === '[data-media-recent-results]') return currentResults;
+                if (selector === '.media-recent-overview-copy small') return overview;
+                return null;
+              },
+            };
+            class DOMParser {parseFromString(text) {return documents[text];}}
+            const pendingBodies = new Map();
+            const fetch = async (url) => ({
+              ok: true, status: 200,
+              text: () => new Promise(resolve => pendingBodies.set(url, resolve)),
+            });
+            const historyUrls = [];
+            const history = {replaceState: (_state, _title, url) => historyUrls.push(String(url))};
+            const location = {assign: () => {throw new Error('must not hard navigate');}};
+            const renderLucideIcons = () => {};
+            const requestAnimationFrame = callback => {callback(); return 1;};
+            const matchMedia = () => ({matches: false});
+            """
+        ) + block + textwrap.dedent(
+            """
+            (async () => {
+              const first = updateResults('/first');
+              await new Promise(setImmediate);
+              const second = updateResults('/second');
+              await new Promise(setImmediate);
+              pendingBodies.get('/second')('B');
+              await second;
+              assert.equal(currentResults.name, 'B');
+              assert.equal(overview.innerHTML, 'B');
+              assert.deepEqual(historyUrls, ['/second']);
+
+              pendingBodies.get('/first')('A');
+              await first;
+              assert.equal(currentResults.name, 'B');
+              assert.equal(overview.innerHTML, 'B');
+              assert.deepEqual(historyUrls, ['/second']);
+            })().catch(error => {console.error(error); process.exit(1);});
+            """
+        )
+        _run_node(script)
+
+    def test_torrent_policy_ignores_closed_modal_load_and_clears_busy_state(self):
+        source = (ROOT / "app/static/js/downloads.js").read_text(encoding="utf-8")
+        block = _extract(
+            source,
+            "const torrentCachePolicyForm=document.getElementById('torrentCachePolicyForm');",
+            "\nlet overviewTimer=null;",
+        )
+        script = textwrap.dedent(
+            """
+            const assert = require('node:assert/strict');
+            const handlers = {};
+            const attributes = {};
+            const form = {};
+            const button = {addEventListener(name, handler) {handlers['open:' + name] = handler;}};
+            const save = {
+              disabled: false,
+              setAttribute(name, value) {attributes[name] = String(value);},
+              removeAttribute(name) {delete attributes[name];},
+              addEventListener(name, handler) {handlers['save:' + name] = handler;},
+            };
+            const retention = {
+              value: '', readOnly: false, dataset: {},
+              addEventListener(name, handler) {handlers['retention:' + name] = handler;},
+              focus() {},
+            };
+            const state = {textContent: '', className: ''};
+            const modalElement = {};
+            const elements = {
+              torrentCachePolicyForm: form,
+              torrentCachePolicyBtn: button,
+              torrentCachePolicySave: save,
+              torrentCacheRetentionDays: retention,
+              torrentCachePolicyState: state,
+              torrentCachePolicyModal: modalElement,
+            };
+            const document = {getElementById: id => elements[id]};
+            let modalOptions = null;
+            let closes = 0;
+            const loads = [];
+            const window = {
+              createAppModal(_element, options) {
+                modalOptions = options;
+                return {open() {}, close() {closes += 1;}};
+              },
+              loadAppConfig({signal} = {}) {
+                return new Promise(resolve => loads.push({resolve, signal}));
+              },
+              fillConfigFields(_root, config) {retention.value = config.retention;},
+              saveAppConfig: async () => ({}),
+            };
+            """
+        ) + block + textwrap.dedent(
+            """
+            (async () => {
+              const first = openTorrentCachePolicy();
+              await new Promise(setImmediate);
+              assert.equal(attributes['aria-busy'], 'true');
+              modalOptions.onRequestClose();
+              assert.equal(attributes['aria-busy'], 'false');
+              assert.equal(closes, 1);
+
+              const second = openTorrentCachePolicy();
+              await new Promise(setImmediate);
+              loads[1].resolve({retention: '30'});
+              await second;
+              assert.equal(retention.value, '30');
+              retention.value = '45';
+              loads[0].resolve({retention: '7'});
+              await first;
+              assert.equal(retention.value, '45');
+              assert.equal(save.disabled, false);
+              assert.equal(attributes['aria-busy'], 'false');
+            })().catch(error => {console.error(error); process.exit(1);});
+            """
+        )
+        _run_node(script)
+
+    def test_directory_external_hints_ignore_changed_query(self):
+        source = (ROOT / "app/static/js/guangya-directory-scrape.js").read_text(encoding="utf-8")
+        invalidate_block = _extract(
+            source,
+            "    function invalidateExternalHints() {",
+            "\n\n    function openModal",
+        )
+        load_block = _extract(
+            source,
+            "    async function loadExternalHints() {",
+            "\n\n    function addChip",
+        )
+        script = textwrap.dedent(
+            """
+            const assert = require('node:assert/strict');
+            const externalHints = {hidden: true, replaceChildren() {this.cleared = (this.cleared || 0) + 1;}};
+            const elements = {
+              query: {value: 'Old title'}, type: {value: 'auto'},
+              externalBtn: {disabled: false}, externalHints,
+            };
+            const state = {
+              inspection: {inspection_id: 'inspection-1'}, requestVersion: 4,
+              externalController: null, pendingExternalKey: '',
+            };
+            const setButtonContent = () => {};
+            const isNsfwOnly = () => false;
+            const alerts = [];
+            const window = {appAlert: value => alerts.push(value)};
+            let resolveRequest;
+            const api = () => new Promise(resolve => {resolveRequest = resolve;});
+            let rendered = 0;
+            const renderExternalHints = () => {rendered += 1; externalHints.hidden = false;};
+            """
+        ) + invalidate_block + load_block + textwrap.dedent(
+            """
+            (async () => {
+              const pending = loadExternalHints();
+              await new Promise(setImmediate);
+              elements.query.value = 'New title';
+              state.requestVersion += 1;
+              invalidateExternalHints();
+              resolveRequest({hints: [{title: 'Old result'}]});
+              await pending;
+              assert.equal(rendered, 0);
+              assert.equal(externalHints.hidden, true);
+              assert.equal(elements.externalBtn.disabled, false);
+              assert.equal(alerts.length, 0);
+            })().catch(error => {console.error(error); process.exit(1);});
+            """
+        )
+        _run_node(script)
+
+    def test_share_preview_is_invalidated_when_url_changes_mid_inspection(self):
+        source = (ROOT / "app/templates/_share_transfer_scripts.html").read_text(encoding="utf-8")
+        block = _extract(source, "    let previewId='';", "\n    function renderTarget")
+        script = textwrap.dedent(
+            """
+            const assert = require('node:assert/strict');
+            const elements = {
+              shareUrl: {value: 'https://guangyapan.com/s/old'},
+              shareStateTag: {innerHTML: '', className: ''},
+              shareSelectionCount: {textContent: ''},
+              shareCheckAll: {checked: false, indeterminate: false},
+              restoreShareBtn: {disabled: false},
+              shareTransferSummary: {textContent: ''},
+              shareTargetDirName: {value: '目标目录'},
+              shareFileToolbar: {hidden: true},
+              shareFileList: {
+                innerHTML: '', children: [],
+                replaceChildren() {this.innerHTML = ''; this.children = [];},
+                querySelectorAll() {return [];},
+              },
+              shareMessage: {textContent: ''},
+              inspectShareBtn: {disabled: false, innerHTML: ''},
+            };
+            const document = {
+              getElementById: id => elements[id],
+              querySelectorAll: () => [],
+            };
+            const window = {renderLucideIcons() {}};
+            let resolveInspect;
+            const fetch = () => new Promise(resolve => {resolveInspect = resolve;});
+            """
+        ) + block + textwrap.dedent(
+            """
+            (async () => {
+              const pending = inspectShare();
+              await new Promise(setImmediate);
+              elements.shareUrl.value = 'https://guangyapan.com/s/new';
+              invalidateSharePreview('分享链接已变化，请重新解析');
+              resolveInspect({
+                ok: true,
+                json: async () => ({preview_id: 'old-preview', share_id: 'old', count: 1, files: [{id: '1'}]}),
+              });
+              await pending;
+              assert.equal(previewId, '');
+              assert.equal(previewUrl, '');
+              assert.deepEqual(files, []);
+              assert.equal(elements.shareFileToolbar.hidden, true);
+              assert.equal(elements.restoreShareBtn.disabled, true);
+              assert.equal(elements.inspectShareBtn.disabled, false);
+              assert.match(elements.inspectShareBtn.innerHTML, /解析分享/);
+              assert.match(elements.shareMessage.textContent, /重新解析/);
+            })().catch(error => {console.error(error); process.exit(1);});
+            """
+        )
+        _run_node(script)
+
+    def test_dashboard_config_requests_are_bound_to_modal_and_current_draft(self):
+        source = (ROOT / "app/templates/dashboard.html").read_text(encoding="utf-8")
+        block = _extract(
+            source,
+            "    const modalEl=document.getElementById('mediaConfigModal');",
+            "\n})();",
+        )
+        script = textwrap.dedent(
+            """
+            const assert = require('node:assert/strict');
+            function control(dataset = {}) {
+              return {
+                dataset, value: '', disabled: false, readOnly: false,
+                tagName: 'INPUT', type: 'text', isConnected: true,
+                attributes: {}, handlers: {},
+                setAttribute(name, value) {this.attributes[name] = String(value);},
+                addEventListener(name, handler) {this.handlers[name] = handler;},
+              };
+            }
+            const urlField = control({key: 'JELLYFIN_URL'});
+            const tokenField = control({key: 'JELLYFIN_API_KEY'});
+            const state = {textContent: '', className: '', classList: {contains(name) {return state.className.split(/\\s+/).includes(name);}}};
+            const detected = {textContent: '尚未识别', dataset: {}};
+            const testButton = control({testMedia: 'jellyfin'});
+            const saveButton = control({saveMedia: 'jellyfin'});
+            const panel = {
+              querySelector(selector) {
+                if (selector === '[data-save-state]') return state;
+                if (selector === '[data-media-detected]') return detected;
+                if (selector === '[data-save-media]') return saveButton;
+                if (selector.includes('JELLYFIN_URL')) return urlField;
+                if (selector.includes('JELLYFIN_API_KEY')) return tokenField;
+                return null;
+              },
+            };
+            urlField.closest = tokenField.closest = selector => selector === '[data-tab-panel]' ? panel : null;
+            const modalHandlers = {};
+            const modalRoot = {
+              hidden: true, attributes: {},
+              setAttribute(name, value) {this.attributes[name] = String(value);},
+              addEventListener(name, handler) {modalHandlers[name] = handler;},
+              querySelectorAll(selector) {
+                if (selector === '[data-tab-panel]') return [panel];
+                if (selector === '[data-key]') return [urlField, tokenField];
+                if (selector === '[data-test-media],[data-save-media]') return [testButton, saveButton];
+                if (selector === '[data-media-detected]') return [detected];
+                if (selector === '[data-test-media]') return [testButton];
+                if (selector === '[data-save-media]') return [saveButton];
+                return [];
+              },
+              querySelector(selector) {
+                if (selector === '[data-save-state]') return state;
+                if (selector === '[data-tab-panel="jellyfin"]') return panel;
+                return null;
+              },
+            };
+            const openButton = control({openMediaConfig: 'jellyfin'});
+            const document = {
+              activeElement: openButton,
+              getElementById: id => id === 'mediaConfigModal' ? modalRoot : null,
+              querySelectorAll: selector => selector === '[data-open-media-config]' ? [openButton] : [],
+            };
+            const tabsFixture = {activate() {}};
+            const setupTabGroup = () => tabsFixture;
+            let modalOptions = null;
+            const createAppModal = (_element, options) => {
+              modalOptions = options;
+              return {open() {modalRoot.hidden = false;}, close() {modalRoot.hidden = true;}};
+            };
+            const configLoads = [];
+            const loadAppConfig = ({signal} = {}) => new Promise(resolve => configLoads.push({resolve, signal}));
+            const fillConfigFields = (_root, config) => {
+              urlField.value = config.JELLYFIN_URL || '';
+              tokenField.value = config.JELLYFIN_API_KEY || '';
+            };
+            let pendingFields = false;
+            const collectConfigFields = () => pendingFields ? {JELLYFIN_URL: urlField.value} : {};
+            const saveAppConfig = async () => ({});
+            let resolveTest;
+            const fetch = () => new Promise(resolve => {resolveTest = resolve;});
+            let nextTimer = 0;
+            const timers = new Map();
+            const cancelledTimers = [];
+            let reloads = 0;
+            const window = {
+              setTimeout(callback, delay) {const id = ++nextTimer; timers.set(id, {callback, delay}); return id;},
+              clearTimeout(id) {cancelledTimers.push(id); timers.delete(id);},
+              location: {reload() {reloads += 1;}},
+            };
+            """
+        ) + block + textwrap.dedent(
+            """
+            (async () => {
+              const firstLoad = openConfig('jellyfin', openButton);
+              await new Promise(setImmediate);
+              closeConfig();
+              const secondLoad = openConfig('jellyfin', openButton);
+              await new Promise(setImmediate);
+              configLoads[1].resolve({JELLYFIN_URL: 'https://new', JELLYFIN_API_KEY: 'new-token'});
+              await secondLoad;
+              assert.equal(urlField.value, 'https://new');
+              urlField.value = 'https://draft';
+              configLoads[0].resolve({JELLYFIN_URL: 'https://old', JELLYFIN_API_KEY: 'old-token'});
+              await firstLoad;
+              assert.equal(urlField.value, 'https://draft');
+
+              urlField.value = 'https://tested';
+              tokenField.value = 'token-a';
+              const testRequest = testButton.handlers.click();
+              await new Promise(setImmediate);
+              urlField.value = 'https://changed';
+              modalHandlers.input({target: urlField});
+              resolveTest({ok: true, json: async () => ({server_name: 'Old', product: 'Jellyfin', version: '1', latency_ms: 2})});
+              await testRequest;
+              assert.equal(state.textContent, '配置已变化，请重新测试');
+              assert.equal(detected.textContent, '尚未识别');
+              assert.equal(testButton.disabled, false);
+
+              pendingFields = false;
+              const saveRequest = saveButton.handlers.click();
+              await saveRequest;
+              assert.equal(timers.size, 1);
+              pendingFields = true;
+              modalHandlers.input({target: urlField});
+              assert.equal(timers.size, 0);
+              assert.equal(cancelledTimers.length, 1);
+              assert.equal(reloads, 0);
+              assert.match(state.textContent, /存在新的未保存更改/);
+              assert.equal(saveButton.disabled, false);
+              assert.equal(saveButton.attributes['aria-busy'], 'false');
+              assert.ok(modalOptions.onRequestClose);
+            })().catch(error => {console.error(error); process.exit(1);});
+            """
+        )
+        _run_node(script)
+
 class AppModalFocusLifecycleTests(unittest.TestCase):
     def test_nested_modals_only_close_top_and_restore_focus_layer_by_layer(self):
         source = (ROOT / "app/static/js/app.js").read_text(encoding="utf-8")
@@ -417,16 +880,18 @@ class AppModalFocusLifecycleTests(unittest.TestCase):
             const makeFocusable = (name) => ({{
               name,
               hidden: false,
+              disabled: false,
               isConnected: true,
               getAttribute: () => null,
+              matches: (selector) => selector === ':disabled' && elements[name].disabled,
               closest: () => null,
-              focus: () => {{document.activeElement = elements[name];}},
+              focus: () => {{if (!elements[name].disabled) document.activeElement = elements[name];}},
             }});
             const elements = {{outer: null, parentFirst: null, parentLast: null, childFirst: null, childLast: null}};
             Object.keys(elements).forEach((name) => {{elements[name] = makeFocusable(name);}});
             function makeModal(first, last) {{
               const dialog = {{
-                querySelectorAll: () => [first, last],
+                querySelectorAll: () => [first, last].filter((element) => !element.disabled),
                 querySelector: () => first,
                 contains: (element) => element === first || element === last,
                 hasAttribute: () => true,
@@ -495,6 +960,16 @@ class AppModalFocusLifecycleTests(unittest.TestCase):
             parentLifecycle.close();
             frames.shift()();
             assert.equal(document.activeElement, elements.outer);
+
+            parentLifecycle.open(elements.outer, {{initialFocus: elements.parentFirst}});
+            frames.shift()();
+            childLifecycle.open(elements.parentFirst, {{initialFocus: elements.childFirst}});
+            frames.shift()();
+            elements.parentFirst.disabled = true;
+            childLifecycle.close();
+            assert.equal(document.activeElement, elements.parentLast);
+            elements.parentFirst.disabled = false;
+            parentLifecycle.close();
             """
         )
         _run_node(script)

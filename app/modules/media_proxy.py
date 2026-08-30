@@ -5997,20 +5997,18 @@ class MediaProxyManager:
                 )
                 for _instance_id, runtime in runtimes
             ]
-            try:
-                results = (
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    if tasks
-                    else ()
-                )
-            except asyncio.CancelledError:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                # 进程 shutdown 已被取消，运行任务均已收敛或取消；保持原有
-                # 语义，不把不可再服务的 runtime 暴露给后续业务调用。
-                self._runtimes.clear()
-                raise
+            cancelled: asyncio.CancelledError | None = None
+            if tasks:
+                stop_group = asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    results = await asyncio.shield(stop_group)
+                except asyncio.CancelledError as exc:
+                    # 外层 lifespan 被取消时，不把取消继续传给真正承担 socket /
+                    # HTTP client 清理的子任务；等待它们收敛后再传播取消。
+                    cancelled = exc
+                    results = await stop_group
+            else:
+                results = ()
 
             failures: list[BaseException] = []
             for (instance_id, runtime), result in zip(runtimes, results, strict=True):
@@ -6019,6 +6017,13 @@ class MediaProxyManager:
                     continue
                 if self._runtimes.get(instance_id) is runtime:
                     self._runtimes.pop(instance_id, None)
+            if cancelled is not None:
+                if failures:
+                    logger.warning(
+                        "媒体反代关闭被取消，仍有 %s 个实例需后续重试",
+                        len(failures),
+                    )
+                raise cancelled
             if failures:
                 # 关闭失败的 runtime 仍持有上游客户端池；保留句柄，使下一次
                 # stop 可以重试，而不是在日志后永久泄漏连接。
@@ -6357,15 +6362,20 @@ class MediaProxyManager:
     async def _stop_runtime(runtime: ProxyRuntime) -> None:
         _release_signed_url_cache(runtime.instance_id, runtime.signed_urls)
         runtime.server.should_exit = True
+        cancelled: asyncio.CancelledError | None = None
         try:
             await asyncio.wait_for(asyncio.shield(runtime.task), timeout=5)
         except asyncio.TimeoutError:
             runtime.task.cancel()
             await asyncio.gather(runtime.task, return_exceptions=True)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             runtime.task.cancel()
             await asyncio.gather(runtime.task, return_exceptions=True)
-            raise
+            current_task = asyncio.current_task()
+            # shield 也会转发“被等待的 Uvicorn task 自身已取消”。只有当前
+            # 清理协程确实收到 cancel 时，才在资源收敛后继续传播取消。
+            if current_task is not None and current_task.cancelling():
+                cancelled = exc
         except Exception as exc:
             logger.warning(
                 "媒体反代运行任务停止时已失败 id=%s type=%s",
@@ -6378,10 +6388,25 @@ class MediaProxyManager:
             except OSError:
                 pass
         if runtime.upstream_clients is not None:
-            # lifespan 首次关闭失败时，连接池会保留失败句柄；在 manager 仍
-            # 持有 runtime 时再重试一次，第二次失败则向调用方传播。
-            await runtime.upstream_clients.aclose()
+            # lifespan 首次关闭失败时，连接池会保留失败句柄；即使当前 stop
+            # 被取消，也要让真实关闭任务收敛后再传播取消。
+            close_task = asyncio.create_task(
+                runtime.upstream_clients.aclose(),
+                name=f"media-proxy-upstream-close-{runtime.instance_id}",
+            )
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+                close_result = (
+                    await asyncio.gather(close_task, return_exceptions=True)
+                )[0]
+                if isinstance(close_result, BaseException):
+                    raise close_result
         logger.info(f"媒体反代实例停止 id={runtime.instance_id}")
+        if cancelled is not None:
+            raise cancelled
 
     def status(self) -> dict[int, dict[str, Any]]:
         return {

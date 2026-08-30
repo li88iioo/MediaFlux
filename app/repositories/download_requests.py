@@ -926,6 +926,78 @@ def update_download_request_and_sync_media_admission(request_id: int, **fields) 
         )
 
 
+def finalize_download_request_submission(
+    request_id: int,
+    claimed_targets: Iterable[str],
+    **fields,
+) -> str | None:
+    """仅由仍持有 ``submitting`` 认领的提交者落盘后端结果。
+
+    外部下载器调用可能长时间阻塞；期间请求可能已经被超时恢复、人工接管或
+    标记为重新提交。最终写入必须再次核对被认领后端仍处于 ``submitting``，
+    否则迟到结果只能进入审计日志，不能复活旧请求。
+    """
+    normalized = tuple(dict.fromkeys(
+        str(target or "").strip() for target in claimed_targets
+        if str(target or "").strip() in {"qb", "guangya"}
+    ))
+    if not normalized:
+        return None
+
+    timestamp = now()
+    conditions = ["id=?", "status NOT IN ('resubmitted','cancelled')"]
+    values: list[object] = [int(request_id)]
+    if "qb" in normalized:
+        conditions.append("qb_status='submitting'")
+    if "guangya" in normalized:
+        conditions.append("gy_status='submitting'")
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status,qb_status,gy_status,error FROM download_requests WHERE "
+            + " AND ".join(conditions),
+            values,
+        ).fetchone()
+        if not row:
+            return None
+
+        updates = {
+            key: value for key, value in fields.items()
+            if key in _DOWNLOAD_REQUEST_UPDATE_FIELDS and key != "status"
+        }
+        effective_qb = str(updates.get("qb_status", row["qb_status"]) or "")
+        effective_gy = str(updates.get("gy_status", row["gy_status"]) or "")
+        statuses = [status for status in (effective_qb, effective_gy) if status]
+        if any(status == "manual_review" for status in statuses):
+            root_status = "manual_review"
+        elif any(
+            status in {"submitting", "submitted", "downloading", "outcome_unknown"}
+            for status in statuses
+        ):
+            root_status = "submitted"
+        elif any(status == "completed" for status in statuses):
+            root_status = "completed"
+        else:
+            root_status = "failed"
+
+        updates["status"] = root_status
+        updates["completed_at"] = (
+            timestamp if root_status in {"completed", "failed", "manual_review"} else None
+        )
+        if not _update_download_request_conn(conn, int(request_id), updates, timestamp):
+            return None
+
+        from app.repositories.media_subscriptions import (  # 局部导入避免仓储循环加载
+            _sync_media_download_admission_for_request_conn,
+        )
+
+        _sync_media_download_admission_for_request_conn(
+            conn, int(request_id), timestamp
+        )
+        return root_status
+
+
 def link_download_request_to_local_media_task(
     request_id: int, task_id: int, content_path: str
 ) -> bool:

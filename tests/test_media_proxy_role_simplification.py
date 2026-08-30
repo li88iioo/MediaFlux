@@ -714,6 +714,74 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool._clients, {})
 
 
+    async def test_stop_runtime_cancellation_still_closes_upstream_pool(self):
+        from app.modules import media_proxy
+
+        class ObservablePool:
+            def __init__(self):
+                self.closed = False
+
+            async def aclose(self):
+                await asyncio.sleep(0)
+                self.closed = True
+
+        pool = ObservablePool()
+        runtime_task = asyncio.create_task(asyncio.Event().wait())
+        runtime = media_proxy.ProxyRuntime(
+            instance_id=14,
+            bind=("127.0.0.1", 18104),
+            server=MagicMock(),
+            task=runtime_task,
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+            upstream_clients=pool,
+        )
+        with patch.object(media_proxy, "_release_signed_url_cache"):
+            stop_task = asyncio.create_task(
+                media_proxy.MediaProxyManager._stop_runtime(runtime)
+            )
+            await asyncio.sleep(0)
+            stop_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await stop_task
+
+        self.assertTrue(pool.closed)
+        self.assertTrue(runtime_task.done())
+        runtime.sock.close.assert_called_once_with()
+
+    async def test_manager_stop_removes_runtime_whose_server_task_was_cancelled(self):
+        from app.modules import media_proxy
+
+        class ObservablePool:
+            def __init__(self):
+                self.closed = False
+
+            async def aclose(self):
+                self.closed = True
+
+        manager = media_proxy.MediaProxyManager()
+        pool = ObservablePool()
+        runtime_task = asyncio.create_task(asyncio.Event().wait())
+        runtime_task.cancel()
+        await asyncio.gather(runtime_task, return_exceptions=True)
+        runtime = media_proxy.ProxyRuntime(
+            instance_id=16,
+            bind=("127.0.0.1", 18106),
+            server=MagicMock(),
+            task=runtime_task,
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+            upstream_clients=pool,
+        )
+        manager._runtimes = {16: runtime}
+
+        with patch.object(media_proxy, "_release_signed_url_cache"):
+            await manager.stop()
+
+        self.assertTrue(pool.closed)
+        self.assertEqual(manager._runtimes, {})
+        runtime.sock.close.assert_called_once_with()
+
     async def test_manager_stop_retains_failed_runtime_for_retry(self):
         from app.modules import media_proxy
 
@@ -778,11 +846,54 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
             self.assertEqual(started, {1, 2})
             stop_task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(stop_task.done())
+            release.set()
             with self.assertRaises(asyncio.CancelledError):
                 await stop_task
 
         self.assertEqual(finished, {1, 2})
         self.assertEqual(manager._runtimes, {})
+
+    async def test_manager_stop_cancellation_retains_runtime_when_cleanup_fails(self):
+        from app.modules import media_proxy
+
+        class BlockingFailingPool:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def aclose(self):
+                self.started.set()
+                await self.release.wait()
+                raise RuntimeError("simulated close failure")
+
+        manager = media_proxy.MediaProxyManager()
+        pool = BlockingFailingPool()
+        runtime_task = asyncio.create_task(asyncio.sleep(0))
+        await runtime_task
+        runtime = media_proxy.ProxyRuntime(
+            instance_id=15,
+            bind=("127.0.0.1", 18105),
+            server=MagicMock(),
+            task=runtime_task,
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+            upstream_clients=pool,
+        )
+        manager._runtimes = {15: runtime}
+
+        with patch.object(media_proxy, "_release_signed_url_cache"):
+            stop_task = asyncio.create_task(manager.stop())
+            await pool.started.wait()
+            stop_task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(stop_task.done())
+            pool.release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await stop_task
+
+        self.assertEqual(manager._runtimes, {15: runtime})
 
     async def test_shutdown_fences_concurrent_reconcile_and_clears_runtime(self):
         from app.modules import media_proxy

@@ -84,12 +84,15 @@
     async function updateResults(url){
         const generation=++requestGeneration;
         requestController?.abort();
-        requestController=new AbortController();
+        const controller=new AbortController();
+        requestController=controller;
         setBusy(true);
         try{
-            const response=await fetch(url,{headers:{'X-Requested-With':'MediaFlux'},signal:requestController.signal});
+            const response=await fetch(url,{headers:{'X-Requested-With':'MediaFlux'},signal:controller.signal});
             if(!response.ok) throw new Error(`筛选失败 (${response.status})`);
-            const nextDocument=new DOMParser().parseFromString(await response.text(),'text/html');
+            const responseText=await response.text();
+            if(generation!==requestGeneration||controller.signal.aborted) return;
+            const nextDocument=new DOMParser().parseFromString(responseText,'text/html');
             const nextResults=nextDocument.querySelector('[data-media-recent-results]');
             const currentResults=document.querySelector('[data-media-recent-results]');
             if(!nextResults||!currentResults) throw new Error('筛选结果结构无效');
@@ -98,6 +101,7 @@
             currentResults.classList.add('is-updating');
             nextResults.style.minHeight=`${stableHeight}px`;
             const applyResult=()=>{
+                if(generation!==requestGeneration||controller.signal.aborted) return;
                 currentResults.replaceWith(nextResults);
                 const nextOverview=nextDocument.querySelector('.media-recent-overview-copy small');
                 const currentOverview=document.querySelector('.media-recent-overview-copy small');

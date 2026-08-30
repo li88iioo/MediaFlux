@@ -17,7 +17,11 @@ from fastapi.testclient import TestClient
 
 from app import database as db
 from app.clients.qbittorrent import TorrentAddResult
-from app.modules.download_dispatcher import _submit_qb, dispatch_request
+from app.modules.download_dispatcher import (
+    _submit_qb,
+    dispatch_missing_targets,
+    dispatch_request,
+)
 from app.modules.download_tracker import DownloadTracker
 from app.modules.local_media_service import LocalMediaService
 from app.modules.media_proxy import _extract_guangya_file_id
@@ -98,6 +102,124 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         row = db.get_download_request(request_id)
         self.assertEqual(row["status"], "submitting")
         self.assertEqual(row["qb_status"], "submitting")
+
+    def test_late_dispatch_result_cannot_reactivate_resubmitted_request(self):
+        request_id, _ = db.create_download_request(
+            f"late-submit-{uuid.uuid4().hex}", "magnet", title="Late",
+            source_value="magnet:?xt=urn:btih:late",
+        )
+        started = threading.Event()
+        release = threading.Event()
+        outcome: dict[str, object] = {}
+        failures: list[Exception] = []
+
+        def slow_submit(_row):
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("测试未释放下载提交")
+            return {"ok": True, "task_id": "late-qb", "error": ""}
+
+        def run_dispatch() -> None:
+            try:
+                outcome.update(dispatch_request(request_id, "qb"))
+            except Exception as exc:  # noqa: BLE001  # pragma: no cover - 由主线程重新抛出
+                failures.append(exc)
+
+        with patch(
+            "app.modules.download_dispatcher._submit_qb", side_effect=slow_submit,
+        ):
+            worker = threading.Thread(target=run_dispatch, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(started.wait(timeout=3))
+                with db.get_conn() as conn:
+                    conn.execute(
+                        "UPDATE download_requests SET updated_at="
+                        "datetime('now','localtime','-30 minutes') WHERE id=?",
+                        (request_id,),
+                    )
+                self.assertEqual(
+                    db.recover_stale_submitting_download_requests(), 1
+                )
+                self.assertTrue(db.mark_download_request_resubmitted(
+                    request_id, successor_request_id=9001, targets="qb",
+                ))
+            finally:
+                release.set()
+                worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        if failures:
+            raise failures[0]
+        row = db.get_download_request(request_id)
+        self.assertEqual(row["status"], "resubmitted")
+        self.assertEqual(row["qb_status"], "resubmitted")
+        self.assertFalse(outcome["ok"])
+        self.assertTrue(outcome["stale_result"])
+        self.assertTrue(outcome["review_required"])
+
+    def test_late_missing_target_result_cannot_reactivate_resubmitted_request(self):
+        request_id, _ = db.create_download_request(
+            f"late-missing-{uuid.uuid4().hex}", "magnet", title="Late missing",
+            source_value="magnet:?xt=urn:btih:late-missing",
+        )
+        db.update_download_request(
+            request_id, targets="qb", status="submitted",
+            qb_status="submitted", gy_status="failed",
+        )
+        started = threading.Event()
+        release = threading.Event()
+        outcome: dict[str, object] = {}
+        failures: list[Exception] = []
+
+        def slow_submit(_row, **_kwargs):
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("测试未释放补充目标提交")
+            return {
+                "ok": True, "task_ids": ["late-gy"], "task_id": "late-gy",
+                "decision": {}, "staging": {}, "error": "",
+            }
+
+        def run_dispatch() -> None:
+            try:
+                outcome.update(dispatch_missing_targets(request_id, "guangya"))
+            except Exception as exc:  # noqa: BLE001  # pragma: no cover - 由主线程重新抛出
+                failures.append(exc)
+
+        with patch(
+            "app.modules.download_dispatcher._submit_guangya",
+            side_effect=slow_submit,
+        ):
+            worker = threading.Thread(target=run_dispatch, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(started.wait(timeout=3))
+                with db.get_conn() as conn:
+                    conn.execute(
+                        "UPDATE download_requests SET updated_at="
+                        "datetime('now','localtime','-30 minutes') WHERE id=?",
+                        (request_id,),
+                    )
+                self.assertEqual(
+                    db.recover_stale_submitting_download_requests(), 1
+                )
+                self.assertTrue(db.mark_download_request_resubmitted(
+                    request_id, successor_request_id=9002, targets="guangya",
+                ))
+            finally:
+                release.set()
+                worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        if failures:
+            raise failures[0]
+        row = db.get_download_request(request_id)
+        self.assertEqual(row["status"], "resubmitted")
+        self.assertEqual(row["gy_status"], "resubmitted")
+        self.assertTrue(outcome["handled"])
+        self.assertFalse(outcome["ok"])
+        self.assertTrue(outcome["stale_result"])
 
     def test_stale_retried_share_requires_manual_without_cloud_replay(self):
         request_id, _ = db.create_share_transfer_request(
@@ -310,13 +432,13 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         with patch("app.database.get_download_request", return_value=row), patch(
             "app.database.claim_download_request", return_value=True,
         ), patch("app.modules.download_dispatcher._submit_qb", return_value=backend), patch(
-            "app.database.update_download_request_and_sync_media_admission",
-        ) as update, patch("app.database.add_download_log") as add_log:
+            "app.database.finalize_download_request_submission", return_value="submitted",
+        ) as finalize, patch("app.database.add_download_log") as add_log:
             result = dispatch_request(91, "qb")
 
         self.assertEqual(result["status"], "submitted")
         self.assertFalse(result["ok"])
-        self.assertEqual(update.call_args.kwargs["qb_status"], "outcome_unknown")
+        self.assertEqual(finalize.call_args.kwargs["qb_status"], "outcome_unknown")
         self.assertEqual(add_log.call_args.kwargs["status"], "outcome_unknown")
 
     def test_tracker_does_not_age_missing_task_while_backend_is_unavailable(self):

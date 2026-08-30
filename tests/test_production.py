@@ -4749,9 +4749,9 @@ class SecurityTests(InitializedWebTestCase):
             "ok": True, "task_id": "abc", "error": ""
         }), patch("app.modules.download_dispatcher._submit_guangya", return_value={
             "ok": False, "task_id": "", "error": "光鸭未登录", "decision": {}
-        }), patch("app.database.update_download_request_and_sync_media_admission") as update, patch(
-            "app.database.add_download_log"
-        ) as add_log:
+        }), patch(
+            "app.database.finalize_download_request_submission", return_value="submitted"
+        ) as finalize, patch("app.database.add_download_log") as add_log:
             first = dispatch_request(31, "both")
             second = dispatch_request(31, "both")
         self.assertTrue(first["ok"])
@@ -4759,7 +4759,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(first["failed"], ["guangya"])
         self.assertFalse(second["ok"])
         self.assertTrue(second["duplicate"])
-        update.assert_called_once()
+        finalize.assert_called_once()
         self.assertEqual(add_log.call_count, 2)
 
     def test_download_dispatcher_contains_backend_exception(self):
@@ -4774,16 +4774,16 @@ class SecurityTests(InitializedWebTestCase):
                 "ok": True, "task_id": "", "error": "",
                 "decision": {"target_dir_id": "source", "target_dir_name": "下载目录"},
             }
-        ), patch("app.database.update_download_request_and_sync_media_admission") as update, patch(
-            "app.database.add_download_log"
-        ) as add_log:
+        ), patch(
+            "app.database.finalize_download_request_submission", return_value="submitted"
+        ) as finalize, patch("app.database.add_download_log") as add_log:
             result = dispatch_request(32, "both")
         self.assertTrue(result["ok"])
         self.assertEqual(result["succeeded"], ["guangya"])
         self.assertEqual(result["failed"], ["qb"])
         self.assertIn("qB unavailable", result["error"])
-        self.assertEqual(update.call_args.kwargs["status"], "submitted")
-        self.assertEqual(update.call_args.kwargs["qb_status"], "failed")
+        self.assertEqual(finalize.call_args.kwargs["status"], "submitted")
+        self.assertEqual(finalize.call_args.kwargs["qb_status"], "failed")
         self.assertEqual(add_log.call_count, 2)
 
     def test_download_tracker_marks_qb_error_state_failed(self):

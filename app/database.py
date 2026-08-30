@@ -4202,6 +4202,7 @@ from app.repositories.download_requests import (  # noqa: E402
     mark_download_request_local_media_failed,
     mark_download_request_local_media_skipped,
     finalize_download_request_notification,
+    finalize_download_request_submission,  # noqa: F401 - database compatibility facade
     renew_download_request_notification_lease,
     recover_stale_submitting_download_requests,
     update_download_request,

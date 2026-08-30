@@ -596,73 +596,216 @@
     });
 
     const modalEl=document.getElementById('mediaConfigModal');
-    const modal=createAppModal(modalEl);
     const configTabs=setupTabGroup(modalEl);
+    const mediaConfigPanels=[...modalEl.querySelectorAll('[data-tab-panel]')];
+    const mediaTestTickets=new WeakMap();
     let configLoaded=false;
-    async function openConfig(type){
-        modal.open(document.activeElement);
-        if(type) configTabs.activate(type);
-        if(configLoaded) return;
+    let configLoadController=null;
+    let configLoadGeneration=0;
+    let configLoadLocks=[];
+    let mediaConfigReloadTimer=null;
+    let mediaConfigReloadPanel=null;
+
+    function setConfigLoadBusy(busy){
+        modalEl.setAttribute('aria-busy',busy?'true':'false');
+        if(busy){
+            if(configLoadLocks.length)return;
+            const fields=[...modalEl.querySelectorAll('[data-key]')];
+            const actions=[...modalEl.querySelectorAll('[data-test-media],[data-save-media]')];
+            configLoadLocks=[
+                ...fields.map(field=>{
+                    const useReadOnly=['INPUT','TEXTAREA'].includes(field.tagName)&&!['checkbox','radio'].includes(field.type);
+                    const lock={field,useReadOnly,disabled:field.disabled,readOnly:field.readOnly};
+                    if(useReadOnly)field.readOnly=true;else field.disabled=true;
+                    return lock;
+                }),
+                ...actions.map(field=>{const lock={field,useReadOnly:false,disabled:field.disabled,readOnly:false};field.disabled=true;return lock;}),
+            ];
+            return;
+        }
+        configLoadLocks.forEach(({field,useReadOnly,disabled,readOnly})=>{
+            if(!field.isConnected)return;
+            field.disabled=disabled;
+            if(useReadOnly)field.readOnly=readOnly;
+        });
+        configLoadLocks=[];
+    }
+
+    function invalidateMediaTest(panel,{announce=false}={}){
+        const ticket=mediaTestTickets.get(panel);
+        if(ticket){
+            ticket.controller.abort();
+            mediaTestTickets.delete(panel);
+            ticket.button.disabled=false;
+            ticket.button.setAttribute('aria-busy','false');
+        }
+        if(!announce)return;
+        const state=panel.querySelector('[data-save-state]');
+        if(ticket||state.classList.contains('is-success')){
+            state.className='inline-save-state';
+            state.textContent='配置已变化，请重新测试';
+        }
+        const detected=panel.querySelector('[data-media-detected]');
+        if(detected?.dataset.defaultText)detected.textContent=detected.dataset.defaultText;
+    }
+
+    function cancelScheduledMediaReload(){
+        if(!mediaConfigReloadTimer)return;
+        window.clearTimeout(mediaConfigReloadTimer);
+        mediaConfigReloadTimer=null;
+        if(mediaConfigReloadPanel){
+            const state=mediaConfigReloadPanel.querySelector('[data-save-state]');
+            const button=mediaConfigReloadPanel.querySelector('[data-save-media]');
+            state.className='inline-save-state';
+            state.textContent='已保存；存在新的未保存更改，未刷新';
+            button.disabled=false;
+            button.setAttribute('aria-busy','false');
+        }
+        mediaConfigReloadPanel=null;
+    }
+
+    function cancelConfigLoad(){
+        configLoadGeneration+=1;
+        configLoadController?.abort();
+        configLoadController=null;
+        setConfigLoadBusy(false);
+    }
+
+    function closeConfig(){
+        cancelConfigLoad();
+        mediaConfigPanels.forEach(panel=>invalidateMediaTest(panel));
+        modal.close();
+    }
+
+    const modal=createAppModal(modalEl,{onRequestClose:closeConfig});
+    modalEl.querySelectorAll('[data-media-detected]').forEach(node=>{node.dataset.defaultText=node.textContent;});
+
+    async function openConfig(type,trigger){
+        modal.open(trigger||document.activeElement);
+        if(type)configTabs.activate(type);
+        if(configLoaded)return;
+        cancelConfigLoad();
+        const generation=++configLoadGeneration;
+        const controller=new AbortController();
+        configLoadController=controller;
+        modalEl.querySelectorAll('[data-test-media],[data-save-media]').forEach(button=>{button.disabled=false;});
+        setConfigLoadBusy(true);
         try{
-            const config=await loadAppConfig();
+            const config=await loadAppConfig({signal:controller.signal});
+            if(generation!==configLoadGeneration||controller.signal.aborted||modalEl.hidden)return;
+            setConfigLoadBusy(false);
             fillConfigFields(modalEl,config);
             configLoaded=true;
         }catch(error){
+            if(error.name==='AbortError'||generation!==configLoadGeneration)return;
             const state=modalEl.querySelector('[data-save-state]');
             state.className='inline-save-state is-error';
             state.textContent=error.message;
+        }finally{
+            if(generation===configLoadGeneration){
+                configLoadController=null;
+                setConfigLoadBusy(false);
+                if(!configLoaded)modalEl.querySelectorAll('[data-test-media],[data-save-media]').forEach(button=>{button.disabled=true;});
+            }
         }
     }
-    document.querySelectorAll('[data-open-media-config]').forEach(btn=>btn.addEventListener('click',()=>openConfig(btn.dataset.openMediaConfig||'')));
+
+    modalEl.addEventListener('input',event=>{
+        const panel=event.target.closest('[data-tab-panel]');
+        if(!panel)return;
+        invalidateMediaTest(panel,{announce:true});
+        cancelScheduledMediaReload();
+    });
+    modalEl.addEventListener('change',event=>{
+        const panel=event.target.closest('[data-tab-panel]');
+        if(!panel)return;
+        invalidateMediaTest(panel,{announce:true});
+        cancelScheduledMediaReload();
+    });
+
+    document.querySelectorAll('[data-open-media-config]').forEach(btn=>btn.addEventListener('click',event=>openConfig(btn.dataset.openMediaConfig||'',event.currentTarget)));
     modalEl.querySelectorAll('[data-test-media]').forEach(btn=>btn.addEventListener('click',async()=>{
         const type=btn.dataset.testMedia;
         const panel=modalEl.querySelector(`[data-tab-panel="${type}"]`);
         const state=panel.querySelector('[data-save-state]');
         const urlField=panel.querySelector(`[data-key="${type==='jellyfin'?'JELLYFIN_URL':'EMBY_URL'}"]`);
         const tokenField=panel.querySelector(`[data-key="${type==='jellyfin'?'JELLYFIN_API_KEY':'EMBY_TOKEN'}"]`);
+        invalidateMediaTest(panel);
+        const controller=new AbortController();
+        const snapshot={url:urlField.value,token:tokenField.value};
+        const ticket={controller,snapshot,button:btn};
+        mediaTestTickets.set(panel,ticket);
         btn.disabled=true;
+        btn.setAttribute('aria-busy','true');
         state.className='inline-save-state';
         state.textContent='正在测试连接...';
         try{
             const response=await fetch('/api/media/test',{
-                method:'POST',headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({server_type:type,url:urlField.value,token:tokenField.value}),
+                method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,
+                body:JSON.stringify({server_type:type,url:snapshot.url,token:snapshot.token}),
             });
             const data=await response.json();
-            if(!response.ok) throw new Error(data.error||'连接测试失败');
+            if(mediaTestTickets.get(panel)!==ticket||controller.signal.aborted)return;
+            if(urlField.value!==snapshot.url||tokenField.value!==snapshot.token){
+                invalidateMediaTest(panel,{announce:true});
+                return;
+            }
+            if(!response.ok)throw new Error(data.error||'连接测试失败');
             state.className='inline-save-state is-success';
             state.textContent=`${data.server_name} · ${data.product} ${data.version} · ${data.latency_ms} ms`;
             const detected=panel.querySelector('[data-media-detected]');
-            if(detected) detected.textContent=`已识别：${data.product} ${data.version}`;
+            if(detected)detected.textContent=`已识别：${data.product} ${data.version}`;
         }catch(error){
+            if(error.name==='AbortError'||mediaTestTickets.get(panel)!==ticket)return;
             state.className='inline-save-state is-error';
             state.textContent=error.message;
         }finally{
-            btn.disabled=false;
+            if(mediaTestTickets.get(panel)===ticket){
+                mediaTestTickets.delete(panel);
+                btn.disabled=false;
+                btn.setAttribute('aria-busy','false');
+            }
         }
     }));
+
     modalEl.querySelectorAll('[data-save-media]').forEach(btn=>btn.addEventListener('click',async()=>{
         const panel=modalEl.querySelector(`[data-tab-panel="${btn.dataset.saveMedia}"]`);
         const state=panel.querySelector('[data-save-state]');
+        cancelScheduledMediaReload();
         btn.disabled=true;
+        btn.setAttribute('aria-busy','true');
         state.className='inline-save-state';
         state.textContent='正在保存...';
         try{
             const result=await saveAppConfig(panel);
-            const hasPendingChanges=result?.__hasPendingConfigChanges===true;
+            const hasPendingChanges=result?.__hasPendingConfigChanges===true||Object.keys(collectConfigFields(modalEl)).length>0;
             if(hasPendingChanges){
                 state.className='inline-save-state';
                 state.textContent='上一版已保存，仍有未保存更改';
                 btn.disabled=false;
+                btn.setAttribute('aria-busy','false');
                 return;
             }
             state.className='inline-save-state is-success';
             state.textContent='已保存，正在刷新看板';
-            window.setTimeout(()=>window.location.reload(),450);
+            mediaConfigReloadPanel=panel;
+            mediaConfigReloadTimer=window.setTimeout(()=>{
+                mediaConfigReloadTimer=null;
+                mediaConfigReloadPanel=null;
+                if(Object.keys(collectConfigFields(modalEl)).length){
+                    state.className='inline-save-state';
+                    state.textContent='已保存；存在新的未保存更改，未刷新';
+                    btn.disabled=false;
+                    btn.setAttribute('aria-busy','false');
+                    return;
+                }
+                window.location.reload();
+            },450);
         }catch(error){
             state.className='inline-save-state is-error';
             state.textContent=error.message;
             btn.disabled=false;
+            btn.setAttribute('aria-busy','false');
         }
     }));
 })();

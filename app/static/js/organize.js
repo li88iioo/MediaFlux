@@ -36,6 +36,9 @@
     const STATUS_IDLE_POLL_MS=30000;
     const STATUS_RETRY_POLL_MS=5000;
     let configReady=false;
+    let configSaveBusy=false;
+    let configSaveQueued=false;
+    let configSavePromise=null;
     let statusRequestSerial=0;
     let organizeActionBusy=false;
     let organizeStatusRunning=false;
@@ -687,15 +690,27 @@
         const cronRow=document.getElementById('organizeCronRow');if(cronRow){cronRow.style.display=scheduleEnabled?'grid':'none';}
     }
     function finishConfigLoad(success){
-        const button=document.getElementById('saveOrganizeConfigBtn');const state=document.getElementById('organizeSaveState');configReady=success;button.disabled=!success;button.setAttribute('aria-busy','false');
+        const button=document.getElementById('saveOrganizeConfigBtn');const state=document.getElementById('organizeSaveState');configReady=success;button.disabled=!success||configSaveBusy;button.setAttribute('aria-busy',configSaveBusy?'true':'false');
         if(success)configFieldLocks.forEach(({field,disabled})=>{field.disabled=disabled;});
         state.textContent=success?(isRules?'保存后立即成为 Web、TG、定时与本地整理的正式规则':'保存来源与目标，后续执行自动使用统一整理规则'):'配置读取失败，请刷新页面后重试';state.className=success?'':'is-error';
     }
-    async function saveConfig(){
-        if(!configReady)return;
-        if(sourceInput)syncSources();if(isRules){extensionEditors.video?.ensure();extensionEditors.metadata?.ensure();}const state=document.getElementById('organizeSaveState');state.textContent='正在保存...';
-        try{const result=await saveAppConfig(workspace);const hasPendingChanges=result?.__hasPendingConfigChanges===true;state.textContent=hasPendingChanges?'上一版已保存，仍有未保存更改':(isRules?'整理规则已保存':'目录配置已保存');state.className=hasPendingChanges?'is-dirty':'is-success';if(!isRules)await loadStatus();}
-        catch(error){state.textContent=error.message;state.className='is-error';}
+    function saveConfig(){
+        if(!configReady)return Promise.resolve();
+        configSaveQueued=true;
+        if(configSavePromise)return configSavePromise;
+        configSaveBusy=true;
+        const button=document.getElementById('saveOrganizeConfigBtn');const state=document.getElementById('organizeSaveState');button.disabled=true;button.setAttribute('aria-busy','true');
+        configSavePromise=(async()=>{
+            try{
+                while(configSaveQueued&&configReady){
+                    configSaveQueued=false;
+                    if(sourceInput)syncSources();if(isRules){extensionEditors.video?.ensure();extensionEditors.metadata?.ensure();}state.textContent='正在保存...';state.className='';
+                    try{const result=await saveAppConfig(workspace);const hasPendingChanges=result?.__hasPendingConfigChanges===true;state.textContent=hasPendingChanges?'上一版已保存，仍有未保存更改':(isRules?'整理规则已保存':'目录配置已保存');state.className=hasPendingChanges?'is-dirty':'is-success';if(!isRules)await loadStatus();}
+                    catch(error){state.textContent=error.message;state.className='is-error';}
+                }
+            }finally{configSaveBusy=false;configSavePromise=null;button.disabled=!configReady;button.setAttribute('aria-busy','false');}
+        })();
+        return configSavePromise;
     }
     async function preview(){
         if(!sources.length){await appAlert({type:'warning',title:'未选择源目录',message:'至少选择一个光鸭源目录后才能预览整理计划。'});return;}

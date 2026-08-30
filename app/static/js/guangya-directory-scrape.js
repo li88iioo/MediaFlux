@@ -243,6 +243,16 @@
         renderIcons(target);
     }
 
+    function invalidateExternalHints() {
+        state.externalController?.abort();
+        state.externalController = null;
+        state.pendingExternalKey = '';
+        elements.externalBtn.disabled = false;
+        setButtonContent(elements.externalBtn, 'book-open-check', '豆瓣 / BGM 线索');
+        elements.externalHints.hidden = true;
+        elements.externalHints.replaceChildren();
+    }
+
     function openModal() {
         modalLifecycle.open(state.activeAction, {initialFocus: elements.query});
     }
@@ -251,13 +261,11 @@
         state.requestVersion += 1;
         state.searchController?.abort();
         state.previewController?.abort();
-        state.externalController?.abort();
         state.searchController = null;
         state.previewController = null;
-        state.externalController = null;
         state.pendingSearchKey = '';
         state.pendingPreviewKey = '';
-        state.pendingExternalKey = '';
+        invalidateExternalHints();
         modalLifecycle.close();
         elements.candidates.classList.remove('is-loading');
     }
@@ -323,6 +331,7 @@
         state.previewController?.abort();
         state.previewController = null;
         state.pendingPreviewKey = '';
+        invalidateExternalHints();
         state.preview = null;
         setPlanReady(false);
         elements.run.disabled = true;
@@ -389,13 +398,7 @@
         elements.run.querySelector('span').textContent = '确认并开始刮削';
         elements.search.disabled = false;
         elements.search.querySelector('span').textContent = '搜索';
-        state.externalController?.abort();
-        state.externalController = null;
-        state.pendingExternalKey = '';
-        elements.externalBtn.disabled = false;
-        setButtonContent(elements.externalBtn, 'book-open-check', '豆瓣 / BGM 线索');
-        elements.externalHints.hidden = true;
-        elements.externalHints.replaceChildren();
+        invalidateExternalHints();
         syncRecognitionMode();
         elements.candidateCount.textContent = '0 项';
         placeholder(
@@ -601,6 +604,7 @@
         if (state.pendingExternalKey === requestKey) return;
         state.externalController?.abort();
         const controller = new AbortController();
+        const version = state.requestVersion;
         state.externalController = controller;
         state.pendingExternalKey = requestKey;
         elements.externalBtn.disabled = true;
@@ -611,9 +615,24 @@
                 query,
                 media_type: elements.type.value,
             }, {signal: controller.signal});
+            const currentKey = JSON.stringify([
+                state.inspection?.inspection_id,
+                elements.query.value.trim(),
+                elements.type.value,
+            ]);
+            if (
+                state.externalController !== controller
+                || controller.signal.aborted
+                || version !== state.requestVersion
+                || currentKey !== requestKey
+            ) return;
             renderExternalHints(data);
         } catch (error) {
-            if (error.name !== 'AbortError') {
+            if (
+                error.name !== 'AbortError'
+                && state.externalController === controller
+                && version === state.requestVersion
+            ) {
                 window.appAlert?.({type: 'error', title: '外部资料查询失败', message: error.message});
             }
         } finally {
@@ -915,6 +934,7 @@
         if (state.pendingSearchKey === searchKey) return;
         state.searchController?.abort();
         state.previewController?.abort();
+        invalidateExternalHints();
         const controller = new AbortController();
         state.searchController = controller;
         state.previewController = null;

@@ -589,8 +589,8 @@
         return instance;
     };
 
-    window.loadAppConfig = async function () {
-        const response = await fetch('/api/config');
+    window.loadAppConfig = async function ({signal} = {}) {
+        const response = await fetch('/api/config', {signal});
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || '配置加载失败');
         return data;
@@ -892,7 +892,10 @@
         return Boolean(
             target
             && target.isConnected !== false
-            && !target.closest?.('[hidden], [aria-hidden="true"]'),
+            && typeof target.focus === 'function'
+            && target.disabled !== true
+            && target.matches?.(':disabled') !== true
+            && !target.closest?.('[hidden], [aria-hidden="true"], [inert]'),
         );
     }
 
@@ -922,11 +925,7 @@
         let destroyed = false;
         function focusableElements() {
             if (!dialog) return [];
-            return [...dialog.querySelectorAll(focusableSelector)].filter((element) => (
-                !element.hidden
-                && element.getAttribute('aria-hidden') !== 'true'
-                && !element.closest?.('[hidden], [aria-hidden="true"]')
-            ));
+            return [...dialog.querySelectorAll(focusableSelector)].filter(canRestoreModalFocus);
         }
         const layer = {modal, dialog, focusableElements};
         function resolveInitialFocus(initialFocus) {

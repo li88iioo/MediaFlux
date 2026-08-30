@@ -273,28 +273,25 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             kind="magnet", title="后端已接收资源",
             source_value="magnet:?xt=urn:btih:backend-accepted",
         )
-        original_update = db.update_download_request_and_sync_media_admission
-        update_calls = 0
+        finalize_calls = 0
 
-        def fail_first_update(request_id, **fields):
-            nonlocal update_calls
-            update_calls += 1
-            if update_calls == 1:
-                raise RuntimeError("simulated sqlite write failure")
-            return original_update(request_id, **fields)
+        def fail_finalize(_request_id, _claimed_targets, **_fields):
+            nonlocal finalize_calls
+            finalize_calls += 1
+            raise RuntimeError("simulated sqlite write failure")
 
         with patch(
             "app.modules.download_dispatcher._submit_qb",
             return_value={"ok": True, "task_id": "qb-accepted"},
         ), patch(
-            "app.modules.download_dispatcher.db.update_download_request_and_sync_media_admission",
-            side_effect=fail_first_update,
+            "app.modules.download_dispatcher.db.finalize_download_request_submission",
+            side_effect=fail_finalize,
         ):
             _created, request_id, result = _persist_and_dispatch(
                 item, "indexer:test", "qb", admission_id=admission_id,
             )
 
-        self.assertEqual(update_calls, 2)
+        self.assertEqual(finalize_calls, 1)
         self.assertEqual(result["status"], "manual_review")
         self.assertEqual(result["request_id"], request_id)
         request = db.get_download_request(request_id)
