@@ -914,5 +914,26 @@ class MediaLibraryEpisodeAuditTests(unittest.TestCase):
         client.detail.assert_not_called()
 
 
+
+
+class MediaLibraryEpisodeAuditClientLifecycleTests(unittest.TestCase):
+    def test_owned_tmdb_client_is_closed_after_audit(self) -> None:
+        from app.agent.library_episode_audit import audit_library_episodes
+
+        owner = MediaLibraryEpisodeAuditTests()
+        client = owner._tmdb_client()
+        with patch(
+            "app.agent.library_episode_audit.inspect_library_series_sources",
+            return_value=owner._sources(),
+        ), patch("app.agent.library_episode_audit.TMDBClient", return_value=client):
+            result = audit_library_episodes({
+                "as_of": "2026-08-03",
+                "max_series": 50,
+            })
+
+        self.assertTrue(result.ok)
+        client.close.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

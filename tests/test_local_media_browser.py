@@ -136,3 +136,48 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         self.assertNotIn(".lm-source-trigger-control", css)
         self.assertNotIn(".lm-source-head-toggle", css)
         self.assertNotRegex(css, r"\.lm-media-row:hover\s*\{[^}]*transform")
+
+    def test_background_poll_keeps_expensive_item_refresh_opt_in(self):
+        js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
+
+        poll_block = js[
+            js.index("function schedulePoll()"):
+            js.index("function sourceCard(")
+        ]
+        self.assertIn("await loadAll(false);", poll_block)
+        self.assertNotIn("includeItems", poll_block)
+        for contract in (
+            "let queuedItemRefresh = false",
+            "function loadAll(manual = false, {includeItems = false} = {})",
+            "queuedItemRefresh = queuedItemRefresh || includeItems",
+            "const shouldLoadItems = queuedItemRefresh",
+            "queuedItemRefresh = false",
+            "const collectedResources = {}",
+            "resources: outcomeResources",
+            "loadAll(true, {includeItems: true})",
+            "loadAll(false, {includeItems: currentTab === 'manual'})",
+            "loadAll(false, {includeItems: true})",
+        ):
+            self.assertIn(contract, js)
+        self.assertNotIn("const shouldLoadItems = currentTab === 'manual' || currentManual", js)
+        self.assertGreaterEqual(js.count("loadAll(false, {includeItems: true})"), 6)
+
+    def test_item_context_menu_ignores_initial_browser_viewport_event_and_restores_focus(self):
+        js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
+
+        for contract in (
+            "let itemContextMenuOpenedAt = 0",
+            "function closeItemContextMenu({restoreFocus = false} = {})",
+            "const returnFocus = activeContextTrigger",
+            "returnFocus.focus({preventScroll: true})",
+            "function closeItemContextMenuAfterViewportChange(event)",
+            "event?.isTrusted",
+            "performance.now() - itemContextMenuOpenedAt < 160",
+            "itemContextMenuOpenedAt = performance.now()",
+            "window.visualViewport?.addEventListener('scroll', closeItemContextMenuAfterViewportChange)",
+            "window.visualViewport?.addEventListener('resize', closeItemContextMenuAfterViewportChange)",
+            "document.addEventListener('scroll', closeItemContextMenuAfterViewportChange, true)",
+            "closeItemContextMenu({restoreFocus: true})",
+        ):
+            self.assertIn(contract, js)
+        self.assertNotIn("window.addEventListener('scroll', closeItemContextMenu, true)", js)

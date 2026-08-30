@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from app.agent.models import Evidence, ToolResult
-from app.clients.tmdb import TMDBClient
+from app.clients.tmdb import TMDBClient, close_tmdb_client
 from app.discovery.models import ProviderNotConfigured, ProviderError
 from app.logger import get_logger
 from app.services import inspect_series_episode_sources
@@ -474,6 +474,8 @@ def _audit_uncached(arguments: dict[str, Any]) -> ToolResult:
             suggestions=["请稍后重试或检查 TMDB 连通性。"],
             error="TMDB 元数据暂时不可用。",
         )
+    finally:
+        close_tmdb_client(client)
 
     local: set[tuple[int, int]] = set()
     for source in ready:

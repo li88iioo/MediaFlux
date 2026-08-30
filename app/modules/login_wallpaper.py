@@ -11,7 +11,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app import config, database as db
-from app.clients.tmdb import TMDBClient
+from app.clients.tmdb import TMDBClient, close_tmdb_client
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -155,6 +155,7 @@ def refresh_login_wallpaper(
         return None
     current = time.time() if now is None else float(now)
     previous = _load_cache()
+    client: object | None = None
     try:
         client = client_factory(timeout=(2.0, 5.0), retries=0)
         payload = client.get(
@@ -189,6 +190,8 @@ def refresh_login_wallpaper(
         )
         logger.warning("登录页 TMDB 壁纸刷新失败 (%s)", type(exc).__name__)
         return previous["wallpaper"]
+    finally:
+        close_tmdb_client(client)
 
 
 def _refresh_worker() -> None:

@@ -386,9 +386,16 @@ def get_indexer_service() -> IndexerService:
 async def shutdown_indexer_service() -> None:
     global _service
     with _lock:
-        service, _service = _service, None
-    if service is not None:
-        await service.aclose()
+        service = _service
+    if service is None:
+        return
+
+    # 只有资源真实关闭后才移除全局句柄。失败时保留同一个、已被关闭
+    # 栅栏隔离的实例，允许后续停机或配置热更新再次调用 aclose。
+    await service.aclose()
+    with _lock:
+        if _service is service:
+            _service = None
 
 
 atexit.register(_stop_standalone_runtime)

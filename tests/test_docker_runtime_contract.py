@@ -185,6 +185,14 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("/media/downloads", self.entrypoint)
         self.assertNotIn("/media/library", self.entrypoint)
         self.assertIn("MEDIAFLUX_RUN_AS_ROOT", self.entrypoint)
+        root_mode = self.entrypoint.split(
+            'if is_enabled "${MEDIAFLUX_RUN_AS_ROOT:-1}"; then', 1
+        )[1].split("fi", 1)[0]
+        self.assertIn("rm -f /app/db/.mediaflux-owner-*", root_mode)
+        self.assertLess(
+            root_mode.index("rm -f /app/db/.mediaflux-owner-*"),
+            root_mode.index('exec "$@"'),
+        )
         self.assertIn("MEDIAFLUX_FIX_STRM_PERMISSIONS", self.entrypoint)
         self.assertIn("rm -rf /var/lib/apt/lists/*", self.dockerfile)
 

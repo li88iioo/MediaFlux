@@ -139,5 +139,41 @@ class DiscoveryImageHeaderTests(unittest.TestCase):
         self.assertTrue(call_kwargs.kwargs["allow_redirects"])
 
 
+
+
+class DiscoveryImageSessionLifecycleTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        from app.routes import discovery_image
+
+        discovery_image.close_poster_session()
+
+    def test_close_poster_session_is_idempotent_and_allows_recreation(self) -> None:
+        from app.routes import discovery_image
+
+        existing = MagicMock()
+        replacement = MagicMock()
+        discovery_image._poster_session = existing
+
+        discovery_image.close_poster_session()
+        discovery_image.close_poster_session()
+
+        existing.close.assert_called_once_with()
+        self.assertIsNone(discovery_image._poster_session)
+        with patch("app.routes.discovery_image.requests.Session", return_value=replacement):
+            self.assertIs(discovery_image._get_poster_session(), replacement)
+        self.assertIs(discovery_image._poster_session, replacement)
+
+    def test_close_failure_still_resets_global_session(self) -> None:
+        from app.routes import discovery_image
+
+        existing = MagicMock()
+        existing.close.side_effect = RuntimeError("close failed")
+        discovery_image._poster_session = existing
+
+        discovery_image.close_poster_session()
+
+        self.assertIsNone(discovery_image._poster_session)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,9 @@ fi
 # 家庭服务器默认使用兼容模式，避免宿主机、qB 与媒体服务器 UID/GID
 # 不一致导致挂载目录不可读写；需要非 root 时显式设为 0。
 if is_enabled "${MEDIAFLUX_RUN_AS_ROOT:-1}"; then
+    # root 模式可能生成 root-owned 数据；使旧的非 root owner marker 失效，
+    # 保证以后切回相同 PUID/PGID 时仍会执行一次完整权限迁移。
+    rm -f /app/db/.mediaflux-owner-*
     umask "${UMASK:-022}"
     exec "$@"
 fi

@@ -35,6 +35,8 @@ logger = get_logger(__name__)
 _PRODUCTION_DB_PATH = PATHS.database_path.resolve()
 DB_PATH = PATHS.database_path
 _lock = threading.RLock()
+_wal_setup_lock = threading.Lock()
+_wal_mode_cache: dict[str, tuple[int, int]] = {}
 _configured_test_mode = False
 SCHEMA_VERSION = 13
 
@@ -142,6 +144,10 @@ def configure_database(path: Path, *, test_mode: bool = False) -> Path:
     with _lock:
         DB_PATH = configured_path
         _configured_test_mode = bool(test_mode)
+    # 数据库路径可在测试、恢复或运维切换中复用；清空一次性 WAL 协商缓存，
+    # 避免同路径的新文件继承旧连接状态。
+    with _wal_setup_lock:
+        _wal_mode_cache.clear()
     return configured_path
 
 _SCHEMA = """
@@ -1725,6 +1731,28 @@ def _protect_database_files(path: Path | None = None) -> None:
         )
 
 
+def _database_file_identity(path: Path) -> tuple[int, int] | None:
+    """返回足以识别数据库文件替换的轻量标识。"""
+    try:
+        metadata = path.stat()
+    except OSError:
+        return None
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _ensure_wal_mode(conn: sqlite3.Connection, path: Path) -> None:
+    """每个数据库文件只协商一次 WAL，文件被替换时自动重新协商。"""
+    cache_key = str(path)
+    with _wal_setup_lock:
+        identity = _database_file_identity(path)
+        if identity is not None and _wal_mode_cache.get(cache_key) == identity:
+            return
+        conn.execute("PRAGMA journal_mode=WAL;")
+        refreshed = _database_file_identity(path)
+        if refreshed is not None:
+            _wal_mode_cache[cache_key] = refreshed
+
+
 def _connect() -> sqlite3.Connection:
     started = time.monotonic()
     conn: sqlite3.Connection | None = None
@@ -1733,10 +1761,9 @@ def _connect() -> sqlite3.Connection:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
+        _ensure_wal_mode(conn, db_path)
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.execute("PRAGMA busy_timeout=5000;")
-        _protect_database_files(db_path)
         return conn
     except sqlite3.Error as exc:
         if conn is not None:
@@ -2867,7 +2894,6 @@ def init_db() -> None:
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             conn.commit()
-            _protect_database_files()
         except BaseException as exc:
             if isinstance(exc, sqlite3.Error):
                 _observe_sqlite_contention(exc, phase="init_schema")
@@ -4281,6 +4307,9 @@ from app.repositories.strm import (  # noqa: E402
 )
 
 
+_STRM_SOURCE_SNAPSHOT_KEY = "strm.configured_sources.snapshot.v1"
+
+
 def _ensure_strm_retired_sources_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS strm_retired_sources ("
@@ -4291,15 +4320,107 @@ def _ensure_strm_retired_sources_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def _normalize_strm_source_snapshot(
+    sources: Iterable[object],
+) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for index, raw in enumerate(sources):
+        if isinstance(raw, dict):
+            source_id = str(raw.get("id") or "").strip()
+            source_name = str(raw.get("name") or "").strip()
+        else:
+            source_id = str(raw or "").strip()
+            source_name = ""
+        if not source_id or source_id == "0":
+            continue
+        normalized.setdefault(source_id, source_name or f"源目录{index + 1}")
+    return normalized
+
+
+def _write_strm_source_snapshot(
+    conn: sqlite3.Connection,
+    sources: dict[str, str],
+    strm_root: str,
+) -> None:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "strm_root": str(strm_root or ""),
+            "sources": [
+                {"id": source_id, "name": source_name}
+                for source_id, source_name in sources.items()
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    conn.execute(
+        "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+        (_STRM_SOURCE_SNAPSHOT_KEY, payload, now()),
+    )
+
+
+def _read_strm_source_snapshot(
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, str], str] | None:
+    row = conn.execute(
+        "SELECT value FROM settings_kv WHERE key=?", (_STRM_SOURCE_SNAPSHOT_KEY,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row["value"] or ""))
+        if not isinstance(payload, dict) or int(payload.get("version") or 0) != 1:
+            raise ValueError("unsupported snapshot")
+        raw_sources = payload.get("sources")
+        if not isinstance(raw_sources, list):
+            raise ValueError("invalid sources")
+        return (
+            _normalize_strm_source_snapshot(raw_sources),
+            str(payload.get("strm_root") or ""),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        logger.warning("STRM 来源快照损坏，已按当前配置重建")
+        return None
+
+
+def _apply_strm_source_reconciliation(
+    conn: sqlite3.Connection,
+    active_ids: tuple[str, ...],
+    retired_sources: dict[str, tuple[str, str]],
+) -> None:
+    _ensure_strm_retired_sources_table(conn)
+    if active_ids:
+        placeholders = ",".join("?" for _ in active_ids)
+        conn.execute(
+            f"DELETE FROM strm_retired_sources WHERE source_id IN ({placeholders})",
+            active_ids,
+        )
+    timestamp = now()
+    for source_id, (source_name, strm_root) in retired_sources.items():
+        conn.execute(
+            "INSERT INTO strm_retired_sources(source_id,source_name,strm_root,queued_at,"
+            "updated_at,attempts,last_error) VALUES(?,?,?,?,?,0,'') "
+            "ON CONFLICT(source_id) DO UPDATE SET source_name=excluded.source_name,"
+            "strm_root=excluded.strm_root,updated_at=excluded.updated_at,last_error=''",
+            (source_id, source_name, strm_root, timestamp, timestamp),
+        )
+
+
 @contextmanager
 def reconcile_strm_retired_sources_transaction(
     active_source_ids: Iterable[object],
     retired_sources: Iterable[tuple[object, object, object]],
+    *,
+    configured_sources: Iterable[object] | None = None,
+    configured_strm_root: str = "",
 ):
-    """在调用方配置发布期间暂存 STRM 来源退役变更。
+    """在配置发布事务内同步 STRM 退役队列和已发布来源快照。
 
-    调用方必须在 ``with`` 块内完成配置文件发布。配置发布抛错时，SQLite
-    变更随上下文一并回滚；只有配置发布成功且上下文正常退出后才提交退役队列。
+    调用方必须在 ``with`` 块内完成配置文件发布。若发布或 SQLite 提交失败，
+    两项数据库状态会一起回滚；进程异常退出后，启动恢复可由旧快照与新配置
+    重建缺失的退役记录。
     """
     active_ids = tuple(
         dict.fromkeys(str(item).strip() for item in active_source_ids if str(item).strip())
@@ -4314,24 +4435,37 @@ def reconcile_strm_retired_sources_transaction(
             str(raw_root or ""),
         )
 
-    timestamp = now()
     with get_conn() as conn:
-        _ensure_strm_retired_sources_table(conn)
-        if active_ids:
-            placeholders = ",".join("?" for _ in active_ids)
-            conn.execute(
-                f"DELETE FROM strm_retired_sources WHERE source_id IN ({placeholders})",
-                active_ids,
-            )
-        for source_id, (source_name, strm_root) in normalized_retired.items():
-            conn.execute(
-                "INSERT INTO strm_retired_sources(source_id,source_name,strm_root,queued_at,"
-                "updated_at,attempts,last_error) VALUES(?,?,?,?,?,0,'') "
-                "ON CONFLICT(source_id) DO UPDATE SET source_name=excluded.source_name,"
-                "strm_root=excluded.strm_root,updated_at=excluded.updated_at,last_error=''",
-                (source_id, source_name, strm_root, timestamp, timestamp),
+        _apply_strm_source_reconciliation(conn, active_ids, normalized_retired)
+        if configured_sources is not None:
+            _write_strm_source_snapshot(
+                conn,
+                _normalize_strm_source_snapshot(configured_sources),
+                configured_strm_root,
             )
         yield list(normalized_retired)
+
+
+def reconcile_configured_strm_sources(
+    configured_sources: Iterable[object],
+    strm_root: str,
+) -> list[str]:
+    """启动时用持久快照修复配置发布与 SQLite 提交之间的崩溃窗口。"""
+    current = _normalize_strm_source_snapshot(configured_sources)
+    active_ids = tuple(current)
+    with get_conn() as conn:
+        previous = _read_strm_source_snapshot(conn)
+        retired: dict[str, tuple[str, str]] = {}
+        if previous is not None:
+            previous_sources, previous_root = previous
+            retired = {
+                source_id: (source_name, previous_root)
+                for source_id, source_name in previous_sources.items()
+                if source_id not in current
+            }
+        _apply_strm_source_reconciliation(conn, active_ids, retired)
+        _write_strm_source_snapshot(conn, current, strm_root)
+        return list(retired)
 
 
 def enqueue_strm_retired_source(source_id: str, source_name: str, strm_root: str) -> None:

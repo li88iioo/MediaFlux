@@ -60,6 +60,58 @@ class _Response:
         yield self.payload
 
 
+class StrmOwnedClientLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _client_with_failing_close():
+        client = Mock()
+        client.close.side_effect = RuntimeError("close exploded")
+        return client
+
+    def test_full_sync_close_failure_does_not_replace_success_result(self):
+        expected = {"ok": True, "generated": 1}
+        client = self._client_with_failing_close()
+        with patch(
+            "app.modules.strm.GuangYaClient", return_value=client,
+        ), patch(
+            "app.modules.strm._sync_strm_impl", return_value=expected,
+        ):
+            result = strm_module.sync_strm(
+                "source", "http://mediaflux.invalid", "/tmp/strm",
+            )
+
+        self.assertIs(result, expected)
+        client.close.assert_called_once_with()
+
+    def test_incremental_sync_close_failure_does_not_replace_success_result(self):
+        expected = {"ok": True, "generated": 1}
+        client = self._client_with_failing_close()
+        with patch(
+            "app.modules.strm.GuangYaClient", return_value=client,
+        ), patch(
+            "app.modules.strm._sync_strm_incremental_impl", return_value=expected,
+        ):
+            result = strm_module.sync_strm_incremental(
+                "source", [], "http://mediaflux.invalid", "/tmp/strm",
+            )
+
+        self.assertIs(result, expected)
+        client.close.assert_called_once_with()
+
+    def test_close_failure_does_not_replace_sync_exception(self):
+        client = self._client_with_failing_close()
+        with patch(
+            "app.modules.strm.GuangYaClient", return_value=client,
+        ), patch(
+            "app.modules.strm._sync_strm_impl",
+            side_effect=ValueError("sync exploded"),
+        ), self.assertRaisesRegex(ValueError, "sync exploded"):
+            strm_module.sync_strm(
+                "source", "http://mediaflux.invalid", "/tmp/strm",
+            )
+
+        client.close.assert_called_once_with()
+
+
 class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
     def setUp(self):
         with db.get_conn() as conn:

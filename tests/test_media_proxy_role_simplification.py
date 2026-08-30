@@ -243,6 +243,109 @@ class MediaProxyLoggingBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    async def test_runtime_start_rolls_back_when_status_persist_fails(self):
+        from app.modules import media_proxy
+
+        row = {
+            "id": 11,
+            "listen_host": "127.0.0.1",
+            "listen_port": 18101,
+            "upstream_url": "http://127.0.0.1:8096",
+        }
+        fake_socket = MagicMock()
+        fake_task = MagicMock()
+        fake_task.done.return_value = False
+        fake_server = MagicMock()
+        manager = media_proxy.MediaProxyManager()
+        real_create_task = asyncio.create_task
+
+        def create_task(coro, *, name=None):
+            if name == "media-proxy-11":
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+                return fake_task
+            return real_create_task(coro, name=name)
+
+        with (
+            patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
+            patch.object(media_proxy.socket, "socket", return_value=fake_socket),
+            patch.object(media_proxy, "create_proxy_app", return_value=object()),
+            patch.object(media_proxy.uvicorn, "Config", return_value=object()),
+            patch.object(media_proxy.uvicorn, "Server", return_value=fake_server),
+            patch.object(media_proxy.asyncio, "create_task", side_effect=create_task),
+            patch.object(media_proxy.asyncio, "sleep", new=AsyncMock()),
+            patch.object(
+                media_proxy.database,
+                "update_media_proxy_instance",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ),
+            patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop_runtime,
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                await manager._start_runtime(row)
+
+        stop_runtime.assert_awaited_once()
+        runtime = stop_runtime.await_args.args[0]
+        self.assertEqual(runtime.instance_id, 11)
+        self.assertIs(runtime.server, fake_server)
+        self.assertIs(runtime.sock, fake_socket)
+        self.assertIs(runtime.task, fake_task)
+        self.assertEqual(manager._runtimes, {})
+
+
+    async def test_runtime_start_cancellation_rolls_back_spawned_runtime(self):
+        from app.modules import media_proxy
+
+        row = {
+            "id": 12,
+            "listen_host": "127.0.0.1",
+            "listen_port": 18102,
+            "upstream_url": "http://127.0.0.1:8096",
+        }
+        fake_socket = MagicMock()
+        fake_task = MagicMock()
+        fake_task.done.return_value = False
+        fake_server = MagicMock()
+        manager = media_proxy.MediaProxyManager()
+        real_create_task = asyncio.create_task
+
+        def create_task(coro, *, name=None):
+            if name == "media-proxy-12":
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+                return fake_task
+            return real_create_task(coro, name=name)
+
+        with (
+            patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
+            patch.object(media_proxy.socket, "socket", return_value=fake_socket),
+            patch.object(media_proxy, "create_proxy_app", return_value=object()),
+            patch.object(media_proxy.uvicorn, "Config", return_value=object()),
+            patch.object(media_proxy.uvicorn, "Server", return_value=fake_server),
+            patch.object(media_proxy.asyncio, "create_task", side_effect=create_task),
+            patch.object(
+                media_proxy.asyncio,
+                "sleep",
+                new=AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+            patch.object(
+                media_proxy.database, "update_media_proxy_instance"
+            ) as update_status,
+            patch.object(manager, "_stop_runtime", new=AsyncMock()) as stop_runtime,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await manager._start_runtime(row)
+
+        stop_runtime.assert_awaited_once()
+        update_status.assert_not_called()
+        runtime = stop_runtime.await_args.args[0]
+        self.assertEqual(runtime.instance_id, 12)
+        self.assertIs(runtime.task, fake_task)
+        self.assertEqual(manager._runtimes, {})
+
+
 class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_reconcile_restarts_a_runtime_whose_task_exited(self):
         from app.modules import media_proxy

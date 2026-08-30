@@ -62,6 +62,14 @@ class _ProviderOutcome:
     duration_ms: int = 0
 
 
+class _CloseAttempt:
+    __slots__ = ("complete", "error")
+
+    def __init__(self) -> None:
+        self.complete = threading.Event()
+        self.error: BaseException | None = None
+
+
 class IndexerService:
     """Concurrent, bounded aggregation over registered resource indexers."""
 
@@ -115,7 +123,7 @@ class IndexerService:
         ] = {}
         self._closing = False
         self._closed = False
-        self._close_complete = threading.Event()
+        self._close_attempt: _CloseAttempt | None = None
 
     async def search(
         self,
@@ -459,14 +467,22 @@ class IndexerService:
         with self._runtime_condition:
             if self._closed:
                 return
-            if self._closing:
-                wait_for_owner = True
+            current_attempt = self._close_attempt
+            if current_attempt is not None and not current_attempt.complete.is_set():
+                attempt = current_attempt
+                close_owner = False
             else:
+                # 失败后的服务继续保持关闭栅栏，但后续 aclose 可以拥有一个
+                # 新尝试，直到 registry 确实释放成功。
                 self._closing = True
-                wait_for_owner = False
+                attempt = _CloseAttempt()
+                self._close_attempt = attempt
+                close_owner = True
 
-        if wait_for_owner:
-            await asyncio.to_thread(self._close_complete.wait)
+        if not close_owner:
+            await asyncio.to_thread(attempt.complete.wait)
+            if attempt.error is not None:
+                raise attempt.error
             return
 
         try:
@@ -490,11 +506,20 @@ class IndexerService:
                     "索引器仍有任务未退出，为避免关闭正在使用的上游客户端，本次未关闭 registry"
                 )
             await self.registry.aclose()
-        finally:
+        except BaseException as exc:
+            attempt.error = exc
+            # _closing 保持为 True，禁止失败后重新接收业务请求；完成事件只
+            # 结束本轮等待者，下一次 aclose 会创建新尝试重试资源释放。
+            with self._runtime_condition:
+                self._runtime_condition.notify_all()
+            raise
+        else:
             with self._runtime_condition:
                 self._closed = True
+                self._closing = False
                 self._runtime_condition.notify_all()
-            self._close_complete.set()
+        finally:
+            attempt.complete.set()
 
     def _ensure_open(self) -> None:
         with self._runtime_lock:

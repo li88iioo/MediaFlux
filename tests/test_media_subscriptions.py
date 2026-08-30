@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app import database as db
 from app.modules.media_subscriptions import (
@@ -12,6 +12,7 @@ from app.modules.media_subscriptions import (
     MediaSubscriptionService,
     _ExpectedMedia,
     _rotated_missing_targets,
+    _tmdb_detail,
 )
 from tests.support import IsolatedDatabaseTestCase
 
@@ -1120,3 +1121,83 @@ class MediaSubscriptionCancellationBoundaryTests(IsolatedDatabaseTestCase):
         with self.assertRaises(MediaSubscriptionError) as ctx:
             asyncio.run(scenario())
         self.assertIs(ctx.exception, cancelled)
+
+
+class MediaSubscriptionTMDBLifecycleTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM media_download_admissions")
+            conn.execute("DELETE FROM media_subscription_candidates")
+            conn.execute("DELETE FROM media_subscription_runs")
+            conn.execute("DELETE FROM media_subscriptions")
+
+    def test_thread_owned_detail_client_closes_on_success_and_error(self) -> None:
+        success = MagicMock()
+        success.detail.return_value = {"id": 1}
+        with patch("app.modules.media_subscriptions.TMDBClient", return_value=success):
+            self.assertEqual(_tmdb_detail("1", "tv"), {"id": 1})
+        success.close.assert_called_once_with()
+
+        failed = MagicMock()
+        failed.detail.side_effect = RuntimeError("upstream failed")
+        with patch("app.modules.media_subscriptions.TMDBClient", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "upstream failed"):
+                _tmdb_detail("1", "tv")
+        failed.close.assert_called_once_with()
+
+    def test_expected_tv_closes_owned_client(self) -> None:
+        service = MediaSubscriptionService()
+        subscription_id = MediaSubscriptionTests._seed_subscription()
+        row = db.get_media_subscription(subscription_id)
+        client = MagicMock()
+        client.tv_season_detail.return_value = {
+            "episodes": [{"episode_number": 1, "air_date": "2026-01-01"}],
+        }
+        detail = {"seasons": [{"season_number": 1}]}
+
+        with patch("app.modules.media_subscriptions.TMDBClient", return_value=client):
+            expected, future, unknown = asyncio.run(
+                service._expected_tv(row, detail, require_active_check=False)
+            )
+
+        self.assertEqual(len(expected), 1)
+        self.assertEqual((future, unknown), (0, 0))
+        client.close.assert_called_once_with()
+
+    def test_cancelled_expected_tv_waits_for_request_before_closing_client(self) -> None:
+        service = MediaSubscriptionService()
+        subscription_id = MediaSubscriptionTests._seed_subscription()
+        row = db.get_media_subscription(subscription_id)
+        request_started = threading.Event()
+        release_request = threading.Event()
+        close_after_request = threading.Event()
+
+        class Client:
+            def tv_season_detail(self, _tmdb_id, _season):
+                request_started.set()
+                release_request.wait(timeout=2)
+                return {"episodes": []}
+
+            def close(self):
+                if release_request.is_set():
+                    close_after_request.set()
+
+        async def scenario() -> None:
+            with patch("app.modules.media_subscriptions.TMDBClient", return_value=Client()):
+                task = asyncio.create_task(
+                    service._expected_tv(
+                        row,
+                        {"seasons": [{"season_number": 1}]},
+                        require_active_check=False,
+                    )
+                )
+                await asyncio.to_thread(request_started.wait, 1)
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                release_request.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(scenario())
+        self.assertTrue(close_after_request.is_set())

@@ -256,8 +256,6 @@ class DatabaseIsolationTests(unittest.TestCase):
             self.assertEqual(db.resolve_db_path(), previous)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class SQLiteContentionObservabilityTests(unittest.TestCase):
@@ -360,3 +358,80 @@ class SQLiteConnectCleanupTests(unittest.TestCase):
 
         self.assertIs(ctx.exception, error)
         self.assertTrue(conn.closed)
+
+
+class SQLiteConnectionHotPathTests(unittest.TestCase):
+    class _Connection:
+        def __init__(self) -> None:
+            self.row_factory = None
+            self.statements: list[str] = []
+            self.closed = False
+
+        def execute(self, statement: str):
+            self.statements.append(statement)
+            return self
+
+        def commit(self) -> None:
+            pass
+
+        def rollback(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    def setUp(self) -> None:
+        self.original_db_path = db.DB_PATH
+        self.original_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tempdir.name) / "hot-path.db"
+        self.db_path.touch()
+        db.configure_database(self.db_path, test_mode=True)
+
+    def tearDown(self) -> None:
+        db.configure_database(
+            self.original_db_path,
+            test_mode=self.original_test_mode,
+        )
+        self.tempdir.cleanup()
+
+    def test_wal_mode_is_negotiated_once_for_same_database_file(self) -> None:
+        first = self._Connection()
+        second = self._Connection()
+        with patch("app.database.sqlite3.connect", side_effect=[first, second]):
+            db._connect().close()
+            db._connect().close()
+
+        wal = "PRAGMA journal_mode=WAL;"
+        self.assertEqual(first.statements.count(wal), 1)
+        self.assertEqual(second.statements.count(wal), 0)
+        self.assertIn("PRAGMA foreign_keys=ON;", second.statements)
+        self.assertIn("PRAGMA busy_timeout=5000;", second.statements)
+
+    def test_replaced_database_file_renegotiates_wal_mode(self) -> None:
+        first = self._Connection()
+        second = self._Connection()
+        with patch("app.database.sqlite3.connect", side_effect=[first, second]):
+            db._connect().close()
+            self.db_path.unlink()
+            self.db_path.touch()
+            db._connect().close()
+
+        wal = "PRAGMA journal_mode=WAL;"
+        self.assertEqual(first.statements.count(wal), 1)
+        self.assertEqual(second.statements.count(wal), 1)
+
+    def test_connection_context_protects_database_files_once_on_exit(self) -> None:
+        connection = self._Connection()
+        with patch("app.database._connect", return_value=connection), patch(
+            "app.database._protect_database_files"
+        ) as protect:
+            with db.get_conn():
+                pass
+
+        protect.assert_called_once_with()
+        self.assertTrue(connection.closed)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -15,7 +15,29 @@ class TabLazyLoadingTests(unittest.TestCase):
         cls.proxy = Path("app/templates/media_proxy.html").read_text(encoding="utf-8")
 
     def test_local_media_items_wait_for_manual_tab(self) -> None:
-        self.assertIn("const shouldLoadItems = currentTab === 'manual' || currentManual", self.local_media)
+        self.assertIn(
+            "function loadAll(manual = false, {includeItems = false} = {})",
+            self.local_media,
+        )
+        self.assertIn(
+            "loadAll(false, {includeItems: currentTab === 'manual'})",
+            self.local_media,
+        )
+        self.assertIn(
+            "if (currentTab === 'manual' && (hasLoadedLocalMedia || refreshing))",
+            self.local_media,
+        )
+        self.assertIn("loadAll(false, {includeItems: true})", self.local_media)
+        poll_block = self.local_media[
+            self.local_media.index("function schedulePoll()"):
+            self.local_media.index("function sourceCard(")
+        ]
+        self.assertIn("await loadAll(false);", poll_block)
+        self.assertNotIn("includeItems", poll_block)
+        self.assertNotIn(
+            "const shouldLoadItems = currentTab === 'manual' || currentManual",
+            self.local_media,
+        )
         self.assertNotIn("!hasLoadedLocalMedia || currentTab === 'manual'", self.local_media)
 
     def test_subscription_panels_load_once_even_when_empty(self) -> None:

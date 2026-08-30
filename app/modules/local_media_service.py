@@ -85,7 +85,7 @@ class LocalMediaServiceError(RuntimeError):
 
 
 class LocalMediaPostMoveError(LocalMediaServiceError):
-    """移动已提交或回滚不完整；上层必须保持人工核验语义。"""
+    """不可逆整理步骤已提交或回滚不完整；上层必须保持人工核验语义。"""
 
     requires_manual = True
 
@@ -1496,10 +1496,16 @@ class LocalMediaService:
 
     @staticmethod
     def _committed_move_failure_message(
-        exc: Exception, moved_targets: list[str], *, rollback_incomplete: bool = False,
+        exc: Exception,
+        moved_targets: list[str],
+        *,
+        rollback_incomplete: bool = False,
+        qb_task_retired: bool = False,
     ) -> str:
         if rollback_incomplete:
             prefix = "本地媒体移动失败且回滚不完整，文件状态需要人工核验"
+        elif qb_task_retired and not moved_targets:
+            prefix = "qB 任务已完成移除，但本地媒体后续收尾失败，已禁止自动恢复 qB"
         else:
             prefix = "本地媒体文件已完成移动，但后续收尾失败，已禁止自动恢复 qB"
         error_text = str(exc or type(exc).__name__).strip() or type(exc).__name__
@@ -1544,6 +1550,7 @@ class LocalMediaService:
         rules = self._restore_rules_snapshot(task.rules_snapshot) if task.rules_snapshot else OrganizeRules.from_config()
         paused = False
         move_committed = False
+        qb_task_retired = False
         committed_targets: list[str] = []
         try:
             if task.qb_hash and qb_client is None:
@@ -1647,6 +1654,7 @@ class LocalMediaService:
             if task.qb_hash and qb_client is not None:
                 try:
                     qb_client.delete_torrents(task.qb_hash, delete_files=False)
+                    qb_task_retired = True
                     cleanup_allowed = True
                 except Exception:
                     qb_cleanup_pending = True
@@ -1703,11 +1711,12 @@ class LocalMediaService:
             }
         except Exception as exc:
             rollback_incomplete = bool(getattr(exc, "rollback_errors", None))
-            if move_committed or rollback_incomplete:
+            if move_committed or qb_task_retired or rollback_incomplete:
                 diagnostic = self._committed_move_failure_message(
                     exc,
                     committed_targets,
                     rollback_incomplete=rollback_incomplete,
+                    qb_task_retired=qb_task_retired,
                 )
                 self._persist_committed_move_failure(owner, task_id, diagnostic)
                 raise LocalMediaPostMoveError(diagnostic) from exc

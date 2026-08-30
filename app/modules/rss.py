@@ -409,6 +409,19 @@ class RSSEngine:
     def __init__(self, *, tmdb_client=None):
         self.parser = MikanParser()
         self._tmdb_client = tmdb_client
+        self._owns_tmdb_client = tmdb_client is None
+
+    def close(self) -> None:
+        """释放本实例按需创建的 TMDB 连接池；注入客户端由调用方管理。"""
+        if not self._owns_tmdb_client:
+            return
+        client = self._tmdb_client
+        self._tmdb_client = None
+        if client is None:
+            return
+        from app.clients.tmdb import close_tmdb_client
+
+        close_tmdb_client(client)
 
     @staticmethod
     def _series_identity_key(value: str) -> str:
@@ -684,7 +697,10 @@ class RSSEngine:
                 result.update({"partial": True, "failed_sources": failed_sources})
             return result
         finally:
-            _release_rss_refresh(sub_id)
+            try:
+                self.close()
+            finally:
+                _release_rss_refresh(sub_id)
 
     # ===== 下载联动 =====
     @staticmethod

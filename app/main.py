@@ -500,6 +500,33 @@ def create_app(*, start_background: bool = False) -> FastAPI:
         _app.state.ready = False
         with runtime_lifecycle_guard(config.PATHS):
             database.init_db()
+            try:
+                from app.modules.strm import parse_strm_sources
+
+                configured_sources, source_error = parse_strm_sources(
+                    config.get("GY_STRM_SOURCE_DIRS", ""),
+                    require_nonempty=False,
+                )
+                if source_error:
+                    logger.warning(
+                        "STRM 来源快照恢复跳过：当前配置无效"
+                    )
+                else:
+                    recovered_retirements = database.reconcile_configured_strm_sources(
+                        configured_sources,
+                        config.get("STRM_ROOT", "").strip(),
+                    )
+                    if recovered_retirements:
+                        logger.warning(
+                            "已恢复中断的 STRM 来源退役状态 count=%s",
+                            len(recovered_retirements),
+                        )
+            except Exception as exc:
+                # 恢复失败不能阻断服务启动；保留快照供下次重试，且不执行
+                # 任何来源清理，避免把不确定状态转化为破坏性操作。
+                logger.warning(
+                    "STRM 来源快照恢复失败 type=%s", type(exc).__name__
+                )
             from app.modules.recognition_knowledge import ensure_seed_knowledge
 
             ensure_seed_knowledge()
@@ -568,6 +595,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
 
                 from app.discovery.service import shutdown_discovery_service
                 from app.discovery.search import shutdown_discovery_search_service
+                from app.routes.discovery_image import close_poster_session
                 from app.indexers.runtime import (
                     shutdown_indexer_service,
                     unbind_indexer_event_loop,
@@ -597,6 +625,12 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                     else:
                         logger.warning(
                             "媒体订阅检查尚未收敛，本次关机跳过 discovery/indexer runtime 销毁"
+                        )
+                    try:
+                        close_poster_session()
+                    except Exception as exc:
+                        logger.warning(
+                            "关闭探索海报连接池失败 type=%s", type(exc).__name__
                         )
                     proxy_runtime_stopped = False
                     if start_background:

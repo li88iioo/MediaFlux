@@ -87,6 +87,7 @@ class LoginWallpaperServiceTests(IsolatedDatabaseTestCase):
             "/movie/popular",
             {"page": 1, "include_adult": "false"},
         )
+        client.close.assert_called_once_with()
         cached = json.loads(db.kv_get("login_wallpaper.tmdb.daily.v1"))
         self.assertEqual(cached["expires_at"], 87_400)
         self.assertEqual(cached["wallpaper"]["tmdb_id"], 22)
@@ -155,6 +156,7 @@ class LoginWallpaperServiceTests(IsolatedDatabaseTestCase):
         cached = json.loads(db.kv_get("login_wallpaper.tmdb.daily.v1"))
         self.assertEqual(cached["retry_after"], 3_300)
         self.assertIsNone(cached["wallpaper"])
+        client.close.assert_called_once_with()
 
     def test_cache_miss_returns_immediately_and_starts_single_refresh(self):
         from app.modules.login_wallpaper import get_login_wallpaper

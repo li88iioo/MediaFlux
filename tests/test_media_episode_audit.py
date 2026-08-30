@@ -473,5 +473,53 @@ class TMDBSeasonPathTests(unittest.TestCase):
             client.tv_season_detail("12345", True)
 
 
+
+
+class EpisodeAuditClientLifecycleTests(unittest.TestCase):
+    def test_owned_tmdb_client_is_closed_after_success(self) -> None:
+        reset_episode_audit_cache_for_tests()
+        client = _FakeTMDB()
+        closed = False
+
+        def close() -> None:
+            nonlocal closed
+            closed = True
+
+        client.close = close
+        with patch(
+            "app.agent.episode_audit.inspect_series_episode_sources",
+            return_value=[_ready([(1, 1)])],
+        ), patch("app.agent.episode_audit.TMDBClient", return_value=client):
+            result = audit_series_episodes({
+                "query": "The Show",
+                "tmdb_id": "",
+                "season": None,
+                "as_of": "2026-08-01",
+            })
+
+        self.assertTrue(result.ok)
+        self.assertTrue(closed)
+
+    def test_close_failure_does_not_replace_tmdb_error(self) -> None:
+        reset_episode_audit_cache_for_tests()
+        client = _FakeTMDB()
+        client.detail = lambda *_args: (_ for _ in ()).throw(
+            ProviderUnavailable("upstream unavailable")
+        )
+        client.close = lambda: (_ for _ in ()).throw(RuntimeError("close failed"))
+        with patch(
+            "app.agent.episode_audit.inspect_series_episode_sources",
+            return_value=[_ready([])],
+        ), patch("app.agent.episode_audit.TMDBClient", return_value=client):
+            result = audit_series_episodes({
+                "query": "The Show",
+                "tmdb_id": "",
+                "season": None,
+                "as_of": "2026-08-01",
+            })
+
+        self.assertEqual(result.status, "unavailable")
+
+
 if __name__ == "__main__":
     unittest.main()

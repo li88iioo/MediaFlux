@@ -55,6 +55,20 @@ def _get_poster_session() -> requests.Session:
         return session
 
 
+def close_poster_session() -> None:
+    """关闭进程级海报连接池；重复调用安全，后续请求可按需重建。"""
+    global _poster_session  # noqa: PLW0603
+    with _session_lock:
+        session = _poster_session
+        _poster_session = None
+    if session is None:
+        return
+    try:
+        session.close()
+    except Exception as exc:
+        logger.warning("关闭探索海报 HTTP Session 失败 type=%s", type(exc).__name__)
+
+
 def _require_discovery_enabled() -> None:
     if not config.get_bool("DISCOVERY_ENABLED", False):
         raise HTTPException(status_code=404, detail="not found")

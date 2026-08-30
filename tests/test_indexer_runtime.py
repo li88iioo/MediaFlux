@@ -410,6 +410,23 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         shutdown_search.assert_not_called()
         proxy.stop.assert_awaited_once_with()
 
+
+    async def test_shutdown_failure_keeps_service_handle_for_retry(self):
+        service = Mock()
+        service.aclose = AsyncMock(
+            side_effect=[RuntimeError("registry still in use"), None]
+        )
+        runtime._service = service
+
+        with self.assertRaisesRegex(RuntimeError, "registry still in use"):
+            await runtime.shutdown_indexer_service()
+
+        self.assertIs(runtime._service, service)
+        await runtime.shutdown_indexer_service()
+        self.assertIsNone(runtime._service)
+        self.assertEqual(service.aclose.await_count, 2)
+
+
     async def test_shutdown_uses_service_lifecycle_hook(self):
         service = Mock()
         service.aclose = AsyncMock()

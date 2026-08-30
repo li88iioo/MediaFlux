@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 from app import config, database as db
 from app.agent.resource_recommendation import rank_episode_search
-from app.clients.tmdb import TMDBClient
+from app.clients.tmdb import TMDBClient, close_tmdb_client
 from app.discovery.models import ProviderError, ProviderNotConfigured
 from app.indexers.config import tmdb_detail_is_animation
 from app.indexers.models import IndexerMediaSearchRequest
@@ -42,6 +42,29 @@ _ALLOWED_CHECK_INTERVALS = frozenset({4320, 10080})
 _ACTIVE_CHECK_RUN_ID: ContextVar[int | None] = ContextVar(
     "media_subscription_active_check_run_id", default=None
 )
+
+
+def _tmdb_detail(tmdb_id: str, media_type: str) -> dict[str, Any]:
+    """在线程内完整持有并释放一次性 TMDB Client。"""
+    client = TMDBClient()
+    try:
+        return client.detail(tmdb_id, media_type)
+    finally:
+        close_tmdb_client(client)
+
+
+async def _await_sync_request(call, /, *args):
+    """等待不可取消的同步请求收尾，避免取消时并发关闭其连接池。"""
+    task = asyncio.create_task(asyncio.to_thread(call, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except Exception:
+            # 外层取消是主结果；同步请求的尾部异常不得替换取消语义。
+            pass
+        raise
 
 
 class MediaSubscriptionError(ValueError):
@@ -412,7 +435,7 @@ class MediaSubscriptionService:
             raise MediaSubscriptionError("按季度订阅时至少选择一个季度")
 
         try:
-            detail = await asyncio.to_thread(TMDBClient().detail, tmdb_id, media_type)
+            detail = await asyncio.to_thread(_tmdb_detail, tmdb_id, media_type)
         except ProviderNotConfigured as exc:
             raise MediaSubscriptionError("请先配置 TMDB API Key", status_code=503, code="not_configured") from exc
         except ProviderError as exc:
@@ -723,7 +746,7 @@ class MediaSubscriptionService:
         revision = int(row["revision"] or 1)
         search_rotation = _search_rotation_from_row(row, revision)
         try:
-            detail = await asyncio.to_thread(TMDBClient().detail, tmdb_id, "tv")
+            detail = await asyncio.to_thread(_tmdb_detail, tmdb_id, "tv")
             self._ensure_active_check(int(row["id"]), revision, cancel_event)
             expected, future_count, unknown_dates = await self._expected_tv(
                 row, detail, cancel_event=cancel_event
@@ -846,42 +869,51 @@ class MediaSubscriptionService:
         future_count = 0
         unknown_dates = 0
         client = TMDBClient()
-        for season in available[:30]:
-            payload = await asyncio.to_thread(client.tv_season_detail, str(row["tmdb_id"]), season)
-            # 已开始的同步 HTTP 请求无法被 asyncio 取消；每季返回后立即复核，
-            # 避免停机/配置变更后继续请求其余最多 29 季。
-            if require_active_check:
-                self._ensure_active_check(
-                    int(row["id"]), int(row["revision"] or 1), cancel_event
+        try:
+            for season in available[:30]:
+                payload = await _await_sync_request(
+                    client.tv_season_detail, str(row["tmdb_id"]), season
                 )
-            episodes = payload.get("episodes", [])
-            if not isinstance(episodes, list):
-                raise MediaSubscriptionError("TMDB 集数数据无效", status_code=502, code="invalid_response")
-            for item in episodes:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    episode = int(item.get("episode_number"))
-                except (TypeError, ValueError):
-                    continue
-                if episode <= 0:
-                    continue
-                aired = _parse_air_date(item.get("air_date"))
-                if aired is None:
-                    unknown_dates += 1
-                    continue
-                if aired > today:
-                    future_count += 1
-                    continue
-                if mode == "future" and aired < created_day:
-                    continue
-                expected.append(_ExpectedMedia(
-                    media_key=build_media_key(str(row["tmdb_id"]), "tv", season, episode),
-                    season=season,
-                    episode=episode,
-                    air_date=aired.isoformat(),
-                ))
-        return expected, future_count, unknown_dates
+                # 已开始的同步 HTTP 请求无法被 asyncio 取消；每季返回后立即复核，
+                # 避免停机/配置变更后继续请求其余最多 29 季。
+                if require_active_check:
+                    self._ensure_active_check(
+                        int(row["id"]), int(row["revision"] or 1), cancel_event
+                    )
+                episodes = payload.get("episodes", [])
+                if not isinstance(episodes, list):
+                    raise MediaSubscriptionError(
+                        "TMDB 集数数据无效", status_code=502, code="invalid_response"
+                    )
+                for item in episodes:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        episode = int(item.get("episode_number"))
+                    except (TypeError, ValueError):
+                        continue
+                    if episode <= 0:
+                        continue
+                    aired = _parse_air_date(item.get("air_date"))
+                    if aired is None:
+                        unknown_dates += 1
+                        continue
+                    if aired > today:
+                        future_count += 1
+                        continue
+                    if mode == "future" and aired < created_day:
+                        continue
+                    expected.append(_ExpectedMedia(
+                        media_key=build_media_key(
+                            str(row["tmdb_id"]), "tv", season, episode
+                        ),
+                        season=season,
+                        episode=episode,
+                        air_date=aired.isoformat(),
+                    ))
+            return expected, future_count, unknown_dates
+        finally:
+            close_tmdb_client(client)
 
     async def _preview_tv(
         self,
@@ -894,7 +926,7 @@ class MediaSubscriptionService:
         title = str(row["title"])
         include_specials = bool(row["include_specials"])
         try:
-            detail = await asyncio.to_thread(TMDBClient().detail, tmdb_id, "tv")
+            detail = await asyncio.to_thread(_tmdb_detail, tmdb_id, "tv")
             expected, future_count, unknown_dates = await self._expected_tv(
                 row,
                 detail,
@@ -1003,7 +1035,7 @@ class MediaSubscriptionService:
     ) -> dict[str, Any]:
         tmdb_id = str(row["tmdb_id"])
         try:
-            detail = await asyncio.to_thread(TMDBClient().detail, tmdb_id, "movie")
+            detail = await asyncio.to_thread(_tmdb_detail, tmdb_id, "movie")
         except ProviderNotConfigured as exc:
             raise MediaSubscriptionError(
                 "请先配置 TMDB API Key", status_code=503, code="not_configured"
@@ -1083,7 +1115,7 @@ class MediaSubscriptionService:
         tmdb_id = str(row["tmdb_id"])
         revision = int(row["revision"] or 1)
         try:
-            detail = await asyncio.to_thread(TMDBClient().detail, tmdb_id, "movie")
+            detail = await asyncio.to_thread(_tmdb_detail, tmdb_id, "movie")
             self._ensure_active_check(int(row["id"]), revision, cancel_event)
         except ProviderNotConfigured as exc:
             raise MediaSubscriptionError("请先配置 TMDB API Key", status_code=503, code="not_configured") from exc

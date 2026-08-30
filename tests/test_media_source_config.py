@@ -290,6 +290,80 @@ class StrmRetirementTransactionTests(unittest.TestCase):
             finally:
                 db.configure_database(previous_path, test_mode=previous_test_mode)
 
+    def test_source_snapshot_recovers_publish_before_commit_crash_window(self):
+        from app import database as db
+
+        previous_path = db.DB_PATH
+        previous_test_mode = db._configured_test_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mediaflux.db"
+            try:
+                db.configure_database(path, test_mode=True)
+                db.init_db()
+                self.assertEqual(
+                    db.reconcile_configured_strm_sources(
+                        [{"id": "11", "name": "旧来源"}], "/old/strm"
+                    ),
+                    [],
+                )
+
+                # 模拟配置文件已发布、但 SQLite 事务未提交便异常退出。
+                with self.assertRaisesRegex(RuntimeError, "process interrupted"):
+                    with db.reconcile_strm_retired_sources_transaction(
+                        [],
+                        [("11", "旧来源", "/old/strm")],
+                        configured_sources=[],
+                        configured_strm_root="/new/strm",
+                    ):
+                        raise RuntimeError("process interrupted")
+                self.assertEqual(db.list_strm_retired_sources(), [])
+
+                recovered = db.reconcile_configured_strm_sources([], "/new/strm")
+                self.assertEqual(recovered, ["11"])
+                rows = db.list_strm_retired_sources()
+                self.assertEqual(rows[0]["source_name"], "旧来源")
+                self.assertEqual(rows[0]["strm_root"], "/old/strm")
+
+                # 来源重新加入时，同一次启动对账会撤销尚未执行的退役。
+                self.assertEqual(
+                    db.reconcile_configured_strm_sources(
+                        [{"id": "11", "name": "恢复来源"}], "/new/strm"
+                    ),
+                    [],
+                )
+                self.assertEqual(db.list_strm_retired_sources(), [])
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_snapshot_changes_share_retirement_transaction_rollback(self):
+        from app import database as db
+
+        previous_path = db.DB_PATH
+        previous_test_mode = db._configured_test_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mediaflux.db"
+            try:
+                db.configure_database(path, test_mode=True)
+                db.init_db()
+                db.reconcile_configured_strm_sources(
+                    [{"id": "11", "name": "旧来源"}], "/old/strm"
+                )
+                before = db.kv_get(db._STRM_SOURCE_SNAPSHOT_KEY)
+
+                with self.assertRaisesRegex(RuntimeError, "abort"):
+                    with db.reconcile_strm_retired_sources_transaction(
+                        [],
+                        [("11", "旧来源", "/old/strm")],
+                        configured_sources=[],
+                        configured_strm_root="/new/strm",
+                    ):
+                        raise RuntimeError("abort")
+
+                self.assertEqual(db.kv_get(db._STRM_SOURCE_SNAPSHOT_KEY), before)
+                self.assertEqual(db.list_strm_retired_sources(), [])
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
 
 if __name__ == "__main__":
     unittest.main()

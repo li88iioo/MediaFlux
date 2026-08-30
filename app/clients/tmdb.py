@@ -60,6 +60,19 @@ def _normalize_base_url(value: object) -> tuple[str, str]:
     return raw.rstrip("/"), ""
 
 
+def close_tmdb_client(client: object | None) -> None:
+    """尽力释放短生命周期 TMDB Client，不让清理异常覆盖业务结果。"""
+    if client is None:
+        return
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.warning("关闭 TMDB HTTP Client 失败 type=%s", type(exc).__name__)
+
+
 class TMDBClient:
     """服务端 TMDB 客户端；认证参数不会进入调用方返回值。"""
 

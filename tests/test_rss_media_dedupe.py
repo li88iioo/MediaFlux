@@ -347,3 +347,61 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         self.assertEqual(error, "")
         self.assertEqual(fields["media_tmdb_id"], "105556")
         self.assertEqual(fields["media_default_season"], 2)
+
+
+class RSSTMDBClientLifecycleTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM rss_entry_media")
+            conn.execute("DELETE FROM rss_entries")
+            conn.execute("DELETE FROM rss_media_bindings")
+            conn.execute("DELETE FROM rss_items")
+
+    @staticmethod
+    def _detail() -> dict:
+        return {
+            "id": 105556,
+            "name": "Bound",
+            "original_name": "Bound",
+            "alternative_titles": {"results": []},
+            "translations": {"translations": []},
+        }
+
+    def test_refresh_closes_lazily_created_tmdb_client(self) -> None:
+        sid = db.add_rss_subscription(
+            "Bound",
+            "https://example.invalid/rss",
+            media_tmdb_id="105556",
+            media_default_season=1,
+            skip_existing_episodes=0,
+        )
+        engine = RSSEngine()
+        engine.parser.parse = Mock(return_value=[RSSEntry(
+            title="Bound S01E01 1080p",
+            guid="bound-1",
+            episode="S01E01",
+            series_title="Bound",
+            torrent_url="magnet:?xt=urn:btih:" + "a" * 40,
+        )])
+        engine.parser.last_error_code = ""
+        client = Mock()
+        client.detail_with_alternative_titles.return_value = self._detail()
+
+        with patch("app.clients.tmdb.TMDBClient", return_value=client):
+            result = engine.refresh(sid)
+
+        self.assertEqual(result["new"], 1)
+        client.close.assert_called_once_with()
+        self.assertIsNone(engine._tmdb_client)
+
+    def test_injected_tmdb_client_remains_caller_owned(self) -> None:
+        client = Mock()
+        client.detail_with_alternative_titles.return_value = self._detail()
+        engine = RSSEngine(tmdb_client=client)
+
+        keys, verified = engine._bound_tv_title_keys("105556")
+        engine.close()
+
+        self.assertTrue(verified)
+        self.assertIn("bound", keys)
+        client.close.assert_not_called()

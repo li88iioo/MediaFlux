@@ -6230,35 +6230,39 @@ class MediaProxyManager:
             sock.close()
             raise RuntimeError(f"监听端口 {host}:{port} 被占用") from exc
         signed_urls = SignedUrlCache()
-        config = uvicorn.Config(
-            create_proxy_app(instance_id, signed_urls),
-            host=host,
-            port=port,
-            log_level="warning",
-            log_config=None,
-            access_log=False,
-            lifespan="on",
-            # 默认仍只信任真实 TCP peer；显式配置可信来源后，由 Uvicorn
-            # 按代理链从右向左解析首个不可信地址，再由本模块清洗重写。
-            proxy_headers=trust_forwarded_headers,
-            forwarded_allow_ips=list(trusted_proxy_cidrs),
-            ws_max_size=_proxy_websocket_message_limit(),
-        )
-        server = uvicorn.Server(config)
-        task = asyncio.create_task(server.serve(sockets=[sock]), name=f"media-proxy-{instance_id}")
-        await asyncio.sleep(0)
-        if task.done():
+        try:
+            app = create_proxy_app(instance_id, signed_urls)
+            config = uvicorn.Config(
+                app,
+                host=host,
+                port=port,
+                log_level="warning",
+                log_config=None,
+                access_log=False,
+                lifespan="on",
+                # 默认仍只信任真实 TCP peer；显式配置可信来源后，由 Uvicorn
+                # 按代理链从右向左解析首个不可信地址，再由本模块清洗重写。
+                proxy_headers=trust_forwarded_headers,
+                forwarded_allow_ips=list(trusted_proxy_cidrs),
+                ws_max_size=_proxy_websocket_message_limit(),
+            )
+            server = uvicorn.Server(config)
+            serve_awaitable = server.serve(sockets=[sock])
+            try:
+                task = asyncio.create_task(
+                    serve_awaitable, name=f"media-proxy-{instance_id}"
+                )
+            except BaseException:
+                close = getattr(serve_awaitable, "close", None)
+                if callable(close):
+                    close()
+                raise
+        except BaseException:
             sock.close()
             _release_signed_url_cache(instance_id, signed_urls)
-            error = task.exception()
-            raise RuntimeError(f"媒体反代启动失败: {error or 'unknown error'}")
-        await asyncio.to_thread(
-            database.update_media_proxy_instance,
-            instance_id,
-            {"status": "running", "last_error": ""},
-        )
-        logger.info(f"媒体反代实例启动 id={instance_id} listen={host}:{port}")
-        return ProxyRuntime(
+            raise
+
+        runtime = ProxyRuntime(
             instance_id,
             (host, port),
             server,
@@ -6267,6 +6271,38 @@ class MediaProxyManager:
             signed_urls,
             forwarding,
         )
+        try:
+            await asyncio.sleep(0)
+            if task.done():
+                error = "cancelled" if task.cancelled() else task.exception()
+                raise RuntimeError(
+                    f"媒体反代启动失败: {error or 'unknown error'}"
+                )
+            await asyncio.to_thread(
+                database.update_media_proxy_instance,
+                instance_id,
+                {"status": "running", "last_error": ""},
+            )
+        except BaseException:
+            # socket 与 Uvicorn task 已经对外生效；启动探测、状态持久化
+            # 失败或当前协程被取消时，都必须完整回滚幽灵监听端口。
+            cleanup_task = asyncio.create_task(
+                self._stop_runtime(runtime),
+                name=f"media-proxy-start-rollback-{instance_id}",
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await asyncio.gather(cleanup_task, return_exceptions=True)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "媒体反代启动回滚失败 id=%s type=%s",
+                    instance_id,
+                    type(cleanup_exc).__name__,
+                )
+            raise
+        logger.info(f"媒体反代实例启动 id={instance_id} listen={host}:{port}")
+        return runtime
 
     @staticmethod
     async def _stop_runtime(runtime: ProxyRuntime) -> None:

@@ -7,7 +7,7 @@ import unicodedata
 from typing import Any
 
 from app.agent.models import Evidence, ToolResult
-from app.clients.tmdb import TMDBClient
+from app.clients.tmdb import TMDBClient, close_tmdb_client
 from app.discovery.models import ProviderError, ProviderNotConfigured
 from app.logger import get_logger
 from app.services import inspect_library_series_sources
@@ -416,9 +416,10 @@ def _tmdb_snapshot(
     }
 
 
-def _audit_library_episodes(
+def _audit_library_episodes_with_client(
     arguments: dict[str, Any],
     *,
+    client: TMDBClient,
     after_tmdb_id: str = "",
     resumable: bool = False,
 ) -> ToolResult:
@@ -434,7 +435,6 @@ def _audit_library_episodes(
             "scan_all": True,
         })
     sources = inspect_library_series_sources(**inspect_arguments)
-    client = TMDBClient()
     request_budget = {"remaining": _MAX_TMDB_REQUESTS}
     mapping_stats = {"attempted": 0, "resolved": 0, "ambiguous": 0, "unmatched": 0}
     prefetched_details: dict[str, dict[str, Any]] = {}
@@ -797,6 +797,24 @@ def _audit_library_episodes(
         summary=f"已核对 {data['checked_series_count']} 部剧集，暂未发现已播缺集",
         data=data,
     )
+
+
+def _audit_library_episodes(
+    arguments: dict[str, Any],
+    *,
+    after_tmdb_id: str = "",
+    resumable: bool = False,
+) -> ToolResult:
+    client = TMDBClient()
+    try:
+        return _audit_library_episodes_with_client(
+            arguments,
+            client=client,
+            after_tmdb_id=after_tmdb_id,
+            resumable=resumable,
+        )
+    finally:
+        close_tmdb_client(client)
 
 
 def audit_library_episodes(arguments: dict[str, Any]) -> ToolResult:

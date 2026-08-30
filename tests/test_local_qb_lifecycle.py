@@ -7,7 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import database as db
-from app.modules.local_media_service import LocalMediaService
+from app.modules.local_media_service import (
+    LocalMediaService,
+    LocalMovePlan,
+)
+from app.modules.local_storage import LocalFilesystemAdapter
 from app.modules.scraper import MatchResult
 from tests.support import IsolatedDatabaseTestCase
 from tests.test_local_media_service import FakeScraper
@@ -127,6 +131,53 @@ class LocalQBLifecycleTests(IsolatedDatabaseTestCase):
             db.get_local_media_task(task_id, owner="admin").status,
             "requires_manual",
         )
+
+    def test_all_skipped_after_qb_delete_failure_never_resumes_and_requires_manual(self):
+        root, source, target, task_id, service = self._fixture()
+        self.addCleanup(root.cleanup)
+        source_file = source / "Movie.2025.mkv"
+        snapshot = LocalFilesystemAdapter(source).snapshot(source_file)
+        preview = {
+            "status": "planned",
+            "digest": "all-skipped",
+            "pending_confirmations": [],
+            "_move_plans": [
+                LocalMovePlan(
+                    source=snapshot,
+                    target=target / "Movie (2025)" / "Movie.2025.mkv",
+                    role="video",
+                    media_group="movie:1",
+                    action="skip",
+                    note="保留现有版本",
+                )
+            ],
+            "_cleanup_candidates": [object()],
+            "_retained_paths": [],
+            "matches": [{
+                "tmdb_id": "1",
+                "title": "Movie",
+                "year": "2025",
+                "media_type": "movie",
+            }],
+        }
+        qb = FakeQB()
+
+        with patch.object(service, "preview", return_value=preview), patch(
+            "app.modules.local_media_service.delete_cleanup_items",
+            side_effect=RuntimeError("injected cleanup failure"),
+        ), self.assertRaisesRegex(
+            Exception, "qB 任务已完成移除.*收尾失败",
+        ):
+            service.execute_task("admin", task_id, qb_client=qb)
+
+        self.assertEqual(
+            qb.calls,
+            [("pause", "hash-1"), ("delete", "hash-1", False)],
+        )
+        self.assertTrue(source_file.exists())
+        task = db.get_local_media_task(task_id, owner="admin")
+        self.assertEqual(task.status, "requires_manual")
+        self.assertIn("qB 任务已完成移除", task.error)
 
     def test_qb_task_without_client_fails_before_any_move(self):
         root, source, _target, task_id, service = self._fixture()

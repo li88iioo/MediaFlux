@@ -52,6 +52,7 @@
     let refreshing = false;
     let refreshQueued = false;
     let queuedManualRefresh = false;
+    let queuedItemRefresh = false;
     let refreshPromise = Promise.resolve();
     let sourceSignature = '';
     let taskSignature = '';
@@ -61,6 +62,7 @@
     let activeMediaItem = null;
     let activeContextItem = null;
     let activeContextTrigger = null;
+    let itemContextMenuOpenedAt = 0;
     const mediaItemMap = new Map();
     let taskDisplayLimit = 60;
     const selectedTaskIds = new Set();
@@ -664,20 +666,24 @@
         releaseHeight();
     }
 
-    function loadAll(manual = false) {
+    function loadAll(manual = false, {includeItems = false} = {}) {
         refreshQueued = true;
         queuedManualRefresh = queuedManualRefresh || manual;
+        queuedItemRefresh = queuedItemRefresh || includeItems;
         if (refreshing) return refreshPromise;
 
         refreshing = true;
         let manualIndicatorVisible = false;
         refreshPromise = (async () => {
             let lastOutcome = null;
+            const collectedResources = {};
             try {
                 while (refreshQueued) {
                     const currentManual = queuedManualRefresh;
+                    const shouldLoadItems = queuedItemRefresh;
                     refreshQueued = false;
                     queuedManualRefresh = false;
+                    queuedItemRefresh = false;
                     if (initialLoadingTimer === null && !initialLoadingShownAt
                         && document.querySelector('.lm-tab-panel.active .lm-initial-loading')) {
                         armInitialLoading();
@@ -688,7 +694,6 @@
                         document.querySelector('.lm-page')?.setAttribute('aria-busy', 'true');
                     }
 
-                    const shouldLoadItems = currentTab === 'manual' || currentManual;
                     const itemRequestSerial = mediaBrowseRequestSerial;
                     const names = shouldLoadItems ? ['sources', 'tasks', 'items'] : ['sources', 'tasks'];
                     const settled = await Promise.allSettled([
@@ -763,8 +768,11 @@
                     }
 
                     hasLoadedLocalMedia = Object.values(loadedResources).some(Boolean);
-                    const errors = names
-                        .map((name) => resources[name])
+                    names.forEach((name) => { collectedResources[name] = resources[name]; });
+                    const outcomeNames = Object.keys(collectedResources);
+                    const outcomeResources = {...resources, ...collectedResources};
+                    const errors = outcomeNames
+                        .map((name) => outcomeResources[name])
                         .filter((result) => !result.ok)
                         .map((result) => result.error);
                     const refreshError = errors.length
@@ -773,8 +781,8 @@
                     setRefreshFailure(refreshError);
                     lastOutcome = {
                         ok: errors.length === 0,
-                        partial: errors.length > 0 && errors.length < names.length,
-                        resources,
+                        partial: errors.length > 0 && errors.length < outcomeNames.length,
+                        resources: outcomeResources,
                         errors,
                     };
                     if (currentManual && window.appAlert) {
@@ -1036,7 +1044,7 @@
                 body: JSON.stringify(payload),
             });
             closeSource();
-            await loadAll();
+            await loadAll(false, {includeItems: true});
         } catch (error) {
             appAlert({type: 'error', title: '保存失败', message: error.message});
         } finally {
@@ -1604,7 +1612,7 @@
                     : (result.preview?.reason || '请在待确认任务中继续处理。'),
             });
             if (result.status === 'completed') closeScrape();
-            await loadAll(false);
+            await loadAll(false, {includeItems: true});
         } catch (error) {
             appAlert({type: 'error', title: '整理失败', message: error.message});
         } finally {
@@ -1613,11 +1621,25 @@
         }
     }
 
-    function closeItemContextMenu() {
+    function closeItemContextMenu({restoreFocus = false} = {}) {
+        const returnFocus = activeContextTrigger;
         $('lmItemContextMenu').hidden = true;
         document.querySelector('.lm-media-row.is-context')?.classList.remove('is-context');
         activeContextItem = null;
         activeContextTrigger = null;
+        itemContextMenuOpenedAt = 0;
+        if (restoreFocus && returnFocus?.isConnected) returnFocus.focus({preventScroll: true});
+    }
+
+    function closeItemContextMenuAfterViewportChange(event) {
+        const menu = $('lmItemContextMenu');
+        // 菜单刚显示或聚焦时，部分 Chromium/WebView 会派发一次可信的
+        // scroll/resize；仅忽略这次浏览器自身事件，后续真实视口变化仍关闭菜单。
+        const isInitialBrowserEvent = event?.isTrusted
+            && !menu.hidden
+            && performance.now() - itemContextMenuOpenedAt < 160;
+        if (isInitialBrowserEvent) return;
+        closeItemContextMenu();
     }
 
     function openItemContextMenu(item, x, y, row) {
@@ -1635,6 +1657,7 @@
             deleteButton.disabled = !item.deletable;
             deleteButton.title = item.deletable ? '' : '仅来源根目录一级条目可移入回收区';
         }
+        itemContextMenuOpenedAt = performance.now();
         menu.hidden = false;
         const rect = menu.getBoundingClientRect();
         const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
@@ -1658,7 +1681,7 @@
                 body: JSON.stringify({source_id: item.source_id, path: item.path, identity: item.identity}),
             });
             appAlert({type: 'success', title: '已移入回收区', message: `${item.name} 已从本地媒体条目中移除。`});
-            await loadAll(false);
+            await loadAll(false, {includeItems: true});
         } catch (error) {
             appAlert({type: 'error', title: '删除失败', message: error.message});
         }
@@ -1668,7 +1691,7 @@
         const button = $('lmRefreshItemsBtn');
         setBusy(button, true, '刷新中');
         try {
-            const outcome = await loadAll(false);
+            const outcome = await loadAll(false, {includeItems: true});
             const itemResult = outcome?.resources?.items;
             if (itemResult?.ok && itemResult.applied) {
                 appAlert({type: 'success', title: '条目已刷新', message: `当前共 ${mediaItems.length} 个本地媒体条目。`});
@@ -1710,7 +1733,9 @@
         }
         icons();
         armInitialLoading();
-        if (currentTab === 'manual' && (hasLoadedLocalMedia || refreshing)) loadAll(false);
+        if (currentTab === 'manual' && (hasLoadedLocalMedia || refreshing)) {
+            loadAll(false, {includeItems: true});
+        }
     }
 
     $('lmAddSourceBtn').addEventListener('click', (event) => openSource(null, event.currentTarget));
@@ -1719,7 +1744,7 @@
         btn.addEventListener('click', () => switchTab(btn.dataset.tabTarget));
     });
     $('lmSourceForm').addEventListener('submit', saveSource);
-    $('lmRefreshBtn').addEventListener('click', () => loadAll(true));
+    $('lmRefreshBtn').addEventListener('click', () => loadAll(true, {includeItems: true}));
     $('lmTaskFilter').addEventListener('change', () => { taskDisplayLimit = 60; renderTasks(true, true); });
     $('lmTaskSearch').addEventListener('input', () => { taskDisplayLimit = 60; renderTasks(true, false); });
     $('lmTaskSelectAll').addEventListener('change', (event) => {
@@ -1847,7 +1872,7 @@
             setBusy(remove, true, '删除中');
             try {
                 await api(`/api/local-media/sources/${remove.dataset.deleteSource}`, {method: 'DELETE'});
-                await loadAll();
+                await loadAll(false, {includeItems: true});
             } catch (error) {
                 appAlert({type: 'error', title: '删除失败', message: error.message});
             } finally {
@@ -1922,11 +1947,13 @@
         else if (action === 'delete') await deleteMediaItem(item);
     });
 
-    window.addEventListener('resize', closeItemContextMenu);
-    window.addEventListener('scroll', closeItemContextMenu, true);
+    window.addEventListener('resize', closeItemContextMenuAfterViewportChange);
+    window.visualViewport?.addEventListener('scroll', closeItemContextMenuAfterViewportChange);
+    window.visualViewport?.addEventListener('resize', closeItemContextMenuAfterViewportChange);
+    document.addEventListener('scroll', closeItemContextMenuAfterViewportChange, true);
     document.addEventListener('keydown', (event) => {
         if (event.key !== 'Escape') return;
-        if (!$('lmItemContextMenu').hidden) closeItemContextMenu();
+        if (!$('lmItemContextMenu').hidden) closeItemContextMenu({restoreFocus: true});
         else if (!$('lmScrapeModal').hidden) closeScrape();
     });
 
@@ -1955,6 +1982,6 @@
 
     switchTab(resolveTargetTab(), false);
 
-    loadAll().finally(schedulePoll);
+    loadAll(false, {includeItems: currentTab === 'manual'}).finally(schedulePoll);
     icons();
 })();

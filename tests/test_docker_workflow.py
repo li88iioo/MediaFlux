@@ -25,6 +25,17 @@ class DockerWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("github.ref_type != 'tag'", self.text)
 
+    def test_release_tags_share_one_serial_promotion_gate(self) -> None:
+        self.assertIn(
+            "group: docker-${{ startsWith(github.ref, 'refs/tags/v') && 'release-promotion' || github.ref }}",
+            self.text,
+        )
+        self.assertNotIn("group: docker-${{ github.ref }}", self.text)
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            self.text,
+        )
+
     def test_image_is_smoke_tested_before_multiarch_publish(self) -> None:
         self.assertIn("  smoke:", self.text)
         self.assertIn("docker build \\", self.text)

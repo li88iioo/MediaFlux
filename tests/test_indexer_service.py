@@ -4,6 +4,7 @@ import asyncio
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 from app.indexers.errors import (
     IndexerRateLimited,
@@ -977,6 +978,59 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(adapter.calls, 1)
         self.assertNotEqual(first.items[0].result_id, second.items[0].result_id)
+
+
+    async def test_close_failure_is_shared_with_waiters_and_can_be_retried(self):
+        service = self.service([FakeAdapter("nyaa")])
+        first_wait_started = threading.Event()
+        release_first_wait = threading.Event()
+        wait_calls = 0
+        wait_calls_lock = threading.Lock()
+
+        def fail_to_drain(_timeout):
+            nonlocal wait_calls
+            with wait_calls_lock:
+                wait_calls += 1
+                call_number = wait_calls
+            if call_number == 1:
+                first_wait_started.set()
+                release_first_wait.wait(1.0)
+            return False
+
+        with patch.object(
+            service, "_wait_for_inflight", side_effect=fail_to_drain
+        ), patch.object(service, "_cancel_inflight") as cancel_inflight, patch.object(
+            service.registry, "aclose", new=AsyncMock()
+        ) as close_registry:
+            owner = asyncio.create_task(service.aclose())
+            self.assertTrue(await asyncio.to_thread(first_wait_started.wait, 1.0))
+            waiter = asyncio.create_task(service.aclose())
+            await asyncio.sleep(0)
+            self.assertFalse(waiter.done())
+            release_first_wait.set()
+            results = await asyncio.gather(owner, waiter, return_exceptions=True)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(isinstance(result, RuntimeError) for result in results))
+        self.assertTrue(all("索引器仍有任务未退出" in str(result) for result in results))
+        cancel_inflight.assert_called_once_with()
+        close_registry.assert_not_awaited()
+        self.assertTrue(service._closing)
+        self.assertFalse(service._closed)
+        with self.assertRaises(IndexerUnavailable):
+            await service.search("another", 1, ("nyaa",))
+
+        with patch.object(
+            service, "_wait_for_inflight", return_value=True
+        ), patch.object(
+            service.registry, "aclose", new=AsyncMock()
+        ) as close_registry:
+            await service.aclose()
+
+        close_registry.assert_awaited_once_with()
+        self.assertFalse(service._closing)
+        self.assertTrue(service._closed)
+
 
     async def test_close_cancels_inflight_search_before_registry_close(self):
         adapter = ShutdownAwareAdapter("nyaa", [item("nyaa", "Frieren")])

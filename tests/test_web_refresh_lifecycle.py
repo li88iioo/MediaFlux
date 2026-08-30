@@ -30,7 +30,7 @@ class LocalMediaRefreshLifecycleTests(unittest.TestCase):
         source = (ROOT / "app/static/js/local-media.js").read_text(encoding="utf-8")
         load_all = _extract(
             source,
-            "    function loadAll(manual = false) {",
+            "    function loadAll(manual = false, {includeItems = false} = {}) {",
             "\n    function openLocalDirectoryPicker",
         )
         refresh_items = _extract(
@@ -49,6 +49,7 @@ class LocalMediaRefreshLifecycleTests(unittest.TestCase):
             let refreshing = false;
             let refreshQueued = false;
             let queuedManualRefresh = false;
+            let queuedItemRefresh = false;
             let refreshPromise = Promise.resolve();
             let initialLoadingTimer = null;
             let initialLoadingShownAt = 0;
@@ -85,7 +86,7 @@ class LocalMediaRefreshLifecycleTests(unittest.TestCase):
             {load_all}
             {refresh_items}
             (async () => {{
-              const outcome = await loadAll(false);
+              const outcome = await loadAll(false, {{includeItems: true}});
               assert.equal(outcome.ok, false);
               assert.equal(outcome.partial, true);
               assert.equal(outcome.resources.sources.applied, true);

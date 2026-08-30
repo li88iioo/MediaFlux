@@ -1395,6 +1395,10 @@ def save_config(request: Request, data: Any = Body(default=None)):
             with db.reconcile_strm_retired_sources_transaction(
                 sorted(new_ids),
                 retired_sources,
+                configured_sources=new_strm_sources or [],
+                configured_strm_root=str(
+                    persisted_updates.get("STRM_ROOT", old_strm_root) or ""
+                ),
             ) as reconciled_ids:
                 config.set_and_save(persisted_updates)
                 config_persisted = True

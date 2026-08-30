@@ -1770,9 +1770,7 @@ def sync_strm_incremental(
     should_stop: Callable[[], bool] | None = None,
 ) -> dict:
     """执行可信变化的精准同步，并释放本函数创建的光鸭连接池。"""
-    owned_client = client is None
-    runtime_client = client or GuangYaClient()
-    try:
+    with _guangya_client_scope(client) as runtime_client:
         return _sync_strm_incremental_impl(
             source_dir_id=source_dir_id,
             changes=changes,
@@ -1788,11 +1786,6 @@ def sync_strm_incremental(
             on_progress=on_progress,
             should_stop=should_stop,
         )
-    finally:
-        if owned_client:
-            close = getattr(runtime_client, "close", None)
-            if callable(close):
-                close()
 
 
 def _sync_strm_impl(
@@ -2822,9 +2815,7 @@ def sync_strm(
     should_stop: Callable[[], bool] | None = None,
 ) -> dict:
     """执行一次全量同步；只关闭本函数创建的光鸭连接池。"""
-    owned_client = client is None
-    runtime_client = client or GuangYaClient()
-    try:
+    with _guangya_client_scope(client) as runtime_client:
         return _sync_strm_impl(
             source_dir_id=source_dir_id,
             base_url=base_url,
@@ -2845,11 +2836,6 @@ def sync_strm(
             on_progress=on_progress,
             should_stop=should_stop,
         )
-    finally:
-        if owned_client:
-            close = getattr(runtime_client, "close", None)
-            if callable(close):
-                close()
 
 
 def parse_strm_sources(
