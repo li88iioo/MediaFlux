@@ -801,6 +801,10 @@ def enqueue_strm_change_targets(
         next_attempt_at = _future_stamp(delay)
     written = 0
     with database.get_conn() as conn:
+        # SQLite 的默认延迟事务不会在上面的 SELECT 前取得写锁；并发入队若
+        # 同时读到旧快照，后提交者会覆盖另一批变化。把读取、合并和写入
+        # 放进同一立即写事务，保持“不丢事件”的队列契约。
+        conn.execute("BEGIN IMMEDIATE")
         for (source_id, rel_dir), items in grouped.items():
             row = conn.execute(
                 "SELECT id,state,pending_changes_json,next_attempt_at "

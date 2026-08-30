@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app import database
 from app.discovery.cache import DiscoveryCache
@@ -207,6 +207,22 @@ class DiscoveryRegistryTests(unittest.TestCase):
             registry.get("tmdb")
         with self.assertRaises(ProviderUnavailable):
             registry.register(provider)
+
+    def test_registry_close_retries_only_failed_provider(self):
+        healthy = FakeProvider()
+        flaky = FakeProvider()
+        flaky.close = Mock(side_effect=[False, True])
+        registry = ProviderRegistry({"healthy": healthy, "flaky": flaky})
+
+        self.assertFalse(registry.close())
+        self.assertEqual(healthy.close_calls, 1)
+        self.assertEqual(flaky.close.call_count, 1)
+        with self.assertRaises(ProviderUnavailable):
+            registry.get("healthy")
+
+        self.assertTrue(registry.close())
+        self.assertEqual(healthy.close_calls, 1)
+        self.assertEqual(flaky.close.call_count, 2)
 
 
 class DiscoveryServiceTests(unittest.TestCase):
@@ -566,6 +582,32 @@ class DiscoveryServiceTests(unittest.TestCase):
             if discovery_service._service is service:
                 registry.close_calls = max(registry.close_calls, 1)
                 shutdown_discovery_service()
+
+    def test_request_scoped_scraper_is_closed_without_masking_business_error(self):
+        scraper = Mock()
+        scraper.search_candidates.return_value = []
+        service = DiscoveryService(
+            registry=self.registry,
+            cache=self.cache,
+            scraper_factory=lambda: scraper,
+        )
+        self.addCleanup(service.shutdown)
+
+        result = service.lookup_tmdb_mapping(
+            "douban", "temporary-close-success", "movie", "Movie"
+        )
+        self.assertEqual(result["candidates"], [])
+        scraper.close.assert_called_once_with()
+
+        failing = Mock()
+        failing.search_candidates.side_effect = RuntimeError("business failed")
+        failing.close.side_effect = RuntimeError("cleanup failed")
+        service._scraper_factory = lambda: failing
+        with self.assertRaisesRegex(RuntimeError, "business failed"):
+            service.lookup_tmdb_mapping(
+                "douban", "temporary-close-failure", "movie", "Movie"
+            )
+        failing.close.assert_called_once_with()
 
     def test_singleton_executor_can_shutdown_and_rebuild(self):
         shutdown_discovery_service()

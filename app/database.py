@@ -6536,6 +6536,19 @@ def list_local_media_tasks(*, owner: str = "admin", status: str = "", limit: int
     return [LocalMediaTask.from_row(row) for row in rows]
 
 
+def list_waiting_local_media_tasks(*, owner: str = "admin", limit: int = 500):
+    """按进入顺序领取待处理任务，避免最新任务窗口长期饿死旧任务。"""
+    from app.modules.local_media_models import LocalMediaTask
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM local_media_tasks WHERE owner=? AND status='waiting_stable' "
+            "ORDER BY id ASC LIMIT ?",
+            (_local_media_owner(owner), max(1, min(int(limit), 1000))),
+        ).fetchall()
+    return [LocalMediaTask.from_row(row) for row in rows]
+
+
 def delete_local_media_tasks(task_ids: list[int], *, owner: str = "admin") -> dict[str, int]:
     """删除指定的非运行中本地整理日志；关联条目和步骤由外键级联清理。"""
     from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES

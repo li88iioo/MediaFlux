@@ -310,6 +310,84 @@ class SettingsDraftLifecycleTests(unittest.TestCase):
         self.assertGreaterEqual(source.count("signal:ticket.signal"), 5)
 
 
+    def test_config_save_preserves_edits_made_while_request_is_in_flight(self):
+        app_source = (ROOT / "app/static/js/app.js").read_text(encoding="utf-8")
+        settings_source = (ROOT / "app/static/js/settings.js").read_text(encoding="utf-8")
+        save_block = _extract(
+            app_source,
+            "    window.collectConfigFields = function (root) {",
+            "\n\n    window.setupTabGroup",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            global.window = global;
+            function syncSecretControls() {{}}
+            {save_block}
+            const normal = {{
+              type: 'text', value: 'sent-value',
+              dataset: {{key: 'NORMAL', configInitialValue: 'old-value'}},
+            }};
+            const secret = {{
+              type: 'password', value: 'secret-a', placeholder: '',
+              dataset: {{key: 'SECRET', secretField: 'true', secretState: 'draft'}},
+            }};
+            const fields = [normal, secret];
+            const root = {{querySelectorAll: selector => selector === '[data-key]' ? fields : []}};
+            let sentPayload = null;
+            let resolveRequest;
+            global.fetch = (_url, options) => {{
+              sentPayload = JSON.parse(options.body);
+              return new Promise(resolve => {{resolveRequest = resolve;}});
+            }};
+            (async () => {{
+              const pending = window.saveAppConfig(root, {{toast: false}});
+              assert.deepEqual(sentPayload, {{NORMAL: 'sent-value', SECRET: 'secret-a'}});
+              normal.value = 'newer-value';
+              secret.value = 'secret-b';
+              secret.dataset.secretState = 'draft';
+              resolveRequest({{ok: true, json: async () => ({{}})}});
+              const first = await pending;
+              assert.equal(first.__hasPendingConfigChanges, true);
+              assert.equal(normal.dataset.configInitialValue, 'sent-value');
+              assert.equal(normal.value, 'newer-value');
+              assert.equal(secret.value, 'secret-b');
+              assert.equal(secret.dataset.secretState, 'draft');
+              assert.deepEqual(window.collectConfigFields(root), {{NORMAL: 'newer-value', SECRET: 'secret-b'}});
+
+              global.fetch = async (_url, options) => ({{ok: true, json: async () => ({{saved: JSON.parse(options.body)}})}});
+              const second = await window.saveAppConfig(root, {{toast: false}});
+              assert.equal(second.__hasPendingConfigChanges, false);
+              assert.equal(normal.dataset.configInitialValue, 'newer-value');
+              assert.equal(secret.value, '');
+              assert.equal(secret.dataset.secretState, 'saved');
+            }})().catch(error => {{console.error(error); process.exit(1);}});
+            """
+        )
+        _run_node(script)
+        self.assertIn("上一版已保存，仍有未保存更改", settings_source)
+
+    def test_every_config_save_surface_reports_in_flight_edits(self):
+        paths = (
+            ROOT / "app/templates/dashboard.html",
+            ROOT / "app/templates/guangya_offline.html",
+            ROOT / "app/static/js/downloads.js",
+            ROOT / "app/static/js/guangya-strm.js",
+            ROOT / "app/static/js/organize.js",
+            ROOT / "app/static/js/settings.js",
+        )
+        for path in paths:
+            with self.subTest(path=path.relative_to(ROOT)):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn("saveAppConfig(", source)
+                self.assertIn("__hasPendingConfigChanges", source)
+                self.assertIn("上一版已保存，仍有未保存更改", source)
+
+        dashboard = paths[0].read_text(encoding="utf-8")
+        pending_branch = dashboard.index("if(hasPendingChanges)")
+        reload_call = dashboard.index("window.location.reload()", pending_branch)
+        self.assertIn("return;", dashboard[pending_branch:reload_call])
+
 class AppModalFocusLifecycleTests(unittest.TestCase):
     def test_nested_modals_only_close_top_and_restore_focus_layer_by_layer(self):
         source = (ROOT / "app/static/js/app.js").read_text(encoding="utf-8")
@@ -417,6 +495,66 @@ class AppModalFocusLifecycleTests(unittest.TestCase):
             parentLifecycle.close();
             frames.shift()();
             assert.equal(document.activeElement, elements.outer);
+            """
+        )
+        _run_node(script)
+
+
+class AgentVisualViewportLifecycleTests(unittest.TestCase):
+    def test_bfcache_rebind_is_idempotent_and_cancels_pending_frame(self):
+        source = (ROOT / "app/static/js/agent.js").read_text(encoding="utf-8")
+        viewport_block = _extract(
+            source,
+            "    function cancelVisualViewportFrame() {",
+            "\n\n    syncConversationLayout();",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('node:assert/strict');
+            let visualViewportFrame = 0;
+            let boundVisualViewport = null;
+            let nextFrame = 0;
+            const frames = new Map();
+            const cancelled = [];
+            const windowHandlers = {{}};
+            const viewportHandlers = {{resize: new Set(), scroll: new Set()}};
+            const viewport = {{
+              height: 700,
+              addEventListener: (name, handler) => viewportHandlers[name].add(handler),
+              removeEventListener: (name, handler) => viewportHandlers[name].delete(handler),
+            }};
+            const window = {{
+              visualViewport: viewport,
+              innerHeight: 800,
+              requestAnimationFrame: callback => {{const id = ++nextFrame; frames.set(id, callback); return id;}},
+              cancelAnimationFrame: id => {{cancelled.push(id); frames.delete(id);}},
+              addEventListener: (name, handler) => {{windowHandlers[name] = handler;}},
+            }};
+            const styleValues = {{}};
+            const document = {{
+              activeElement: null,
+              documentElement: {{style: {{setProperty: (name, value) => {{styleValues[name] = value;}}}}}},
+            }};
+            const page = {{classList: {{toggle: () => {{}}}}}};
+            const promptInput = {{}};
+            const scrollToLatest = () => {{}};
+            {viewport_block}
+            assert.equal(viewportHandlers.resize.size, 1);
+            assert.equal(viewportHandlers.scroll.size, 1);
+            assert.ok(visualViewportFrame > 0);
+            const pendingFrame = visualViewportFrame;
+            windowHandlers.pagehide();
+            assert.equal(viewportHandlers.resize.size, 0);
+            assert.equal(viewportHandlers.scroll.size, 0);
+            assert.equal(visualViewportFrame, 0);
+            assert.deepEqual(cancelled, [pendingFrame]);
+            windowHandlers.pageshow({{persisted: true}});
+            windowHandlers.pageshow({{persisted: true}});
+            assert.equal(viewportHandlers.resize.size, 1);
+            assert.equal(viewportHandlers.scroll.size, 1);
+            const frame = frames.get(visualViewportFrame);
+            frame();
+            assert.equal(styleValues['--agent-viewport-height'], '700px');
             """
         )
         _run_node(script)

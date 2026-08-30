@@ -694,7 +694,7 @@
     async function saveConfig(){
         if(!configReady)return;
         if(sourceInput)syncSources();if(isRules){extensionEditors.video?.ensure();extensionEditors.metadata?.ensure();}const state=document.getElementById('organizeSaveState');state.textContent='正在保存...';
-        try{await saveAppConfig(workspace);state.textContent=isRules?'整理规则已保存':'目录配置已保存';state.className='is-success';if(!isRules)await loadStatus();}
+        try{const result=await saveAppConfig(workspace);const hasPendingChanges=result?.__hasPendingConfigChanges===true;state.textContent=hasPendingChanges?'上一版已保存，仍有未保存更改':(isRules?'整理规则已保存':'目录配置已保存');state.className=hasPendingChanges?'is-dirty':'is-success';if(!isRules)await loadStatus();}
         catch(error){state.textContent=error.message;state.className='is-error';}
     }
     async function preview(){

@@ -1167,6 +1167,55 @@ class AgentBrowserTests(unittest.TestCase):
         )
         self.page.wait_for_function("window.__collapseCalls === 1")
 
+    def test_session_delete_success_restores_focus_to_adjacent_session(self):
+        session_ids = [
+            "agent_session_history_prev",
+            "agent_session_history_delete",
+            "agent_session_history_next",
+        ]
+        self.page.evaluate("""sessionIds => {
+            const list = document.getElementById('agentSessionList');
+            const makeItem = sessionId => {
+                const item = document.createElement('article');
+                item.className = 'agent-session-item';
+                item.dataset.sessionId = sessionId;
+                const open = document.createElement('button');
+                open.type = 'button';
+                open.className = 'agent-session-open';
+                open.dataset.agentSessionOpen = sessionId;
+                const title = document.createElement('strong');
+                title.textContent = sessionId;
+                open.append(title);
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.dataset.agentSessionDelete = sessionId;
+                remove.setAttribute('aria-label', `删除会话：${sessionId}`);
+                remove.textContent = '删除';
+                item.append(open, remove);
+                return item;
+            };
+            list.replaceChildren(...sessionIds.map(makeItem));
+            window.__agentSessionsResponse = {
+                sessions: [sessionIds[0], sessionIds[2]].map((sessionId, index) => ({
+                    session_id: sessionId,
+                    title: `保留会话 ${index + 1}`,
+                    message_count: 1,
+                    updated_at: '2026-08-30T08:00:00Z',
+                })),
+            };
+        }""", session_ids)
+        remove = self.page.locator(f'[data-agent-session-delete="{session_ids[1]}"]')
+        remove.click()
+        remove.click()
+        self.page.wait_for_function(
+            "expected => document.activeElement?.dataset.agentSessionOpen === expected",
+            arg=session_ids[2],
+        )
+        self.assertEqual(
+            self.page.evaluate("document.activeElement.dataset.agentSessionOpen"),
+            session_ids[2],
+        )
+
     def test_session_delete_failure_keeps_row_and_restores_button(self):
         session_id = "agent_session_history_0002"
         self.page.evaluate("""sessionId => {

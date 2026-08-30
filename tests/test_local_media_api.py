@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app import database as db
 from app.main import create_app
+from app.modules.local_media_recognition_summary import infer_recognition_summary
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -674,9 +675,14 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             title="骸骨骑士大人异世界冒险中", year="2022", media_type="tv",
             effective_season=2, effective_episode=8,
         )
+        service = SimpleNamespace(
+            infer_recognition_summary=lambda rows: infer_recognition_summary(
+                rows, scraper=scraper,
+            )
+        )
         with patch(
             "app.routes.local_media_api.get_local_media_service",
-            return_value=SimpleNamespace(scraper=scraper),
+            return_value=service,
         ):
             response = self.client.get(f"/api/local-media/tasks/{task_id}")
         self.assertEqual(response.status_code, 200, response.text)

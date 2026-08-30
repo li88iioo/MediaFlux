@@ -8,9 +8,11 @@ from unittest.mock import Mock, patch
 
 from app import database as db
 from app.clients.qbittorrent import TorrentTask
+import app.modules.local_media_scheduler as local_media_scheduler_module
 from app.modules.local_media_scheduler import (
     LocalMediaProbeRetryable,
     LocalMediaScheduler,
+    LocalMediaSourceAmbiguous,
     LocalMediaSourceMigrationRequired,
 )
 from app.modules.local_storage import LocalFilesystemAdapter, LocalScanLimitExceeded
@@ -251,6 +253,54 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             task = db.get_local_media_task(task_id, owner="admin")
             self.assertEqual(task.source_id, migrated_id)
             self.assertEqual(Path(task.content_path), migrated_root / "Movie.mkv")
+
+    def test_equal_prefix_checks_all_sources_and_selects_only_actual_match(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            empty_root = root / "empty"
+            actual_root = root / "actual"
+            empty_root.mkdir()
+            actual_root.mkdir()
+            (actual_root / "Movie.mkv").write_bytes(b"movie")
+            db.create_local_media_source(
+                name="empty", qb_profile="configured:qb", qb_path_prefix="/downloads",
+                local_root=str(empty_root), stable_seconds=0, owner="admin",
+            )
+            actual_id = db.create_local_media_source(
+                name="actual", qb_profile="configured:qb", qb_path_prefix="/downloads",
+                local_root=str(actual_root), stable_seconds=0, owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            task_id = scheduler.enqueue_completed_torrent(
+                self.torrent("/downloads/Movie.mkv", hash_value="equal-prefix")
+            )
+
+            task = db.get_local_media_task(task_id, owner="admin")
+            self.assertEqual(task.source_id, actual_id)
+            self.assertEqual(Path(task.content_path), actual_root / "Movie.mkv")
+
+    def test_equal_prefix_multiple_actual_matches_are_explicitly_ambiguous(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            for name in ("first", "second"):
+                source_root = root / name
+                source_root.mkdir()
+                (source_root / "Movie.mkv").write_bytes(b"movie")
+                db.create_local_media_source(
+                    name=name, qb_profile="configured:qb", qb_path_prefix="/downloads",
+                    local_root=str(source_root), stable_seconds=0, owner="admin",
+                )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            with self.assertRaisesRegex(
+                LocalMediaSourceAmbiguous, "同时命中多个本地媒体来源",
+            ):
+                scheduler.enqueue_completed_torrent(
+                    self.torrent("/downloads/Movie.mkv", hash_value="ambiguous-prefix")
+                )
+
+            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
 
     def test_symlink_source_is_a_visible_configuration_failure(self):
         with tempfile.TemporaryDirectory() as root_raw:
@@ -851,6 +901,67 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         scheduler.start(); scheduler.start(); scheduler.stop(); scheduler.stop()
         self.assertIsNone(scheduler._thread)
         self.assertEqual(scheduler.status(), {"running": False, "interval_seconds": 0.2})
+
+    def test_shutdown_blocks_restart_while_joining_old_thread(self):
+        service = Mock()
+        service.close.return_value = True
+        scheduler = LocalMediaScheduler(service=service, interval=0.2)
+        scheduler._owns_service = True
+
+        class OldThread:
+            alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def join(self, timeout=None):
+                del timeout
+                self.alive = False
+                scheduler.start()
+
+        old_thread = OldThread()
+        scheduler._thread = old_thread
+
+        self.assertTrue(scheduler.shutdown())
+        self.assertIsNone(scheduler._thread)
+        service.close.assert_called_once_with()
+
+    def test_successful_global_shutdown_releases_instance_for_rebuild(self):
+        previous = local_media_scheduler_module._scheduler
+        self.addCleanup(
+            setattr, local_media_scheduler_module, "_scheduler", previous,
+        )
+        service = Mock()
+        service.close.return_value = True
+        scheduler = LocalMediaScheduler(service=service)
+        scheduler._owns_service = True
+        local_media_scheduler_module._scheduler = scheduler
+
+        self.assertTrue(scheduler.shutdown())
+        self.assertIsNone(local_media_scheduler_module._scheduler)
+
+        replacement = LocalMediaScheduler(service=FakeService())
+        with patch.object(
+            local_media_scheduler_module, "LocalMediaScheduler", return_value=replacement,
+        ):
+            self.assertIs(
+                local_media_scheduler_module.get_local_media_scheduler(), replacement,
+            )
+
+    def test_incomplete_service_close_keeps_global_scheduler_reference(self):
+        previous = local_media_scheduler_module._scheduler
+        self.addCleanup(
+            setattr, local_media_scheduler_module, "_scheduler", previous,
+        )
+        service = Mock()
+        service.close.return_value = False
+        scheduler = LocalMediaScheduler(service=service)
+        scheduler._owns_service = True
+        local_media_scheduler_module._scheduler = scheduler
+
+        self.assertFalse(scheduler.shutdown())
+        self.assertIs(local_media_scheduler_module._scheduler, scheduler)
+        service.close.assert_called_once_with()
 
     def test_status_reports_running_without_starting_additional_work(self):
         scheduler = LocalMediaScheduler(service=FakeService(), interval=0.2)

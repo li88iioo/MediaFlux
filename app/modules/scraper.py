@@ -3393,13 +3393,15 @@ class TMDBScraper:
     supports_parent_path = True
 
 
-    def close(self) -> None:
+    def close(self) -> bool:
         """释放内部创建的 TMDB Client；注入 Client 仍由调用方管理。"""
-        if self._closed:
-            return
-        self._closed = True
-        if self._owns_client:
-            close_tmdb_client(self.client)
+        with self._close_lock:
+            if self._closed:
+                return True
+            if self._owns_client and not close_tmdb_client(self.client):
+                return False
+            self._closed = True
+            return True
 
     @staticmethod
     def validate_position(
@@ -3415,6 +3417,7 @@ class TMDBScraper:
     def __init__(self, client: TMDBClient | None = None):
         self._owns_client = client is None
         self.client = client or TMDBClient()
+        self._close_lock = threading.Lock()
         self._closed = False
         self.api_key = str(getattr(self.client, "api_key", "") or "")
         self.base_url = str(getattr(self.client, "base_url", "") or "").rstrip("/")

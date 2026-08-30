@@ -19,6 +19,7 @@ import re
 import threading
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from difflib import SequenceMatcher
 from typing import Callable
@@ -780,6 +781,23 @@ def organize_rules_snapshot_matches(snapshot: object, current_rules: OrganizeRul
     return normalized == organize_rules_snapshot(current_rules)
 
 
+class _LeasedNsfwRecognizerProxy:
+    """兼容旧调用面，并把每次识别器方法调用纳入 lease 生命周期。"""
+
+    def __init__(self, organizer: "Organizer", rules: OrganizeRules) -> None:
+        self._organizer = organizer
+        self._rules = copy.deepcopy(rules)
+
+    def __getattr__(self, name: str):
+        def invoke(*args, **kwargs):
+            with self._organizer._nsfw_recognizer_lease(self._rules) as recognizer:
+                if recognizer is None:
+                    raise RuntimeError("MetaTube 识别器不可用或正在关闭")
+                return getattr(recognizer, name)(*args, **kwargs)
+
+        return invoke
+
+
 class Organizer:
     def __init__(
         self, client: GuangYaClient = None, scraper: TMDBScraper = None, *,
@@ -790,6 +808,9 @@ class Organizer:
         self.client = client if client is not None else GuangYaClient()
         self.scraper = scraper if scraper is not None else TMDBScraper()
         self._closed = False
+        self._closing = False
+        self._owned_scraper_closed = not self._owns_scraper
+        self._owned_client_closed = not self._owns_client
         self._traversal_limits = traversal_limits or (
             max(8, min(get_int("GY_ORGANIZE_MAX_SCAN_DEPTH", DEFAULT_TRAVERSAL_MAX_DEPTH), 512)),
             max(100, min(get_int("GY_ORGANIZE_MAX_SCAN_DIRS", DEFAULT_TRAVERSAL_MAX_DIRS), 500_000)),
@@ -802,36 +823,109 @@ class Organizer:
         self._media_probe_cache_checked: set[tuple[str, str, int]] = set()
         self._probe_budget = None
         self._nsfw_recognizers: dict[tuple[str, str, str, int], object] = {}
+        self._close_call_lock = threading.Lock()
+        self._nsfw_lock = threading.RLock()
+        self._nsfw_active_leases: dict[int, int] = {}
+        self._retired_nsfw_recognizers: dict[int, object] = {}
 
-    def close(self) -> None:
-        """释放 Organizer 内部创建的长连接，注入依赖仍由调用方管理。"""
-        if self._closed:
+    @staticmethod
+    def _close_nsfw_recognizer(recognizer: object) -> bool:
+        close = getattr(recognizer, "close", None)
+        if not callable(close):
+            return True
+        try:
+            closed = close()
+        except Exception as exc:
+            logger.warning(
+                "关闭 MetaTube 识别器失败 type=%s", type(exc).__name__
+            )
+            return False
+        if closed is False:
+            logger.warning("关闭 MetaTube 识别器未完成，已保留供后续重试")
+            return False
+        return True
+
+    def _retire_nsfw_recognizer_locked(self, recognizer: object | None) -> list[object]:
+        if recognizer is None:
+            return []
+        identity = id(recognizer)
+        if self._nsfw_active_leases.get(identity, 0) > 0:
+            self._retired_nsfw_recognizers[identity] = recognizer
+            return []
+        self._retired_nsfw_recognizers.pop(identity, None)
+        return [recognizer]
+
+    def _requeue_failed_nsfw_closes(self, recognizers: list[object]) -> None:
+        if not recognizers:
             return
-        self._closed = True
-        recognizers = list(self._nsfw_recognizers.values())
-        self._nsfw_recognizers.clear()
-        for recognizer in recognizers:
-            close = getattr(recognizer, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception as exc:
-                    logger.warning(
-                        "关闭 MetaTube 识别器失败 type=%s",
-                        type(exc).__name__,
+        with self._nsfw_lock:
+            for recognizer in recognizers:
+                self._retired_nsfw_recognizers[id(recognizer)] = recognizer
+
+    def close(self) -> bool:
+        """释放 Organizer 内部创建的长连接，注入依赖仍由调用方管理。"""
+        with self._close_call_lock:
+            with self._nsfw_lock:
+                if self._closed:
+                    return True
+                self._closing = True
+                recognizers_to_close: list[object] = []
+                for recognizer in self._nsfw_recognizers.values():
+                    recognizers_to_close.extend(
+                        self._retire_nsfw_recognizer_locked(recognizer)
                     )
-        if self._owns_scraper:
-            close = getattr(self.scraper, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception as exc:
-                    logger.warning(
-                        "关闭 TMDB Scraper 失败 type=%s",
-                        type(exc).__name__,
-                    )
-        if self._owns_client:
-            close_guangya_client(self.client)
+                self._nsfw_recognizers.clear()
+                for identity, recognizer in list(
+                    self._retired_nsfw_recognizers.items()
+                ):
+                    if self._nsfw_active_leases.get(identity, 0) <= 0:
+                        self._retired_nsfw_recognizers.pop(identity, None)
+                        recognizers_to_close.append(recognizer)
+
+            seen: set[int] = set()
+            failed_recognizers = []
+            for recognizer in recognizers_to_close:
+                identity = id(recognizer)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if not self._close_nsfw_recognizer(recognizer):
+                    failed_recognizers.append(recognizer)
+            self._requeue_failed_nsfw_closes(failed_recognizers)
+
+            with self._nsfw_lock:
+                recognizers_drained = (
+                    not self._nsfw_active_leases
+                    and not self._retired_nsfw_recognizers
+                )
+            if not recognizers_drained:
+                return False
+
+            if self._owns_scraper and not self._owned_scraper_closed:
+                close = getattr(self.scraper, "close", None)
+                if callable(close):
+                    try:
+                        closed = close()
+                    except Exception as exc:
+                        logger.warning(
+                            "关闭 TMDB Scraper 失败 type=%s",
+                            type(exc).__name__,
+                        )
+                        closed = False
+                    self._owned_scraper_closed = closed is not False
+                else:
+                    self._owned_scraper_closed = True
+            if self._owns_client and not self._owned_client_closed:
+                self._owned_client_closed = close_guangya_client(self.client)
+
+            resources_closed = (
+                self._owned_scraper_closed and self._owned_client_closed
+            )
+            if resources_closed:
+                with self._nsfw_lock:
+                    self._closed = True
+                    self._closing = False
+            return resources_closed
 
     @staticmethod
     def _parse_exts(raw: str, defaults: set[str]) -> set[str]:
@@ -931,28 +1025,108 @@ class Organizer:
         self._forced_detail_refreshes.add(key)
         return self._detail_for_match(match, force_refresh=True), True
 
-    def _nsfw_recognizer(self, rules: OrganizeRules):
+    def _retry_inactive_retired_nsfw_locked(self) -> bool:
+        """固定为 current + 至多一个 retired；active 旧代也会阻止扩代。"""
+        blocked = False
+        for identity, recognizer in list(self._retired_nsfw_recognizers.items()):
+            if self._nsfw_active_leases.get(identity, 0) > 0:
+                blocked = True
+                continue
+            if self._close_nsfw_recognizer(recognizer):
+                self._retired_nsfw_recognizers.pop(identity, None)
+            else:
+                blocked = True
+        return not blocked
+
+    def _resolve_nsfw_recognizer_locked(
+        self, rules: OrganizeRules,
+    ) -> tuple[object | None, list[object]]:
+        if self._closed or self._closing:
+            return None, []
         if not rules.nsfw_enabled or not str(rules.nsfw_metatube_endpoint or "").strip():
-            return None
+            return None, []
         key = (
             str(rules.nsfw_metatube_endpoint).strip(),
             str(rules.nsfw_metatube_token or ""),
             str(rules.nsfw_strip_domains or ""),
             int(rules.nsfw_timeout_seconds),
         )
-        if key not in self._nsfw_recognizers:
-            from app.modules.nsfw import NsfwRecognizer
-            try:
-                self._nsfw_recognizers[key] = NsfwRecognizer(
-                    key[0], key[1], strip_domains=key[2], timeout=key[3]
+        if key in self._nsfw_recognizers:
+            return self._nsfw_recognizers[key], []
+        if not self._retry_inactive_retired_nsfw_locked():
+            return None, []
+
+        previous_close_failed = False
+        for previous in self._nsfw_recognizers.values():
+            identity = id(previous)
+            if self._nsfw_active_leases.get(identity, 0) > 0:
+                self._retired_nsfw_recognizers[identity] = previous
+            elif not self._close_nsfw_recognizer(previous):
+                self._retired_nsfw_recognizers[identity] = previous
+                previous_close_failed = True
+        self._nsfw_recognizers.clear()
+        if previous_close_failed:
+            return None, []
+
+        from app.modules.nsfw import NsfwRecognizer
+        try:
+            recognizer = NsfwRecognizer(
+                key[0], key[1], strip_domains=key[2], timeout=key[3]
+            )
+        except ValueError as exc:
+            log_throttled(
+                logger, logging.WARNING, f"metatube-config:{exc}",
+                "MetaTube 配置无效，已跳过成人内容识别: %s", exc,
+            )
+            recognizer = None
+
+        self._nsfw_recognizers[key] = recognizer
+        return recognizer, []
+
+    def _nsfw_recognizer(self, rules: OrganizeRules):
+        """兼容纠错链路：实际方法调用仍通过 lease 保护底层识别器。"""
+        with self._nsfw_lock:
+            if (
+                self._closed
+                or self._closing
+                or not rules.nsfw_enabled
+                or not str(rules.nsfw_metatube_endpoint or "").strip()
+            ):
+                return None
+        return _LeasedNsfwRecognizerProxy(self, rules)
+
+    @contextmanager
+    def _nsfw_recognizer_lease(self, rules: OrganizeRules):
+        with self._nsfw_lock:
+            recognizer, recognizers_to_close = self._resolve_nsfw_recognizer_locked(
+                rules
+            )
+            if recognizer is not None:
+                identity = id(recognizer)
+                self._nsfw_active_leases[identity] = (
+                    self._nsfw_active_leases.get(identity, 0) + 1
                 )
-            except ValueError as exc:
-                log_throttled(
-                    logger, logging.WARNING, f"metatube-config:{exc}",
-                    "MetaTube 配置无效，已跳过成人内容识别: %s", exc,
-                )
-                self._nsfw_recognizers[key] = None
-        return self._nsfw_recognizers[key]
+
+        failed = [
+            item
+            for item in recognizers_to_close
+            if not self._close_nsfw_recognizer(item)
+        ]
+        self._requeue_failed_nsfw_closes(failed)
+        try:
+            yield recognizer
+        finally:
+            if recognizer is not None:
+                identity = id(recognizer)
+                with self._nsfw_lock:
+                    remaining = self._nsfw_active_leases.get(identity, 0) - 1
+                    if remaining > 0:
+                        self._nsfw_active_leases[identity] = remaining
+                    else:
+                        self._nsfw_active_leases.pop(identity, None)
+                        retired = self._retired_nsfw_recognizers.get(identity)
+                        if retired is not None and self._close_nsfw_recognizer(retired):
+                            self._retired_nsfw_recognizers.pop(identity, None)
 
     @staticmethod
     def _nsfw_unresolved_match() -> MatchResult:

@@ -42,6 +42,10 @@ class LocalMediaSourceMigrationRequired(RuntimeError):
     """qB 已命中遗留来源，但该来源必须迁移为 Docker 容器路径。"""
 
 
+class LocalMediaSourceAmbiguous(ValueError):
+    """同一 qB 路径实际命中多个同优先级来源，必须先修正配置。"""
+
+
 def _candidate_search_key(value: object) -> str:
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
     return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", normalized)
@@ -77,6 +81,9 @@ class LocalMediaScheduler:
         self._capture_result_task_ids: set[int] = set()
         self._captured_task_results: dict[int, dict[str, object]] = {}
         self._guard = threading.RLock()
+        self._stopping = False
+        self._shutdown_requested = False
+        self._lifecycle_generation = 0
 
     @staticmethod
     def _default_qb_client():
@@ -87,11 +94,17 @@ class LocalMediaScheduler:
 
     def start(self) -> None:
         with self._guard:
-            if self._thread and self._thread.is_alive():
+            if (
+                self._stopping
+                or self._shutdown_requested
+                or (self._thread and self._thread.is_alive())
+            ):
                 return
             self._stop_event.clear()
+            generation = self._lifecycle_generation
             self._thread = threading.Thread(
                 target=self._loop,
+                args=(generation,),
                 name="local-media-scheduler",
                 daemon=True,
             )
@@ -100,31 +113,46 @@ class LocalMediaScheduler:
 
     def stop(self, timeout: float = 30.0) -> bool:
         with self._guard:
+            self._stopping = True
+            self._lifecycle_generation += 1
             self._stop_event.set()
             self._wake_event.set()
             thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
+            thread.join(timeout=max(0.0, float(timeout)))
         stopped = not thread or not thread.is_alive()
         with self._guard:
             if self._thread is thread and stopped:
                 self._thread = None
+            if not self._shutdown_requested:
+                self._stopping = False
         return stopped
 
     def shutdown(self, timeout: float = 30.0) -> bool:
         """终止调度线程，并仅释放调度器内部创建的本地媒体服务。"""
+        with self._guard:
+            self._shutdown_requested = True
         stopped = self.stop(timeout=timeout)
-        if stopped and self._owns_service:
+        if not stopped:
+            return False
+        closed = True
+        if self._owns_service:
             close = getattr(self.service, "close", None)
             if callable(close):
                 try:
-                    close()
+                    # 兼容旧版 ``None`` 成功语义；新版显式 False 表示仍有
+                    # 在途资源，不能清空全局引用或构造第二个服务实例。
+                    closed = close() is not False
                 except Exception as exc:
+                    closed = False
                     logger.warning(
                         "关闭本地媒体调度服务失败 type=%s",
                         type(exc).__name__,
                     )
-        return stopped
+        if not closed:
+            return False
+        _release_global_scheduler(self)
+        return True
 
     def reload(self) -> None:
         self._wake_event.set()
@@ -171,18 +199,43 @@ class LocalMediaScheduler:
         valid_matches = [item for item in strongest_matches if not item[3]]
         if not valid_matches:
             raise LocalMediaSourceMigrationRequired(strongest_matches[0][3])
-        _, source, mapping, _ = valid_matches[0]
-        local_path = assert_within(
-            mapping.local_root.joinpath(*mapping.relative_parts(raw_path)),
-            mapping.local_root,
-        )
-        try:
-            contains_video = LocalFilesystemAdapter(mapping.local_root).contains_video(local_path)
-        except (LocalStorageError, OSError) as exc:
-            logger.warning("qB 完成内容媒体检查暂时失败 %s: %s", local_path.name, exc)
-            raise LocalMediaProbeRetryable(str(exc)) from exc
-        if not contains_video:
+        actual_matches: list[tuple[object, PathMapping, Path]] = []
+        probe_errors: list[str] = []
+        for _, candidate_source, candidate_mapping, _ in valid_matches:
+            candidate_path = assert_within(
+                candidate_mapping.local_root.joinpath(
+                    *candidate_mapping.relative_parts(raw_path)
+                ),
+                candidate_mapping.local_root,
+            )
+            try:
+                contains_video = LocalFilesystemAdapter(
+                    candidate_mapping.local_root
+                ).contains_video(candidate_path)
+            except (LocalStorageError, OSError) as exc:
+                probe_errors.append(
+                    f"{candidate_source.name or candidate_source.id}: {exc}"
+                )
+                continue
+            if contains_video:
+                actual_matches.append(
+                    (candidate_source, candidate_mapping, candidate_path)
+                )
+        if len(actual_matches) > 1:
+            names = "、".join(
+                str(getattr(candidate_source, "name", "") or candidate_source.id)
+                for candidate_source, _mapping, _path in actual_matches
+            )
+            raise LocalMediaSourceAmbiguous(
+                f"qB 路径同时命中多个本地媒体来源：{names}；请调整来源路径映射"
+            )
+        if not actual_matches:
+            if probe_errors:
+                detail = "；".join(probe_errors[:3])
+                logger.warning("qB 完成内容媒体检查暂时失败: %s", detail)
+                raise LocalMediaProbeRetryable(detail)
             return None
+        source, mapping, local_path = actual_matches[0]
         if request_id is None:
             task_id = db.create_local_media_task(
                 source.id, task.hash, str(local_path), owner=self.owner,
@@ -519,12 +572,15 @@ class LocalMediaScheduler:
 
     def run_once(self) -> int:
         processed = 0
-        for task in reversed(db.list_local_media_tasks(owner=self.owner, status="waiting_stable", limit=500)):
+        for task in db.list_waiting_local_media_tasks(owner=self.owner, limit=500):
             processed += int(self._process_waiting(task))
         return processed
 
-    def _loop(self) -> None:
+    def _loop(self, generation: int) -> None:
         while not self._stop_event.is_set():
+            with self._guard:
+                if generation != self._lifecycle_generation:
+                    return
             try:
                 self.run_once()
             except Exception as exc:
@@ -538,6 +594,14 @@ class LocalMediaScheduler:
 
 _scheduler: LocalMediaScheduler | None = None
 _scheduler_lock = threading.Lock()
+
+
+def _release_global_scheduler(scheduler: LocalMediaScheduler) -> None:
+    """仅在成功关闭的实例仍是全局实例时释放引用。"""
+    global _scheduler
+    with _scheduler_lock:
+        if _scheduler is scheduler:
+            _scheduler = None
 
 
 def get_local_media_scheduler() -> LocalMediaScheduler:

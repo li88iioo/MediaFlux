@@ -142,9 +142,11 @@
         state.className='';
         state.textContent='正在保存当前分区...';
         try{
-            await saveAppConfig(panel);
-            state.className='is-success';
-            state.textContent='当前分区已保存';
+            const result=await saveAppConfig(panel);
+            const hasPendingChanges=result?.__hasPendingConfigChanges===true
+                || Object.keys(collectConfigFields(panel)).length>0;
+            state.className=hasPendingChanges?'':'is-success';
+            state.textContent=hasPendingChanges?'上一版已保存，仍有未保存更改':'当前分区已保存';
         }
         catch(error){state.className='is-error';state.textContent=error.message;}
         finally{

@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -60,17 +61,22 @@ def _normalize_base_url(value: object) -> tuple[str, str]:
     return raw.rstrip("/"), ""
 
 
-def close_tmdb_client(client: object | None) -> None:
+def close_tmdb_client(client: object | None) -> bool:
     """尽力释放短生命周期 TMDB Client，不让清理异常覆盖业务结果。"""
     if client is None:
-        return
+        return True
     close = getattr(client, "close", None)
     if not callable(close):
-        return
+        return True
     try:
-        close()
+        closed = close()
     except Exception as exc:
         logger.warning("关闭 TMDB HTTP Client 失败 type=%s", type(exc).__name__)
+        return False
+    if closed is False:
+        logger.warning("关闭 TMDB HTTP Client 失败，已保留句柄供后续重试")
+        return False
+    return True
 
 
 class TMDBClient:
@@ -99,7 +105,10 @@ class TMDBClient:
         self.timeout = timeout
         self.retries = max(0, min(int(retries), 2))
         self.session = session or requests.Session()
-        self._close_lock = threading.Lock()
+        self._close_call_lock = threading.Lock()
+        self._lifecycle_condition = threading.Condition(threading.Lock())
+        self._active_requests = 0
+        self._closing = False
         self._closed = False
 
         proxy = (
@@ -109,6 +118,20 @@ class TMDBClient:
             normalized = proxy if proxy.startswith(("http://", "https://")) else f"http://{proxy}"
             self.session.proxies.update({"http": normalized, "https": normalized})
 
+    @contextmanager
+    def _request_operation(self):
+        """让关闭与在途 HTTP 请求互斥，且不串行化正常请求。"""
+        with self._lifecycle_condition:
+            if self._closed or self._closing:
+                raise ProviderUnavailable("TMDB Client 已关闭")
+            self._active_requests += 1
+        try:
+            yield
+        finally:
+            with self._lifecycle_condition:
+                self._active_requests = max(0, self._active_requests - 1)
+                self._lifecycle_condition.notify_all()
+
     def get(
         self,
         path: str,
@@ -117,9 +140,19 @@ class TMDBClient:
         deadline_at: float | None = None,
         retries: int | None = None,
     ) -> dict[str, Any]:
-        with self._close_lock:
-            if self._closed:
-                raise ProviderUnavailable("TMDB Client 已关闭")
+        with self._request_operation():
+            return self._get_open(
+                path, params, deadline_at=deadline_at, retries=retries,
+            )
+
+    def _get_open(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        deadline_at: float | None = None,
+        retries: int | None = None,
+    ) -> dict[str, Any]:
         if self.config_error:
             raise ProviderNotConfigured(self.config_error)
         if not self.api_key:
@@ -194,14 +227,33 @@ class TMDBClient:
             raise ValueError("TMDB ID 必须是 1 到 10 位数字")
         return normalized
 
-    def close(self) -> None:
-        with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-        close = getattr(self.session, "close", None)
-        if callable(close):
-            close()
+    def close(self) -> bool:
+        """关闭连接池；在途请求结束后可重试，不抢先拆除其 Session。"""
+        with self._close_call_lock:
+            with self._lifecycle_condition:
+                if self._closed:
+                    return True
+                self._closing = True
+                if self._active_requests:
+                    return False
+
+            close = getattr(self.session, "close", None)
+            if callable(close):
+                try:
+                    closed = close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭 TMDB Session 失败 type=%s", type(exc).__name__
+                    )
+                    return False
+                if closed is False:
+                    logger.warning("关闭 TMDB Session 失败，已保留句柄供后续重试")
+                    return False
+            with self._lifecycle_condition:
+                self._closed = True
+                self._closing = False
+                self._lifecycle_condition.notify_all()
+            return True
 
     def detail(
         self,

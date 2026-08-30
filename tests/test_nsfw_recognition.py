@@ -1070,6 +1070,221 @@ class DirectoryScrapeRecognizerLifecycleTests(unittest.TestCase):
         service.close()
         self.assertEqual(constructed[1].close_calls, 1)
 
+    def test_directory_service_close_retries_failed_recognizer(self):
+        service = DirectoryScrapeService(
+            client=object(), scraper=MagicMock(), store=MagicMock(),
+        )
+        recognizer = MagicMock()
+        recognizer.close.side_effect = [False, True]
+        service._cached_nsfw_key = ("endpoint", "token", "", 8)
+        service._cached_nsfw_recognizer = recognizer
+
+        self.assertFalse(service.close())
+        self.assertFalse(service._closed)
+        self.assertTrue(service.close())
+        self.assertTrue(service._closed)
+        self.assertEqual(recognizer.close.call_count, 2)
+
+    def test_failed_retired_recognizer_blocks_unbounded_config_generations(self):
+        service = DirectoryScrapeService(
+            client=object(), scraper=MagicMock(), store=MagicMock(),
+        )
+        constructed = []
+
+        class FakeRecognizer:
+            def __init__(self, endpoint, *_args, **_kwargs):
+                self.endpoint = endpoint
+                self.allow_close = endpoint != "http://metatube-a.invalid"
+                self.close_calls = 0
+                constructed.append(self)
+
+            def close(self):
+                self.close_calls += 1
+                return self.allow_close
+
+        rules_a = self._rules("http://metatube-a.invalid")
+        rules_b = self._rules("http://metatube-b.invalid")
+        rules_c = self._rules("http://metatube-c.invalid")
+        with patch("app.modules.nsfw.NsfwRecognizer", FakeRecognizer):
+            with service._nsfw_recognizer_lease(rules_a) as recognizer:
+                self.assertIs(recognizer, constructed[0])
+                with service._nsfw_recognizer_lease(rules_b) as recognizer:
+                    self.assertIs(recognizer, constructed[1])
+                    self.assertEqual(len(service._retired_nsfw_recognizers), 1)
+            self.assertEqual(len(service._retired_nsfw_recognizers), 1)
+
+            with service._nsfw_recognizer_lease(rules_c) as recognizer:
+                self.assertIsNone(recognizer)
+            self.assertEqual(len(constructed), 2)
+            self.assertEqual(len(service._retired_nsfw_recognizers), 1)
+
+            constructed[0].allow_close = True
+            with service._nsfw_recognizer_lease(rules_c) as recognizer:
+                self.assertIs(recognizer, constructed[2])
+            self.assertEqual(constructed[1].close_calls, 1)
+
+        self.assertEqual(len(service._retired_nsfw_recognizers), 0)
+        self.assertTrue(service.close())
+
+    def test_active_retired_recognizer_blocks_a_third_generation(self):
+        service = DirectoryScrapeService(
+            client=object(), scraper=MagicMock(), store=MagicMock(),
+        )
+        constructed = []
+
+        class FakeRecognizer:
+            def __init__(self, endpoint, *_args, **_kwargs):
+                self.endpoint = endpoint
+                self.close_calls = 0
+                constructed.append(self)
+
+            def close(self):
+                self.close_calls += 1
+                return True
+
+        rules_a = self._rules("http://metatube-a.invalid")
+        rules_b = self._rules("http://metatube-b.invalid")
+        rules_c = self._rules("http://metatube-c.invalid")
+        with patch("app.modules.nsfw.NsfwRecognizer", FakeRecognizer):
+            with service._nsfw_recognizer_lease(rules_a) as recognizer_a:
+                self.assertIs(recognizer_a, constructed[0])
+                with service._nsfw_recognizer_lease(rules_b) as recognizer_b:
+                    self.assertIs(recognizer_b, constructed[1])
+                    with service._nsfw_recognizer_lease(rules_c) as recognizer_c:
+                        self.assertIsNone(recognizer_c)
+                    self.assertEqual(len(constructed), 2)
+                    self.assertEqual(len(service._retired_nsfw_recognizers), 1)
+
+            with service._nsfw_recognizer_lease(rules_c) as recognizer_c:
+                self.assertIs(recognizer_c, constructed[2])
+
+        self.assertEqual(constructed[0].close_calls, 1)
+        self.assertEqual(constructed[1].close_calls, 1)
+        self.assertTrue(service.close())
+
+
+class OrganizerRecognizerLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _rules(endpoint: str) -> OrganizeRules:
+        return OrganizeRules(
+            nsfw_enabled=True,
+            nsfw_exclusive=True,
+            nsfw_metatube_endpoint=endpoint,
+        )
+
+    def test_hot_config_switch_keeps_only_current_and_leased_retired_recognizer(self):
+        organizer = Organizer(client=object(), scraper=MagicMock())
+        old_rules = self._rules("http://metatube-old.invalid")
+        new_rules = self._rules("http://metatube-new.invalid")
+        old_started = threading.Event()
+        release_old = threading.Event()
+        constructed = []
+
+        class FakeRecognizer:
+            def __init__(self, endpoint, *_args, **_kwargs):
+                self.endpoint = endpoint
+                self.close_calls = 0
+                constructed.append(self)
+
+            def close(self):
+                self.close_calls += 1
+                return True
+
+        def hold_old() -> None:
+            with organizer._nsfw_recognizer_lease(old_rules):
+                old_started.set()
+                self.assertTrue(release_old.wait(timeout=2))
+
+        with patch("app.modules.nsfw.NsfwRecognizer", FakeRecognizer):
+            thread = threading.Thread(target=hold_old)
+            thread.start()
+            self.assertTrue(old_started.wait(timeout=2))
+            with organizer._nsfw_recognizer_lease(new_rules):
+                self.assertEqual(len(organizer._nsfw_recognizers), 1)
+                self.assertEqual(len(organizer._retired_nsfw_recognizers), 1)
+                self.assertEqual(constructed[0].close_calls, 0)
+            release_old.set()
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(constructed[0].close_calls, 1)
+        self.assertEqual(len(organizer._retired_nsfw_recognizers), 0)
+        self.assertTrue(organizer.close())
+        self.assertEqual(constructed[1].close_calls, 1)
+
+    def test_failed_retired_recognizer_blocks_unbounded_config_generations(self):
+        organizer = Organizer(client=object(), scraper=MagicMock())
+        constructed = []
+
+        class FakeRecognizer:
+            def __init__(self, endpoint, *_args, **_kwargs):
+                self.endpoint = endpoint
+                self.allow_close = endpoint != "http://metatube-a.invalid"
+                self.close_calls = 0
+                constructed.append(self)
+
+            def close(self):
+                self.close_calls += 1
+                return self.allow_close
+
+        rules_a = self._rules("http://metatube-a.invalid")
+        rules_b = self._rules("http://metatube-b.invalid")
+        rules_c = self._rules("http://metatube-c.invalid")
+        with patch("app.modules.nsfw.NsfwRecognizer", FakeRecognizer):
+            with organizer._nsfw_recognizer_lease(rules_a) as recognizer:
+                self.assertIs(recognizer, constructed[0])
+                with organizer._nsfw_recognizer_lease(rules_b) as recognizer:
+                    self.assertIs(recognizer, constructed[1])
+                    self.assertEqual(len(organizer._retired_nsfw_recognizers), 1)
+            self.assertEqual(len(organizer._retired_nsfw_recognizers), 1)
+
+            with organizer._nsfw_recognizer_lease(rules_c) as recognizer:
+                self.assertIsNone(recognizer)
+            self.assertEqual(len(constructed), 2)
+            self.assertEqual(len(organizer._retired_nsfw_recognizers), 1)
+
+            constructed[0].allow_close = True
+            with organizer._nsfw_recognizer_lease(rules_c) as recognizer:
+                self.assertIs(recognizer, constructed[2])
+            self.assertEqual(constructed[1].close_calls, 1)
+
+        self.assertEqual(len(organizer._retired_nsfw_recognizers), 0)
+        self.assertTrue(organizer.close())
+
+    def test_active_retired_recognizer_blocks_a_third_generation(self):
+        organizer = Organizer(client=object(), scraper=MagicMock())
+        constructed = []
+
+        class FakeRecognizer:
+            def __init__(self, endpoint, *_args, **_kwargs):
+                self.endpoint = endpoint
+                self.close_calls = 0
+                constructed.append(self)
+
+            def close(self):
+                self.close_calls += 1
+                return True
+
+        rules_a = self._rules("http://metatube-a.invalid")
+        rules_b = self._rules("http://metatube-b.invalid")
+        rules_c = self._rules("http://metatube-c.invalid")
+        with patch("app.modules.nsfw.NsfwRecognizer", FakeRecognizer):
+            with organizer._nsfw_recognizer_lease(rules_a) as recognizer_a:
+                self.assertIs(recognizer_a, constructed[0])
+                with organizer._nsfw_recognizer_lease(rules_b) as recognizer_b:
+                    self.assertIs(recognizer_b, constructed[1])
+                    with organizer._nsfw_recognizer_lease(rules_c) as recognizer_c:
+                        self.assertIsNone(recognizer_c)
+                    self.assertEqual(len(constructed), 2)
+                    self.assertEqual(len(organizer._retired_nsfw_recognizers), 1)
+
+            with organizer._nsfw_recognizer_lease(rules_c) as recognizer_c:
+                self.assertIs(recognizer_c, constructed[2])
+
+        self.assertEqual(constructed[0].close_calls, 1)
+        self.assertEqual(constructed[1].close_calls, 1)
+        self.assertTrue(organizer.close())
+
 
 if __name__ == "__main__":
     unittest.main()

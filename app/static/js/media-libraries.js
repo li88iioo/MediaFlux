@@ -457,13 +457,13 @@
             rootId,
             rootName: isLocal ? '容器目录' : 'STRM 输出',
             allowRoot: true,
-            fetchDirectory: async (path) => {
+            fetchDirectory: async (path, {signal} = {}) => {
                 const requested = String(path || rootId);
                 const query = new URLSearchParams({path: requested});
                 const endpoint = isLocal
                     ? '/api/media-libraries/local-directories'
                     : '/api/media-libraries/strm-directories';
-                const data = await api(`${endpoint}?${query}`);
+                const data = await api(`${endpoint}?${query}`, {signal});
                 return Array.isArray(data.directories) ? data.directories : [];
             },
             onSelect: (selected) => {

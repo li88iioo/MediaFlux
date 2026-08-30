@@ -85,6 +85,48 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
         self.assertEqual(claimed[0]["changes"][0]["etag"], "new")
         self.assertEqual(claimed[0]["changes"][0]["size"], 2)
 
+    def test_concurrent_enqueue_serializes_read_merge_write(self):
+        first_in_merge = threading.Event()
+        release_first = threading.Event()
+        errors: list[BaseException] = []
+        original_merge = db.merge_strm_changes
+
+        def delayed_merge(existing, incoming):
+            if threading.current_thread().name == "enqueue-first":
+                first_in_merge.set()
+                self.assertTrue(release_first.wait(timeout=2))
+            return original_merge(existing, incoming)
+
+        def enqueue(file_id: str) -> None:
+            try:
+                db.enqueue_strm_change_targets([_change(file_id=file_id)])
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with patch("app.repositories.strm.merge_strm_changes", side_effect=delayed_merge):
+            first = threading.Thread(
+                target=enqueue, args=("f1",), name="enqueue-first",
+            )
+            second = threading.Thread(
+                target=enqueue, args=("f2",), name="enqueue-second",
+            )
+            first.start()
+            self.assertTrue(first_in_merge.wait(timeout=2))
+            second.start()
+            time.sleep(0.05)
+            release_first.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        claimed = db.claim_strm_change_targets(owner="test")
+        self.assertEqual(
+            sorted(item["file_id"] for item in claimed[0]["changes"]),
+            ["f1", "f2"],
+        )
+
     def test_queue_overflow_is_marked_for_full_sync_instead_of_silent_drop(self):
         changes = [_change(file_id=f"f{index}") for index in range(5001)]
         merged = db.merge_strm_changes(changes)

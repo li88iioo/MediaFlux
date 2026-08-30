@@ -110,12 +110,14 @@ class DiscoveryService:
             if self._registry_closed:
                 return True
             try:
-                self.registry.close()
+                closed = self.registry.close()
             except Exception as exc:
                 logger.warning(
                     "关闭 Discovery provider registry 失败 type=%s",
                     type(exc).__name__,
                 )
+                return False
+            if closed is False:
                 return False
             self._registry_closed = True
             return True
@@ -140,6 +142,28 @@ class DiscoveryService:
                 close_registry = self._closed and self._lifecycle_drained_locked()
             if close_registry:
                 self._finish_deferred_shutdown()
+
+    @contextmanager
+    def _scraper_operation(self) -> Iterator[Any]:
+        """为一次映射请求创建并尽力释放 TMDB Scraper。"""
+        scraper = self._scraper_factory()
+        try:
+            yield scraper
+        finally:
+            close = getattr(scraper, "close", None)
+            if callable(close):
+                try:
+                    closed = close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭 Discovery 临时 TMDB Scraper 失败 type=%s",
+                        type(exc).__name__,
+                    )
+                else:
+                    if closed is False:
+                        logger.warning(
+                            "关闭 Discovery 临时 TMDB Scraper 未完成"
+                        )
 
     def _future_finished(self, future: Future[Any]) -> None:
         close_registry = False
@@ -414,8 +438,8 @@ class DiscoveryService:
                 "confirmed": True,
                 "candidates": [],
             }
-        with self._network_operation():
-            candidates = self._scraper_factory().search_candidates(title, year, media_type)
+        with self._network_operation(), self._scraper_operation() as scraper:
+            candidates = scraper.search_candidates(title, year, media_type)
         serialized = [self._candidate_dict(candidate) for candidate in candidates]
         return {
             "tmdb_id": "",
@@ -475,8 +499,8 @@ class DiscoveryService:
         requested_id = str(tmdb_id or "").strip()
         if not requested_id.isdigit() or not 1 <= len(requested_id) <= 10:
             raise ValueError("TMDB ID 无效")
-        with self._network_operation():
-            match = self._scraper_factory().match_from_tmdb(requested_id, media_type)
+        with self._network_operation(), self._scraper_operation() as scraper:
+            match = scraper.match_from_tmdb(requested_id, media_type)
         if bool(getattr(match, "need_confirm", True)) or str(getattr(match, "tmdb_id", "")) != requested_id:
             raise ValueError("无法核验所选 TMDB 映射")
         return {

@@ -430,18 +430,25 @@ class MetaTubeClient:
         self.timeout = max(2.0, min(float(timeout or 8.0), 30.0))
         self._owns_session = session is None
         self.session = session or requests.Session()
+        self._close_lock = threading.Lock()
         self._closed = False
 
-    def close(self) -> None:
+    def close(self) -> bool:
         """释放内部创建的 requests Session；注入 Session 仍由调用方管理。"""
-        if self._closed:
-            return
-        self._closed = True
-        if not self._owns_session:
-            return
-        close = getattr(self.session, "close", None)
-        if callable(close):
-            close()
+        with self._close_lock:
+            if self._closed:
+                return True
+            if self._owns_session:
+                close = getattr(self.session, "close", None)
+                if callable(close):
+                    try:
+                        closed = close()
+                    except Exception:
+                        return False
+                    if closed is False:
+                        return False
+            self._closed = True
+            return True
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json", "User-Agent": "MediaFlux/MetaTube"}
@@ -610,14 +617,22 @@ class NsfwRecognizer:
     ) -> None:
         self.client = MetaTubeClient(endpoint, token, timeout=timeout, session=session)
         self.strip_domains = str(strip_domains or "")
+        self._close_lock = threading.Lock()
         self._closed = False
 
-    def close(self) -> None:
+    def close(self) -> bool:
         """幂等释放识别器持有的 MetaTube 客户端。"""
-        if self._closed:
-            return
-        self._closed = True
-        self.client.close()
+        with self._close_lock:
+            if self._closed:
+                return True
+            try:
+                closed = self.client.close()
+            except Exception:
+                return False
+            if closed is False:
+                return False
+            self._closed = True
+            return True
 
     def candidates(self, value: str) -> list[Candidate]:
         identifier = extract_nsfw_identifier(value, self.strip_domains)

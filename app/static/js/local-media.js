@@ -821,13 +821,13 @@
             rootId: effectiveRootId,
             rootName: effectiveRootName,
             allowRoot: !isRootsMode && Boolean(sourceId),
-            fetchDirectory: async (path) => {
+            fetchDirectory: async (path, {signal} = {}) => {
                 const isRootsPath = !path || path === '__roots__';
                 const query = new URLSearchParams({path});
                 if (sourceId) query.set('source_id', String(sourceId));
 
                 try {
-                    const data = await api(`/api/local-media/directories?${query.toString()}`);
+                    const data = await api(`/api/local-media/directories?${query.toString()}`, {signal});
                     return (data.directories || []).map((item) => {
                         const itemId = String(item.id ?? item.path ?? item.file_id ?? '');
                         return {
@@ -841,7 +841,7 @@
                 } catch (error) {
                     if (!isRootsPath && !sourceId) {
                         try {
-                            const fallbackData = await api('/api/local-media/directories?path=__roots__');
+                            const fallbackData = await api('/api/local-media/directories?path=__roots__', {signal});
                             return (fallbackData.directories || []).map((item) => {
                                 const itemId = String(item.id ?? item.path ?? item.file_id ?? '');
                                 return {

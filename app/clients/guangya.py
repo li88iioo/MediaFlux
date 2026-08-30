@@ -36,27 +36,39 @@ from app.private_files import protect_private_file
 logger = get_logger(__name__)
 
 
-def close_guangya_client(client: object | None) -> None:
+def close_guangya_client(client: object | None) -> bool:
     """尽力释放短生命周期光鸭 Client，不让清理异常覆盖业务结果。"""
     if client is None:
-        return
+        return True
     close = getattr(client, "close", None)
     if not callable(close):
-        return
+        return True
     try:
-        close()
+        closed = close()
     except Exception as exc:
         logger.warning("关闭光鸭 HTTP Client 失败 type=%s", type(exc).__name__)
+        return False
+    if closed is False:
+        logger.warning("关闭光鸭 HTTP Client 失败，已保留句柄供后续重试")
+        return False
+    return True
 
 
-def _close_raw_client(raw: object | None) -> None:
+def _close_raw_client(raw: object | None) -> bool:
     """释放登录前临时 SDK Client；兼容没有 close 的测试替身。"""
+    if raw is None:
+        return True
     close = getattr(raw, "close", None)
     if callable(close):
         try:
-            close()
+            closed = close()
         except Exception as exc:
             logger.warning("关闭光鸭 SDK Client 失败 type=%s", type(exc).__name__)
+            return False
+        if closed is False:
+            logger.warning("关闭光鸭 SDK Client 失败，已保留句柄供后续重试")
+            return False
+    return True
 
 
 TOKEN_FILE = PATHS.token_file
@@ -637,6 +649,7 @@ class GuangYaClient:
         self._read_metrics_lock = threading.Lock()
         self._read_metrics: GuangYaReadMetrics | None = None
         self._raw = None
+        self._retired_raws: dict[int, object] = {}
         self._last_persisted_token = ""
         self._token_generation = 0
         self._credential_fingerprint = ""
@@ -827,12 +840,51 @@ class GuangYaClient:
             and instance_fingerprint == current_fingerprint
         )
 
-    def _invalidate_if_stale(self) -> bool:
-        if self._credentials_current():
-            return False
+    def _close_or_retire_raw_locked(self, raw: object | None) -> bool:
+        """关闭被替换的 SDK Client；失败时保留句柄供 close() 重试。"""
+        if raw is None:
+            return True
+        retired = getattr(self, "_retired_raws", None)
+        if retired is None:
+            retired = self._retired_raws = {}
+        identity = id(raw)
+        if _close_raw_client(raw):
+            retired.pop(identity, None)
+            return True
+        retired[identity] = raw
+        return False
+
+    def _discard_current_raw_locked(self) -> bool:
+        raw = self._raw
         self._raw = None
-        self._last_persisted_token = ""
-        return True
+        return self._close_or_retire_raw_locked(raw)
+
+    def _retry_retired_raws_locked(self) -> bool:
+        all_closed = True
+        retired = getattr(self, "_retired_raws", None)
+        if retired is None:
+            retired = self._retired_raws = {}
+        for identity, raw in list(retired.items()):
+            if _close_raw_client(raw):
+                retired.pop(identity, None)
+            else:
+                all_closed = False
+        return all_closed
+
+    def _invalidate_if_stale(self) -> bool:
+        lock = getattr(self, "_token_lock", None)
+        if lock is None:
+            if self._credentials_current():
+                return False
+            self._discard_current_raw_locked()
+            self._last_persisted_token = ""
+            return True
+        with lock:
+            if self._credentials_current():
+                return False
+            self._discard_current_raw_locked()
+            self._last_persisted_token = ""
+            return True
 
     def _token_payload(self) -> dict:
         expires_at = getattr(self._raw, "token_expires_at", None)
@@ -874,7 +926,7 @@ class GuangYaClient:
         if not self._raw:
             return
         if not self._credentials_current():
-            self._raw = None
+            self._discard_current_raw_locked()
             raise RuntimeError("光鸭登录凭证已撤销，请重新登录")
         data = self._token_payload()
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1247,7 +1299,8 @@ class GuangYaClient:
         finally:
             if installed:
                 if previous is not None and previous is not tmp:
-                    _close_raw_client(previous)
+                    with self._token_lock:
+                        self._close_or_retire_raw_locked(previous)
             else:
                 _close_raw_client(tmp)
         logger.info("光鸭登录成功 phone=%s****%s", phone[:3], phone[-4:])
@@ -1268,7 +1321,7 @@ class GuangYaClient:
                 and not str(getattr(self, "_credential_fingerprint", "") or "")
             )
             if (not self._credentials_current() or not token_exists) and not ephemeral_credentials:
-                self._raw = None
+                self._discard_current_raw_locked()
                 self._last_persisted_token = ""
                 if not token_exists:
                     raise RuntimeError("光鸭登录凭证已撤销，请重新登录")
@@ -1353,7 +1406,7 @@ class GuangYaClient:
         with self._token_lock:
             with _acquire_process_lock(self._token_process_lock):
                 self._token_generation = _advance_token_generation(self.token_file)
-                self._raw = None
+                self._discard_current_raw_locked()
                 self._cleanup_token_temp_files()
                 try:
                     self.token_file.unlink()
@@ -1423,15 +1476,18 @@ class GuangYaClient:
         """完整读取目录全部分页，适合需要完整快照的调用方。"""
         return list(self.iter_dir(parent_id))
 
-    def close(self) -> None:
+    def close(self) -> bool:
         """幂等释放 SDK 底层 httpx 连接池。"""
         with self._token_lock:
+            all_closed = self._retry_retired_raws_locked()
             raw = self._raw
-            if raw is None:
-                return
-            _close_raw_client(raw)
-            if self._raw is raw:
-                self._raw = None
+            if raw is not None:
+                if _close_raw_client(raw):
+                    if self._raw is raw:
+                        self._raw = None
+                else:
+                    all_closed = False
+            return all_closed and not getattr(self, "_retired_raws", {})
 
     def create_dir(self, name: str, parent_id: str = "0") -> str:
         res = self.raw.fs_create_dir(

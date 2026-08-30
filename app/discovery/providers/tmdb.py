@@ -14,6 +14,9 @@ from app.discovery.models import (
     ProviderUnavailable,
 )
 from app.discovery.providers.base import DiscoveryProvider
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 _DISCOVER_FILTERS = {
     "sort_by", "with_genres", "without_genres", "with_keywords", "without_keywords",
@@ -52,21 +55,33 @@ class TMDBProvider(DiscoveryProvider):
     def __init__(self, client: TMDBClient | None = None):
         self.client = client or TMDBClient()
         self._close_lock = threading.Lock()
+        self._closing = False
         self._closed = False
 
     def _ensure_open(self) -> None:
         with self._close_lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise ProviderUnavailable("TMDB 数据源已关闭")
 
-    def close(self) -> None:
+    def close(self) -> bool:
         with self._close_lock:
             if self._closed:
-                return
+                return True
+            self._closing = True
+            close = getattr(self.client, "close", None)
+            if callable(close):
+                try:
+                    closed = close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭 TMDB 探索客户端失败 type=%s", type(exc).__name__
+                    )
+                    return False
+                if closed is False:
+                    return False
             self._closed = True
-        close = getattr(self.client, "close", None)
-        if callable(close):
-            close()
+            self._closing = False
+            return True
 
     def list_items(
         self,

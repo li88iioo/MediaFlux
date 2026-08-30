@@ -663,13 +663,19 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                             ("local-media", close_local_media_service),
                         ):
                             try:
-                                closer()
+                                closed = closer()
                             except Exception as exc:
                                 logger.warning(
                                     "关闭 %s 运行时失败 type=%s",
                                     label,
                                     type(exc).__name__,
                                 )
+                            else:
+                                if closed is False:
+                                    logger.warning(
+                                        "关闭 %s 运行时尚未完成，已保留资源供后续重试",
+                                        label,
+                                    )
                         try:
                             await shutdown_indexer_service()
                         except Exception as exc:

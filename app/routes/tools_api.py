@@ -835,6 +835,7 @@ def _test_fixed_target(target: dict[str, str], proxies) -> dict:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
     started = perf_counter()
+    response = None
     try:
         response = requests.get(
             url,
@@ -866,6 +867,13 @@ def _test_fixed_target(target: dict[str, str], proxies) -> dict:
             "elapsed_ms": max(1, int((perf_counter() - started) * 1000)),
             "error": str(exc),
         }
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                # 连接探测的清理失败不应掩盖已经得到的探测结果。
+                pass
 
 
 async def _fetch_ai_models(

@@ -255,20 +255,23 @@ class ProviderRegistry:
             str(name).lower(): provider for name, provider in (providers or {}).items()
         }
         self._lock = threading.RLock()
+        self._close_call_lock = threading.Lock()
+        self._closing = False
         self._closed = False
+        self._pending_close_providers: dict[int, Any] | None = None
 
     def register(self, provider: Any) -> None:
         name = str(getattr(provider, "name", "") or "").lower()
         if not name:
             raise ValueError("Provider name is required")
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise ProviderUnavailable("探索数据源注册表已关闭")
             self._providers[name] = provider
 
     def get(self, name: str) -> Any:
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise ProviderUnavailable("探索数据源注册表已关闭")
             provider = self._providers.get(str(name or "").lower())
         if provider is None:
@@ -279,26 +282,48 @@ class ProviderRegistry:
         with self._lock:
             return sorted(self._providers)
 
-    def close(self) -> None:
-        """幂等关闭所有唯一 Provider；单个关闭失败不阻塞其余资源释放。"""
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            providers = tuple({id(provider): provider for provider in self._providers.values()}.values())
+    def close(self) -> bool:
+        """关闭所有唯一 Provider；失败项保留到下一次调用重试。"""
+        with self._close_call_lock:
+            with self._lock:
+                if self._closed:
+                    return True
+                self._closing = True
+                if self._pending_close_providers is None:
+                    self._pending_close_providers = {
+                        id(provider): provider for provider in self._providers.values()
+                    }
+                providers = tuple(self._pending_close_providers.values())
 
-        for provider in providers:
-            close = getattr(provider, "close", None)
-            if not callable(close):
-                continue
-            try:
-                close()
-            except Exception as exc:  # pragma: no cover - defensive shutdown isolation
-                logger.warning(
-                    "关闭探索数据源失败 provider=%s error=%s",
-                    getattr(provider, "name", type(provider).__name__),
-                    exc,
-                )
+            failed: dict[int, Any] = {}
+            for provider in providers:
+                close = getattr(provider, "close", None)
+                if not callable(close):
+                    continue
+                try:
+                    closed = close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭探索数据源失败 provider=%s error=%s",
+                        getattr(provider, "name", type(provider).__name__),
+                        exc,
+                    )
+                    failed[id(provider)] = provider
+                    continue
+                if closed is False:
+                    logger.warning(
+                        "关闭探索数据源未完成 provider=%s，已保留供后续重试",
+                        getattr(provider, "name", type(provider).__name__),
+                    )
+                    failed[id(provider)] = provider
+
+            with self._lock:
+                self._pending_close_providers = failed
+                if failed:
+                    return False
+                self._closed = True
+                self._closing = False
+                return True
 
 
 def build_default_registry() -> ProviderRegistry:

@@ -27,7 +27,6 @@ from app.modules.media_server_path_mapping import MediaServerPathMapping
 from app.modules.media_server_profiles import list_configured_profiles
 from app.modules.local_media_notifications import notify_local_media_task
 from app.modules.local_media_recognition_summary import (
-    infer_recognition_summary,
     merge_recognition_summaries,
     parse_recognition_summary,
     summary_from_task,
@@ -173,8 +172,8 @@ def _task_recognition_payload(task, item_rows) -> dict:
     inferred: dict = {}
     if item_rows and str(getattr(task, "status", "")) == "completed":
         try:
-            inferred = infer_recognition_summary(
-                item_rows, scraper=get_local_media_service().scraper,
+            inferred = get_local_media_service().infer_recognition_summary(
+                item_rows
             )
         except Exception as exc:
             logger.debug(

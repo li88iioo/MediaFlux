@@ -6,7 +6,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,7 @@ from app.modules.local_media_cleanup import (
 )
 from app.modules.local_media_recognition_summary import (
     build_recognition_summary,
+    infer_recognition_summary as infer_local_recognition_summary,
     serialize_recognition_summary,
 )
 from app.modules.organize import (
@@ -229,6 +232,16 @@ _CATEGORY_KEYS = {
 }
 
 
+def _local_media_operation(method):
+    """把公开业务入口纳入服务生命周期，嵌套调用复用外层 lease。"""
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._lifecycle_operation():
+            return method(self, *args, **kwargs)
+
+    return guarded
+
+
 class LocalMediaService:
     def __init__(
         self,
@@ -238,27 +251,99 @@ class LocalMediaService:
     ) -> None:
         self._owns_scraper = scraper is None
         self._closed = False
+        self._closing = False
+        self._scraper_closed = not self._owns_scraper
+        self._close_call_lock = threading.Lock()
+        self._lifecycle_condition = threading.Condition(threading.Lock())
+        self._active_operations = 0
+        self._operation_depth = threading.local()
+        self._operation_lock = threading.RLock()
         self.scraper = scraper or TMDBScraper()
         self.organizer = Organizer(client=object(), scraper=self.scraper)
         self.inspections = inspection_store or _InspectionStore()
 
-    def close(self) -> None:
-        """幂等释放服务内部创建的识别客户端与缓存识别器。"""
-        if self._closed:
+    @contextmanager
+    def _lifecycle_operation(self):
+        depth = int(getattr(self._operation_depth, "value", 0) or 0)
+        if depth:
+            self._operation_depth.value = depth + 1
+            try:
+                yield
+            finally:
+                self._operation_depth.value = depth
             return
-        self._closed = True
-        self.organizer.close()
-        if self._owns_scraper:
-            close = getattr(self.scraper, "close", None)
-            if callable(close):
+
+        with self._lifecycle_condition:
+            if self._closed or self._closing:
+                raise LocalMediaServiceError("本地媒体服务正在关闭，请稍后重试")
+            self._active_operations += 1
+        self._operation_depth.value = 1
+        try:
+            yield
+        finally:
+            try:
+                del self._operation_depth.value
+            except AttributeError:
+                pass
+            with self._lifecycle_condition:
+                self._active_operations -= 1
+                finish_close = (
+                    self._active_operations == 0
+                    and self._closing
+                    and not self._closed
+                )
+                self._lifecycle_condition.notify_all()
+            if finish_close:
+                self.close()
+
+    def _lifecycle_state(self) -> tuple[bool, bool, int]:
+        with self._lifecycle_condition:
+            return self._closed, self._closing, self._active_operations
+
+    def close(self) -> bool:
+        """幂等释放服务资源；在途业务完成前不抢先关闭底层客户端。"""
+        with self._close_call_lock:
+            with self._lifecycle_condition:
+                if self._closed:
+                    return True
+                self._closing = True
+                if self._active_operations:
+                    return False
+
+            with self._operation_lock:
                 try:
-                    close()
+                    organizer_closed = self.organizer.close()
                 except Exception as exc:
                     logger.warning(
-                        "关闭本地媒体 TMDB Scraper 失败 type=%s",
-                        type(exc).__name__,
+                        "关闭本地媒体 Organizer 失败 type=%s", type(exc).__name__
                     )
+                    organizer_closed = False
+                if organizer_closed is None:
+                    organizer_closed = True
+                if self._owns_scraper and not self._scraper_closed:
+                    close = getattr(self.scraper, "close", None)
+                    if callable(close):
+                        try:
+                            closed = close()
+                        except Exception as exc:
+                            logger.warning(
+                                "关闭本地媒体 TMDB Scraper 失败 type=%s",
+                                type(exc).__name__,
+                            )
+                            closed = False
+                        self._scraper_closed = closed is not False
+                    else:
+                        self._scraper_closed = True
+                resources_closed = bool(organizer_closed and self._scraper_closed)
 
+            if resources_closed:
+                with self._lifecycle_condition:
+                    self._closed = True
+                    self._closing = False
+                    self._lifecycle_condition.notify_all()
+            return resources_closed
+
+    @_local_media_operation
     def inspect_source(self, owner: str, source_id: int, path: Path | str) -> dict[str, Any]:
         source = db.get_local_media_source(source_id, owner=owner)
         if source is None:
@@ -389,6 +474,7 @@ class LocalMediaService:
             ],
         }
 
+    @_local_media_operation
     def inspect_task(self, owner: str, task_id: int) -> dict[str, Any]:
         task = db.get_local_media_task(task_id, owner=owner)
         if task is None:
@@ -410,6 +496,7 @@ class LocalMediaService:
         })
         return result
 
+    @_local_media_operation
     def search(
         self,
         query: str,
@@ -443,6 +530,12 @@ class LocalMediaService:
             for item in self.scraper.search_candidates(query, year, effective_type)
         ]
 
+    @_local_media_operation
+    def infer_recognition_summary(self, item_rows) -> dict[str, Any]:
+        """在服务 lease 内执行历史摘要推断，避免关闭时裸用 Scraper。"""
+        return infer_local_recognition_summary(item_rows, scraper=self.scraper)
+
+    @_local_media_operation
     def external_hints(
         self,
         owner: str,
@@ -875,7 +968,36 @@ class LocalMediaService:
         values["target_dir_id"] = "0"
         return enforce_fixed_organize_rules(OrganizeRules(**values))
 
+    @_local_media_operation
     def preview(
+        self,
+        owner: str,
+        inspection_id: str,
+        tmdb_id: str = "",
+        media_type: str = "",
+        overrides: dict | None = None,
+        rules_snapshot: str = "",
+        automatic: bool = False,
+        season_override: int | None = None,
+        episode_override: int | None = None,
+        numbering_mode: str = "auto",
+    ) -> dict[str, Any]:
+        """串行生成预览，隔离共享 Organizer 的任务级缓存与探测预算。"""
+        with self._operation_lock:
+            return self._preview_locked(
+                owner,
+                inspection_id,
+                tmdb_id,
+                media_type,
+                overrides,
+                rules_snapshot,
+                automatic,
+                season_override,
+                episode_override,
+                numbering_mode,
+            )
+
+    def _preview_locked(
         self,
         owner: str,
         inspection_id: str,
@@ -1559,6 +1681,7 @@ class LocalMediaService:
                 type(persist_exc).__name__,
             )
 
+    @_local_media_operation
     def execute_task(self, owner: str, task_id: int, *, qb_client=None) -> dict[str, Any]:
         task = db.get_local_media_task(task_id, owner=owner)
         if task is None:
@@ -1756,6 +1879,7 @@ class LocalMediaService:
                 )
             raise
 
+    @_local_media_operation
     def create_manual_task(
         self, owner: str, inspection_id: str, *, tmdb_id: str = "", media_type: str = "",
         rules_snapshot: str = "", season_override: int | None = None,
@@ -1805,6 +1929,7 @@ class LocalMediaService:
         self.inspections.discard(owner, inspection_id)
         return task_id
 
+    @_local_media_operation
     def execute_preview(self, owner: str, inspection_id: str, preview: dict[str, Any]) -> MoveTransactionResult:
         inspection = self.inspections.get(owner, inspection_id)
         if preview.get("status") != "planned" or not preview.get("_move_plans"):
@@ -1835,17 +1960,37 @@ _service_lock = threading.Lock()
 
 
 def get_local_media_service() -> LocalMediaService:
+    """返回可用实例，并收敛上一次未完成关闭留下的旧实例。"""
     global _service
-    with _service_lock:
-        if _service is None:
-            _service = LocalMediaService()
-        return _service
+    while True:
+        with _service_lock:
+            service = _service
+            if service is None:
+                service = _service = LocalMediaService()
+                return service
+
+        closed, closing, active = service._lifecycle_state()
+        if not closed and not closing:
+            return service
+        if closing and active:
+            raise LocalMediaServiceError("本地媒体运行时正在切换，请稍后重试")
+        if not closed and not service.close():
+            raise LocalMediaServiceError("本地媒体运行时尚未完成关闭，请稍后重试")
+        with _service_lock:
+            if _service is service:
+                _service = None
 
 
-def close_local_media_service() -> None:
+def close_local_media_service() -> bool:
     """关闭并移除 Web/Agent 共用的本地媒体服务。"""
     global _service
     with _service_lock:
-        service, _service = _service, None
-    if service is not None:
-        service.close()
+        service = _service
+    if service is None:
+        return True
+    closed = service.close()
+    if closed:
+        with _service_lock:
+            if _service is service:
+                _service = None
+    return closed

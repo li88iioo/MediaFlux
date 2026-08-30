@@ -31,6 +31,10 @@ class DirectoryPickerSecurityCodeContractTests(unittest.TestCase):
             "function updateSelectionControls() {\n            if (!multiple) return;",
             js,
         )
+        self.assertIn("dialog?.setAttribute('aria-labelledby', title.id);", js)
+        self.assertIn("lifecycle = window.createAppModal(modal", js)
+        self.assertIn("fetchDirectory(nextId, {signal: controller.signal})", js)
+        self.assertIn("navigator?.cancel();", js)
 
     def test_local_media_js_has_virtual_root_and_allow_root_contracts(self):
         js = LOCAL_MEDIA_JS.read_text(encoding="utf-8")
@@ -40,6 +44,31 @@ class DirectoryPickerSecurityCodeContractTests(unittest.TestCase):
         self.assertIn("input.value = safeId;", js)
         self.assertIn("input.dispatchEvent(new Event('input', {bubbles: true}));", js)
         self.assertIn("input.dispatchEvent(new Event('change', {bubbles: true}));", js)
+
+    def test_all_custom_directory_loaders_forward_abort_signal(self):
+        expected_contracts = {
+            "app/static/js/local-media.js": (
+                "fetchDirectory: async (path, {signal} = {}) =>",
+                "api(`/api/local-media/directories?${query.toString()}`, {signal})",
+            ),
+            "app/static/js/media-libraries.js": (
+                "fetchDirectory: async (path, {signal} = {}) =>",
+                "api(`${endpoint}?${query}`, {signal})",
+            ),
+            "app/static/js/guangya-strm.js": (
+                "fetchDirectory: async (path, {signal} = {}) =>",
+                "fetch(`/api/local-media/directories?${query.toString()}`, {signal})",
+            ),
+            "app/templates/guangya.html": (
+                "fetchDirectory: (id,{signal}={})=>",
+                "gyApi('/dirs?parent_id='+encodeURIComponent(id),{signal})",
+            ),
+        }
+        for relative_path, contracts in expected_contracts.items():
+            with self.subTest(path=relative_path):
+                source = (ROOT / relative_path).read_text(encoding="utf-8")
+                for contract in contracts:
+                    self.assertIn(contract, source)
 
 
 class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
@@ -94,6 +123,7 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
                     this.value = '';
                     this.scrollWidth = 0;
                     this.scrollLeft = 0;
+                    this.isConnected = true;
                 }
                 appendChild(child) {
                     this.children.push(child);
@@ -108,6 +138,7 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
                     for (const c of children) this.appendChild(c);
                 }
                 remove() {
+                    this.isConnected = false;
                     if (this.parentElement) {
                         const idx = this.parentElement.children.indexOf(this);
                         if (idx !== -1) this.parentElement.children.splice(idx, 1);
@@ -115,9 +146,20 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
                 }
                 setAttribute(k, v) { this.attributes[k] = String(v); }
                 getAttribute(k) { return this.attributes[k] || null; }
+                hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attributes, k); }
+                contains(node) {
+                    if (node === this) return true;
+                    return this.children.some(child => child.contains(node));
+                }
+                closest() { return null; }
+                focus() { document.activeElement = this; }
                 addEventListener(evt, fn) {
                     if (!this._listeners[evt]) this._listeners[evt] = [];
                     this._listeners[evt].push(fn);
+                }
+                removeEventListener(evt, fn) {
+                    const handlers = this._listeners[evt] || [];
+                    this._listeners[evt] = handlers.filter(handler => handler !== fn);
                 }
                 dispatchEvent(event) {
                     const handlers = this._listeners[event.type] || [];
@@ -148,6 +190,8 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
                         if (selector.startsWith('[data-dir-select-current]') && el.dataset.dirSelectCurrent !== undefined) return true;
                         if (selector.startsWith('[data-dir-confirm]') && el.dataset.dirConfirm !== undefined) return true;
                         if (selector.startsWith('[data-dir-close]') && el.dataset.dirClose !== undefined) return true;
+                        if (selector.startsWith('[data-modal-close]') && el.dataset.modalClose !== undefined) return true;
+                        if (selector.includes('[role="dialog"]') && el.getAttribute('role') === 'dialog') return true;
                         if (selector === '.settings-dir-dialog') return el.classList.contains('settings-dir-dialog');
                         return false;
                     };
@@ -159,11 +203,13 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
                 set innerHTML(html) {
                     const dialog = new MockElement('div');
                     dialog.classList.add('settings-dir-dialog');
+                    dialog.setAttribute('role', 'dialog');
 
                     const title = new MockElement('strong');
                     title.dataset.dirTitle = '';
                     const close = new MockElement('button');
                     close.dataset.dirClose = '';
+                    close.dataset.modalClose = '';
                     const up = new MockElement('button');
                     up.dataset.dirUp = '';
                     const breadcrumb = new MockElement('nav');
@@ -199,6 +245,7 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
             global.MutationObserver = class { observe() {} disconnect() {} };
             global.document = {
                 documentElement: new MockElement('html'),
+                activeElement: null,
                 getElementById(id) { return null; },
                 createElement(tag) { return new MockElement(tag); },
                 querySelector(sel) { return null; },
@@ -211,6 +258,8 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
             global.window = global;
             global.addEventListener = () => {};
             global.removeEventListener = () => {};
+            global.requestAnimationFrame = callback => { callback(); return 1; };
+            global.cancelAnimationFrame = () => {};
             global.innerWidth = 1200;
             global.innerHeight = 800;
             global.localStorage = { getItem: () => null, setItem: () => null };
@@ -225,7 +274,11 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
 
             // TEST 1: Initial state at __roots__ should have selectCurrent disabled
             let selectedValue = null;
+            const trigger = new MockElement('button');
+            document.body.appendChild(trigger);
+            trigger.focus();
             const picker1 = window.openGuangYaDirectoryPicker({
+                trigger,
                 rootId: '__roots__',
                 rootName: '本机目录',
                 allowRoot: false,
@@ -242,7 +295,11 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
             });
 
             const btnSelectCurrent = picker1.modal.querySelector('[data-dir-select-current]');
+            const pickerDialog = picker1.modal.querySelector('[role="dialog"]');
+            const pickerTitle = picker1.modal.querySelector('[data-dir-title]');
             testResults.test1_initial_disabled = btnSelectCurrent.disabled;
+            testResults.test1_labelled = pickerDialog.getAttribute('aria-labelledby') === pickerTitle.id;
+            testResults.test1_initial_focus = document.activeElement === picker1.modal.querySelector('[data-dir-close]');
             testResults.test1_initial_title = btnSelectCurrent.title;
 
             // Trigger select current button click at __roots__
@@ -258,6 +315,21 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
                 // Click select current now
                 clickHandlers.forEach(fn => fn());
                 testResults.test2_selected_value = selectedValue;
+                testResults.test2_focus_restored = document.activeElement === trigger;
+                testResults.test2_modal_open_cleared = !document.body.classList.contains('modal-open');
+
+                let pendingSignal = null;
+                const picker2 = window.openGuangYaDirectoryPicker({
+                    modalId: 'abortablePicker',
+                    rootId: 'drive',
+                    trigger,
+                    fetchDirectory: (_id, {signal}) => {
+                        pendingSignal = signal;
+                        return new Promise(() => {});
+                    },
+                });
+                picker2.close();
+                testResults.test3_request_aborted = pendingSignal?.aborted === true;
 
                 // Output results as JSON
                 console.log(JSON.stringify(testResults));
@@ -266,11 +338,16 @@ class DirectoryPickerSecurityNodeHarnessTests(unittest.TestCase):
         )
         results = self._run_node_script(harness)
         self.assertTrue(results.get("test1_initial_disabled"))
+        self.assertTrue(results.get("test1_labelled"))
+        self.assertTrue(results.get("test1_initial_focus"))
         self.assertIn("虚拟根入口不可选", results.get("test1_initial_title", ""))
         self.assertTrue(results.get("test1_click_roots_blocked"))
         self.assertFalse(results.get("test2_drive_disabled"))
         self.assertEqual(results.get("test2_drive_title"), "")
         self.assertEqual(results.get("test2_selected_value", {}).get("id"), "C:\\")
+        self.assertTrue(results.get("test2_focus_restored"))
+        self.assertTrue(results.get("test2_modal_open_cleared"))
+        self.assertTrue(results.get("test3_request_aborted"))
 
     def test_local_media_on_select_rejects_virtual_roots(self):
         harness = textwrap.dedent(

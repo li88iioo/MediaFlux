@@ -395,9 +395,10 @@
         saveState.className='';
         saveState.textContent='保存中...';
         try{
-            await saveAppConfig(form);
-            saveState.className='is-success';
-            saveState.textContent='离线转存设置已保存';
+            const result=await saveAppConfig(form);
+            const hasPendingChanges=result?.__hasPendingConfigChanges===true;
+            saveState.className=hasPendingChanges?'is-dirty':'is-success';
+            saveState.textContent=hasPendingChanges?'上一版已保存，仍有未保存更改':'离线转存设置已保存';
         }catch(error){
             saveState.className='is-error';
             saveState.textContent=error.message;

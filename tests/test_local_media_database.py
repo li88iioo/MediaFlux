@@ -10,6 +10,29 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
+    def test_waiting_task_queue_is_oldest_first_beyond_scheduler_batch_limit(self):
+        owner = "queue-order-owner"
+        source_id = db.create_local_media_source(
+            name="queue-order", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/queue-order", owner=owner,
+        )
+        task_ids = [
+            db.create_local_media_task(
+                source_id,
+                "",
+                f"/tmp/queue-order/Movie-{index:03d}.mkv",
+                owner=owner,
+                trigger="manual",
+            )
+            for index in range(501)
+        ]
+
+        waiting = db.list_waiting_local_media_tasks(owner=owner, limit=500)
+
+        self.assertEqual([task.id for task in waiting], task_ids[:500])
+        self.assertIn(task_ids[0], {task.id for task in waiting})
+        self.assertNotIn(task_ids[-1], {task.id for task in waiting})
+
     def test_source_media_type_accepts_explicit_nsfw_and_rejects_unknown_values(self):
         source_id = db.create_local_media_source(
             name="adult-source", qb_profile="", qb_path_prefix="",

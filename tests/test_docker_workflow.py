@@ -51,6 +51,19 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn(".State.ExitCode", self.text)
         self.assertIn("docker rm --force mediaflux-smoke", self.text)
 
+    def test_graceful_shutdown_accepts_uvicorn_sigterm_and_requires_lifespan_exit(
+        self,
+    ) -> None:
+        self.assertGreaterEqual(self.text.count("0|143) ;;"), 3)
+        self.assertGreaterEqual(
+            self.text.count('grep -Fq "Application shutdown complete"'),
+            3,
+        )
+        self.assertNotIn(
+            "test \"$(docker inspect --format '{{.State.ExitCode}}' mediaflux-smoke)\" = \"0\"",
+            self.text,
+        )
+
     def test_smoke_verifies_embedded_docker_build_metadata(self) -> None:
         self.assertIn("mediaflux.py version --json", self.text)
         self.assertIn('.version == "0.0.0-ci"', self.text)
@@ -199,9 +212,18 @@ esac
         self.assertIn("exists but cannot be verified; refusing overwrite", promote)
         self.assertGreaterEqual(promote.count("exit 1"), 2)
         self.assertIn("existing-exact-manifest.json", promote)
+        self.assertIn(
+            '"$IMAGE_REPOSITORY@$existing_digest" --raw', promote
+        )
+        self.assertNotIn('imagetools inspect "$exact" --raw', promote)
         self.assertIn('platform_digest=$(jq -r', promote)
         self.assertIn('$IMAGE_REPOSITORY@$platform_digest', promote)
         self.assertNotIn('"$exact" mediaflux.py version --json', promote)
+        self.assertIn(
+            '"$IMAGE_REPOSITORY@$mutable_digest" mediaflux.py version --json',
+            promote,
+        )
+        self.assertNotIn('"$mutable_tag" mediaflux.py version --json', promote)
         self.assertIn('"linux/amd64:x86_64"', promote)
         self.assertIn('"linux/arm64:aarch64"', promote)
         self.assertIn('--arg arch "$expected_arch"', promote)

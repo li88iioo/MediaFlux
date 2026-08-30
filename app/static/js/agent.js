@@ -38,6 +38,7 @@
     let restoringHistory = false;
     let historyReturnFocus = true;
     let visualViewportFrame = 0;
+    let boundVisualViewport = null;
     const directToolActions = new WeakMap();
     const confirmationPrepareActions = new WeakMap();
 
@@ -3109,10 +3110,16 @@
             return;
         }
         const sessionItem = button?.closest('.agent-session-item');
+        const sessionItems = [...sessionListNode.querySelectorAll('.agent-session-item')];
+        const sessionIndex = sessionItems.indexOf(sessionItem);
+        const adjacentSessionId = sessionItems[sessionIndex + 1]?.dataset.sessionId
+            || sessionItems[sessionIndex - 1]?.dataset.sessionId
+            || '';
         button?.classList.remove('is-armed');
         button?.setAttribute('aria-label', `删除会话：${sessionTitle}`);
         button?.setAttribute('aria-busy', 'true');
         setSessionTransitionBusy(true);
+        let deleteSucceeded = false;
         try {
             await fetchJSON(`/api/agent/sessions/${encodeURIComponent(normalized)}`, {method: 'DELETE'});
             if (sessionItem && window.MFAnim && typeof window.MFAnim.slideOutAndCollapse === 'function') {
@@ -3126,6 +3133,7 @@
                 emptyTranscript();
             }
             await loadSessions();
+            deleteSucceeded = true;
             announceSessionStatus(`会话“${sessionTitle}”已删除。`);
         } catch (error) {
             announceSessionStatus(`删除会话“${sessionTitle}”失败。`);
@@ -3133,6 +3141,15 @@
         } finally {
             button?.setAttribute('aria-busy', 'false');
             setSessionTransitionBusy(false);
+            if (deleteSucceeded) {
+                const adjacentSession = adjacentSessionId
+                    ? sessionListNode.querySelector(`[data-agent-session-open="${CSS.escape(adjacentSessionId)}"]`)
+                    : null;
+                const focusTarget = adjacentSession
+                    || historyRail?.querySelector('[data-agent-history-close]')
+                    || railToggleButton;
+                focusTarget?.focus({preventScroll: true});
+            }
         }
     }
 
@@ -3298,10 +3315,16 @@
         composer.requestSubmit();
     });
 
+    function cancelVisualViewportFrame() {
+        if (!visualViewportFrame) return;
+        window.cancelAnimationFrame(visualViewportFrame);
+        visualViewportFrame = 0;
+    }
+
     function syncVisualViewport() {
         const viewport = window.visualViewport;
         if (!viewport) return;
-        if (visualViewportFrame) window.cancelAnimationFrame(visualViewportFrame);
+        cancelVisualViewportFrame();
         visualViewportFrame = window.requestAnimationFrame(() => {
             visualViewportFrame = 0;
             const viewportHeight = Math.max(1, Math.round(viewport.height));
@@ -3312,14 +3335,29 @@
         });
     }
 
-    if (window.visualViewport) {
-        window.visualViewport.addEventListener('resize', syncVisualViewport, {passive: true});
-        window.visualViewport.addEventListener('scroll', syncVisualViewport, {passive: true});
-        window.addEventListener('pagehide', () => {
-            window.visualViewport?.removeEventListener('resize', syncVisualViewport);
-            window.visualViewport?.removeEventListener('scroll', syncVisualViewport);
-        }, {once: true});
+    function unbindVisualViewport() {
+        if (boundVisualViewport) {
+            boundVisualViewport.removeEventListener('resize', syncVisualViewport);
+            boundVisualViewport.removeEventListener('scroll', syncVisualViewport);
+            boundVisualViewport = null;
+        }
+        cancelVisualViewportFrame();
+    }
+
+    function bindVisualViewport() {
+        const viewport = window.visualViewport;
+        if (!viewport || boundVisualViewport === viewport) return;
+        unbindVisualViewport();
+        boundVisualViewport = viewport;
+        viewport.addEventListener('resize', syncVisualViewport, {passive: true});
+        viewport.addEventListener('scroll', syncVisualViewport, {passive: true});
         syncVisualViewport();
+    }
+
+    if (window.visualViewport) {
+        bindVisualViewport();
+        window.addEventListener('pagehide', unbindVisualViewport);
+        window.addEventListener('pageshow', bindVisualViewport);
     }
 
     syncConversationLayout();

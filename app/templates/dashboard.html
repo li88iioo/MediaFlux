@@ -648,7 +648,14 @@
         state.className='inline-save-state';
         state.textContent='正在保存...';
         try{
-            await saveAppConfig(panel);
+            const result=await saveAppConfig(panel);
+            const hasPendingChanges=result?.__hasPendingConfigChanges===true;
+            if(hasPendingChanges){
+                state.className='inline-save-state';
+                state.textContent='上一版已保存，仍有未保存更改';
+                btn.disabled=false;
+                return;
+            }
             state.className='inline-save-state is-success';
             state.textContent='已保存，正在刷新看板';
             window.setTimeout(()=>window.location.reload(),450);

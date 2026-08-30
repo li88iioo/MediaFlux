@@ -238,6 +238,7 @@
         let currentId = String(options.rootId || '0');
         let currentPath = [];
         let requestVersion = 0;
+        let requestController = null;
 
         function snapshot() {
             return {
@@ -247,8 +248,17 @@
             };
         }
 
+        function cancel() {
+            requestVersion += 1;
+            requestController?.abort();
+            requestController = null;
+        }
+
         async function load(targetId, targetPath) {
             const version = ++requestVersion;
+            requestController?.abort();
+            const controller = new AbortController();
+            requestController = controller;
             const nextId = String(targetId || options.rootId || '0');
             const nextPath = (targetPath || []).map((node) => ({
                 id: String(node.id),
@@ -256,8 +266,8 @@
             }));
             options.onLoading?.({id: nextId, path: nextPath});
             try {
-                const items = await options.fetchDirectory(nextId);
-                if (version !== requestVersion) return false;
+                const items = await options.fetchDirectory(nextId, {signal: controller.signal});
+                if (version !== requestVersion || controller.signal.aborted) return false;
                 if (!Array.isArray(items)) throw new Error('目录数据格式无效');
                 currentId = nextId;
                 currentPath = nextPath;
@@ -266,9 +276,11 @@
                 options.onLoaded?.(items, state);
                 return true;
             } catch (error) {
-                if (version !== requestVersion) return false;
+                if (version !== requestVersion || controller.signal.aborted || error?.name === 'AbortError') return false;
                 options.onError?.(error, snapshot());
                 return false;
+            } finally {
+                if (requestController === controller) requestController = null;
             }
         }
 
@@ -287,7 +299,7 @@
                 ? load(String(options.rootId || '0'), [])
                 : load(currentPath[index].id, currentPath.slice(0, index + 1)),
             state: snapshot,
-            cancel: () => { requestVersion += 1; },
+            cancel,
         };
     };
 
@@ -323,12 +335,17 @@
         container.scrollLeft = container.scrollWidth;
     };
 
+    const directoryPickerInstances = new Map();
+
     window.openGuangYaDirectoryPicker = function (options) {
         function isVirtualRootId(id) {
             const raw = String(id || '').trim().toLowerCase();
             return !raw || raw === '__roots__' || raw === '0' || raw === 'undefined' || raw === 'null' || raw === '[object object]';
         }
         const modalId = options.modalId || 'guangyaDirModal';
+        const returnFocus = options.trigger || document.activeElement;
+        directoryPickerInstances.get(modalId)?.destroy({restoreFocus: false});
+        document.getElementById(modalId)?.remove();
         const multiple = options.multiple === true;
         const allowRoot = options.allowRoot !== false;
         const selected = new Map(
@@ -340,15 +357,15 @@
                     path: Array.isArray(item.path) ? item.path.map((part) => ({...part})) : [],
                 }]),
         );
-        document.getElementById(modalId)?.remove();
 
         const modal = document.createElement('div');
         modal.id = modalId;
         modal.className = 'settings-dir-modal';
+        modal.hidden = true;
         modal.innerHTML = `<div class="card card-pad settings-dir-dialog" role="dialog" aria-modal="true">
             <div class="settings-dir-head">
                 <strong data-dir-title></strong>
-                <button type="button" class="icon-btn" data-dir-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+                <button type="button" class="icon-btn" data-dir-close data-modal-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
             </div>
             <div class="dir-browser-toolbar">
                 <button type="button" class="jump-btn dir-browser-up" data-dir-up disabled title="返回上一级"><i data-lucide="arrow-up"></i>上一级</button>
@@ -365,7 +382,10 @@
             </div>
         </div>`;
 
+        const dialog = modal.querySelector('[role="dialog"]');
         const title = modal.querySelector('[data-dir-title]');
+        title.id = `${modalId}Title`;
+        dialog?.setAttribute('aria-labelledby', title.id);
         const upButton = modal.querySelector('[data-dir-up]');
         const breadcrumb = modal.querySelector('[data-dir-breadcrumb]');
         const list = modal.querySelector('[data-dir-list]');
@@ -378,15 +398,19 @@
         confirm.hidden = !multiple;
 
         let navigator;
+        let lifecycle = null;
+        let closed = false;
+        let instance = null;
         let lastItems = [];
         let lastState = {path: [], isRoot: true};
-        function close() {
+        function close({restoreFocus = true} = {}) {
+            if (closed) return;
+            closed = true;
             navigator?.cancel();
+            lifecycle?.close({restoreFocus});
+            lifecycle?.destroy({restoreFocus: false});
             modal.remove();
-            document.removeEventListener('keydown', onKeydown);
-        }
-        function onKeydown(event) {
-            if (event.key === 'Escape') close();
+            if (directoryPickerInstances.get(modalId) === instance) directoryPickerInstances.delete(modalId);
         }
         function normalizedNode(node) {
             const rawId = node ? (node.id ?? node.file_id ?? node.path ?? '') : '';
@@ -518,8 +542,8 @@
 
         navigator = window.createGuangYaDirectoryNavigator({
             rootId: options.rootId || '0',
-            fetchDirectory: options.fetchDirectory || (async (id) => {
-                const response = await fetch(`/api/guangya/dirs?parent_id=${encodeURIComponent(id)}`);
+            fetchDirectory: options.fetchDirectory || (async (id, {signal} = {}) => {
+                const response = await fetch(`/api/guangya/dirs?parent_id=${encodeURIComponent(id)}`, {signal});
                 const data = await response.json();
                 if (!response.ok) throw new Error(data.error || '目录加载失败');
                 return data;
@@ -551,17 +575,18 @@
             },
         });
 
-        modal.querySelector('[data-dir-close]').addEventListener('click', close);
-        modal.addEventListener('click', (event) => { if (event.target === modal) close(); });
         upButton.addEventListener('click', () => navigator.up());
         selectCurrent.addEventListener('click', () => selectNode(currentNode()));
         confirm.addEventListener('click', () => commitSelection(Array.from(selected.values())));
-        document.addEventListener('keydown', onKeydown);
         document.body.appendChild(modal);
+        lifecycle = window.createAppModal(modal, {onRequestClose: () => close()});
+        instance = {modal, navigator, close, destroy: close};
+        directoryPickerInstances.set(modalId, instance);
         window.renderLucideIcons?.(modal);
         updateSelectionControls();
+        lifecycle.open(returnFocus, {initialFocus: modal.querySelector('[data-dir-close]')});
         navigator.root();
-        return {modal, navigator, close};
+        return instance;
     };
 
     window.loadAppConfig = async function () {
@@ -712,39 +737,87 @@
         return { dismiss };
     };
 
+    function configFieldValue(field) {
+        return field.type === 'checkbox' ? (field.checked ? '1' : '0') : field.value;
+    }
+
+    function captureConfigSaveSnapshot(root, payload) {
+        const clearedSecrets = new Set(Array.isArray(payload.__clear_secrets) ? payload.__clear_secrets : []);
+        return [...root.querySelectorAll('[data-key]')].flatMap((field) => {
+            const key = field.dataset.key;
+            if (!key || field.dataset.managedByEnvironment === 'true') return [];
+            const secret = field.dataset.secretField === 'true';
+            const included = Object.prototype.hasOwnProperty.call(payload, key) || (secret && clearedSecrets.has(key));
+            if (!included) return [];
+            return [{
+                field,
+                key,
+                secret,
+                state: secret ? (field.dataset.secretState || 'empty') : '',
+                value: secret ? field.value : payload[key],
+            }];
+        });
+    }
+
+    function applyConfigSaveSnapshot(snapshot) {
+        snapshot.forEach(({field, secret, state, value}) => {
+            if (!secret) {
+                field.dataset.configInitialValue = String(value ?? '');
+                return;
+            }
+            const currentState = field.dataset.secretState || 'empty';
+            const currentValue = field.value;
+            if (state === 'draft') {
+                if (currentState === 'draft' && currentValue !== value) {
+                    syncSecretControls(field);
+                    return;
+                }
+                if (currentState === 'clear') {
+                    syncSecretControls(field);
+                    return;
+                }
+                field.value = '';
+                field.type = 'password';
+                field.dataset.secretState = 'saved';
+                field.placeholder = '已保存；输入新值以替换';
+            } else if (state === 'clear') {
+                if (currentState === 'draft' && currentValue) {
+                    syncSecretControls(field);
+                    return;
+                }
+                field.value = '';
+                field.type = 'password';
+                field.dataset.secretState = 'empty';
+                field.placeholder = '未配置';
+            }
+            syncSecretControls(field);
+        });
+    }
+
     window.saveAppConfig = async function (root, options = {}) {
+        const payload = window.collectConfigFields(root);
+        const snapshot = captureConfigSaveSnapshot(root, payload);
         try {
             const response = await fetch('/api/config', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(window.collectConfigFields(root)),
+                body: JSON.stringify(payload),
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || '配置保存失败');
-            root.querySelectorAll('[data-secret-field="true"]').forEach((field) => {
-                const state = field.dataset.secretState || 'empty';
-                if (state === 'draft' && field.value) {
-                    field.value = '';
-                    field.type = 'password';
-                    field.dataset.secretState = 'saved';
-                    field.placeholder = '已保存；输入新值以替换';
-                } else if (state === 'clear') {
-                    field.value = '';
-                    field.type = 'password';
-                    field.dataset.secretState = 'empty';
-                    field.placeholder = '未配置';
-                }
-                syncSecretControls(field);
-            });
-            root.querySelectorAll('[data-key]').forEach((field) => {
-                field.dataset.configInitialValue = field.type === 'checkbox'
-                    ? (field.checked ? '1' : '0')
-                    : field.value;
-            });
+            applyConfigSaveSnapshot(snapshot);
+            const hasPendingChanges = Object.keys(window.collectConfigFields(root)).length > 0;
+            if (data && typeof data === 'object') {
+                Object.defineProperty(data, '__hasPendingConfigChanges', {
+                    value: hasPendingChanges,
+                    enumerable: false,
+                });
+            }
             if (options.toast !== false) {
                 const warnings = Array.isArray(data.warnings)
                     ? data.warnings.filter(Boolean)
                     : [];
+                if (hasPendingChanges) warnings.unshift('上一版已保存，仍有未保存更改');
                 if (warnings.length) {
                     window.showToast(warnings.join('；'), 'warning', 5200);
                 } else {
@@ -843,8 +916,10 @@
             'a[href]', 'button:not([disabled])', 'input:not([disabled]):not([type="hidden"])',
             'select:not([disabled])', 'textarea:not([disabled])', '[tabindex]:not([tabindex="-1"])',
         ].join(',');
+        const closeControls = [...modal.querySelectorAll('[data-modal-close]')];
         let returnFocus = null;
         let focusGeneration = 0;
+        let destroyed = false;
         function focusableElements() {
             if (!dialog) return [];
             return [...dialog.querySelectorAll(focusableSelector)].filter((element) => (
@@ -860,13 +935,15 @@
         }
         function close({restoreFocus = true} = {}) {
             focusGeneration += 1;
+            const wasOpen = !modal.hidden;
             modal.hidden = true;
             unregisterModalLayer(layer);
             const target = returnFocus;
             returnFocus = null;
-            if (restoreFocus) restoreModalFocus(target);
+            if (wasOpen && restoreFocus) restoreModalFocus(target);
         }
         function requestClose(reason = 'dismiss') {
+            if (destroyed) return;
             if (typeof options.onRequestClose === 'function') {
                 options.onRequestClose({reason, close});
                 return;
@@ -874,6 +951,7 @@
             close();
         }
         function open(trigger, {initialFocus = null} = {}) {
+            if (destroyed) return false;
             const generation = ++focusGeneration;
             returnFocus = trigger || document.activeElement;
             modal.hidden = false;
@@ -882,15 +960,16 @@
                 if (generation !== focusGeneration || modal.hidden || topModalLayer() !== layer) return;
                 resolveInitialFocus(initialFocus)?.focus?.({preventScroll: true});
             });
+            return true;
         }
-        modal.querySelectorAll('[data-modal-close]').forEach((button) => (
-            button.addEventListener('click', () => requestClose('control'))
-        ));
-        modal.addEventListener('click', (event) => {
+        function onControlClick() {
+            requestClose('control');
+        }
+        function onBackdropClick(event) {
             if (event.target === modal) requestClose('backdrop');
-        });
-        document.addEventListener('keydown', (event) => {
-            if (modal.hidden || topModalLayer() !== layer) return;
+        }
+        function onDocumentKeydown(event) {
+            if (destroyed || modal.hidden || topModalLayer() !== layer) return;
             if (event.key === 'Escape') {
                 event.preventDefault();
                 event.stopImmediatePropagation?.();
@@ -916,12 +995,24 @@
                 event.preventDefault();
                 first.focus({preventScroll: true});
             }
-        });
+        }
+        function destroy({restoreFocus = true} = {}) {
+            if (destroyed) return;
+            close({restoreFocus});
+            destroyed = true;
+            closeControls.forEach((button) => button.removeEventListener?.('click', onControlClick));
+            modal.removeEventListener?.('click', onBackdropClick);
+            document.removeEventListener?.('keydown', onDocumentKeydown);
+        }
+        closeControls.forEach((button) => button.addEventListener('click', onControlClick));
+        modal.addEventListener('click', onBackdropClick);
+        document.addEventListener('keydown', onDocumentKeydown);
         return {
             open,
             close,
             requestClose,
-            isTop: () => !modal.hidden && topModalLayer() === layer,
+            destroy,
+            isTop: () => !destroyed && !modal.hidden && topModalLayer() === layer,
         };
     };
 

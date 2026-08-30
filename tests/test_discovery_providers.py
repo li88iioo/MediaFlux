@@ -1128,6 +1128,12 @@ class BangumiProviderTests(unittest.TestCase):
 
 
 class ProviderLifecycleTests(unittest.TestCase):
+    class FlakyCloseSession(FakeSession):
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("close failed")
+
     def test_tmdb_provider_close_is_idempotent_and_blocks_requests(self):
         session = FakeSession()
         provider = TMDBProvider(client=TMDBClient(api_key="key", session=session))
@@ -1152,6 +1158,24 @@ class ProviderLifecycleTests(unittest.TestCase):
         with self.assertRaises(ProviderUnavailable):
             provider.list_items("calendar", "tv", 1, {})
 
+    def test_bangumi_close_never_waits_for_calendar_while_holding_close_lock(self):
+        session = FakeSession()
+        provider = BangumiProvider(session=session)
+        provider._calendar_payload = []
+
+        class AssertCloseUnlocked:
+            def __enter__(inner_self):
+                self.assertFalse(provider._close_lock.locked())
+                return inner_self
+
+            def __exit__(inner_self, exc_type, exc, traceback):
+                return False
+
+        provider._calendar_lock = AssertCloseUnlocked()
+
+        self.assertTrue(provider.close())
+        self.assertIsNone(provider._calendar_payload)
+
     def test_douban_provider_close_deduplicates_shared_session(self):
         session = FakeSession()
         provider = DoubanProvider(enabled=True, session=session)
@@ -1162,6 +1186,88 @@ class ProviderLifecycleTests(unittest.TestCase):
         self.assertEqual(session.close_calls, 1)
         with self.assertRaises(ProviderUnavailable):
             provider.list_items("movie_hot", "movie", 1, {})
+
+    def test_douban_credential_rotation_retires_and_closes_old_session(self):
+        config = {"DOUBAN_DBCL2": "cookie-a"}
+        old_session = FakeSession()
+        new_session = FakeSession()
+        old_client = Mock(configured=True, session=old_session)
+        new_client = Mock(configured=True, session=new_session)
+        factory = Mock(side_effect=(old_client, new_client))
+        provider = DoubanProvider(
+            enabled=True,
+            config=config,
+            public_client=object(),
+            authenticated_client_factory=factory,
+        )
+
+        self.assertIs(provider._authenticated_fallback_client(), old_client)
+        config["DOUBAN_DBCL2"] = "cookie-b"
+        self.assertIs(provider._authenticated_fallback_client(), new_client)
+        self.assertEqual(old_session.close_calls, 1)
+        self.assertFalse(provider._retired_close_resources)
+
+        self.assertTrue(provider.close())
+        self.assertEqual(old_session.close_calls, 1)
+        self.assertEqual(new_session.close_calls, 1)
+        self.assertFalse(provider._retired_close_resources)
+
+    def test_douban_rotation_blocks_new_generation_until_failed_close_recovers(self):
+        class RetryableSession(FakeSession):
+            def close(self):
+                self.close_calls += 1
+                return False if self.close_calls == 1 else None
+
+        config = {"DOUBAN_DBCL2": "cookie-a"}
+        old_session = RetryableSession()
+        new_session = FakeSession()
+        old_client = Mock(configured=True, session=old_session)
+        new_client = Mock(configured=True, session=new_session)
+        factory = Mock(side_effect=(old_client, new_client))
+        provider = DoubanProvider(
+            enabled=True,
+            config=config,
+            public_client=object(),
+            authenticated_client_factory=factory,
+        )
+
+        self.assertIs(provider._authenticated_fallback_client(), old_client)
+        config["DOUBAN_DBCL2"] = "cookie-b"
+        self.assertIsNone(provider._authenticated_fallback_client())
+        self.assertEqual(factory.call_count, 1)
+        self.assertEqual(old_session.close_calls, 1)
+        self.assertEqual(len(provider._retired_close_resources), 1)
+
+        self.assertIs(provider._authenticated_fallback_client(), new_client)
+        self.assertEqual(factory.call_count, 2)
+        self.assertEqual(old_session.close_calls, 2)
+        self.assertFalse(provider._retired_close_resources)
+        self.assertTrue(provider.close())
+        self.assertEqual(new_session.close_calls, 1)
+
+    def test_provider_close_failures_keep_resources_for_retry(self):
+        cases = (
+            (
+                "tmdb",
+                lambda session: TMDBProvider(
+                    client=TMDBClient(api_key="key", session=session)
+                ),
+            ),
+            ("bangumi", lambda session: BangumiProvider(session=session)),
+            (
+                "douban",
+                lambda session: DoubanProvider(enabled=True, session=session),
+            ),
+        )
+        for name, factory in cases:
+            with self.subTest(provider=name):
+                session = self.FlakyCloseSession()
+                provider = factory(session)
+                self.assertFalse(provider.close())
+                self.assertFalse(provider._closed)
+                self.assertTrue(provider.close())
+                self.assertTrue(provider._closed)
+                self.assertEqual(session.close_calls, 2)
 
 
 class TMDBScraperCompatibilityTests(unittest.TestCase):

@@ -395,7 +395,7 @@ def claim_failed_share_transfer_request(request_id: int) -> bool:
     """显式重试一次明确失败的分享转存；不确定结果禁止重新云写。"""
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE download_requests SET status='submitting',gy_status='',error='',"
+            "UPDATE download_requests SET status='submitting',gy_status='submitting',error='',"
             "completed_at=NULL,updated_at=? WHERE id=? AND kind='guangya_share' "
             "AND status='failed' AND (SELECT COUNT(*) FROM download_log "
             "WHERE request_id=download_requests.id AND source='guangya_share')=1",
@@ -1026,7 +1026,7 @@ def recover_stale_submitting_download_requests(stale_minutes: int = 15) -> int:
     )
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        cur = conn.execute(
+        regular_cur = conn.execute(
             "UPDATE download_requests SET status='manual_review',"
             "qb_status=CASE WHEN qb_status='submitting' THEN 'manual_review' ELSE qb_status END,"
             "gy_status=CASE WHEN gy_status='submitting' THEN 'manual_review' ELSE gy_status END,"
@@ -1041,7 +1041,31 @@ def recover_stale_submitting_download_requests(stale_minutes: int = 15) -> int:
             "< datetime('now','localtime', ?)",
             (message, message, message, timestamp, timestamp, f"-{minutes} minutes"),
         )
-        return int(cur.rowcount or 0)
+        share_message = (
+            "光鸭分享转存长时间未完成，云端写入结果未知；"
+            "请核对目标目录，勿直接重试"
+        )
+        share_cur = conn.execute(
+            "UPDATE download_requests SET status='manual_review',gy_status='manual_review',"
+            "error=CASE "
+            "WHEN instr(COALESCE(error,''),?)>0 THEN error "
+            "WHEN COALESCE(error,'')='' THEN ? "
+            "ELSE substr(error || char(10) || ?,1,1000) END,"
+            "completed_at=COALESCE(completed_at,?),updated_at=? "
+            "WHERE kind='guangya_share' AND status='submitting' "
+            "AND COALESCE(gy_status,'') IN ('','submitting') "
+            "AND datetime(COALESCE(NULLIF(updated_at,''),created_at)) "
+            "< datetime('now','localtime', ?)",
+            (
+                share_message,
+                share_message,
+                share_message,
+                timestamp,
+                timestamp,
+                f"-{minutes} minutes",
+            ),
+        )
+        return int(regular_cur.rowcount or 0) + int(share_cur.rowcount or 0)
 
 
 def list_active_download_requests(

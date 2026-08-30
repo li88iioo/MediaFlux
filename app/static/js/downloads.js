@@ -956,9 +956,10 @@ async function saveTorrentCachePolicy(){
     torrentCachePolicySave.setAttribute('aria-busy','true');
     setTorrentCachePolicyState('保存中…');
     try{
-        await window.saveAppConfig(torrentCachePolicyForm,{toast:false});
-        setTorrentCachePolicyState('已保存','success');
-        window.showToast?.('种子缓存策略已保存','success');
+        const result=await window.saveAppConfig(torrentCachePolicyForm,{toast:false});
+        const hasPendingChanges=result?.__hasPendingConfigChanges===true;
+        setTorrentCachePolicyState(hasPendingChanges?'上一版已保存，仍有未保存更改':'已保存',hasPendingChanges?'':'success');
+        window.showToast?.(hasPendingChanges?'上一版已保存，仍有未保存更改':'种子缓存策略已保存',hasPendingChanges?'warning':'success');
     }catch(error){
         setTorrentCachePolicyState(error.message||'策略保存失败','error');
     }finally{

@@ -26,6 +26,9 @@ from app.discovery.providers.base import (
     map_request_error,
     response_json,
 )
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 _BANGUMI_IMAGE_HOSTS = {"lain.bgm.tv"}
 
@@ -100,26 +103,43 @@ class BangumiProvider(DiscoveryProvider):
         self._calendar_payload: list[Any] | None = None
         self._calendar_expires_at = 0.0
         self._calendar_is_stale = False
+        self._close_call_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._closing = False
         self._closed = False
 
     def _ensure_open(self) -> None:
         with self._close_lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise ProviderUnavailable("Bangumi 数据源已关闭")
 
-    def close(self) -> None:
-        with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-        with self._calendar_lock:
-            self._calendar_payload = None
-            self._calendar_expires_at = 0.0
-            self._calendar_is_stale = False
-        close = getattr(self.session, "close", None)
-        if callable(close):
-            close()
+    def close(self) -> bool:
+        # 不可在持有 _close_lock 时等待 _calendar_lock：周历加载路径会先持有
+        # _calendar_lock 再检查关闭状态，反向加锁会在关机与刷新并发时死锁。
+        with self._close_call_lock:
+            with self._close_lock:
+                if self._closed:
+                    return True
+                self._closing = True
+            close = getattr(self.session, "close", None)
+            if callable(close):
+                try:
+                    closed = close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭 Bangumi Session 失败 type=%s", type(exc).__name__
+                    )
+                    return False
+                if closed is False:
+                    return False
+            with self._calendar_lock:
+                self._calendar_payload = None
+                self._calendar_expires_at = 0.0
+                self._calendar_is_stale = False
+            with self._close_lock:
+                self._closed = True
+                self._closing = False
+            return True
 
     def _get(self, path: str, *, expected_type: type) -> Any:
         self._ensure_open()

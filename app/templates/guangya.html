@@ -615,7 +615,7 @@ function gyRenderItems(items){
 
 const gyNavigator = createGuangYaDirectoryNavigator({
     rootId: '0',
-    fetchDirectory: (id)=>gyApi('/dirs?parent_id='+encodeURIComponent(id)),
+    fetchDirectory: (id,{signal}={})=>gyApi('/dirs?parent_id='+encodeURIComponent(id),{signal}),
     onLoading: ()=>gyDirList.replaceChildren(gyEmptyState('加载中...')),
     onPathChange: (state)=>{
         renderDirectoryBreadcrumb(gyBreadcrumb, state.path, index=>gyNavigator.goTo(index));

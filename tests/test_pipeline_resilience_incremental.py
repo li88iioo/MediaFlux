@@ -99,6 +99,66 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(row["status"], "submitting")
         self.assertEqual(row["qb_status"], "submitting")
 
+    def test_stale_retried_share_requires_manual_without_cloud_replay(self):
+        request_id, _ = db.create_share_transfer_request(
+            f"share-retry-{uuid.uuid4().hex}", title="Share", origin="web",
+        )
+        db.finish_share_transfer_request(
+            request_id,
+            success=False,
+            target_dir_id="target",
+            target_dir_name="Target",
+            title="Share",
+            error="temporary failure",
+        )
+        self.assertTrue(db.claim_failed_share_transfer_request(request_id))
+        claimed = db.get_download_request(request_id)
+        self.assertEqual(claimed["status"], "submitting")
+        self.assertEqual(claimed["gy_status"], "submitting")
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE download_requests SET updated_at="
+                "datetime('now','localtime','-30 minutes') WHERE id=?",
+                (request_id,),
+            )
+
+        tracker = DownloadTracker()
+        with patch.object(
+            tracker, "_run_torrent_data_cleanup_if_due", return_value=0,
+        ), patch.object(
+            tracker, "_gy_tasks", return_value=(True, []),
+        ) as gy_tasks, patch(
+            "app.modules.download_tracker.db.list_active_download_requests",
+            return_value=[],
+        ):
+            self.assertEqual(tracker.run_once(), 0)
+
+        gy_tasks.assert_not_called()
+        recovered = db.get_download_request(request_id)
+        self.assertEqual(recovered["status"], "manual_review")
+        self.assertEqual(recovered["gy_status"], "manual_review")
+        self.assertIn("云端写入结果未知", recovered["error"])
+        self.assertIn("勿直接重试", recovered["error"])
+
+    def test_recent_retried_share_is_not_recovered_early(self):
+        request_id, _ = db.create_share_transfer_request(
+            f"share-recent-{uuid.uuid4().hex}", title="Share", origin="web",
+        )
+        db.finish_share_transfer_request(
+            request_id,
+            success=False,
+            target_dir_id="target",
+            target_dir_name="Target",
+            title="Share",
+            error="temporary failure",
+        )
+        self.assertTrue(db.claim_failed_share_transfer_request(request_id))
+
+        self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
+        row = db.get_download_request(request_id)
+        self.assertEqual(row["status"], "submitting")
+        self.assertEqual(row["gy_status"], "submitting")
+
     def test_download_notification_is_claimed_by_exactly_one_tracker(self):
         request_id, _ = db.create_download_request(
             "notification-claim", "magnet", title="并发通知"

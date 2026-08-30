@@ -112,8 +112,14 @@ jobs:
         if: success()
         run: |
           docker stop --time 60 mediaflux-smoke
-          test "$(docker inspect --format '{{.State.ExitCode}}' mediaflux-smoke)" = "0"
-          docker logs mediaflux-smoke
+          shutdown_exit=$(docker inspect --format '{{.State.ExitCode}}' mediaflux-smoke)
+          case "$shutdown_exit" in
+            0|143) ;;
+            *) echo "Unexpected container shutdown exit code: $shutdown_exit" >&2; exit 1 ;;
+          esac
+          docker logs mediaflux-smoke > "$RUNNER_TEMP/docker-smoke-shutdown.log" 2>&1
+          cat "$RUNNER_TEMP/docker-smoke-shutdown.log"
+          grep -Fq "Application shutdown complete" "$RUNNER_TEMP/docker-smoke-shutdown.log"
       - name: Smoke test persisted v0.1.4 database upgrade
         if: success()
         env:
@@ -183,7 +189,15 @@ jobs:
               jq -e 'all(.[]; .status != "error")' \
                 "$RUNNER_TEMP/docker-v014-doctor.json"
               docker stop --time 60 mediaflux-v014-upgrade
-              test "$(docker inspect --format '{{.State.ExitCode}}' mediaflux-v014-upgrade)" = "0"
+              shutdown_exit=$(docker inspect --format '{{.State.ExitCode}}' mediaflux-v014-upgrade)
+              case "$shutdown_exit" in
+                0|143) ;;
+                *) echo "Unexpected upgrade shutdown exit code: $shutdown_exit" >&2; exit 1 ;;
+              esac
+              docker logs mediaflux-v014-upgrade \
+                > "$RUNNER_TEMP/docker-v014-shutdown.log" 2>&1
+              grep -Fq "Application shutdown complete" \
+                "$RUNNER_TEMP/docker-v014-shutdown.log"
               exit 0
             fi
             sleep 2
@@ -388,7 +402,14 @@ jobs:
               exit 1
             fi
             docker stop --time 60 "$container"
-            test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = "0"
+            shutdown_exit=$(docker inspect --format '{{.State.ExitCode}}' "$container")
+            case "$shutdown_exit" in
+              0|143) ;;
+              *) echo "Unexpected $platform shutdown exit code: $shutdown_exit" >&2; exit 1 ;;
+            esac
+            shutdown_log="$RUNNER_TEMP/docker-${safe_platform}-shutdown.log"
+            docker logs "$container" > "$shutdown_log" 2>&1
+            grep -Fq "Application shutdown complete" "$shutdown_log"
             docker rm "$container"
           done
 
@@ -428,7 +449,9 @@ jobs:
             fi
           fi
           if [[ -n "$existing_digest" && "$existing_digest" != "$IMAGE_DIGEST" ]]; then
-            docker buildx imagetools inspect "$exact" --raw > "$RUNNER_TEMP/existing-exact-manifest.json"
+            docker buildx imagetools inspect \
+              "$IMAGE_REPOSITORY@$existing_digest" --raw \
+              > "$RUNNER_TEMP/existing-exact-manifest.json"
             if ! jq -e '
               [.manifests[].platform | "\(.os)/\(.architecture)"] as $platforms
               | ($platforms | index("linux/amd64")) != null
@@ -479,7 +502,7 @@ jobs:
               if mutable_digest=$(bash packaging/scripts/inspect_registry_digest.sh "$mutable_tag"); then
                 safe_name=$(printf '%s' "$mutable_tag" | tr '/:.' '____')
                 docker run --rm --platform linux/amd64 --entrypoint python \
-                  "$mutable_tag" mediaflux.py version --json \
+                  "$IMAGE_REPOSITORY@$mutable_digest" mediaflux.py version --json \
                   > "$RUNNER_TEMP/docker-current-$safe_name.json"
                 current_version=$(jq -r '.version' "$RUNNER_TEMP/docker-current-$safe_name.json")
                 if ! python packaging/scripts/check_version_promotion.py "$VERSION" "$current_version"; then

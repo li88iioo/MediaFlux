@@ -262,52 +262,133 @@ class DoubanProvider(DiscoveryProvider):
         self._fallback_breakers: dict[str, tuple[int, float]] = {}
         # 熔断检查与实际网络请求之间也要单飞，避免并发首探重复请求/日志。
         self._fallback_in_flight: set[str] = set()
+        self._close_call_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._closing = False
         self._closed = False
+        self._pending_close_resources: list[Any] | None = None
+        self._retired_close_resources: dict[int, Any] = {}
 
-    def close(self) -> None:
-        with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-            clients = (self.public_client, self._frodo_client, self._authenticated_client)
-            self._frodo_client = None
-            self._authenticated_client = None
+    def close(self) -> bool:
+        with self._close_call_lock:
+            with self._close_lock:
+                if self._closed:
+                    return True
+                self._closing = True
+                pending = self._pending_close_resources
 
-        resources: list[Any] = []
-        for client in clients:
-            if client is None:
-                continue
-            session = getattr(client, "session", None)
-            resources.append(session if session is not None else client)
-        resources.append(self.session)
+            if pending is None:
+                # 先公布 closing，再等待懒加载锁：已越过入口检查的请求即使排队
+                # 到这里之后才获得锁，也会在工厂调用前复核状态，不能再创建新客户端。
+                with self._frodo_lock, self._authenticated_lock:
+                    clients = (
+                        self.public_client,
+                        self._frodo_client,
+                        self._authenticated_client,
+                    )
+                    resources: list[Any] = list(
+                        self._retired_close_resources.values()
+                    )
+                    seen: set[int] = {id(resource) for resource in resources}
+                    for client in clients:
+                        if client is None:
+                            continue
+                        session = getattr(client, "session", None)
+                        resource = session if session is not None else client
+                        identity = id(resource)
+                        if identity not in seen:
+                            seen.add(identity)
+                            resources.append(resource)
+                    if self.session is not None and id(self.session) not in seen:
+                        resources.append(self.session)
+                    pending = resources
+                with self._close_lock:
+                    self._pending_close_resources = pending
 
-        seen: set[int] = set()
-        for resource in resources:
-            if resource is None or id(resource) in seen:
-                continue
-            seen.add(id(resource))
-            close = getattr(resource, "close", None)
-            if not callable(close):
-                continue
-            try:
-                close()
-            except Exception as exc:  # pragma: no cover - defensive shutdown isolation
-                logger.warning("关闭豆瓣客户端资源失败 error=%s", exc)
+            resources = tuple(pending)
+            failed: list[Any] = []
+            for resource in resources:
+                close = getattr(resource, "close", None)
+                if not callable(close):
+                    continue
+                try:
+                    closed = close()
+                except Exception as exc:  # pragma: no cover - shutdown isolation
+                    logger.warning("关闭豆瓣客户端资源失败 error=%s", exc)
+                    failed.append(resource)
+                    continue
+                if closed is False:
+                    failed.append(resource)
 
-    def _load_dbcl2(self) -> None:
-        """每次调用都对齐当前配置值：用户在设置中更新 Cookie 必须免重启生效。"""
+            if not failed:
+                with self._frodo_lock, self._authenticated_lock:
+                    self._frodo_client = None
+                    self._authenticated_client = None
+                    self._retired_close_resources.clear()
+            with self._close_lock:
+                self._pending_close_resources = failed
+                if failed:
+                    return False
+                self._closed = True
+                self._closing = False
+                return True
+
+    @staticmethod
+    def _authenticated_resource(client: Any | None) -> Any | None:
+        if client is None:
+            return None
+        session = getattr(client, "session", None)
+        return session if session is not None else client
+
+    @staticmethod
+    def _close_authenticated_resource(resource: Any | None) -> bool:
+        if resource is None:
+            return True
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            return True
+        try:
+            closed = close()
+        except Exception as exc:
+            logger.warning("关闭豆瓣认证客户端资源失败 error=%s", exc)
+            return False
+        if closed is False:
+            logger.warning("关闭豆瓣认证客户端资源未完成，已保留供后续重试")
+            return False
+        return True
+
+    def _retry_retired_close_resources_locked(self) -> bool:
+        """认证旧代际未回收前禁止继续创建，避免热切换无限积累 Session。"""
+        blocked = False
+        for identity, resource in list(self._retired_close_resources.items()):
+            if self._close_authenticated_resource(resource):
+                self._retired_close_resources.pop(identity, None)
+            else:
+                blocked = True
+        return not blocked
+
+    def _load_dbcl2(self) -> bool:
+        """对齐 Cookie；返回本次是否发生了凭据代际切换。"""
         if not self._dbcl2_from_config:
-            return
+            return False
         try:
             current = normalize_dbcl2(_config_get(self._config, "DOUBAN_DBCL2"))
         except ValueError:
             current = ""
-        if current != self.dbcl2:
-            self.dbcl2 = current
-            # 凭据变化后旧客户端与旧的认证熔断都不再有意义。
-            self._authenticated_client = None
-            self._record_fallback_success("dbcl2")
+        if current == self.dbcl2:
+            return False
+
+        self.dbcl2 = current
+        previous = self._authenticated_client
+        self._authenticated_client = None
+        resource = self._authenticated_resource(previous)
+        if resource is not None:
+            if self._close_authenticated_resource(resource):
+                self._retired_close_resources.pop(id(resource), None)
+            else:
+                self._retired_close_resources[id(resource)] = resource
+        self._record_fallback_success("dbcl2")
+        return True
 
     def _build_frodo_client(self) -> DoubanFrodoClient:
         return DoubanFrodoClient(
@@ -329,7 +410,7 @@ class DoubanProvider(DiscoveryProvider):
 
     def _ensure_enabled(self) -> None:
         with self._close_lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise ProviderUnavailable("豆瓣数据源已关闭")
         if not self.enabled:
             raise ProviderNotConfigured("豆瓣探索 Provider 未启用")
@@ -527,24 +608,34 @@ class DoubanProvider(DiscoveryProvider):
         return subject_id, normalized_type
 
     def _frodo_fallback_client(self) -> Any | None:
+        self._ensure_enabled()
         if self._frodo_client is not None:
             return self._frodo_client if bool(getattr(self._frodo_client, "configured", False)) else None
         if self.api_key is not None or self.api_secret is not None:
             if not (self.api_key and self.api_secret):
                 return None
         with self._frodo_lock:
+            self._ensure_enabled()
             if self._frodo_client is None:
                 self._frodo_client = self._frodo_client_factory()
             client = self._frodo_client
         return client if bool(getattr(client, "configured", False)) else None
 
     def _authenticated_fallback_client(self) -> Any | None:
+        self._ensure_enabled()
         if self._authenticated_client_injected:
             client = self._authenticated_client
             return client if bool(getattr(client, "configured", False)) else None
         with self._authenticated_lock:
+            self._ensure_enabled()
             # 已缓存客户端也要复核配置：Cookie 更新后立即重建，免重启生效。
-            self._load_dbcl2()
+            rotated = self._load_dbcl2()
+            # 刚切换时若旧资源第一次关闭失败，本轮不立即二次重试；
+            # 下次访问先完成回收，成功后才允许创建新代际。
+            if self._retired_close_resources and (
+                rotated or not self._retry_retired_close_resources_locked()
+            ):
+                return None
             if not self.dbcl2:
                 return None
             if self._authenticated_client is None:

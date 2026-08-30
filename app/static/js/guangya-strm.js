@@ -838,9 +838,9 @@
                     rootId: '__roots__',
                     rootName: '本机目录',
                     allowRoot: true,
-                    fetchDirectory: async (path) => {
+                    fetchDirectory: async (path, {signal} = {}) => {
                         const query = new URLSearchParams({path: !path || path === '__roots__' ? '__roots__' : path});
-                        const res = await fetch(`/api/local-media/directories?${query.toString()}`);
+                        const res = await fetch(`/api/local-media/directories?${query.toString()}`, {signal});
                         const data = await res.json().catch(() => ({}));
                         if (!res.ok) throw new Error(data.error || '读取本地目录失败');
                         return (data.directories || []).map((item) => {
@@ -931,14 +931,23 @@
         const baseUrlChanged=!isBaseUrlManaged()&&previousBaseUrl!==nextBaseUrl;
         btn.disabled=true;btn.setAttribute('aria-disabled','true');state.className='';state.textContent='保存中...';
         try{
-            await saveAppConfig(form);
-            state.className='is-success';
+            const result=await saveAppConfig(form);
+            const hasPendingChanges=result?.__hasPendingConfigChanges===true;
             if(baseUrlChanged){
                 baseUrlRefreshPending=true;
                 baseUrlRefreshAwaitingRun=false;
-                state.textContent='播放地址已保存，待完整刷新 STRM';
                 setBaseUrlRefreshState('pending');
+            }
+            if(hasPendingChanges){
+                state.className='';
+                state.textContent=baseUrlChanged
+                    ? '上一版播放地址已保存，仍有未保存更改；完整刷新待执行'
+                    : '上一版已保存，仍有未保存更改';
+            }else if(baseUrlChanged){
+                state.className='is-success';
+                state.textContent='播放地址已保存，待完整刷新 STRM';
             }else{
+                state.className='is-success';
                 state.textContent='STRM 设置已保存';
             }
             validateCron();loadStatus();

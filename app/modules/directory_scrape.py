@@ -6,6 +6,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from functools import wraps
 from time import monotonic
 from typing import Callable
 
@@ -506,6 +507,17 @@ class _CallbackCancelEvent:
             self._cancelled = True
         return self._cancelled
 
+
+def _directory_scrape_operation(method):
+    """保护目录刮削公开入口，嵌套调用沿用当前线程的外层 lease。"""
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._lifecycle_operation():
+            return method(self, *args, **kwargs)
+
+    return guarded
+
+
 class DirectoryScrapeService:
     def __init__(
         self,
@@ -520,44 +532,128 @@ class DirectoryScrapeService:
         self.scraper = scraper if scraper is not None else TMDBScraper()
         self.store = store or get_directory_scrape_store()
         self._closed = False
+        self._closing = False
+        self._owned_scraper_closed = not self._owns_scraper
+        self._owned_client_closed = not self._owns_client
         self.rules_loader = rules_loader
         self._cached_nsfw_key: tuple[str, str, str, int] | None = None
         self._cached_nsfw_recognizer = None
+        self._close_call_lock = threading.Lock()
+        self._lifecycle_condition = threading.Condition(threading.Lock())
+        self._active_operations = 0
+        self._operation_depth = threading.local()
         self._nsfw_lock = threading.RLock()
         self._nsfw_active_leases: dict[int, int] = {}
         self._retired_nsfw_recognizers: dict[int, object] = {}
 
-    def close(self) -> None:
-        """释放全局目录刮削服务持有的内部客户端。"""
-        with self._nsfw_lock:
-            if self._closed:
-                return
-            self._closed = True
-            recognizer = self._cached_nsfw_recognizer
-            self._cached_nsfw_recognizer = None
-            self._cached_nsfw_key = None
-            recognizers_to_close = self._retire_nsfw_recognizer_locked(recognizer)
-            for identity, retired in list(self._retired_nsfw_recognizers.items()):
-                if self._nsfw_active_leases.get(identity, 0) <= 0:
-                    self._retired_nsfw_recognizers.pop(identity, None)
-                    recognizers_to_close.append(retired)
-        self._close_nsfw_recognizers(recognizers_to_close)
-        if self._owns_scraper:
-            close = getattr(self.scraper, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception as exc:
-                    logger.warning(
-                        "关闭目录刮削 TMDB Scraper 失败 type=%s",
-                        type(exc).__name__,
-                    )
-        if self._owns_client:
-            close_guangya_client(self.client)
+    @contextmanager
+    def _lifecycle_operation(self):
+        depth = int(getattr(self._operation_depth, "value", 0) or 0)
+        if depth:
+            self._operation_depth.value = depth + 1
+            try:
+                yield
+            finally:
+                self._operation_depth.value = depth
+            return
+
+        with self._lifecycle_condition:
+            if self._closed or self._closing:
+                raise DirectoryScrapeRequestError("目录刮削服务正在关闭，请稍后重试")
+            self._active_operations += 1
+        self._operation_depth.value = 1
+        try:
+            yield
+        finally:
+            try:
+                del self._operation_depth.value
+            except AttributeError:
+                pass
+            with self._lifecycle_condition:
+                self._active_operations -= 1
+                finish_close = (
+                    self._active_operations == 0
+                    and self._closing
+                    and not self._closed
+                )
+                self._lifecycle_condition.notify_all()
+            if finish_close:
+                self.close()
+
+    def _lifecycle_state(self) -> tuple[bool, bool, int]:
+        with self._lifecycle_condition:
+            return self._closed, self._closing, self._active_operations
+
+    def close(self) -> bool:
+        """释放内部客户端；在途刮削结束前不抢先拆除共享资源。"""
+        with self._close_call_lock:
+            with self._lifecycle_condition:
+                if self._closed:
+                    return True
+                self._closing = True
+                if self._active_operations:
+                    return False
+
+            with self._nsfw_lock:
+                recognizer = self._cached_nsfw_recognizer
+                self._cached_nsfw_recognizer = None
+                self._cached_nsfw_key = None
+                recognizers_to_close = self._retire_nsfw_recognizer_locked(
+                    recognizer
+                )
+                for identity, retired in list(
+                    self._retired_nsfw_recognizers.items()
+                ):
+                    if self._nsfw_active_leases.get(identity, 0) <= 0:
+                        self._retired_nsfw_recognizers.pop(identity, None)
+                        recognizers_to_close.append(retired)
+            failed_recognizers = self._close_nsfw_recognizers(
+                recognizers_to_close
+            )
+            if failed_recognizers:
+                with self._nsfw_lock:
+                    for failed in failed_recognizers:
+                        self._retired_nsfw_recognizers[id(failed)] = failed
+
+            with self._nsfw_lock:
+                recognizers_drained = (
+                    not self._nsfw_active_leases
+                    and not self._retired_nsfw_recognizers
+                )
+            if not recognizers_drained:
+                return False
+
+            if self._owns_scraper and not self._owned_scraper_closed:
+                close = getattr(self.scraper, "close", None)
+                if callable(close):
+                    try:
+                        closed = close()
+                    except Exception as exc:
+                        logger.warning(
+                            "关闭目录刮削 TMDB Scraper 失败 type=%s",
+                            type(exc).__name__,
+                        )
+                        closed = False
+                    self._owned_scraper_closed = closed is not False
+                else:
+                    self._owned_scraper_closed = True
+            if self._owns_client and not self._owned_client_closed:
+                self._owned_client_closed = close_guangya_client(self.client)
+
+            resources_closed = (
+                self._owned_scraper_closed and self._owned_client_closed
+            )
+            if resources_closed:
+                with self._lifecycle_condition:
+                    self._closed = True
+                    self._closing = False
+                    self._lifecycle_condition.notify_all()
+            return resources_closed
 
     @staticmethod
-    def _close_nsfw_recognizers(recognizers: list[object]) -> None:
+    def _close_nsfw_recognizers(recognizers: list[object]) -> list[object]:
         seen: set[int] = set()
+        failed: list[object] = []
         for recognizer in recognizers:
             identity = id(recognizer)
             if recognizer is None or identity in seen:
@@ -566,12 +662,20 @@ class DirectoryScrapeService:
             close = getattr(recognizer, "close", None)
             if callable(close):
                 try:
-                    close()
+                    closed = close()
                 except Exception as exc:
                     logger.warning(
                         "关闭目录刮削 MetaTube 识别器失败 type=%s",
                         type(exc).__name__,
                     )
+                    failed.append(recognizer)
+                    continue
+                if closed is False:
+                    logger.warning(
+                        "关闭目录刮削 MetaTube 识别器未完成，已保留供后续重试"
+                    )
+                    failed.append(recognizer)
+        return failed
 
     def _retire_nsfw_recognizer_locked(self, recognizer) -> list[object]:
         if recognizer is None:
@@ -583,11 +687,25 @@ class DirectoryScrapeService:
         self._retired_nsfw_recognizers.pop(identity, None)
         return [recognizer]
 
+    def _retry_inactive_retired_nsfw_locked(self) -> bool:
+        """固定为 current + 至多一个 retired；active 旧代也会阻止扩代。"""
+        blocked = False
+        for identity, recognizer in list(self._retired_nsfw_recognizers.items()):
+            if self._nsfw_active_leases.get(identity, 0) > 0:
+                blocked = True
+                continue
+            if self._close_nsfw_recognizers([recognizer]):
+                blocked = True
+            else:
+                self._retired_nsfw_recognizers.pop(identity, None)
+        return not blocked
+
     def _resolve_nsfw_recognizer_locked(
         self,
         rules: OrganizeRules,
     ) -> tuple[object | None, list[object]]:
-        if self._closed:
+        operation_depth = int(getattr(self._operation_depth, "value", 0) or 0)
+        if self._closed or (self._closing and operation_depth <= 0):
             return None, []
         if not rules.nsfw_enabled or not str(rules.nsfw_metatube_endpoint or "").strip():
             return None, []
@@ -599,20 +717,30 @@ class DirectoryScrapeService:
         )
         if self._cached_nsfw_key == key and self._cached_nsfw_recognizer is not None:
             return self._cached_nsfw_recognizer, []
+        if not self._retry_inactive_retired_nsfw_locked():
+            return None, []
+
+        previous = self._cached_nsfw_recognizer
+        self._cached_nsfw_key = None
+        self._cached_nsfw_recognizer = None
+        if previous is not None:
+            identity = id(previous)
+            if self._nsfw_active_leases.get(identity, 0) > 0:
+                self._retired_nsfw_recognizers[identity] = previous
+            elif self._close_nsfw_recognizers([previous]):
+                self._retired_nsfw_recognizers[identity] = previous
+                return None, []
+
         from app.modules.nsfw import NsfwRecognizer
         try:
             recognizer = NsfwRecognizer(
                 key[0], key[1], strip_domains=key[2], timeout=key[3],
             )
         except ValueError:
-            previous = self._cached_nsfw_recognizer
-            self._cached_nsfw_key = None
-            self._cached_nsfw_recognizer = None
-            return None, self._retire_nsfw_recognizer_locked(previous)
-        previous = self._cached_nsfw_recognizer
+            return None, []
         self._cached_nsfw_key = key
         self._cached_nsfw_recognizer = recognizer
-        return recognizer, self._retire_nsfw_recognizer_locked(previous)
+        return recognizer, []
 
     @contextmanager
     def _nsfw_recognizer_lease(self, rules: OrganizeRules):
@@ -623,11 +751,14 @@ class DirectoryScrapeService:
                 self._nsfw_active_leases[identity] = (
                     self._nsfw_active_leases.get(identity, 0) + 1
                 )
-        self._close_nsfw_recognizers(recognizers_to_close)
+        failed = self._close_nsfw_recognizers(recognizers_to_close)
+        if failed:
+            with self._nsfw_lock:
+                for item in failed:
+                    self._retired_nsfw_recognizers[id(item)] = item
         try:
             yield recognizer
         finally:
-            recognizer_to_close = None
             if recognizer is not None:
                 identity = id(recognizer)
                 with self._nsfw_lock:
@@ -636,11 +767,11 @@ class DirectoryScrapeService:
                         self._nsfw_active_leases[identity] = remaining
                     else:
                         self._nsfw_active_leases.pop(identity, None)
-                        recognizer_to_close = self._retired_nsfw_recognizers.pop(
-                            identity, None,
-                        )
-            if recognizer_to_close is not None:
-                self._close_nsfw_recognizers([recognizer_to_close])
+                        retired = self._retired_nsfw_recognizers.get(identity)
+                        if retired is not None and not self._close_nsfw_recognizers(
+                            [retired]
+                        ):
+                            self._retired_nsfw_recognizers.pop(identity, None)
 
     def _rules_for_scope(self, scope_id: str) -> OrganizeRules:
         """沿光鸭父目录向上寻找正式来源，并应用来源级成人识别边界。"""
@@ -704,6 +835,7 @@ class DirectoryScrapeService:
             return Organizer._nsfw_unresolved_match()
         return self.scraper.match(filename, parent_path)
 
+    @_directory_scrape_operation
     def inspect(self, owner: str, directory_id: str) -> dict:
         rules = self._rules_for_scope(directory_id)
         inspection = DirectoryMediaInspector(
@@ -719,6 +851,7 @@ class DirectoryScrapeService:
         )
         return self._inspection_payload(inspection_id, inspection, rules)
 
+    @_directory_scrape_operation
     def inspect_file(self, owner: str, file_id: str) -> dict:
         rules = self._rules_for_scope(file_id)
         inspection = DirectoryMediaInspector(
@@ -819,6 +952,7 @@ class DirectoryScrapeService:
             },
         }
 
+    @_directory_scrape_operation
     def search(
         self,
         owner: str,
@@ -878,6 +1012,7 @@ class DirectoryScrapeService:
         )
         return candidates
 
+    @_directory_scrape_operation
     def external_hints(
         self,
         owner: str,
@@ -963,6 +1098,7 @@ class DirectoryScrapeService:
             "advisory": "外部线索主要用于自动整理失败后的第二轮 TMDB 查询；不会直接写入 TMDB ID 或锁定",
         }
 
+    @_directory_scrape_operation
     def preview(
         self,
         owner: str,
@@ -1126,6 +1262,7 @@ class DirectoryScrapeService:
         stored.payload["preview_id"] = preview_id
         return payload
 
+    @_directory_scrape_operation
     def auto_match(self, owner: str, inspection_id: str) -> dict:
         record = self.store.get_inspection(owner, inspection_id)
         if record.inspection.requires_manual_match:
@@ -1180,9 +1317,11 @@ class DirectoryScrapeService:
         )
         return {"status": "matched", **preview}
 
+    @_directory_scrape_operation
     def preview_reference(self, owner: str, preview_id: str) -> str:
         return self.store.get_preview(owner, preview_id).inspection.directory_name
 
+    @_directory_scrape_operation
     def execute_preview(
         self, owner: str, preview_id: str, *,
         cancel_check: Callable[[], None] | None = None,
@@ -1987,18 +2126,37 @@ _service_lock = threading.Lock()
 
 
 def get_directory_scrape_service() -> DirectoryScrapeService:
+    """返回可用实例，并在必要时完成旧实例的延迟关闭。"""
     global _service
-    with _service_lock:
-        if _service is None:
-            _service = DirectoryScrapeService(store=_store)
-        return _service
+    while True:
+        with _service_lock:
+            service = _service
+            if service is None:
+                service = _service = DirectoryScrapeService(store=_store)
+                return service
+
+        closed, closing, active = service._lifecycle_state()
+        if not closed and not closing:
+            return service
+        if closing and active:
+            raise DirectoryScrapeRequestError("目录刮削运行时正在切换，请稍后重试")
+        if not closed and not service.close():
+            raise DirectoryScrapeRequestError("目录刮削运行时尚未完成关闭，请稍后重试")
+        with _service_lock:
+            if _service is service:
+                _service = None
 
 
-def close_directory_scrape_service() -> None:
+def close_directory_scrape_service() -> bool:
     """关闭并释放全局目录刮削服务；下次访问会按最新配置重建。"""
     global _service
     with _service_lock:
         service = _service
-        _service = None
-    if service is not None:
-        service.close()
+    if service is None:
+        return True
+    closed = service.close()
+    if closed:
+        with _service_lock:
+            if _service is service:
+                _service = None
+    return closed

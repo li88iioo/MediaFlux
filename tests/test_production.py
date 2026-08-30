@@ -3875,6 +3875,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn("http://jellyfin.local:8096/System/Info/Public", called_urls)
         self.assertIn("http://emby.local:8096/System/Info/Public", called_urls)
         self.assertIn("http://qb.local:8080/api/v2/app/version", called_urls)
+        self.assertEqual(response.close.call_count, payload["summary"]["total"])
 
         rejected = self.client.post(
             "/api/tools/proxy/test",
