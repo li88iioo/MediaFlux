@@ -38,6 +38,7 @@ _MAX_LOCAL_IMPORT_PROBE_ATTEMPTS = 8
 _NOTIFICATION_LEASE_SECONDS = 300
 _TORRENT_DATA_CLEANUP_INTERVAL_SECONDS = 3600
 _TORRENT_DATA_CLEANUP_BATCH_SIZE = 500
+_STALE_SUBMISSION_MINUTES = 15
 
 
 class DownloadTracker:
@@ -114,6 +115,22 @@ class DownloadTracker:
 
     def _run_once_locked(self) -> int:
         self._run_torrent_data_cleanup_if_due()
+        try:
+            recovered = db.recover_stale_submitting_download_requests(
+                stale_minutes=_STALE_SUBMISSION_MINUTES,
+            )
+        except Exception as exc:
+            log_throttled(
+                logger,
+                logging.WARNING,
+                f"download-tracker-stale-submitting:{type(exc).__name__}",
+                "恢复超时下载提交状态失败 type=%s",
+                type(exc).__name__,
+                interval_seconds=300.0,
+            )
+        else:
+            if recovered:
+                logger.warning("已将 %s 条超时下载提交转为人工核验", recovered)
         local_media_enabled = bool(db.list_local_media_sources(owner="admin", enabled_only=True))
         try:
             cursor = max(0, int(db.kv_get(_TRACKER_CURSOR_KEY, "0") or 0))

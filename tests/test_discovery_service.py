@@ -540,6 +540,33 @@ class DiscoveryServiceTests(unittest.TestCase):
         page = self.service.list_items(" TMDB ", " POPULAR ", " MOVIE ", 1, {})
         self.assertEqual(page.provider.name, "tmdb")
 
+    def test_global_service_handle_is_retained_until_registry_close_retry_succeeds(self):
+        from app.discovery import service as discovery_service
+
+        class Registry:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("registry close failed")
+
+        shutdown_discovery_service()
+        registry = Registry()
+        service = DiscoveryService(registry=registry, cache=self.cache)
+        discovery_service._service = service
+        try:
+            self.assertFalse(shutdown_discovery_service())
+            self.assertIs(discovery_service._service, service)
+            self.assertTrue(shutdown_discovery_service())
+            self.assertIsNone(discovery_service._service)
+            self.assertEqual(registry.close_calls, 2)
+        finally:
+            if discovery_service._service is service:
+                registry.close_calls = max(registry.close_calls, 1)
+                shutdown_discovery_service()
+
     def test_singleton_executor_can_shutdown_and_rebuild(self):
         shutdown_discovery_service()
         first = get_discovery_service()

@@ -311,68 +311,112 @@ class SettingsDraftLifecycleTests(unittest.TestCase):
 
 
 class AppModalFocusLifecycleTests(unittest.TestCase):
-    def test_modal_cancels_late_focus_traps_tab_and_restores_trigger(self):
+    def test_nested_modals_only_close_top_and_restore_focus_layer_by_layer(self):
         source = (ROOT / "app/static/js/app.js").read_text(encoding="utf-8")
         modal_block = _extract(
             source,
-            "    window.createAppModal = function (modal) {",
+            "    const modalStack = [];",
             "\n\n    const confirmModal",
         )
         script = textwrap.dedent(
             f"""
             const assert = require('node:assert/strict');
             const frames = [];
-            let keydownHandler = null;
-            const makeFocusable = (name) => ({{
-              name, hidden: false, isConnected: true,
-              getAttribute: () => null,
-              focus: () => {{document.activeElement = elements[name];}},
-            }});
-            const elements = {{first: null, last: null, trigger: null}};
-            elements.first = makeFocusable('first');
-            elements.last = makeFocusable('last');
-            elements.trigger = makeFocusable('trigger');
-            const dialog = {{
-              querySelectorAll: () => [elements.first, elements.last],
-              querySelector: () => elements.first,
-              contains: (element) => element === elements.first || element === elements.last,
-              hasAttribute: () => true,
-              setAttribute: () => {{}},
-              focus: () => {{document.activeElement = dialog;}},
+            const keydownHandlers = [];
+            const classes = new Set();
+            const classList = {{
+              toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name),
+              contains: (name) => classes.has(name),
             }};
-            const body = {{classList: {{add: () => {{}}, remove: () => {{}}}}, appendChild: () => {{}}}};
+            const body = {{classList, appendChild: () => {{}}}};
             const document = {{
               body,
-              activeElement: elements.trigger,
-              addEventListener: (name, handler) => {{if (name === 'keydown') keydownHandler = handler;}},
+              activeElement: null,
+              addEventListener: (name, handler) => {{
+                if (name === 'keydown') keydownHandlers.push(handler);
+              }},
             }};
-            const modal = {{
-              hidden: true,
-              parentElement: body,
-              querySelector: () => dialog,
-              querySelectorAll: () => [],
-              addEventListener: () => {{}},
-            }};
+            const makeFocusable = (name) => ({{
+              name,
+              hidden: false,
+              isConnected: true,
+              getAttribute: () => null,
+              closest: () => null,
+              focus: () => {{document.activeElement = elements[name];}},
+            }});
+            const elements = {{outer: null, parentFirst: null, parentLast: null, childFirst: null, childLast: null}};
+            Object.keys(elements).forEach((name) => {{elements[name] = makeFocusable(name);}});
+            function makeModal(first, last) {{
+              const dialog = {{
+                querySelectorAll: () => [first, last],
+                querySelector: () => first,
+                contains: (element) => element === first || element === last,
+                hasAttribute: () => true,
+                setAttribute: () => {{}},
+                focus: () => {{document.activeElement = dialog;}},
+              }};
+              const modal = {{
+                hidden: true,
+                parentElement: body,
+                querySelector: () => dialog,
+                querySelectorAll: () => [],
+                addEventListener: () => {{}},
+              }};
+              return {{modal, dialog}};
+            }}
             const requestAnimationFrame = (callback) => {{frames.push(callback); return frames.length;}};
             const window = {{}};
             {modal_block}
-            const lifecycle = window.createAppModal(modal);
-            lifecycle.open(elements.trigger, {{initialFocus: elements.first}});
-            lifecycle.close();
-            frames.shift()();
-            assert.equal(document.activeElement, elements.trigger);
+            const parent = makeModal(elements.parentFirst, elements.parentLast);
+            const child = makeModal(elements.childFirst, elements.childLast);
+            // 生命周期创建顺序与实际页面一致：全局确认框通常早于页面弹窗创建，
+            // 但页面弹窗会先打开，确认框随后叠在其上方。
+            const childLifecycle = window.createAppModal(child.modal);
+            const parentLifecycle = window.createAppModal(parent.modal);
+            const dispatchKey = (key, shiftKey = false) => {{
+              let prevented = 0;
+              let immediateStopped = false;
+              const event = {{
+                key,
+                shiftKey,
+                preventDefault: () => {{prevented += 1;}},
+                stopImmediatePropagation: () => {{immediateStopped = true;}},
+                stopPropagation: () => {{}},
+              }};
+              for (const handler of keydownHandlers) {{
+                handler(event);
+                if (immediateStopped) break;
+              }}
+              return prevented;
+            }};
 
-            lifecycle.open(elements.trigger, {{initialFocus: elements.first}});
+            document.activeElement = elements.outer;
+            parentLifecycle.open(elements.outer, {{initialFocus: elements.parentFirst}});
             frames.shift()();
-            assert.equal(document.activeElement, elements.first);
-            document.activeElement = elements.last;
-            let prevented = false;
-            keydownHandler({{key: 'Tab', shiftKey: false, preventDefault: () => {{prevented = true;}}, stopPropagation: () => {{}}}});
-            assert.equal(prevented, true);
-            assert.equal(document.activeElement, elements.first);
-            keydownHandler({{key: 'Escape', shiftKey: false, preventDefault: () => {{}}, stopPropagation: () => {{}}}});
-            assert.equal(modal.hidden, true);
-            assert.equal(document.activeElement, elements.trigger);
+            childLifecycle.open(elements.parentFirst, {{initialFocus: elements.childFirst}});
+            frames.shift()();
+            assert.equal(document.activeElement, elements.childFirst);
+            assert.equal(body.classList.contains('modal-open'), true);
+
+            document.activeElement = elements.childLast;
+            assert.equal(dispatchKey('Tab'), 1);
+            assert.equal(document.activeElement, elements.childFirst);
+
+            assert.equal(dispatchKey('Escape'), 1);
+            assert.equal(child.modal.hidden, true);
+            assert.equal(parent.modal.hidden, false);
+            assert.equal(document.activeElement, elements.parentFirst);
+            assert.equal(body.classList.contains('modal-open'), true);
+
+            assert.equal(dispatchKey('Escape'), 1);
+            assert.equal(parent.modal.hidden, true);
+            assert.equal(document.activeElement, elements.outer);
+            assert.equal(body.classList.contains('modal-open'), false);
+
+            parentLifecycle.open(elements.outer, {{initialFocus: elements.parentFirst}});
+            parentLifecycle.close();
+            frames.shift()();
+            assert.equal(document.activeElement, elements.outer);
             """
         )
         _run_node(script)

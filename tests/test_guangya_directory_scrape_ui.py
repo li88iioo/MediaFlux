@@ -22,6 +22,11 @@ except ImportError:  # pragma: no cover - 由显式 system python3 门禁执行
 
 
 ROOT = Path(__file__).resolve().parents[1]
+APP_SOURCE = (ROOT / "app/static/js/app.js").read_text("utf-8")
+APP_MODAL_SCRIPT = APP_SOURCE[
+    APP_SOURCE.index("    const modalStack = [];"):
+    APP_SOURCE.index("\n\n    const confirmModal")
+]
 DIRECTORY_SCRIPT = ROOT / "app/static/js/guangya-directory-scrape.js"
 POSITION_SCRIPT = ROOT / "app/static/js/media-scrape-position.js"
 DIRECTORY_CSS = ROOT / "app/static/css/guangya-directory-scrape.css"
@@ -456,6 +461,26 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
         )
 
 
+    def test_modal_and_task_polling_share_page_lifecycle(self):
+        script = DIRECTORY_SCRIPT.read_text("utf-8")
+
+        for contract in (
+            "const modalLifecycle = window.createAppModal(modal",
+            "onRequestClose: closeModal",
+            "modalLifecycle.open(state.activeAction, {initialFocus: elements.query})",
+            "const taskPollEntries = new Map()",
+            "taskPollInFlight",
+            "fetch('/api/guangya/organize/status', {signal: controller.signal})",
+            "document.addEventListener('visibilitychange'",
+            "window.addEventListener('pagehide'",
+            "window.addEventListener('pageshow'",
+            "if (!event.persisted) taskPollEntries.clear()",
+        ):
+            self.assertIn(contract, script)
+        self.assertNotIn("for (let attempt = 0; attempt < 1800; attempt += 1)", script)
+        self.assertNotIn("else if (!modal.hidden) closeModal()", script)
+
+
 @unittest.skipIf(sync_playwright is None, "system Python 未安装 Playwright")
 class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
     @classmethod
@@ -534,6 +559,7 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
             }
             """
         )
+        self.page.add_script_tag(content=APP_MODAL_SCRIPT)
         self.page.add_script_tag(content=POSITION_SCRIPT.read_text("utf-8"))
         self.page.add_script_tag(content=DIRECTORY_SCRIPT.read_text("utf-8"))
 

@@ -496,15 +496,21 @@ def create_app(*, start_background: bool = False) -> FastAPI:
     startup_guard = runtime_lifecycle_guard(config.PATHS) if start_background else None
     startup_guard_state_lock = threading.Lock()
     startup_guard_released = startup_guard is None
+    startup_guard_atexit_registered = False
 
     def release_startup_guard() -> None:
-        nonlocal startup_guard_released
+        nonlocal startup_guard_released, startup_guard_atexit_registered
         with startup_guard_state_lock:
             if startup_guard_released:
                 return
             startup_guard_released = True
         assert startup_guard is not None
-        startup_guard.__exit__(None, None, None)
+        try:
+            startup_guard.__exit__(None, None, None)
+        finally:
+            if startup_guard_atexit_registered:
+                atexit.unregister(release_startup_guard)
+                startup_guard_atexit_registered = False
 
     if startup_guard is not None:
         startup_guard.__enter__()
@@ -591,11 +597,20 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                 if "_call_connection_lost" in handle_str or "_call_connection_lost" in msg:
                     if isinstance(exception, (ConnectionResetError, OSError)):
                         return
-                loop.default_exception_handler(context)
+                if previous_exception_handler is not None:
+                    previous_exception_handler(loop, context)
+                else:
+                    loop.default_exception_handler(context)
 
-            indexer_event_loop.set_exception_handler(_silence_proactor_connection_lost)
-            bind_indexer_event_loop(indexer_event_loop)
+            indexer_bound = False
+            exception_handler_installed = False
             try:
+                indexer_event_loop.set_exception_handler(
+                    _silence_proactor_connection_lost
+                )
+                exception_handler_installed = True
+                bind_indexer_event_loop(indexer_event_loop)
+                indexer_bound = True
                 # 后台媒体订阅线程可能立即使用全局 Indexer；必须先绑定其唯一
                 # 异步运行循环，避免启动窗口内创建跨循环的 HTTP 客户端。
                 if start_background:
@@ -610,9 +625,12 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                 # 再释放其运行时，避免关机窗口内出现资源已关闭但巡检仍在访问。
                 from app.indexers.runtime import begin_indexer_shutdown
 
-                begin_indexer_shutdown(indexer_event_loop)
-                runtime_safe_to_close = True
-                if start_background:
+                if indexer_bound:
+                    begin_indexer_shutdown(indexer_event_loop)
+                # bind 失败表示当前 lifespan 从未取得全局 Indexer 运行时所有权；
+                # 此时不能在当前 loop 上关闭可能仍属于独立线程/另一应用的客户端。
+                runtime_safe_to_close = indexer_bound
+                if start_background and indexer_bound:
                     # 媒体订阅 worker 可能正等待提交到本生命周期循环的 Indexer
                     # 协程；若在主循环线程同步 join，会让双方互相等待直到停止超时。
                     try:
@@ -659,7 +677,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                                 "关闭 indexer 运行时失败 type=%s",
                                 type(exc).__name__,
                             )
-                    else:
+                    elif indexer_bound:
                         logger.warning(
                             "媒体订阅检查尚未收敛，本次关机跳过 discovery/indexer runtime 销毁"
                         )
@@ -670,7 +688,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                             "关闭探索海报连接池失败 type=%s", type(exc).__name__
                         )
                     proxy_runtime_stopped = False
-                    if start_background:
+                    if start_background and indexer_bound:
                         try:
                             await proxy_manager.stop()
                             proxy_runtime_stopped = True
@@ -679,7 +697,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                                 "关闭媒体反代运行时失败 type=%s",
                                 type(exc).__name__,
                             )
-                    if start_background and proxy_runtime_stopped:
+                    if start_background and indexer_bound and proxy_runtime_stopped:
                         try:
                             probe_runtime_stopped = await asyncio.to_thread(
                                 shutdown_signed_media_probe_runtime,
@@ -695,14 +713,15 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                                 type(exc).__name__,
                             )
                 finally:
-                    if runtime_safe_to_close:
+                    if runtime_safe_to_close and indexer_bound:
                         unbind_indexer_event_loop(indexer_event_loop)
-                    else:
+                    elif indexer_bound:
                         logger.warning(
                             "索引器运行时保持关闭门控，等待进程退出，避免存活 worker 跨事件循环复用客户端"
                         )
                     if (
-                        indexer_event_loop.get_exception_handler()
+                        exception_handler_installed
+                        and indexer_event_loop.get_exception_handler()
                         is _silence_proactor_connection_lost
                     ):
                         indexer_event_loop.set_exception_handler(
@@ -717,120 +736,126 @@ def create_app(*, start_background: bool = False) -> FastAPI:
         finally:
             release_startup_guard()
 
-    app = FastAPI(title="MediaFlux", docs_url=None, redoc_url=None, lifespan=lifespan)
-    app.state.background_services_enabled = start_background
-    app.state.ready = False
-    app.state.release_startup_lifecycle_guard = release_startup_guard
-    if startup_guard is not None:
-        # 应用对象在进入 lifespan 前即被启动器拒绝或测试丢弃时，也要在
-        # 解释器模块拆卸前释放文件锁；回调本身幂等。
-        atexit.register(release_startup_guard)
-    app.add_middleware(AgentBodyLimitMiddleware)
-    app.add_middleware(SecurityMiddleware)
-    app.add_middleware(
-        SessionMiddleware,
-        secret_key=secret_key,
-        session_cookie="session",
-        max_age=config.get_int("SESSION_LIFETIME_MINUTES", 720) * 60,
-        same_site="lax",
-        https_only=config.get_bool("SESSION_COOKIE_SECURE", False),
-    )
-    static_files = CachedStaticFiles(directory=str(APP_DIR / "static"))
-    app.mount("/static", StaticTextGZipMiddleware(static_files), name="static")
-
-    from app.routes.auth import router as auth_router
-    from app.routes.pages import router as pages_router
-    from app.routes.api import router as api_router
-    from app.routes.proxy import router as proxy_router
-    from app.routes.guangya_api import router as gy_router
-    from app.routes.guangya_scrape_api import router as guangya_scrape_router
-    from app.routes.rss_api import router as rss_router
-    from app.routes.subscriptions_api import router as subscriptions_router
-    from app.routes.strm_api import router as strm_router
-    from app.routes.downloads_api import router as download_router
-    from app.routes.tools_api import router as tools_router
-    from app.routes.logs_api import router as logs_router
-    from app.routes.offline_api import router as offline_router
-    from app.routes.share_api import router as share_router
-    from app.routes.media_image import router as media_image_router
-    from app.routes.media_proxy_api import router as media_proxy_api_router
-    from app.routes.discovery_api import router as discovery_api_router
-    from app.routes.discovery_image import router as discovery_image_router
-    from app.routes.indexers_api import router as indexers_api_router
-    from app.routes.local_media_api import router as local_media_api_router
-    from app.routes.media_libraries_api import router as media_libraries_api_router
-    from app.routes.agent_api import router as agent_api_router
-    from app.routes.recognition_knowledge_api import router as recognition_knowledge_api_router
-
-    for router in (
-        auth_router, pages_router, api_router, proxy_router, gy_router,
-        guangya_scrape_router,
-        rss_router, subscriptions_router, strm_router, download_router,
-        tools_router, logs_router, offline_router, share_router,
-        media_image_router, media_proxy_api_router,
-        discovery_api_router, discovery_image_router, indexers_api_router,
-        local_media_api_router, media_libraries_api_router, agent_api_router,
-        recognition_knowledge_api_router,
-    ):
-        app.include_router(router)
-
-    @app.get("/favicon.ico", include_in_schema=False)
-    async def favicon():
-        return FileResponse(APP_DIR / "static" / "favicon.svg", media_type="image/svg+xml")
-
-    @app.get("/healthz", name="healthz")
-    async def healthz():
-        return {"status": "ok"}
-
-    @app.get("/readyz", name="readyz")
-    async def readyz(request: Request):
-        from app.version import BuildInfo
-        from urllib.parse import urlsplit
-
-        ready = bool(getattr(request.app.state, "ready", False))
-        payload = {
-            "service": "MediaFlux",
-            "status": "ready" if ready else "starting",
-            "version": BuildInfo.current().version,
-        }
-        response = JSONResponse(payload, status_code=200 if ready else 503)
-        response.headers["Cache-Control"] = "no-store"
-        origin = str(request.headers.get("origin") or "").strip()
-        if origin:
-            parsed = urlsplit(origin)
-            if (
-                parsed.scheme in {"http", "https"}
-                and parsed.hostname
-                and parsed.hostname == request.url.hostname
-                and parsed.username is None
-                and parsed.password is None
-                and parsed.path in {"", "/"}
-                and not parsed.query
-                and not parsed.fragment
-            ):
-                response.headers["Access-Control-Allow-Origin"] = origin
-                response.headers["Vary"] = "Origin"
-        return response
-
-    @app.exception_handler(HTTPException)
-    async def handle_http_error(request: Request, exc: HTTPException):
-        if request.url.path.startswith("/api/"):
-            return JSONResponse({"error": exc.detail or "request failed"}, status_code=exc.status_code)
-        return PlainTextResponse(str(exc.detail), status_code=exc.status_code)
-
-    @app.exception_handler(Exception)
-    async def handle_unexpected_error(request: Request, exc: Exception):
-        # ServerErrorMiddleware 在调用此 handler 后仍会重新抛出异常，Uvicorn 会
-        # 记录一份完整 traceback。应用侧只保留请求摘要，避免同一堆栈打印两遍。
-        logger.error(
-            "未处理请求异常 method=%s path=%s type=%s",
-            request.method,
-            request.url.path,
-            type(exc).__name__,
+    try:
+        app = FastAPI(title="MediaFlux", docs_url=None, redoc_url=None, lifespan=lifespan)
+        app.state.background_services_enabled = start_background
+        app.state.ready = False
+        app.state.release_startup_lifecycle_guard = release_startup_guard
+        app.add_middleware(AgentBodyLimitMiddleware)
+        app.add_middleware(SecurityMiddleware)
+        app.add_middleware(
+            SessionMiddleware,
+            secret_key=secret_key,
+            session_cookie="session",
+            max_age=config.get_int("SESSION_LIFETIME_MINUTES", 720) * 60,
+            same_site="lax",
+            https_only=config.get_bool("SESSION_COOKIE_SECURE", False),
         )
-        if request.url.path.startswith("/api/"):
-            return JSONResponse({"error": "internal server error"}, status_code=500)
-        return PlainTextResponse("Internal Server Error", status_code=500)
+        static_files = CachedStaticFiles(directory=str(APP_DIR / "static"))
+        app.mount("/static", StaticTextGZipMiddleware(static_files), name="static")
+
+        from app.routes.auth import router as auth_router
+        from app.routes.pages import router as pages_router
+        from app.routes.api import router as api_router
+        from app.routes.proxy import router as proxy_router
+        from app.routes.guangya_api import router as gy_router
+        from app.routes.guangya_scrape_api import router as guangya_scrape_router
+        from app.routes.rss_api import router as rss_router
+        from app.routes.subscriptions_api import router as subscriptions_router
+        from app.routes.strm_api import router as strm_router
+        from app.routes.downloads_api import router as download_router
+        from app.routes.tools_api import router as tools_router
+        from app.routes.logs_api import router as logs_router
+        from app.routes.offline_api import router as offline_router
+        from app.routes.share_api import router as share_router
+        from app.routes.media_image import router as media_image_router
+        from app.routes.media_proxy_api import router as media_proxy_api_router
+        from app.routes.discovery_api import router as discovery_api_router
+        from app.routes.discovery_image import router as discovery_image_router
+        from app.routes.indexers_api import router as indexers_api_router
+        from app.routes.local_media_api import router as local_media_api_router
+        from app.routes.media_libraries_api import router as media_libraries_api_router
+        from app.routes.agent_api import router as agent_api_router
+        from app.routes.recognition_knowledge_api import router as recognition_knowledge_api_router
+
+        for router in (
+            auth_router, pages_router, api_router, proxy_router, gy_router,
+            guangya_scrape_router,
+            rss_router, subscriptions_router, strm_router, download_router,
+            tools_router, logs_router, offline_router, share_router,
+            media_image_router, media_proxy_api_router,
+            discovery_api_router, discovery_image_router, indexers_api_router,
+            local_media_api_router, media_libraries_api_router, agent_api_router,
+            recognition_knowledge_api_router,
+        ):
+            app.include_router(router)
+
+        @app.get("/favicon.ico", include_in_schema=False)
+        async def favicon():
+            return FileResponse(APP_DIR / "static" / "favicon.svg", media_type="image/svg+xml")
+
+        @app.get("/healthz", name="healthz")
+        async def healthz():
+            return {"status": "ok"}
+
+        @app.get("/readyz", name="readyz")
+        async def readyz(request: Request):
+            from app.version import BuildInfo
+            from urllib.parse import urlsplit
+
+            ready = bool(getattr(request.app.state, "ready", False))
+            payload = {
+                "service": "MediaFlux",
+                "status": "ready" if ready else "starting",
+                "version": BuildInfo.current().version,
+            }
+            response = JSONResponse(payload, status_code=200 if ready else 503)
+            response.headers["Cache-Control"] = "no-store"
+            origin = str(request.headers.get("origin") or "").strip()
+            if origin:
+                parsed = urlsplit(origin)
+                if (
+                    parsed.scheme in {"http", "https"}
+                    and parsed.hostname
+                    and parsed.hostname == request.url.hostname
+                    and parsed.username is None
+                    and parsed.password is None
+                    and parsed.path in {"", "/"}
+                    and not parsed.query
+                    and not parsed.fragment
+                ):
+                    response.headers["Access-Control-Allow-Origin"] = origin
+                    response.headers["Vary"] = "Origin"
+            return response
+
+        @app.exception_handler(HTTPException)
+        async def handle_http_error(request: Request, exc: HTTPException):
+            if request.url.path.startswith("/api/"):
+                return JSONResponse({"error": exc.detail or "request failed"}, status_code=exc.status_code)
+            return PlainTextResponse(str(exc.detail), status_code=exc.status_code)
+
+        @app.exception_handler(Exception)
+        async def handle_unexpected_error(request: Request, exc: Exception):
+            # ServerErrorMiddleware 在调用此 handler 后仍会重新抛出异常，Uvicorn 会
+            # 记录一份完整 traceback。应用侧只保留请求摘要，避免同一堆栈打印两遍。
+            logger.error(
+                "未处理请求异常 method=%s path=%s type=%s",
+                request.method,
+                request.url.path,
+                type(exc).__name__,
+            )
+            if request.url.path.startswith("/api/"):
+                return JSONResponse({"error": "internal server error"}, status_code=500)
+            return PlainTextResponse("Internal Server Error", status_code=500)
+
+    except BaseException:
+        release_startup_guard()
+        raise
+    if startup_guard is not None:
+        # 仅在应用完整构造成功后注册进程退出兜底；正常 lifespan/启动器
+        # 释放时会同步注销，避免重复应用工厂积累 closure。
+        atexit.register(release_startup_guard)
+        startup_guard_atexit_registered = True
 
     return app
 

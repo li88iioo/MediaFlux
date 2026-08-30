@@ -876,19 +876,17 @@
 
     const sourceModal = window.createAppModal ? window.createAppModal($('lmSourceModal')) : null;
     const taskDetailModal = window.createAppModal ? window.createAppModal($('lmTaskDetailModal')) : null;
-    let scrapeReturnFocus = null;
+    const scrapeLifecycle = window.createAppModal($('lmScrapeModal'), {
+        onRequestClose: closeScrape,
+    });
     const scrapeModal = {
         open(trigger = null) {
-            scrapeReturnFocus = trigger || document.activeElement;
-            $('lmScrapeModal').hidden = false;
             document.body.classList.add('lm-scrape-open');
-            window.requestAnimationFrame(() => $('lmScrapeCloseBtn')?.focus());
+            scrapeLifecycle.open(trigger, {initialFocus: $('lmScrapeCloseBtn')});
         },
         close() {
-            $('lmScrapeModal').hidden = true;
             document.body.classList.remove('lm-scrape-open');
-            scrapeReturnFocus?.focus?.();
-            scrapeReturnFocus = null;
+            scrapeLifecycle.close();
         },
     };
 
@@ -1152,10 +1150,6 @@
     }
 
     $('lmScrapeModal').addEventListener('click', (event) => {
-        if (event.target === $('lmScrapeModal')) {
-            closeScrape();
-            return;
-        }
         const paneButton = event.target.closest('[data-scrape-mobile-pane]');
         if (paneButton) setScrapeMobilePane(paneButton.dataset.scrapeMobilePane);
     });
@@ -1952,9 +1946,9 @@
     window.visualViewport?.addEventListener('resize', closeItemContextMenuAfterViewportChange);
     document.addEventListener('scroll', closeItemContextMenuAfterViewportChange, true);
     document.addEventListener('keydown', (event) => {
-        if (event.key !== 'Escape') return;
-        if (!$('lmItemContextMenu').hidden) closeItemContextMenu({restoreFocus: true});
-        else if (!$('lmScrapeModal').hidden) closeScrape();
+        if (event.key === 'Escape' && !$('lmItemContextMenu').hidden) {
+            closeItemContextMenu({restoreFocus: true});
+        }
     });
 
     document.addEventListener('visibilitychange', async () => {

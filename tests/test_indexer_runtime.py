@@ -126,6 +126,38 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stopped)
         self.assertIsNone(runtime._runtime_loop)
 
+    async def test_standalone_shutdown_failure_keeps_runtime_handles_for_retry(self):
+        async def capture_loop():
+            return asyncio.get_running_loop()
+
+        owner_loop = await asyncio.to_thread(
+            runtime.run_indexer_awaitable_sync,
+            capture_loop(),
+            timeout_seconds=1.0,
+        )
+        thread = runtime._standalone_thread
+        service = Mock()
+        service.aclose = AsyncMock(
+            side_effect=[RuntimeError("close failed once"), None]
+        )
+        runtime._service = service
+
+        first = await asyncio.to_thread(runtime._stop_standalone_runtime, 0.2)
+        self.assertFalse(first)
+        self.assertIs(runtime._runtime_loop, owner_loop)
+        self.assertIs(runtime._standalone_loop, owner_loop)
+        self.assertIs(runtime._standalone_thread, thread)
+        self.assertTrue(runtime._runtime_stopping)
+        self.assertTrue(thread.is_alive())
+
+        second = await asyncio.to_thread(runtime._stop_standalone_runtime, 1.0)
+        self.assertTrue(second)
+        self.assertEqual(service.aclose.await_count, 2)
+        self.assertIsNone(runtime._runtime_loop)
+        self.assertIsNone(runtime._standalone_loop)
+        self.assertIsNone(runtime._standalone_thread)
+        self.assertFalse(runtime._runtime_stopping)
+
     async def test_async_bridge_without_binding_uses_standalone_loop(self):
         caller_loop = asyncio.get_running_loop()
 
@@ -307,6 +339,72 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         observed = await runtime.run_indexer_awaitable(capture_loop())
 
         self.assertIs(observed, owner_loop)
+
+    async def test_lifespan_restores_exception_handler_when_indexer_bind_fails(self):
+        from app.main import create_app
+
+        owner_loop = asyncio.get_running_loop()
+        previous = owner_loop.get_exception_handler()
+        delegated: list[dict] = []
+
+        def original_handler(_loop, context):
+            delegated.append(context)
+
+        def bind_with_failure(loop):
+            handler = loop.get_exception_handler()
+            self.assertIsNotNone(handler)
+            handler(loop, {"message": "unsilenced runtime failure"})
+            raise RuntimeError("bind failed")
+
+        owner_loop.set_exception_handler(original_handler)
+        proxy = Mock()
+        proxy.start = AsyncMock()
+        proxy.stop = AsyncMock()
+        try:
+            with patch(
+                "app.main.database.init_db"
+            ), patch(
+                "app.modules.recognition_knowledge.ensure_seed_knowledge"
+            ), patch(
+                "app.modules.media_proxy.get_media_proxy_manager", return_value=proxy
+            ), patch(
+                "app.indexers.runtime.bind_indexer_event_loop",
+                side_effect=bind_with_failure,
+            ) as bind, patch(
+                "app.indexers.runtime.begin_indexer_shutdown"
+            ) as begin, patch(
+                "app.indexers.runtime.unbind_indexer_event_loop"
+            ) as unbind, patch(
+                "app.discovery.service.shutdown_discovery_service"
+            ) as shutdown_discovery, patch(
+                "app.discovery.search.shutdown_discovery_search_service"
+            ) as shutdown_search, patch(
+                "app.modules.directory_scrape.close_directory_scrape_service"
+            ) as close_directory_scrape, patch(
+                "app.modules.local_media_service.close_local_media_service"
+            ) as close_local_media, patch(
+                "app.routes.discovery_image.close_poster_session"
+            ) as close_poster, patch(
+                "app.indexers.runtime.shutdown_indexer_service", new=AsyncMock()
+            ) as shutdown_indexer:
+                app = create_app(start_background=False)
+                with self.assertRaisesRegex(RuntimeError, "bind failed"):
+                    async with app.router.lifespan_context(app):
+                        self.fail("lifespan must not start after bind failure")
+
+            bind.assert_called_once_with(owner_loop)
+            begin.assert_not_called()
+            unbind.assert_not_called()
+            shutdown_discovery.assert_not_called()
+            shutdown_search.assert_not_called()
+            close_directory_scrape.assert_not_called()
+            close_local_media.assert_not_called()
+            close_poster.assert_called_once_with()
+            shutdown_indexer.assert_not_awaited()
+            self.assertEqual(delegated, [{"message": "unsilenced runtime failure"}])
+            self.assertIs(owner_loop.get_exception_handler(), original_handler)
+        finally:
+            owner_loop.set_exception_handler(previous)
 
     async def test_application_lifespan_offloads_background_shutdown(self):
         from app.main import create_app

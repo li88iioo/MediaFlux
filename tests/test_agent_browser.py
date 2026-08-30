@@ -105,6 +105,8 @@ class AgentBrowserTests(unittest.TestCase):
             window.__agentSessionsDelayMs = Number(config.sessionsDelayMs || 0);
             window.__agentSessionsResponse = config.sessionsResponse || {sessions: []};
             window.__agentSessionDetails = config.sessionDetails || {};
+            window.__agentSessionDeleteStatus = 200;
+            window.__agentSessionDeleteError = '会话删除失败';
             window.__agentResetGate = null;
             window.__resolveAgentReset = null;
             window.__agentConfirmGate = null;
@@ -125,6 +127,12 @@ class AgentBrowserTests(unittest.TestCase):
                     payload = capturedPayload;
                 } else if (requestUrl.startsWith('/api/agent/sessions/')) {
                     const sessionId = decodeURIComponent(requestUrl.split('/').pop());
+                    if (method === 'DELETE' && window.__agentSessionDeleteStatus !== 200) {
+                        return new Response(JSON.stringify({error: window.__agentSessionDeleteError}), {
+                            status: window.__agentSessionDeleteStatus,
+                            headers: {'Content-Type': 'application/json'},
+                        });
+                    }
                     payload = method === 'DELETE'
                         ? {deleted: true, reset: {reset: true}}
                         : {session: window.__agentSessionDetails[sessionId] || null};
@@ -1122,13 +1130,20 @@ class AgentBrowserTests(unittest.TestCase):
     def test_session_delete_requires_two_deliberate_clicks(self):
         session_id = "agent_session_history_0001"
         self.page.evaluate("""sessionId => {
+            window.__collapseCalls = 0;
+            window.MFAnim = {
+                slideOutAndCollapse: () => { window.__collapseCalls += 1; },
+            };
             const item = document.createElement('article');
             item.className = 'agent-session-item';
             item.dataset.sessionId = sessionId;
             const open = document.createElement('button');
             open.type = 'button';
+            open.className = 'agent-session-open';
             open.dataset.agentSessionOpen = sessionId;
-            open.textContent = '历史会话';
+            const title = document.createElement('strong');
+            title.textContent = '历史会话';
+            open.append(title);
             const remove = document.createElement('button');
             remove.type = 'button';
             remove.dataset.agentSessionDelete = sessionId;
@@ -1143,12 +1158,55 @@ class AgentBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.evaluate(
             "window.__agentCalls.filter(call => call.method === 'DELETE').length"
         ), 0)
+        self.assertEqual(self.page.evaluate("window.__collapseCalls"), 0)
         self.page.wait_for_function("document.getElementById('agentSessionStatus').textContent.includes('再次点击')")
         self.assertIn("再次点击", self.page.locator("#agentSessionStatus").inner_text())
         remove.click()
         self.page.wait_for_function(
             "window.__agentCalls.filter(call => call.method === 'DELETE').length === 1"
         )
+        self.page.wait_for_function("window.__collapseCalls === 1")
+
+    def test_session_delete_failure_keeps_row_and_restores_button(self):
+        session_id = "agent_session_history_0002"
+        self.page.evaluate("""sessionId => {
+            window.__agentSessionDeleteStatus = 500;
+            window.__collapseCalls = 0;
+            window.MFAnim = {
+                slideOutAndCollapse: () => { window.__collapseCalls += 1; },
+            };
+            const item = document.createElement('article');
+            item.className = 'agent-session-item';
+            item.dataset.sessionId = sessionId;
+            const open = document.createElement('button');
+            open.type = 'button';
+            open.className = 'agent-session-open';
+            open.dataset.agentSessionOpen = sessionId;
+            const title = document.createElement('strong');
+            title.textContent = '保留的会话';
+            open.append(title);
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.dataset.agentSessionDelete = sessionId;
+            remove.setAttribute('aria-label', '删除会话');
+            remove.textContent = '删除';
+            item.append(open, remove);
+            document.getElementById('agentSessionList').replaceChildren(item);
+        }""", session_id)
+        remove = self.page.locator(f'[data-agent-session-delete="{session_id}"]')
+        remove.click()
+        remove.click()
+        self.page.wait_for_function(
+            "document.getElementById('agentSessionStatus').textContent.includes('失败')"
+        )
+        self.page.wait_for_function(
+            "!document.querySelector('[data-agent-session-delete]').disabled"
+        )
+        self.assertEqual(self.page.locator(f'.agent-session-item[data-session-id="{session_id}"]').count(), 1)
+        self.assertEqual(self.page.evaluate("window.__collapseCalls"), 0)
+        self.assertFalse(remove.evaluate("button => button.classList.contains('is-armed')"))
+        self.assertEqual(remove.get_attribute("aria-busy"), "false")
+        self.assertEqual(remove.get_attribute("aria-label"), "删除会话：保留的会话")
 
     def test_saved_session_restores_only_safe_noninteractive_summary(self):
         session_id = "agent_session_history_0001"

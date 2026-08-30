@@ -12,6 +12,7 @@ from functools import partial
 from typing import Any
 
 from app import config, database
+from app.logger import get_logger
 from app.discovery.cache import CacheLookup, DiscoveryCache
 from app.discovery.models import (
     DiscoveryPage,
@@ -35,6 +36,7 @@ from app.discovery.registry import (
 
 _DISCOVERY_CLOSED_MESSAGE = "探索服务已关闭，请重试"
 _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+logger = get_logger(__name__)
 
 _ERROR_TYPES = {
     "authentication": ProviderAuthenticationError,
@@ -74,6 +76,8 @@ class DiscoveryService:
         self._refresh_clock = refresh_clock or time.monotonic
         self._refresh_cooldown_seconds = 30.0
         self._closed = False
+        self._registry_close_lock = threading.Lock()
+        self._registry_closed = False
         # 映射与默认后台刷新始终共用专用有界 executor；即使测试或嵌入方
         # 注入了 refresh_submit，异步映射也不能退回 asyncio 默认线程池。
         self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
@@ -96,6 +100,30 @@ class DiscoveryService:
             and self._active_submissions == 0
         )
 
+    @property
+    def closed(self) -> bool:
+        with self._refresh_guard:
+            return self._closed
+
+    def _close_registry(self) -> bool:
+        with self._registry_close_lock:
+            if self._registry_closed:
+                return True
+            try:
+                self.registry.close()
+            except Exception as exc:
+                logger.warning(
+                    "关闭 Discovery provider registry 失败 type=%s",
+                    type(exc).__name__,
+                )
+                return False
+            self._registry_closed = True
+            return True
+
+    def _finish_deferred_shutdown(self) -> None:
+        if self._close_registry():
+            _release_discovery_service(self)
+
     @contextmanager
     def _network_operation(self) -> Iterator[None]:
         with self._refresh_guard:
@@ -111,7 +139,7 @@ class DiscoveryService:
                 self._refresh_guard.notify_all()
                 close_registry = self._closed and self._lifecycle_drained_locked()
             if close_registry:
-                self.registry.close()
+                self._finish_deferred_shutdown()
 
     def _future_finished(self, future: Future[Any]) -> None:
         close_registry = False
@@ -120,7 +148,7 @@ class DiscoveryService:
             self._refresh_guard.notify_all()
             close_registry = self._closed and self._lifecycle_drained_locked()
         if close_registry:
-            self.registry.close()
+            self._finish_deferred_shutdown()
 
     def _track_future_locked(self, future: Future[Any]) -> None:
         self._inflight_futures.add(future)
@@ -159,7 +187,7 @@ class DiscoveryService:
                 self._refresh_guard.notify_all()
                 close_registry = self._closed and self._lifecycle_drained_locked()
             if close_registry:
-                self.registry.close()
+                self._finish_deferred_shutdown()
         return succeeded
 
     def _submit_mapping(self, callback: Callable[[], dict[str, Any]]) -> Future[dict[str, Any]]:
@@ -344,9 +372,12 @@ class DiscoveryService:
                 self._refresh_guard.wait(timeout=remaining)
             drained = self._lifecycle_drained_locked()
 
-        if drained:
-            self.registry.close()
-        return drained
+        if not drained:
+            return False
+        closed = self._close_registry()
+        if closed:
+            _release_discovery_service(self)
+        return closed
 
     def get_detail(self, provider: str, media_type: str, external_id: str) -> MediaCard | None:
         if media_type not in {"movie", "tv"}:
@@ -520,8 +551,18 @@ _service: DiscoveryService | None = None
 _service_lock = threading.Lock()
 
 
+def _release_discovery_service(service: DiscoveryService) -> None:
+    global _service
+    with _service_lock:
+        if _service is service:
+            _service = None
+
+
 def get_discovery_service() -> DiscoveryService:
     global _service
+    service = _service
+    if service is not None and service.closed:
+        service.shutdown()
     if _service is None:
         with _service_lock:
             if _service is None:
@@ -529,9 +570,8 @@ def get_discovery_service() -> DiscoveryService:
     return _service
 
 
-def shutdown_discovery_service() -> None:
-    global _service
-    with _service_lock:
-        service, _service = _service, None
-    if service is not None:
-        service.shutdown()
+def shutdown_discovery_service() -> bool:
+    service = _service
+    if service is None:
+        return True
+    return service.shutdown()

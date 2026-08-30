@@ -57,6 +57,48 @@ class _LocalScraper:
 
 
 class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
+    def test_tracker_recovers_only_stale_submitting_backends(self):
+        request_id, _ = db.create_download_request(
+            f"stale-submit-{uuid.uuid4().hex}", "magnet", title="Stale",
+            source_value="magnet:?xt=urn:btih:stale",
+        )
+        self.assertTrue(db.claim_download_request(request_id, "both"))
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE download_requests SET qb_status='submitted',"
+                "updated_at=datetime('now','localtime','-30 minutes') WHERE id=?",
+                (request_id,),
+            )
+
+        tracker = DownloadTracker()
+        with patch.object(
+            tracker, "_run_torrent_data_cleanup_if_due", return_value=0,
+        ), patch(
+            "app.modules.download_tracker.db.list_active_download_requests",
+            return_value=[],
+        ):
+            self.assertEqual(tracker.run_once(), 0)
+
+        row = db.get_download_request(request_id)
+        self.assertEqual(row["status"], "manual_review")
+        self.assertEqual(row["qb_status"], "submitted")
+        self.assertEqual(row["gy_status"], "manual_review")
+        self.assertIn("远端接收结果未知", row["error"])
+        self.assertIn("勿直接重复提交", row["error"])
+        self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
+
+    def test_recent_submitting_download_is_not_recovered_early(self):
+        request_id, _ = db.create_download_request(
+            f"recent-submit-{uuid.uuid4().hex}", "magnet", title="Recent",
+            source_value="magnet:?xt=urn:btih:recent",
+        )
+        self.assertTrue(db.claim_download_request(request_id, "qb"))
+
+        self.assertEqual(db.recover_stale_submitting_download_requests(), 0)
+        row = db.get_download_request(request_id)
+        self.assertEqual(row["status"], "submitting")
+        self.assertEqual(row["qb_status"], "submitting")
+
     def test_download_notification_is_claimed_by_exactly_one_tracker(self):
         request_id, _ = db.create_download_request(
             "notification-claim", "magnet", title="并发通知"

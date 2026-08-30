@@ -51,6 +51,9 @@
         pendingPreviewKey: '',
         pendingExternalKey: '',
     };
+    const modalLifecycle = window.createAppModal(modal, {
+        onRequestClose: closeModal,
+    });
     const positionControls = window.MediaScrapePosition.create({
         root: modal,
         isSingleFile: () => isSingleFileScope(),
@@ -241,21 +244,21 @@
     }
 
     function openModal() {
-        modal.hidden = false;
-        document.body.classList.add('modal-open');
-        requestAnimationFrame(() => elements.query.focus({preventScroll: true}));
+        modalLifecycle.open(state.activeAction, {initialFocus: elements.query});
     }
 
     function closeModal() {
         state.requestVersion += 1;
         state.searchController?.abort();
         state.previewController?.abort();
+        state.externalController?.abort();
         state.searchController = null;
         state.previewController = null;
+        state.externalController = null;
         state.pendingSearchKey = '';
         state.pendingPreviewKey = '';
-        modal.hidden = true;
-        document.body.classList.remove('modal-open');
+        state.pendingExternalKey = '';
+        modalLifecycle.close();
         elements.candidates.classList.remove('is-loading');
     }
 
@@ -981,97 +984,214 @@
         setRowState(row, action, 'idle');
     }
 
-    async function pollTask(taskId, directory, row, action, parentId) {
+    const TASK_POLL_INTERVAL_MS = 1000;
+    const TASK_POLL_MAX_ATTEMPTS = 1800;
+    const taskPollEntries = new Map();
+    let taskPollTimer = null;
+    let taskPollController = null;
+    let taskPollInFlight = false;
+    let taskPollGeneration = 0;
+    let taskPollingDisposed = false;
+
+    function clearTaskPollTimer() {
+        if (taskPollTimer !== null) window.clearTimeout(taskPollTimer);
+        taskPollTimer = null;
+    }
+
+    function scheduleTaskPoll(delay = TASK_POLL_INTERVAL_MS) {
+        if (
+            taskPollingDisposed
+            || document.hidden
+            || taskPollInFlight
+            || taskPollTimer !== null
+            || !taskPollEntries.size
+        ) return;
+        taskPollTimer = window.setTimeout(() => {
+            taskPollTimer = null;
+            runTaskPoll().catch(() => {});
+        }, delay);
+    }
+
+    async function refreshTaskParent(parentId) {
+        if (window.gyNavigator?.state?.().id === parentId) {
+            await window.gyNavigator.reload();
+        }
+    }
+
+    function countTaskFailures(stats) {
+        const countFailure = (value) => {
+            if (Array.isArray(value)) return value.length;
+            const number = Number(value || 0);
+            return Number.isFinite(number) ? number : (value ? 1 : 0);
+        };
+        return [
+            'failed',
+            'replacement_cleanup_failed',
+            'empty_dir_cleanup_failed',
+            'source_dir_cleanup_failed',
+            'audit_failures',
+            'scan_errors',
+        ].reduce((total, key) => total + countFailure(stats[key]), 0);
+    }
+
+    async function applyTaskPollStatus(entry, status) {
+        const {taskId, row, action} = entry;
+        const matchesTask = (item) => String(item?.id || '') === taskId;
+        const queued = (status.operation_queue?.items || []).find(matchesTask);
+        if (queued) {
+            const ahead = Number(queued.ahead || 0);
+            setRowState(
+                row,
+                action,
+                'queued',
+                ahead > 0 ? `已排队，前方 ${ahead} 项` : '已排队，等待当前任务结束',
+            );
+            return false;
+        }
+        const history = (status.operation_history || []).find(matchesTask);
+        const task = matchesTask(status) ? status : history;
+        if (!task) return false;
+        if (task.status === 'running') {
+            setRowState(row, action, 'running', '目录刮削任务执行中');
+            return false;
+        }
+        if (['completed', 'partial'].includes(task.status)) {
+            const stats = task.result?.stats || {};
+            const failures = countTaskFailures(stats);
+            const pending = Number(stats.pending_confirmation || 0);
+            if (failures > 0 || task.status === 'partial') {
+                const visibleFailures = Math.max(1, failures);
+                setRowState(row, action, 'error', `${visibleFailures} 项处理失败`);
+                window.appAlert?.({
+                    type: 'warning',
+                    title: '目录刮削部分完成',
+                    message: `${visibleFailures} 项处理失败，请到整理日志查看详情。`,
+                });
+                return true;
+            }
+            if (pending > 0) {
+                const files = Array.isArray(stats.pending_files) ? stats.pending_files : [];
+                setRowState(row, action, 'done', `${pending} 项待确认`);
+                window.appAlert?.({
+                    type: 'warning',
+                    title: '目录刮削已完成，仍有文件待确认',
+                    message: [
+                        `${pending} 个无法安全归属的文件已保留在源目录，没有移动。`,
+                        files.slice(0, 3).map((item) => item.name).join('、'),
+                        '可在目录中对这些文件单独右键刮削。',
+                    ].filter(Boolean).join(' '),
+                });
+                return true;
+            }
+            setRowState(row, action, 'done', '目录刮削完成');
+            return true;
+        }
+        if (['failed', 'stopped'].includes(task.status)) {
+            throw new Error(task.error || task.message || '目录刮削未完成');
+        }
+        return false;
+    }
+
+    async function runTaskPoll() {
+        if (taskPollingDisposed || document.hidden || taskPollInFlight || !taskPollEntries.size) return;
+        taskPollInFlight = true;
+        const generation = taskPollGeneration;
+        const controller = new AbortController();
+        taskPollController = controller;
+        const refreshParents = new Set();
+        try {
+            const response = await fetch('/api/guangya/organize/status', {signal: controller.signal});
+            const status = await response.json();
+            if (!response.ok) throw new Error(status.error || '任务状态读取失败');
+            if (generation !== taskPollGeneration || document.hidden || taskPollingDisposed) return;
+            for (const [taskId, entry] of [...taskPollEntries.entries()]) {
+                entry.attempts += 1;
+                try {
+                    const finished = await applyTaskPollStatus(entry, status);
+                    if (finished) {
+                        taskPollEntries.delete(taskId);
+                        refreshParents.add(entry.parentId);
+                    }
+                    else if (entry.attempts >= TASK_POLL_MAX_ATTEMPTS) {
+                        setRowState(
+                            entry.row,
+                            entry.action,
+                            'running',
+                            '任务仍在后台运行，请稍后查看整理日志',
+                        );
+                        taskPollEntries.delete(taskId);
+                    }
+                } catch (error) {
+                    setRowState(entry.row, entry.action, 'error', error.message);
+                    window.appAlert?.({type: 'error', title: '目录刮削失败', message: error.message});
+                    taskPollEntries.delete(taskId);
+                }
+            }
+            for (const parentId of refreshParents) {
+                try {
+                    await refreshTaskParent(parentId);
+                } catch (_error) {
+                    window.appAlert?.({
+                        type: 'warning',
+                        title: '任务已完成，但目录刷新失败',
+                        message: '请手动刷新当前目录确认最新内容。',
+                    });
+                }
+            }
+        } catch (error) {
+            if (error?.name === 'AbortError' || generation !== taskPollGeneration) return;
+            for (const entry of taskPollEntries.values()) {
+                setRowState(entry.row, entry.action, 'error', error.message);
+            }
+            taskPollEntries.clear();
+            window.appAlert?.({type: 'error', title: '目录刮削失败', message: error.message});
+        } finally {
+            if (taskPollController === controller) taskPollController = null;
+            taskPollInFlight = false;
+            scheduleTaskPoll();
+        }
+    }
+
+    function pollTask(taskId, directory, row, action, parentId) {
+        const normalizedTaskId = String(taskId || '');
+        if (!normalizedTaskId) return;
         if (action?.dataset?.state !== 'queued') {
             setRowState(row, action, 'running', '目录刮削任务执行中');
         }
-        for (let attempt = 0; attempt < 1800; attempt += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-            try {
-                const response = await fetch('/api/guangya/organize/status');
-                const status = await response.json();
-                if (!response.ok) throw new Error(status.error || '任务状态读取失败');
-                const queued = (status.operation_queue?.items || []).find((item) => item.id === taskId);
-                if (queued) {
-                    const ahead = Number(queued.ahead || 0);
-                    setRowState(
-                        row,
-                        action,
-                        'queued',
-                        ahead > 0 ? `已排队，前方 ${ahead} 项` : '已排队，等待当前任务结束',
-                    );
-                    continue;
-                }
-                const history = (status.operation_history || []).find((item) => item.id === taskId);
-                const task = status.id === taskId ? status : history;
-                if (!task) continue;
-                if (task.status === 'running') {
-                    setRowState(row, action, 'running', '目录刮削任务执行中');
-                    continue;
-                }
-                if (['completed', 'partial'].includes(task.status)) {
-                    const stats = task.result?.stats || {};
-                    const countFailure = (value) => {
-                        if (Array.isArray(value)) return value.length;
-                        const number = Number(value || 0);
-                        return Number.isFinite(number) ? number : (value ? 1 : 0);
-                    };
-                    const failures = [
-                        'failed',
-                        'replacement_cleanup_failed',
-                        'empty_dir_cleanup_failed',
-                        'source_dir_cleanup_failed',
-                        'audit_failures',
-                        'scan_errors',
-                    ].reduce((total, key) => total + countFailure(stats[key]), 0);
-                    const pending = Number(stats.pending_confirmation || 0);
-                    if (failures > 0 || task.status === 'partial') {
-                        const visibleFailures = Math.max(1, failures);
-                        setRowState(row, action, 'error', `${visibleFailures} 项处理失败`);
-                        window.appAlert?.({
-                            type: 'warning',
-                            title: '目录刮削部分完成',
-                            message: `${visibleFailures} 项处理失败，请到整理日志查看详情。`,
-                        });
-                        if (window.gyNavigator?.state?.().id === parentId) {
-                            await window.gyNavigator.reload();
-                        }
-                        return;
-                    }
-                    if (pending > 0) {
-                        const files = Array.isArray(stats.pending_files) ? stats.pending_files : [];
-                        setRowState(row, action, 'done', `${pending} 项待确认`);
-                        window.appAlert?.({
-                            type: 'warning',
-                            title: '目录刮削已完成，仍有文件待确认',
-                            message: [
-                                `${pending} 个无法安全归属的文件已保留在源目录，没有移动。`,
-                                files.slice(0, 3).map((item) => item.name).join('、'),
-                                '可在目录中对这些文件单独右键刮削。',
-                            ].filter(Boolean).join(' '),
-                        });
-                        if (window.gyNavigator?.state?.().id === parentId) {
-                            await window.gyNavigator.reload();
-                        }
-                        return;
-                    }
-                    setRowState(row, action, 'done', '目录刮削完成');
-                    if (window.gyNavigator?.state?.().id === parentId) {
-                        await window.gyNavigator.reload();
-                    }
-                    return;
-                }
-                if (['failed', 'stopped'].includes(task.status)) {
-                    throw new Error(task.error || task.message || '目录刮削未完成');
-                }
-            } catch (error) {
-                setRowState(row, action, 'error', error.message);
-                window.appAlert?.({type: 'error', title: '目录刮削失败', message: error.message});
-                return;
-            }
-        }
-        setRowState(row, action, 'running', '任务仍在后台运行，请稍后查看整理日志');
+        const current = taskPollEntries.get(normalizedTaskId);
+        taskPollEntries.set(normalizedTaskId, {
+            taskId: normalizedTaskId,
+            directory,
+            row,
+            action,
+            parentId,
+            attempts: current?.attempts || 0,
+        });
+        scheduleTaskPoll();
     }
+
+    document.addEventListener('visibilitychange', () => {
+        taskPollGeneration += 1;
+        clearTaskPollTimer();
+        if (document.hidden) {
+            taskPollController?.abort();
+            return;
+        }
+        scheduleTaskPoll(0);
+    });
+    window.addEventListener('pagehide', (event) => {
+        taskPollingDisposed = true;
+        taskPollGeneration += 1;
+        clearTaskPollTimer();
+        taskPollController?.abort();
+        taskPollController = null;
+        if (!event.persisted) taskPollEntries.clear();
+    });
+    window.addEventListener('pageshow', (event) => {
+        if (!event.persisted) return;
+        taskPollingDisposed = false;
+        scheduleTaskPoll(0);
+    });
 
     async function runManual() {
         if (!state.preview) return;
@@ -1227,9 +1347,7 @@
         }
     });
     document.addEventListener('keydown', (event) => {
-        if (event.key !== 'Escape') return;
-        if (!menu.hidden) closeMenu({restoreFocus: true});
-        else if (!modal.hidden) closeModal();
+        if (event.key === 'Escape' && !menu.hidden) closeMenu({restoreFocus: true});
     });
     window.addEventListener('resize', closeMenuAfterViewportChange);
     window.visualViewport?.addEventListener('scroll', closeMenuAfterViewportChange);
@@ -1237,11 +1355,7 @@
     document.addEventListener('scroll', closeMenuAfterViewportChange, true);
     modal.addEventListener('click', (event) => {
         const paneButton = event.target.closest('[data-scrape-mobile-pane]');
-        if (paneButton) {
-            setMobilePane(paneButton.dataset.scrapeMobilePane);
-            return;
-        }
-        if (event.target === modal) closeModal();
+        if (paneButton) setMobilePane(paneButton.dataset.scrapeMobilePane);
     });
     function sanitizeSearchQuery(query) {
         return window.MediaScrapePosition.sanitizeSearchQuery(query, {

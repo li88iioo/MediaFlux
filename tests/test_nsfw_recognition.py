@@ -962,5 +962,114 @@ class NsfwConfigValidationTests(unittest.TestCase):
             _validate_nsfw_organize_updates({"GY_ORGANIZE_NSFW_CATEGORY_NAME": "../adult"})
 
 
+class DirectoryScrapeRecognizerLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _rules(endpoint: str) -> OrganizeRules:
+        return OrganizeRules(
+            nsfw_enabled=True,
+            nsfw_exclusive=True,
+            nsfw_metatube_endpoint=endpoint,
+        )
+
+    @staticmethod
+    def _match(endpoint: str) -> MatchResult:
+        return MatchResult(
+            title="SSIS-001", media_type="movie", confidence=1.0,
+            status="matched", matched_by="metatube", provider="metatube",
+            external_id=endpoint,
+        )
+
+    def test_concurrent_first_use_constructs_one_recognizer_per_config(self):
+        constructed = []
+        match_barrier = threading.Barrier(2)
+        start_barrier = threading.Barrier(3)
+        service = DirectoryScrapeService(
+            client=object(), scraper=MagicMock(), store=MagicMock(),
+        )
+        rules = self._rules("http://metatube-one.invalid")
+        results: list[MatchResult] = []
+
+        class FakeRecognizer:
+            def __init__(self, endpoint, *_args, **_kwargs):
+                self.endpoint = endpoint
+                self.close_calls = 0
+                time.sleep(0.03)
+                constructed.append(self)
+
+            def match(self, _filename, _parent_path):
+                match_barrier.wait(timeout=2)
+                return DirectoryScrapeRecognizerLifecycleTests._match(self.endpoint)
+
+            def close(self):
+                self.close_calls += 1
+
+        def recognize() -> None:
+            start_barrier.wait()
+            results.append(service._recognize("SSIS-001.mp4", "/", rules))
+
+        threads = [threading.Thread(target=recognize) for _ in range(2)]
+        with patch("app.modules.nsfw.NsfwRecognizer", FakeRecognizer):
+            for thread in threads:
+                thread.start()
+            start_barrier.wait()
+            for thread in threads:
+                thread.join(timeout=3)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(constructed), 1)
+        service.close()
+        self.assertEqual(constructed[0].close_calls, 1)
+
+    def test_hot_config_switch_defers_close_until_active_match_releases(self):
+        constructed = []
+        old_started = threading.Event()
+        release_old = threading.Event()
+        service = DirectoryScrapeService(
+            client=object(), scraper=MagicMock(), store=MagicMock(),
+        )
+        old_rules = self._rules("http://metatube-old.invalid")
+        new_rules = self._rules("http://metatube-new.invalid")
+        old_results: list[MatchResult] = []
+
+        class FakeRecognizer:
+            def __init__(self, endpoint, *_args, **_kwargs):
+                self.endpoint = endpoint
+                self.close_calls = 0
+                constructed.append(self)
+
+            def match(self, _filename, _parent_path):
+                if self.endpoint == old_rules.nsfw_metatube_endpoint:
+                    old_started.set()
+                    if not release_old.wait(timeout=3):
+                        raise AssertionError("old recognizer was not released")
+                return DirectoryScrapeRecognizerLifecycleTests._match(self.endpoint)
+
+            def close(self):
+                self.close_calls += 1
+
+        with patch("app.modules.nsfw.NsfwRecognizer", FakeRecognizer):
+            thread = threading.Thread(
+                target=lambda: old_results.append(
+                    service._recognize("SSIS-001.mp4", "/", old_rules)
+                )
+            )
+            thread.start()
+            self.assertTrue(old_started.wait(timeout=2))
+            new_result = service._recognize("SSIS-001.mp4", "/", new_rules)
+            self.assertEqual(len(constructed), 2)
+            self.assertEqual(constructed[0].close_calls, 0)
+            self.assertEqual(new_result.external_id, new_rules.nsfw_metatube_endpoint)
+            release_old.set()
+            thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(old_results[0].external_id, old_rules.nsfw_metatube_endpoint)
+        self.assertEqual(constructed[0].close_calls, 1)
+        self.assertEqual(constructed[1].close_calls, 0)
+        service.close()
+        self.assertEqual(constructed[1].close_calls, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

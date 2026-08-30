@@ -219,38 +219,54 @@ class DiscoverySearchService:
         self._closed = False
         self._state_lock = threading.RLock()
         self._inflight: set[Future] = set()
-        self._providers_closed = False
+        self._provider_close_lock = threading.Lock()
+        self._closed_provider_ids: set[int] = set()
 
-    def _close_providers(self) -> None:
+    @property
+    def closed(self) -> bool:
         with self._state_lock:
-            if self._providers_closed:
-                return
-            # 关闭尝试由当前调用独占；单个 provider 失败不能阻断其余资源释放。
-            self._providers_closed = True
-        seen: set[int] = set()
-        for name, provider in self.providers.items():
-            if id(provider) in seen:
-                continue
-            seen.add(id(provider))
-            close = getattr(provider, "close", None)
-            if not callable(close):
-                continue
-            try:
-                close()
-            except Exception as exc:
-                logger.warning(
-                    "Discovery provider close failed provider=%s type=%s",
-                    name,
-                    type(exc).__name__,
-                )
+            return self._closed
+
+    def _close_providers(self) -> bool:
+        # close 失败的 provider 保留在待关闭集合中；后续 shutdown/get 会仅重试
+        # 失败项，已经成功释放的共享 provider 不重复关闭。
+        with self._provider_close_lock:
+            unique: list[tuple[str, Any]] = []
+            seen: set[int] = set()
+            for name, provider in self.providers.items():
+                identity = id(provider)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                unique.append((name, provider))
+
+            for name, provider in unique:
+                identity = id(provider)
+                if identity in self._closed_provider_ids:
+                    continue
+                close = getattr(provider, "close", None)
+                if not callable(close):
+                    self._closed_provider_ids.add(identity)
+                    continue
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "Discovery provider close failed provider=%s type=%s",
+                        name,
+                        type(exc).__name__,
+                    )
+                    continue
+                self._closed_provider_ids.add(identity)
+            return len(self._closed_provider_ids) == len(unique)
 
     def _future_finished(self, future: Future) -> None:
         close_providers = False
         with self._state_lock:
             self._inflight.discard(future)
             close_providers = self._closed and not self._inflight
-        if close_providers:
-            self._close_providers()
+        if close_providers and self._close_providers():
+            _release_discovery_search_service(self)
 
     def _enabled_names(self) -> list[str]:
         names = [name for name in _PROVIDER_ORDER if name in self.providers]
@@ -378,24 +394,37 @@ class DiscoverySearchService:
         )
 
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         with self._state_lock:
-            if self._closed:
-                return
+            first_attempt = not self._closed
             self._closed = True
             close_providers = not self._inflight
-        if self._owns_executor:
+        if first_attempt and self._owns_executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
-        if close_providers:
-            self._close_providers()
+        if not close_providers:
+            return False
+        closed = self._close_providers()
+        if closed:
+            _release_discovery_search_service(self)
+        return closed
 
 
 _search_service: DiscoverySearchService | None = None
 _search_service_lock = threading.Lock()
 
 
+def _release_discovery_search_service(service: DiscoverySearchService) -> None:
+    global _search_service
+    with _search_service_lock:
+        if _search_service is service:
+            _search_service = None
+
+
 def get_discovery_search_service() -> DiscoverySearchService:
     global _search_service
+    service = _search_service
+    if service is not None and service.closed:
+        service.shutdown()
     if _search_service is None:
         with _search_service_lock:
             if _search_service is None:
@@ -403,9 +432,8 @@ def get_discovery_search_service() -> DiscoverySearchService:
     return _search_service
 
 
-def shutdown_discovery_search_service() -> None:
-    global _search_service
-    with _search_service_lock:
-        service, _search_service = _search_service, None
-    if service is not None:
-        service.shutdown()
+def shutdown_discovery_search_service() -> bool:
+    service = _search_service
+    if service is None:
+        return True
+    return service.shutdown()

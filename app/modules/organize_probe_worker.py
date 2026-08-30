@@ -12,7 +12,7 @@ import threading
 import uuid
 
 from app import database as db
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.logger import get_logger
 from app.modules.organize_postprocess import companion_target_name
 from app.modules.process_lock import CrossProcessLock
@@ -53,25 +53,27 @@ class OrganizeProbeWorker:
         logger.info("整理媒体规格后台补全器已启动")
 
     def stop(self, timeout: float = 30.0) -> bool:
-        self._stop_event.set()
-        self._wake_event.set()
-        thread = self._thread
+        with self._state_lock:
+            self._stop_event.set()
+            self._wake_event.set()
+            thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.1, float(timeout or 0.1)))
-        stopped = not thread or not thread.is_alive()
-        if stopped:
+        if thread and thread.is_alive():
+            logger.warning("整理媒体规格后台补全器未能在关闭超时内结束")
+            return False
+
+        with self._state_lock:
+            # join 期间允许显式 restart；只清理本轮捕获的旧线程，不能抹掉
+            # 新线程句柄或关闭它正在复用的 HTTP Client。
+            if self._thread is not thread:
+                logger.warning("整理媒体规格后台补全器在关闭期间已重新启动")
+                return False
             self._thread = None
             client = self._client
             self._client = None
-            close = getattr(client, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-        else:
-            logger.warning("整理媒体规格后台补全器未能在关闭超时内结束")
-        return stopped
+        close_guangya_client(client)
+        return True
 
     def wake(self) -> None:
         self._wake_event.set()

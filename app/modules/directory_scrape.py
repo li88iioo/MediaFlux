@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from time import monotonic
 from typing import Callable
@@ -522,24 +523,25 @@ class DirectoryScrapeService:
         self.rules_loader = rules_loader
         self._cached_nsfw_key: tuple[str, str, str, int] | None = None
         self._cached_nsfw_recognizer = None
+        self._nsfw_lock = threading.RLock()
+        self._nsfw_active_leases: dict[int, int] = {}
+        self._retired_nsfw_recognizers: dict[int, object] = {}
 
     def close(self) -> None:
         """释放全局目录刮削服务持有的内部客户端。"""
-        if self._closed:
-            return
-        self._closed = True
-        recognizer = self._cached_nsfw_recognizer
-        self._cached_nsfw_recognizer = None
-        self._cached_nsfw_key = None
-        close = getattr(recognizer, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception as exc:
-                logger.warning(
-                    "关闭目录刮削 MetaTube 识别器失败 type=%s",
-                    type(exc).__name__,
-                )
+        with self._nsfw_lock:
+            if self._closed:
+                return
+            self._closed = True
+            recognizer = self._cached_nsfw_recognizer
+            self._cached_nsfw_recognizer = None
+            self._cached_nsfw_key = None
+            recognizers_to_close = self._retire_nsfw_recognizer_locked(recognizer)
+            for identity, retired in list(self._retired_nsfw_recognizers.items()):
+                if self._nsfw_active_leases.get(identity, 0) <= 0:
+                    self._retired_nsfw_recognizers.pop(identity, None)
+                    recognizers_to_close.append(retired)
+        self._close_nsfw_recognizers(recognizers_to_close)
         if self._owns_scraper:
             close = getattr(self.scraper, "close", None)
             if callable(close):
@@ -553,9 +555,42 @@ class DirectoryScrapeService:
         if self._owns_client:
             close_guangya_client(self.client)
 
-    def _nsfw_recognizer(self, rules: OrganizeRules):
+    @staticmethod
+    def _close_nsfw_recognizers(recognizers: list[object]) -> None:
+        seen: set[int] = set()
+        for recognizer in recognizers:
+            identity = id(recognizer)
+            if recognizer is None or identity in seen:
+                continue
+            seen.add(identity)
+            close = getattr(recognizer, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.warning(
+                        "关闭目录刮削 MetaTube 识别器失败 type=%s",
+                        type(exc).__name__,
+                    )
+
+    def _retire_nsfw_recognizer_locked(self, recognizer) -> list[object]:
+        if recognizer is None:
+            return []
+        identity = id(recognizer)
+        if self._nsfw_active_leases.get(identity, 0) > 0:
+            self._retired_nsfw_recognizers[identity] = recognizer
+            return []
+        self._retired_nsfw_recognizers.pop(identity, None)
+        return [recognizer]
+
+    def _resolve_nsfw_recognizer_locked(
+        self,
+        rules: OrganizeRules,
+    ) -> tuple[object | None, list[object]]:
+        if self._closed:
+            return None, []
         if not rules.nsfw_enabled or not str(rules.nsfw_metatube_endpoint or "").strip():
-            return None
+            return None, []
         key = (
             str(rules.nsfw_metatube_endpoint or "").strip(),
             str(rules.nsfw_metatube_token or ""),
@@ -563,29 +598,49 @@ class DirectoryScrapeService:
             int(rules.nsfw_timeout_seconds or 8),
         )
         if self._cached_nsfw_key == key and self._cached_nsfw_recognizer is not None:
-            return self._cached_nsfw_recognizer
-        previous = self._cached_nsfw_recognizer
-        self._cached_nsfw_key = None
-        self._cached_nsfw_recognizer = None
-        close = getattr(previous, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception as exc:
-                logger.warning(
-                    "关闭旧目录刮削 MetaTube 识别器失败 type=%s",
-                    type(exc).__name__,
-                )
+            return self._cached_nsfw_recognizer, []
         from app.modules.nsfw import NsfwRecognizer
         try:
             recognizer = NsfwRecognizer(
                 key[0], key[1], strip_domains=key[2], timeout=key[3],
             )
         except ValueError:
-            return None
+            previous = self._cached_nsfw_recognizer
+            self._cached_nsfw_key = None
+            self._cached_nsfw_recognizer = None
+            return None, self._retire_nsfw_recognizer_locked(previous)
+        previous = self._cached_nsfw_recognizer
         self._cached_nsfw_key = key
         self._cached_nsfw_recognizer = recognizer
-        return recognizer
+        return recognizer, self._retire_nsfw_recognizer_locked(previous)
+
+    @contextmanager
+    def _nsfw_recognizer_lease(self, rules: OrganizeRules):
+        with self._nsfw_lock:
+            recognizer, recognizers_to_close = self._resolve_nsfw_recognizer_locked(rules)
+            if recognizer is not None:
+                identity = id(recognizer)
+                self._nsfw_active_leases[identity] = (
+                    self._nsfw_active_leases.get(identity, 0) + 1
+                )
+        self._close_nsfw_recognizers(recognizers_to_close)
+        try:
+            yield recognizer
+        finally:
+            recognizer_to_close = None
+            if recognizer is not None:
+                identity = id(recognizer)
+                with self._nsfw_lock:
+                    remaining = self._nsfw_active_leases.get(identity, 0) - 1
+                    if remaining > 0:
+                        self._nsfw_active_leases[identity] = remaining
+                    else:
+                        self._nsfw_active_leases.pop(identity, None)
+                        recognizer_to_close = self._retired_nsfw_recognizers.pop(
+                            identity, None,
+                        )
+            if recognizer_to_close is not None:
+                self._close_nsfw_recognizers([recognizer_to_close])
 
     def _rules_for_scope(self, scope_id: str) -> OrganizeRules:
         """沿光鸭父目录向上寻找正式来源，并应用来源级成人识别边界。"""
@@ -640,11 +695,11 @@ class DirectoryScrapeService:
             raise DirectoryScrapeRequestError("所选 MetaTube 条目番号与当前目录不一致")
 
     def _recognize(self, filename: str, parent_path: str, rules: OrganizeRules) -> MatchResult:
-        recognizer = self._nsfw_recognizer(rules)
-        if recognizer is not None:
-            match = recognizer.match(filename, parent_path)
-            if match is not None:
-                return match
+        with self._nsfw_recognizer_lease(rules) as recognizer:
+            if recognizer is not None:
+                match = recognizer.match(filename, parent_path)
+                if match is not None:
+                    return match
         if rules.nsfw_exclusive:
             return Organizer._nsfw_unresolved_match()
         return self.scraper.match(filename, parent_path)
@@ -801,18 +856,18 @@ class DirectoryScrapeService:
                     seen.add(key)
                     candidates.append(self._candidate_payload(candidate, current_type))
         if normalized_type in {"auto", "movie"}:
-            recognizer = self._nsfw_recognizer(record.rules)
-            if recognizer is not None:
-                for candidate in recognizer.candidates(search_query):
-                    key = (
-                        str(candidate.provider or "metatube"),
-                        str(candidate.external_id or ""),
-                        "movie",
-                    )
-                    if not candidate.external_id or key in seen:
-                        continue
-                    seen.add(key)
-                    candidates.append(self._candidate_payload(candidate, "movie"))
+            with self._nsfw_recognizer_lease(record.rules) as recognizer:
+                if recognizer is not None:
+                    for candidate in recognizer.candidates(search_query):
+                        key = (
+                            str(candidate.provider or "metatube"),
+                            str(candidate.external_id or ""),
+                            "movie",
+                        )
+                        if not candidate.external_id or key in seen:
+                            continue
+                        seen.add(key)
+                        candidates.append(self._candidate_payload(candidate, "movie"))
         candidates.sort(
             key=lambda item: (
                 0 if item.get("provider") == "metatube" and float(item.get("score") or 0) >= 1 else 1,
@@ -952,13 +1007,15 @@ class DirectoryScrapeService:
             )
         requested_tmdb_id = str(tmdb_id or "").strip()
         if resolved_provider == "metatube":
-            recognizer = self._nsfw_recognizer(record.rules)
-            if recognizer is None:
-                raise DirectoryScrapeRequestError("MetaTube 成人内容识别未启用或配置无效")
-            try:
-                match, detail = recognizer.resolve(str(external_id or ""))
-            except Exception as exc:
-                raise DirectoryScrapeRequestError(str(exc) or "MetaTube 详情不存在或无法确认") from exc
+            with self._nsfw_recognizer_lease(record.rules) as recognizer:
+                if recognizer is None:
+                    raise DirectoryScrapeRequestError("MetaTube 成人内容识别未启用或配置无效")
+                try:
+                    match, detail = recognizer.resolve(str(external_id or ""))
+                except Exception as exc:
+                    raise DirectoryScrapeRequestError(
+                        str(exc) or "MetaTube 详情不存在或无法确认"
+                    ) from exc
             self._validate_metatube_source_identity(current, detail, record.rules)
             normalized_type = "movie"
         else:

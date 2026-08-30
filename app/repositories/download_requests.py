@@ -1016,6 +1016,34 @@ def update_download_request_for_local_media_task(
         return int(cur.rowcount)
 
 
+def recover_stale_submitting_download_requests(stale_minutes: int = 15) -> int:
+    """把超时的后端提交精确转为人工核验，不覆盖其它已确认后端。"""
+    minutes = max(1, int(stale_minutes or 15))
+    timestamp = now()
+    message = (
+        "下载后端提交长时间未完成，远端接收结果未知；"
+        "请先核对对应下载器，勿直接重复提交"
+    )
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE download_requests SET status='manual_review',"
+            "qb_status=CASE WHEN qb_status='submitting' THEN 'manual_review' ELSE qb_status END,"
+            "gy_status=CASE WHEN gy_status='submitting' THEN 'manual_review' ELSE gy_status END,"
+            "error=CASE "
+            "WHEN instr(COALESCE(error,''),?)>0 THEN error "
+            "WHEN COALESCE(error,'')='' THEN ? "
+            "ELSE substr(error || char(10) || ?,1,1000) END,"
+            "completed_at=COALESCE(completed_at,?),updated_at=? "
+            "WHERE COALESCE(kind,'')<>'guangya_share' "
+            "AND (status='submitting' OR qb_status='submitting' OR gy_status='submitting') "
+            "AND datetime(COALESCE(NULLIF(updated_at,''),created_at)) "
+            "< datetime('now','localtime', ?)",
+            (message, message, message, timestamp, timestamp, f"-{minutes} minutes"),
+        )
+        return int(cur.rowcount or 0)
+
+
 def list_active_download_requests(
     limit: int = 100,
     *,

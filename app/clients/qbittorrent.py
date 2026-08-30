@@ -261,8 +261,9 @@ class QBittorrentClient:
             logger.warning("qB 登录失败: 下载器不可用")
             return TorrentAddResult(False, "qb_unavailable", True)
         except (requests.ReadTimeout, requests.Timeout):
-            logger.warning("qB 登录结果未知: 请求超时")
-            return TorrentAddResult(False, "qb_outcome_unknown", False)
+            # 登录请求本身不创建下载任务；超时可安全重试。
+            logger.warning("qB 登录失败: 下载器响应超时")
+            return TorrentAddResult(False, "qb_unavailable", True)
         except requests.RequestException:
             logger.warning("qB 登录结果未知: 请求异常")
             return TorrentAddResult(False, "qb_outcome_unknown", False)

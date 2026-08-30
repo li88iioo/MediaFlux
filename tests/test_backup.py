@@ -90,6 +90,65 @@ class BackupTests(unittest.TestCase):
 
         self.assertEqual(events, ["enter", "exit"])
 
+    def test_background_app_releases_startup_guard_when_late_construction_fails(self) -> None:
+        from app import main
+
+        events: list[str] = []
+
+        @contextmanager
+        def lifecycle_guard(_paths):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        with patch(
+            "app.modules.backup.runtime_lifecycle_guard",
+            side_effect=lifecycle_guard,
+        ), patch(
+            "app.modules.backup.recover_pending_restore",
+            return_value=False,
+        ), patch.object(
+            main, "_secret_key", return_value="test-secret"
+        ), patch.object(
+            main,
+            "FastAPI",
+            side_effect=RuntimeError("late app construction failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "late app construction failure"):
+                main.create_app(start_background=True)
+
+        self.assertEqual(events, ["enter", "exit"])
+
+    def test_normal_startup_guard_unregisters_atexit_callback_when_released(self) -> None:
+        from app import main
+
+        @contextmanager
+        def lifecycle_guard(_paths):
+            yield
+
+        with patch(
+            "app.modules.backup.runtime_lifecycle_guard",
+            side_effect=lifecycle_guard,
+        ), patch(
+            "app.modules.backup.recover_pending_restore",
+            return_value=False,
+        ), patch.object(
+            main, "_secret_key", return_value="test-secret"
+        ), patch.object(
+            main.atexit, "register"
+        ) as register, patch.object(
+            main.atexit, "unregister"
+        ) as unregister:
+            app = main.create_app(start_background=True)
+            callback = app.state.release_startup_lifecycle_guard
+            register.assert_called_once_with(callback)
+            callback()
+            callback()
+
+        unregister.assert_called_once_with(callback)
+
     def test_runtime_lifecycle_is_reentrant_within_process_but_keeps_file_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_paths(Path(directory))

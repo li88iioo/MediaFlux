@@ -13,6 +13,11 @@ except ImportError:  # pragma: no cover - 由显式 system python3 门禁执行
 
 
 ROOT = Path(__file__).resolve().parents[1]
+APP_SOURCE = (ROOT / "app/static/js/app.js").read_text("utf-8")
+APP_MODAL_SCRIPT = APP_SOURCE[
+    APP_SOURCE.index("    const modalStack = [];"):
+    APP_SOURCE.index("\n\n    const confirmModal")
+]
 POSITION_SCRIPT = (ROOT / "app/static/js/media-scrape-position.js").read_text("utf-8")
 SCRIPT = (ROOT / "app/static/js/guangya-directory-scrape.js").read_text("utf-8")
 STYLES = (ROOT / "app/static/css/guangya-directory-scrape.css").read_text("utf-8")
@@ -233,6 +238,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
             }
             """
         )
+        self.page.add_script_tag(content=APP_MODAL_SCRIPT)
         self.page.add_script_tag(content=POSITION_SCRIPT)
         self.page.add_script_tag(content=SCRIPT)
         self.assertEqual(self.page_errors, [])
@@ -915,6 +921,205 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
             self.page.get_attribute(str(binding["action"]), "aria-expanded"),
             "false",
         )
+
+
+    def test_scrape_modal_uses_shared_focus_lifecycle(self):
+        binding = self._bind(is_directory=False, is_video=True, left=200, top=120)
+        self._open_button(binding)
+        self.page.locator('[data-scrape-action="manual"]').click()
+        self.page.wait_for_function("() => !document.getElementById('gyScrapeModal').hidden")
+        self.page.wait_for_function("() => document.activeElement === document.getElementById('gyScrapeQuery')")
+        self.assertTrue(self.page.evaluate("document.body.classList.contains('modal-open')"))
+
+        self.page.keyboard.press("Escape")
+        self.page.wait_for_function("() => document.getElementById('gyScrapeModal').hidden")
+        self.assertFalse(self.page.evaluate("document.body.classList.contains('modal-open')"))
+        self.assertTrue(self.page.evaluate(
+            "selector => document.activeElement === document.querySelector(selector)",
+            binding["action"],
+        ))
+
+    def test_task_polling_shares_one_status_request_for_concurrent_tasks(self):
+        first = self._bind(is_directory=True, left=180, top=80)
+        second = self._bind(is_directory=True, left=220, top=120)
+        self.page.evaluate(
+            """
+            () => {
+                window.appConfirm = async () => true;
+                window.__statusRequests = 0;
+                window.__runTasks = 0;
+                window.__reloads = 0;
+                window.gyNavigator = {
+                    state: () => ({id: ''}),
+                    reload: async () => { window.__reloads += 1; },
+                };
+                const originalFetch = window.fetch;
+                window.fetch = async (path, options = {}) => {
+                    if (String(path).endsWith('/run')) {
+                        window.__runTasks += 1;
+                        const taskId = `task-${window.__runTasks}`;
+                        window.__requests.push({path: String(path), body: JSON.parse(options.body || '{}')});
+                        return {ok: true, json: async () => ({task_id: taskId})};
+                    }
+                    if (String(path) === '/api/guangya/organize/status') {
+                        window.__statusRequests += 1;
+                        return {
+                            ok: true,
+                            json: async () => ({
+                                operation_history: [1, 2].map(index => ({
+                                    id: `task-${index}`,
+                                    status: 'completed',
+                                    result: {stats: {}},
+                                })),
+                            }),
+                        };
+                    }
+                    return originalFetch(path, options);
+                };
+                const nativeSetTimeout = window.setTimeout.bind(window);
+                const nativeClearTimeout = window.clearTimeout.bind(window);
+                const pending = new Map();
+                let timerId = 10000;
+                window.setTimeout = (callback, delay, ...args) => {
+                    if (delay === 0 || delay === 1000) {
+                        timerId += 1;
+                        pending.set(timerId, () => callback(...args));
+                        return timerId;
+                    }
+                    return nativeSetTimeout(callback, delay, ...args);
+                };
+                window.clearTimeout = (id) => {
+                    if (!pending.delete(id)) nativeClearTimeout(id);
+                };
+                window.__pendingPollCount = () => pending.size;
+                window.__runNextPoll = () => {
+                    const next = pending.entries().next().value;
+                    if (!next) return false;
+                    pending.delete(next[0]);
+                    next[1]();
+                    return true;
+                };
+            }
+            """
+        )
+
+        self._open_button(first)
+        self.page.locator('[data-scrape-action="auto"]').click()
+        self.page.wait_for_function("() => window.__runTasks === 1")
+        self._open_button(second)
+        self.page.locator('[data-scrape-action="auto"]').click()
+        self.page.wait_for_function("() => window.__runTasks === 2")
+        self.assertEqual(self.page.evaluate("window.__pendingPollCount()"), 1)
+
+        self.assertTrue(self.page.evaluate("window.__runNextPoll()"))
+        self.page.wait_for_function(
+            "() => document.getElementById('action-0').dataset.state === 'done'"
+            " && document.getElementById('action-1').dataset.state === 'done'"
+        )
+        self.assertEqual(self.page.evaluate("window.__statusRequests"), 1)
+        self.assertEqual(self.page.evaluate("window.__reloads"), 1)
+        self.assertEqual(self.page.evaluate("window.__pendingPollCount()"), 0)
+
+    def test_task_polling_pauses_while_hidden_and_pagehide_discards_pending_work(self):
+        first = self._bind(is_directory=True, left=180, top=80)
+        second = self._bind(is_directory=True, left=220, top=120)
+        self.page.evaluate(
+            """
+            () => {
+                window.appConfirm = async () => true;
+                window.__hiddenForTest = false;
+                Object.defineProperty(document, 'hidden', {
+                    configurable: true,
+                    get: () => window.__hiddenForTest,
+                });
+                window.__statusRequests = 0;
+                window.__runTasks = 0;
+                window.__terminalTasks = new Set();
+                const originalFetch = window.fetch;
+                window.fetch = async (path, options = {}) => {
+                    if (String(path).endsWith('/run')) {
+                        window.__runTasks += 1;
+                        return {ok: true, json: async () => ({task_id: `task-${window.__runTasks}`})};
+                    }
+                    if (String(path) === '/api/guangya/organize/status') {
+                        window.__statusRequests += 1;
+                        return {
+                            ok: true,
+                            json: async () => ({
+                                operation_history: [...window.__terminalTasks].map(id => ({
+                                    id,
+                                    status: 'completed',
+                                    result: {stats: {}},
+                                })),
+                            }),
+                        };
+                    }
+                    return originalFetch(path, options);
+                };
+                const nativeSetTimeout = window.setTimeout.bind(window);
+                const nativeClearTimeout = window.clearTimeout.bind(window);
+                const pending = new Map();
+                let timerId = 20000;
+                window.__clearedPoll = null;
+                window.setTimeout = (callback, delay, ...args) => {
+                    if (delay === 0 || delay === 1000) {
+                        timerId += 1;
+                        pending.set(timerId, () => callback(...args));
+                        return timerId;
+                    }
+                    return nativeSetTimeout(callback, delay, ...args);
+                };
+                window.clearTimeout = (id) => {
+                    const callback = pending.get(id);
+                    if (callback) {
+                        window.__clearedPoll = callback;
+                        pending.delete(id);
+                    } else {
+                        nativeClearTimeout(id);
+                    }
+                };
+                window.__pendingPollCount = () => pending.size;
+                window.__runNextPoll = () => {
+                    const next = pending.entries().next().value;
+                    if (!next) return false;
+                    pending.delete(next[0]);
+                    next[1]();
+                    return true;
+                };
+            }
+            """
+        )
+
+        self._open_button(first)
+        self.page.locator('[data-scrape-action="auto"]').click()
+        self.page.wait_for_function("() => window.__runTasks === 1")
+        self.assertEqual(self.page.evaluate("window.__pendingPollCount()"), 1)
+        self.page.evaluate("""() => {
+            window.__hiddenForTest = true;
+            document.dispatchEvent(new Event('visibilitychange'));
+        }""")
+        self.assertEqual(self.page.evaluate("window.__pendingPollCount()"), 0)
+        self.assertEqual(self.page.evaluate("window.__statusRequests"), 0)
+
+        self.page.evaluate("""() => {
+            window.__terminalTasks.add('task-1');
+            window.__hiddenForTest = false;
+            document.dispatchEvent(new Event('visibilitychange'));
+        }""")
+        self.assertEqual(self.page.evaluate("window.__pendingPollCount()"), 1)
+        self.assertTrue(self.page.evaluate("window.__runNextPoll()"))
+        self.page.wait_for_function("() => document.getElementById('action-0').dataset.state === 'done'")
+        self.assertEqual(self.page.evaluate("window.__statusRequests"), 1)
+
+        self._open_button(second)
+        self.page.locator('[data-scrape-action="auto"]').click()
+        self.page.wait_for_function("() => window.__runTasks === 2")
+        self.assertEqual(self.page.evaluate("window.__pendingPollCount()"), 1)
+        self.page.evaluate("window.dispatchEvent(new Event('pagehide'))")
+        self.assertEqual(self.page.evaluate("window.__pendingPollCount()"), 0)
+        self.page.evaluate("window.__clearedPoll?.()")
+        self.assertEqual(self.page.evaluate("window.__statusRequests"), 1)
+
 
 
 if __name__ == "__main__":

@@ -61,6 +61,49 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
         self.assertFalse(db.claim_local_media_task(task_id, expected="waiting_stable", owner="admin"))
         self.assertEqual(db.get_local_media_task(task_id, owner="admin").status, "recognizing")
 
+    def test_concurrent_scan_task_creation_reuses_one_active_task(self):
+        source_id = db.create_local_media_source(
+            name="concurrent-scan", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/concurrent-scan", owner="admin",
+        )
+        workers = 8
+        barrier = threading.Barrier(workers + 1)
+        task_ids: list[int] = []
+        errors: list[BaseException] = []
+        result_lock = threading.Lock()
+
+        def create_task() -> None:
+            barrier.wait()
+            try:
+                task_id = db.create_local_media_task(
+                    source_id, "", "/tmp/concurrent-scan/Movie.mkv",
+                    owner="admin", trigger="scan",
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                with result_lock:
+                    errors.append(exc)
+            else:
+                with result_lock:
+                    task_ids.append(task_id)
+
+        threads = [threading.Thread(target=create_task) for _ in range(workers)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(task_ids), workers)
+        self.assertEqual(len(set(task_ids)), 1)
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id FROM local_media_tasks WHERE source_id=? AND content_path=?",
+                (source_id, "/tmp/concurrent-scan/Movie.mkv"),
+            ).fetchall()
+        self.assertEqual([int(row["id"]) for row in rows], [task_ids[0]])
+
     def test_init_db_purges_deprecated_smb_credentials_but_keeps_schema_columns(self):
         source_id = db.create_local_media_source(
             name="legacy-smb", qb_profile="", qb_path_prefix="",

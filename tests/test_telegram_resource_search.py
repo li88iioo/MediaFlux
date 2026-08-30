@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.bot.handlers import (
     _dispatch_resource_download,
@@ -82,6 +84,79 @@ class TelegramIndexerWorkerTests(unittest.TestCase):
 
         call.assert_not_called()
         self.assertIsNone(worker._thread)
+
+    def test_call_closes_coroutine_when_threadsafe_submission_fails(self):
+        worker = TelegramIndexerWorker()
+        worker._loop = Mock()
+        worker._service = object()
+        captured = []
+
+        async def pending():
+            return "unused"
+
+        def factory(_service):
+            coroutine = pending()
+            captured.append(coroutine)
+            return coroutine
+
+        with patch.object(worker, "_ensure_started"), patch(
+            "app.modules.telegram_resource_search.asyncio.run_coroutine_threadsafe",
+            side_effect=RuntimeError("loop stopped"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "loop stopped"):
+                worker._call(factory, timeout=0.1)
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsNone(captured[0].cr_frame)
+
+    def test_close_failure_keeps_worker_service_and_loop_for_retry(self):
+        worker = TelegramIndexerWorker()
+
+        class Service:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def aclose(self):
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("close failed once")
+
+        service = Service()
+        with patch(
+            "app.modules.telegram_resource_search.build_indexer_service",
+            return_value=service,
+        ):
+            worker._ensure_started()
+            thread = worker._thread
+            loop = worker._loop
+            self.assertIsNotNone(thread)
+            self.assertIsNotNone(loop)
+
+            self.assertFalse(worker.stop(timeout=0.05))
+            deadline = time.monotonic() + 1.0
+            while service.close_calls < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(service.close_calls, 1)
+            self.assertIs(worker._thread, thread)
+            self.assertIs(worker._loop, loop)
+            self.assertIs(worker._service, service)
+            self.assertTrue(thread.is_alive())
+            self.assertTrue(worker._stopping)
+
+            factory = Mock()
+            with self.assertRaisesRegex(
+                TelegramResourceSearchError, "正在关闭"
+            ):
+                worker._call(factory, timeout=0.1)
+            factory.assert_not_called()
+
+            self.assertTrue(worker.stop(timeout=1.0))
+
+        self.assertEqual(service.close_calls, 2)
+        self.assertIsNone(worker._thread)
+        self.assertIsNone(worker._loop)
+        self.assertIsNone(worker._service)
+        self.assertFalse(worker._stopping)
 
 
 class TelegramResourceSearchStoreTests(unittest.TestCase):

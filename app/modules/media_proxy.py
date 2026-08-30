@@ -6073,9 +6073,11 @@ class MediaProxyManager:
                     {"status": "error", "last_error": str(exc)},
                 )
                 return {"restarted": False, "reason": "invalid_config"}
-            runtime = self._runtimes.pop(int(instance_id), None)
+            runtime = self._runtimes.get(int(instance_id))
             if runtime is not None:
                 await self._stop_runtime(runtime)
+                if self._runtimes.get(int(instance_id)) is runtime:
+                    self._runtimes.pop(int(instance_id), None)
             try:
                 replacement = await self._start_runtime(resolved)
             except Exception as exc:
@@ -6129,9 +6131,11 @@ class MediaProxyManager:
                         instance_id,
                         {"status": "error", "last_error": message},
                     )
-                    runtime = self._runtimes.pop(instance_id, None)
+                    runtime = self._runtimes.get(instance_id)
                     if runtime:
                         await self._stop_runtime(runtime)
+                        if self._runtimes.get(instance_id) is runtime:
+                            self._runtimes.pop(instance_id, None)
                         stopped.append(instance_id)
 
             for instance_id, runtime in list(self._runtimes.items()):
@@ -6209,6 +6213,13 @@ class MediaProxyManager:
                     started.append(instance_id)
                     continue
 
+                # 即使新旧实例监听端口不同，也先完整关闭旧 runtime。这样
+                # 上游连接池关闭失败时仍能由 manager 保留同一句柄重试，避免
+                # 提前启动一个无法登记、也无法在后续 stop 中回收的替代实例。
+                await self._stop_runtime(runtime)
+                if self._runtimes.get(instance_id) is runtime:
+                    self._runtimes.pop(instance_id, None)
+                stopped.append(instance_id)
                 try:
                     replacement = await self._start_runtime(row)
                 except Exception as exc:
@@ -6220,7 +6231,6 @@ class MediaProxyManager:
                         {"status": "error", "last_error": message},
                     )
                     continue
-                await self._stop_runtime(runtime)
                 self._runtimes[instance_id] = replacement
                 started.append(instance_id)
 

@@ -181,3 +181,12 @@ class LocalMediaBrowserTests(IsolatedDatabaseTestCase):
         ):
             self.assertIn(contract, js)
         self.assertNotIn("window.addEventListener('scroll', closeItemContextMenu, true)", js)
+
+    def test_scrape_modal_uses_shared_modal_lifecycle(self):
+        js = Path("app/static/js/local-media.js").read_text(encoding="utf-8")
+
+        self.assertIn("const scrapeLifecycle = window.createAppModal($('lmScrapeModal')", js)
+        self.assertIn("onRequestClose: closeScrape", js)
+        self.assertIn("scrapeLifecycle.open(trigger, {initialFocus: $('lmScrapeCloseBtn')})", js)
+        self.assertIn("scrapeLifecycle.close()", js)
+        self.assertNotIn("else if (!$('lmScrapeModal').hidden) closeScrape()", js)

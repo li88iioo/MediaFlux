@@ -12,7 +12,10 @@ from typing import Any, Callable
 from app import config
 from app.indexers.models import IndexerMediaSearchRequest
 from app.indexers.runtime import build_indexer_service
+from app.logger import get_logger
 from app.modules.indexer_download import download_indexer_result_public
+
+logger = get_logger(__name__)
 
 _SITE_ERROR_MESSAGES = {
     "timeout": "响应超时",
@@ -211,6 +214,7 @@ class TelegramIndexerWorker:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._service = None
         self._startup_error: BaseException | None = None
+        self._stopping = False
 
     def search(self, query: str) -> dict[str, Any]:
         if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
@@ -248,11 +252,21 @@ class TelegramIndexerWorker:
         self._ensure_started()
         if self._startup_error is not None:
             raise TelegramResourceSearchError("资源站服务启动失败") from self._startup_error
-        loop = self._loop
-        service = self._service
+        with self._lock:
+            if self._stopping:
+                raise TelegramResourceSearchError("资源站服务正在关闭，请稍后重试")
+            loop = self._loop
+            service = self._service
         if loop is None or service is None:
             raise TelegramResourceSearchError("资源站服务尚未就绪")
-        future = asyncio.run_coroutine_threadsafe(factory(service), loop)
+        coroutine = factory(service)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except BaseException:
+            close = getattr(coroutine, "close", None)
+            if callable(close):
+                close()
+            raise
         try:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError as exc:
@@ -263,6 +277,8 @@ class TelegramIndexerWorker:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            if self._stopping:
+                raise TelegramResourceSearchError("资源站服务正在关闭，请稍后重试")
             self._ready.clear()
             self._startup_error = None
             self._thread = threading.Thread(
@@ -289,35 +305,48 @@ class TelegramIndexerWorker:
             loop.close()
             return
         self._ready.set()
-        try:
+        while True:
             loop.run_forever()
-        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             try:
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    loop.run_until_complete(
-                        asyncio.gather(*pending, return_exceptions=True)
-                    )
                 loop.run_until_complete(service.aclose())
-            finally:
-                loop.close()
-                with self._lock:
-                    self._loop = None
-                    self._service = None
+            except Exception as exc:
+                # IndexerService 的 close 是可重试的；保持同一 owner loop 和
+                # service 存活，下一次 stop 再次触发关闭，不能创建第二套客户端池。
+                logger.warning(
+                    "关闭 Telegram 资源站运行时失败 type=%s", type(exc).__name__
+                )
+                continue
+            break
+        loop.close()
+        with self._lock:
+            if self._loop is loop:
+                self._loop = None
+            if self._service is service:
+                self._service = None
 
     def stop(self, timeout: float = 5.0) -> bool:
         with self._lock:
             loop = self._loop
             thread = self._thread
+            if thread is None:
+                self._stopping = False
+                return True
+            self._stopping = True
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=timeout)
         with self._lock:
-            if thread is None or not thread.is_alive():
+            if self._thread is thread and not thread.is_alive():
                 self._thread = None
+                self._stopping = False
                 return True
         return False
 

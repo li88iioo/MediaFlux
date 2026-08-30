@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from app import database as db
-from app.clients.guangya import GuangYaClient
+from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
@@ -57,25 +57,27 @@ class STRMMetadataWorker:
         logger.info("STRM 元数据后台下载器已启动")
 
     def stop(self, timeout: float = 30.0) -> bool:
-        self._stop_event.set()
-        self._wake_event.set()
-        thread = self._thread
+        with self._state_lock:
+            self._stop_event.set()
+            self._wake_event.set()
+            thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(0.1, float(timeout or 0.1)))
-        stopped = not thread or not thread.is_alive()
-        if stopped:
+        if thread and thread.is_alive():
+            logger.warning("STRM 元数据后台下载器未能在关闭超时内结束")
+            return False
+
+        with self._state_lock:
+            # join 期间允许显式 restart；只清理本轮捕获的旧线程，不能抹掉
+            # 新线程句柄或关闭它正在复用的 HTTP Client。
+            if self._thread is not thread:
+                logger.warning("STRM 元数据后台下载器在关闭期间已重新启动")
+                return False
             self._thread = None
             client = self._client
             self._client = None
-            close = getattr(client, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-        else:
-            logger.warning("STRM 元数据后台下载器未能在关闭超时内结束")
-        return stopped
+        close_guangya_client(client)
+        return True
 
     def wake(self) -> None:
         self._wake_event.set()

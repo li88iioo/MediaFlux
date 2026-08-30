@@ -4203,6 +4203,7 @@ from app.repositories.download_requests import (  # noqa: E402
     mark_download_request_local_media_skipped,
     finalize_download_request_notification,
     renew_download_request_notification_lease,
+    recover_stale_submitting_download_requests,
     update_download_request,
     update_download_request_and_sync_media_admission,
     update_download_request_for_local_media_task,
@@ -6355,6 +6356,7 @@ def create_local_media_task(
     timestamp = now()
     token = str(operation_token or uuid.uuid4().hex)
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         source = conn.execute(
             "SELECT id FROM local_media_sources WHERE id=? AND owner=?",
             (int(source_id), safe_owner),

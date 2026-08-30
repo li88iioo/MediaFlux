@@ -417,8 +417,16 @@ jobs:
           set -euo pipefail
           exact="$IMAGE_REPOSITORY:$DOCKER_VERSION"
           promotion_digest="$IMAGE_DIGEST"
-          existing_digest=$(docker buildx imagetools inspect "$exact" 2>/dev/null \
-            | awk '$1 == "Digest:" {print $2; exit}' || true)
+          existing_digest=""
+          if existing_digest=$(bash packaging/scripts/inspect_registry_digest.sh "$exact"); then
+            :
+          else
+            inspect_status=$?
+            if [[ "$inspect_status" -ne 3 ]]; then
+              echo "Unable to determine whether immutable tag $exact exists; refusing promotion" >&2
+              exit "$inspect_status"
+            fi
+          fi
           if [[ -n "$existing_digest" && "$existing_digest" != "$IMAGE_DIGEST" ]]; then
             docker buildx imagetools inspect "$exact" --raw > "$RUNNER_TEMP/existing-exact-manifest.json"
             if ! jq -e '
@@ -467,7 +475,8 @@ jobs:
           if [[ "$STABLE" == "true" ]]; then
             for mutable_tag in "$IMAGE_REPOSITORY:$SERIES" "$IMAGE_REPOSITORY:latest"; do
               allow_mutable=true
-              if docker buildx imagetools inspect "$mutable_tag" >/dev/null 2>&1; then
+              mutable_digest=""
+              if mutable_digest=$(bash packaging/scripts/inspect_registry_digest.sh "$mutable_tag"); then
                 safe_name=$(printf '%s' "$mutable_tag" | tr '/:.' '____')
                 docker run --rm --platform linux/amd64 --entrypoint python \
                   "$mutable_tag" mediaflux.py version --json \
@@ -476,6 +485,12 @@ jobs:
                 if ! python packaging/scripts/check_version_promotion.py "$VERSION" "$current_version"; then
                   allow_mutable=false
                   echo "Keep $mutable_tag on newer version $current_version"
+                fi
+              else
+                inspect_status=$?
+                if [[ "$inspect_status" -ne 3 ]]; then
+                  echo "Unable to determine whether mutable tag $mutable_tag exists; refusing promotion" >&2
+                  exit "$inspect_status"
                 fi
               fi
               if [[ "$allow_mutable" == "true" ]]; then

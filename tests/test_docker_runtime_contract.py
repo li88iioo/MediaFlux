@@ -114,6 +114,11 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertNotIn("/healthz", self.dockerfile)
         self.assertNotIn("flask_port", self.dockerfile)
         self.assertNotIn("healthcheck", self.compose["services"]["mediaflux"])
+        self.assertIn("export WEB_PORT=1258", self.entrypoint)
+        self.assertLess(
+            self.entrypoint.index("export WEB_PORT=1258"),
+            self.entrypoint.index('if [ "$(id -u)" -ne 0 ]; then'),
+        )
 
     def test_production_compose_is_single_file_and_first_run_ready(self) -> None:
         service = self.compose["services"]["mediaflux"]

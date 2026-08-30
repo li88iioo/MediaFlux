@@ -169,6 +169,18 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         self.assertNotIn("PRIVATESECRET", rendered)
         self.assertNotIn("passkey", rendered)
 
+    def test_qb_login_timeout_is_safe_to_retry_before_torrent_submission(self):
+        client = QBittorrentClient(
+            "http://qb.internal:8080", username="u", password="secret",
+        )
+        client._session.post = MagicMock(side_effect=requests.ReadTimeout("login timeout"))
+
+        result = client.add_torrent_detailed(urls="magnet:?xt=urn:btih:PRIVATESECRET")
+
+        self.assertEqual(result, TorrentAddResult(False, "qb_unavailable", True))
+        client._session.post.assert_called_once()
+        self.assertTrue(client._session.post.call_args.args[0].endswith("/api/v2/auth/login"))
+
     def test_preview_selects_retryable_failed_qb_only_and_is_sanitized(self):
         qb_sub = self._subscription()
         gy_sub = self._subscription("GuangYa RSS", "guangya")

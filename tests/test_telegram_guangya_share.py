@@ -41,6 +41,7 @@ class FakeShareClient:
         self.inspect_calls: list[str] = []
         self.restore_calls: list[tuple[str, list[str], str]] = []
         self.create_dir_calls: list[tuple[str, str]] = []
+        self.close_calls = 0
 
     def inspect_share(self, share_url: str) -> dict:
         self.inspect_calls.append(share_url)
@@ -59,6 +60,9 @@ class FakeShareClient:
             SimpleNamespace(file_id="dir-private-1", name="电影", is_dir=True, size=0),
             SimpleNamespace(file_id="not-a-dir", name="readme.txt", is_dir=False, size=10),
         ]
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class FakeMarkup:
@@ -578,6 +582,7 @@ class TelegramShareViewTests(unittest.TestCase):
     def test_target_directory_view_lists_only_directories_and_callbacks_stay_opaque(self):
         from app.bot.handlers import _share_target_view
 
+        client = FakeShareClient()
         text, markup = _share_target_view(
             FAKE_TELEBOT,
             self.preview_id,
@@ -586,7 +591,7 @@ class TelegramShareViewTests(unittest.TestCase):
             parent_id="0",
             parent_name="根目录",
             page=0,
-            client=FakeShareClient(),
+            client=client,
             store=self.store,
         )
         labels = [button.text for button in markup.buttons]
@@ -598,6 +603,49 @@ class TelegramShareViewTests(unittest.TestCase):
         self.assertIn("目标目录", text)
         self.assertTrue(all(re.fullmatch(r"gys:[A-Za-z0-9_-]{8,}", value) for value in callbacks))
         self.assertTrue(all("dir-private-1" not in value for value in callbacks))
+        self.assertEqual(client.close_calls, 0)
+
+    def test_target_directory_view_closes_owned_client_when_rendering_fails(self):
+        from app.bot.handlers import _share_target_view
+
+        client = FakeShareClient()
+        client.logged_in = False
+        with patch("app.clients.guangya.GuangYaClient", return_value=client):
+            with self.assertRaisesRegex(ValueError, "未登录"):
+                _share_target_view(
+                    FAKE_TELEBOT,
+                    self.preview_id,
+                    chat_id="chat",
+                    user_id="user",
+                    store=self.store,
+                )
+
+        self.assertEqual(client.close_calls, 1)
+
+    def test_telegram_share_inspection_closes_short_lived_client_on_success_and_failure(self):
+        from app.bot.handlers import _inspect_telegram_share
+
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id="chat"),
+            from_user=SimpleNamespace(id="user"),
+        )
+        bot = Mock()
+        successful = FakeShareClient()
+        failed = FakeShareClient()
+        failed.inspect_share = Mock(side_effect=RuntimeError("upstream failed"))
+
+        with patch(
+            "app.modules.share_transfer.get_share_transfer_store", return_value=self.store,
+        ), patch(
+            "app.modules.share_transfer.GuangYaClient", side_effect=[successful, failed],
+        ):
+            _inspect_telegram_share(bot, message, SHARE_URL, FAKE_TELEBOT)
+            _inspect_telegram_share(bot, message, SHARE_URL, FAKE_TELEBOT)
+
+        self.assertEqual(successful.close_calls, 1)
+        self.assertEqual(failed.close_calls, 1)
+        self.assertEqual(bot.reply_to.call_count, 2)
+        self.assertIn("解析失败", bot.reply_to.call_args.args[1])
 
 
 class ShareApiSecurityTests(IsolatedDatabaseTestCase):

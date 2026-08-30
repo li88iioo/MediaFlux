@@ -458,3 +458,51 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         self.assertEqual(refresh.call_args.args[0], [path])
         self.assertFalse(refresh.call_args.kwargs["immediate"])
         self.assertEqual(db.count_strm_metadata_refresh_paths(), 0)
+
+    def test_stop_does_not_discard_worker_restarted_during_join(self):
+        from unittest.mock import patch
+
+        from app.modules.strm_metadata_worker import STRMMetadataWorker
+
+        class FakeClient:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        class FakeThread:
+            def __init__(self, *, alive=False, on_join=None):
+                self.alive = alive
+                self.on_join = on_join
+
+            def is_alive(self):
+                return self.alive
+
+            def start(self):
+                self.alive = True
+
+            def join(self, timeout=None):
+                self.alive = False
+                if self.on_join:
+                    self.on_join()
+
+        worker = STRMMetadataWorker()
+        client = FakeClient()
+        replacement = FakeThread()
+        old = FakeThread(alive=True, on_join=worker.start)
+        worker._thread = old
+        worker._client = client
+
+        with patch("app.modules.strm_metadata_worker.threading.Thread", return_value=replacement):
+            self.assertFalse(worker.stop(timeout=0.1))
+
+        self.assertIs(worker._thread, replacement)
+        self.assertTrue(replacement.is_alive())
+        self.assertFalse(worker._stop_event.is_set())
+        self.assertEqual(client.close_calls, 0)
+
+        replacement.alive = False
+        self.assertTrue(worker.stop(timeout=0.1))
+        self.assertIsNone(worker._thread)
+        self.assertEqual(client.close_calls, 1)

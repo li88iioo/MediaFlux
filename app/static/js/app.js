@@ -784,12 +784,61 @@
         return {activate};
     };
 
-    window.createAppModal = function (modal) {
+    const modalStack = [];
+
+    function syncModalOpenState() {
+        document.body.classList.toggle('modal-open', modalStack.length > 0);
+    }
+
+    function pruneModalStack() {
+        for (let index = modalStack.length - 1; index >= 0; index -= 1) {
+            if (modalStack[index].modal.hidden) modalStack.splice(index, 1);
+        }
+        syncModalOpenState();
+    }
+
+    function registerModalLayer(layer) {
+        const existing = modalStack.indexOf(layer);
+        if (existing >= 0) modalStack.splice(existing, 1);
+        modalStack.push(layer);
+        syncModalOpenState();
+    }
+
+    function unregisterModalLayer(layer) {
+        const index = modalStack.indexOf(layer);
+        if (index >= 0) modalStack.splice(index, 1);
+        syncModalOpenState();
+    }
+
+    function topModalLayer() {
+        pruneModalStack();
+        return modalStack[modalStack.length - 1] || null;
+    }
+
+    function canRestoreModalFocus(target) {
+        return Boolean(
+            target
+            && target.isConnected !== false
+            && !target.closest?.('[hidden], [aria-hidden="true"]'),
+        );
+    }
+
+    function restoreModalFocus(target) {
+        if (canRestoreModalFocus(target)) {
+            target.focus?.({preventScroll: true});
+            return;
+        }
+        const layer = topModalLayer();
+        const fallback = layer?.focusableElements?.()[0] || layer?.dialog;
+        fallback?.focus?.({preventScroll: true});
+    }
+
+    window.createAppModal = function (modal, options = {}) {
         if (!modal) return null;
         // 弹窗必须脱离带 transform/animation 的页面内容容器，否则 fixed 会相对
         // 容器而非浏览器视口定位，长页面中会出现在当前可视区域下方。
         if (modal.parentElement !== document.body) document.body.appendChild(modal);
-        const dialog = modal.querySelector('[role="dialog"]');
+        const dialog = modal.querySelector('[role="dialog"], [role="alertdialog"]') || modal;
         const focusableSelector = [
             'a[href]', 'button:not([disabled])', 'input:not([disabled]):not([type="hidden"])',
             'select:not([disabled])', 'textarea:not([disabled])', '[tabindex]:not([tabindex="-1"])',
@@ -804,6 +853,7 @@
                 && !element.closest?.('[hidden], [aria-hidden="true"]')
             ));
         }
+        const layer = {modal, dialog, focusableElements};
         function resolveInitialFocus(initialFocus) {
             if (typeof initialFocus === 'string') return dialog?.querySelector(initialFocus);
             return initialFocus || focusableElements()[0] || dialog;
@@ -811,29 +861,41 @@
         function close({restoreFocus = true} = {}) {
             focusGeneration += 1;
             modal.hidden = true;
-            document.body.classList.remove('modal-open');
+            unregisterModalLayer(layer);
             const target = returnFocus;
             returnFocus = null;
-            if (restoreFocus && target?.isConnected !== false) target?.focus?.({preventScroll: true});
+            if (restoreFocus) restoreModalFocus(target);
+        }
+        function requestClose(reason = 'dismiss') {
+            if (typeof options.onRequestClose === 'function') {
+                options.onRequestClose({reason, close});
+                return;
+            }
+            close();
         }
         function open(trigger, {initialFocus = null} = {}) {
             const generation = ++focusGeneration;
             returnFocus = trigger || document.activeElement;
             modal.hidden = false;
-            document.body.classList.add('modal-open');
+            registerModalLayer(layer);
             requestAnimationFrame(() => {
-                if (generation !== focusGeneration || modal.hidden) return;
+                if (generation !== focusGeneration || modal.hidden || topModalLayer() !== layer) return;
                 resolveInitialFocus(initialFocus)?.focus?.({preventScroll: true});
             });
         }
-        modal.querySelectorAll('[data-modal-close]').forEach((button) => button.addEventListener('click', () => close()));
-        modal.addEventListener('click', (event) => { if (event.target === modal) close(); });
+        modal.querySelectorAll('[data-modal-close]').forEach((button) => (
+            button.addEventListener('click', () => requestClose('control'))
+        ));
+        modal.addEventListener('click', (event) => {
+            if (event.target === modal) requestClose('backdrop');
+        });
         document.addEventListener('keydown', (event) => {
-            if (modal.hidden) return;
+            if (modal.hidden || topModalLayer() !== layer) return;
             if (event.key === 'Escape') {
                 event.preventDefault();
+                event.stopImmediatePropagation?.();
                 event.stopPropagation();
-                close();
+                requestClose('escape');
                 return;
             }
             if (event.key !== 'Tab' || !dialog) return;
@@ -855,7 +917,12 @@
                 first.focus({preventScroll: true});
             }
         });
-        return {open, close};
+        return {
+            open,
+            close,
+            requestClose,
+            isTop: () => !modal.hidden && topModalLayer() === layer,
+        };
     };
 
     const confirmModal = document.getElementById('appConfirmModal');
@@ -871,23 +938,18 @@
         const confirmSubmit = document.getElementById('appConfirmSubmit');
         const confirmIcon = confirmModal.querySelector('[data-confirm-icon]');
         let activeConfirm = null;
-        let confirmReturnFocus = null;
+        let confirmLifecycle = null;
 
-        function confirmFocusable() {
-            return [...confirmDialog.querySelectorAll('button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])')];
-        }
         function syncConfirmSubmit() {
             if (!activeConfirm) return;
             const verifyText = activeConfirm.verifyText || '';
             confirmSubmit.disabled = activeConfirm.busy || (verifyText && confirmVerifyInput.value !== verifyText);
         }
-        function finishConfirm(value) {
+        function finishConfirm(value, {restoreFocus = true} = {}) {
             if (!activeConfirm) return;
             const resolve = activeConfirm.resolve;
             activeConfirm = null;
-            confirmModal.hidden = true;
-            document.body.classList.remove('modal-open');
-            confirmReturnFocus?.focus?.();
+            confirmLifecycle.close({restoreFocus});
             resolve(value);
         }
         async function submitConfirm() {
@@ -913,43 +975,27 @@
                 syncConfirmSubmit();
             }
         }
+        confirmLifecycle = window.createAppModal(confirmModal, {
+            onRequestClose: () => {
+                if (activeConfirm?.dismissible !== false && !activeConfirm?.busy) finishConfirm(false);
+            },
+        });
         confirmCancel.addEventListener('click', () => finishConfirm(false));
         confirmSubmit.addEventListener('click', submitConfirm);
         confirmVerifyInput.addEventListener('input', syncConfirmSubmit);
-        confirmModal.addEventListener('click', (event) => {
-            if (event.target === confirmModal && activeConfirm?.dismissible !== false && !activeConfirm.busy) finishConfirm(false);
-        });
         document.addEventListener('keydown', (event) => {
-            if (confirmModal.hidden || !activeConfirm) return;
-            if (event.key === 'Escape' && activeConfirm.dismissible !== false && !activeConfirm.busy) {
-                event.preventDefault();
-                finishConfirm(false);
-                return;
-            }
+            if (!activeConfirm || !confirmLifecycle.isTop()) return;
             if (event.key === 'Enter' && !event.shiftKey && document.activeElement === confirmVerifyInput) {
                 event.preventDefault();
                 submitConfirm();
-                return;
-            }
-            if (event.key !== 'Tab') return;
-            const focusable = confirmFocusable();
-            if (!focusable.length) return;
-            const first = focusable[0];
-            const last = focusable[focusable.length - 1];
-            if (event.shiftKey && document.activeElement === first) {
-                event.preventDefault();
-                last.focus();
-            } else if (!event.shiftKey && document.activeElement === last) {
-                event.preventDefault();
-                first.focus();
             }
         });
 
         window.appConfirm = function (options = {}) {
-            if (activeConfirm) finishConfirm(false);
+            const trigger = options.trigger || document.activeElement;
+            if (activeConfirm) finishConfirm(false, {restoreFocus: false});
             const danger = options.danger === true;
             const verifyText = String(options.verifyText || '');
-            confirmReturnFocus = options.trigger || document.activeElement;
             confirmModal.classList.remove('is-danger', 'has-error');
             confirmModal.classList.toggle('is-danger', danger);
             confirmKicker.textContent = danger ? 'DANGEROUS ACTION' : (options.kicker || 'CONFIRM ACTION');
@@ -964,8 +1010,6 @@
             confirmVerifyInput.value = '';
             confirmVerifyInput.placeholder = verifyText;
             confirmCancel.disabled = false;
-            confirmModal.hidden = false;
-            document.body.classList.add('modal-open');
             renderIcons(confirmModal);
             return new Promise((resolve) => {
                 activeConfirm = {
@@ -978,7 +1022,9 @@
                     busy: false,
                 };
                 syncConfirmSubmit();
-                requestAnimationFrame(() => (verifyText ? confirmVerifyInput : confirmCancel).focus());
+                confirmLifecycle.open(trigger, {
+                    initialFocus: verifyText ? confirmVerifyInput : confirmCancel,
+                });
             });
         };
     } else {
@@ -987,14 +1033,13 @@
 
     const messageModal = document.getElementById('appMessageModal');
     if (messageModal) {
-        const messageDialog = messageModal.querySelector('[role="alertdialog"]');
         const messageTitle = document.getElementById('appMessageTitle');
         const messageText = document.getElementById('appMessageText');
         const messageKicker = document.getElementById('appMessageKicker');
         const messageClose = document.getElementById('appMessageClose');
         const messageIcon = messageModal.querySelector('[data-message-icon]');
         let activeMessage = null;
-        let messageReturnFocus = null;
+        let messageLifecycle = null;
 
         const messageTypes = {
             success: {title: '操作完成', kicker: 'SUCCESS', icon: 'circle-check-big'},
@@ -1002,39 +1047,33 @@
             warning: {title: '请注意', kicker: 'ATTENTION', icon: 'triangle-alert'},
             error: {title: '操作失败', kicker: 'ERROR', icon: 'circle-x'},
         };
-        function finishMessage() {
+        function finishMessage({restoreFocus = true} = {}) {
             if (!activeMessage) return;
             const resolve = activeMessage.resolve;
             activeMessage = null;
-            messageModal.hidden = true;
-            if (confirmModal?.hidden !== false) document.body.classList.remove('modal-open');
-            messageReturnFocus?.focus?.();
+            messageLifecycle.close({restoreFocus});
             resolve(true);
         }
-        messageClose.addEventListener('click', finishMessage);
-        messageModal.addEventListener('click', (event) => {
-            if (event.target === messageModal && activeMessage?.dismissible !== false) finishMessage();
+        messageLifecycle = window.createAppModal(messageModal, {
+            onRequestClose: () => {
+                if (activeMessage?.dismissible !== false) finishMessage();
+            },
         });
+        messageClose.addEventListener('click', () => finishMessage());
         document.addEventListener('keydown', (event) => {
-            if (messageModal.hidden || !activeMessage) return;
-            if ((event.key === 'Escape' && activeMessage.dismissible !== false) || event.key === 'Enter') {
-                event.preventDefault();
-                finishMessage();
-                return;
-            }
-            if (event.key !== 'Tab') return;
+            if (!activeMessage || !messageLifecycle.isTop() || event.key !== 'Enter') return;
             event.preventDefault();
-            messageClose.focus();
+            finishMessage();
         });
 
         window.appAlert = function (options = {}) {
             if (typeof options === 'string') options = {message: options};
-            if (activeMessage) finishMessage();
+            const trigger = options.trigger || document.activeElement;
+            if (activeMessage) finishMessage({restoreFocus: false});
             const type = ['success', 'info', 'warning', 'error'].includes(options.type)
                 ? options.type
                 : 'info';
             const meta = messageTypes[type];
-            messageReturnFocus = options.trigger || document.activeElement;
             messageModal.classList.remove('is-success', 'is-info', 'is-warning', 'is-error');
             messageModal.classList.add(`is-${type}`);
             messageKicker.textContent = options.kicker || meta.kicker;
@@ -1042,12 +1081,10 @@
             messageText.textContent = options.message || '';
             messageClose.textContent = options.closeText || '知道了';
             messageIcon.innerHTML = `<i data-lucide="${options.icon || meta.icon}"></i>`;
-            messageModal.hidden = false;
-            document.body.classList.add('modal-open');
             renderIcons(messageModal);
             return new Promise((resolve) => {
                 activeMessage = {resolve, dismissible: options.dismissible};
-                requestAnimationFrame(() => messageClose.focus());
+                messageLifecycle.open(trigger, {initialFocus: messageClose});
             });
         };
     } else {

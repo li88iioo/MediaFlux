@@ -440,6 +440,86 @@ class MediaProxyManagerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(manager._runtimes[9], replacement)
         self.assertEqual(result, {"started": [9], "stopped": [9], "failed": {}})
 
+    async def test_reconcile_stop_failure_retains_runtime_and_does_not_start_replacement(self):
+        from app.modules import media_proxy
+
+        row = {
+            "id": 9,
+            "listen_host": "127.0.0.1",
+            "listen_port": 18100,
+            "upstream_url": "http://127.0.0.1:8096",
+            "enabled": 1,
+        }
+        task = MagicMock()
+        task.done.return_value = False
+        previous = media_proxy.ProxyRuntime(
+            instance_id=9,
+            bind=("127.0.0.1", 18099),
+            server=MagicMock(),
+            task=task,
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+        )
+        manager = media_proxy.MediaProxyManager()
+        manager._runtimes[9] = previous
+
+        with (
+            patch.object(media_proxy.database, "list_media_proxy_instances", return_value=[row]),
+            patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
+            patch.object(
+                manager,
+                "_stop_runtime",
+                new=AsyncMock(side_effect=RuntimeError("client close failed")),
+            ) as stop,
+            patch.object(manager, "_start_runtime", new=AsyncMock()) as start,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "client close failed"):
+                await manager.reconcile()
+
+        stop.assert_awaited_once_with(previous)
+        start.assert_not_awaited()
+        self.assertIs(manager._runtimes[9], previous)
+
+    async def test_restart_stop_failure_retains_runtime_and_does_not_start_replacement(self):
+        from app.modules import media_proxy
+
+        row = {
+            "id": 9,
+            "listen_host": "127.0.0.1",
+            "listen_port": 18099,
+            "upstream_url": "http://127.0.0.1:8096",
+            "enabled": 1,
+        }
+        task = MagicMock()
+        task.done.return_value = False
+        previous = media_proxy.ProxyRuntime(
+            instance_id=9,
+            bind=("127.0.0.1", 18099),
+            server=MagicMock(),
+            task=task,
+            sock=MagicMock(),
+            signed_urls=MagicMock(),
+        )
+        manager = media_proxy.MediaProxyManager()
+        manager._runtimes[9] = previous
+
+        with (
+            patch.object(media_proxy.database, "get_media_proxy_instance", return_value=row),
+            patch.object(media_proxy, "resolve_proxy_instance", return_value=row),
+            patch.object(
+                manager,
+                "_stop_runtime",
+                new=AsyncMock(side_effect=RuntimeError("client close failed")),
+            ) as stop,
+            patch.object(manager, "_start_runtime", new=AsyncMock()) as start,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "client close failed"):
+                await manager.restart_instance(9)
+
+        stop.assert_awaited_once_with(previous)
+        start.assert_not_awaited()
+        self.assertIs(manager._runtimes[9], previous)
+
     async def test_reconcile_offloads_sqlite_work_from_event_loop(self):
         from app.modules import media_proxy
 

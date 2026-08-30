@@ -21,6 +21,11 @@ require_numeric_id() {
 
 mkdir -p /app/db/cache /app/db/logs /data/strm
 
+# 官方镜像内部端口是稳定契约；宿主机端口只通过 Docker 的端口映射调整。
+# 备份恢复的 user.env 可能来自本机部署，不能让其中的 WEB_PORT 改变容器
+# 监听端口并使固定 1258 的 healthcheck 永久失败。
+export WEB_PORT=1258
+
 # 显式指定 Docker user 时，尊重调用方预先准备的权限。
 if [ "$(id -u)" -ne 0 ]; then
     exec "$@"

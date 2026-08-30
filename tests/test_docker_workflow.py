@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -114,6 +116,71 @@ class DockerWorkflowTests(unittest.TestCase):
             "      - name: Re-verify release tag before promotion", 1
         )[0]
         self.assertNotIn('$IMAGE_REPOSITORY@$IMAGE_DIGEST', candidate_smoke)
+
+    def test_registry_existence_checks_fail_closed_before_promotion(self) -> None:
+        promote = self.text.split("      - name: Promote verified image tags", 1)[1]
+        self.assertGreaterEqual(
+            promote.count("packaging/scripts/inspect_registry_digest.sh"),
+            2,
+        )
+        self.assertIn("Unable to determine whether immutable tag", promote)
+        self.assertIn("Unable to determine whether mutable tag", promote)
+
+        script = Path("packaging/scripts/inspect_registry_digest.sh").resolve()
+        reference = "ghcr.io/example/mediaflux:v0.1.9"
+        with tempfile.TemporaryDirectory() as directory:
+            fake_docker = Path(directory) / "docker"
+            fake_docker.write_text(
+                """#!/bin/sh
+case "$FAKE_REGISTRY_RESULT" in
+  exists)
+    printf 'Name: %s\nDigest: sha256:abc123\n' "$4"
+    exit 0
+    ;;
+  missing)
+    printf 'ERROR: %s: not found\n' "$4" >&2
+    exit 1
+    ;;
+  unauthorized)
+    printf 'ERROR: unauthorized: authentication required\n' >&2
+    exit 1
+    ;;
+  credentials-missing)
+    printf 'ERROR: %s: credentials file not found\n' "$4" >&2
+    exit 1
+    ;;
+  no-digest)
+    printf 'Name: %s\n' "$4"
+    exit 0
+    ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+            base_env = {
+                **os.environ,
+                "PATH": f"{directory}:{os.environ.get('PATH', '')}",
+                "MEDIAFLUX_REGISTRY_INSPECT_ATTEMPTS": "1",
+                "MEDIAFLUX_REGISTRY_INSPECT_DELAY_SECONDS": "0",
+            }
+
+            def inspect(result: str):
+                return subprocess.run(
+                    ["bash", str(script), reference],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env={**base_env, "FAKE_REGISTRY_RESULT": result},
+                )
+
+            existing = inspect("exists")
+            self.assertEqual(existing.returncode, 0, existing.stderr)
+            self.assertEqual(existing.stdout.strip(), "sha256:abc123")
+            self.assertEqual(inspect("missing").returncode, 3)
+            self.assertEqual(inspect("unauthorized").returncode, 1)
+            self.assertEqual(inspect("credentials-missing").returncode, 1)
+            self.assertEqual(inspect("no-digest").returncode, 1)
 
     def test_version_tag_is_immutable_and_mutable_tags_cannot_regress(self) -> None:
         promote = self.text.split("      - name: Promote verified image tags", 1)[1]

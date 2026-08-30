@@ -3109,12 +3109,17 @@
             return;
         }
         const sessionItem = button?.closest('.agent-session-item');
-        if (sessionItem && window.MFAnim && typeof window.MFAnim.slideOutAndCollapse === 'function') {
-            window.MFAnim.slideOutAndCollapse(sessionItem);
-        }
+        button?.classList.remove('is-armed');
+        button?.setAttribute('aria-label', `删除会话：${sessionTitle}`);
+        button?.setAttribute('aria-busy', 'true');
         setSessionTransitionBusy(true);
         try {
             await fetchJSON(`/api/agent/sessions/${encodeURIComponent(normalized)}`, {method: 'DELETE'});
+            if (sessionItem && window.MFAnim && typeof window.MFAnim.slideOutAndCollapse === 'function') {
+                try {
+                    window.MFAnim.slideOutAndCollapse(sessionItem);
+                } catch (_) { /* 动效失败不能改变已完成的删除结果 */ }
+            }
             if (agentSessionId === normalized) {
                 conversationGeneration += 1;
                 agentSessionId = createAgentSessionId();
@@ -3126,6 +3131,7 @@
             announceSessionStatus(`删除会话“${sessionTitle}”失败。`);
             appendRequestError(error);
         } finally {
+            button?.setAttribute('aria-busy', 'false');
             setSessionTransitionBusy(false);
         }
     }

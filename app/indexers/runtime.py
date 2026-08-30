@@ -120,31 +120,50 @@ def _stop_standalone_runtime(timeout_seconds: float = 10.0) -> bool:
                 pending = ()
         for future in pending:
             future.cancel()
-        closed = True
+
+        closed = _service is None
         if loop.is_running() and not loop.is_closed():
+            shutdown_awaitable = shutdown_indexer_service()
             try:
-                future = asyncio.run_coroutine_threadsafe(
-                    shutdown_indexer_service(), loop,
-                )
-                future.result(timeout=max(0.1, float(timeout_seconds)))
+                future = asyncio.run_coroutine_threadsafe(shutdown_awaitable, loop)
             except Exception as exc:
-                closed = False
+                _close_awaitable(shutdown_awaitable)
+                logger.warning(
+                    "提交 Indexer 独立运行时关闭失败 type=%s", type(exc).__name__
+                )
+                return False
+            try:
+                future.result(timeout=max(0.1, float(timeout_seconds)))
+                closed = True
+            except Exception as exc:
+                future.cancel()
+                # service/client 必须在其所属 loop 上重试关闭。首次失败时保留
+                # loop、thread 和 stopping 栅栏，不能让后续调用创建第二套运行时。
                 logger.warning(
                     "关闭 Indexer 独立运行时失败 type=%s", type(exc).__name__
                 )
-            finally:
+                return False
+            try:
                 loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+
         if thread is not threading.current_thread():
             thread.join(timeout=max(0.1, float(timeout_seconds)))
         stopped = not thread.is_alive()
+        if not (closed and stopped):
+            return False
+
         with _runtime_loop_lock:
             if _runtime_loop is loop:
                 _runtime_loop = None
                 _runtime_stopping = False
                 _runtime_futures.clear()
-            _standalone_loop = None
-            _standalone_thread = None
-        return closed and stopped
+            if _standalone_loop is loop:
+                _standalone_loop = None
+            if _standalone_thread is thread:
+                _standalone_thread = None
+        return True
 
 
 def _submit_to_runtime_loop(

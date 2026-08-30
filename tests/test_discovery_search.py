@@ -161,26 +161,56 @@ class DiscoverySearchUnitTests(unittest.TestCase):
             release.set()
             executor.delegate.shutdown(wait=True)
 
-    def test_provider_close_failure_does_not_block_remaining_providers(self):
+    def test_provider_close_failure_is_retried_without_reclosing_successes(self):
         from app.discovery.search import DiscoverySearchService
 
         class Provider(FakeSearchProvider):
-            def __init__(self, name, fail=False):
+            def __init__(self, name, fail_once=False):
                 super().__init__(name)
-                self.fail = fail
-                self.closed = False
+                self.fail_once = fail_once
+                self.close_calls = 0
 
             def close(self):
-                self.closed = True
-                if self.fail:
+                self.close_calls += 1
+                if self.fail_once and self.close_calls == 1:
                     raise RuntimeError("close failed")
 
-        first = Provider("tmdb", fail=True)
+        first = Provider("tmdb", fail_once=True)
         second = Provider("douban")
         service = DiscoverySearchService(providers={"tmdb": first, "douban": second})
-        service.shutdown()
-        self.assertTrue(first.closed)
-        self.assertTrue(second.closed)
+
+        self.assertFalse(service.shutdown())
+        self.assertEqual((first.close_calls, second.close_calls), (1, 1))
+        self.assertTrue(service.shutdown())
+        self.assertEqual((first.close_calls, second.close_calls), (2, 1))
+
+    def test_global_search_service_handle_is_retained_until_close_retry_succeeds(self):
+        from app.discovery import search
+
+        class Provider(FakeSearchProvider):
+            def __init__(self):
+                super().__init__("tmdb")
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls == 1:
+                    raise RuntimeError("close failed")
+
+        search.shutdown_discovery_search_service()
+        provider = Provider()
+        service = search.DiscoverySearchService(providers={"tmdb": provider})
+        search._search_service = service
+        try:
+            self.assertFalse(search.shutdown_discovery_search_service())
+            self.assertIs(search._search_service, service)
+            self.assertTrue(search.shutdown_discovery_search_service())
+            self.assertIsNone(search._search_service)
+            self.assertEqual(provider.close_calls, 2)
+        finally:
+            if search._search_service is service:
+                provider.close_calls = max(provider.close_calls, 1)
+                search.shutdown_discovery_search_service()
 
     def test_tmdb_search_maps_movie_and_tv_and_ignores_people(self):
         from app.discovery.search import TMDBSearchProvider

@@ -540,16 +540,23 @@ def _share_target_view(telebot, preview_id: str, *, chat_id: str, user_id: str =
                        parent_id: str = "0", parent_name: str = "根目录", page: int = 0,
                        trail=None, client=None, store=None):
     """构建光鸭目标目录选择器，目录 ID 仅保存在服务端 action store。"""
-    from app.clients.guangya import GuangYaClient
+    from app.clients.guangya import GuangYaClient, close_guangya_client
     from app.modules.share_transfer import get_share_transfer_store
 
     store = store or get_share_transfer_store()
     store.snapshot(preview_id, chat_id, user_id)
     store.begin_actions(preview_id, chat_id, user_id)
+    owns_client = client is None
     client = client or GuangYaClient()
-    if not client.logged_in:
-        raise ValueError("光鸭未登录，请先重新登录")
-    directories = [item for item in client.list_dir(str(parent_id or "0")) if item.is_dir]
+    try:
+        if not client.logged_in:
+            raise ValueError("光鸭未登录，请先重新登录")
+        directories = [
+            item for item in client.list_dir(str(parent_id or "0")) if item.is_dir
+        ]
+    finally:
+        if owns_client:
+            close_guangya_client(client)
     pages = max(1, (len(directories) + _SHARE_DIR_PAGE_SIZE - 1) // _SHARE_DIR_PAGE_SIZE)
     page = max(0, min(int(page), pages - 1))
     trail = list(trail or [])
@@ -2217,7 +2224,6 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
         )
 
 def _inspect_telegram_share(bot, msg, share_url: str, telebot) -> None:
-    from app.clients.guangya import GuangYaClient
     from app.modules.share_transfer import (
         get_share_transfer_store, inspect_share_for_transfer,
     )
@@ -2228,7 +2234,6 @@ def _inspect_telegram_share(bot, msg, share_url: str, telebot) -> None:
             share_url,
             chat_id,
             user_id,
-            client=GuangYaClient(),
             store=get_share_transfer_store(),
         )
         text, markup = _share_selection_view(
@@ -2253,7 +2258,6 @@ def _edit_share_message(bot, call, text: str, markup=None) -> None:
 
 
 def _handle_share_callback(bot, call, telebot) -> None:
-    from app.clients.guangya import GuangYaClient
     from app.modules.share_transfer import get_share_transfer_store
 
     store = get_share_transfer_store()
@@ -2301,8 +2305,7 @@ def _handle_share_callback(bot, call, telebot) -> None:
                 parent_id=str(value.get("parent_id") or "0"),
                 parent_name=str(value.get("parent_name") or "根目录"),
                 page=int(value.get("page") or 0),
-                trail=value.get("trail") or [],
-                client=GuangYaClient(), store=store,
+                trail=value.get("trail") or [], store=store,
             )
         elif action == "choose_target":
             value = value if isinstance(value, dict) else {}
