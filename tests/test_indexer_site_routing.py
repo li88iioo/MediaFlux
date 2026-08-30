@@ -13,19 +13,19 @@ from app.indexers.config import plan_media_site_route, tmdb_detail_is_animation
 from app.indexers.service import IndexerService
 from app.modules.media_subscriptions import _resolve_search_sites
 
-ALL_SITES = ("nyaa", "mikan", "btbtla", "1lou", "animetosho", "tpb")
+ALL_SITES = ("nyaa", "mikan", "btbtla", "1lou", "tpb")
 
 
 class PlanMediaSiteRouteTests(unittest.TestCase):
     def test_japanese_anime_prefers_anime_trackers_and_drops_tpb(self):
         routed = plan_media_site_route(ALL_SITES, is_animation=True, original_language="ja")
 
-        self.assertEqual(routed, ("mikan", "nyaa", "animetosho", "1lou", "btbtla"))
+        self.assertEqual(routed, ("mikan", "nyaa", "1lou", "btbtla"))
 
     def test_chinese_anime_prefers_cn_forums_and_drops_mikan(self):
         routed = plan_media_site_route(ALL_SITES, is_animation=True, original_language="zh")
 
-        self.assertEqual(routed, ("1lou", "btbtla", "nyaa", "animetosho"))
+        self.assertEqual(routed, ("1lou", "btbtla", "nyaa"))
 
     def test_live_action_drops_anime_only_sites(self):
         for language in ("zh", "en", ""):
@@ -45,9 +45,9 @@ class PlanMediaSiteRouteTests(unittest.TestCase):
 
     def test_routing_fails_open_when_everything_would_be_dropped(self):
         # 只启用了动漫专站却搜真人影视：宁可搜到噪声也不能一个站都不搜。
-        routed = plan_media_site_route(("mikan", "animetosho"), is_animation=False)
+        routed = plan_media_site_route(("mikan",), is_animation=False)
 
-        self.assertEqual(routed, ("mikan", "animetosho"))
+        self.assertEqual(routed, ("mikan",))
 
     def test_respects_the_enabled_subset(self):
         routed = plan_media_site_route(("nyaa", "tpb"), is_animation=True, original_language="ja")
@@ -81,7 +81,7 @@ class TmdbAnimationDetectionTests(unittest.TestCase):
 class ServiceMediaSiteRouteTests(unittest.TestCase):
     def test_route_uses_registry_order_and_enabled_subset(self):
         stub = SimpleNamespace(
-            registry=SimpleNamespace(ids=lambda: ("nyaa", "mikan", "btbtla", "1lou", "animetosho", "tpb", "sukebei")),
+            registry=SimpleNamespace(ids=lambda: ("nyaa", "mikan", "btbtla", "1lou", "tpb", "sukebei")),
             enabled_site_ids=frozenset({"nyaa", "1lou", "tpb", "sukebei"}),
         )
 

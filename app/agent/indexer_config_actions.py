@@ -16,6 +16,7 @@ from app.indexers.config import (
     INDEXER_SITE_ORDER,
     build_indexer_site_updates,
     normalize_indexer_site_ids,
+    normalize_persisted_indexer_site_ids,
 )
 from app.logger import get_logger
 
@@ -87,7 +88,7 @@ def current_indexer_site_ids(*, strict: bool = False) -> tuple[str, ...]:
     )
     raw = str(configured or "")
     try:
-        requested = set(normalize_indexer_site_ids(raw))
+        requested = set(normalize_persisted_indexer_site_ids(raw))
     except ValueError as exc:
         if strict:
             raise AgentToolError(

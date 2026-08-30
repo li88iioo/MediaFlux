@@ -321,7 +321,6 @@ class DiscoveryPageTests(InitializedWebTestCase):
             'data-indexer-site="mikan"',
             'data-indexer-site="btbtla"',
             'data-indexer-site="1lou"',
-            'data-indexer-site="animetosho"',
             'data-indexer-site="tpb"',
             'data-indexer-site="sukebei"',
             '成人内容，默认关闭',
@@ -345,6 +344,9 @@ class DiscoveryPageTests(InitializedWebTestCase):
             '<strong>Sukebei</strong><small>成人</small>',
         ):
             self.assertIn(contract, html)
+        self.assertIn("const DEFAULT_INDEXER_SITES=['nyaa','mikan','btbtla','1lou','tpb'];", html)
+        self.assertNotIn("AnimeTosho", html)
+        self.assertNotIn('data-indexer-site="animetosho"', html)
         styles = STYLES.read_text(encoding="utf-8")
         self.assertRegex(
             styles,

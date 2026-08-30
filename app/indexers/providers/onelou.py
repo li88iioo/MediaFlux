@@ -17,6 +17,7 @@ from ..errors import (
     IndexerInvalidResponse,
     IndexerRateLimited,
     IndexerSecurityError,
+    IndexerTimeout,
     IndexerUnavailable,
 )
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
@@ -38,6 +39,7 @@ _THREAD_HREF = re.compile(r"thread-\d+\.htm")
 # 站点搜索 JSON API 的固定参数（“全部”筛选）。
 _SEARCH_API_PATH = "/search/api/search.php"
 _SEARCH_API_PARAMS = {
+    "fid": "0",
     "page": "1",
     # 1LOU 的 relevance 只返回高相关旧帖子集，无法在服务层补回未返回的新帖；
     # 因此所有本地排序模式都先取 newest 子集，再由聚合层做最终排序。
@@ -47,7 +49,9 @@ _SEARCH_API_PARAMS = {
     "year": "全部",
     "quality": "全部",
     "source": "全部",
-    "track": "1",
+    # 站点前端只在用户显式提交搜索表单时使用 track=1；服务端后台检索
+    # 不应重复写入站点搜索统计，因此保持官方页面的静默值。
+    "track": "0",
 }
 
 
@@ -80,12 +84,18 @@ class OneLouAdapter(IndexerAdapter):
         http,
         google_search: GoogleSiteSearch | None = None,
         min_interval_seconds: float = 0,
+        endpoint_timeout_seconds: float | None = None,
         monotonic: Callable[[], float] | None = None,
         sleeper: Callable[[float], Awaitable[None]] | None = None,
     ):
         self.http = http
         self.google_search = google_search
         self.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self.endpoint_timeout_seconds = (
+            max(0.1, float(endpoint_timeout_seconds))
+            if endpoint_timeout_seconds is not None
+            else None
+        )
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleeper or asyncio.sleep
         self._search_slot_lock = CrossLoopAsyncLock()
@@ -109,7 +119,7 @@ class OneLouAdapter(IndexerAdapter):
             self._last_search_started = self._monotonic()
 
     def search_timeout_overhead_seconds(self) -> float:
-        # 原生链耗尽预算后仍为可选 Google 回退保留独立的短预算。
+        # 单个原生入口已有独立上限，再为可选 Google 回退保留短预算。
         return self.google_search.timeout_seconds if self.google_search is not None else 0.0
 
     def _join_known_host(self, candidate: str) -> str:
@@ -193,7 +203,7 @@ class OneLouAdapter(IndexerAdapter):
         html_fallback_bases: list[str] = []
         for base_url in (self.base_url, *self.mirror_base_urls):
             try:
-                response = await self.http.get(
+                response = await self._native_get(
                     fixed_host_join(base_url, _SEARCH_API_PATH),
                     params={"q": request.query, **_SEARCH_API_PARAMS},
                 )
@@ -211,7 +221,7 @@ class OneLouAdapter(IndexerAdapter):
             except IndexerInvalidResponse as exc:
                 html_fallback_bases.append(base_url)
                 best_error = self._prefer_error(best_error, exc)
-            except (IndexerRateLimited, IndexerUnavailable, IndexerSecurityError) as exc:
+            except (IndexerRateLimited, IndexerTimeout, IndexerUnavailable, IndexerSecurityError) as exc:
                 # 429/5xx/安全跳转不追加旧搜索请求，避免限流时继续施压或放宽 HTTPS。
                 best_error = self._prefer_error(best_error, exc)
             except httpx.TransportError:
@@ -223,7 +233,7 @@ class OneLouAdapter(IndexerAdapter):
         # 仅当 API 结构本身失效时尝试旧版 HTML 路径；镜像 429/5xx 不走此分支。
         for base_url in html_fallback_bases:
             try:
-                response = await self.http.get(
+                response = await self._native_get(
                     fixed_host_join(base_url, f"/search-{quote(request.query, safe='')}.htm"),
                 )
                 self._validate_status(response.status_code)
@@ -234,18 +244,34 @@ class OneLouAdapter(IndexerAdapter):
                     best_error,
                     IndexerUnavailable("1lou legacy search transport failed"),
                 )
-            except (IndexerInvalidResponse, IndexerRateLimited, IndexerUnavailable, IndexerSecurityError) as exc:
+            except (
+                IndexerInvalidResponse,
+                IndexerRateLimited,
+                IndexerTimeout,
+                IndexerUnavailable,
+                IndexerSecurityError,
+            ) as exc:
                 best_error = self._prefer_error(best_error, exc)
         assert best_error is not None
         raise best_error
+
+    async def _native_get(self, url: str, **kwargs):
+        operation = self.http.get(url, **kwargs)
+        if self.endpoint_timeout_seconds is None:
+            return await operation
+        try:
+            return await asyncio.wait_for(operation, timeout=self.endpoint_timeout_seconds)
+        except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+            raise IndexerTimeout(f"1lou endpoint timed out: {url}") from exc
 
     @staticmethod
     def _prefer_error(current: IndexerError | None, candidate: IndexerError) -> IndexerError:
         priorities = {
             IndexerInvalidResponse: 1,
             IndexerUnavailable: 2,
-            IndexerSecurityError: 3,
-            IndexerRateLimited: 4,
+            IndexerTimeout: 3,
+            IndexerSecurityError: 4,
+            IndexerRateLimited: 5,
         }
         current_priority = max(
             (priority for error_type, priority in priorities.items() if isinstance(current, error_type)),

@@ -163,9 +163,8 @@ class NyaaAdapter(DirectResultAdapter):
             if item is not None:
                 items.append(item)
         has_more = any(
-            (anchor.get_text(" ", strip=True).lower() in {"next", "next ›", ">", "›"})
-            or _page_number(anchor.get("href")) > request.page
-            for anchor in soup.select("ul.pagination a[href]")
+            _search_page_number(anchor.get("href"), base_url=base_url) > request.page
+            for anchor in soup.select(".pagination a[href]")
         )
         return IndexerPage(
             items=items,
@@ -346,3 +345,14 @@ def _page_number(href: str | None) -> int:
     except (TypeError, ValueError):
         pass
     return 0
+
+
+def _search_page_number(href: str | None, *, base_url: str) -> int:
+    try:
+        candidate = fixed_host_join(base_url, str(href or ""))
+    except IndexerSecurityError:
+        return 0
+    base_path = urlsplit(base_url).path.rstrip("/")
+    if urlsplit(candidate).path.rstrip("/") != base_path:
+        return 0
+    return _page_number(candidate)

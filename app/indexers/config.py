@@ -9,17 +9,30 @@ INDEXER_SITE_DEFINITIONS: tuple[tuple[str, str], ...] = (
     ("mikan", "Mikan"),
     ("btbtla", "BTBTLA"),
     ("1lou", "1LOU"),
-    ("animetosho", "AnimeTosho"),
     ("tpb", "The Pirate Bay"),
     ("sukebei", "Sukebei"),
 )
 INDEXER_SITE_ORDER = tuple(site_id for site_id, _label in INDEXER_SITE_DEFINITIONS)
 INDEXER_SITE_LABELS = dict(INDEXER_SITE_DEFINITIONS)
-DEFAULT_INDEXER_SITE_IDS = INDEXER_SITE_ORDER[:6]
+DEFAULT_INDEXER_SITE_IDS = ("nyaa", "mikan", "btbtla", "1lou", "tpb")
+_RETIRED_INDEXER_SITE_IDS = frozenset({"animetosho"})
 
 
 def normalize_indexer_site_ids(value: Any) -> tuple[str, ...]:
     """严格规范化固定站点 ID，去重并按产品顺序返回。"""
+    return _normalize_indexer_site_ids(value)
+
+
+def normalize_persisted_indexer_site_ids(value: Any) -> tuple[str, ...]:
+    """读取旧持久化配置时丢弃已下线站点，其他未知项仍严格报错。"""
+    return _normalize_indexer_site_ids(value, ignored=_RETIRED_INDEXER_SITE_IDS)
+
+
+def _normalize_indexer_site_ids(
+    value: Any,
+    *,
+    ignored: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
     if isinstance(value, str):
         raw = value
         if "\r" in raw or "\n" in raw or len(raw) > 256:
@@ -43,7 +56,7 @@ def normalize_indexer_site_ids(value: Any) -> tuple[str, ...]:
             raise ValueError("资源站点 ID 格式无效")
         requested.add(site_id)
 
-    unknown = sorted(requested - set(INDEXER_SITE_ORDER))
+    unknown = sorted(requested - set(INDEXER_SITE_ORDER) - ignored)
     if unknown:
         raise ValueError(f"未知资源站点: {', '.join(unknown)}")
     return tuple(site_id for site_id in INDEXER_SITE_ORDER if site_id in requested)
@@ -65,14 +78,14 @@ def build_indexer_site_updates(value: Any) -> dict[str, str]:
 #
 # 只剔除确定无关的站点，永不返回空集合（fail-open 回退全量），
 # 用户在订阅上显式配置的站点列表始终优先于自动路由。
-_ANIME_JA_PREFERRED = ("mikan", "nyaa", "animetosho", "1lou", "btbtla")
+_ANIME_JA_PREFERRED = ("mikan", "nyaa", "1lou", "btbtla")
 _ANIME_JA_DROPPED = frozenset({"tpb"})
 # 国漫主要在中文站；Mikan 只收录日本番组。
-_ANIME_ZH_PREFERRED = ("1lou", "btbtla", "nyaa", "animetosho")
+_ANIME_ZH_PREFERRED = ("1lou", "btbtla", "nyaa")
 _ANIME_ZH_DROPPED = frozenset({"mikan", "tpb"})
 # 真人影视不会出现在动漫专站。
 _LIVE_ACTION_PREFERRED = ("1lou", "btbtla", "tpb")
-_LIVE_ACTION_DROPPED = frozenset({"mikan", "animetosho", "nyaa"})
+_LIVE_ACTION_DROPPED = frozenset({"mikan", "nyaa"})
 
 
 def plan_media_site_route(

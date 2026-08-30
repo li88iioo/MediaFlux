@@ -15,7 +15,6 @@ from app.indexers.errors import (
 )
 from app.indexers.http import BrowserImpersonatingHttpClient, FixedHostHttpClient, IndexerHttpResponse
 from app.indexers.models import IndexerItem, IndexerSearchRequest
-from app.indexers.providers.animetosho import AnimeToshoAdapter
 from app.indexers.providers.btbtla import BTBtlaAdapter
 from app.indexers.providers.google_site import GoogleSiteSearch
 from app.indexers.providers.mikan import MikanAdapter
@@ -85,8 +84,6 @@ ONELOU_DETAIL_HTML = b'<a href="/attach-download-frieren.torrent">Frieren.torren
 ONELOU_DETAIL_MAGNET_HTML = (
     b'<a href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=Frieren">magnet</a>'
 )
-
-ANIMETOSHO_JSON = (_INDEXER_FIXTURES / "animetosho-search.json").read_bytes()
 
 TPB_JSON = (_INDEXER_FIXTURES / "tpb-search.json").read_bytes()
 
@@ -275,48 +272,11 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page.pagination_supported)
         self.assertEqual(http.calls, [])
 
-    async def test_animetosho_parses_json_and_resolves_direct_candidates(self):
-        http = FakeHttpClient(
-            ANIMETOSHO_JSON,
-            content_type="application/json; charset=utf-8",
-        )
-        adapter = AnimeToshoAdapter(http=http)
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(http.calls[0]["params"], {"q": "Frieren", "page": "1"})
-        item = page.items[0]
-        self.assertEqual(item.site_id, "animetosho")
-        self.assertEqual(item.size_bytes, 1073741824)
-        self.assertEqual(item.download_kinds, ("magnet", "torrent"))
-        resolved = await adapter.resolve(item)
-        self.assertEqual(resolved.kind, "magnet")
-
-    async def test_animetosho_only_reports_next_page_for_a_full_upstream_page(self):
-        short_http = FakeHttpClient(ANIMETOSHO_JSON, content_type="application/json")
-        short_page = await AnimeToshoAdapter(http=short_http).search(
-            IndexerSearchRequest.create("Frieren")
-        )
-        self.assertFalse(short_page.has_more)
-
-        full_payload = b"[" + b",".join([ANIMETOSHO_JSON[1:-1]] * 75) + b"]"
-        full_http = FakeHttpClient(full_payload, content_type="application/json")
-        full_page = await AnimeToshoAdapter(http=full_http).search(
-            IndexerSearchRequest.create("Frieren")
-        )
-        self.assertTrue(full_page.has_more)
-
-    async def test_animetosho_and_tpb_pacers_delay_repeated_search_slots(self):
+    async def test_tpb_pacer_delays_repeated_search_slots(self):
         sleeps: list[float] = []
-        times = iter([10.0, 10.0, 10.25, 11.0, 20.0, 20.0, 20.5, 21.0])
+        times = iter([20.0, 20.0, 20.5, 21.0])
         monotonic = lambda: next(times)
         sleeper = lambda delay: _record_sleep(sleeps, delay)
-        anime = AnimeToshoAdapter(
-            http=FakeHttpClient(ANIMETOSHO_JSON, content_type="application/json"),
-            min_interval_seconds=1,
-            monotonic=monotonic,
-            sleeper=sleeper,
-        )
         tpb = PirateBayAdapter(
             http=FakeHttpClient(TPB_JSON, content_type="application/json"),
             min_interval_seconds=1,
@@ -325,18 +285,16 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         request = IndexerSearchRequest.create("Frieren")
 
-        await anime.wait_for_search_slot(request)
-        await anime.wait_for_search_slot(request)
         await tpb.wait_for_search_slot(request)
         await tpb.wait_for_search_slot(request)
 
-        self.assertEqual(sleeps, [0.75, 0.5])
+        self.assertEqual(sleeps, [0.5])
 
     async def test_search_pacer_handles_zero_monotonic_origin(self):
         sleeps: list[float] = []
         times = iter([0.0, 0.0, 0.25, 1.0])
-        adapter = AnimeToshoAdapter(
-            http=FakeHttpClient(ANIMETOSHO_JSON, content_type="application/json"),
+        adapter = PirateBayAdapter(
+            http=FakeHttpClient(TPB_JSON, content_type="application/json"),
             min_interval_seconds=1,
             monotonic=lambda: next(times),
             sleeper=lambda delay: _record_sleep(sleeps, delay),
@@ -347,32 +305,6 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         await adapter.wait_for_search_slot(request)
 
         self.assertEqual(sleeps, [0.75])
-
-    async def test_animetosho_rejects_malformed_json(self):
-        adapter = AnimeToshoAdapter(
-            http=FakeHttpClient(b"{", content_type="application/json"),
-        )
-
-        with self.assertRaises(IndexerInvalidResponse):
-            await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-    async def test_animetosho_discards_unsafe_torrent_but_keeps_valid_magnet(self):
-        body = ANIMETOSHO_JSON.replace(
-            b"https://storage.animetosho.org/torrent/abc.torrent",
-            b"http://tracker.example/torrent/abc.torrent",
-        )
-        adapter = AnimeToshoAdapter(
-            http=FakeHttpClient(body, content_type="application/json"),
-        )
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(len(page.items), 1)
-        self.assertEqual(page.items[0].download_kinds, ("magnet",))
-        self.assertIsNone(page.items[0].torrent_url)
-        resolved = await adapter.resolve(page.items[0])
-        self.assertEqual(resolved.kind, "magnet")
-
     async def test_nyaa_parses_direct_downloads_counts_and_native_pagination(self):
         http = FakeHttpClient(NYAA_HTML)
         adapter = NyaaAdapter(
@@ -402,6 +334,41 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(item.torrent_url.endswith("/download/123.torrent"))
         self.assertEqual(http.calls[0]["params"]["p"], "1")
         self.assertEqual(http.calls[0]["params"]["q"], "Frieren")
+
+    async def test_nyaa_detects_mirror_div_pagination(self):
+        mirror_html = NYAA_HTML.replace(
+            b'<ul class="pagination">',
+            b'<div class="pagination">',
+        ).replace(b"</ul>", b"</div>")
+        adapter = NyaaAdapter(
+            site_id="nyaa",
+            site_name="Nyaa",
+            base_url="https://nyaa.net/",
+            http=FakeHttpClient(mirror_html),
+            default_enabled=True,
+        )
+
+        page = await adapter.search(IndexerSearchRequest.create("Frieren", page=1))
+
+        self.assertTrue(page.has_more)
+        self.assertTrue(page.pagination_supported)
+
+    async def test_nyaa_ignores_unrelated_pagination_component(self):
+        unrelated_pagination = NYAA_HTML.replace(
+            b'<ul class="pagination"><li><a href="/?p=2">Next</a></li></ul>',
+            b'<footer><div class="pagination"><a href="/help?p=2">Next</a></div></footer>',
+        )
+        adapter = NyaaAdapter(
+            site_id="nyaa",
+            site_name="Nyaa",
+            base_url="https://nyaa.net/",
+            http=FakeHttpClient(unrelated_pagination),
+            default_enabled=True,
+        )
+
+        page = await adapter.search(IndexerSearchRequest.create("Frieren", page=1))
+
+        self.assertFalse(page.has_more)
 
     async def test_nyaa_maps_requested_sort_to_upstream_subset(self):
         http = FakeHttpClient(NYAA_HTML)
@@ -757,7 +724,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
 
         page = await adapter.search(IndexerSearchRequest.create("Frieren", page=1))
 
-        self.assertFalse(page.pagination_supported)
+        self.assertTrue(page.pagination_supported)
         self.assertFalse(page.has_more)
         self.assertEqual(len(http.calls), 2, "search should load only the best matching show detail")
         self.assertEqual(http.calls[1]["url"], "https://www.btbtlb.com/detail/frieren")
@@ -778,6 +745,75 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(http.calls[2]["url"], "https://www.btbtlb.com/tdown/848617892.html")
         self.assertEqual(resolved.kind, "magnet")
         self.assertIn("urn:btih:0123456789abcdef0123456789abcdef01234567", resolved.value)
+
+    async def test_btbtla_prefers_complete_modern_resource_rows_when_layouts_coexist(self):
+        search_html = b"""
+        <div class="module-item">
+          <a class="module-item-title" href="/detail/demo.html">Demo</a>
+        </div>
+        """
+        detail_html = b"""
+        <div id="download-list">
+          <div class="module-row-one active">
+            <div class="module-row-info">
+              <a class="module-row-text" href="/tdown/1.html">Demo One [1GiB]</a>
+            </div>
+            <a class="btn-down" href="/tdown/1.html">11</a>
+          </div>
+          <div class="module-row-info">
+            <a class="module-row-text" href="/tdown/2.html">Demo Two [2GiB]</a>
+            <a class="btn-down" href="/tdown/2.html">22</a>
+          </div>
+          <div class="module-row-info">
+            <a class="module-row-text" href="/tdown/3.html">Demo Three [3GiB]</a>
+            <a class="btn-down" href="/tdown/3.html">33</a>
+          </div>
+          <div class="module-row-info">
+            <a class="module-row-text" href="/tdown/2.html">Duplicate Two [2GiB]</a>
+          </div>
+          <div class="module-row-info">
+            <a class="module-row-text" href="/pdown/cloud.html">Cloud Only [9GiB]</a>
+          </div>
+        </div>
+        """
+        http = FakeHttpClient(search_html)
+        http.responses = [search_html, detail_html]
+
+        page = await BTBtlaAdapter(http=http).search(IndexerSearchRequest.create("Demo"))
+
+        self.assertEqual(
+            [item.detail_url for item in page.items],
+            [
+                "https://www.btbtlb.com/tdown/1.html",
+                "https://www.btbtlb.com/tdown/2.html",
+                "https://www.btbtlb.com/tdown/3.html",
+            ],
+        )
+        self.assertEqual([item.downloads for item in page.items], [11, 22, 33])
+
+    async def test_btbtla_keeps_legacy_row_with_metadata_only_info_block(self):
+        search_html = b"""
+        <div class="module-item">
+          <a class="module-item-title" href="/detail/legacy.html">Legacy</a>
+        </div>
+        """
+        detail_html = b"""
+        <div id="download-list">
+          <div class="module-row-one active">
+            <div class="module-row-info"><span>metadata only</span></div>
+            <a class="module-row-text" href="/tdown/legacy.html">Legacy [1GiB]</a>
+            <a class="btn-down" href="/tdown/legacy.html">8</a>
+          </div>
+        </div>
+        """
+        http = FakeHttpClient(search_html)
+        http.responses = [search_html, detail_html]
+
+        page = await BTBtlaAdapter(http=http).search(IndexerSearchRequest.create("Legacy"))
+
+        self.assertEqual(len(page.items), 1)
+        self.assertEqual(page.items[0].detail_url, "https://www.btbtlb.com/tdown/legacy.html")
+        self.assertEqual(page.items[0].downloads, 8)
 
     async def test_btbtla_resolve_falls_back_to_trusted_torrent_url(self):
         download_html = b'<a href="/dlt/token-123">Torrent file</a>'
@@ -882,14 +918,73 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         await adapter.search(IndexerSearchRequest.create("two"))
         self.assertEqual(sleeps, [5.0])
 
-    async def test_btbtla_page_two_is_empty_without_upstream_request(self):
-        http = FakeHttpClient(BTBTLA_SEARCH_HTML)
-        page = await BTBtlaAdapter(http=http).search(IndexerSearchRequest.create("Frieren", page=2))
+    async def test_btbtla_detects_and_requests_native_search_pages(self):
+        first_search = b"""
+        <div class="module-item">
+          <a class="module-item-title" href="/detail/first.html">Star Wars</a>
+        </div>
+        <a class="page-next" href="/search/Star%20Wars/2">Next</a>
+        """
+        second_search = b"""
+        <div class="module-item">
+          <a class="module-item-title" href="/detail/second.html">Star Wars</a>
+        </div>
+        <a class="page-number" href="/search/Star%20Wars/1">1</a>
+        """
+        first_detail = b"""
+        <div id="download-list"><div class="module-row-info">
+          <a class="module-row-text" href="/tdown/first.html">Star Wars First [1GiB]</a>
+        </div></div>
+        """
+        second_detail = b"""
+        <div id="download-list"><div class="module-row-info">
+          <a class="module-row-text" href="/tdown/second.html">Star Wars Second [2GiB]</a>
+        </div></div>
+        """
+        http = FakeHttpClient(first_search)
+        http.responses = [first_search, first_detail, second_search, second_detail]
+        adapter = BTBtlaAdapter(http=http)
 
-        self.assertEqual(page.items, [])
-        self.assertFalse(page.pagination_supported)
+        first = await adapter.search(IndexerSearchRequest.create("Star Wars", page=1))
+        second = await adapter.search(IndexerSearchRequest.create("Star Wars", page=2))
+
+        self.assertTrue(first.pagination_supported)
+        self.assertTrue(first.has_more)
+        self.assertEqual(first.page, 1)
+        self.assertEqual([item.title for item in first.items], ["Star Wars First"])
+        self.assertTrue(second.pagination_supported)
+        self.assertFalse(second.has_more)
+        self.assertEqual(second.page, 2)
+        self.assertEqual([item.title for item in second.items], ["Star Wars Second"])
+        self.assertEqual(
+            [call["url"] for call in http.calls],
+            [
+                "https://www.btbtlb.com/search/Star%20Wars",
+                "https://www.btbtlb.com/detail/first.html",
+                "https://www.btbtlb.com/search/Star%20Wars/2",
+                "https://www.btbtlb.com/detail/second.html",
+            ],
+        )
+
+    async def test_btbtla_ignores_off_host_and_wrong_query_page_links(self):
+        search_html = b"""
+        <div class="module-item">
+          <a class="module-item-title" href="/detail/demo.html">Demo</a>
+        </div>
+        <a class="page-next" href="https://evil.example/search/Demo/2">Unsafe</a>
+        <a class="page-number" href="/search/Other/2">Other query</a>
+        """
+        detail_html = b"""
+        <div id="download-list"><div class="module-row-info">
+          <a class="module-row-text" href="/tdown/demo.html">Demo [1GiB]</a>
+        </div></div>
+        """
+        http = FakeHttpClient(search_html)
+        http.responses = [search_html, detail_html]
+
+        page = await BTBtlaAdapter(http=http).search(IndexerSearchRequest.create("Demo"))
+
         self.assertFalse(page.has_more)
-        self.assertEqual(http.calls, [])
 
     async def test_btbtla_resolve_rejects_off_host_redirect_with_fake_transport(self):
         seen = []
@@ -928,7 +1023,9 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(page.has_more)
         self.assertEqual(len(http.calls), 1, "search must not visit thread pages")
         self.assertIn("/search/api/search.php", http.calls[0]["url"])
+        self.assertEqual(http.calls[0]["params"]["fid"], "0")
         self.assertEqual(http.calls[0]["params"]["sort"], "newest")
+        self.assertEqual(http.calls[0]["params"]["track"], "0")
         self.assertEqual(len(page.items), 1, "cloud-drive-only results stay filtered")
         item = page.items[0]
         self.assertEqual(item.title, "Frieren Complete 1080p")
@@ -1011,6 +1108,31 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(page.items), 1)
         self.assertEqual(len(google_http.calls), 1)
         self.assertEqual(len(native_http.calls), 2)
+
+    async def test_onelou_endpoint_timeouts_still_reach_google_fallback(self):
+        class SlowNativeHttp(FakeHttpClient):
+            async def get(self, url: str, *, params=None, headers=None, max_redirects=3):
+                self.calls.append({
+                    "url": url,
+                    "params": dict(params or {}),
+                    "headers": dict(headers or {}),
+                })
+                await asyncio.sleep(0.2)
+                raise AssertionError("timed-out native request must be cancelled")
+
+        native_http = SlowNativeHttp(ONELOU_API_EMPTY, content_type="application/json")
+        google_http = FakeHttpClient(ONELOU_GOOGLE_HTML)
+        adapter = OneLouAdapter(
+            http=native_http,
+            google_search=GoogleSiteSearch(http=google_http),
+            endpoint_timeout_seconds=0.01,
+        )
+
+        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
+
+        self.assertEqual([item.title for item in page.items], ["Frieren Complete 1080p"])
+        self.assertEqual(len(native_http.calls), 2)
+        self.assertEqual(len(google_http.calls), 1)
 
     async def test_onelou_google_interstitial_cools_down_after_native_empty(self):
         native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
@@ -1241,7 +1363,6 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(registry.get("nyaa").http.pin_resolved_address)
         self.assertTrue(registry.get("mikan").http.pin_resolved_address)
         self.assertTrue(registry.get("1lou").http.pin_resolved_address)
-        self.assertTrue(registry.get("animetosho").http.pin_resolved_address)
         self.assertTrue(registry.get("tpb").http.pin_resolved_address)
         self.assertEqual(registry.get("1lou").min_interval_seconds, 5)
         self.assertIsNotNone(registry.get("1lou").google_search)
@@ -1255,23 +1376,20 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
             "btbtla": FakeHttpClient(BTBTLA_SEARCH_HTML),
             "1lou": FakeHttpClient(ONELOU_API_JSON, content_type="application/json"),
             "google": FakeHttpClient(ONELOU_GOOGLE_HTML),
-            "animetosho": FakeHttpClient(ANIMETOSHO_JSON, content_type="application/json"),
             "tpb": FakeHttpClient(TPB_JSON, content_type="application/json"),
         }
         registry = build_default_registry(http_clients=clients)
 
-        self.assertEqual(registry.ids(), ("nyaa", "sukebei", "mikan", "btbtla", "1lou", "animetosho", "tpb"))
+        self.assertEqual(registry.ids(), ("nyaa", "sukebei", "mikan", "btbtla", "1lou", "tpb"))
         self.assertTrue(registry.get("nyaa").default_enabled)
         self.assertFalse(registry.get("sukebei").default_enabled)
         self.assertTrue(registry.get("sukebei").capabilities.pagination_supported)
         self.assertEqual(registry.get("sukebei").base_url, "https://sukebei.nyaa.si/")
         self.assertTrue(registry.get("mikan").default_enabled)
         self.assertTrue(registry.get("btbtla").default_enabled)
-        self.assertFalse(registry.get("btbtla").capabilities.pagination_supported)
+        self.assertTrue(registry.get("btbtla").capabilities.pagination_supported)
         self.assertTrue(registry.get("1lou").default_enabled)
         self.assertEqual(registry.get("1lou").capabilities.download_kinds, ("torrent", "magnet"))
-        self.assertTrue(registry.get("animetosho").default_enabled)
-        self.assertEqual(registry.get("animetosho").capabilities.download_kinds, ("magnet", "torrent"))
         self.assertTrue(registry.get("tpb").default_enabled)
         self.assertEqual(registry.get("tpb").capabilities.download_kinds, ("magnet",))
 

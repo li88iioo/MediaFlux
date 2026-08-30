@@ -2617,7 +2617,6 @@ def feature_state_followup_request(
 
 
 _INDEXER_SITE_ALIASES = (
-    ("animetosho", ("anime tosho", "animetosho")),
     ("tpb", ("the pirate bay", "pirate bay", "海盗湾", "tpb")),
     ("btbtla", ("btbtla",)),
     ("sukebei", ("sukebei",)),

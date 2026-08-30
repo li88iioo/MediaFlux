@@ -357,6 +357,9 @@ def build_indexer_service() -> IndexerService:
     # Nyaa 有主站和镜像两个端点；单端点预算必须显著短于总站点预算，
     # 否则主站卡满后服务层会取消整个适配器，镜像永远没有执行机会。
     nyaa_endpoint_timeout_seconds = max(0.5, min(4.0, site_timeout_seconds * 0.4))
+    # 1LOU 的两个可信入口当前偶有应用层长时间无响应；限制单入口预算，
+    # 确保镜像和可选 Google 回退仍能在总站点预算内执行。
+    onelou_endpoint_timeout_seconds = max(0.5, min(3.0, site_timeout_seconds * 0.3))
     registry = build_default_registry(
         user_agent=_user_agent(),
         nyaa_endpoint_timeout_seconds=nyaa_endpoint_timeout_seconds,
@@ -366,6 +369,7 @@ def build_indexer_service() -> IndexerService:
         onelou_min_interval_seconds=_bounded_int(
             "INDEXER_1LOU_MIN_INTERVAL_SECONDS", 5, 0, 10
         ),
+        onelou_endpoint_timeout_seconds=onelou_endpoint_timeout_seconds,
         onelou_google_enabled=config.get_bool("INDEXER_1LOU_GOOGLE_ENABLED", True),
     )
     configured = _csv(

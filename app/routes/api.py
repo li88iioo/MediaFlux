@@ -167,12 +167,6 @@ _BOOLEAN_VALUES = {
     "1": "1", "true": "1", "yes": "1", "on": "1", "y": "1",
     "0": "0", "false": "0", "no": "0", "off": "0", "n": "0",
 }
-_INDEXER_SITE_ORDER = (
-    "nyaa", "mikan", "btbtla", "1lou", "animetosho", "tpb", "sukebei",
-)
-_DEFAULT_INDEXER_SITES = _INDEXER_SITE_ORDER[:6]
-
-
 def _is_config_mask(value: Any) -> bool:
     return str(value).strip() == _CONFIG_MASK
 

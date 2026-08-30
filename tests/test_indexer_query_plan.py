@@ -26,12 +26,11 @@ class IndexerQueryPlanTests(unittest.TestCase):
                 self.assertNotIn("2026", " ".join(queries))
 
     def test_anime_sites_prefer_latin_alias_then_original_title(self):
-        for site_id in ("nyaa", "animetosho"):
-            with self.subTest(site_id=site_id):
-                queries = build_site_queries(site_id, self.request)
-                self.assertEqual(queries[0], "Tefuda ga Oome no Victoria")
-                self.assertIn("手札が多めのビクトリア", queries)
-                self.assertLessEqual(len(queries), 3)
+        queries = build_site_queries("nyaa", self.request)
+
+        self.assertEqual(queries[0], "Tefuda ga Oome no Victoria")
+        self.assertIn("手札が多めのビクトリア", queries)
+        self.assertLessEqual(len(queries), 3)
 
     def test_tpb_uses_english_and_latin_only_when_available(self):
         queries = build_site_queries("tpb", self.request)

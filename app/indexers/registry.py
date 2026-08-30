@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from .http import BrowserImpersonatingHttpClient, FixedHostHttpClient
-from .providers.animetosho import AnimeToshoAdapter
 from .providers.base import IndexerAdapter
 from .providers.btbtla import BTBtlaAdapter
 from .providers.google_site import GoogleSiteSearch
@@ -50,7 +49,7 @@ def build_default_registry(
     nyaa_endpoint_timeout_seconds: float = 4,
     btbtla_min_interval_seconds: float = 5,
     onelou_min_interval_seconds: float = 5,
-    animetosho_min_interval_seconds: float = 1,
+    onelou_endpoint_timeout_seconds: float = 3,
     tpb_min_interval_seconds: float = 1,
     onelou_google_enabled: bool = True,
 ) -> IndexerRegistry:
@@ -89,15 +88,6 @@ def build_default_registry(
             max_redirects=0,
             pin_resolved_address=True,
         )
-    animetosho_http = supplied.get("animetosho") or FixedHostHttpClient(
-        allowed_hosts={
-            "feed.animetosho.org",
-            "storage.animetosho.org",
-            "animetosho.org",
-        },
-        user_agent=user_agent,
-        pin_resolved_address=True,
-    )
     tpb_http = supplied.get("tpb") or FixedHostHttpClient(
         allowed_hosts={"apibay.org"},
         user_agent=user_agent,
@@ -130,10 +120,7 @@ def build_default_registry(
                 http=onelou_http,
                 google_search=GoogleSiteSearch(http=google_http) if google_http is not None else None,
                 min_interval_seconds=onelou_min_interval_seconds,
-            ),
-            "animetosho": AnimeToshoAdapter(
-                http=animetosho_http,
-                min_interval_seconds=animetosho_min_interval_seconds,
+                endpoint_timeout_seconds=onelou_endpoint_timeout_seconds,
             ),
             "tpb": PirateBayAdapter(
                 http=tpb_http,

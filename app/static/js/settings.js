@@ -35,8 +35,8 @@
             field.addEventListener('change',gate.invalidate);
         });
     }
-    const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','1lou','animetosho','tpb','sukebei'];
-    const DEFAULT_INDEXER_SITES=INDEXER_SITE_ORDER.slice(0,6);
+    const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','1lou','tpb','sukebei'];
+    const DEFAULT_INDEXER_SITES=['nyaa','mikan','btbtla','1lou','tpb'];
     const indexerSiteBox=form.querySelector('[data-indexer-site-box]');
     const indexerSiteField=indexerSiteBox?.querySelector('[data-key="INDEXER_ENABLED_SITES"]');
     const indexerSiteInputs=[...(indexerSiteBox?.querySelectorAll('[data-indexer-site]')||[])];

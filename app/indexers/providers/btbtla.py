@@ -6,7 +6,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -41,7 +41,7 @@ class BTBtlaAdapter(IndexerAdapter):
     base_url = "https://www.btbtlb.com/"
     mirror_base_urls = ("https://btbtlb.com/",)
     default_enabled = True
-    capabilities = IndexerCapabilities(pagination_supported=False, download_kinds=("magnet", "torrent"))
+    capabilities = IndexerCapabilities(pagination_supported=True, download_kinds=("magnet", "torrent"))
 
     def __init__(
         self,
@@ -72,8 +72,6 @@ class BTBtlaAdapter(IndexerAdapter):
         return self.min_interval_seconds * paced_gaps
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
-        if request.page > 1:
-            return IndexerPage(items=[], page=request.page, has_more=False, pagination_supported=False)
         last_error: IndexerRateLimited | IndexerUnavailable | None = None
         for base_url in self._host_bases:
             try:
@@ -91,7 +89,10 @@ class BTBtlaAdapter(IndexerAdapter):
         *,
         detail_limit: int,
     ) -> IndexerPage:
-        search_url = fixed_host_join(base_url, f"/search/{quote(request.query, safe='')}")
+        search_path = f"/search/{quote(request.query, safe='')}"
+        if request.page > 1:
+            search_path = f"{search_path}/{request.page}"
+        search_url = fixed_host_join(base_url, search_path)
         response = await self._get(search_url)
         try:
             self._validate_response("search", response)
@@ -99,10 +100,21 @@ class BTBtlaAdapter(IndexerAdapter):
             response_base_url = self._base_for_url(response.url)
             soup = BeautifulSoup(response.body, "lxml")
             candidates = self._parse_search_candidates(soup, base_url=response_base_url)
+            has_more = self._has_search_page_link(
+                soup,
+                query=request.query,
+                page=request.page + 1,
+                base_url=response_base_url,
+            )
             text = soup.get_text(" ", strip=True).lower()
             if not candidates:
                 if any(marker in text for marker in ("暂无", "无结果", "no result")):
-                    return IndexerPage(items=[], page=1, has_more=False, pagination_supported=False)
+                    return IndexerPage(
+                        items=[],
+                        page=request.page,
+                        has_more=False,
+                        pagination_supported=True,
+                    )
                 raise IndexerInvalidResponse("BTBtla search page structure is invalid")
         except IndexerInvalidResponse as exc:
             raise IndexerUnavailable("BTBtla search endpoint returned an invalid page") from exc
@@ -146,7 +158,12 @@ class BTBtlaAdapter(IndexerAdapter):
                 break
         if not items and detail_error is not None:
             raise detail_error
-        return IndexerPage(items=items, page=1, has_more=False, pagination_supported=False)
+        return IndexerPage(
+            items=items,
+            page=request.page,
+            has_more=has_more,
+            pagination_supported=True,
+        )
 
     async def resolve(self, stored_result: IndexerItem) -> ResolvedDownload:
         self._validate_stored_result(stored_result)
@@ -241,9 +258,15 @@ class BTBtlaAdapter(IndexerAdapter):
     ) -> list[IndexerItem]:
         items: list[IndexerItem] = []
         seen_urls: set[str] = set()
-        # 旧布局：#download-list 容器内的 module-row-one；新布局可能只保留
-        # module-row-info 块，两者都解析。
-        rows = soup.select("#download-list .module-row-one") or soup.select(".module-row-info")
+        download_list = soup.select_one("#download-list")
+        scope = download_list if download_list is not None else soup
+        modern_rows = scope.select(".module-row-info")
+        legacy_rows = scope.select(".module-row-one")
+        # 线上页面会同时保留少量旧 Tab 容器和全部现代资源行。旧实现用
+        # ``old_rows or modern_rows``，只要旧容器存在就会丢掉绝大多数资源。
+        # 现代行优先，再兼容旧容器。旧容器可能把 module-row-info 仅作为
+        # 元数据块、把真正的下载链接放在外层；两类节点都扫描并由 URL 去重。
+        rows = [*modern_rows, *legacy_rows]
         for row in rows:
             resource_anchor = None
             resource_url = ""
@@ -279,11 +302,25 @@ class BTBtlaAdapter(IndexerAdapter):
                 continue
 
             downloads = None
-            download_counter = row.select_one("a.btn-down[href]")
-            if download_counter is not None:
+            download_counters = list(row.select("a.btn-down[href]"))
+            if not download_counters:
+                legacy_parent = row.find_parent(class_="module-row-one")
+                if legacy_parent is not None:
+                    download_counters = list(legacy_parent.select("a.btn-down[href]"))
+            for download_counter in download_counters:
+                try:
+                    counter_url = self._join_known_host(
+                        download_counter.get("href") or "",
+                        relative_base_url=base_url,
+                    )
+                except IndexerSecurityError:
+                    continue
+                if counter_url != resource_url:
+                    continue
                 count_match = re.search(r"\d+", download_counter.get_text(" ", strip=True))
                 if count_match:
                     downloads = int(count_match.group(0))
+                break
             items.append(
                 IndexerItem(
                     site_id=self.site_id,
@@ -299,6 +336,31 @@ class BTBtlaAdapter(IndexerAdapter):
                 )
             )
         return items
+
+    def _has_search_page_link(
+        self,
+        soup: BeautifulSoup,
+        *,
+        query: str,
+        page: int,
+        base_url: str,
+    ) -> bool:
+        expected_url = fixed_host_join(
+            base_url,
+            f"/search/{quote(query, safe='')}/{page}",
+        )
+        expected_path = unquote(urlsplit(expected_url).path).rstrip("/")
+        for anchor in soup.select("a[href]"):
+            try:
+                candidate = self._join_known_host(
+                    anchor.get("href") or "",
+                    relative_base_url=base_url,
+                )
+            except IndexerSecurityError:
+                continue
+            if unquote(urlsplit(candidate).path).rstrip("/") == expected_path:
+                return True
+        return False
 
     @staticmethod
     def _search_candidate_score(query: str, title: str) -> tuple[int, int]:

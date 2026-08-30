@@ -36,6 +36,7 @@ from app.indexers.config import (
     DEFAULT_INDEXER_SITE_IDS,
     INDEXER_SITE_ORDER,
     normalize_indexer_site_ids,
+    normalize_persisted_indexer_site_ids,
 )
 from app.main import create_app
 from app.routes.api import _normalize_indexer_sites
@@ -55,9 +56,15 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
                 "INDEXER_SUKEBEI_ENABLED": "1",
             },
         )
+        self.assertEqual(
+            normalize_persisted_indexer_site_ids("nyaa,animetosho"),
+            ("nyaa",),
+        )
         for value in (["nyaa", "evil"], ["nyaa", 1], "nyaa\nevil", object()):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 normalize_indexer_site_ids(value)
+        with self.assertRaises(ValueError):
+            normalize_indexer_site_ids("nyaa,animetosho")
 
     def test_arguments_reject_arbitrary_configuration_and_empty_selection(self):
         self.assertEqual(
@@ -94,9 +101,11 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
             {"site_ids": ["nyaa", "mikan", "tpb"]},
         )
         self.assertEqual(
-            indexer_sites_request("把参与资源检索的站点设置为 Sukebei 和 AnimeTosho"),
-            {"site_ids": ["sukebei", "animetosho"]},
+            indexer_sites_request("把参与资源检索的站点设置为 Sukebei 和 TPB"),
+            {"site_ids": ["sukebei", "tpb"]},
         )
+        with self.assertRaises(AgentToolError):
+            indexer_sites_request("把参与资源检索的站点设置为 AnimeTosho")
         self.assertEqual(
             indexer_sites_request("只启用蜜柑和海盗湾这些资源站点"),
             {"site_ids": ["mikan", "tpb"]},
@@ -177,7 +186,7 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
                     resolve_indexer_site_change(
                         unopened, current_site_ids=["sukebei"]
                     ),
-                    list(INDEXER_SITE_ORDER),
+                    list(normalize_indexer_site_ids((*DEFAULT_INDEXER_SITE_IDS, "sukebei"))),
                 )
         self.assertEqual(
             indexer_site_change_request("关闭所有站点"),

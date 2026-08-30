@@ -11,7 +11,7 @@ from app.indexers import runtime
 
 class FakeRegistry:
     def ids(self):
-        return ("nyaa", "sukebei", "mikan", "btbtla", "1lou", "animetosho", "tpb")
+        return ("nyaa", "sukebei", "mikan", "btbtla", "1lou", "tpb")
 
     def enabled_ids(self):
         return ("nyaa",)
@@ -72,6 +72,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             nyaa_endpoint_timeout_seconds=4.0,
             btbtla_min_interval_seconds=5,
             onelou_min_interval_seconds=5,
+            onelou_endpoint_timeout_seconds=3.0,
             onelou_google_enabled=True,
         )
         self.assertIs(service.registry, registry)
@@ -93,8 +94,30 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             service.enabled_site_ids,
-            frozenset({"nyaa", "mikan", "btbtla", "1lou", "animetosho", "tpb"}),
+            frozenset({"nyaa", "mikan", "btbtla", "1lou", "tpb"}),
         )
+
+    def test_build_service_ignores_retired_site_in_persisted_selection(self):
+        registry = FakeRegistry()
+
+        def get_value(key, default=""):
+            if key == "INDEXER_ENABLED_SITES":
+                return "nyaa,animetosho"
+            return default
+
+        with patch("app.indexers.runtime.config.get", side_effect=get_value), patch(
+            "app.indexers.runtime.config.get_int",
+            side_effect=lambda _key, default: default,
+        ), patch(
+            "app.indexers.runtime.config.get_bool",
+            return_value=False,
+        ), patch(
+            "app.indexers.runtime.build_default_registry",
+            return_value=registry,
+        ):
+            service = runtime._build_service()
+
+        self.assertEqual(service.enabled_site_ids, frozenset({"nyaa"}))
 
     async def test_sync_bridge_without_binding_reuses_and_closes_standalone_loop(self):
         observed: list[asyncio.AbstractEventLoop] = []

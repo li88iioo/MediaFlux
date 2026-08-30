@@ -11,6 +11,7 @@ from typing import Any
 import unicodedata
 
 from app import config, database as db
+from app.indexers.config import INDEXER_SITE_ORDER
 from app.clients.base import normalize_playback_progress
 from app.agent.action_history import action_history_arguments, list_action_history
 from app.agent.config_actions import media_server_arguments, test_media_server
@@ -2497,14 +2498,11 @@ def build_tool_registry() -> ToolRegistry:
                 "site_ids": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 8,
+                    "maxItems": len(INDEXER_SITE_ORDER),
                     "uniqueItems": True,
                     "items": {
                         "type": "string",
-                        "enum": [
-                            "nyaa", "mikan", "btbtla", "1lou",
-                            "animetosho", "tpb", "sukebei",
-                        ],
+                        "enum": list(INDEXER_SITE_ORDER),
                     },
                 },
                 "enable_search": {"type": "boolean"},

@@ -90,7 +90,7 @@ def build_site_queries(site_id: str, request: IndexerMediaSearchRequest) -> tupl
 
     if site_id == "mikan":
         bases = [title, original, *aliases, english]
-    elif site_id in {"nyaa", "animetosho"}:
+    elif site_id == "nyaa":
         preferred_latin = latin_aliases[:1]
         remaining_latin = latin_aliases[1:]
         bases = [*preferred_latin, original, *remaining_latin, english, title, *other_aliases]

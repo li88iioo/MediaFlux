@@ -11,7 +11,7 @@ from typing import Any
 from app import config
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
-from app.indexers.config import INDEXER_SITE_ORDER
+from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -133,7 +133,7 @@ def feature_summary_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 def _enabled_sites() -> tuple[str, ...]:
     configured = config.get(
         "INDEXER_ENABLED_SITES",
-        "nyaa,mikan,btbtla,1lou,animetosho,tpb",
+        ",".join(DEFAULT_INDEXER_SITE_IDS),
     )
     requested = {
         part.strip().lower()
