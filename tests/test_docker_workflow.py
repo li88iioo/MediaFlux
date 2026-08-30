@@ -55,7 +55,7 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:1258/readyz", self.text)
         self.assertIn("needs: [test, smoke]", self.text)
         self.assertIn("docker logs mediaflux-smoke", self.text)
-        self.assertIn("docker stop --time 60 mediaflux-smoke", self.text)
+        self.assertIn("docker stop --timeout 60 mediaflux-smoke", self.text)
         self.assertIn(".State.ExitCode", self.text)
         self.assertIn("docker rm --force mediaflux-smoke", self.text)
 
@@ -92,7 +92,7 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("strm_metadata_refresh_outbox", smoke_job)
         self.assertIn("PRAGMA integrity_check", smoke_job)
         self.assertIn("PRAGMA foreign_key_check", smoke_job)
-        self.assertIn("docker stop --time 60 mediaflux-v014-upgrade", smoke_job)
+        self.assertIn("docker stop --timeout 60 mediaflux-v014-upgrade", smoke_job)
 
     def test_full_test_job_installs_runtime_dependencies(self) -> None:
         test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
@@ -132,7 +132,11 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn('container="mediaflux-${safe_platform}-startup"', self.text)
         self.assertIn('docker run --detach --platform "$platform"', self.text)
         self.assertIn("http://127.0.0.1:1258/readyz", self.text)
-        self.assertIn('docker stop --time 60 "$container"', self.text)
+        self.assertIn('docker pull --quiet --platform "$platform"', self.text)
+        self.assertIn("candidate exited before readiness", self.text)
+        self.assertIn('>/dev/null 2>&1; then', self.text)
+        self.assertIn('docker stop --timeout 60 "$container"', self.text)
+        self.assertNotIn("docker stop --time ", self.text)
         candidate_smoke = self.text.split("      - name: Smoke test candidate images", 1)[1].split(
             "      - name: Re-verify release tag before promotion", 1
         )[0]

@@ -111,7 +111,7 @@ jobs:
       - name: Verify graceful container shutdown
         if: success()
         run: |
-          docker stop --time 60 mediaflux-smoke
+          docker stop --timeout 60 mediaflux-smoke >/dev/null
           shutdown_exit=$(docker inspect --format '{{.State.ExitCode}}' mediaflux-smoke)
           case "$shutdown_exit" in
             0|143) ;;
@@ -188,7 +188,7 @@ jobs:
                 > "$RUNNER_TEMP/docker-v014-doctor.json"
               jq -e 'all(.[]; .status != "error")' \
                 "$RUNNER_TEMP/docker-v014-doctor.json"
-              docker stop --time 60 mediaflux-v014-upgrade
+              docker stop --timeout 60 mediaflux-v014-upgrade >/dev/null
               shutdown_exit=$(docker inspect --format '{{.State.ExitCode}}' mediaflux-v014-upgrade)
               case "$shutdown_exit" in
                 0|143) ;;
@@ -374,12 +374,14 @@ jobs:
             test -n "$platform_digest" && test "$platform_digest" != null
             safe_platform=${platform//\//-}
             output="$RUNNER_TEMP/docker-$safe_platform-version.json"
+            image_reference="$IMAGE_REPOSITORY@$platform_digest"
+            docker pull --quiet --platform "$platform" "$image_reference" >/dev/null
             docker run --rm --platform "$platform" --entrypoint python \
-              "$IMAGE_REPOSITORY@$platform_digest" mediaflux.py version --json > "$output"
+              "$image_reference" mediaflux.py version --json > "$output"
             jq -e --arg version "$EXPECTED_VERSION" --arg sha "$EXPECTED_SHA" \
               --arg arch "$expected_arch" \
               '.version == $version and .arch == $arch and .package == "docker" and .commit == $sha' \
-              "$output"
+              "$output" >/dev/null
 
             container="mediaflux-${safe_platform}-startup"
             docker run --detach --platform "$platform" --name "$container" \
@@ -387,12 +389,21 @@ jobs:
               --env MEDIAFLUX_INITIALIZED=1 \
               --env ENV_WEB_PASSPORT=admin \
               --env ENV_WEB_PASSWORD=ci-platform-password-with-more-than-16-bytes \
-              "$IMAGE_REPOSITORY@$platform_digest"
+              "$image_reference" >/dev/null
             ready=false
+            echo "Waiting for $platform candidate readiness"
             for attempt in $(seq 1 45); do
+              if [[ "$(docker inspect --format '{{.State.Running}}' "$container")" != "true" ]]; then
+                echo "$platform candidate exited before readiness" >&2
+                docker logs "$container"
+                docker rm --force "$container" >/dev/null 2>&1 || true
+                exit 1
+              fi
               if docker exec "$container" python -c \
-                "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1258/readyz', timeout=3)"; then
+                "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1258/readyz', timeout=3)" \
+                >/dev/null 2>&1; then
                 ready=true
+                echo "$platform candidate ready (attempt $attempt)"
                 break
               fi
               sleep 2
@@ -402,7 +413,7 @@ jobs:
               docker rm --force "$container" >/dev/null 2>&1 || true
               exit 1
             fi
-            docker stop --time 60 "$container"
+            docker stop --timeout 60 "$container" >/dev/null
             shutdown_exit=$(docker inspect --format '{{.State.ExitCode}}' "$container")
             case "$shutdown_exit" in
               0|143) ;;
@@ -411,7 +422,7 @@ jobs:
             shutdown_log="$RUNNER_TEMP/docker-${safe_platform}-shutdown.log"
             docker logs "$container" > "$shutdown_log" 2>&1
             grep -Fq "Application shutdown complete" "$shutdown_log"
-            docker rm "$container"
+            docker rm "$container" >/dev/null
           done
 
       - name: Re-verify release tag before promotion
