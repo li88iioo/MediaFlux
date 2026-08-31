@@ -160,6 +160,94 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         create_request.assert_not_called()
         self.assertEqual(bot.replies[-1][1], "你无权在此群组执行该操作")
 
+    def test_plain_web_page_is_not_created_as_download_request(self):
+        from app.bot import handlers
+        from tests.test_production import TelegramBotTests
+
+        bot = TelegramBotTests.FakeBot()
+        telebot = TelegramBotTests._telebot_types()
+        values = {"TG_CHAT_ID": "100", "TG_AGENT_ALLOWED_USER_IDS": ""}
+        first, second = self._patch_values(values)
+        message = self._message(
+            chat_id=100,
+            user_id=9,
+            text="http://192.168.0.195:1258/guangya/offline",
+        )
+        with first, second, patch(
+            "app.modules.download_dispatcher.create_request"
+        ) as create_request, patch(
+            "app.bot.agent_adapter.handle_agent_message", return_value=False,
+        ) as handle_agent_message:
+            handlers._register_commands(bot, telebot)
+            receive_link = next(
+                registered
+                for filters, registered in bot.message_handlers
+                if filters.get("content_types") == ["text"]
+                and filters.get("func") is not None
+                and filters["func"](message)
+            )
+            receive_link(message)
+
+        create_request.assert_not_called()
+        handle_agent_message.assert_called_once_with(bot, telebot, message)
+
+    def test_stale_plain_web_picker_cannot_dispatch_after_routing_fix(self):
+        from app.bot import handlers
+        from tests.test_production import TelegramBotTests
+
+        class Bot(TelegramBotTests.FakeBot):
+            def __init__(self):
+                super().__init__()
+                self.answers = []
+                self.edits = []
+
+            def answer_callback_query(self, *args, **kwargs):
+                self.answers.append((args, kwargs))
+
+            def edit_message_text(self, *args, **kwargs):
+                self.edits.append((args, kwargs))
+
+        bot = Bot()
+        call = SimpleNamespace(
+            id="stale-web-choice",
+            data="tgc:opaque",
+            from_user=SimpleNamespace(id=9),
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=100),
+                message_id=23,
+            ),
+        )
+        store = SimpleNamespace(claim=lambda *args, **kwargs: {
+            "operation": "download_request",
+            "decision": "confirm",
+            "value": {"request_id": 77, "target": "guangya"},
+        })
+        row = {
+            "id": 77,
+            "status": "pending",
+            "kind": "http",
+            "source_value": "http://192.168.0.195:1258/guangya/offline",
+        }
+        with patch(
+            "app.modules.telegram_write_confirmations.get_telegram_write_confirmation_store",
+            return_value=store,
+        ), patch(
+            "app.bot.handlers.db.bind_pending_download_request_owner", return_value=row,
+        ), patch(
+            "app.bot.handlers.db.claim_download_request", return_value=True,
+        ) as claim_request, patch(
+            "app.bot.handlers.db.update_download_request",
+        ) as update_request, patch(
+            "app.bot.handlers._dispatch_download_callback",
+        ) as dispatch:
+            handlers._handle_write_confirmation_callback(bot, call, SimpleNamespace())
+
+        dispatch.assert_not_called()
+        claim_request.assert_called_once_with(77, "cancelled")
+        self.assertEqual(update_request.call_args.kwargs["status"], "cancelled")
+        self.assertIn("普通网页不会创建下载任务", bot.answers[-1][0][1])
+        self.assertIn("未提交下载", bot.edits[-1][0][0])
+
     def test_private_write_callback_keeps_legacy_chat_only_authorization(self):
         from app.bot import handlers
         from tests.test_production import TelegramBotTests

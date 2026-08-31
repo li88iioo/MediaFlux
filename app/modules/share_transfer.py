@@ -11,7 +11,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
 from app import database as db
@@ -171,7 +171,15 @@ class ShareTransferPreviewStore:
             raise ValueError("预览已使用，请重新解析")
         return entry
 
-    def create(self, inspected: dict, chat_id: str, user_id: str = "") -> str:
+    def create(
+        self,
+        inspected: dict,
+        chat_id: str,
+        user_id: str = "",
+        *,
+        target_id: str = "0",
+        target_name: str = "根目录",
+    ) -> str:
         share_id = str((inspected or {}).get("share_id") or "").strip()
         access_token = str((inspected or {}).get("access_token") or "").strip()
         if not share_id or not access_token:
@@ -188,6 +196,10 @@ class ShareTransferPreviewStore:
         preview_id = str(self._token_factory() or "").strip()
         if not preview_id:
             raise RuntimeError("无法生成分享预览标识")
+        normalized_target_id = str(target_id or "0").strip() or "0"
+        normalized_target_name = str(target_name or "").strip() or (
+            "根目录" if normalized_target_id == "0" else "默认转存目录"
+        )
         now = self._clock()
         entry = _PreviewEntry(
             preview_id=preview_id,
@@ -197,8 +209,8 @@ class ShareTransferPreviewStore:
             files=normalized,
             file_order=tuple(order),
             selected_ids=set(order),
-            target_id="0",
-            target_name="根目录",
+            target_id=normalized_target_id,
+            target_name=normalized_target_name,
             expires_at=now + self._ttl_seconds,
         )
         with self._lock:
@@ -408,7 +420,17 @@ def inspect_share_for_transfer(
     with _guangya_client_scope(client) as runtime_client:
         inspected = runtime_client.inspect_share(str(share_url or "").strip())
         store = store or get_share_transfer_store()
-        preview_id = store.create(inspected, chat_id, user_id)
+        target_id = str(get("GY_SHARE_TARGET_DIR", "0") or "0").strip() or "0"
+        target_name = str(
+            get("GY_SHARE_TARGET_DIR_NAME", "根目录") or "根目录"
+        ).strip() or ("根目录" if target_id == "0" else "默认转存目录")
+        preview_id = store.create(
+            inspected,
+            chat_id,
+            user_id,
+            target_id=target_id,
+            target_name=target_name,
+        )
         return store.snapshot(preview_id, chat_id, user_id)
 
 

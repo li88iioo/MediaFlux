@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import re
 import unicodedata
@@ -26,6 +27,30 @@ logger = get_logger(__name__)
 SUPPORTED_TARGETS = {"qb", "guangya", "both"}
 _URL_RE = re.compile(r"(?i)(magnet:\?\S+|ed2k://\S+|https?://\S+)")
 _QB_TORRENT_ID_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_GUANGYA_SHARE_PATH_RE = re.compile(
+    r"/(?:s|share)/[A-Za-z0-9][A-Za-z0-9_-]*(?:/|$)",
+    re.IGNORECASE,
+)
+_HTTP_DOWNLOAD_SUFFIXES = frozenset({
+    ".torrent", ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv",
+    ".webm", ".ts", ".m2ts", ".mp3", ".flac", ".aac", ".wav",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+    ".iso", ".img", ".apk", ".exe", ".msi", ".dmg", ".pkg",
+    ".pdf", ".epub", ".srt", ".ass", ".ssa", ".jpg", ".jpeg",
+    ".png", ".webp",
+})
+_HTTP_DOWNLOAD_PATH_RE = re.compile(
+    r"(?:^|[-_.])(?:download|downloads|dl|get|fetch|attachment)(?:[-_.]|$)",
+    re.IGNORECASE,
+)
+_HTTP_DOWNLOAD_QUERY_KEYS = frozenset({
+    "attachment", "dl", "download", "file", "filename",
+    "response-content-disposition",
+})
+_HTTP_SIGNED_QUERY_KEYS = frozenset({
+    "expires", "policy", "sign", "signature", "token",
+    "x-amz-signature", "x-oss-signature",
+})
 
 
 @dataclass(frozen=True)
@@ -77,15 +102,58 @@ def is_guangya_share_url(url: str) -> bool:
     return bool(
         parsed.scheme.lower() in {"http", "https"}
         and official_host
-        and re.search(r"/(?:s|share)/[A-Za-z0-9]+(?:/|$)", parsed.path, re.IGNORECASE)
+        and _GUANGYA_SHARE_PATH_RE.search(unquote(parsed.path))
     )
 
 
+def _is_private_or_local_host(hostname: str) -> bool:
+    host = str(hostname or "").strip().lower().rstrip(".")
+    if not host or host == "localhost" or host.endswith((".local", ".localhost")):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not address.is_global
+
+
+def is_probable_http_download_url(url: str) -> bool:
+    """区分明确下载直链与普通网页，避免 Telegram 分享网页时误建任务。"""
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return False
+
+    path = unquote(parsed.path or "")
+    basename = path.rstrip("/").rsplit("/", 1)[-1].lower()
+    if any(basename.endswith(suffix) for suffix in _HTTP_DOWNLOAD_SUFFIXES):
+        return True
+
+    # 局域网/本机的无扩展名 URL 更可能是管理页面或 API；不得仅凭
+    # /download 一类页面名自动触发写操作。明确文件后缀仍保留直链能力。
+    if _is_private_or_local_host(parsed.hostname):
+        return False
+
+    query_keys = {key.lower() for key in parse_qs(parsed.query, keep_blank_values=True)}
+    if query_keys & _HTTP_DOWNLOAD_QUERY_KEYS:
+        return True
+    if path and query_keys & _HTTP_SIGNED_QUERY_KEYS:
+        return True
+
+    path_segments = [segment for segment in path.split("/") if segment]
+    return any(_HTTP_DOWNLOAD_PATH_RE.search(segment) for segment in path_segments)
+
+
 def route_download_url(url: str) -> str:
-    """先路由光鸭分享，再回退既有离线协议识别。"""
+    """路由分享、下载直链和普通网页；普通网页交给 Agent/忽略。"""
     if is_guangya_share_url(url):
         return "guangya_share"
-    return normalize_download_url(url).kind
+    item = normalize_download_url(url)
+    if item.kind == "http" and not is_probable_http_download_url(url):
+        return "web"
+    return item.kind
 
 
 def normalize_download_url(url: str) -> DownloadInput:

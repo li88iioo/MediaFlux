@@ -13,6 +13,10 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 SHARE_URL = "https://www.guangyapan.com/s/demo123?code=2468"
+HASH_ROUTE_SHARE_URL = (
+    "https://www.guangyapan.com/s/"
+    "1938060615538466851_aecd7hu726g3whGl#/share"
+)
 SECRET_TOKEN = "share-access-token-must-stay-private"
 SIGNED_URL = "https://download.invalid/file?sign=private-signature"
 
@@ -69,9 +73,15 @@ class FakeMarkup:
     def __init__(self, row_width: int = 2) -> None:
         self.row_width = row_width
         self.buttons = []
+        self.rows = []
 
-    def add(self, *buttons) -> None:
+    def add(self, *buttons, row_width=None) -> None:
+        width = max(1, int(row_width or self.row_width))
         self.buttons.extend(buttons)
+        self.rows.extend(
+            list(buttons[index:index + width])
+            for index in range(0, len(buttons), width)
+        )
 
 
 FAKE_TELEBOT = SimpleNamespace(types=SimpleNamespace(
@@ -84,9 +94,17 @@ FAKE_TELEBOT = SimpleNamespace(types=SimpleNamespace(
 
 class GuangYaShareRoutingTests(unittest.TestCase):
     def test_guangya_share_url_routes_before_generic_http(self):
-        from app.modules.download_dispatcher import route_download_url
+        from app.modules.download_dispatcher import (
+            extract_download_url,
+            route_download_url,
+        )
 
         self.assertEqual(route_download_url(SHARE_URL), "guangya_share")
+        self.assertEqual(route_download_url(HASH_ROUTE_SHARE_URL), "guangya_share")
+        self.assertEqual(
+            extract_download_url(f"请解析 {HASH_ROUTE_SHARE_URL}"),
+            HASH_ROUTE_SHARE_URL,
+        )
         self.assertEqual(route_download_url("https://example.invalid/archive.iso"), "http")
         self.assertEqual(route_download_url("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"), "magnet")
 
@@ -96,8 +114,18 @@ class GuangYaShareRoutingTests(unittest.TestCase):
         self.assertTrue(is_guangya_share_url("https://guangyapan.com/share/ABC123"))
         self.assertTrue(is_guangya_share_url("https://www.guangyapan.com/s/ABC123?pwd=1"))
         self.assertTrue(is_guangya_share_url("https://www.guangyapan.com/S/ABC123?code=1"))
+        self.assertTrue(is_guangya_share_url(HASH_ROUTE_SHARE_URL))
+        self.assertTrue(is_guangya_share_url("https://www.guangyapan.com/s/ABC-123_def"))
         self.assertFalse(is_guangya_share_url("https://guangyapan.com.evil.invalid/s/ABC123"))
         self.assertFalse(is_guangya_share_url("https://www.guangyapan.com/download/ABC123"))
+
+    def test_guangya_client_keeps_the_complete_hash_route_share_id(self):
+        from app.clients.guangya import GuangYaClient
+
+        self.assertEqual(
+            GuangYaClient._parse_share(HASH_ROUTE_SHARE_URL),
+            ("1938060615538466851_aecd7hu726g3whGl", ""),
+        )
 
 
 class GuangYaRestoreResultTests(unittest.TestCase):
@@ -139,6 +167,33 @@ class GuangYaRestoreResultTests(unittest.TestCase):
 
 
 class ShareTransferPreviewStoreTests(unittest.TestCase):
+    def test_inspection_uses_the_saved_share_target_as_the_default(self):
+        from app.modules.share_transfer import (
+            ShareTransferPreviewStore,
+            inspect_share_for_transfer,
+        )
+
+        store = ShareTransferPreviewStore(token_factory=lambda: "configured-preview")
+        client = FakeShareClient()
+        with patch(
+            "app.modules.share_transfer.get",
+            side_effect=lambda key, default="": {
+                "GY_SHARE_TARGET_DIR": "saved-target",
+                "GY_SHARE_TARGET_DIR_NAME": "分享转存目录",
+            }.get(key, default),
+        ):
+            preview = inspect_share_for_transfer(
+                HASH_ROUTE_SHARE_URL,
+                "chat",
+                "user",
+                client=client,
+                store=store,
+            )
+
+        self.assertEqual(preview["target_id"], "saved-target")
+        self.assertEqual(preview["target_name"], "分享转存目录")
+        self.assertEqual(client.inspect_calls, [HASH_ROUTE_SHARE_URL])
+
     def test_store_is_bounded_expires_after_fifteen_minutes_and_isolates_chat_user(self):
         from app.modules.share_transfer import ShareTransferPreviewStore
 
@@ -572,6 +627,9 @@ class TelegramShareViewTests(unittest.TestCase):
         self.assertIn("取消", labels)
         self.assertIn("下一页", labels)
         self.assertIn("1/2", text)
+        row_labels = [[button.text for button in row] for row in markup.rows]
+        self.assertIn(["全选", "全不选"], row_labels)
+        self.assertIn(["确认转存", "取消"], row_labels)
         for callback in callbacks:
             self.assertRegex(callback, r"^gys:[A-Za-z0-9_-]{8,}$")
             self.assertNotIn("file-", callback)

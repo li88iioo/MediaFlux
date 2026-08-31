@@ -516,6 +516,7 @@ def _share_selection_view(telebot, preview_id: str, *, chat_id: str, user_id: st
     markup.add(
         _share_action_button(telebot, store, preview_id, chat_id, user_id, "全选", "all", page),
         _share_action_button(telebot, store, preview_id, chat_id, user_id, "全不选", "none", page),
+        row_width=2,
     )
     markup.add(_share_action_button(
         telebot, store, preview_id, chat_id, user_id,
@@ -525,6 +526,7 @@ def _share_selection_view(telebot, preview_id: str, *, chat_id: str, user_id: st
     markup.add(
         _share_action_button(telebot, store, preview_id, chat_id, user_id, "确认转存", "confirm"),
         _share_action_button(telebot, store, preview_id, chat_id, user_id, "取消", "cancel"),
+        row_width=2,
     )
     text = (
         "<b>光鸭分享转存</b>\n"
@@ -1514,15 +1516,21 @@ def _register_commands(bot, telebot):
 
             handle_agent_message(bot, telebot, msg)
             return
-        if _reject_unauthorized_group_write(bot, msg):
-            return
         try:
+            route = route_download_url(url)
+            if route == "web":
+                from app.bot.agent_adapter import handle_agent_message
+
+                handle_agent_message(bot, telebot, msg)
+                return
+            if _reject_unauthorized_group_write(bot, msg):
+                return
             send_typing(
                 bot,
                 msg.chat.id,
                 message_thread_id=getattr(msg, "message_thread_id", None),
             )
-            if route_download_url(url) == "guangya_share":
+            if route == "guangya_share":
                 _inspect_telegram_share(bot, msg, url, telebot)
                 return
             item = normalize_download_url(url)
@@ -1880,6 +1888,29 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                         reply_markup=None,
                     )
                 return
+            if str(row["kind"] or "") == "http":
+                from app.modules.download_dispatcher import route_download_url
+
+                if route_download_url(str(row["source_value"] or "")) == "web":
+                    if db.claim_download_request(request_id, "cancelled"):
+                        db.update_download_request(
+                            request_id,
+                            status="cancelled",
+                            error="普通网页链接未提交下载",
+                            completed_at=db.now(),
+                        )
+                    _edit_write_confirmation_message(
+                        bot,
+                        call.message,
+                        "未提交下载",
+                        "该地址是普通网页，不是可识别的下载直链。",
+                    )
+                    bot.answer_callback_query(
+                        call.id,
+                        "普通网页不会创建下载任务",
+                        show_alert=True,
+                    )
+                    return
             target = str(value.get("target") or "")
             if target not in {"qb", "guangya", "both"}:
                 raise TelegramWriteConfirmationError("下载确认参数无效")

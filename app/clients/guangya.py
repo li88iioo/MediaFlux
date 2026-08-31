@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from time import monotonic, sleep, time
 from typing import Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, unquote, urlparse
 
 from app.config import PATHS
 from app.logger import get_logger, log_throttled
@@ -2119,6 +2119,11 @@ class GuangYaClient:
         qs = parse_qs(parsed.query)
         code = qs.get("code", [""])[0] or qs.get("pwd", [""])[0] or qs.get("p", [""])[0]
         # 路径中取 share_id（如 /s/xxxxx 或 /share/xxxxx）
-        m = re.search(r"/(?:s|share)/([A-Za-z0-9]+)", parsed.path)
-        share_id = m.group(1) if m else parsed.path.strip("/").split("/")[-1]
+        path = unquote(parsed.path)
+        m = re.search(
+            r"/(?:s|share)/([A-Za-z0-9][A-Za-z0-9_-]*)(?:/|$)",
+            path,
+            re.IGNORECASE,
+        )
+        share_id = m.group(1) if m else path.strip("/").split("/")[-1]
         return share_id, code
