@@ -43,7 +43,7 @@ from app.agent.recent_read_operations import RecentReadOperationStore
 from app.agent.recent_resource_candidates import RecentResourceCandidateStore
 from app.agent.recent_discovery_candidates import RecentDiscoveryCandidateStore
 from app.agent.session_context import SQLiteAgentSessionContextRepository
-from app.agent.tools import build_tool_registry
+from app.agent.tools import build_tool_registry, reset_agent_tool_caches_for_tests
 
 _lock = threading.Lock()
 _service: AgentOrchestrator | None = None
@@ -102,3 +102,4 @@ def reset_agent_service_for_tests() -> None:
         reset_guangya_cleanup_context_for_tests()
         reset_guangya_workspace_context_for_tests()
         reset_guangya_fs_change_context_for_tests()
+        reset_agent_tool_caches_for_tests()

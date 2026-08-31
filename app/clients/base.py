@@ -312,6 +312,10 @@ class MediaServerClient:
         """返回显示名称、产品名和版本；旧客户端可只实现 _server_name。"""
         return self._server_name(), self.display_name, ""
 
+    def server_identity(self) -> tuple[str, str, str]:
+        """公开只读系统身份；供受控 Provider transport 复用现有适配。"""
+        return self._server_identity()
+
     def _libraries(self) -> list[Library]:
         raise NotImplementedError
 

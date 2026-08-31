@@ -97,6 +97,8 @@ _TRANSFER_RATE_RE = re.compile(r"(?i)\b(?:\d+(?:\.\d+)?\s*)?(?:[kmgt]?i?b|b)/s\b
 
 _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "agent.capabilities": "Agent 能力列表",
+    "provider.capabilities": "Provider 能力列表",
+    "provider.query": "Provider 实时查询",
     "agent.action_history": "Agent 操作记录",
     "agent.read_plan": "综合检查",
     "automation.diagnose_pipeline": "自动化链路诊断",
@@ -251,6 +253,11 @@ _PUBLIC_SOURCE_LABELS: dict[str, str] = {
     "rss": "RSS 订阅",
     "strm": "STRM 同步",
     "workspace": "工作区",
+    "provider_catalog": "Provider 能力目录",
+    "provider_api": "Provider 实时接口",
+    "jellyfin_api": "Jellyfin",
+    "emby_api": "Emby",
+    "qbittorrent_api": "qBittorrent",
 }
 
 _PUBLIC_FOLLOWUP_PROMPTS: dict[str, str] = {
@@ -284,6 +291,51 @@ _BANNED_KEY_FRAGMENTS = (
 # 发送给外部模型的数据字段必须显式允许，并转换为公开中文名称。未知字段一律丢弃。
 _PUBLIC_DATA_KEYS: dict[str, str] = {
     "affected": "影响数量",
+    "artifact_ref": "查询快照编号",
+    "profile_ref": "配置引用",
+    "profiles": "可用配置",
+    "operations": "可用操作",
+    "rules": "调用规则",
+    "risk": "风险级别",
+    "description": "说明",
+    "input_schema": "输入字段",
+    "required": "必填",
+    "allowed_values": "允许值",
+    "minimum": "最小值",
+    "maximum": "最大值",
+    "default": "默认值",
+    "timeout_seconds": "超时（秒）",
+    "reads_execute_automatically": "只读自动执行",
+    "writes_require_preview_and_confirmation": "写入需要预检确认",
+    "arbitrary_http_allowed": "允许任意 HTTP",
+    "name": "名称",
+    "type": "类型",
+    "product": "产品",
+    "version": "版本",
+    "libraries": "媒体库",
+    "collection_type": "媒体库类型",
+    "runtime_minutes": "时长（分钟）",
+    "series_name": "剧集名称",
+    "season_number": "季号",
+    "episode_number": "集号",
+    "date_added": "入库时间",
+    "progress_percent": "进度百分比",
+    "transfer": "传输状态",
+    "torrents": "下载任务",
+    "files": "文件",
+    "download_speed": "下载速度",
+    "upload_speed": "上传速度",
+    "downloaded_bytes_total": "累计下载",
+    "uploaded_bytes_total": "累计上传",
+    "download_rate_limit": "下载限速",
+    "upload_rate_limit": "上传限速",
+    "dht_nodes": "DHT 节点",
+    "downloaded": "已下载字节",
+    "eta": "预计剩余秒数",
+    "ratio": "分享率",
+    "category": "分类",
+    "added_on": "添加时间",
+    "index": "文件序号",
     "entry_number": "条目编号",
     "processed": "已处理",
     "published_at": "发布时间",
@@ -665,6 +717,8 @@ _PUBLIC_TEXT_VALUE_KEYS = frozenset({
     "kind", "extension", "location",
     "subscription_status", "stage", "route", "last_seen_at", "coverage",
     "available_names",
+    "artifact_ref", "profile_ref", "description", "name", "type", "product",
+    "version", "collection_type", "series_name", "category", "input_schema",
 })
 _MAX_DEPTH = 4
 _MAX_MAPPING_ITEMS = 24
@@ -1162,7 +1216,23 @@ def _safe_value(
     if isinstance(value, float):
         return value if value == value and abs(value) != float("inf") else None
     if isinstance(value, str):
-        if source_key in {"object_name", "location"}:
+        if source_key == "operation":
+            operation = value.strip().casefold()
+            if re.fullmatch(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){2,5}", operation):
+                return operation
+        if source_key == "profile_ref":
+            profile_ref = value.strip()
+            if re.fullmatch(r"configured:[a-z][a-z0-9_]{1,31}", profile_ref):
+                return profile_ref
+        if source_key == "artifact_ref":
+            artifact_ref = value.strip().upper()
+            if re.fullmatch(r"PA-[0-9A-F]{24}", artifact_ref):
+                return artifact_ref
+        if source_key == "object_ref":
+            object_ref = value.strip().upper()
+            if re.fullmatch(r"PO-[0-9A-F]{24}", object_ref):
+                return object_ref
+        if source_key in {"object_name", "location", "name"}:
             return sanitize_untrusted_filename(value, limit=240) or None
         if source_key in {"candidate_summaries", "review_summaries"}:
             return sanitize_untrusted_filename(value, limit=520) or None

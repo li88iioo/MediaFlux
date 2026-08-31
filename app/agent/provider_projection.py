@@ -1,0 +1,57 @@
+"""Provider 原始响应的有界安全投影。"""
+from __future__ import annotations
+
+import math
+from typing import Any
+
+from app.agent.result_projection import sanitize_public_text
+
+_SENSITIVE_KEYS = frozenset({
+    "path", "save_path", "content_path", "url", "web_url", "image_url",
+    "token", "api_key", "authorization", "cookie", "password", "username",
+    "tracker", "magnet", "hash", "device_id", "headers", "response_headers",
+})
+
+
+def _safe_key(value: Any) -> str:
+    return str(value or "").strip()[:64]
+
+
+def project_provider_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    max_depth: int = 4,
+    max_items: int = 32,
+) -> Any:
+    if depth > max_depth:
+        return None
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return max(-(2**63), min(value, 2**63 - 1))
+    if isinstance(value, float):
+        return round(value, 4) if math.isfinite(value) else 0.0
+    if isinstance(value, str):
+        return sanitize_public_text(value, limit=500)
+    if isinstance(value, (list, tuple)):
+        return [
+            project_provider_value(
+                item, depth=depth + 1, max_depth=max_depth, max_items=max_items
+            )
+            for item in list(value)[:max_items]
+        ]
+    if isinstance(value, dict):
+        projected: dict[str, Any] = {}
+        for raw_key, raw_value in list(value.items())[:max_items]:
+            key = _safe_key(raw_key)
+            if not key or key.casefold() in _SENSITIVE_KEYS:
+                continue
+            projected[key] = project_provider_value(
+                raw_value,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+            )
+        return projected
+    return sanitize_public_text(value, limit=160)

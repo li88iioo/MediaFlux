@@ -46,6 +46,13 @@ from app.agent.pending_action_actions import (
     cancel_pending_action,
     pending_action_arguments,
 )
+from app.agent.provider_actions import (
+    list_provider_capabilities,
+    provider_capabilities_arguments,
+    provider_query_arguments,
+    query_provider,
+    reset_provider_gateway_for_tests,
+)
 from app.agent.feature_gate import is_agent_enabled
 from app.agent.missing_media_workflows import (
     list_missing_workflows,
@@ -1169,6 +1176,7 @@ def reset_agent_tool_caches_for_tests() -> None:
     with _search_cache_lock:
         _search_cache.clear()
     reset_episode_audit_cache_for_tests()
+    reset_provider_gateway_for_tests()
 
 
 def _safe_optional_index(value: Any, *, allow_zero: bool) -> int | None:
@@ -1326,6 +1334,74 @@ def build_tool_registry() -> ToolRegistry:
         llm_freshness="live",
         llm_examples=("Agent 现在开启了吗", "查看智能助手状态"),
     ))
+    registry.register(ToolSpec(
+        name="provider.capabilities",
+        description=(
+            "列出媒体服务器与 qBittorrent 当前已开放的原生语义操作、参数和非敏感 profile；"
+            "不会连接上游，也不会返回地址或凭据。"
+        ),
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "enum": ["media", "qbittorrent"],
+                },
+                "intent": {"type": "string", "maxLength": 160},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 24, "default": 12},
+            },
+            "additionalProperties": False,
+        },
+        handler=list_provider_capabilities,
+        validator=provider_capabilities_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        native_alias="mf_provider_capabilities",
+        llm_domains=("media_library", "downloads", "system"),
+        llm_source_kind="provider_catalog",
+        llm_freshness="snapshot",
+        llm_examples=(
+            "查看 Jellyfin 可以读取哪些信息",
+            "查看 qBittorrent 可用能力",
+            "我能让你检查哪些媒体服务器内容",
+        ),
+    ))
+    registry.register(ToolSpec(
+        name="provider.query",
+        description=(
+            "调用静态目录中已登记的 Jellyfin、Emby 或 qBittorrent 只读操作。"
+            "profile 和 operation 必须先从 Provider 能力清单获取；禁止任意 URL、HTTP 方法、header 或凭据。"
+        ),
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["profile_ref", "operation", "arguments"],
+            "properties": {
+                "profile_ref": {"type": "string", "minLength": 1, "maxLength": 80},
+                "operation": {"type": "string", "minLength": 3, "maxLength": 96},
+                "arguments": {"type": "object", "additionalProperties": True},
+            },
+            "additionalProperties": False,
+        },
+        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
+        context_handler=query_provider,
+        validator=provider_query_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        native_alias="mf_provider_query",
+        llm_domains=("media_library", "downloads", "episodes", "system"),
+        llm_source_kind="provider_api",
+        llm_freshness="live",
+        llm_parallel_safe=False,
+        llm_examples=(
+            "读取 Jellyfin 媒体库",
+            "在媒体服务器中搜索一部剧",
+            "读取 qBittorrent 下载任务",
+            "查看刚才下载任务的文件",
+        ),
+    ))
+
     registry.register(ToolSpec(
         name="agent.cancel_pending_action",
         description=(

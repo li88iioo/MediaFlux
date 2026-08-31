@@ -142,6 +142,8 @@ _TOOL_RATE_LIMITS = {
     "discovery.remove_watchlist": 4,
     "bangumi.calendar": 6,
     "web.search": 6,
+    "provider.capabilities": 12,
+    "provider.query": 8,
     "guangya.capabilities": 12,
     "guangya.connection_status": 4,
     "guangya.fs.query": 8,
