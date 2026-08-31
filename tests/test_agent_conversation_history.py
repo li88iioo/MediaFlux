@@ -132,7 +132,7 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         response = {
             "mode": "confirmed_action",
             "tool_call": {
-                "name": "indexer.submit_resource",
+                "name": "indexer.submit_candidate",
                 "arguments": {
                     "result_id": "private-result-id",
                     "target": "qb",
@@ -538,7 +538,7 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
 
         selection_response = {
             "mode": "tool_result",
-            "tool_call": {"name": "indexer.submit_resource", "arguments": {}},
+            "tool_call": {"name": "indexer.submit_candidate", "arguments": {}},
             "result": {
                 "ok": False,
                 "status": "selection_required",
@@ -1148,7 +1148,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
             "request_id": "confirm-request-secret",
             "mode": "confirmed_action",
             "tool_call": {
-                "name": "indexer.submit_resource",
+                "name": "indexer.submit_candidate",
                 "arguments": {"result_id": "private-result-id", "target": "qb"},
             },
             "action_plan": {

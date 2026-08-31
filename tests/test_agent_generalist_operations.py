@@ -13,11 +13,6 @@ from app.agent.local_media_scan_actions import (
     prepare_scan_local_media_sources,
     scan_local_media_sources_confirmed,
 )
-from app.agent.media_library_actions import (
-    media_library_refresh_arguments,
-    prepare_refresh_media_library,
-    refresh_media_library_confirmed,
-)
 from app.agent.media_proxy_actions import (
     media_proxy_restart_arguments,
     prepare_restart_media_proxy_instance,
@@ -28,7 +23,6 @@ from app.agent.registry import AgentToolError
 from app.agent.service import reset_agent_service_for_tests
 from app.agent.tools import build_tool_registry
 from app.modules.local_media_scheduler import LocalMediaScheduler
-from app.modules.media_server_profiles import MediaServerProfile
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -49,14 +43,15 @@ class AgentGeneralistOperationTests(IsolatedDatabaseTestCase):
         capabilities = {
             item["name"]: item for item in registry.capabilities()
         }
-        for name in (
-            "local_media.scan_sources",
-            "library.refresh_library",
-            "media_proxy.restart_instance",
-        ):
+        expected_risks = {
+            "local_media.scan_sources": "low_write",
+            "provider.change.execute": "write",
+            "media_proxy.restart_instance": "low_write",
+        }
+        for name, risk in expected_risks.items():
             with self.subTest(name=name):
                 self.assertTrue(capabilities[name]["requires_confirmation"])
-                self.assertEqual(capabilities[name]["risk"], "low_write")
+                self.assertEqual(capabilities[name]["risk"], risk)
 
         cases = {
             "扫描全部本地媒体来源": (
@@ -235,98 +230,6 @@ class AgentGeneralistOperationTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["queued_count"], 1)
         task = db.get_local_media_task(result["task_ids"][0], owner="admin")
         self.assertIn("Alpha.Show", task.content_path)
-
-    def test_media_library_refresh_requires_unique_live_match(self) -> None:
-        self.assertEqual(
-            media_library_refresh_arguments(
-                {"provider": "JELLYFIN", "library_name": "动漫"}
-            ),
-            {"provider": "jellyfin", "library_name": "动漫"},
-        )
-        profile = MediaServerProfile(
-            source="configured:jellyfin",
-            server_type="jellyfin",
-            label="Jellyfin",
-            url="http://jellyfin.invalid:8096",
-            credential="secret",
-            enabled=True,
-        )
-        client = Mock()
-        client.list_virtual_folders.return_value = [
-            {"id": "private-library-id", "name": "动漫"}
-        ]
-        client.refresh_library.return_value = True
-        with patch(
-            "app.agent.media_library_actions.list_configured_profiles",
-            return_value=[profile],
-        ), patch(
-            "app.agent.media_library_actions._client_for",
-            return_value=client,
-        ), patch(
-            "app.agent.media_library_actions.get_web_secret",
-            return_value="x" * 32,
-        ):
-            preview, fingerprint = prepare_refresh_media_library(
-                {"provider": "jellyfin", "library_name": "动漫"}
-            )
-            result = refresh_media_library_confirmed(
-                {"provider": "jellyfin", "library_name": "动漫"},
-                fingerprint,
-            )
-        self.assertEqual(preview.data["library"], "动漫")
-        self.assertTrue(result.ok)
-        self.assertTrue(result.data["refreshed"])
-        client.refresh_library.assert_called_once_with("private-library-id")
-
-    def test_media_library_auto_falls_back_to_reachable_server(self) -> None:
-        jellyfin = MediaServerProfile(
-            source="configured:jellyfin",
-            server_type="jellyfin",
-            label="Jellyfin",
-            url="http://jellyfin.invalid:8096",
-            credential="secret",
-            enabled=True,
-        )
-        emby = MediaServerProfile(
-            source="configured:emby",
-            server_type="emby",
-            label="Emby",
-            url="http://emby.invalid:8096",
-            credential="secret",
-            enabled=True,
-        )
-        unavailable = Mock()
-        unavailable.list_virtual_folders.side_effect = ConnectionError
-        reachable = Mock()
-        reachable.list_virtual_folders.return_value = [
-            {"id": "emby-library-id", "name": "动漫"}
-        ]
-        reachable.refresh_library.return_value = True
-
-        def client_for(profile: MediaServerProfile):
-            return unavailable if profile.server_type == "jellyfin" else reachable
-
-        with patch(
-            "app.agent.media_library_actions.list_configured_profiles",
-            return_value=[jellyfin, emby],
-        ), patch(
-            "app.agent.media_library_actions._client_for",
-            side_effect=client_for,
-        ), patch(
-            "app.agent.media_library_actions.get_web_secret",
-            return_value="x" * 32,
-        ):
-            preview, fingerprint = prepare_refresh_media_library(
-                {"provider": "auto", "library_name": "动漫"}
-            )
-            result = refresh_media_library_confirmed(
-                {"provider": "auto", "library_name": "动漫"},
-                fingerprint,
-            )
-
-        self.assertEqual(preview.data["provider"], "emby")
-        self.assertTrue(result.ok)
-        reachable.refresh_library.assert_called_once_with("emby-library-id")
 
     def test_media_proxy_restart_queues_runtime_rebuild_without_config_write(self) -> None:
         self.assertEqual(

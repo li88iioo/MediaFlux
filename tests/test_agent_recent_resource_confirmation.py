@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from app import database as db
 from app.agent.action_history import action_history_owner_digest
 from app.agent.confirmation import ConfirmationStore
-from app.agent.models import RiskLevel, ToolResult, ToolSpec
+from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
     is_recent_resource_submit_message,
@@ -31,6 +31,7 @@ from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.service import reset_agent_service_for_tests
 from app.agent.state_commit import (
     AgentStateCommitBuffer,
+    active_agent_resource_candidates,
     defer_agent_state_commits,
 )
 from app.main import create_app
@@ -160,20 +161,10 @@ class RecentResourceCandidateStoreTests(unittest.TestCase):
         for secret in ("magnet:", "/private", "/secret", "secret.example"):
             self.assertNotIn(secret, serialized)
         self.assertIsNone(store.get(owner="session-b"))
-        self.assertTrue(store.contains_result(
-            owner="session-a", result_id="resource-result-0001"
-        ))
-        self.assertFalse(store.contains_result(
-            owner="session-b", result_id="resource-result-0001"
-        ))
-
         snapshot["candidates"].clear()
         self.assertEqual(len(store.get(owner="session-a")["candidates"]), 2)
         now[0] = 111.0
         self.assertIsNone(store.get(owner="session-a"))
-        self.assertFalse(store.contains_result(
-            owner="session-a", result_id="resource-result-0001"
-        ))
 
     def test_verified_missing_context_is_internal_and_invalid_context_is_dropped(self):
         store = RecentResourceCandidateStore()
@@ -389,6 +380,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
     ):
         preview_calls: list[dict] = []
         execute_calls: list[dict] = []
+        resource_store = recent_resource_store or RecentResourceCandidateStore()
         search_results = [
             _single_result(
                 _candidate("resource-result-0001"),
@@ -426,72 +418,89 @@ class RecentResourceConfirmationTests(unittest.TestCase):
                 _candidate("season-resource-0001", title="Example.S02E03.2160p.WEB-DL")
             ),
         ))
-        def prepare_single_submit(arguments: dict) -> tuple[ToolResult, str]:
-            preview_calls.append(dict(arguments))
+        def resolve_one(arguments: dict, context: ToolContext) -> dict:
+            snapshot = resource_store.get(owner=context.owner)
+            if snapshot is None:
+                snapshot = active_agent_resource_candidates(owner=context.owner)
+            candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
+            position = int(arguments["position"])
+            if position < 1 or position > len(candidates):
+                raise AgentToolError("候选已过期", code="precondition_failed")
+            return {
+                "result_id": str(candidates[position - 1]["result_id"]),
+                "target": str(arguments["target"]),
+            }
+
+        def prepare_one(arguments: dict, context: ToolContext):
+            internal = resolve_one(arguments, context)
+            preview_calls.append(dict(internal))
             return (
-                ToolResult(
-                    True,
-                    "confirmation_required",
-                    "preview",
-                    data=dict(arguments),
-                ),
-                f"{arguments['result_id']}:{arguments['target']}",
+                ToolResult(True, "confirmation_required", "preview", data={
+                    "position": arguments["position"],
+                    "target": arguments["target"],
+                }),
+                f"{internal['result_id']}:{internal['target']}",
             )
 
-        def confirm_single_submit(
-            arguments: dict, _expected_context: str
-        ) -> ToolResult:
-            execute_calls.append(dict(arguments))
-            if submit_handler is not None:
-                return submit_handler(arguments)
-            return ToolResult(True, "accepted", "submitted", data={
-                "request_id": 101,
-                "target": arguments["target"],
-                "status": "submitted",
-                "succeeded": ["qb"] if arguments["target"] == "qb" else ["guangya"],
-                "failed": [],
-                "created": True,
-                "duplicate": False,
-            })
+        def confirm_one(arguments: dict, expected: str, context: ToolContext):
+            internal = resolve_one(arguments, context)
+            if expected != f"{internal['result_id']}:{internal['target']}":
+                raise AgentToolError("候选已变化", code="confirmation_stale")
+            execute_calls.append(dict(internal))
+            return (
+                submit_handler(internal)
+                if submit_handler is not None
+                else ToolResult(True, "accepted", "submitted", data={
+                    "request_id": 101,
+                    "target": internal["target"],
+                    "status": "submitted",
+                    "succeeded": ["qb"] if internal["target"] == "qb" else ["guangya"],
+                    "failed": [],
+                    "created": True,
+                    "duplicate": False,
+                })
+            )
 
-        registry.register(ToolSpec(
-            name="indexer.submit_resource",
-            description="submit",
-            risk=RiskLevel.DANGER,
-            parameters={},
-            validator=lambda arguments: {
-                "result_id": str(arguments.get("result_id") or ""),
-                "target": str(arguments.get("target") or ""),
-            },
-            requires_confirmation=True,
-            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_single_submit),
-            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirm_single_submit),
-        ))
-        def prepare_batch_submit(arguments: dict) -> tuple[ToolResult, str]:
+        def resolve_batch(arguments: dict, context: ToolContext) -> dict:
+            snapshot = resource_store.get(owner=context.owner)
+            if snapshot is None:
+                snapshot = active_agent_resource_candidates(owner=context.owner)
+            candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
+            positions = list(arguments["positions"])
+            if any(position < 1 or position > len(candidates) for position in positions):
+                raise AgentToolError("候选已过期", code="precondition_failed")
+            return {
+                "result_ids": [
+                    str(candidates[position - 1]["result_id"])
+                    for position in positions
+                ],
+                "target": str(arguments["target"]),
+            }
+
+        def prepare_batch(arguments: dict, context: ToolContext):
+            internal = resolve_batch(arguments, context)
             return (
                 ToolResult(
                     True,
                     "confirmation_required",
                     "batch preview",
-                    data={
-                        "count": len(arguments["result_ids"]),
-                        "target": arguments["target"],
-                    },
+                    data={"count": len(internal["result_ids"]), "target": internal["target"]},
                 ),
-                ",".join(arguments["result_ids"]) + ":" + arguments["target"],
+                ",".join(internal["result_ids"]) + ":" + internal["target"],
             )
 
-        def confirm_batch_submit(
-            arguments: dict, _expected_context: str
-        ) -> ToolResult:
-            execute_calls.append(dict(arguments))
+        def confirm_batch(arguments: dict, expected: str, context: ToolContext):
+            internal = resolve_batch(arguments, context)
+            if expected != ",".join(internal["result_ids"]) + ":" + internal["target"]:
+                raise AgentToolError("候选已变化", code="confirmation_stale")
+            execute_calls.append(dict(internal))
             return ToolResult(True, "partial", "batch submitted", data={
-                "target": arguments["target"],
+                "target": internal["target"],
                 "items": [
                     {
-                        "result_id": arguments["result_ids"][0],
+                        "result_id": internal["result_ids"][0],
                         "request_id": 201,
-                        "target": arguments["target"],
+                        "target": internal["target"],
                         "status": "submitted",
                         "created": True,
                         "duplicate": False,
@@ -499,9 +508,9 @@ class RecentResourceConfirmationTests(unittest.TestCase):
                         "failed": [],
                     },
                     {
-                        "result_id": arguments["result_ids"][1],
+                        "result_id": internal["result_ids"][1],
                         "request_id": 202,
-                        "target": arguments["target"],
+                        "target": internal["target"],
                         "status": "failed",
                         "created": True,
                         "duplicate": False,
@@ -512,22 +521,37 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             })
 
         registry.register(ToolSpec(
-            name="indexer.submit_resource_batch",
+            name="indexer.submit_candidate",
+            description="submit",
+            risk=RiskLevel.DANGER,
+            parameters={},
+            validator=lambda arguments: {
+                "position": int(arguments.get("position") or 0),
+                "target": str(arguments.get("target") or ""),
+            },
+            handler=lambda _arguments: ToolResult(False, "confirmation_required", "confirm"),
+            requires_confirmation=True,
+            context_confirmation_preparer=prepare_one,
+            context_confirmed_handler=confirm_one,
+        ))
+        registry.register(ToolSpec(
+            name="indexer.submit_candidates",
             description="batch submit",
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda arguments: {
-                "result_ids": list(arguments.get("result_ids") or []),
+                "positions": list(arguments.get("positions") or []),
                 "target": str(arguments.get("target") or ""),
             },
+            handler=lambda _arguments: ToolResult(False, "confirmation_required", "confirm"),
             requires_confirmation=True,
-            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_batch_submit),
-            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirm_batch_submit),
+            context_confirmation_preparer=prepare_batch,
+            context_confirmed_handler=confirm_batch,
         ))
         service = AgentOrchestrator(
             registry,
             ConfirmationStore(token_factory=lambda: "confirm-resource-0001"),
-            recent_resource_store=recent_resource_store,
+            recent_resource_store=resource_store,
             automatic_verification_enqueuer=automatic_verification_enqueuer,
             record_actions=record_actions,
         )
@@ -544,12 +568,12 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         )
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(
-            prepared["tool_call"]["name"], "indexer.submit_resource_batch"
+            prepared["tool_call"]["name"], "indexer.submit_candidates"
         )
         self.assertEqual(execute_calls, [])
 
         confirmed = service.confirm(
-            prepared["action_plan"]["plan_id"], owner="session-a"
+            prepared["confirmation"]["confirmation_id"], owner="session-a"
         )
         self.assertEqual(len(execute_calls), 1)
         self.assertEqual(confirmed["result"]["status"], "partial")
@@ -572,7 +596,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             self.assertNotIn(secret, serialized)
         with self.assertRaises(AgentToolError):
             service.confirm(
-                prepared["action_plan"]["plan_id"], owner="session-a"
+                prepared["confirmation"]["confirmation_id"], owner="session-a"
             )
 
     def test_same_query_can_prepare_a_staged_owner_bound_resource(self):
@@ -585,8 +609,8 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             )
             result_id = searched["result"]["data"]["items"][0]["result_id"]
             prepared = service.prepare(
-                "indexer.submit_resource",
-                {"result_id": result_id, "target": "qb"},
+                "indexer.submit_candidate",
+                {"position": 1, "target": "qb"},
                 owner="session-a",
             )
 
@@ -757,7 +781,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         self.assertEqual(execute_calls, [])
 
         confirmed = service.confirm(
-            prepared["action_plan"]["plan_id"], owner="session-a"
+            prepared["confirmation"]["confirmation_id"], owner="session-a"
         )
         self.assertEqual(confirmed["mode"], "confirmed_action")
         self.assertEqual(execute_calls, [{
@@ -773,7 +797,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
                 needs_target = service.query("下载第1个", owner="session-a")
                 context = [{
                     "role": "assistant",
-                    "tool_name": "indexer.submit_resource",
+                    "tool_name": "indexer.submit_candidate",
                     "status": "selection_required",
                     "text": needs_target["result"]["summary"],
                 }]
@@ -795,7 +819,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         needs_target = service.query("下载第1个", owner="session-a")
         context = [{
             "role": "assistant",
-            "tool_name": "indexer.submit_resource",
+            "tool_name": "indexer.submit_candidate",
             "status": "selection_required",
             "text": needs_target["result"]["summary"],
         }]
@@ -820,7 +844,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             owner="session-a",
             conversation_context=[{
                 "role": "assistant",
-                "tool_name": "indexer.submit_resource",
+                "tool_name": "indexer.submit_candidate",
                 "status": "selection_required",
                 "text": "请选择一个下载目标。",
                 "pending_selection": pending,
@@ -1103,11 +1127,11 @@ class RecentResourceConfirmationTests(unittest.TestCase):
 
         response = service.query("下载刚才推荐的第 2 个到 qB", owner="session-a")
         self.assertEqual(response["mode"], "confirmation_required")
-        self.assertEqual(response["tool_call"]["name"], "indexer.submit_resource")
+        self.assertEqual(response["confirmation"]["tool"], "indexer.submit_candidate")
         self.assertEqual(preview_calls, [{"result_id": "resource-result-0002", "target": "qb"}])
         self.assertEqual(execute_calls, [])
 
-        confirmed = service.confirm(response["action_plan"]["plan_id"], owner="session-a")
+        confirmed = service.confirm(response["confirmation"]["confirmation_id"], owner="session-a")
         self.assertEqual(confirmed["mode"], "confirmed_action")
         self.assertEqual(execute_calls, [{"result_id": "resource-result-0002", "target": "qb"}])
         verification = service.recent_download_store.get(owner="session-a")[0].verification
@@ -1151,7 +1175,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
 
         with self.assertLogs("app.agent.orchestrator", level="WARNING") as captured:
             confirmed = service.confirm(
-                prepared["action_plan"]["plan_id"], owner="session-a"
+                prepared["confirmation"]["confirmation_id"], owner="session-a"
             )
 
         self.assertEqual(confirmed["mode"], "confirmed_action")
@@ -1281,7 +1305,7 @@ class RecentResourceRepairTrackingIntegrationTests(IsolatedDatabaseTestCase):
             owner="tg:v1:100\x1f200",
         )
         confirmed = service.confirm(
-            prepared["action_plan"]["plan_id"],
+            prepared["confirmation"]["confirmation_id"],
             owner="tg:v1:100\x1f200",
         )
 
@@ -1345,7 +1369,7 @@ class RecentResourceRepairTrackingIntegrationTests(IsolatedDatabaseTestCase):
             owner_digest=action_history_owner_digest("tg:v1:100\x1f200"), limit=10
         )
         self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["tool_name"], "indexer.submit_resource")
+        self.assertEqual(history[0]["tool_name"], "indexer.submit_candidate")
         serialized = repr(dict(history[0])) + repr(confirmed)
         for secret in (
             "magnet:",
@@ -1413,7 +1437,7 @@ class RecentResourceConfirmationAPITests(IsolatedDatabaseTestCase):
                 json={"session_id": "test_session_identifier_0001", "message": "下载刚才推荐的第 1 个到 qB"},
             )
             direct_cross_owner = self.client_b.post(
-                "/api/agent/actions/indexer.submit_resource/prepare",
+                "/api/agent/actions/indexer.submit_candidate/prepare",
                 headers=headers_b,
                 json={
                     "session_id": "test_session_identifier_0001",
@@ -1428,17 +1452,17 @@ class RecentResourceConfirmationAPITests(IsolatedDatabaseTestCase):
                 headers=headers_a,
                 json={"session_id": "test_session_identifier_0001", "message": "下载刚才推荐的第 1 个到 qB"},
             )
-            confirmation_id = prepared.json()["action_plan"]["plan_id"]
+            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
             wrong_owner = self.client_b.post(
                 "/api/agent/actions/confirm",
                 headers=headers_b,
-                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
             )
             self.assertEqual(execute_calls, [])
             confirmed = self.client_a.post(
                 "/api/agent/actions/confirm",
                 headers=headers_a,
-                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
             )
 
         self.assertEqual(searched.status_code, 200, searched.text)

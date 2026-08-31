@@ -125,7 +125,7 @@ def _submission_agent(
         return result
 
     registry.register(ToolSpec(
-        name="indexer.submit_resource",
+        name="indexer.submit_candidate",
         description="submit",
         risk=RiskLevel.DANGER,
         parameters={},
@@ -478,7 +478,7 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         prepared = service.prepare(
-            "indexer.submit_resource",
+            "indexer.submit_candidate",
             {"result_id": "safe-result-00000001", "target": "qb"},
             owner="session-a",
         )
@@ -503,7 +503,7 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         prepared = service.prepare(
-            "indexer.submit_resource",
+            "indexer.submit_candidate",
             {"result_id": "safe-result-00000001", "target": "qb"},
             owner="session-a",
         )
@@ -534,7 +534,7 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         expired = expired_service.prepare(
-            "indexer.submit_resource",
+            "indexer.submit_candidate",
             {"result_id": "safe-result-00000001", "target": "qb"},
             owner="session-a",
         )
@@ -553,7 +553,7 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         stale = stale_service.prepare(
-            "indexer.submit_resource",
+            "indexer.submit_candidate",
             {"result_id": "safe-result-00000001", "target": "qb"},
             owner="session-a",
         )
@@ -664,7 +664,7 @@ class RecentDownloadStatusAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(searched.status_code, 200, searched.text)
 
             prepared = self.client_a.post(
-                "/api/agent/actions/indexer.submit_resource/prepare",
+                "/api/agent/actions/indexer.submit_candidate/prepare",
                 headers=headers_a,
                 json={"session_id": "test_session_identifier_0001", "arguments": {"result_id": "safe-result-00000001", "target": "qb"}},
             )

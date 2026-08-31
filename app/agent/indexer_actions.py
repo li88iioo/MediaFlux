@@ -269,7 +269,19 @@ def search_resources(
     except IndexerError as exc:
         return ToolResult(False, exc.code, exc.public_message, error=exc.public_message)
 
-    items = [_public_item(item) for item in result.items[:arguments["limit"]]]
+    items: list[dict[str, Any]] = []
+    candidate_position = 0
+    for raw_item in result.items[: arguments["limit"]]:
+        item = _public_item(raw_item)
+        if (
+            _RESULT_ID_RE.fullmatch(str(item.get("result_id") or ""))
+            and str(item.get("download_state") or "").lower()
+            in {"ready", "resolvable"}
+            and bool(set(item.get("download_kinds") or []) & {"magnet", "torrent"})
+        ):
+            candidate_position += 1
+            item["position"] = candidate_position
+        items.append(item)
     errors = [
         {
             "site_id": _safe_text(error.site_id, 32),

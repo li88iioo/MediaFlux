@@ -106,7 +106,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             self.assertEqual(logged_in.status_code, 302)
             csrf = self._csrf(client.get("/rss").text)
             headers = {"X-CSRF-Token": csrf}
-            with patch("app.routes.rss_api._wake_rss_scheduler") as wake_scheduler:
+            with patch("app.routes.rss_api.wake_rss_scheduler") as wake_scheduler:
                 paused = client.put(
                     f"/api/rss/subscriptions/{subscription_id}",
                     json={"enabled": False},

@@ -526,7 +526,12 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
     if (_RESOURCE_SEARCH_RE.search(text) or resource_availability) and not (
         _SERIES_UPDATE_RE.search(text) and library_requested
     ):
-        allowed = ["indexer.search_resources", "indexer.diagnose_readiness"]
+        allowed = [
+            "indexer.search_resources",
+            "indexer.diagnose_readiness",
+            "indexer.submit_candidate",
+            "indexer.submit_candidates",
+        ]
         required_sources = ["resource_index"]
         primary_domains = ["indexer", "resource_search"]
         subscription_requested = bool(
@@ -952,8 +957,8 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
                 "rss.get_subscription_summary",
                 "rss.entry_summaries",
                 "rss.recent_activity",
-                "rss.set_subscription_enabled",
-                "rss.set_refresh_interval",
+                "rss.create_subscription",
+                "rss.update_subscription",
                 "rss.refresh_subscription",
                 "rss.refresh_subscriptions",
                 "rss.mark_entries",
@@ -965,7 +970,7 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             max_provider_requests=7,
             max_tool_rounds=4,
             max_tool_calls=7,
-            max_capabilities=14,
+            max_capabilities=16,
             parallel_reads=False,
             completion_rule="RSS 订阅源、条目和刷新动作必须保持同一订阅范围；提交、重试、标记和删除都必须锁定公开编号并确认。",
         )

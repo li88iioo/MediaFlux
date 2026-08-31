@@ -511,6 +511,7 @@ class AgentBrowserTests(unittest.TestCase):
                 "status": "success" if episode != 2 else "unavailable",
                 "search": {
                     "items": [{
+                        "position": episode,
                         "result_id": f"season_result_resource_{episode:04d}",
                         "site_id": "nyaa",
                         "site_name": "Nyaa",
@@ -525,7 +526,7 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.evaluate("payload => { window.__agentPrepareResponse = payload; }", {
             "request_id": "season-prepare-test",
             "mode": "confirmation_required",
-            "tool_call": {"name": "indexer.submit_resource", "elapsed_ms": 5},
+            "tool_call": {"name": "indexer.submit_candidate", "elapsed_ms": 5},
             "result": {
                 "ok": True, "status": "ready", "summary": "资源提交预检已完成",
                 "data": {}, "evidence": [], "suggestions": [],
@@ -588,10 +589,7 @@ class AgentBrowserTests(unittest.TestCase):
         request_body = json.loads(prepare_calls[0]["body"])
         self.assertRegex(request_body.pop("session_id"), r"^[A-Za-z0-9_-]{16,64}$")
         self.assertEqual(request_body, {
-            "arguments": {
-                "result_id": "season_result_resource_0001",
-                "target": "qb",
-            },
+            "arguments": {"position": 1, "target": "qb"},
         })
         self.assertFalse(any(call["url"].endswith("/actions/confirm") for call in calls))
         self.page.locator(".agent-confirmation-cancel").click()
@@ -769,7 +767,7 @@ class AgentBrowserTests(unittest.TestCase):
                     "query": "黑镜", "returned": 1, "sites_attempted": ["nyaa"],
                     "sites_succeeded": ["nyaa"], "partial": False, "cached": False, "has_more": False,
                     "items": [{
-                        "result_id": result_id, "site_id": "nyaa", "site_name": "Nyaa",
+                        "position": 1, "result_id": result_id, "site_id": "nyaa", "site_name": "Nyaa",
                         "title": "Black Mirror S07E05 1080p", "size_text": "1.2 GB", "seeders": 18,
                         "download_state": "resolvable", "download_kinds": ["magnet"],
                     }],
@@ -780,7 +778,7 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.evaluate("payload => { window.__agentPrepareResponse = payload; }", {
             "request_id": "prepare-test",
             "mode": "confirmation_required",
-            "tool_call": {"name": "indexer.submit_resource", "elapsed_ms": 5},
+            "tool_call": {"name": "indexer.submit_candidate", "elapsed_ms": 5},
             "result": {"ok": True, "status": "ready", "summary": "资源提交预检已完成", "data": {}, "evidence": [], "suggestions": []},
             "action_plan": {
                 "version": 1,
@@ -803,7 +801,7 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.evaluate("payload => { window.__agentConfirmResponse = payload; }", {
             "request_id": "confirm-test",
             "mode": "confirmed_action",
-            "tool_call": {"name": "indexer.submit_resource", "elapsed_ms": 8},
+            "tool_call": {"name": "indexer.submit_candidate", "elapsed_ms": 8},
             "result": {"ok": True, "status": "accepted", "summary": "下载任务已提交", "data": {"target": "qb"}, "evidence": [], "suggestions": []},
         })
         self.page.locator("#agentPrompt").fill("搜索《黑镜》的资源")
@@ -827,9 +825,9 @@ class AgentBrowserTests(unittest.TestCase):
         request_body = json.loads(prepare_calls[0]["body"])
         self.assertRegex(request_body.pop("session_id"), r"^[A-Za-z0-9_-]{16,64}$")
         self.assertEqual(request_body, {
-            "arguments": {"result_id": result_id, "target": "qb"},
+            "arguments": {"position": 1, "target": "qb"},
         })
-        self.assertFalse(any(call["url"].endswith("/indexer.submit_resource") for call in calls))
+        self.assertFalse(any(call["url"].endswith("/indexer.submit_candidate") for call in calls))
         self.assertNotIn(result_id, self.page.locator("body").inner_text())
         session_calls_before_confirm = len([
             call for call in self.page.evaluate("window.__agentCalls")
@@ -865,7 +863,7 @@ class AgentBrowserTests(unittest.TestCase):
                     "sites_succeeded": ["nyaa"], "partial": False, "cached": False,
                     "has_more": False,
                     "items": [{
-                        "result_id": result_id, "site_id": "nyaa", "site_name": "Nyaa",
+                        "position": 1, "result_id": result_id, "site_id": "nyaa", "site_name": "Nyaa",
                         "title": "Black Mirror S07E05 1080p", "size_text": "1.2 GB",
                         "seeders": 18, "download_state": "resolvable",
                         "download_kinds": ["magnet"],
@@ -1417,6 +1415,7 @@ class AgentBrowserTests(unittest.TestCase):
                     "query": "黑镜", "returned": 1, "sites_attempted": ["nyaa"],
                     "sites_succeeded": ["nyaa"], "partial": False, "cached": False, "has_more": False,
                     "items": [{
+                        "position": 1,
                         "result_id": "result_mobile_resource_123456",
                         "site_id": "nyaa", "site_name": "Nyaa",
                         "title": "Black Mirror S07E05 1080p", "size_text": "1.2 GB", "seeders": 18,

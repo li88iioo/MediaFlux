@@ -42,8 +42,8 @@ _MEDIA_CONTEXT_TOOL_TYPES: dict[str, str] = {
     "discovery.lookup_rating": "",
     "discovery.add_watchlist": "",
     "indexer.search_resources": "",
-    "indexer.submit_resource": "tv",
-    "indexer.submit_resource_batch": "tv",
+    "indexer.submit_candidate": "tv",
+    "indexer.submit_candidates": "tv",
     "downloads.recent_submission_status": "tv",
     "downloads.verify_recent_submission_library": "tv",
     "library.missing_media_workflows": "tv",
@@ -1217,7 +1217,7 @@ class SQLiteAgentConversationHistoryRepository:
                     projection.pop("tentative_media_context", None)
         result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
         if (
-            tool_name == "indexer.submit_resource"
+            tool_name == "indexer.submit_candidate"
             and str(result.get("status") or "").strip().lower() == "selection_required"
         ):
             pending_selection = self._validated_pending_selection(

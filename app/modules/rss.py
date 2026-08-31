@@ -215,7 +215,7 @@ def rss_subscription_refresh_revision(subscription) -> str:
         "exclude_keywords": str(value("exclude_keywords", "") or ""),
         "action": str(value("action", "") or ""),
         "media_tmdb_id": str(value("media_tmdb_id", "") or ""),
-        "media_default_season": int(value("media_default_season", 1) or 1),
+        "media_default_season": int(value("media_default_season", 1)),
         "skip_existing_episodes": int(value("skip_existing_episodes", 0) or 0),
     }
     encoded = json.dumps(
@@ -543,7 +543,11 @@ class RSSEngine:
 
             exclude = self._split_keywords(sub["exclude_keywords"])
             media_tmdb_id = str(sub["media_tmdb_id"] or "").strip()
-            default_season = int(sub["media_default_season"] or 1)
+            default_season = int(
+                sub["media_default_season"]
+                if sub["media_default_season"] is not None
+                else 1
+            )
             skip_existing_requested = bool(sub["skip_existing_episodes"] and media_tmdb_id)
             library_positions: set[tuple[int, int]] = set()
             library_check = {"sources": 0, "ready": 0, "unavailable": 0, "truncated": 0}

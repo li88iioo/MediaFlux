@@ -53,8 +53,14 @@ class FakeResultStore:
 
 
 class FakeIndexerService:
-    def __init__(self, *, item: IndexerItem | None = None):
+    def __init__(
+        self,
+        *,
+        item: IndexerItem | None = None,
+        items: list[IndexerItem] | None = None,
+    ):
         self.item = item or _resource_item()
+        self.items = list(items) if items is not None else [self.item]
         self.result_store = FakeResultStore(self.item)
         self.enabled_site_ids = frozenset({"nyaa"})
         self.search_calls: list[tuple[object, object]] = []
@@ -64,7 +70,7 @@ class FakeIndexerService:
         return AggregatedIndexerResult(
             query=request.title,
             page=request.page,
-            items=[self.item],
+            items=self.items,
             sites_attempted=("nyaa", "broken"),
             sites_succeeded=("nyaa",),
             errors=[IndexerProviderError("broken", "unavailable", "站点暂不可用")],
@@ -171,11 +177,44 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "partial")
         self.assertEqual(result.data["items"][0]["result_id"], _RESULT_ID)
+        self.assertEqual(result.data["items"][0]["position"], 1)
         self.assertEqual(service.search_calls[0][1], ["nyaa"])
         serialized = str(result.to_dict())
         self.assertNotIn(_SECRET_MAGNET, serialized)
         self.assertNotIn(_SECRET_TORRENT_URL, serialized)
         self.assertNotIn(_SECRET_DETAIL_URL, serialized)
+
+    def test_search_candidate_positions_skip_unavailable_items_without_gaps(self):
+        unavailable = _resource_item(
+            result_id="unavailable-result-1234",
+            title="Unavailable",
+            download_state="unavailable",
+            download_kinds=(),
+        )
+        first = _resource_item(result_id="eligible-result-0001", title="First")
+        second = _resource_item(result_id="eligible-result-0002", title="Second")
+        service = FakeIndexerService(items=[unavailable, first, second])
+        arguments = {
+            "title": "Demo",
+            "original_title": "",
+            "english_title": "",
+            "aliases": [],
+            "year": None,
+            "media_type": "",
+            "page": 1,
+            "sites": ["nyaa"],
+            "limit": 20,
+        }
+        with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
+            "app.agent.indexer_actions.get_indexer_service", return_value=service
+        ):
+            result = search_resources(arguments)
+
+        self.assertNotIn("position", result.data["items"][0])
+        self.assertEqual(
+            [item.get("position") for item in result.data["items"]],
+            [None, 1, 2],
+        )
 
     def test_search_resources_enforces_caller_timeout(self):
         service = FakeIndexerService()
@@ -230,10 +269,10 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         registry = build_tool_registry()
         capabilities = {item["name"]: item for item in registry.capabilities()}
         self.assertEqual(capabilities["indexer.search_resources"]["risk"], "read")
-        self.assertEqual(capabilities["indexer.submit_resource"]["risk"], "danger")
-        self.assertTrue(capabilities["indexer.submit_resource"]["requires_confirmation"])
+        self.assertEqual(capabilities["indexer.submit_candidate"]["risk"], "danger")
+        self.assertTrue(capabilities["indexer.submit_candidate"]["requires_confirmation"])
         with self.assertRaises(AgentToolError) as blocked:
-            registry.execute("indexer.submit_resource", {"result_id": _RESULT_ID, "target": "qb"})
+            registry.execute("indexer.submit_candidate", {"position": 1, "target": "qb"})
         self.assertEqual(blocked.exception.code, "confirmation_required")
 
     def test_preview_is_safe_and_requires_ready_target(self):
@@ -622,18 +661,18 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
             self.assertNotIn(_SECRET_MAGNET, searched.text)
 
             prepared = self.client.post(
-                "/api/agent/actions/indexer.submit_resource/prepare",
+                "/api/agent/actions/indexer.submit_candidate/prepare",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {"result_id": _RESULT_ID, "target": "qb"}},
+                json={"session_id": "test_session_identifier_0001", "arguments": {"position": 1, "target": "qb"}},
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
             confirmation_id = prepared.json()["action_plan"]["plan_id"]
             dispatch.assert_not_awaited()
 
             direct = self.client.post(
-                "/api/agent/tools/indexer.submit_resource",
+                "/api/agent/tools/indexer.submit_candidate",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {"result_id": _RESULT_ID, "target": "qb"}},
+                json={"session_id": "test_session_identifier_0001", "arguments": {"position": 1, "target": "qb"}},
             )
             self.assertEqual(direct.status_code, 409, direct.text)
 
@@ -713,9 +752,9 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(searched.status_code, 200, searched.text)
 
             prepared = self.client.post(
-                "/api/agent/actions/indexer.submit_resource/prepare",
+                "/api/agent/actions/indexer.submit_candidate/prepare",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {"result_id": _RESULT_ID, "target": "qb"}},
+                json={"session_id": "test_session_identifier_0001", "arguments": {"position": 1, "target": "qb"}},
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
             service.result_store.item = _resource_item(download_state="resolvable", download_kinds=("torrent",))

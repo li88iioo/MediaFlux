@@ -6,8 +6,11 @@ from unittest.mock import Mock, patch
 from app import database as db
 from app.clients.base import SeriesCandidate, SeriesEpisodeInventory, SeriesSearchResult
 from app.modules.media_identity import build_media_key, parse_episode_label
-from app.modules.rss import RSSEngine, RSSEntry
-from app.routes.rss_api import _rss_media_binding_fields
+from app.modules.rss import RSSEngine, RSSEntry, rss_subscription_refresh_revision
+from app.modules.rss_subscription_config import (
+    RSSSubscriptionConfigError,
+    normalize_rss_subscription_create,
+)
 from app.services import inspect_series_episode_inventory_by_tmdb
 from tests.support import IsolatedDatabaseTestCase
 
@@ -56,6 +59,26 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         self.assertEqual(str(row["media_tmdb_id"]), "105556")
         self.assertEqual(int(row["media_default_season"]), 0)
         self.assertTrue(bool(row["skip_existing_episodes"]))
+
+    def test_specials_season_zero_is_preserved_in_refresh_revision(self) -> None:
+        zero_id = db.add_rss_subscription(
+            "Specials", "https://example.invalid/specials",
+            media_tmdb_id="105556", media_default_season=0,
+            skip_existing_episodes=1,
+        )
+        one_id = db.add_rss_subscription(
+            "Season One", "https://example.invalid/season-one",
+            media_tmdb_id="105556", media_default_season=1,
+            skip_existing_episodes=1,
+        )
+
+        zero = db.get_rss_subscription(zero_id)
+        one = db.get_rss_subscription(one_id)
+        self.assertEqual(int(zero["media_default_season"]), 0)
+        self.assertNotEqual(
+            rss_subscription_refresh_revision(zero),
+            rss_subscription_refresh_revision(one),
+        )
 
     def test_media_key_dedupes_across_rss_subscriptions(self) -> None:
         first_sub = db.add_rss_subscription("A", "https://a.invalid/rss")
@@ -336,17 +359,28 @@ class RSSMediaDedupeTests(IsolatedDatabaseTestCase):
         client.find_series_candidates_by_tmdb.assert_called_once_with("105556", limit=20)
         self.assertFalse(hasattr(client, "search_series_candidates"))
 
-    def test_route_binding_validation_requires_tmdb_for_library_filter(self) -> None:
-        _fields, error = _rss_media_binding_fields({"skip_existing_episodes": True})
-        self.assertIn("TMDB ID", error)
-        fields, error = _rss_media_binding_fields({
+    def test_shared_binding_validation_requires_tmdb_for_library_filter(self) -> None:
+        base = {"name": "Anime", "urls": "https://example.invalid/rss"}
+        with self.assertRaisesRegex(RSSSubscriptionConfigError, "TMDB ID"):
+            normalize_rss_subscription_create({
+                **base,
+                "skip_existing_episodes": True,
+            })
+        fields = normalize_rss_subscription_create({
+            **base,
             "skip_existing_episodes": True,
             "media_tmdb_id": "00105556",
             "media_default_season": 2,
         })
-        self.assertEqual(error, "")
         self.assertEqual(fields["media_tmdb_id"], "105556")
         self.assertEqual(fields["media_default_season"], 2)
+        specials = normalize_rss_subscription_create({
+            **base,
+            "skip_existing_episodes": True,
+            "media_tmdb_id": "105556",
+            "media_default_season": 0,
+        })
+        self.assertEqual(specials["media_default_season"], 0)
 
 
 class RSSTMDBClientLifecycleTests(IsolatedDatabaseTestCase):

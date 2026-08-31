@@ -155,6 +155,7 @@ def build_provider_catalog() -> ProviderCatalog:
             parameters={
                 "type": "object",
                 "properties": {
+                    "query": {"type": "string", "maxLength": 240, "default": ""},
                     "category": {"type": "string", "maxLength": 80, "default": ""},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
                 },

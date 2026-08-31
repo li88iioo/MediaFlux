@@ -208,10 +208,13 @@ def _prepare_rate_limit(tool_name: str) -> int:
         "guangya.directory_scrape.run": 3,
         "guangya.organize.run_once": 4,
         "guangya.organize.stop": 4,
-        "indexer.submit_resource": 6,
+        "indexer.submit_candidate": 6,
+        "indexer.submit_candidates": 4,
         "strm.retry_failures": 3,
         "rss.refresh_subscription": 3,
         "rss.refresh_subscriptions": 3,
+        "rss.create_subscription": 4,
+        "rss.update_subscription": 4,
         "rss.mark_entries": 4,
         "rss.submit_entries_to_qb": 3,
         "rss.submit_pending_to_qb": 3,
@@ -221,7 +224,6 @@ def _prepare_rate_limit(tool_name: str) -> int:
         "media_proxy.set_instance_enabled": 4,
         "media_proxy.restart_instance": 3,
         "local_media.scan_sources": 3,
-        "library.refresh_library": 3,
         "recognition.set_rule_enabled": 4,
     }.get(tool_name, 10)
 
@@ -1074,7 +1076,7 @@ def query(request: Request, data: Any = Body(default=None)):
         feature_summary_request = is_feature_summary_message(message)
         config_component_request = config_component_explain_request(message) is not None
         if recent_resource_submit:
-            _check_rate_limit(request, "action:prepare:indexer.submit_resource", limit=6)
+            _check_rate_limit(request, "action:prepare:indexer.submit_candidate", limit=6)
         elif recent_download_library_verification:
             _check_rate_limit(request, "recent-download-library-verification", limit=6)
         elif recent_download_explanation:

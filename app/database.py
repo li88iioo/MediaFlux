@@ -1488,7 +1488,6 @@ CREATE TABLE IF NOT EXISTS telegram_agent_actions (
     action_kind TEXT NOT NULL,
     group_id TEXT NOT NULL,
     confirmation_id TEXT NOT NULL DEFAULT '',
-    result_id TEXT NOT NULL DEFAULT '',
     target TEXT NOT NULL DEFAULT '',
     tool_name TEXT NOT NULL DEFAULT '',
     arguments_json TEXT NOT NULL DEFAULT '{}',

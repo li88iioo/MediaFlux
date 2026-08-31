@@ -5,21 +5,16 @@ from fastapi import APIRouter, Body, Query, Request
 
 from app import database as db
 from app.logger import get_logger
-from app.modules.media_identity import normalize_tmdb_id
-from app.modules.rss import RSSEngine, validate_rss_source_urls
+from app.modules.rss import RSSEngine
+from app.modules.rss_subscription_config import (
+    normalize_rss_subscription_create,
+    normalize_rss_subscription_update,
+    wake_rss_scheduler,
+)
 from app.web import api_error, api_response, require_api_login
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/rss")
-
-
-def _wake_rss_scheduler() -> None:
-    """Best-effort 唤醒调度器；保存语义不因后台线程故障而回滚。"""
-    try:
-        from app.modules.rss_scheduler import get_rss_scheduler
-        get_rss_scheduler().reload()
-    except Exception as exc:
-        logger.warning("RSS 调度器唤醒失败 type=%s", type(exc).__name__)
 
 
 # ===== 统计 =====
@@ -50,121 +45,38 @@ def list_subs(request: Request):
         "gy_target_dir": r["gy_target_dir"] or "",
         "gy_target_dir_name": r["gy_target_dir_name"] or "",
         "media_tmdb_id": r["media_tmdb_id"] or "",
-        "media_default_season": int(r["media_default_season"] or 1),
+        "media_default_season": int(r["media_default_season"] if r["media_default_season"] is not None else 1),
         "skip_existing_episodes": bool(r["skip_existing_episodes"]),
         "updated_at": r["updated_at"],
     } for r in rows])
 
 
-def _rss_media_binding_fields(data: dict, *, partial: bool = False) -> tuple[dict, str]:
-    keys = {"media_tmdb_id", "media_default_season", "skip_existing_episodes"}
-    if partial and not (keys & data.keys()):
-        return {}, ""
-    raw_tmdb_id = str(data.get("media_tmdb_id") or "").strip()
-    skip_existing = bool(data.get("skip_existing_episodes", False))
-    if skip_existing and not raw_tmdb_id:
-        return {}, "启用媒体库去重前必须填写 TMDB ID"
-    tmdb_id = ""
-    if raw_tmdb_id:
-        try:
-            tmdb_id = normalize_tmdb_id(raw_tmdb_id)
-        except ValueError as exc:
-            return {}, str(exc)
-    try:
-        default_season = int(data.get("media_default_season", 1) or 0)
-    except (TypeError, ValueError):
-        return {}, "默认季号无效"
-    if not 0 <= default_season <= 100:
-        return {}, "默认季号必须在 0 到 100 之间"
-    return {
-        "media_tmdb_id": tmdb_id,
-        "media_default_season": default_season,
-        "skip_existing_episodes": 1 if skip_existing else 0,
-    }, ""
-
-
 @router.post("/subscriptions")
 def create_sub(request: Request, data: dict = Body(...)):
     require_api_login(request)
-    name = (data.get("name") or "").strip()
-    urls = (data.get("urls") or "").strip()
     try:
-        interval = max(0, int(data.get("refresh_interval_minutes") or 0))
-    except (TypeError, ValueError):
-        return api_error("自动刷新周期无效", 400)
-    method = (data.get("download_method") or "").strip().lower()
-    if method not in ("", "qb", "guangya"):
-        return api_error("下载目标无效", 400)
-    media_fields, media_error = _rss_media_binding_fields(data)
-    if media_error:
-        return api_error(media_error, 400)
-    if not name or not urls:
-        return api_error("名称和 URL 必填", 400)
-    try:
-        urls = validate_rss_source_urls(urls)
-    except ValueError as exc:
+        fields = normalize_rss_subscription_create(data, allow_target_paths=True)
+    except (TypeError, ValueError) as exc:
         return api_error(str(exc), 400)
-    sub_id = db.add_rss_subscription(
-        name=name,
-        urls=urls,
-        exclude_keywords=(data.get("exclude_keywords") or "").strip(),
-        refresh_cron=(data.get("refresh_cron") or "").strip(),
-        parser=(data.get("parser") or "mikan").strip(),
-        action=(data.get("action") or "subscribe").strip(),
-        enabled=1 if data.get("enabled", True) else 0,
-        refresh_interval_minutes=interval,
-        download_method=method,
-        qb_save_path=(data.get("qb_save_path") or "").strip(),
-        gy_target_dir=str(data.get("gy_target_dir") or "").strip(),
-        gy_target_dir_name=(data.get("gy_target_dir_name") or "").strip(),
-        **media_fields,
-    )
-    _wake_rss_scheduler()
+    sub_id = db.add_rss_subscription(**fields)
+    wake_rss_scheduler()
     return api_response({"success": True, "id": sub_id})
 
 
 @router.put("/subscriptions/{sid}")
 def update_sub(sid: int, request: Request, data: dict = Body(...)):
     require_api_login(request)
-    fields = {}
-    for k in ("name", "urls", "exclude_keywords", "refresh_cron",
-              "parser", "action", "download_method", "qb_save_path",
-              "gy_target_dir", "gy_target_dir_name"):
-        if k in data:
-            fields[k] = data[k]
-    if "refresh_interval_minutes" in data:
-        try:
-            fields["refresh_interval_minutes"] = max(0, int(data.get("refresh_interval_minutes") or 0))
-        except (TypeError, ValueError):
-            return api_error("自动刷新周期无效", 400)
-    if "download_method" in fields:
-        fields["download_method"] = str(fields["download_method"] or "").strip().lower()
-        if fields["download_method"] not in ("", "qb", "guangya"):
-            return api_error("下载目标无效", 400)
-    if "urls" in fields:
-        try:
-            fields["urls"] = validate_rss_source_urls(str(fields["urls"] or ""))
-        except ValueError as exc:
-            return api_error(str(exc), 400)
-    if "enabled" in data:
-        fields["enabled"] = 1 if data["enabled"] else 0
-    media_keys = {"media_tmdb_id", "media_default_season", "skip_existing_episodes"}
-    if media_keys & data.keys():
-        current = db.get_rss_subscription(sid)
-        if current is None:
-            return api_error("订阅项不存在", 404)
-        merged_media = {
-            "media_tmdb_id": current["media_tmdb_id"],
-            "media_default_season": current["media_default_season"],
-            "skip_existing_episodes": bool(current["skip_existing_episodes"]),
-            **{key: data[key] for key in media_keys if key in data},
-        }
-        media_fields, media_error = _rss_media_binding_fields(merged_media)
-        if media_error:
-            return api_error(media_error, 400)
-        fields.update(media_fields)
+    current = db.get_rss_subscription(sid)
+    if current is None:
+        return api_error("订阅项不存在", 404)
+    try:
+        fields = normalize_rss_subscription_update(
+            data, current=current, allow_target_paths=True
+        )
+    except (TypeError, ValueError) as exc:
+        return api_error(str(exc), 400)
     db.update_rss_subscription(sid, fields)
-    _wake_rss_scheduler()
+    wake_rss_scheduler()
     return api_response({"success": True})
 
 
@@ -172,7 +84,7 @@ def update_sub(sid: int, request: Request, data: dict = Body(...)):
 def delete_sub(sid: int, request: Request):
     require_api_login(request)
     db.delete_rss_subscription(sid)
-    _wake_rss_scheduler()
+    wake_rss_scheduler()
     return api_response({"success": True})
 
 

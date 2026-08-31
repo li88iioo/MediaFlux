@@ -6,11 +6,11 @@ import unittest
 
 from app.agent.state_commit import (
     AgentStateCommitBuffer,
-    active_agent_state_owns_resource,
+    active_agent_resource_candidates,
     commit_or_defer_agent_state,
     defer_agent_state_commits,
     isolate_agent_resource_results,
-    stage_agent_resource_result_ids,
+    stage_agent_resource_candidates,
 )
 
 
@@ -67,38 +67,35 @@ class AgentStateCommitBufferTests(unittest.TestCase):
         self.assertEqual(buffer.commit(), 1)
         self.assertEqual(committed, ["thread"])
 
-    def test_isolated_resource_capability_is_owner_bound_and_scope_limited(self):
+    def test_isolated_resource_candidates_are_owner_bound_and_scope_limited(self):
+        snapshot = {"candidates": [{"position": 1, "result_id": "resource-result-0002"}]}
         with isolate_agent_resource_results():
-            self.assertTrue(stage_agent_resource_result_ids(
-                owner="owner-a", result_ids={"resource-result-0002"}
+            self.assertTrue(stage_agent_resource_candidates(
+                owner="owner-a", snapshot=snapshot
             ))
-            self.assertTrue(active_agent_state_owns_resource(
-                owner="owner-a", result_id="resource-result-0002"
-            ))
-            self.assertFalse(active_agent_state_owns_resource(
-                owner="owner-b", result_id="resource-result-0002"
-            ))
+            first = active_agent_resource_candidates(owner="owner-a")
+            self.assertEqual(first, snapshot)
+            first["candidates"].clear()
+            self.assertEqual(
+                active_agent_resource_candidates(owner="owner-a"), snapshot
+            )
+            self.assertIsNone(active_agent_resource_candidates(owner="owner-b"))
 
-        self.assertFalse(active_agent_state_owns_resource(
-            owner="owner-a", result_id="resource-result-0002"
-        ))
+        self.assertIsNone(active_agent_resource_candidates(owner="owner-a"))
 
-    def test_staged_resource_capability_is_owner_bound_and_revoked_on_discard(self):
+    def test_staged_resource_candidates_are_revoked_on_discard(self):
+        snapshot = {"candidates": [{"position": 1, "result_id": "resource-result-0001"}]}
         buffer = AgentStateCommitBuffer(owner="owner-a")
         with defer_agent_state_commits(buffer):
-            self.assertTrue(stage_agent_resource_result_ids(
-                owner="owner-a", result_ids={"resource-result-0001"}
+            self.assertTrue(stage_agent_resource_candidates(
+                owner="owner-a", snapshot=snapshot
             ))
-            self.assertTrue(active_agent_state_owns_resource(
-                owner="owner-a", result_id="resource-result-0001"
-            ))
-            self.assertFalse(active_agent_state_owns_resource(
-                owner="owner-b", result_id="resource-result-0001"
-            ))
+            self.assertEqual(
+                active_agent_resource_candidates(owner="owner-a"), snapshot
+            )
+            self.assertIsNone(active_agent_resource_candidates(owner="owner-b"))
             buffer.discard()
-            self.assertFalse(active_agent_state_owns_resource(
-                owner="owner-a", result_id="resource-result-0001"
-            ))
+            self.assertIsNone(active_agent_resource_candidates(owner="owner-a"))
 
 
 if __name__ == "__main__":

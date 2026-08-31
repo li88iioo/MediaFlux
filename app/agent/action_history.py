@@ -17,9 +17,6 @@ from app.modules.web_secret import get_web_secret
 logger = get_logger(__name__)
 
 _TOOL_LABELS = {
-    "downloads.pause_task": "下载任务暂停",
-    "downloads.resume_task": "下载任务恢复",
-    "downloads.delete_task": "下载任务移除",
     "downloads.retry_submission": "下载请求重新提交",
     "provider.change.execute": "Provider 原生写计划执行",
     "rss.mark_entries": "RSS 条目标记",
@@ -28,8 +25,8 @@ _TOOL_LABELS = {
     "rss.retry_failed_to_qb": "RSS 失败条目重试",
     "rss.refresh_subscription": "RSS 订阅刷新",
     "rss.refresh_subscriptions": "RSS 订阅批量刷新",
-    "rss.set_subscription_enabled": "RSS 订阅状态修改",
-    "rss.set_refresh_interval": "RSS 刷新周期修改",
+    "rss.create_subscription": "RSS 订阅创建",
+    "rss.update_subscription": "RSS 订阅配置修改",
     "rss.delete_subscription": "RSS 订阅删除",
     "media.create_subscription": "媒体追更创建",
     "media.delete_subscription": "媒体追更删除",
@@ -47,7 +44,6 @@ _TOOL_LABELS = {
     "media_proxy.restart_instance": "媒体反代实例重启",
     "local_media.set_source_trigger_enabled": "本地媒体来源触发器启停",
     "local_media.scan_sources": "本地媒体来源扫描",
-    "library.refresh_library": "媒体库精准刷新",
     "local_media.retry_task": "本地媒体任务重试",
     "local_media.refresh_task_library": "本地媒体任务精准刷新",
     "recognition.set_rule_enabled": "识别规则启停",
@@ -64,8 +60,8 @@ _TOOL_LABELS = {
     "guangya.organize.run_once": "光鸭整理任务",
     "guangya.organize.cleanup.execute": "光鸭整理残留清理",
     "guangya.organize.stop": "停止光鸭整理任务",
-    "indexer.submit_resource": "资源下载提交",
-    "indexer.submit_resource_batch": "批量资源下载提交",
+    "indexer.submit_candidate": "资源下载提交",
+    "indexer.submit_candidates": "批量资源下载提交",
     "library.set_patrol_policy": "缺集巡检策略修改",
     "library.trigger_patrol_now": "立即全库缺集巡检",
     "library.start_episode_audit": "后台全库剧集检查",
@@ -73,9 +69,6 @@ _TOOL_LABELS = {
 }
 
 _SAFE_FIELDS = {
-    "downloads.pause_task": {"operation", "affected"},
-    "downloads.resume_task": {"operation", "affected"},
-    "downloads.delete_task": {"operation", "affected", "delete_files"},
     "downloads.retry_submission": {
         "target", "status", "created", "duplicate", "succeeded", "failed",
         "source_attention_preserved",
@@ -98,8 +91,15 @@ _SAFE_FIELDS = {
     "rss.refresh_subscriptions": {
         "requested", "refreshed", "failed", "total", "new", "skipped",
     },
-    "rss.set_subscription_enabled": {"operation", "enabled", "affected", "runtime_refreshed"},
-    "rss.set_refresh_interval": {"operation", "refresh_interval_minutes", "affected", "runtime_refreshed"},
+    "rss.create_subscription": {
+        "operation", "subscription_id", "affected", "name", "url_count", "action",
+        "enabled", "refresh_interval_minutes", "download_method", "media_tmdb_id",
+        "media_default_season", "skip_existing_episodes", "runtime_refreshed",
+    },
+    "rss.update_subscription": {
+        "operation", "affected", "changed_field_count",
+        "runtime_refreshed",
+    },
     "rss.delete_subscription": {"operation", "affected", "deleted_entries", "runtime_refreshed"},
     "media.create_subscription": {
         "operation", "subscription_number", "affected", "created", "season", "runtime_refreshed",
@@ -141,9 +141,6 @@ _SAFE_FIELDS = {
         "operation", "source_numbers", "scanned_sources", "candidates",
         "queued_tasks", "runtime_started",
     },
-    "library.refresh_library": {
-        "operation", "provider", "library", "refreshed",
-    },
     "local_media.set_source_trigger_enabled": {
         "operation", "source_number", "trigger", "enabled", "affected", "runtime_refreshed",
     },
@@ -178,10 +175,10 @@ _SAFE_FIELDS = {
         "residual_dir_count", "selected_count", "kept_count", "requires_manual",
     },
     "guangya.organize.stop": {"accepted"},
-    "indexer.submit_resource": {
+    "indexer.submit_candidate": {
         "target", "status", "created", "succeeded", "failed", "duplicate",
     },
-    "indexer.submit_resource_batch": {
+    "indexer.submit_candidates": {
         "target", "total", "succeeded", "failed", "duplicate",
     },
     "library.set_patrol_policy": {"runtime_refreshed"},
@@ -222,7 +219,7 @@ _COUNT_FIELDS = {
     "requested", "claimed", "submitted", "failed", "matched", "resolved", "missing",
     "stale", "source_count", "succeeded", "cleaned", "subscription_id",
     "total", "new", "skipped", "site_count", "affected",
-    "refresh_interval_minutes", "deleted_entries",
+    "refresh_interval_minutes", "deleted_entries", "changed_field_count",
     "max_series", "progress_current", "progress_total", "instance_number", "rule_id",
     "subscription_number", "watchlist_number", "source_number", "task_number", "season",
     "candidate_number", "queue_position", "plan_count", "outcome_unknown",
@@ -267,7 +264,7 @@ _ENUM_FIELDS = {
     "media_type": {"movie", "tv"},
     "task_status": {"pending", "running", "retry_wait", "not_scheduled"},
     "operation": {
-        "pause", "resume", "delete", "enable", "disable", "set_interval",
+        "pause", "resume", "delete", "enable", "disable", "set_interval", "update",
         "add", "remove", "create", "restore", "retry", "precise_refresh",
         "set_preferences", "clear_preferences", "set_notification_rule",
         "reset_notification_rule", "media.library.refresh", "media.item.refresh",

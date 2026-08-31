@@ -349,7 +349,7 @@ class PatrolFollowupAPITests(IsolatedDatabaseTestCase):
         )
         episode_search = followup.json()["result"]["data"]["episodes"][0]["search"]
         self.assertEqual(episode_search["recommendation"]["status"], "recommended")
-        self.assertEqual(episode_search["download_plan"]["result_id"], "patrol-result-id")
+        self.assertEqual(episode_search["download_plan"]["candidate_position"], 1)
         self.assertFalse(episode_search["download_plan"]["auto_submit"])
         self.assertEqual(blocked.status_code, 200, blocked.text)
         self.assertEqual(limited.status_code, 429, limited.text)

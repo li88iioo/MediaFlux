@@ -48,6 +48,10 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertEqual(ranked["items"][0]["quality"]["confidence"], "high")
         self.assertTrue(ranked["items"][0]["quality"]["eligible"])
         self.assertFalse(ranked["items"][-1]["quality"]["eligible"])
+        self.assertEqual(
+            [item.get("position") for item in ranked["items"]],
+            [1, 2, None],
+        )
         self.assertTrue(any("冲突" in warning for warning in ranked["items"][-1]["quality"]["warnings"]))
         self.assertEqual(ranked["recommendation"]["status"], "recommended")
         selected = ranked["recommendation"]["selected"]
@@ -99,8 +103,8 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertEqual(ranked["download_plan"]["mode"], "read_only")
         self.assertFalse(ranked["download_plan"]["auto_submit"])
         self.assertTrue(ranked["download_plan"]["requires_confirmation"])
-        self.assertEqual(ranked["download_plan"]["prepare_tool"], "indexer.submit_resource")
-        self.assertEqual(ranked["download_plan"]["result_id"], "season-pack-id-0001")
+        self.assertEqual(ranked["download_plan"]["prepare_tool"], "indexer.submit_candidate")
+        self.assertEqual(ranked["download_plan"]["candidate_position"], 1)
 
     def test_exact_episode_marker_wins_over_ambiguous_complete_tag(self):
         ranked = rank_episode_search({"items": [
@@ -165,7 +169,7 @@ class ResourceRecommendationTests(unittest.TestCase):
 
         self.assertEqual(unavailable["recommendation"]["status"], "no_downloadable_candidate")
         self.assertIsNone(unavailable["recommendation"]["selected"])
-        self.assertEqual(unavailable["download_plan"]["result_id"], "")
+        self.assertIsNone(unavailable["download_plan"]["candidate_position"])
         self.assertEqual(invalid_handle["recommendation"]["status"], "no_downloadable_candidate")
         self.assertFalse(invalid_handle["items"][0]["quality"]["eligible"])
         self.assertTrue(any(

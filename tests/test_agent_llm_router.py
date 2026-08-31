@@ -460,7 +460,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
 
         self.assertEqual(read_tools & confirmation_tools, set())
         hidden_tools = set(all_tools) - read_tools - confirmation_tools
-        self.assertTrue(hidden_tools)
+        self.assertEqual(hidden_tools, set())
         self.assertTrue(all(
             all_tools[name]["risk"] == RiskLevel.READ.value
             and not all_tools[name]["requires_confirmation"]
@@ -494,8 +494,8 @@ class AgentLLMSelectionTests(unittest.TestCase):
             "guangya.organize.cleanup.execute",
         }.issubset(confirmation_tools))
         self.assertIn("agent.cancel_pending_action", read_tools)
-        self.assertNotIn("indexer.submit_resource", confirmation_tools)
-        self.assertNotIn("indexer.submit_resource_batch", confirmation_tools)
+        self.assertIn("indexer.submit_candidate", confirmation_tools)
+        self.assertIn("indexer.submit_candidates", confirmation_tools)
         exposed_names = read_tools | confirmation_tools
         self.assertFalse(any(
             token in name.casefold()

@@ -17,35 +17,23 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "只会执行写计划中已经冻结的精确操作；不能在确认阶段新增目标、修改参数或退化为全库刷新。qB 任务移除始终保留已下载文件。",
         "reversibility": "暂停和恢复可通过反向操作撤销；媒体刷新请求无法撤回；移除的 qB 任务不会由 MediaFlux 自动恢复，但本地文件会保留。",
     },
-    "downloads.pause_task": {
-        "action": "暂停下载任务",
-        "object": "你指定的 qBittorrent 任务",
-        "impact": "任务会停止继续下载或做种，已下载文件不会被删除。",
-        "reversibility": "可再次确认恢复该任务。",
-    },
-    "downloads.resume_task": {
-        "action": "恢复下载任务",
-        "object": "你指定的 qBittorrent 暂停任务",
-        "impact": "任务会恢复下载或做种，实际速度由下载器与网络决定。",
-        "reversibility": "可再次确认暂停该任务。",
-    },
-    "downloads.delete_task": {
-        "action": "移除下载任务",
-        "object": "你指定的 qBittorrent 任务",
-        "impact": "只会从下载器移除任务，绝不会删除已经下载的文件。",
-        "reversibility": "任务移除后不能由 MediaFlux 自动恢复；本地文件仍会保留。",
-    },
     "downloads.retry_submission": {
         "action": "重新提交下载请求",
         "object": "你指定的一条下载待处理记录",
         "impact": "会使用服务端保留的原始请求创建新的下载提交；不会在确认页暴露链接、种子、路径或凭据。",
         "reversibility": "已发出的下载请求无法撤回；提交失败时原记录会继续保留在待处理列表。",
     },
-    "rss.set_subscription_enabled": {
-        "action": "切换 RSS 订阅状态",
-        "object": "你指定的 RSS 订阅",
-        "impact": "会启用或停用后续定时刷新；不会立即抓取订阅或创建下载任务。",
-        "reversibility": "可再次确认切换回原状态；已经开始的刷新不会被强制中断。",
+    "rss.create_subscription": {
+        "action": "创建 RSS 订阅",
+        "object": "你刚才提供并通过服务端校验的 RSS 订阅配置",
+        "impact": "会保存订阅、过滤、刷新和下载目标配置并重新加载调度器；不会立即抓取历史条目或创建下载任务。",
+        "reversibility": "可再次修改、停用或删除订阅；已经由后续刷新创建的下载请求不受删除订阅影响。",
+    },
+    "rss.update_subscription": {
+        "action": "更新 RSS 订阅配置",
+        "object": "你指定的一条 RSS 订阅",
+        "impact": "会更新确认页列出的配置字段并重新加载调度器；不会立即刷新订阅或创建下载任务。",
+        "reversibility": "可再次确认修改；确认前订阅若已变化，本次票据会自动失效。",
     },
     "media.set_subscription_enabled": {
         "action": "切换媒体追更状态",
@@ -94,12 +82,6 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "object": "你指定的一条媒体追更订阅",
         "impact": "会删除订阅记录并停止后续更新检查；不会删除已提交的下载任务或媒体文件。",
         "reversibility": "删除不可撤销；如果只想暂时停止追更，请改为暂停订阅。",
-    },
-    "rss.set_refresh_interval": {
-        "action": "调整 RSS 自动刷新周期",
-        "object": "你指定的 RSS 订阅",
-        "impact": "会影响后续定时刷新计划；0 分钟表示关闭自动刷新，不会立即抓取或下载。",
-        "reversibility": "可再次确认修改周期或恢复自动刷新。",
     },
     "rss.delete_subscription": {
         "action": "永久删除 RSS 订阅",
@@ -203,12 +185,6 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "会把发现的媒体加入本地整理队列；后续文件操作继续服从现有来源与归档规则。",
         "reversibility": "扫描本身不修改文件；进入队列后的任务可在执行前通过来源控制停止后续接管。",
     },
-    "library.refresh_library": {
-        "action": "刷新媒体库",
-        "object": "唯一匹配的已配置 Jellyfin 或 Emby 媒体库",
-        "impact": "媒体服务器会在后台扫描该媒体库并可能更新元数据；不会移动、覆盖或删除媒体文件。",
-        "reversibility": "刷新请求无法撤回，但不会改变 MediaFlux 的媒体库映射或文件内容。",
-    },
     "local_media.set_source_trigger_enabled": {
         "action": "切换本地媒体来源触发方式",
         "object": "你按公开序号指定的本地媒体来源触发器",
@@ -293,13 +269,13 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "真空目录会在双重复核后进入回收站；仅明确选择隔离的非空残留目录会整体移动到 MediaFlux 隔离区。",
         "reversibility": "隔离目录可手工移回；空目录可从光鸭回收站恢复。明确保留、未完成复核、含媒体元数据或快照变化的目录不会进入任务。",
     },
-    "indexer.submit_resource_batch": {
+    "indexer.submit_candidates": {
         "action": "批量提交资源下载",
         "object": "你刚才选择的 2 到 12 个资源候选",
         "impact": "会逐项向同一下载目标创建任务；各项独立幂等，部分失败不会回滚已成功项目。",
         "reversibility": "可在目标下载器或云盘任务中分别暂停或删除；已发出的提交请求无法撤回。",
     },
-    "indexer.submit_resource": {
+    "indexer.submit_candidate": {
         "action": "提交资源下载",
         "object": "你刚才选择的资源候选",
         "impact": "会向所选下载目标创建任务；不会向模型或页面暴露下载链接。",

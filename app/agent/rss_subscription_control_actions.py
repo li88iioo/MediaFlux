@@ -1,10 +1,10 @@
 """RSS 订阅的受控管理动作：精确 ID、原子预检快照、一次性确认。"""
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
 from app import database as db
@@ -12,9 +12,14 @@ from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
 from app.logger import get_logger
 from app.modules.rss import rss_subscription_refresh_revision
+from app.modules.rss_subscription_config import (
+    RSSSubscriptionConfigError,
+    normalize_rss_subscription_create,
+    normalize_rss_subscription_update,
+    wake_rss_scheduler,
+)
 
 logger = get_logger(__name__)
-_MAX_REFRESH_INTERVAL_MINUTES = 10_080
 _MAX_SAFE_ID = 2_147_483_647
 
 
@@ -33,42 +38,87 @@ def _strict_subscription_id(value: Any) -> int:
     return value
 
 
-def rss_subscription_enabled_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(arguments, dict):
-        raise AgentToolError("工具参数必须是 JSON 对象")
-    if set(arguments) != {"subscription_id", "enabled"}:
-        raise AgentToolError(
-            "rss.set_subscription_enabled 只接受 subscription_id 和 enabled 参数"
-        )
-    enabled = arguments.get("enabled")
-    if not isinstance(enabled, bool):
-        raise AgentToolError("enabled 必须是布尔值")
-    return {
-        "subscription_id": _strict_subscription_id(arguments.get("subscription_id")),
-        "enabled": enabled,
-    }
+_RSS_CONFIG_KEYS = frozenset({
+    "name",
+    "urls",
+    "exclude_keywords",
+    "action",
+    "enabled",
+    "refresh_interval_minutes",
+    "download_method",
+    "media_tmdb_id",
+    "media_default_season",
+    "skip_existing_episodes",
+})
+_RSS_UPDATE_KEYS = _RSS_CONFIG_KEYS
+_RSS_INTERNAL_CREATE_KEYS = _RSS_CONFIG_KEYS | {
+    "refresh_cron",
+    "parser",
+    "qb_save_path",
+    "gy_target_dir",
+    "gy_target_dir_name",
+}
 
 
-def rss_refresh_interval_arguments(arguments: dict[str, Any]) -> dict[str, int]:
+def _agent_config_payload(arguments: dict[str, Any], *, create: bool) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
-    if set(arguments) != {"subscription_id", "refresh_interval_minutes"}:
-        raise AgentToolError(
-            "rss.set_refresh_interval 只接受 subscription_id 和 refresh_interval_minutes 参数"
-        )
-    interval = arguments.get("refresh_interval_minutes")
-    if (
-        isinstance(interval, bool)
-        or not isinstance(interval, int)
-        or interval < 0
-        or interval > _MAX_REFRESH_INTERVAL_MINUTES
-    ):
-        raise AgentToolError(
-            f"refresh_interval_minutes 必须是 0 到 {_MAX_REFRESH_INTERVAL_MINUTES} 的整数"
-        )
+    normalized_create = create and isinstance(arguments.get("urls"), str)
+    allowed = (
+        _RSS_INTERNAL_CREATE_KEYS
+        if normalized_create
+        else _RSS_CONFIG_KEYS
+        if create
+        else _RSS_UPDATE_KEYS | {"subscription_id"}
+    )
+    unknown = set(arguments) - allowed
+    if unknown:
+        raise AgentToolError("RSS 订阅配置包含未支持字段")
+    if create and not {"name", "urls"}.issubset(arguments):
+        raise AgentToolError("创建 RSS 订阅需要 name 和 urls")
+    if not create and set(arguments) == {"subscription_id"}:
+        raise AgentToolError("至少需要修改一个 RSS 订阅字段")
+
+    payload = {key: value for key, value in arguments.items() if key != "subscription_id"}
+    if normalized_create:
+        if any(str(payload.get(key) or "").strip() for key in (
+            "qb_save_path", "gy_target_dir", "gy_target_dir_name"
+        )):
+            raise AgentToolError("Agent 不接受任意下载路径或云端目录标识")
+        # ToolRegistry 会在预检和确认阶段各规范化一次。数据库字段使用
+        # 0/1，而公开工具契约使用 JSON boolean，因此在第二次规范化前
+        # 恢复为布尔值，保证 validator 幂等且不放宽外部输入类型。
+        for key in ("enabled", "skip_existing_episodes"):
+            if key in payload and payload[key] in (0, 1):
+                payload[key] = bool(payload[key])
+        return payload
+    if "urls" in payload:
+        urls = payload["urls"]
+        if not isinstance(urls, list) or not 1 <= len(urls) <= 8:
+            raise AgentToolError("urls 必须包含 1 到 8 个订阅地址")
+        normalized_urls: list[str] = []
+        for value in urls:
+            if not isinstance(value, str) or not value.strip() or len(value.strip()) > 1000:
+                raise AgentToolError("每个 RSS 订阅地址必须是长度不超过 1000 的非空字符串")
+            normalized_urls.append(value.strip())
+        payload["urls"] = "\n".join(normalized_urls)
+    return payload
+
+
+def rss_create_subscription_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    payload = _agent_config_payload(arguments, create=True)
+    try:
+        fields = normalize_rss_subscription_create(payload, allow_target_paths=False)
+    except RSSSubscriptionConfigError as exc:
+        raise AgentToolError(str(exc)) from exc
+    return fields
+
+
+def rss_update_subscription_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    payload = _agent_config_payload(arguments, create=False)
     return {
         "subscription_id": _strict_subscription_id(arguments.get("subscription_id")),
-        "refresh_interval_minutes": interval,
+        **payload,
     }
 
 
@@ -131,71 +181,243 @@ def _missing() -> AgentToolError:
     return AgentToolError("未找到指定的 RSS 订阅", code="precondition_failed")
 
 
-def _prepare_enabled(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
-    state = _capture(arguments["subscription_id"], operation="set_enabled")
-    if not state["exists"]:
-        raise _missing()
-    requested = bool(arguments["enabled"])
-    if state["enabled"] == requested:
-        label = "启用" if requested else "停用"
-        raise AgentToolError(f"该 RSS 订阅已经{label}", code="precondition_failed")
-    label = "启用" if requested else "停用"
+def _row_value(row: Any, key: str, default: Any = "") -> Any:
+    try:
+        return row[key]
+    except (KeyError, TypeError, IndexError):
+        return default
+
+
+def _config_revision(row: Any) -> str:
+    fields = (
+        "id", "name", "enabled", "refresh_cron", "refresh_interval_minutes",
+        "urls", "parser", "exclude_keywords", "action", "download_method",
+        "qb_save_path", "gy_target_dir", "gy_target_dir_name", "media_tmdb_id",
+        "media_default_season", "skip_existing_episodes", "updated_at",
+    )
+    return _fingerprint({key: _row_value(row, key) for key in fields})
+
+
+def _changed_config_fields(
+    current: Any, fields: dict[str, Any]
+) -> dict[str, Any]:
+    """只保留真实变化，避免同一配置动作生成无效确认票据。"""
+    changed: dict[str, Any] = {}
+    for key, value in fields.items():
+        try:
+            current_value = current[key]
+        except (KeyError, TypeError, IndexError):
+            current_value = None
+        if current_value != value:
+            changed[key] = value
+    return changed
+
+
+def _safe_config_summary(fields: dict[str, Any]) -> dict[str, Any]:
+    urls = str(fields.get("urls") or "")
+    return {
+        "name": str(fields.get("name") or "")[:160],
+        "url_count": len([line for line in urls.splitlines() if line.strip()]),
+        "action": str(fields.get("action") or "subscribe"),
+        "enabled": bool(fields.get("enabled", 1)),
+        "refresh_interval_minutes": int(fields.get("refresh_interval_minutes") or 0),
+        "download_method": str(fields.get("download_method") or ""),
+        "media_tmdb_id": str(fields.get("media_tmdb_id") or ""),
+        "media_default_season": int(fields.get("media_default_season", 1)),
+        "skip_existing_episodes": bool(fields.get("skip_existing_episodes", 0)),
+    }
+
+
+def _prepare_create(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
+    fields = dict(arguments)
     preview = ToolResult(
         ok=True,
         status="confirmation_required",
-        summary=f"确认后将{label} 1 个 RSS 订阅",
+        summary="确认后将创建 1 个 RSS 订阅",
         data={
-            "operation": "enable" if requested else "disable",
-            "subscription_id": arguments["subscription_id"],
-            "enabled": requested,
+            "operation": "create",
             "affected": 1,
+            **_safe_config_summary(fields),
             "effects": [
-                "启用后允许该订阅参与后续定时刷新。"
-                if requested
-                else "停用后不会再安排新的定时刷新；已经开始的刷新不会被强制中断。"
+                "保存订阅配置并让调度器重新加载。",
+                "不会立即刷新订阅，也不会自动提交历史条目。",
             ],
         },
         evidence=[Evidence(
-            "rss_database",
-            "仅核对本地订阅状态；未访问订阅地址、未读取条目内容、未触发刷新或下载。",
+            "rss_configuration",
+            "已校验订阅配置；确认页不返回订阅地址、下载路径或凭据。",
             _now(),
         )],
-        suggestions=["确认票据只可使用一次；订阅状态变化后需要重新预检。"],
+        suggestions=["确认票据只可使用一次；Agent 不接受任意下载路径或云端目录标识。"],
     )
-    return preview, _fingerprint(state)
+    return preview, _fingerprint({"operation": "create", "fields": fields})
 
 
-def _prepare_interval(arguments: dict[str, int]) -> tuple[ToolResult, str]:
-    state = _capture(arguments["subscription_id"], operation="set_interval")
-    if not state["exists"]:
+def _prepare_update(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
+    subscription_id = int(arguments["subscription_id"])
+    current = db.get_rss_subscription(subscription_id)
+    if current is None:
         raise _missing()
-    requested = int(arguments["refresh_interval_minutes"])
-    if state["refresh_interval_minutes"] == requested:
-        raise AgentToolError("该 RSS 订阅已经使用这个刷新周期", code="precondition_failed")
-    effect = (
-        "自动刷新周期将关闭；仍可手动刷新订阅。"
-        if requested == 0
-        else f"后续自动刷新周期将调整为每 {requested} 分钟一次。"
-    )
-    preview = ToolResult(
+    payload = {key: value for key, value in arguments.items() if key != "subscription_id"}
+    try:
+        fields = normalize_rss_subscription_update(
+            payload,
+            current=current,
+            allow_target_paths=False,
+        )
+    except RSSSubscriptionConfigError as exc:
+        raise AgentToolError(str(exc)) from exc
+    fields = _changed_config_fields(current, fields)
+    if not fields:
+        raise AgentToolError("RSS 订阅配置没有变化", code="precondition_failed")
+    context = {
+        "operation": "update",
+        "subscription_id": subscription_id,
+        "revision": _config_revision(current),
+        "fields": fields,
+    }
+    preview_data: dict[str, Any] = {
+        "operation": "update",
+        "subscription_id": subscription_id,
+        "affected": 1,
+        "changed_fields": sorted(fields),
+        "effects": [
+            "保存指定配置并让调度器重新加载。",
+            "不会立即刷新订阅或创建下载任务。",
+        ],
+    }
+    if "name" in fields:
+        preview_data["name"] = str(fields["name"])[:160]
+    if "urls" in fields:
+        preview_data["url_count"] = len(
+            [line for line in str(fields["urls"]).splitlines() if line.strip()]
+        )
+    for key in (
+        "action",
+        "enabled",
+        "refresh_interval_minutes",
+        "download_method",
+        "media_tmdb_id",
+        "media_default_season",
+        "skip_existing_episodes",
+    ):
+        if key in fields:
+            preview_data[key] = fields[key]
+    return ToolResult(
         ok=True,
         status="confirmation_required",
-        summary="确认后将修改 1 个 RSS 订阅的自动刷新周期",
+        summary="确认后将更新 1 个 RSS 订阅",
+        data=preview_data,
+        evidence=[Evidence(
+            "rss_database",
+            "已生成订阅配置快照；确认页不返回订阅地址、下载路径或凭据。",
+            _now(),
+        )],
+        suggestions=["订阅配置变化后，当前确认票据会自动失效。"],
+    ), _fingerprint(context)
+
+
+def _confirmed_create(arguments: dict[str, Any], expected_context: str) -> ToolResult:
+    fields = dict(arguments)
+    actual_context = _fingerprint({"operation": "create", "fields": fields})
+    if not secrets.compare_digest(actual_context, str(expected_context or "")):
+        raise AgentToolError("确认上下文与订阅配置不一致", code="confirmation_invalid")
+    try:
+        subscription_id = db.add_rss_subscription(**fields)
+    except (TypeError, ValueError) as exc:
+        return ToolResult(
+            ok=False,
+            status="precondition_failed",
+            summary="RSS 订阅创建失败",
+            error=str(exc)[:240],
+        )
+    runtime_refreshed = _reload_scheduler()
+    return ToolResult(
+        ok=True,
+        status="completed",
+        summary="RSS 订阅已创建",
         data={
-            "operation": "set_interval",
-            "subscription_id": arguments["subscription_id"],
-            "refresh_interval_minutes": requested,
+            "operation": "create",
+            "subscription_id": subscription_id,
             "affected": 1,
-            "effects": [effect, "不会立即刷新订阅，也不会自动创建下载任务。"],
+            "runtime_refreshed": runtime_refreshed,
+            **_safe_config_summary(fields),
         },
         evidence=[Evidence(
             "rss_database",
-            "仅核对本地订阅与当前周期；未访问订阅地址、未读取条目内容。",
+            "已使用一次性确认票据保存订阅配置；未立即刷新或创建下载任务。",
             _now(),
         )],
-        suggestions=["确认后调度器会重新读取配置；0 分钟表示关闭自动刷新。"],
+        suggestions=(
+            ["订阅已保存，调度器已重新加载。"]
+            if runtime_refreshed
+            else ["订阅已保存；请重启 MediaFlux 使当前进程重新加载调度。"]
+        ),
     )
-    return preview, _fingerprint(state)
+
+
+def _confirmed_config_update(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    subscription_id = int(arguments["subscription_id"])
+    current = db.get_rss_subscription(subscription_id)
+    if current is None:
+        return ToolResult(
+            ok=False,
+            status="conflict",
+            summary="RSS 订阅已不存在，请重新检查",
+            error="确认快照已失效。",
+        )
+    payload = {key: value for key, value in arguments.items() if key != "subscription_id"}
+    try:
+        fields = normalize_rss_subscription_update(
+            payload,
+            current=current,
+            allow_target_paths=False,
+        )
+    except RSSSubscriptionConfigError as exc:
+        raise AgentToolError(str(exc)) from exc
+    fields = _changed_config_fields(current, fields)
+    if not fields:
+        raise AgentToolError("RSS 订阅配置没有变化", code="precondition_failed")
+    context = {
+        "operation": "update",
+        "subscription_id": subscription_id,
+        "revision": _config_revision(current),
+        "fields": fields,
+    }
+    if not secrets.compare_digest(_fingerprint(context), str(expected_context or "")):
+        return ToolResult(
+            ok=False,
+            status="conflict",
+            summary="RSS 订阅配置已变化，请重新预检",
+            error="确认快照已失效。",
+        )
+    db.update_rss_subscription(subscription_id, fields)
+    runtime_refreshed = _reload_scheduler()
+    return ToolResult(
+        ok=True,
+        status="completed",
+        summary="RSS 订阅配置已更新",
+        data={
+            "operation": "update",
+            "subscription_id": subscription_id,
+            "affected": 1,
+            "changed_fields": sorted(fields),
+            "changed_field_count": len(fields),
+            "runtime_refreshed": runtime_refreshed,
+        },
+        evidence=[Evidence(
+            "rss_database",
+            "已使用一次性确认票据更新订阅配置；未立即刷新或创建下载任务。",
+            _now(),
+        )],
+        suggestions=(
+            ["订阅配置已生效。"]
+            if runtime_refreshed
+            else ["配置已保存；请重启 MediaFlux 使当前进程重新加载调度。"]
+        ),
+    )
 
 
 def _prepare_delete(arguments: dict[str, int]) -> tuple[ToolResult, str]:
@@ -227,79 +449,7 @@ def _prepare_delete(arguments: dict[str, int]) -> tuple[ToolResult, str]:
 
 
 def _reload_scheduler() -> bool:
-    try:
-        from app.modules.rss_scheduler import get_rss_scheduler
-
-        get_rss_scheduler().reload()
-        return True
-    except Exception as exc:
-        logger.warning("Agent RSS 配置已保存但调度器刷新失败 type=%s", type(exc).__name__)
-        return False
-
-
-def _confirmed_update(
-    arguments: dict[str, Any],
-    expected_context: str,
-    *,
-    operation: str,
-) -> ToolResult:
-    subscription_id = int(arguments["subscription_id"])
-    with db.get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM rss_items WHERE id=?", (subscription_id,)).fetchone()
-        state = _snapshot(row, operation=operation)
-        if not state["exists"] or not secrets.compare_digest(
-            _fingerprint(state), str(expected_context or "")
-        ):
-            return ToolResult(
-                ok=False,
-                status="conflict",
-                summary="RSS 订阅状态已变化，请重新预检",
-                error="确认快照已失效。",
-            )
-        if operation == "set_enabled":
-            requested = bool(arguments["enabled"])
-            conn.execute(
-                "UPDATE rss_items SET enabled=?, updated_at=? WHERE id=?",
-                (1 if requested else 0, db.now(), subscription_id),
-            )
-            operation_label = "enable" if requested else "disable"
-            summary = "RSS 订阅已启用" if requested else "RSS 订阅已停用"
-            data: dict[str, Any] = {
-                "operation": operation_label,
-                "enabled": requested,
-                "affected": 1,
-            }
-        else:
-            requested = int(arguments["refresh_interval_minutes"])
-            conn.execute(
-                "UPDATE rss_items SET refresh_interval_minutes=?, updated_at=? WHERE id=?",
-                (requested, db.now(), subscription_id),
-            )
-            summary = "RSS 自动刷新周期已更新"
-            data = {
-                "operation": "set_interval",
-                "refresh_interval_minutes": requested,
-                "affected": 1,
-            }
-
-    runtime_refreshed = _reload_scheduler()
-    data["runtime_refreshed"] = runtime_refreshed
-    suggestions = ["新的调度策略已在当前进程生效。"] if runtime_refreshed else [
-        "配置已保存；请重启 MediaFlux 使调度策略在当前进程生效。"
-    ]
-    return ToolResult(
-        ok=True,
-        status="completed",
-        summary=summary,
-        data=data,
-        evidence=[Evidence(
-            "rss_database",
-            "已使用一次性确认票据原子更新订阅配置；未暴露订阅地址、条目或凭据。",
-            _now(),
-        )],
-        suggestions=suggestions,
-    )
+    return wake_rss_scheduler()
 
 
 def _confirmed_delete(arguments: dict[str, int], expected_context: str) -> ToolResult:
@@ -348,24 +498,25 @@ def _confirmed_delete(arguments: dict[str, int], expected_context: str) -> ToolR
         ],
     )
 
-def prepare_set_rss_subscription_enabled(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
-    return _prepare_enabled(arguments)
+
+def prepare_create_rss_subscription(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
+    return _prepare_create(arguments)
 
 
-def set_rss_subscription_enabled_confirmed(
+def create_rss_subscription_confirmed(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:
-    return _confirmed_update(arguments, expected_context, operation="set_enabled")
+    return _confirmed_create(arguments, expected_context)
 
 
-def prepare_set_rss_refresh_interval(arguments: dict[str, int]) -> tuple[ToolResult, str]:
-    return _prepare_interval(arguments)
+def prepare_update_rss_subscription(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
+    return _prepare_update(arguments)
 
 
-def set_rss_refresh_interval_confirmed(
-    arguments: dict[str, int], expected_context: str
+def update_rss_subscription_confirmed(
+    arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:
-    return _confirmed_update(arguments, expected_context, operation="set_interval")
+    return _confirmed_config_update(arguments, expected_context)
 
 
 def prepare_delete_rss_subscription(arguments: dict[str, int]) -> tuple[ToolResult, str]:

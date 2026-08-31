@@ -352,8 +352,13 @@ def rank_episode_search(
         if isinstance(item, dict)
     ] if isinstance(raw_items, list) else []
     items.sort(key=_sort_key)
+    candidate_position = 0
     for rank, item in enumerate(items, start=1):
         item["quality"]["rank"] = rank
+        item.pop("position", None)
+        if item["quality"]["eligible"]:
+            candidate_position += 1
+            item["position"] = candidate_position
     ranked_data["items"] = items
 
     eligible = [item for item in items if item["quality"]["eligible"]]
@@ -380,9 +385,9 @@ def rank_episode_search(
         "mode": "read_only",
         "auto_submit": False,
         "requires_confirmation": True,
-        "prepare_tool": "indexer.submit_resource",
+        "prepare_tool": "indexer.submit_candidate",
         "supported_targets": ["qb", "guangya", "both"],
-        "result_id": selected_summary["result_id"] if selected_summary else "",
-        "note": "当前仅生成建议；提交前将重新校验短期资源句柄和下载目标。",
+        "candidate_position": 1 if selected_summary else None,
+        "note": "当前仅生成建议；提交前将按当前会话候选序号重新校验资源和下载目标。",
     }
     return ranked_data

@@ -14,9 +14,9 @@ from app.agent.orchestrator import (
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError
 from app.agent.rss_subscription_control_actions import (
+    rss_create_subscription_arguments,
     rss_delete_subscription_arguments,
-    rss_refresh_interval_arguments,
-    rss_subscription_enabled_arguments,
+    rss_update_subscription_arguments,
 )
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from tests.support import IsolatedDatabaseTestCase
@@ -44,50 +44,42 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
     def _confirm(self, tool: str, arguments: dict):
         service = get_agent_service()
         prepared = service.prepare(tool, arguments, owner="owner")
-        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
+        confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
         return prepared, confirmed
 
     def test_validators_registry_and_natural_language_are_strict(self):
         self.assertEqual(
-            rss_subscription_enabled_arguments({"subscription_id": self.sid, "enabled": False}),
+            rss_update_subscription_arguments({
+                "subscription_id": self.sid, "enabled": False,
+            }),
             {"subscription_id": self.sid, "enabled": False},
-        )
-        self.assertEqual(
-            rss_refresh_interval_arguments({
-                "subscription_id": self.sid, "refresh_interval_minutes": 0,
-            })["refresh_interval_minutes"],
-            0,
         )
         self.assertEqual(
             rss_delete_subscription_arguments({"subscription_id": self.sid}),
             {"subscription_id": self.sid},
         )
-        invalid_enabled = ({}, {"subscription_id": self.sid, "enabled": 1},
-                           {"subscription_id": True, "enabled": False},
-                           {"subscription_id": self.sid, "enabled": False, "all": True})
-        for invalid in invalid_enabled:
+        for invalid in (
+            {},
+            {"subscription_id": True, "enabled": False},
+            {"subscription_id": self.sid, "enabled": False, "all": True},
+        ):
             with self.subTest(invalid=invalid), self.assertRaises(AgentToolError):
-                rss_subscription_enabled_arguments(invalid)
-        for interval in (-1, 10081, True, "30"):
-            with self.subTest(interval=interval), self.assertRaises(AgentToolError):
-                rss_refresh_interval_arguments({
-                    "subscription_id": self.sid,
-                    "refresh_interval_minutes": interval,
-                })
+                rss_update_subscription_arguments(invalid)
 
         tools = {item["name"]: item for item in get_agent_service().capabilities()["tools"]}
-        self.assertEqual(tools["rss.set_subscription_enabled"]["risk"], "low_write")
-        self.assertEqual(tools["rss.set_refresh_interval"]["risk"], "low_write")
+        self.assertEqual(tools["rss.update_subscription"]["risk"], "low_write")
+        self.assertNotIn("rss.set_subscription_enabled", tools)
+        self.assertNotIn("rss.set_refresh_interval", tools)
         self.assertEqual(tools["rss.delete_subscription"]["risk"], "danger")
         self.assertTrue(tools["rss.delete_subscription"]["requires_confirmation"])
 
         self.assertEqual(
             rss_subscription_control_request(f"停用 RSS 订阅 {self.sid}"),
-            ("rss.set_subscription_enabled", {"subscription_id": self.sid, "enabled": False}),
+            ("rss.update_subscription", {"subscription_id": self.sid, "enabled": False}),
         )
         self.assertEqual(
             rss_subscription_control_request(f"将 RSS 订阅 {self.sid} 刷新周期设为 2 小时"),
-            ("rss.set_refresh_interval", {
+            ("rss.update_subscription", {
                 "subscription_id": self.sid, "refresh_interval_minutes": 120,
             }),
         )
@@ -99,11 +91,11 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             self.assertIsNone(rss_subscription_control_request(message))
         self.assertEqual(
             rss_subscription_control_name_request("停用 Mikan RSS 订阅"),
-            ("rss.set_subscription_enabled", "Mikan", {"enabled": False}),
+            ("rss.update_subscription", "Mikan", {"enabled": False}),
         )
         self.assertEqual(
             rss_subscription_control_name_request("将 RSS 订阅 Mikan 刷新周期设为 2 小时"),
-            ("rss.set_refresh_interval", "Mikan", {"refresh_interval_minutes": 120}),
+            ("rss.update_subscription", "Mikan", {"refresh_interval_minutes": 120}),
         )
         self.assertEqual(
             rss_subscription_control_name_request("删除 Mikan RSS 订阅"),
@@ -117,11 +109,11 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
         scheduler = Mock()
         with patch("app.modules.rss_scheduler.get_rss_scheduler", return_value=scheduler):
             prepared, confirmed = self._confirm(
-                "rss.set_subscription_enabled",
+                "rss.update_subscription",
                 {"subscription_id": self.sid, "enabled": False},
             )
             prepared2, confirmed2 = self._confirm(
-                "rss.set_refresh_interval",
+                "rss.update_subscription",
                 {"subscription_id": self.sid, "refresh_interval_minutes": 0},
             )
         self.assertEqual(scheduler.reload.call_count, 2)
@@ -140,12 +132,12 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
     def test_stale_subscription_update_conflicts(self):
         service = get_agent_service()
         prepared = service.prepare(
-            "rss.set_subscription_enabled",
+            "rss.update_subscription",
             {"subscription_id": self.sid, "enabled": False},
             owner="owner",
         )
         db.update_rss_subscription(self.sid, {"exclude_keywords": "CHANGED_SECRET"})
-        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
+        confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
         self.assertFalse(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "conflict")
         self.assertEqual(int(db.get_rss_subscription(self.sid)["enabled"]), 1)
@@ -159,7 +151,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             "rss.delete_subscription", {"subscription_id": self.sid}, owner="owner"
         )
         db.add_rss_entry(self.sid, "LATE_PRIVATE_TITLE", "late-guid")
-        conflict = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
+        conflict = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
         self.assertEqual(conflict["result"]["status"], "conflict")
         self.assertIsNotNone(db.get_rss_subscription(self.sid))
 
@@ -182,7 +174,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             side_effect=RuntimeError("secret scheduler failure"),
         ):
             _, confirmed = self._confirm(
-                "rss.set_subscription_enabled",
+                "rss.update_subscription",
                 {"subscription_id": self.sid, "enabled": False},
             )
         self.assertTrue(confirmed["result"]["ok"])
@@ -192,29 +184,99 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             owner_digest=action_history_owner_digest("owner"), limit=1
         )[0]
         details = json.loads(history["safe_details"])
-        self.assertEqual(details["operation"], "disable")
+        self.assertEqual(details["operation"], "update")
         self.assertEqual(details["affected"], 1)
         self.assertNotIn("subscription_id", details)
         serialized = json.dumps(confirmed, ensure_ascii=False)
         self.assertNotIn("secret scheduler failure", serialized)
 
+    def test_create_and_update_use_shared_safe_config_chain(self):
+        create_arguments = {
+            "name": "Anime Feed",
+            "urls": ["https://feed.example/rss"],
+            "exclude_keywords": "CAM",
+            "action": "download",
+            "enabled": True,
+            "refresh_interval_minutes": 45,
+            "download_method": "qb",
+            "media_tmdb_id": "12345",
+            "media_default_season": 2,
+            "skip_existing_episodes": True,
+        }
+        normalized = rss_create_subscription_arguments(create_arguments)
+        self.assertEqual(normalized["urls"], "https://feed.example/rss")
+        self.assertEqual(normalized["download_method"], "qb")
+        with self.assertRaises(AgentToolError):
+            rss_create_subscription_arguments({
+                **create_arguments,
+                "qb_save_path": "/unsafe/path",
+            })
+
+        service = get_agent_service()
+        with patch("app.modules.rss_scheduler.get_rss_scheduler", return_value=Mock()):
+            prepared = service.prepare(
+                "rss.create_subscription", create_arguments, owner="owner"
+            )
+            serialized = json.dumps(prepared, ensure_ascii=False)
+            self.assertNotIn("feed.example", serialized)
+            created = service.confirm(
+                prepared["confirmation"]["confirmation_id"], owner="owner"
+            )
+        self.assertTrue(created["result"]["ok"])
+        created_id = int(created["result"]["data"]["subscription_id"])
+        row = db.get_rss_subscription(created_id)
+        self.assertEqual(row["name"], "Anime Feed")
+        self.assertEqual(row["media_tmdb_id"], "12345")
+
+        update_arguments = rss_update_subscription_arguments({
+            "subscription_id": created_id,
+            "name": "Anime Feed Updated",
+            "refresh_interval_minutes": 60,
+        })
+        with patch("app.modules.rss_scheduler.get_rss_scheduler", return_value=Mock()):
+            prepared = service.prepare(
+                "rss.update_subscription", update_arguments, owner="owner"
+            )
+            updated = service.confirm(
+                prepared["confirmation"]["confirmation_id"], owner="owner"
+            )
+        self.assertTrue(updated["result"]["ok"])
+        row = db.get_rss_subscription(created_id)
+        self.assertEqual(row["name"], "Anime Feed Updated")
+        self.assertEqual(int(row["refresh_interval_minutes"]), 60)
+
+    def test_update_confirmation_conflicts_after_subscription_changes(self):
+        service = get_agent_service()
+        prepared = service.prepare(
+            "rss.update_subscription",
+            {"subscription_id": self.sid, "exclude_keywords": "SAFE"},
+            owner="owner",
+        )
+        db.update_rss_subscription(self.sid, {"refresh_interval_minutes": 31})
+        confirmed = service.confirm(
+            prepared["confirmation"]["confirmation_id"], owner="owner"
+        )
+        self.assertFalse(confirmed["result"]["ok"])
+        self.assertEqual(confirmed["result"]["status"], "conflict")
+        self.assertEqual(db.get_rss_subscription(self.sid)["exclude_keywords"], "PRIVATE_FILTER")
+
     def test_orchestrator_prepares_exact_subscription_control(self):
         service = get_agent_service()
         result = service.query(f"停用 RSS 订阅 {self.sid}", owner="owner")
         self.assertEqual(result["mode"], "confirmation_required")
-        self.assertEqual(result["tool_call"]["name"], "rss.set_subscription_enabled")
+        self.assertEqual(result["confirmation"]["tool"], "rss.update_subscription")
 
     def test_orchestrator_resolves_unique_subscription_name_for_controls(self):
         service = get_agent_service()
         for message, tool in (
-            ("停用 Private Feed RSS 订阅", "rss.set_subscription_enabled"),
-            ("将 Private Feed RSS 订阅刷新周期设为 45 分钟", "rss.set_refresh_interval"),
+            ("停用 Private Feed RSS 订阅", "rss.update_subscription"),
+            ("将 Private Feed RSS 订阅刷新周期设为 45 分钟", "rss.update_subscription"),
             ("删除 Private Feed RSS 订阅", "rss.delete_subscription"),
         ):
             with self.subTest(message=message):
                 result = service.query(message, owner="owner")
                 self.assertEqual(result["mode"], "confirmation_required")
-                self.assertEqual(result["tool_call"]["name"], tool)
+                self.assertEqual(result["confirmation"]["tool"], tool)
                 serialized = json.dumps(result, ensure_ascii=False)
                 self.assertNotIn("secret.invalid", serialized)
                 self.assertNotIn("RSS_SECRET", serialized)

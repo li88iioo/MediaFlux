@@ -329,8 +329,8 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         self.assertEqual(
             prepare_mock.call_args.args[:2],
             (
-                "indexer.submit_resource",
-                {"result_id": "resource-result-0001", "target": "qb"},
+                "indexer.submit_candidate",
+                {"position": 1, "target": "qb"},
             ),
         )
 

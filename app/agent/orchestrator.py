@@ -84,7 +84,7 @@ from app.agent.recent_read_operations import READ_PLAN_OPERATION, RecentReadOper
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     public_candidate_projection,
-    safe_resource_result_ids,
+    safe_resource_snapshot,
 )
 from app.agent.recent_discovery_candidates import RecentDiscoveryCandidateStore
 from app.agent.recent_download_submissions import (
@@ -99,6 +99,8 @@ from app.agent.recent_download_submissions import (
 from app.agent.episode_audit import invalidate_episode_audit_cache
 from app.agent.feature_gate import invalidate_agent_runtime_generation
 from app.agent.progress_events import emit_agent_progress
+from app.agent.provider_actions import get_provider_gateway
+from app.agent.provider_models import ProviderGatewayError
 from app.agent.rate_limit import allow_agent_tool
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.rss_reference import resolve_rss_subscription_name
@@ -106,10 +108,9 @@ from app.agent import result_projection
 from app.agent.response_contract import attach_response_contract
 from app.agent.session_context import AgentSessionContextRepository
 from app.agent.state_commit import (
-    active_agent_state_owns_resource,
     commit_or_defer_agent_state,
     isolate_agent_resource_results,
-    stage_agent_resource_result_ids,
+    stage_agent_resource_candidates,
 )
 from app.agent.workspace_next_actions import resolve_workspace_action_handoff
 from app.agent.turn_runtime import (
@@ -1107,13 +1108,13 @@ _DOWNLOAD_CONTROL_PATTERN = re.compile(
     r"^(暂停|停止|恢复|继续|删除|移除)\s*(?:q(?:bittorrent|b)?\s*任务|下载任务)\s*[《「『\"'](.+?)[》」』\"']$",
     re.IGNORECASE,
 )
-_DOWNLOAD_CONTROL_TOOLS = {
-    "暂停": "downloads.pause_task",
-    "停止": "downloads.pause_task",
-    "恢复": "downloads.resume_task",
-    "继续": "downloads.resume_task",
-    "删除": "downloads.delete_task",
-    "移除": "downloads.delete_task",
+_DOWNLOAD_CONTROL_OPERATIONS = {
+    "暂停": "qb.torrents.pause",
+    "停止": "qb.torrents.pause",
+    "恢复": "qb.torrents.resume",
+    "继续": "qb.torrents.resume",
+    "删除": "qb.torrents.delete_task",
+    "移除": "qb.torrents.delete_task",
 }
 _DOWNLOAD_RETRY_SCOPES = (
     "下载请求", "下载待处理请求", "下载待处理记录", "待处理下载请求", "待处理下载记录",
@@ -1183,7 +1184,7 @@ def is_download_queue_diagnosis_message(message: str) -> bool:
     )
 
 
-def download_task_control_request(message: str) -> tuple[str, dict[str, str]] | None:
+def download_task_control_request(message: str) -> tuple[str, str] | None:
     normalized = unicodedata.normalize("NFKC", str(message or "")).strip()
     matched = _DOWNLOAD_CONTROL_PATTERN.fullmatch(normalized)
     if not matched:
@@ -1192,7 +1193,7 @@ def download_task_control_request(message: str) -> tuple[str, dict[str, str]] | 
     task_name = " ".join(task_name.split()).strip()
     if not task_name:
         return None
-    return _DOWNLOAD_CONTROL_TOOLS[verb], {"task_name": task_name}
+    return _DOWNLOAD_CONTROL_OPERATIONS[verb], task_name
 
 
 def is_download_task_control_message(message: str) -> bool:
@@ -1624,7 +1625,7 @@ def rss_subscription_control_name_request(
         if name is None:
             return None
         return (
-            "rss.set_subscription_enabled",
+            "rss.update_subscription",
             name,
             {"enabled": matched.group(1) in {"启用", "开启"}},
         )
@@ -1641,7 +1642,7 @@ def rss_subscription_control_name_request(
         if interval > 10_080:
             return None
         return (
-            "rss.set_refresh_interval",
+            "rss.update_subscription",
             name,
             {"refresh_interval_minutes": interval},
         )
@@ -1672,7 +1673,7 @@ def rss_subscription_control_request(
         if subscription_id <= 0:
             return None
         return (
-            "rss.set_subscription_enabled",
+            "rss.update_subscription",
             {
                 "subscription_id": subscription_id,
                 "enabled": enabled_match.group(1) in {"启用", "开启"},
@@ -1687,7 +1688,7 @@ def rss_subscription_control_request(
         if subscription_id <= 0 or interval > 10_080:
             return None
         return (
-            "rss.set_refresh_interval",
+            "rss.update_subscription",
             {
                 "subscription_id": subscription_id,
                 "refresh_interval_minutes": interval,
@@ -3873,7 +3874,7 @@ def _recent_resource_target_followup_request(
     """承接上一轮已经选定候选、只缺下载目标的安全追问。"""
     previous = _last_assistant_context(conversation_context)
     if (
-        str(previous.get("tool_name") or "").strip() != "indexer.submit_resource"
+        str(previous.get("tool_name") or "").strip() != "indexer.submit_candidate"
         or str(previous.get("status") or "").strip().casefold() != "selection_required"
     ):
         return None
@@ -5997,11 +5998,11 @@ class AgentOrchestrator:
             state_result = deepcopy(result)
             state_arguments = deepcopy(normalized_arguments)
             native_resource_capture = _NATIVE_RESOURCE_CAPTURE.get()
-            resource_result_ids = safe_resource_result_ids(state_result)
-            if resource_result_ids:
-                stage_agent_resource_result_ids(
+            resource_snapshot = safe_resource_snapshot(state_result)
+            if resource_snapshot.get("candidates"):
+                stage_agent_resource_candidates(
                     owner=owner,
-                    result_ids=resource_result_ids,
+                    snapshot=resource_snapshot,
                 )
 
             def commit_followup_state() -> None:
@@ -6320,7 +6321,7 @@ class AgentOrchestrator:
         candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
         if not isinstance(candidates, list) or len(candidates) < 2:
             return self._response(
-                "indexer.submit_resource_batch",
+                "indexer.submit_candidates",
                 {},
                 ToolResult(False, "precondition_failed", "当前会话没有可批量提交的资源候选",
                     error="最近资源候选不存在、已过期或不足两项。"),
@@ -6356,21 +6357,11 @@ class AgentOrchestrator:
                 "批量资源要提交到哪里？请选择 qB、光鸭或两边。",
                 ["把第 1、2 个到 qB。", "把前 3 个到两边。"],
             )
-        selected = [candidates[position - 1] for position in positions]
-        result_ids = [str(item.get("result_id") or "") for item in selected]
-        followup_items: list[dict[str, Any]] = []
-        for item in selected:
-            context: dict[str, Any] = {"result_id": str(item.get("result_id") or "")}
-            verification = item.get("_verification_context")
-            if isinstance(verification, dict):
-                context["verification"] = verification
-            followup_items.append(context)
         try:
             return self.prepare(
-                "indexer.submit_resource_batch",
-                {"result_ids": result_ids, "target": target},
+                "indexer.submit_candidates",
+                {"positions": positions, "target": target},
                 owner=owner,
-                followup_context={"kind": "resource_batch", "items": followup_items},
             )
         except AgentToolError as exc:
             if not (
@@ -6382,7 +6373,7 @@ class AgentOrchestrator:
             ):
                 raise
             return self._response(
-                "indexer.submit_resource_batch",
+                "indexer.submit_candidates",
                 {},
                 ToolResult(False, "precondition_failed", "最近资源列表已恢复，但部分下载句柄已经过期",
                     error="请重新搜索资源后再批量提交。"),
@@ -6401,7 +6392,7 @@ class AgentOrchestrator:
         candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
         if not isinstance(candidates, list) or not candidates:
             return self._response(
-                "indexer.submit_resource",
+                "indexer.submit_candidate",
                 {},
                 ToolResult(
                     False,
@@ -6488,8 +6479,8 @@ class AgentOrchestrator:
                 )
         try:
             return self.prepare(
-                "indexer.submit_resource",
-                {"result_id": selected["result_id"], "target": target},
+                "indexer.submit_candidate",
+                {"position": position, "target": target},
                 owner=owner,
                 followup_context=workflow_followup_context(
                     verification_context,
@@ -6515,7 +6506,7 @@ class AgentOrchestrator:
             ):
                 raise
             return self._response(
-                "indexer.submit_resource",
+                "indexer.submit_candidate",
                 {},
                 ToolResult(
                     False,
@@ -6724,7 +6715,7 @@ class AgentOrchestrator:
                 f"回复：第 {position} 个到两边。",
             ]
         return AgentOrchestrator._response(
-            "indexer.submit_resource",
+            "indexer.submit_candidate",
             {},
             ToolResult(
                 False,
@@ -6781,7 +6772,6 @@ class AgentOrchestrator:
         session_id: str = "",
         rate_identity: str = "",
         budget_already_reserved: bool = False,
-        trusted_resource_owner_binding: bool = False,
         _cleanup_scope: str = "",
     ) -> dict[str, Any]:
         tool_name = str(tool_name or "").strip()
@@ -6792,47 +6782,6 @@ class AgentOrchestrator:
             or arguments not in (None, {})
         ):
             raise AgentToolError("无效的光鸭清理确认范围")
-        if tool_name == "indexer.submit_resource_batch":
-            result_ids = (
-                arguments.get("result_ids")
-                if isinstance(arguments, dict)
-                and isinstance(arguments.get("result_ids"), list)
-                else []
-            )
-            if not result_ids or any(
-                not isinstance(result_id, str)
-                or not (
-                    self.recent_resource_store.contains_result(
-                        owner=owner, result_id=result_id
-                    )
-                    or active_agent_state_owns_resource(
-                        owner=owner, result_id=result_id
-                    )
-                )
-                for result_id in result_ids
-            ):
-                raise AgentToolError(
-                    "批量资源不属于当前会话或候选已经过期，请重新搜索后再选择。",
-                    code="precondition_failed",
-                )
-        if tool_name == "indexer.submit_resource":
-            result_id = (
-                str(arguments.get("result_id") or "").strip()
-                if isinstance(arguments, dict)
-                else ""
-            )
-            if not trusted_resource_owner_binding and not (
-                self.recent_resource_store.contains_result(
-                    owner=owner, result_id=result_id
-                )
-                or active_agent_state_owns_resource(
-                    owner=owner, result_id=result_id
-                )
-            ):
-                raise AgentToolError(
-                    "该资源不属于当前会话或候选已经过期，请重新搜索后再选择。",
-                    code="precondition_failed",
-                )
         if not budget_already_reserved and tool_name in {
             "rss.refresh_subscription",
             "rss.refresh_subscriptions",
@@ -7170,13 +7119,16 @@ class AgentOrchestrator:
                 )
             raise
         if result.ok:
-            # 所有确认工具都是受控写操作。统一在服务层推进运行代次，避免
-            # Web/TG 或具体工具各自维护“哪些写入会让旧读结果失效”的名单。
-            # 生产调用在 agent_runtime_admission 终态窗口内执行，因此旧请求
-            # 只能在本次写入完成后取得锁，并会因代次变化而拒绝迟到发布。
+            # 所有确认工具都是受控写操作；统一推进运行代次，拒绝迟到发布。
             invalidate_agent_runtime_generation()
-        if ticket.tool_name == "indexer.submit_resource_batch":
+        single_verification_context: dict[str, Any] | None = None
+        if ticket.tool_name == "indexer.submit_candidates":
             raw_items = result.data.get("items") if isinstance(result.data, dict) else None
+            internal_contexts = (
+                result.data.pop("_verification_contexts", [])
+                if isinstance(result.data, dict)
+                else []
+            )
             context_items = (
                 ticket.followup_context.get("items")
                 if ticket.followup_context.get("kind") == "resource_batch"
@@ -7188,7 +7140,8 @@ class AgentOrchestrator:
                 for item in context_items
                 if isinstance(item, dict)
             }
-            for raw in reversed(raw_items[:12]) if isinstance(raw_items, list) else []:
+            indexed_items = list(enumerate(raw_items[:12])) if isinstance(raw_items, list) else []
+            for index, raw in reversed(indexed_items):
                 if not isinstance(raw, dict):
                     continue
                 dispatch_status = str(raw.get("status") or "").strip().lower()
@@ -7200,8 +7153,12 @@ class AgentOrchestrator:
                     "下载任务已提交" if dispatch_status in {"submitted", "partial"} else "下载任务未提交",
                     data=dict(raw),
                 )
-                verification_context = verification_by_result.get(
-                    str(raw.get("result_id") or "")
+                verification_context = (
+                    internal_contexts[index]
+                    if isinstance(internal_contexts, list)
+                    and index < len(internal_contexts)
+                    and isinstance(internal_contexts[index], dict)
+                    else verification_by_result.get(str(raw.get("result_id") or ""))
                 )
                 self.recent_download_store.capture(
                     owner=owner,
@@ -7224,17 +7181,29 @@ class AgentOrchestrator:
                             "Agent 批量下载后自动复核排队失败 type=%s",
                             type(exc).__name__,
                         )
-        if ticket.tool_name == "indexer.submit_resource":
+        if ticket.tool_name == "indexer.submit_candidate":
+            internal_verification = (
+                result.data.pop("_verification_context", None)
+                if isinstance(result.data, dict)
+                else None
+            )
+            single_verification_context = (
+                ticket.followup_context
+                if ticket.followup_context
+                else internal_verification
+                if isinstance(internal_verification, dict)
+                else None
+            )
             self.recent_download_store.capture(
                 owner=owner,
                 result=result,
-                verification_context=ticket.followup_context,
+                verification_context=single_verification_context,
             )
             if self.automatic_verification_enqueuer is not None:
                 try:
                     self.automatic_verification_enqueuer(
                         result,
-                        ticket.followup_context,
+                        single_verification_context,
                         owner,
                     )
                 except Exception as exc:
@@ -7256,18 +7225,18 @@ class AgentOrchestrator:
             )
         public_result = (
             sanitize_submission_confirmation_result(result)
-            if ticket.tool_name == "indexer.submit_resource"
+            if ticket.tool_name == "indexer.submit_candidate"
             else sanitize_batch_submission_confirmation_result(result)
-            if ticket.tool_name == "indexer.submit_resource_batch"
+            if ticket.tool_name == "indexer.submit_candidates"
             else result
         )
         verification = (
-            parse_recent_download_verification_context(ticket.followup_context)
-            if ticket.tool_name == "indexer.submit_resource"
+            parse_recent_download_verification_context(single_verification_context)
+            if ticket.tool_name == "indexer.submit_candidate"
             else None
         )
         if (
-            ticket.tool_name == "indexer.submit_resource"
+            ticket.tool_name == "indexer.submit_candidate"
             and public_result.ok
             and public_result.status == "accepted"
             and verification is not None
@@ -8504,6 +8473,95 @@ class AgentOrchestrator:
 
         return None
 
+    def _prepare_provider_download_control(
+        self, *, operation: str, task_name: str, owner: str
+    ) -> dict[str, Any]:
+        """把确定性 qB 控制请求收敛到唯一 Provider 写计划链。"""
+        gateway = get_provider_gateway()
+        profiles = [
+            profile
+            for profile in gateway.profiles("qbittorrent")
+            if profile.state == "online"
+        ]
+        if len(profiles) != 1:
+            return self._response(
+                "provider.capabilities",
+                {},
+                ToolResult(
+                    False,
+                    "provider_not_configured",
+                    "qBittorrent 当前未配置或不可用",
+                    suggestions=["请先在设置中完成 qBittorrent 配置。"],
+                    error="无法确定唯一可用的 qBittorrent 配置。",
+                ),
+                0,
+            )
+        context = ToolContext(owner=owner)
+        try:
+            query = gateway.query(
+                profile_ref=profiles[0].profile_ref,
+                operation="qb.torrents.info",
+                arguments={"query": task_name, "limit": 100},
+                context=context,
+            )
+            candidates = query.data.get("torrents")
+            if not isinstance(candidates, list):
+                candidates = []
+            normalized_name = unicodedata.normalize(
+                "NFKC", " ".join(task_name.split())
+            ).casefold()
+            matches = [
+                item
+                for item in candidates
+                if isinstance(item, dict)
+                and unicodedata.normalize(
+                    "NFKC", " ".join(str(item.get("name") or "").split())
+                ).casefold()
+                == normalized_name
+            ]
+            if len(matches) != 1:
+                summary = (
+                    "没有找到名称完全匹配的 qBittorrent 任务"
+                    if not matches
+                    else "存在多个同名 qBittorrent 任务，无法安全选择"
+                )
+                return self._response(
+                    "provider.query",
+                    {"operation": "qb.torrents.info"},
+                    ToolResult(
+                        False,
+                        "selection_required",
+                        summary,
+                        suggestions=["请先查看下载队列，再引用唯一候选执行操作。"],
+                        error="Agent 不会猜测或批量处理同名下载任务。",
+                    ),
+                    0,
+                )
+            torrent_ref = str(matches[0].get("object_ref") or "")
+            preview = gateway.preview_change(
+                profile_ref=profiles[0].profile_ref,
+                operation=operation,
+                arguments={"torrent_refs": [torrent_ref]},
+                context=context,
+            )
+            return self.prepare(
+                "provider.change.execute",
+                {"plan_ref": str(preview.data.get("plan_ref") or "")},
+                owner=owner,
+            )
+        except ProviderGatewayError as exc:
+            return self._response(
+                "provider.change.preview",
+                {"operation": operation},
+                ToolResult(
+                    False,
+                    exc.code,
+                    exc.safe_message,
+                    error=exc.safe_message,
+                ),
+                0,
+            )
+
     def _handle_download_and_media_subscription_requests(
         self,
         message: str,
@@ -8542,8 +8600,10 @@ class AgentOrchestrator:
                     LOGIN_REQUIRED_ACTION,
                     [CONFIRM_EXECUTION_IN_AGENT],
                 )
-            tool_name, arguments = download_control
-            return self.prepare(tool_name, arguments, owner=owner)
+            operation, task_name = download_control
+            return self._prepare_provider_download_control(
+                operation=operation, task_name=task_name, owner=owner
+            )
         if is_download_task_control_message(lower):
             return self._unsupported(
                 "请用书名号或引号提供一个完整任务名称；同名任务不会由 Agent 猜测选择。",
@@ -8802,13 +8862,13 @@ class AgentOrchestrator:
                     **extra_arguments,
                 }
                 return self.prepare(tool_name, arguments, owner=owner)
-            if tool_name == "rss.set_subscription_enabled":
+            if "enabled" in extra_arguments:
                 action = "启用" if extra_arguments.get("enabled") else "停用"
                 examples = [
                     f"{action} RSS 订阅 {sid}。"
                     for sid in resolution.candidate_ids[:3]
                 ]
-            elif tool_name == "rss.set_refresh_interval":
+            elif "refresh_interval_minutes" in extra_arguments:
                 interval = int(extra_arguments.get("refresh_interval_minutes", 0) or 0)
                 examples = [
                     f"将 RSS 订阅 {sid} 刷新周期设为 {interval} 分钟。"

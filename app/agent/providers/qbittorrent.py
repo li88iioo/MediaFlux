@@ -100,6 +100,12 @@ class QBittorrentProviderTransport:
                 )
             if operation == "qb.torrents.info":
                 tasks = client.list_torrents(str(arguments.get("category") or ""))
+                query = " ".join(str(arguments.get("query") or "").split()).casefold()
+                if query:
+                    tasks = [
+                        task for task in tasks
+                        if query in " ".join(str(task.name or "").split()).casefold()
+                    ]
                 limit = int(arguments.get("limit", 20))
                 items = [
                     {

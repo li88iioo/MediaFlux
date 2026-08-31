@@ -997,13 +997,13 @@
     }
 
     function createResourceActions(item) {
-        const resultId = String(item?.result_id || '');
-        if (!/^[A-Za-z0-9_-]{16,128}$/.test(resultId)) return null;
+        const position = Number(item?.position);
+        if (!Number.isInteger(position) || position < 1 || position > 12) return null;
         const actions = node('div', 'agent-resource-actions');
         [['qb', 'qBittorrent', 'download'], ['guangya', '光鸭', 'cloud-download']].forEach(([target, label, iconName]) => {
             const button = node('button', 'agent-resource-action', label);
             button.type = 'button';
-            button.dataset.agentResourceId = resultId;
+            button.dataset.agentResourcePosition = String(position);
             button.dataset.agentTarget = target;
             button.append(icon(iconName));
             actions.append(button);
@@ -2547,9 +2547,9 @@
     }
 
     async function prepareResourceSubmission(button) {
-        const resultId = String(button?.dataset.agentResourceId || '');
+        const position = Number(button?.dataset.agentResourcePosition);
         const target = String(button?.dataset.agentTarget || '');
-        if (!/^[A-Za-z0-9_-]{16,128}$/.test(resultId) || !['qb', 'guangya'].includes(target)) return;
+        if (!Number.isInteger(position) || position < 1 || position > 12 || !['qb', 'guangya'].includes(target)) return;
         if (requestInFlight || confirmationInFlight || sessionResetInFlight) return;
         const generation = conversationGeneration;
         const requestSessionId = agentSessionId;
@@ -2563,10 +2563,10 @@
         const pending = appendPendingMessage();
         const startedAt = performance.now();
         try {
-            const payload = await fetchJSON('/api/agent/actions/indexer.submit_resource/prepare', {
+            const payload = await fetchJSON('/api/agent/actions/indexer.submit_candidate/prepare', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(sessionPayload({arguments: {result_id: resultId, target}}, requestSessionId)),
+                body: JSON.stringify(sessionPayload({arguments: {position, target}}, requestSessionId)),
                 signal: controller.signal,
             });
             await sleep(Math.max(0, MIN_PENDING_MS - (performance.now() - startedAt)));
@@ -3312,7 +3312,7 @@
             return;
         }
         const resourceTrigger = event.target instanceof Element
-            ? event.target.closest('[data-agent-resource-id][data-agent-target]')
+            ? event.target.closest('[data-agent-resource-position][data-agent-target]')
             : null;
         if (resourceTrigger) {
             prepareResourceSubmission(resourceTrigger);

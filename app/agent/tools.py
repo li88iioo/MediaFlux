@@ -1,26 +1,66 @@
 """Media Agent 的受控读取与确认动作工具。"""
 from __future__ import annotations
 
-from datetime import date, datetime
 import hashlib
 import json
 import re
 import secrets
 import threading
 import time
-from typing import Any
 import unicodedata
+from datetime import date, datetime
+from typing import Any
 
-from app import config, database as db
-from app.indexers.config import INDEXER_SITE_ORDER
-from app.clients.base import normalize_playback_progress
+from app import config
+from app import database as db
 from app.agent.action_history import action_history_arguments, list_action_history
-from app.agent.config_actions import media_server_arguments, test_media_server
-from app.agent.config_diagnosis_actions import diagnose_config
-from app.agent.config_explain_actions import config_component_arguments, explain_config_component
 from app.agent.automation_actions import (
     automation_pipeline_arguments,
     diagnose_automation_pipeline,
+)
+from app.agent.config_actions import media_server_arguments, test_media_server
+from app.agent.config_diagnosis_actions import diagnose_config
+from app.agent.config_explain_actions import (
+    config_component_arguments,
+    explain_config_component,
+)
+from app.agent.discovery_actions import (
+    bangumi_calendar,
+    recommend_discovery,
+    search_discovery,
+)
+from app.agent.discovery_actions import (
+    calendar_arguments as bangumi_calendar_arguments,
+)
+from app.agent.discovery_actions import (
+    recommend_arguments as discovery_recommend_arguments,
+)
+from app.agent.discovery_actions import (
+    search_arguments as discovery_search_arguments,
+)
+from app.agent.discovery_mapping_actions import (
+    confirm_discovery_mapping,
+    confirm_discovery_mapping_confirmed,
+    discovery_confirm_mapping_arguments,
+    discovery_detail_arguments,
+    discovery_mapping_candidates_arguments,
+    get_discovery_detail,
+    get_discovery_mapping_candidates,
+    prepare_confirm_discovery_mapping,
+)
+from app.agent.discovery_watchlist_actions import (
+    add_watchlist,
+    add_watchlist_arguments,
+    add_watchlist_confirmed,
+    get_watchlist_summary,
+    list_watchlist_summaries,
+    prepare_add_watchlist,
+    prepare_remove_watchlist,
+    remove_watchlist,
+    remove_watchlist_arguments,
+    remove_watchlist_confirmed,
+    watchlist_summaries_arguments,
+    watchlist_summary_arguments,
 )
 from app.agent.download_actions import (
     diagnose_download_queue,
@@ -28,50 +68,67 @@ from app.agent.download_actions import (
     download_request_summaries_arguments,
     summarize_download_requests,
 )
-from app.agent.download_control_actions import (
-    delete_download_task_confirmed,
-    download_task_arguments,
-    pause_download_task_confirmed,
-    prepare_delete_download_task,
-    prepare_pause_download_task,
-    prepare_resume_download_task,
-    resume_download_task_confirmed,
-)
 from app.agent.download_retry_actions import (
     download_retry_submission_arguments,
     prepare_retry_download_submission,
     retry_download_submission_confirmed,
 )
-from app.agent.pending_action_actions import (
-    cancel_pending_action,
-    pending_action_arguments,
+from app.agent.durable_job_actions import (
+    agent_job_status_arguments,
+    cancel_agent_job,
+    cancel_agent_job_arguments,
+    cancel_agent_job_confirmed,
+    get_agent_job_status,
+    prepare_cancel_agent_job,
+    prepare_start_episode_audit,
+    start_episode_audit,
+    start_episode_audit_arguments,
+    start_episode_audit_confirmed,
 )
-from app.agent.provider_actions import (
-    execute_provider_change_confirmed,
-    list_provider_capabilities,
-    prepare_provider_change_execution,
-    preview_provider_change,
-    provider_capabilities_arguments,
-    provider_change_status,
-    provider_plan_arguments,
-    provider_plan_ref_arguments,
-    provider_query_arguments,
-    query_provider,
-    reset_provider_gateway_for_tests,
+from app.agent.episode_audit import (
+    audit_series_episodes,
+    reset_episode_audit_cache_for_tests,
+)
+from app.agent.episode_resource_actions import (
+    missing_episode_resource_arguments,
+    missing_season_resource_arguments,
+    search_missing_episode_resources,
+    search_missing_season_resources,
+)
+from app.agent.feature_actions import (
+    clear_confirmation_state as clear_feature_confirmation_state,
+)
+from app.agent.feature_actions import (
+    feature_state_arguments,
+    feature_state_confirmation_context,
+    feature_summary_arguments,
+    preview_set_feature_state,
+    set_feature_state,
+    summarize_feature_states,
+    verify_feature_state_write,
 )
 from app.agent.feature_gate import is_agent_enabled
-from app.agent.missing_media_workflows import (
-    list_missing_workflows,
-    missing_workflow_arguments,
+from app.agent.guangya_cleanup_actions import (
+    classify_guangya_cleanup_candidates,
+    execute_guangya_cleanup,
+    execute_guangya_cleanup_confirmed,
+    guangya_cleanup_classify_arguments,
+    guangya_cleanup_execute_arguments,
+    guangya_cleanup_preview_arguments,
+    prepare_guangya_cleanup_confirmation,
+    preview_guangya_cleanup,
 )
-from app.agent.rss_actions import (
-    diagnose_rss,
-    get_rss_recent_activity,
-    get_rss_subscription_summary,
-    list_rss_subscription_summaries,
-    rss_diagnosis_arguments,
-    rss_subscription_summaries_arguments,
-    rss_subscription_summary_arguments,
+from app.agent.guangya_directory_scrape_actions import (
+    directory_scrape_inspect_arguments,
+    directory_scrape_preview_arguments,
+    directory_scrape_run_arguments,
+    directory_scrape_search_arguments,
+    inspect_directory_scrape,
+    prepare_run_directory_scrape,
+    preview_directory_scrape,
+    run_directory_scrape,
+    run_directory_scrape_confirmed,
+    search_directory_scrape,
 )
 from app.agent.rss_download_actions import (
     prepare_rss_pending_download,
@@ -97,15 +154,15 @@ from app.agent.rss_refresh_actions import (
     rss_refresh_subscriptions_arguments,
 )
 from app.agent.rss_subscription_control_actions import (
+    create_rss_subscription_confirmed,
     delete_rss_subscription_confirmed,
+    prepare_create_rss_subscription,
     prepare_delete_rss_subscription,
-    prepare_set_rss_refresh_interval,
-    prepare_set_rss_subscription_enabled,
+    prepare_update_rss_subscription,
+    rss_create_subscription_arguments,
     rss_delete_subscription_arguments,
-    rss_refresh_interval_arguments,
-    rss_subscription_enabled_arguments,
-    set_rss_refresh_interval_confirmed,
-    set_rss_subscription_enabled_confirmed,
+    rss_update_subscription_arguments,
+    update_rss_subscription_confirmed,
 )
 from app.agent.media_subscription_actions import (
     create_media_subscription_confirmed,
@@ -153,13 +210,38 @@ from app.agent.rss_retry_actions import (
     retry_failed_rss_to_qb_confirmed,
     rss_failure_retry_arguments,
 )
-from app.agent.strm_history_actions import (
-    get_strm_run_history,
-    strm_run_history_arguments,
+from app.agent.rss_subscription_control_actions import (
+    create_rss_subscription,
+    create_rss_subscription_confirmed,
+    delete_rss_subscription,
+    delete_rss_subscription_confirmed,
+    prepare_create_rss_subscription,
+    prepare_delete_rss_subscription,
+    prepare_update_rss_subscription,
+    rss_create_subscription_arguments,
+    rss_delete_subscription_arguments,
+    rss_update_subscription_arguments,
+    update_rss_subscription,
+    update_rss_subscription_confirmed,
+)
+from app.agent.safe_policy_actions import (
+    SAFE_POLICY_IDS,
+    prepare_safe_policy_confirmation,
+    preview_set_safe_policy,
+    safe_policy_arguments,
+    safe_policy_confirmation_context,
+    safe_policy_summary_arguments,
+    set_safe_policy,
+    set_safe_policy_confirmed,
+    summarize_safe_policies,
 )
 from app.agent.strm_failure_actions import (
     strm_failure_triage_arguments,
     triage_strm_failures,
+)
+from app.agent.strm_history_actions import (
+    get_strm_run_history,
+    strm_run_history_arguments,
 )
 from app.agent.strm_retry_actions import (
     prepare_strm_failure_retry,
@@ -289,28 +371,37 @@ from app.agent.telegram_test_actions import (
     send_telegram_test_notification_confirmed,
     telegram_test_arguments,
 )
-from app.agent.indexer_readiness_actions import (
-    diagnose_indexer_readiness,
-    indexer_readiness_arguments,
+from app.agent.update_actions import check_library_updates
+from app.agent.web_search_actions import search_web, web_search_arguments
+from app.agent.workspace_actions import (
+    _contains_sensitive_text,
+    _safe_status,
+    _safe_title,
+    _safe_year,
+    search_workspace,
+    workspace_search_arguments,
 )
-from app.agent.indexer_actions import (
-    prepare_submit_resource,
-    prepare_submit_resource_batch,
-    search_arguments as indexer_search_arguments,
-    search_resources,
-    submit_arguments as indexer_submit_arguments,
-    submit_batch_arguments as indexer_submit_batch_arguments,
-    submit_resource_batch_confirmed,
-    submit_resource_confirmed,
+from app.agent.indexer_actions import search_arguments as indexer_search_arguments
+from app.agent.indexer_actions import search_resources
+from app.agent.indexer_candidate_actions import (
+    IndexerCandidateActions,
+    indexer_candidate_batch_submit_arguments,
+    indexer_candidate_submit_arguments,
 )
-from app.agent.local_media_actions import (
-    diagnose_local_media,
-    local_media_diagnosis_arguments,
-    local_media_history_arguments,
-    local_media_review_queue_arguments,
-    summarize_local_media_history,
-    summarize_local_media_review_queue,
+from app.agent.workspace_briefing_actions import (
+    summarize_workspace_briefing,
+    workspace_briefing_arguments,
 )
+from app.agent.workspace_next_actions import (
+    summarize_workspace_next_actions,
+    workspace_next_actions_arguments,
+)
+from app.agent.workspace_todo_actions import (
+    summarize_workspace_todo,
+    workspace_todo_arguments,
+)
+from app.clients.base import normalize_playback_progress
+from app.indexers.config import INDEXER_SITE_ORDER
 from app.modules.local_media_models import LOCAL_TASK_STATUSES
 from app.agent.local_media_task_actions import (
     inspect_local_media_task,
@@ -338,11 +429,6 @@ from app.agent.local_media_source_actions import (
     local_media_source_trigger_arguments,
     prepare_set_local_media_source_trigger_enabled,
     set_local_media_source_trigger_enabled_confirmed,
-)
-from app.agent.media_library_actions import (
-    media_library_refresh_arguments,
-    prepare_refresh_media_library,
-    refresh_media_library_confirmed,
 )
 from app.agent.media_server_actions import (
     diagnose_media_servers,
@@ -1307,8 +1393,13 @@ def search_library(arguments: dict[str, Any]) -> ToolResult:
     )
 
 
-def build_tool_registry() -> ToolRegistry:
+def build_tool_registry(
+    recent_resource_store: RecentResourceCandidateStore | None = None,
+) -> ToolRegistry:
     registry = ToolRegistry()
+    candidate_actions = IndexerCandidateActions(
+        recent_resource_store or RecentResourceCandidateStore()
+    )
     registry.register(ToolSpec(
         name="agent.runtime_status",
         description="只读返回 Media Agent 总开关、Telegram 接入和模型路由的当前启用状态，不返回令牌、密钥或供应商配置值。",
@@ -1798,51 +1889,6 @@ def build_tool_registry() -> ToolRegistry:
         llm_freshness="live",
         llm_examples=("查看光鸭离线任务", "列出最近的下载请求", "哪些下载请求需要处理"),
     ))
-    download_task_parameters = {
-        "type": "object",
-        "required": ["task_name"],
-        "properties": {
-            "task_name": {"type": "string", "minLength": 1, "maxLength": 240},
-        },
-        "additionalProperties": False,
-    }
-    registry.register(ToolSpec(
-        name="downloads.pause_task",
-        description="预检并在用户确认后暂停一个名称完全匹配的 qBittorrent 任务；不暴露 hash 或路径。",
-        risk=RiskLevel.LOW_WRITE,
-        parameters=download_task_parameters,
-        validator=download_task_arguments,
-        requires_confirmation=True,
-        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(pause_download_task_confirmed),
-        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_pause_download_task),
-        llm_confirmation=True,
-    ))
-    registry.register(ToolSpec(
-        name="downloads.resume_task",
-        description="预检并在用户确认后恢复一个名称完全匹配的 qBittorrent 暂停任务；不暴露 hash 或路径。",
-        risk=RiskLevel.LOW_WRITE,
-        parameters=download_task_parameters,
-        validator=download_task_arguments,
-        requires_confirmation=True,
-        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(resume_download_task_confirmed),
-        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_resume_download_task),
-        llm_confirmation=True,
-    ))
-    registry.register(ToolSpec(
-        name="downloads.delete_task",
-        description="预检并在用户确认后只从 qBittorrent 移除一个名称完全匹配的任务；绝不删除下载文件。",
-        risk=RiskLevel.DANGER,
-        parameters=download_task_parameters,
-        validator=download_task_arguments,
-        requires_confirmation=True,
-        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(delete_download_task_confirmed),
-        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_delete_download_task),
-        llm_confirmation=True,
-        llm_examples=(
-            "删除下载器中名称完全匹配的任务，但保留文件",
-            "移除刚才那个 qBittorrent 任务",
-        ),
-    ))
     registry.register(ToolSpec(
         name="downloads.retry_submission",
         description=(
@@ -1914,42 +1960,82 @@ def build_tool_registry() -> ToolRegistry:
         llm_read_plan=True,
     ))
     registry.register(ToolSpec(
-        name="rss.set_subscription_enabled",
-        description="预检并在用户确认后启用或停用一个指定 RSS 订阅；不返回名称、URL、过滤词、条目或凭据。",
+        name="rss.create_subscription",
+        description="预检并在用户确认后创建一个 RSS 订阅；支持订阅地址、过滤、刷新、下载目标和媒体去重配置，不接受任意下载路径或云端目录标识。",
         risk=RiskLevel.LOW_WRITE,
         parameters={
             "type": "object",
-            "required": ["subscription_id", "enabled"],
+            "required": ["name", "urls"],
             "properties": {
-                "subscription_id": {"type": "integer", "minimum": 1},
+                "name": {"type": "string", "minLength": 1, "maxLength": 160},
+                "urls": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+                },
+                "exclude_keywords": {"type": "string", "maxLength": 1000},
+                "action": {"type": "string", "enum": ["subscribe", "download"]},
                 "enabled": {"type": "boolean"},
+                "refresh_interval_minutes": {
+                    "type": "integer", "minimum": 0, "maximum": 10080
+                },
+                "download_method": {"type": "string", "enum": ["", "qb", "guangya"]},
+                "media_tmdb_id": {"type": "string", "maxLength": 10},
+                "media_default_season": {"type": "integer", "minimum": 0, "maximum": 100},
+                "skip_existing_episodes": {"type": "boolean"},
             },
             "additionalProperties": False,
         },
-        validator=rss_subscription_enabled_arguments,
+        validator=rss_create_subscription_arguments,
         requires_confirmation=True,
-        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_rss_subscription_enabled_confirmed),
-        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_rss_subscription_enabled),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(create_rss_subscription_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_create_rss_subscription),
         llm_confirmation=True,
+        llm_examples=(
+            "新增一个 RSS 订阅",
+            "订阅这个 RSS 地址并用 qB 下载",
+        ),
     ))
     registry.register(ToolSpec(
-        name="rss.set_refresh_interval",
-        description="预检并在用户确认后调整一个指定 RSS 订阅的自动刷新周期；0 表示关闭自动刷新，不会立即抓取或下载。",
+        name="rss.update_subscription",
+        description="预检并在用户确认后更新一个指定 RSS 订阅的名称、地址、过滤、刷新、下载目标或媒体去重配置；不接受任意路径。",
         risk=RiskLevel.LOW_WRITE,
         parameters={
             "type": "object",
-            "required": ["subscription_id", "refresh_interval_minutes"],
+            "required": ["subscription_id"],
             "properties": {
                 "subscription_id": {"type": "integer", "minimum": 1},
-                "refresh_interval_minutes": {"type": "integer", "minimum": 0, "maximum": 10080},
+                "name": {"type": "string", "minLength": 1, "maxLength": 160},
+                "urls": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+                },
+                "exclude_keywords": {"type": "string", "maxLength": 1000},
+                "action": {"type": "string", "enum": ["subscribe", "download"]},
+                "enabled": {"type": "boolean"},
+                "refresh_interval_minutes": {
+                    "type": "integer", "minimum": 0, "maximum": 10080
+                },
+                "download_method": {"type": "string", "enum": ["", "qb", "guangya"]},
+                "media_tmdb_id": {"type": "string", "maxLength": 10},
+                "media_default_season": {"type": "integer", "minimum": 0, "maximum": 100},
+                "skip_existing_episodes": {"type": "boolean"},
             },
             "additionalProperties": False,
         },
-        validator=rss_refresh_interval_arguments,
+        validator=rss_update_subscription_arguments,
         requires_confirmation=True,
-        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_rss_refresh_interval_confirmed),
-        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_rss_refresh_interval),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(update_rss_subscription_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_update_rss_subscription),
         llm_confirmation=True,
+        llm_examples=(
+            "修改 RSS 订阅 2 的过滤词",
+            "把 RSS 订阅 3 改为每 30 分钟刷新",
+            "更新这个 RSS 订阅的地址",
+        ),
     ))
     registry.register(ToolSpec(
         name="rss.delete_subscription",
@@ -3802,45 +3888,56 @@ def build_tool_registry() -> ToolRegistry:
         ),
     ))
     registry.register(ToolSpec(
-        name="indexer.submit_resource",
-        description="在用户确认后，以短期 result_id 将一个已搜索资源提交到 qBittorrent、光鸭或两者。",
+        name="indexer.submit_candidate",
+        description="在用户确认后，按当前登录会话最近资源搜索中的候选序号提交到 qBittorrent、光鸭或两者；内部下载句柄不会暴露给模型。",
         risk=RiskLevel.DANGER,
         parameters={
             "type": "object",
-            "required": ["result_id", "target"],
+            "required": ["position", "target"],
             "properties": {
-                "result_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$"},
+                "position": {"type": "integer", "minimum": 1, "maximum": 12},
                 "target": {"type": "string", "enum": ["qb", "guangya", "both"]},
             },
             "additionalProperties": False,
         },
-        validator=indexer_submit_arguments,
+        validator=indexer_candidate_submit_arguments,
         requires_confirmation=True,
-        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_submit_resource),
-        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(submit_resource_confirmed),
+        context_confirmation_preparer=candidate_actions.prepare_one,
+        context_confirmed_handler=candidate_actions.confirm_one,
+        llm_confirmation=True,
+        llm_examples=(
+            "把刚才第 2 个资源下载到 qB",
+            "提交第一个候选到光鸭",
+        ),
     ))
     registry.register(ToolSpec(
-        name="indexer.submit_resource_batch",
-        description="在用户一次确认后，把当前会话中 2 到 12 个已搜索资源逐项提交到同一下载目标；各项独立幂等并报告部分失败。",
+        name="indexer.submit_candidates",
+        description="在用户一次确认后，按当前登录会话最近资源搜索中的 2 到 12 个候选序号逐项提交到同一目标；各项独立幂等并报告部分失败。",
         risk=RiskLevel.DANGER,
         parameters={
             "type": "object",
-            "required": ["result_ids", "target"],
+            "required": ["positions", "target"],
             "properties": {
-                "result_ids": {
+                "positions": {
                     "type": "array",
                     "minItems": 2,
                     "maxItems": 12,
-                    "items": {"type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$"},
+                    "uniqueItems": True,
+                    "items": {"type": "integer", "minimum": 1, "maximum": 12},
                 },
                 "target": {"type": "string", "enum": ["qb", "guangya", "both"]},
             },
             "additionalProperties": False,
         },
-        validator=indexer_submit_batch_arguments,
+        validator=indexer_candidate_batch_submit_arguments,
         requires_confirmation=True,
-        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_submit_resource_batch),
-        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(submit_resource_batch_confirmed),
+        context_confirmation_preparer=candidate_actions.prepare_batch,
+        context_confirmed_handler=candidate_actions.confirm_batch,
+        llm_confirmation=True,
+        llm_examples=(
+            "把刚才第 1、3 个资源都下到 qB",
+            "提交前两个候选到光鸭",
+        ),
     ))
     registry.register(ToolSpec(
         name="workspace.briefing",
@@ -4065,30 +4162,6 @@ def build_tool_registry() -> ToolRegistry:
             "检查《某剧》有没有更新",
             "这部剧最新播到哪里而本地有多少",
         ),
-    ))
-
-    registry.register(ToolSpec(
-        name="library.refresh_library",
-        description="预检并确认后按媒体服务器类型和唯一媒体库名称提交精准刷新；不接受 URL、路径或内部媒体库 ID。",
-        risk=RiskLevel.LOW_WRITE,
-        parameters={
-            "type": "object",
-            "required": ["provider", "library_name"],
-            "properties": {
-                "provider": {"type": "string", "enum": ["auto", "jellyfin", "emby"]},
-                "library_name": {"type": "string", "minLength": 1, "maxLength": 80},
-            },
-            "additionalProperties": False,
-        },
-        validator=media_library_refresh_arguments,
-        requires_confirmation=True,
-        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_refresh_media_library),
-        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(refresh_media_library_confirmed),
-        llm_confirmation=True,
-        llm_domains=("library",),
-        llm_source_kind="local_library",
-        llm_parallel_safe=False,
-        llm_examples=("通知 Jellyfin 扫描动漫库", "刷新 Emby 的电影媒体库"),
     ))
 
     registry.register(ToolSpec(

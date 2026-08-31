@@ -27,6 +27,11 @@ _CONTEXT_TYPE = "resource_candidates"
 logger = logging.getLogger(__name__)
 
 
+def safe_resource_snapshot(result: ToolResult) -> dict[str, Any]:
+    """返回与持久候选仓相同的脱敏快照，供单次请求内按序号续接。"""
+    return deepcopy(_safe_snapshot(result))
+
+
 class RecentResourceCandidateStore:
     """保存最近一次缺集资源搜索的安全、短期、owner 绑定候选。"""
 
@@ -109,40 +114,6 @@ class RecentResourceCandidateStore:
                     return deepcopy(selected) if selected is not None else None
             return self._restore(owner_key=owner_key, now=now, search_id=search_id)
 
-    def contains_result(self, *, owner: str, result_id: str) -> bool:
-        """确认短期资源句柄来自同一 owner 的受信候选快照。"""
-        owner_key = str(owner or "").strip()
-        token = str(result_id or "").strip()
-        if not owner_key or not _RESULT_ID_PATTERN.fullmatch(token):
-            return False
-
-        def contains(entries: list[tuple[float, dict[str, Any]]] | None) -> bool:
-            return any(
-                secrets.compare_digest(
-                    str(candidate.get("result_id") or ""), token
-                )
-                for _expires, snapshot in entries or []
-                for candidate in (
-                    snapshot.get("candidates")
-                    if isinstance(snapshot.get("candidates"), list)
-                    else []
-                )
-                if isinstance(candidate, dict)
-            )
-
-        with self._owner_lock(owner_key):
-            now = self._clock()
-            with self._lock:
-                self._prune_locked(now)
-                if contains(self._entries.get(owner_key)):
-                    return True
-            # 新 worker 或进程重启后，本地缓存可能为空；恢复 owner 绑定的
-            # 安全快照再核对，绝不把 result_id 当成跨会话 bearer capability。
-            if self._repository is not None:
-                self._restore(owner_key=owner_key, now=now)
-                with self._lock:
-                    return contains(self._entries.get(owner_key))
-        return False
     def reset(self) -> None:
         with self._lock:
             self._entries.clear()
@@ -225,21 +196,6 @@ class RecentResourceCandidateStore:
         )
         return deepcopy(selected) if selected is not None else None
 
-
-def safe_resource_result_ids(result: ToolResult) -> set[str]:
-    """提取工具结果中已通过候选安全投影校验的短期资源标识。"""
-    snapshot = _safe_snapshot(result)
-    candidates = snapshot.get("candidates")
-    if not isinstance(candidates, list):
-        return set()
-    return {
-        str(candidate.get("result_id") or "").strip()
-        for candidate in candidates
-        if isinstance(candidate, dict)
-        and _RESULT_ID_PATTERN.fullmatch(
-            str(candidate.get("result_id") or "").strip()
-        )
-    }
 
 
 def _safe_snapshot(result: ToolResult) -> dict[str, Any]:
