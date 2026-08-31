@@ -76,6 +76,16 @@
     --mf-window-bottom-inset: 0px;
 }
 
+/* Lucide 会把占位 <i> 替换为 <svg>。首帧先保留一个字符宽度，避免
+   图标脚本执行后按钮、标签和工具栏整体横向跳动。 */
+i[data-lucide] {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    flex: 0 0 1em;
+    vertical-align: -.125em;
+}
+
 :root[data-theme="light"] {
     color-scheme: light;
     --bg-base: #f8fafc;
@@ -663,7 +673,9 @@ svg { display: block; flex: 0 0 auto; }
 .offline-dir-value { min-width: 0; flex: 1 1 auto; overflow: hidden; }
 .offline-dir-badge { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .offline-dir-icon { width: 32px; height: 32px; display: grid; place-items: center; background: var(--control-tint); border: 1px solid var(--border-soft); border-radius: 6px; color: var(--accent); flex-shrink: 0; }
-.offline-dir-icon svg { width: 16px; height: 16px; }
+.offline-dir-icon svg,
+.offline-dir-icon > i[data-lucide] { width: 18px; height: 18px; flex: 0 0 18px; }
+.offline-dir-icon svg { overflow: visible; }
 .offline-dir-badge.is-empty .offline-dir-icon { color: var(--text-muted); }
 .offline-dir-text { min-width: 0; flex: 1 1 auto; overflow: hidden; }
 .offline-dir-text strong { display: block; font-size: 13px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -675,6 +687,7 @@ svg { display: block; flex: 0 0 auto; }
 .offline-tag-input-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 .offline-tag-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .tag-chip-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; font-size: 11.5px; font-weight: 500; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 5px; animation: tagPop 0.15s cubic-bezier(0.16, 1, 0.3, 1); user-select: none; }
+.tag-chip-badge.is-initial { animation: none; }
 .tag-chip-badge.is-secondary { color: var(--accent-2); background: rgba(157, 232, 255, 0.08); border-color: rgba(157, 232, 255, 0.2); }
 .tag-chip-remove { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border: none; background: transparent; color: currentColor; opacity: 0.65; cursor: pointer; border-radius: 50%; padding: 0; font-size: 13px; line-height: 1; transition: opacity 0.15s ease, background 0.15s ease; }
 .tag-chip-remove:hover { opacity: 1; background: rgba(255, 255, 255, 0.2); }
@@ -2015,7 +2028,12 @@ html[data-media-proxy-initial-tab="advanced"] #proxyTab_advanced { display: bloc
     transition: color .2s, background .2s, border-color .2s, transform .25s var(--ease-out);
 }
 .jump-btn { min-height: 34px; padding: 7px 12px; color: var(--text-primary); background: var(--bg-input); border: 1px solid var(--border); font-size: 11px; font-weight: 650; }
-.jump-btn svg, .btn svg { width: 15px; height: 15px; }
+.jump-btn svg, .btn svg,
+.jump-btn > i[data-lucide], .btn > i[data-lucide] {
+    width: 15px;
+    height: 15px;
+    flex: 0 0 15px;
+}
 .jump-btn:hover { color: var(--accent); border-color: var(--accent); transform: translateY(-1px); }
 .btn { width: 100%; min-height: 40px; padding: 9px 14px; border: 1px solid transparent; font-size: 13px; font-weight: 700; }
 .btn-primary, .search-btn { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
@@ -2272,6 +2290,7 @@ input[type="password"].form-input { padding-right: 44px; }
     text-overflow: ellipsis;
 }
 .stat-foot-stack { display: flex; gap: 8px; align-items: center; }
+.stat-foot-stack #lastRefresh { min-width: 10.5em; margin-left: auto; text-align: right; }
 
 /* Control icon button on card head */
 .stat-card-head .icon-action-subtle {
@@ -2356,11 +2375,12 @@ input[type="password"].form-input { padding-right: 44px; }
     font-size: 13px;
     font-weight: 600;
 }
-.dl-tab-btn svg {
+.dl-tab-btn svg,
+.dl-tab-btn > i[data-lucide] {
     display: block;
     width: 17px;
     height: 17px;
-    flex: 0 0 auto;
+    flex: 0 0 17px;
     color: currentColor;
 }
 .dl-tab-btn:hover {
@@ -2380,13 +2400,14 @@ input[type="password"].form-input { padding-right: 44px; }
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-width: 18px;
+    min-width: 28px;
     height: 18px;
     padding: 0 6px;
     border-radius: 999px;
     font-size: 11px;
     font-weight: 700;
     line-height: 1;
+    box-sizing: border-box;
     color: var(--text-muted);
     background: var(--neutral-soft, rgba(0, 0, 0, 0.06));
     border: 1px solid var(--neutral-border, rgba(0, 0, 0, 0.05));
@@ -2511,18 +2532,20 @@ input[type="password"].form-input { padding-right: 44px; }
     .qb-select-all span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .qb-bulk-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; flex: 0 0 auto; }
     .qb-bulk-actions .rss-btn { width: auto; min-width: 0; height: 28px; min-height: 28px; padding: 0 7px; font-size: 11px; gap: 3px; justify-content: center; }
-    .qb-bulk-actions .rss-btn svg { width: 12px; height: 12px; }
+    .qb-bulk-actions .rss-btn svg,
+    .qb-bulk-actions .rss-btn > i[data-lucide] { width: 12px; height: 12px; flex-basis: 12px; }
     .download-batch-toolbar { display: flex; align-items: center; justify-content: space-between; flex-direction: row; gap: 8px; padding: 5px 8px; min-height: 38px; }
     .download-batch-select-all { min-width: 0; min-height: 28px; flex: 0 1 auto; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; white-space: nowrap; }
     .download-batch-select-all span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .download-batch-actions { width: auto; display: flex; align-items: center; justify-content: flex-end; gap: 4px; flex: 0 0 auto; }
     .download-batch-actions .rss-btn { width: auto; min-width: 0; height: 28px; min-height: 28px; padding: 0 6px; font-size: 11px; gap: 3px; justify-content: center; }
-    .download-batch-actions .rss-btn svg { width: 12px; height: 12px; }
+    .download-batch-actions .rss-btn svg,
+    .download-batch-actions .rss-btn > i[data-lucide] { width: 12px; height: 12px; flex-basis: 12px; }
     .dl-tab-bar { width: 100%; display: flex; padding: 4px; gap: 4px; border-radius: 10px; }
     .dl-tab-btn { min-width: 0; flex: 1 1 0; height: 38px; min-height: 38px; justify-content: center; gap: 6px; padding-inline: 6px; font-size: 12px; }
     .dl-tab-btn > span:not(.dl-tab-badge) { min-width: 0; white-space: nowrap; }
-    .dl-tab-btn svg, .dl-tab-badge { flex: 0 0 auto; }
-    .dl-tab-btn svg { width: 15px; height: 15px; }
+    .dl-tab-btn svg, .dl-tab-btn > i[data-lucide], .dl-tab-badge { flex: 0 0 auto; }
+    .dl-tab-btn svg, .dl-tab-btn > i[data-lucide] { width: 15px; height: 15px; flex-basis: 15px; }
     .dl-tab-badge { padding-inline: 5px; height: 16px; min-width: 16px; font-size: 10px; }
     .download-log-filters { width: 100% !important; grid-template-columns: 1fr 1fr !important; }
     .download-log-search { grid-column: 1 / -1; }
@@ -3228,7 +3251,8 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .rss-batch-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .rss-entry-filters .form-select { width: 100%; min-height: 34px; font-size: 11px; }
 .rss-search-field { min-width: 0; position: relative; }
-.rss-search-field > svg { position: absolute; left: 10px; top: 50%; z-index: 1; width: 15px; height: 15px; color: var(--text-muted); transform: translateY(-50%); pointer-events: none; }
+.rss-search-field > svg,
+.rss-search-field > i[data-lucide] { position: absolute; left: 10px; top: 50%; z-index: 1; width: 15px; height: 15px; color: var(--text-muted); transform: translateY(-50%); pointer-events: none; }
 .rss-search-field .form-input { min-height: 34px; padding-left: 34px; font-size: 11px; }
 .rss-entry-filters .jump-btn, .rss-batch-actions .jump-btn { width: auto; }
 .rss-batchbar { min-height: 44px; display: flex; align-items: center; gap: 14px; margin-bottom: 12px; padding: 8px 14px; color: var(--text-secondary); background: var(--bg-card); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); font-size: 11px; box-shadow: 0 2px 8px rgba(0,0,0,0.02); }
@@ -3341,9 +3365,11 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     background: var(--bg-elevated);
     color: var(--text-muted);
 }
-.rss-sub-avatar svg {
+.rss-sub-avatar svg,
+.rss-sub-avatar > i[data-lucide] {
     width: 18px;
     height: 18px;
+    flex-basis: 18px;
 }
 .rss-sub-details {
     display: flex;
@@ -3384,9 +3410,11 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     background: var(--bg-elevated);
     border: 1px solid var(--border-soft);
 }
-.rss-badge svg {
+.rss-badge svg,
+.rss-badge > i[data-lucide] {
     width: 12px;
     height: 12px;
+    flex-basis: 12px;
 }
 
 /* Bottom Row inside Subscription Card */
@@ -3409,10 +3437,11 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     min-width: 0;
     flex: 1 1 260px;
 }
-.rss-sub-url-inline svg {
+.rss-sub-url-inline svg,
+.rss-sub-url-inline > i[data-lucide] {
     width: 12px;
     height: 12px;
-    flex-shrink: 0;
+    flex: 0 0 12px;
     opacity: 0.6;
 }
 .rss-sub-url-inline > span:first-of-type {
@@ -3451,9 +3480,11 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     border-radius: var(--radius-xs);
     white-space: nowrap;
 }
-.rss-meta-pill svg {
+.rss-meta-pill svg,
+.rss-meta-pill > i[data-lucide] {
     width: 13px;
     height: 13px;
+    flex-basis: 13px;
     color: var(--text-muted);
 }
 .rss-meta-pill.is-warning {
@@ -3512,9 +3543,11 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     border-color: rgba(239, 68, 68, 0.3);
     background: rgba(239, 68, 68, 0.08);
 }
-.rss-btn svg {
+.rss-btn svg,
+.rss-btn > i[data-lucide] {
     width: 14px;
     height: 14px;
+    flex: 0 0 14px;
 }
 
 /* Clean Icon-Only Done Badge for Entry Action */
@@ -6268,7 +6301,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .subscription-metric-copy small { color: var(--text-secondary); font-size: 10px; font-weight: 680; line-height: 1.15; white-space: nowrap; }
 .subscription-metric-note { color: var(--text-muted); font-size: 9px; line-height: 1.2; white-space: nowrap; }
 .subscription-metric-value {
-    min-width: 2ch;
+    min-width: 4ch;
     justify-self: end;
     color: var(--text-primary);
     font: 700 24px/1 "SFMono-Regular", Consolas, monospace;
@@ -6318,24 +6351,26 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     font-size: 13px;
     font-weight: 600;
 }
-.subscription-tab svg {
+.subscription-tab svg,
+.subscription-tab > i[data-lucide] {
     display: block;
     width: 17px;
     height: 17px;
-    flex: 0 0 auto;
+    flex: 0 0 17px;
     color: currentColor;
 }
 .subscription-tab b {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-width: 18px;
+    min-width: 28px;
     height: 18px;
     padding: 0 6px;
     border-radius: 999px;
     font-size: 11px;
     font-weight: 700;
     line-height: 1;
+    box-sizing: border-box;
     color: var(--text-muted);
     background: var(--neutral-soft, rgba(0, 0, 0, 0.06));
     border: 1px solid var(--neutral-border, rgba(0, 0, 0, 0.05));
@@ -6865,7 +6900,7 @@ html[data-subscription-initial-tab="runs"] #subscriptionPanelRuns { display: blo
 .subscription-rss-stats { margin-bottom: 14px; }
 .subscription-rss-card { margin-bottom: 14px; }
 .subscription-rss-card:last-child { margin-bottom: 0; }
-.subscription-rss-source-list { min-height: 96px; display: grid; gap: 8px; }
+.subscription-rss-source-list { min-height: 112px; display: grid; gap: 8px; }
 .subscription-rss-entry-list { min-height: 180px; }
 .subscription-section-toolbar { align-items: center; }
 .subscription-section-toolbar .btn { min-height: 36px; }
@@ -7038,7 +7073,8 @@ html[data-subscription-initial-tab="runs"] #subscriptionPanelRuns { display: blo
     .subscription-panel-actions .form-select { width: 100%; }
     .subscription-tabs { width: 100%; display: flex; padding: 4px; gap: 4px; border-radius: 10px; }
     .subscription-tab { min-width: 0; flex: 1 1 0; height: 38px; min-height: 38px; justify-content: center; gap: 6px; padding-inline: 6px; font-size: 12px; }
-    .subscription-tab svg { width: 15px; height: 15px; }
+    .subscription-tab svg,
+    .subscription-tab > i[data-lucide] { width: 15px; height: 15px; flex-basis: 15px; }
     .subscription-tab b { padding-inline: 5px; height: 16px; min-width: 16px; font-size: 10px; }
     .media-subscription-card { grid-template-columns: 40px minmax(0, 1fr); }
     .subscription-skeleton.is-media { grid-template-columns: 40px minmax(0, 1fr); }
@@ -7064,7 +7100,8 @@ html[data-subscription-initial-tab="runs"] #subscriptionPanelRuns { display: blo
     .subscription-metric-value { font-size: 20px; }
     .subscription-tabs { width: 100%; display: flex; padding: 4px; gap: 4px; border-radius: 10px; }
     .subscription-tab { min-width: 0; flex: 1 1 0; height: 38px; min-height: 38px; justify-content: center; gap: 5px; padding-inline: 4px; font-size: 12px; }
-    .subscription-tab svg { width: 15px; height: 15px; }
+    .subscription-tab svg,
+    .subscription-tab > i[data-lucide] { width: 15px; height: 15px; flex-basis: 15px; }
     .subscription-tab b { padding-inline: 4px; height: 16px; min-width: 16px; font-size: 10px; }
     .subscription-panel { min-height: 330px; padding: 12px; }
     .subscription-panel-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; width: 100%; align-items: center; }
@@ -7101,7 +7138,8 @@ html[data-subscription-initial-tab="runs"] #subscriptionPanelRuns { display: blo
     .subscription-candidate-actions .rss-btn { flex: 1; }
     .subscription-section-toolbar { gap: 10px; }
     .subscription-section-toolbar .subscription-rss-create { width: 38px; min-width: 38px; padding: 0; font-size: 0; }
-    .subscription-section-toolbar .subscription-rss-create svg { width: 16px; height: 16px; }
+    .subscription-section-toolbar .subscription-rss-create svg,
+    .subscription-section-toolbar .subscription-rss-create > i[data-lucide] { width: 16px; height: 16px; flex-basis: 16px; }
     .subscription-rss-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .subscription-rss-stats .stat-card { min-width: 0; min-height: 88px; padding: 12px; }
     .subscription-rss-stats .stat-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -161,9 +161,45 @@ def guangya(request: Request):
     return _page(request, "guangya.html", "guangya")
 
 
+def _offline_transfer_defaults() -> dict[str, object]:
+    """返回离线转存页首帧配置，避免异步回填时控件和标签横向跳动。"""
+
+    def split_tags(key: str) -> list[str]:
+        raw = str(config.get(key, "") or "")
+        return [item.strip() for item in re.split(r"[,，\r\n]+", raw) if item.strip()]
+
+    return {
+        "offline_initial": {
+            "magnet_enabled": config.get_bool("OFFLINE_MAGNET_ENABLED", True),
+            "ed2k_enabled": config.get_bool("OFFLINE_ED2K_ENABLED", True),
+            "http_enabled": config.get_bool("OFFLINE_HTTP_ENABLED", False),
+            "target_dir": str(config.get("OFFLINE_TARGET_DIR", "") or "").strip(),
+            "target_dir_name": str(
+                config.get("OFFLINE_TARGET_DIR_NAME", "") or ""
+            ).strip(),
+            "secondary_enabled": config.get_bool("OFFLINE_SECONDARY_ENABLED", False),
+            "secondary_dir": str(
+                config.get("OFFLINE_SECONDARY_DIR", "") or ""
+            ).strip(),
+            "secondary_dir_name": str(
+                config.get("OFFLINE_SECONDARY_DIR_NAME", "") or ""
+            ).strip(),
+            "secondary_keywords": split_tags("OFFLINE_SECONDARY_KEYWORDS"),
+            "exclude_keywords": split_tags("OFFLINE_EXCLUDE_KEYWORDS"),
+            "min_file_mb": max(0, config.get_int("OFFLINE_MIN_FILE_MB", 0)),
+            "allowed_exts": split_tags("OFFLINE_ALLOWED_EXTS"),
+        }
+    }
+
+
 @router.get("/guangya/offline", name="pages.guangya_offline")
 def guangya_offline(request: Request):
-    return _page(request, "guangya_offline.html", "guangya_offline")
+    return _page(
+        request,
+        "guangya_offline.html",
+        "guangya_offline",
+        **_offline_transfer_defaults(),
+    )
 
 
 @router.get("/guangya/strm", name="pages.guangya_strm")

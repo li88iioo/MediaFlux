@@ -2,6 +2,20 @@
 {% block title %}离线转存 - MediaFlux{% endblock %}
 {% block page_title %}光鸭离线转存{% endblock %}
 {% block body_class %}persistent-savebar-page{% endblock %}
+{% set offline_initial = offline_initial | default({
+    'magnet_enabled': true,
+    'ed2k_enabled': true,
+    'http_enabled': false,
+    'target_dir': '',
+    'target_dir_name': '',
+    'secondary_enabled': false,
+    'secondary_dir': '',
+    'secondary_dir_name': '',
+    'secondary_keywords': [],
+    'exclude_keywords': [],
+    'min_file_mb': 0,
+    'allowed_exts': []
+}, true) %}
 {% block content %}
 <section class="standalone-settings offline-settings-shell" id="offlineForm">
     <div class="offline-settings-grid">
@@ -30,7 +44,7 @@
                                 </div>
                             </div>
                             <label class="toggle">
-                                <input id="offlineMagnetEnabled" type="checkbox" data-key="OFFLINE_MAGNET_ENABLED" checked>
+                                <input id="offlineMagnetEnabled" type="checkbox" data-key="OFFLINE_MAGNET_ENABLED"{% if offline_initial.magnet_enabled %} checked{% endif %}>
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -45,7 +59,7 @@
                                 </div>
                             </div>
                             <label class="toggle">
-                                <input id="offlineEd2kEnabled" type="checkbox" data-key="OFFLINE_ED2K_ENABLED" checked>
+                                <input id="offlineEd2kEnabled" type="checkbox" data-key="OFFLINE_ED2K_ENABLED"{% if offline_initial.ed2k_enabled %} checked{% endif %}>
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -60,7 +74,7 @@
                                 </div>
                             </div>
                             <label class="toggle">
-                                <input id="offlineHttpEnabled" type="checkbox" data-key="OFFLINE_HTTP_ENABLED">
+                                <input id="offlineHttpEnabled" type="checkbox" data-key="OFFLINE_HTTP_ENABLED"{% if offline_initial.http_enabled %} checked{% endif %}>
                                 <span class="toggle-slider"></span>
                             </label>
                         </div>
@@ -75,10 +89,15 @@
                         <div class="hint">未命中二次分流时使用</div>
                     </div>
                     <div class="field-control offline-dir-control">
-                        <input type="hidden" data-key="OFFLINE_TARGET_DIR" id="offlineTargetDir">
-                        <input type="hidden" data-key="OFFLINE_TARGET_DIR_NAME" id="offlineTargetDirName">
+                        <input type="hidden" data-key="OFFLINE_TARGET_DIR" id="offlineTargetDir" value="{{ offline_initial.target_dir }}">
+                        <input type="hidden" data-key="OFFLINE_TARGET_DIR_NAME" id="offlineTargetDirName" value="{{ offline_initial.target_dir_name }}">
                         <div class="offline-dir-card-box">
-                            <div class="offline-dir-value" id="offlineTargetDirValue">未选择</div>
+                            <div class="offline-dir-value" id="offlineTargetDirValue">
+                                <div class="offline-dir-badge{% if not offline_initial.target_dir %} is-empty{% endif %}">
+                                    <span class="offline-dir-icon"><i data-lucide="{% if offline_initial.target_dir %}folder{% else %}folder-dashed{% endif %}"></i></span>
+                                    <div class="offline-dir-text"><strong>{{ offline_initial.target_dir_name or '未选择' }}</strong><span class="offline-dir-id">{% if offline_initial.target_dir %}ID: {{ offline_initial.target_dir }}{% else %}未选择关联目录{% endif %}</span></div>
+                                </div>
+                            </div>
                             <button type="button" class="jump-btn offline-dir-btn" data-offline-dir="primary"><i data-lucide="folder-search"></i>选择目录</button>
                         </div>
                     </div>
@@ -91,22 +110,27 @@
                         <div class="hint">关键词命中时改存到另一个目录</div>
                     </div>
                     <div class="field-control">
-                        <label class="toggle"><input type="checkbox" data-key="OFFLINE_SECONDARY_ENABLED" id="offlineSecondaryEnabled"><span class="toggle-slider"></span></label>
+                        <label class="toggle"><input type="checkbox" data-key="OFFLINE_SECONDARY_ENABLED" id="offlineSecondaryEnabled"{% if offline_initial.secondary_enabled %} checked{% endif %}><span class="toggle-slider"></span></label>
                     </div>
                 </div>
 
                 <!-- 4. 二次分流嵌套设置区 -->
-                <div id="offlineSecondaryRows" class="offline-secondary-block">
+                <div id="offlineSecondaryRows" class="offline-secondary-block{% if not offline_initial.secondary_enabled %} is-disabled{% endif %}">
                     <div class="form-row">
                         <div class="field-label">
                             <div class="name">二次分流目录</div>
                             <div class="hint">关键词命中时使用</div>
                         </div>
                         <div class="field-control offline-dir-control">
-                            <input type="hidden" data-key="OFFLINE_SECONDARY_DIR" id="offlineSecondaryDir">
-                            <input type="hidden" data-key="OFFLINE_SECONDARY_DIR_NAME" id="offlineSecondaryDirName">
+                            <input type="hidden" data-key="OFFLINE_SECONDARY_DIR" id="offlineSecondaryDir" value="{{ offline_initial.secondary_dir }}">
+                            <input type="hidden" data-key="OFFLINE_SECONDARY_DIR_NAME" id="offlineSecondaryDirName" value="{{ offline_initial.secondary_dir_name }}">
                             <div class="offline-dir-card-box">
-                                <div class="offline-dir-value" id="offlineSecondaryDirValue">未选择</div>
+                                <div class="offline-dir-value" id="offlineSecondaryDirValue">
+                                    <div class="offline-dir-badge{% if not offline_initial.secondary_dir %} is-empty{% endif %}">
+                                        <span class="offline-dir-icon"><i data-lucide="{% if offline_initial.secondary_dir %}folder{% else %}folder-dashed{% endif %}"></i></span>
+                                        <div class="offline-dir-text"><strong>{{ offline_initial.secondary_dir_name or '未选择' }}</strong><span class="offline-dir-id">{% if offline_initial.secondary_dir %}ID: {{ offline_initial.secondary_dir }}{% else %}未选择关联目录{% endif %}</span></div>
+                                    </div>
+                                </div>
                                 <button type="button" class="jump-btn offline-dir-btn" data-offline-dir="secondary"><i data-lucide="folder-search"></i>选择目录</button>
                             </div>
                         </div>
@@ -117,9 +141,9 @@
                             <div class="hint">按 Enter 或逗号生成标签</div>
                         </div>
                         <div class="field-control">
-                            <input type="hidden" data-key="OFFLINE_SECONDARY_KEYWORDS" id="offlineSecondaryKeywords">
+                            <input type="hidden" data-key="OFFLINE_SECONDARY_KEYWORDS" id="offlineSecondaryKeywords" value="{{ offline_initial.secondary_keywords | join(', ') }}">
                             <div class="offline-tag-input-box" id="offlineSecondaryTagBox">
-                                <div class="offline-tag-list"></div>
+                                <div class="offline-tag-list">{% for tag in offline_initial.secondary_keywords %}<span class="tag-chip-badge is-secondary is-initial">{{ tag }} <button type="button" class="tag-chip-remove" aria-label="删除 {{ tag }}">&times;</button></span>{% endfor %}</div>
                                 <input type="text" class="offline-tag-field" id="offlineSecondaryTagField" placeholder="输入分流词按 Enter 添加...">
                             </div>
                         </div>
@@ -151,7 +175,7 @@
                     <div class="field-control">
                         <div class="strm-composite-input-wrap offline-size-wrap">
                             <i data-lucide="hard-drive" class="strm-composite-icon"></i>
-                            <input type="number" min="0" class="form-input strm-composite-input" data-key="OFFLINE_MIN_FILE_MB" id="offlineMinFileMb" value="0">
+                            <input type="number" min="0" class="form-input strm-composite-input" data-key="OFFLINE_MIN_FILE_MB" id="offlineMinFileMb" value="{{ offline_initial.min_file_mb }}">
                             <span class="offline-unit-suffix">MB</span>
                         </div>
                     </div>
@@ -164,9 +188,9 @@
                         <div class="hint">链接或文件名匹配时自动排除；按 Enter 或逗号生成标签</div>
                     </div>
                     <div class="field-control">
-                        <input type="hidden" data-key="OFFLINE_EXCLUDE_KEYWORDS" id="offlineExcludeKeywords">
+                        <input type="hidden" data-key="OFFLINE_EXCLUDE_KEYWORDS" id="offlineExcludeKeywords" value="{{ offline_initial.exclude_keywords | join(', ') }}">
                         <div class="offline-tag-input-box" id="offlineExcludeTagBox">
-                            <div class="offline-tag-list"></div>
+                            <div class="offline-tag-list">{% for tag in offline_initial.exclude_keywords %}<span class="tag-chip-badge is-initial">{{ tag }} <button type="button" class="tag-chip-remove" aria-label="删除 {{ tag }}">&times;</button></span>{% endfor %}</div>
                             <input type="text" class="offline-tag-field" id="offlineExcludeTagField" placeholder="输入排除词按 Enter 添加...">
                         </div>
                         <div class="offline-preset-chips" id="offlinePresetChips">
@@ -186,9 +210,9 @@
                         <div class="hint">仅可选择视频格式；音频、字幕、图片、文本和广告附件始终不会提交</div>
                     </div>
                     <div class="field-control">
-                        <input type="hidden" data-key="OFFLINE_ALLOWED_EXTS" id="offlineAllowedExts">
+                        <input type="hidden" data-key="OFFLINE_ALLOWED_EXTS" id="offlineAllowedExts" value="{{ offline_initial.allowed_exts | join(', ') }}">
                         <div class="offline-tag-input-box" id="offlineAllowedExtsTagBox">
-                            <div class="offline-tag-list"></div>
+                            <div class="offline-tag-list">{% for tag in offline_initial.allowed_exts %}<span class="tag-chip-badge is-initial">{{ tag }} <button type="button" class="tag-chip-remove" aria-label="删除 {{ tag }}">&times;</button></span>{% endfor %}</div>
                             <input type="text" class="offline-tag-field" id="offlineAllowedExtsTagField" placeholder="输入扩展名 (如 mkv) 按 Enter 添加...">
                         </div>
                     </div>
@@ -219,7 +243,8 @@
         const listEl=boxEl.querySelector('.offline-tag-list');
         const inputEl=boxEl.querySelector('.offline-tag-field');
         const badgeClass=options.badgeClass||'';
-        let tags=[];
+        const parseTags=rawText=>String(rawText||'').split(/[,，\r\n]+/).map(s=>s.trim()).filter(Boolean);
+        let tags=parseTags(hiddenInputEl.value);
 
         function syncHidden(){
             hiddenInputEl.value=tags.join(', ');
@@ -245,6 +270,14 @@
             });
             syncHidden();
         }
+        function bindInitialRemoveButtons(){
+            listEl.querySelectorAll('.tag-chip-remove').forEach((button,index)=>{
+                button.addEventListener('click',event=>{
+                    event.stopPropagation();
+                    removeTag(index);
+                });
+            });
+        }
         function addTags(rawText){
             if(!rawText)return;
             const items=String(rawText).split(/[,，\r\n]+/).map(s=>s.trim()).filter(Boolean);
@@ -264,9 +297,19 @@
             }
         }
         function setTagsFromString(rawText){
-            tags=(rawText||'').split(/[,，\r\n]+/).map(s=>s.trim()).filter(Boolean);
+            const nextTags=parseTags(rawText);
+            const matchesInitial=nextTags.length===tags.length
+                && nextTags.every((tag,index)=>tag===tags[index])
+                && listEl.children.length===nextTags.length;
+            tags=nextTags;
+            if(matchesInitial){
+                hiddenInputEl.value=tags.join(', ');
+                return;
+            }
             renderTags();
         }
+
+        bindInitialRemoveButtons();
 
         boxEl.addEventListener('click',e=>{
             if(e.target!==inputEl && !e.target.closest('.tag-chip-remove')){
@@ -328,9 +371,9 @@
             const hasVal=Boolean(idEl.value && idEl.value!=='0');
 
             if(hasVal){
-                valEl.innerHTML=`<div class="offline-dir-badge"><i data-lucide="folder" class="offline-dir-icon"></i><div class="offline-dir-text"><strong>${esc(name)}</strong><span class="offline-dir-id">ID: ${esc(id)}</span></div></div>`;
+                valEl.innerHTML=`<div class="offline-dir-badge"><span class="offline-dir-icon"><i data-lucide="folder"></i></span><div class="offline-dir-text"><strong>${esc(name)}</strong><span class="offline-dir-id">ID: ${esc(id)}</span></div></div>`;
             }else{
-                valEl.innerHTML=`<div class="offline-dir-badge is-empty"><i data-lucide="folder-dashed" class="offline-dir-icon"></i><div class="offline-dir-text"><strong>${esc(fallback)}</strong><span class="offline-dir-id">未选择关联目录</span></div></div>`;
+                valEl.innerHTML=`<div class="offline-dir-badge is-empty"><span class="offline-dir-icon"><i data-lucide="folder-dashed"></i></span><div class="offline-dir-text"><strong>${esc(fallback)}</strong><span class="offline-dir-id">未选择关联目录</span></div></div>`;
             }
         });
         window.renderLucideIcons?.(document.getElementById('offlineConfigForm'));

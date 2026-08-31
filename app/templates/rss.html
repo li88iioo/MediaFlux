@@ -265,6 +265,7 @@ let rssBatchBusy = false;
 let rssSubsLoaded = false;
 let rssEntriesLoaded = false;
 let rssPanelLoadPromise = null;
+let rssStatsHydrated = false;
 
 function lockRssListHeight(list){
     if(!list)return()=>{};
@@ -276,9 +277,11 @@ function lockRssListHeight(list){
 function animateRssStats(values){
     Object.entries(values).forEach(([id,value])=>{
         const target=document.getElementById(id);if(!target)return;
-        if(window.MFAnim)window.MFAnim.countUp(target,Number(value)||0,{duration:.6});
-        else target.textContent=String(Number(value)||0);
+        const numeric=Number(value)||0;
+        if(rssStatsHydrated&&window.MFAnim)window.MFAnim.countUp(target,numeric,{duration:.6});
+        else{target.textContent=String(numeric);target.dataset.countValue=String(numeric);}
     });
+    rssStatsHydrated=true;
 }
 
 function escapeHtml(value){
@@ -787,5 +790,5 @@ window.ensureRssPanelLoaded=()=>{
 };
 </script>
 {% if discovery_enabled %}<script src="{{ url_for('static', path='js/discovery.js') }}?v=20260825a" defer></script>{% endif %}
-<script src="/static/js/subscriptions.js?v=20260822a"></script>
+<script src="/static/js/subscriptions.js?v=20260831a"></script>
 {% endblock %}

@@ -13,6 +13,7 @@ let hasLoadedDownloadLogs = false;
 let hasLoadedDownloadIssues = false;
 let currentQbTasks = [];
 let currentQbDisplaySignature = '';
+let hasRenderedQbSummary = false;
 let currentIssueIds = [];
 let currentLogIds = [];
 const selectedQbHashes = new Set();
@@ -191,7 +192,7 @@ function syncLogSelectionControls() {
 
 function updateQbSummary(qb, taskCount=currentQbTasks.length) {
     const qbCountEl=document.getElementById('qbCount');
-    if(window.MFAnim && qbCountEl) window.MFAnim.countUp(qbCountEl, taskCount);
+    if(window.MFAnim && qbCountEl && hasRenderedQbSummary) window.MFAnim.countUp(qbCountEl, taskCount);
     else if(qbCountEl) qbCountEl.textContent = taskCount;
     document.getElementById('tabTasksBadge').textContent = taskCount;
     document.getElementById('qbStatus').textContent = qb.online ? (qb.version?.app||'在线') : (qb.error||'离线');
@@ -204,6 +205,7 @@ function updateQbSummary(qb, taskCount=currentQbTasks.length) {
         document.getElementById('dlSpeed').textContent=speed(qb.transfer.dl_info_speed);
         document.getElementById('upSpeed').textContent='上传 '+speed(qb.transfer.up_info_speed);
     }
+    hasRenderedQbSummary=true;
 }
 
 function updateQbLiveRows(qb){

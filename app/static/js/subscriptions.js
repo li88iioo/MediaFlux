@@ -21,6 +21,7 @@
         watchlistContext: null,
         candidateSubscriptionId: null,
         loaded: {media: false, watchlist: false, runs: false},
+        statsHydrated: false,
     };
 
     const modalReturnFocus = new WeakMap();
@@ -403,10 +404,14 @@
                 const element = document.getElementById(id);
                 if (!element) return;
                 const numeric = Number(value) || 0;
-                if (element.classList.contains('subscription-metric-value') && window.MFAnim) {
+                if (state.statsHydrated && element.classList.contains('subscription-metric-value') && window.MFAnim) {
                     window.MFAnim.countUp(element, numeric, {duration: 0.6});
-                } else element.textContent = String(numeric);
+                } else {
+                    element.textContent = String(numeric);
+                    element.dataset.countValue = String(numeric);
+                }
             });
+            state.statsHydrated = true;
         } catch (error) {
             if (error.name !== 'AbortError') console.warn('订阅中心统计读取失败', error);
         } finally {
