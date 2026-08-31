@@ -210,7 +210,7 @@ MediaFlux 的诞生与演进离不开开源社区优秀项目与开发者的探�
 - [DDSRem-Dev/guangyaclient](https://github.com/DDSRem-Dev/guangyaclient)：为光鸭云盘的高效底层通讯、免 Key 验证码登录与 Token 管理提供了优秀的官方客户端 SDK 支持。
 - [walkingddd/TgtoDrive](https://github.com/walkingddd/TgtoDrive)：在云盘流转与早期 STRM 模式的探索上带来了宝贵的架构启发。
 - [qBittorrent](https://www.qbittorrent.org/) / [Jellyfin](https://jellyfin.org/) / [Emby](https://emby.media/)：为现代家庭媒体生态提供了强大的基础底座。
-
+- [LINUX.DO](https://linux.do)：一个友好的技术社区。
 ---
 
 ## 开源许可证
