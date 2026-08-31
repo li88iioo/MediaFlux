@@ -10,7 +10,14 @@ from time import monotonic, sleep, time
 from unittest.mock import MagicMock, patch
 
 from app.clients.guangya import GuangYaClient
-from app.modules.organize import OrganizeRules, Organizer
+from app.modules.organize import (
+    OrganizeContext,
+    OrganizePlan,
+    OrganizePlanningResult,
+    OrganizeRules,
+    Organizer,
+)
+from app.modules.organize_scan import OrganizeScanResult
 from app.modules.organize_tasks import OrganizeTaskManager, _cleanup_manual_source_root
 
 
@@ -51,6 +58,54 @@ class OrganizerCleanupSafetyTests(unittest.TestCase):
         self.assertEqual(stats["audit_failures"], 1)
         self.assertEqual(stats["empty_dir_cleanup_skipped"], 1)
         self.assertIn("保留目录以便恢复", stats["empty_dir_cleanup_reasons"][0])
+
+
+    def test_known_nonempty_single_group_skips_remote_cleanup_probe(self):
+        organizer = Organizer(client=MagicMock(), scraper=MagicMock())
+        rules = OrganizeRules(
+            target_dir_id="target",
+            clean_empty=True,
+            link_strm=False,
+            notify_enabled=False,
+            library_notify=False,
+        )
+        scan_result = OrganizeScanResult(
+            scanned_videos=[],
+            scanned_dirs=[("group-1", 1, "etag-group", 1)],
+            companion_files={},
+            video_files_by_path={},
+            protected_sources=set(),
+            source_root_name="来源",
+        )
+        planning_result = OrganizePlanningResult(
+            plans=[OrganizePlan(
+                file_id="video-1",
+                original_name="video-1.mkv",
+                original_path="作品",
+                original_parent_id="group-1",
+                action="skip",
+                note="目标已有同版本",
+            )],
+            subtitle_plans_by_video={},
+        )
+        stats = {"failed": 0, "scan_errors": []}
+
+        with patch(
+            "app.modules.organize.execute_organize_plans", return_value=None,
+        ), patch.object(organizer, "_clean_empty_dirs_report") as cleanup:
+            organizer._run_execution_stage(
+                scan_result, planning_result,
+                OrganizeContext(
+                    source_dir_id="source", dry_run=False, post_actions=False,
+                ),
+                rules,
+                stats,
+            )
+
+        cleanup.assert_not_called()
+        self.assertEqual(stats["empty_dir_cleanup_candidates"], 1)
+        self.assertEqual(stats["empty_dir_cleanup_not_empty"], 1)
+        self.assertIn("未移动媒体", stats["empty_dir_cleanup_reasons"][0])
 
 
 class ManualSourceRootCleanupTests(unittest.TestCase):

@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -43,11 +44,11 @@ class _NoopLockContext:
 
 
 class OrganizeWorkerBudgetTests(unittest.TestCase):
-    def test_production_default_is_two_and_test_default_is_serial(self):
+    def test_production_default_is_three_and_test_default_is_serial(self):
         with patch("app.modules.organize.get", return_value=""), patch.dict(
             os.environ, {"MEDIAFLUX_TEST_MODE": "0"}, clear=False
         ):
-            self.assertEqual(resolve_organize_workers(), 2)
+            self.assertEqual(resolve_organize_workers(), 3)
         with patch("app.modules.organize.get", return_value=""), patch.dict(
             os.environ, {"MEDIAFLUX_TEST_MODE": "1"}, clear=False
         ):
@@ -260,8 +261,114 @@ class OrganizeGroupParallelPlanningTests(unittest.TestCase):
         self.assertEqual(stats["moved"], 3)
         self.assertEqual(stats["planning_workers"], 2)
         self.assertEqual(stats["media_probe_worker_budget"], 4)
-        self.assertEqual(stats["media_probe_workers_per_planner"], 2)
+        self.assertEqual(stats["media_probe_workers_per_planner"], 4)
         organizer.close()
+
+    def test_shared_executor_waits_for_running_planners_before_returning_on_cancel(self):
+        organizer = Organizer(client=SimpleNamespace(), scraper=object())
+        tasks = [
+            OrganizeGroupTask(
+                source_dir_id="root",
+                source_name="来源",
+                group_id=f"group-{index}",
+                group_path=f"作品 {index}",
+                group_name=f"作品 {index}",
+                index=index,
+                total=2,
+            )
+            for index in range(1, 3)
+        ]
+        rows = {
+            task.key: {
+                "id": task.group_id,
+                "path": task.group_path,
+                "name": task.group_name,
+                "status": "planned",
+                "stage": GROUP_STAGE_PENDING,
+                "index": task.index,
+                "total": 0,
+                "moved": 0,
+                "metadata_moved": 0,
+                "skipped": 0,
+                "need_confirm": 0,
+                "failed": 0,
+            }
+            for task in tasks
+        }
+        cancel = threading.Event()
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        errors: list[BaseException] = []
+        shared_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="shared-plan-test",
+        )
+        context = OrganizeContext(
+            source_dir_id="root",
+            dry_run=False,
+            post_actions=False,
+            cancel_event=cancel,
+            planning_executor=shared_executor,
+        )
+
+        def prepare(_planner, task, *_args, **_kwargs):
+            if task.index == 1:
+                first_started.set()
+                release_first.wait(timeout=2)
+            else:
+                second_started.set()
+                release_second.wait(timeout=2)
+            return _PreparedOrganizeGroup(
+                task=task,
+                stats=organizer._initial_stats(),
+                planning_elapsed_seconds=0.01,
+            )
+
+        def run() -> None:
+            try:
+                organizer._organize_groups_parallel(
+                    context,
+                    OrganizeRules(
+                        target_dir_id="target",
+                        clean_empty=False,
+                        link_strm=False,
+                        notify_enabled=False,
+                        library_notify=False,
+                    ),
+                    tasks=tasks,
+                    rows=rows,
+                    stats=organizer._initial_stats(),
+                    progress=GroupProgress(total=2, started_at=time.monotonic()),
+                    total_started=time.monotonic(),
+                    workers=2,
+                )
+            except BaseException as exc:  # pragma: no cover - 主线程统一断言
+                errors.append(exc)
+
+        caller = threading.Thread(target=run)
+        try:
+            with patch.object(organizer, "_prepare_group_plan", side_effect=prepare):
+                caller.start()
+                self.assertTrue(first_started.wait(timeout=1))
+                self.assertTrue(second_started.wait(timeout=1))
+                cancel.set()
+                release_first.set()
+                time.sleep(0.08)
+                # 第二个 Future 已在运行，cancel() 无法终止它；来源调用必须
+                # 等它退出后才能关闭 Planner 并归还共享执行池。
+                self.assertTrue(caller.is_alive())
+                release_second.set()
+                caller.join(timeout=2)
+        finally:
+            release_first.set()
+            release_second.set()
+            caller.join(timeout=2)
+            shared_executor.shutdown(wait=True, cancel_futures=True)
+            organizer.close()
+
+        self.assertEqual(errors, [])
+        self.assertFalse(caller.is_alive())
 
     def test_parallel_planners_force_refresh_same_tmdb_identity_once(self):
         class _SharedDetailScraper:
@@ -330,6 +437,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
         *,
         expected_source_workers: int = 2,
         probe_workers: int = 4,
+        source_count: int = 2,
     ):
         state_lock = threading.Lock()
         barrier = (
@@ -374,7 +482,10 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
                     planning_active += 1
                     planning_peak = max(planning_peak, planning_active)
                 try:
-                    if barrier is not None:
+                    if barrier is not None and source_id in {
+                        f"source-{chr(ord('a') + index)}"
+                        for index in range(expected_source_workers)
+                    }:
                         barrier.wait(timeout=2)
                     time.sleep(0.01)
                 finally:
@@ -413,8 +524,11 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
         manager._task = {"id": "parallel-task", "status": "running", "stats": {}}
         manager._wake_download_tracker = lambda *_args, **_kwargs: None
         sources = [
-            {"id": "source-a", "name": "来源 A"},
-            {"id": "source-b", "name": "来源 B"},
+            {
+                "id": f"source-{chr(ord('a') + index)}",
+                "name": f"来源 {chr(ord('A') + index)}",
+            }
+            for index in range(source_count)
         ]
         with patch(
             "app.modules.organize_tasks.Organizer", _FakeOrganizer
@@ -451,9 +565,40 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
             [item["id"] for item in final["source_results"]],
             ["source-a", "source-b"],
         )
-        self.assertEqual([item["planning_workers"] for item in kwargs], [1, 1])
-        self.assertEqual([item["media_probe_workers"] for item in kwargs], [2, 2])
+        self.assertEqual([item["planning_workers"] for item in kwargs], [2, 2])
+        self.assertEqual([item["media_probe_workers"] for item in kwargs], [4, 4])
+        self.assertIs(
+            kwargs[0]["planning_executor"], kwargs[1]["planning_executor"],
+        )
+        self.assertIsNotNone(kwargs[0]["planning_executor"])
         self.assertIs(kwargs[0]["execution_lock"], kwargs[1]["execution_lock"])
+
+    def test_short_sources_release_the_shared_pool_to_the_remaining_source(self):
+        manager, planning_peak, writer_peak, kwargs = self._run_manager(
+            OrganizeRules(
+                target_dir_id="target",
+                clean_empty=False,
+                link_strm=False,
+                notify_enabled=False,
+                library_notify=False,
+            ),
+            source_count=3,
+        )
+
+        final = manager.task_status()
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["stats"]["source_workers"], 2)
+        self.assertEqual(planning_peak, 2)
+        self.assertEqual(writer_peak, 1)
+        self.assertEqual(len(kwargs), 3)
+        shared_pool = kwargs[0]["planning_executor"]
+        self.assertIsNotNone(shared_pool)
+        self.assertTrue(all(item["planning_executor"] is shared_pool for item in kwargs))
+        self.assertEqual([item["planning_workers"] for item in kwargs], [2, 2, 2])
+        self.assertEqual(
+            [item["id"] for item in final["source_results"]],
+            ["source-a", "source-b", "source-c"],
+        )
 
     def test_media_probe_budget_caps_parallel_sources(self):
         manager, planning_peak, writer_peak, kwargs = self._run_manager(
@@ -476,6 +621,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
         self.assertEqual(final["stats"]["media_probe_worker_budget"], 1)
         self.assertEqual([item["planning_workers"] for item in kwargs], [2, 2])
         self.assertEqual([item["media_probe_workers"] for item in kwargs], [1, 1])
+        self.assertEqual([item["planning_executor"] for item in kwargs], [None, None])
 
     def test_nsfw_sources_fall_back_to_serial_source_dispatch(self):
         manager, planning_peak, writer_peak, kwargs = self._run_manager(
@@ -498,6 +644,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
         self.assertEqual(final["stats"]["source_workers"], 1)
         self.assertEqual([item["planning_workers"] for item in kwargs], [2, 2])
         self.assertEqual([item["media_probe_workers"] for item in kwargs], [4, 4])
+        self.assertEqual([item["planning_executor"] for item in kwargs], [None, None])
         self.assertEqual([item["execution_lock"] for item in kwargs], [None, None])
 
     def test_parallel_source_failure_keeps_completed_peer_result(self):

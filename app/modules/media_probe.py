@@ -53,7 +53,33 @@ def _transient_probe_error(exc: subprocess.CalledProcessError) -> bool:
 
 
 class _ProbeCancelled(RuntimeError):
-    """内部控制流：正在运行的 ffprobe 已因任务取消而终止。"""
+    """内部控制流：正在运行或等待中的 ffprobe 已因任务取消而终止。"""
+
+
+_PROBE_SLOT_CONDITION = threading.Condition()
+_PROBE_SLOT_ACTIVE = 0
+
+
+def _acquire_probe_slot(
+    cancel_event: threading.Event | None,
+) -> None:
+    """获取进程级 ffprobe 槽位；排队不消耗子进程执行超时。"""
+    global _PROBE_SLOT_ACTIVE
+    with _PROBE_SLOT_CONDITION:
+        while _PROBE_SLOT_ACTIVE >= resolve_media_probe_workers():
+            if cancel_event is not None and cancel_event.is_set():
+                raise _ProbeCancelled()
+            _PROBE_SLOT_CONDITION.wait(timeout=0.1)
+        if cancel_event is not None and cancel_event.is_set():
+            raise _ProbeCancelled()
+        _PROBE_SLOT_ACTIVE += 1
+
+
+def _release_probe_slot() -> None:
+    global _PROBE_SLOT_ACTIVE
+    with _PROBE_SLOT_CONDITION:
+        _PROBE_SLOT_ACTIVE = max(0, _PROBE_SLOT_ACTIVE - 1)
+        _PROBE_SLOT_CONDITION.notify_all()
 
 
 def _terminate_probe_process(process: subprocess.Popen) -> tuple[str, str]:
@@ -80,48 +106,52 @@ def _run_ffprobe(
     *,
     cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess:
-    """运行 ffprobe，并允许整理任务在子进程执行期间及时取消。"""
+    """运行 ffprobe；本地与光鸭共同消费进程级并发槽位。"""
     command = [
         executable, "-v", "error", "-show_streams", "-of", "json", url,
     ]
     timeout_seconds = max(0.1, float(timeout))
-    if cancel_event is None:
-        return subprocess.run(
-            command, capture_output=True, text=True,
-            timeout=timeout_seconds, check=True,
-        )
-
-    deadline = time.monotonic() + timeout_seconds
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    while True:
-        if cancel_event is not None and cancel_event.is_set():
-            _terminate_probe_process(process)
-            raise _ProbeCancelled()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            stdout, stderr = _terminate_probe_process(process)
-            raise subprocess.TimeoutExpired(
-                command, timeout_seconds, output=stdout, stderr=stderr,
+    _acquire_probe_slot(cancel_event)
+    try:
+        if cancel_event is None:
+            return subprocess.run(
+                command, capture_output=True, text=True,
+                timeout=timeout_seconds, check=True,
             )
-        try:
-            stdout, stderr = process.communicate(timeout=min(0.1, remaining))
-            break
-        except subprocess.TimeoutExpired:
-            continue
 
-    completed = subprocess.CompletedProcess(
-        command, int(process.returncode or 0), stdout, stderr,
-    )
-    if completed.returncode != 0:
-        raise subprocess.CalledProcessError(
-            completed.returncode, command, output=stdout, stderr=stderr,
+        deadline = time.monotonic() + timeout_seconds
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-    return completed
+        while True:
+            if cancel_event.is_set():
+                _terminate_probe_process(process)
+                raise _ProbeCancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stdout, stderr = _terminate_probe_process(process)
+                raise subprocess.TimeoutExpired(
+                    command, timeout_seconds, output=stdout, stderr=stderr,
+                )
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        completed = subprocess.CompletedProcess(
+            command, int(process.returncode or 0), stdout, stderr,
+        )
+        if completed.returncode != 0:
+            raise subprocess.CalledProcessError(
+                completed.returncode, command, output=stdout, stderr=stderr,
+            )
+        return completed
+    finally:
+        _release_probe_slot()
 
 
 
@@ -794,7 +824,7 @@ def probe_media_profile(
 
 
 def resolve_media_probe_workers() -> int:
-    """云盘媒体探测并发数；保持保守上限，避免压垮家庭网络和云盘接口。"""
+    """进程级媒体探测并发数；本地与光鸭共享同一保守预算。"""
     try:
         configured = int(str(os.environ.get("MEDIAFLUX_MEDIA_PROBE_WORKERS") or "4"))
     except (TypeError, ValueError):

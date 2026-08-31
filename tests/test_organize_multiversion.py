@@ -14,8 +14,14 @@ from app.config import web_credentials
 from app.main import create_app
 from app.modules.media_variant import MediaVariant, classify_variant, variants_can_coexist
 from app.modules.naming import append_variant_tags, template_has_media_identity
-from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
+from app.modules.organize import (
+    OrganizeContext,
+    OrganizePlan,
+    OrganizeRules,
+    Organizer,
+)
 from app.modules.organize_postprocess import media_role
+from app.modules.organize_runtime import OrganizeTaskRuntime
 from app.modules.scraper import MatchResult
 from tests.support import IsolatedDatabaseTestCase, release_parse_result
 
@@ -559,6 +565,35 @@ class _TvVariantTreeClient(_VariantTreeClient):
         self.list_calls = []
 
 
+class _VersionedTvVariantTreeClient(_TvVariantTreeClient):
+    """模拟支持目录 updated_at 的光鸭客户端。"""
+
+    def __init__(self, incoming: GuangYaFile, existing: GuangYaFile):
+        super().__init__(incoming, existing)
+        self.season_revision = 1
+
+    def file_info(self, file_id):
+        if file_id == "season":
+            return GuangYaFile(
+                "season", "Season 3", True, parent_id="show",
+                updated_at=self.season_revision,
+            )
+        return super().file_info(file_id)
+
+    def move(self, file_ids, parent_id):
+        result = super().move(file_ids, parent_id)
+        if parent_id == "season":
+            self.season_revision += 1
+        return result
+
+    def rename(self, file_id, new_name):
+        parent_id, _item = self._find(file_id)
+        result = super().rename(file_id, new_name)
+        if parent_id == "season":
+            self.season_revision += 1
+        return result
+
+
 class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
     def test_historical_identity_is_not_lost_behind_large_audit_history(self):
         from app import database as db
@@ -1021,6 +1056,174 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(client.list_calls.count("category"), 2)
         self.assertEqual(client.list_calls.count("show"), 2)
         self.assertEqual(client.list_calls.count("season"), 4)
+
+    def test_versioned_target_inventory_avoids_relisting_unchanged_shared_season(self):
+        episodes = [
+            GuangYaFile(
+                f"versioned-{number}",
+                f"Better.Show.2021.S03E{number:02d}.1080p.WEB-DL.H264.AAC.mkv",
+                False, 1000 + number, f"etag-{number}", "source",
+            )
+            for number in range(1, 4)
+        ]
+        placeholder = GuangYaFile("placeholder", "placeholder.txt", False, 1)
+        client = _VersionedTvVariantTreeClient(episodes[0], placeholder)
+        client.tree["source"] = episodes
+        client.tree["season"] = []
+        organizer = Organizer(client=client, scraper=_TvVariantScraper())
+
+        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
+            "app.modules.organize.add_organize_log_items"
+        ):
+            _plans, stats = organizer.organize(
+                "source", self._rules(), dry_run=False, post_actions=False,
+            )
+
+        self.assertEqual(stats["moved"], 3)
+        self.assertEqual(client.list_calls.count("season"), 1)
+        self.assertEqual(int(stats.get("target_dir_refreshes", 0) or 0), 0)
+        self.assertGreaterEqual(stats.get("target_inventory_cache_hits", 0), 3)
+        self.assertGreaterEqual(stats.get("target_revision_checkpoints", 0), 3)
+
+    def test_versioned_target_inventory_refreshes_on_external_revision_change(self):
+        first = GuangYaFile(
+            "versioned-1",
+            "Better.Show.2021.S03E01.1080p.WEB-DL.H264.AAC.mkv",
+            False, 1000, "etag-1", "source",
+        )
+        second = GuangYaFile(
+            "versioned-2",
+            "Better.Show.2021.S03E02.1080p.WEB-DL.H264.AAC.mkv",
+            False, 1000, "etag-2", "source",
+        )
+        external = GuangYaFile(
+            "versioned-external-2",
+            "Better.Show.2021.S03E02.2160p.WEB-DL.H265.AAC.mkv",
+            False, 10000, "external-etag", "season",
+        )
+        placeholder = GuangYaFile("placeholder", "placeholder.txt", False, 1)
+        client = _VersionedTvVariantTreeClient(first, placeholder)
+        client.tree["source"] = [first, second]
+        client.tree["season"] = []
+        original_file_info = client.file_info
+        season_checks = 0
+
+        def file_info_with_external_change(file_id):
+            nonlocal season_checks
+            if file_id == "season":
+                season_checks += 1
+                if season_checks == 5:
+                    client.tree["season"].append(external)
+                    client.season_revision += 1
+            return original_file_info(file_id)
+
+        client.file_info = file_info_with_external_change
+        organizer = Organizer(client=client, scraper=_TvVariantScraper())
+        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
+            "app.modules.organize.add_organize_log_items"
+        ):
+            plans, stats = organizer.organize(
+                "source", self._rules(keep_multi_versions=False),
+                dry_run=False, post_actions=False,
+            )
+
+        by_id = {plan.file_id: plan for plan in plans}
+        self.assertEqual(stats["moved"], 1)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(client.list_calls.count("season"), 2)
+        self.assertEqual(stats.get("target_revision_mismatches"), 1)
+        self.assertEqual(by_id["versioned-2"].conflict_decision, "skip")
+        self.assertEqual(client._find("versioned-external-2")[0], "season")
+
+    def test_target_inventory_retries_when_revision_changes_during_first_refresh(self):
+        incoming = GuangYaFile(
+            "unstable-incoming",
+            "Better.Show.2021.S03E01.1080p.WEB-DL.H264.AAC.mkv",
+            False, 1000, "incoming-etag", "source",
+        )
+        external = GuangYaFile(
+            "unstable-external",
+            "Better.Show.2021.S03E01.2160p.WEB-DL.H265.AAC.mkv",
+            False, 10000, "external-etag", "season",
+        )
+        placeholder = GuangYaFile("placeholder", "placeholder.txt", False, 1)
+        client = _VersionedTvVariantTreeClient(incoming, placeholder)
+        client.tree["source"] = [incoming]
+        client.tree["season"] = []
+        original_file_info = client.file_info
+        season_checks = 0
+
+        def file_info_with_change_during_refresh(file_id):
+            nonlocal season_checks
+            if file_id == "season":
+                season_checks += 1
+                if season_checks == 2:
+                    client.tree["season"].append(external)
+                    client.season_revision += 1
+            return original_file_info(file_id)
+
+        client.file_info = file_info_with_change_during_refresh
+        organizer = Organizer(client=client, scraper=_TvVariantScraper())
+        with patch("app.modules.organize.add_organize_log", return_value=1), patch(
+            "app.modules.organize.add_organize_log_items"
+        ):
+            plans, stats = organizer.organize(
+                "source", self._rules(keep_multi_versions=False),
+                dry_run=False, post_actions=False,
+            )
+
+        self.assertEqual(stats["moved"], 0)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(client.list_calls.count("season"), 2)
+        self.assertEqual(stats.get("target_inventory_unstable_retries"), 1)
+        self.assertEqual(plans[0].conflict_decision, "skip")
+        self.assertEqual(client._find("unstable-external")[0], "season")
+        self.assertEqual(client._find("unstable-incoming")[0], "source")
+
+    def test_task_conflict_loader_refreshes_after_external_target_removal(self):
+        incoming = GuangYaFile(
+            "refresh-incoming",
+            "Better.Show.2021.S03E02.1080p.WEB-DL.H264.AAC.mkv",
+            False, 1000, "incoming-etag", "source",
+        )
+        existing = GuangYaFile(
+            "refresh-existing",
+            "Better.Show.2021.S03E02.2160p.WEB-DL.H265.AAC.mkv",
+            False, 10000, "existing-etag", "season",
+        )
+        client = _VersionedTvVariantTreeClient(incoming, existing)
+        organizer = Organizer(client=client, scraper=_TvVariantScraper())
+        runtime = OrganizeTaskRuntime()
+        context = OrganizeContext(
+            source_dir_id="source",
+            dry_run=False,
+            post_actions=False,
+            task_runtime=runtime,
+        )
+        stats = organizer._initial_stats()
+        loader, _history_loader = organizer._task_conflict_loaders(
+            context, self._rules(keep_multi_versions=False), stats,
+        )
+        plan = OrganizePlan(
+            file_id=incoming.file_id,
+            original_name=incoming.name,
+            original_path=f"/{incoming.name}",
+            original_parent_id="source",
+            target_path="动漫/Better Show (2021) {tmdb-113256}/Season 3",
+        )
+
+        target_id, first_files, _first_evidence = loader(plan)
+        self.assertEqual(target_id, "season")
+        self.assertEqual([item.file_id for item in first_files], ["refresh-existing"])
+
+        client.tree["season"] = []
+        client.season_revision += 1
+        target_id, second_files, _second_evidence = loader(plan)
+
+        self.assertEqual(target_id, "season")
+        self.assertEqual(second_files, [])
+        self.assertEqual(client.list_calls.count("season"), 2)
+        self.assertEqual(stats.get("target_revision_mismatches"), 1)
 
     def test_shared_season_recheck_observes_external_conflict_before_second_episode(self):
         first = GuangYaFile(

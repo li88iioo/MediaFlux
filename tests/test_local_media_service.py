@@ -4,6 +4,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -96,6 +98,147 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         )
         db.upsert_local_library_target(source_id, category, str(target_root), owner="admin")
         return source_id
+
+    def test_execute_task_uses_one_cross_service_writer(self):
+        state_lock = threading.Lock()
+        first_entered = threading.Event()
+        release = threading.Event()
+        active = 0
+        peak = 0
+        entries = 0
+        errors: list[BaseException] = []
+
+        class WriterService(LocalMediaService):
+            def _execute_task_under_writer(
+                self, owner: str, task_id: int, *, qb_client=None,
+            ):
+                nonlocal active, peak, entries
+                del self, owner, qb_client
+                with state_lock:
+                    active += 1
+                    entries += 1
+                    peak = max(peak, active)
+                    first_entered.set()
+                try:
+                    release.wait(timeout=2)
+                    return {"status": "completed", "task_id": task_id}
+                finally:
+                    with state_lock:
+                        active -= 1
+
+        match = MatchResult(
+            tmdb_id="1", title="Writer", year="2026",
+            media_type="movie", confidence=1.0,
+        )
+        services = [
+            WriterService(scraper=FakeScraper(match)),
+            WriterService(scraper=FakeScraper(match)),
+        ]
+
+        def execute(service: WriterService, task_id: int) -> None:
+            try:
+                service.execute_task("admin", task_id)
+            except BaseException as exc:  # pragma: no cover - 主线程统一断言
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=execute, args=(service, index + 1))
+            for index, service in enumerate(services)
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            self.assertTrue(first_entered.wait(timeout=1))
+            time.sleep(0.05)
+            with state_lock:
+                self.assertEqual(entries, 1)
+                self.assertEqual(peak, 1)
+            release.set()
+            for thread in threads:
+                thread.join(timeout=2)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=2)
+            for service in services:
+                service.close()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(entries, 2)
+        self.assertEqual(peak, 1)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+    def test_warmed_tasks_recheck_latest_target_inventory_before_each_commit(self):
+        from app.modules.organize import OrganizeRules
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "parallel-writer-downloads"
+            target_root = root / "parallel-writer-movies"
+            first_dir = source_root / "first"
+            second_dir = source_root / "second"
+            first_dir.mkdir(parents=True)
+            second_dir.mkdir(parents=True)
+            target_root.mkdir()
+            first_file = first_dir / "Movie.2026.mkv"
+            second_file = second_dir / "Movie.2026.mkv"
+            first_file.write_bytes(b"first-version")
+            second_file.write_bytes(b"second-version")
+            source_id = self._source(source_root, target_root, "movie")
+            task_ids = [
+                db.create_local_media_task(
+                    source_id, "", str(path), owner="admin", trigger="manual",
+                )
+                for path in (first_file, second_file)
+            ]
+            self.assertTrue(all(
+                db.claim_local_media_task(task_id, owner="admin")
+                for task_id in task_ids
+            ))
+            match = MatchResult(
+                tmdb_id="1", title="Movie", year="2026",
+                media_type="movie", confidence=1.0,
+            )
+            services = [
+                LocalMediaService(scraper=FakeScraper(match)),
+                LocalMediaService(scraper=FakeScraper(match)),
+            ]
+            rules = OrganizeRules(
+                region_split=False, year_split=False, naming_scope="both",
+                conflict_strategy=1, emby_refresh=False,
+            )
+            try:
+                with patch(
+                    "app.modules.local_media_service.OrganizeRules.from_config",
+                    return_value=rules,
+                ):
+                    warmed = [
+                        service.prepare_task("admin", task_id)
+                        for service, task_id in zip(services, task_ids, strict=True)
+                    ]
+                    results = [
+                        service.execute_task("admin", task_id)
+                        for service, task_id in zip(services, task_ids, strict=True)
+                    ]
+            finally:
+                for service in services:
+                    service.close()
+
+            targets = list(target_root.rglob("*.mkv"))
+            second_retained = second_file.exists()
+
+        self.assertEqual(
+            [item["status"] for item in warmed], ["planned", "planned"],
+        )
+        self.assertEqual(len(results[0]["moved"]), 1)
+        self.assertEqual(results[1]["moved"], [])
+        self.assertTrue(any("跳过 1 项" in item for item in results[1]["warnings"]))
+        self.assertEqual(len(targets), 1)
+        self.assertTrue(second_retained)
+        self.assertEqual(
+            [db.get_local_media_task(task_id, owner="admin").status for task_id in task_ids],
+            ["completed", "completed"],
+        )
 
     def test_dynamis_b_global_filename_uses_shared_clean_title_in_local_inspection(self):
         from app.modules.scraper import TMDBScraper

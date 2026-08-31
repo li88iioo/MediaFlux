@@ -24,6 +24,7 @@ from app.modules.directory_scrape import DirectoryScrapeService, FixedMatchScrap
 from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
 from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
 from app.modules.local_move_transaction import LocalMoveTransaction, MoveTransactionResult
+from app.modules.process_lock import CrossProcessLock
 from app.modules.local_path_mapping import (
     assert_within,
     require_container_absolute_path,
@@ -70,6 +71,22 @@ from app.modules.special_media import (
 
 
 logger = get_logger(__name__)
+
+# 目标库存读取、冲突仲裁和文件提交必须是一个跨入口原子区间。Web、TG、
+# 调度器以及多 ASGI 进程共同使用同一把锁；底层移动事务仍保留自己的
+# fail-fast 锁，二者名称不同，不会发生递归锁死。
+_LOCAL_MEDIA_PIPELINE_WRITE_LOCK = CrossProcessLock("local-media-pipeline-write")
+
+
+@contextmanager
+def _local_media_write_lease():
+    if not _LOCAL_MEDIA_PIPELINE_WRITE_LOCK.acquire(blocking=True):  # pragma: no cover
+        raise LocalMediaServiceError("本地媒体写入队列暂不可用，请稍后重试")
+    try:
+        yield
+    finally:
+        _LOCAL_MEDIA_PIPELINE_WRITE_LOCK.release()
+
 
 _SERVER_ONLY_RULE_FIELDS = {
     "nsfw_enabled",
@@ -261,6 +278,26 @@ class LocalMediaService:
         self.scraper = scraper or TMDBScraper()
         self.organizer = Organizer(client=object(), scraper=self.scraper)
         self.inspections = inspection_store or _InspectionStore()
+
+    def parallel_planning_safe(self) -> bool:
+        """仅默认 TMDB Scraper 声明可共享缓存并发规划。"""
+        closed, closing, _active = self._lifecycle_state()
+        return not closed and not closing and type(self.scraper) is TMDBScraper
+
+    def create_planning_worker(self) -> "LocalMediaService":
+        """创建拥有独立 Organizer/检查仓的只读规划服务。"""
+        if not self.parallel_planning_safe():
+            raise LocalMediaServiceError("当前本地媒体识别器不支持并行规划")
+        worker = LocalMediaService(scraper=self.scraper)
+        # 与光鸭组级并行保持同一契约：只共享强制详情刷新去重状态，
+        # 其余 Organizer 任务缓存、ProbeBudget 和目标库存均由 Worker 独享。
+        worker.organizer._forced_detail_refreshes = (
+            self.organizer._forced_detail_refreshes
+        )
+        worker.organizer._forced_detail_refresh_lock = (
+            self.organizer._forced_detail_refresh_lock
+        )
+        return worker
 
     @contextmanager
     def _lifecycle_operation(self):
@@ -1682,7 +1719,51 @@ class LocalMediaService:
             )
 
     @_local_media_operation
+    def prepare_task(self, owner: str, task_id: int) -> dict[str, Any]:
+        """只读预热一个任务的识别与探测缓存，不改变任务状态或文件。"""
+        task = db.get_local_media_task(task_id, owner=owner)
+        if task is None:
+            raise LocalMediaServiceError("本地媒体任务不存在")
+        source = db.get_local_media_source(task.source_id, owner=owner)
+        if source is None:
+            raise LocalMediaServiceError("本地媒体来源不存在")
+        if source.media_type == "nsfw":
+            raise LocalMediaServiceError("成人番号来源保持串行识别")
+        inspection_id = ""
+        try:
+            inspection = self.inspect_source(
+                owner, task.source_id, task.content_path,
+            )
+            inspection_id = str(inspection.get("inspection_id") or "")
+            preview = self.preview(
+                owner, inspection_id, task.tmdb_id, task.media_type,
+                rules_snapshot=task.rules_snapshot,
+                automatic=task.trigger in {"scan", "qb_completed"},
+                season_override=task.season_override,
+                episode_override=task.episode_override,
+                numbering_mode=task.numbering_mode,
+            )
+            return {
+                "task_id": int(task_id),
+                "status": str(preview.get("status") or ""),
+                "pending_confirmations": len(
+                    preview.get("pending_confirmations") or []
+                ),
+            }
+        finally:
+            if inspection_id:
+                self.inspections.discard(owner, inspection_id)
+
+    @_local_media_operation
     def execute_task(self, owner: str, task_id: int, *, qb_client=None) -> dict[str, Any]:
+        with _local_media_write_lease():
+            return self._execute_task_under_writer(
+                owner, task_id, qb_client=qb_client,
+            )
+
+    def _execute_task_under_writer(
+        self, owner: str, task_id: int, *, qb_client=None,
+    ) -> dict[str, Any]:
         task = db.get_local_media_task(task_id, owner=owner)
         if task is None:
             raise LocalMediaServiceError("本地媒体任务不存在")
@@ -1930,7 +2011,15 @@ class LocalMediaService:
         return task_id
 
     @_local_media_operation
-    def execute_preview(self, owner: str, inspection_id: str, preview: dict[str, Any]) -> MoveTransactionResult:
+    def execute_preview(
+        self, owner: str, inspection_id: str, preview: dict[str, Any],
+    ) -> MoveTransactionResult:
+        with _local_media_write_lease():
+            return self._execute_preview_under_writer(owner, inspection_id, preview)
+
+    def _execute_preview_under_writer(
+        self, owner: str, inspection_id: str, preview: dict[str, Any],
+    ) -> MoveTransactionResult:
         inspection = self.inspections.get(owner, inspection_id)
         if preview.get("status") != "planned" or not preview.get("_move_plans"):
             raise LocalMediaServiceError("预览尚未达到可执行状态")

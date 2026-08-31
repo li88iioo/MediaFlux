@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 import re
 import unicodedata
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from app import database as db
@@ -32,6 +35,31 @@ logger = get_logger(__name__)
 MANUAL_SCAN_TOKEN_PREFIX = "manual-scan:"
 SILENT_MANUAL_SCAN_TOKEN_PREFIX = "silent-manual-scan:"
 _MAX_CAPTURED_TASK_RESULTS = 1000
+_DEFAULT_LOCAL_MEDIA_ORGANIZE_WORKERS = 2
+_MAX_LOCAL_MEDIA_ORGANIZE_WORKERS = 3
+
+
+def resolve_local_media_organize_workers() -> int:
+    """本地媒体只读规划 Worker 数；正式环境默认 2，测试默认串行。"""
+    configured = str(get("LOCAL_MEDIA_ORGANIZE_WORKERS", "") or "").strip()
+    if configured:
+        try:
+            requested = int(configured)
+        except (TypeError, ValueError):
+            requested = _DEFAULT_LOCAL_MEDIA_ORGANIZE_WORKERS
+    else:
+        requested = (
+            1
+            if os.environ.get("MEDIAFLUX_TEST_MODE", "").strip() == "1"
+            else _DEFAULT_LOCAL_MEDIA_ORGANIZE_WORKERS
+        )
+    from app.modules.media_probe import resolve_media_probe_workers
+
+    return max(1, min(
+        requested,
+        _MAX_LOCAL_MEDIA_ORGANIZE_WORKERS,
+        resolve_media_probe_workers(),
+    ))
 
 
 class LocalMediaProbeRetryable(RuntimeError):
@@ -455,7 +483,39 @@ class LocalMediaScheduler:
         token = str(getattr(task, "operation_token", "") or "")
         return token.startswith(SILENT_MANUAL_SCAN_TOKEN_PREFIX)
 
-    def _process_waiting(self, task) -> bool:
+    @staticmethod
+    def _canonical_task_path(task) -> str:
+        return str(Path(task.content_path).expanduser().resolve(strict=False))
+
+    @staticmethod
+    def _paths_overlap(first: str, second: str) -> bool:
+        left = Path(first)
+        right = Path(second)
+        return left == right or left in right.parents or right in left.parents
+
+    def _acquire_task_path(self, task) -> str | None:
+        key = self._canonical_task_path(task)
+        with self._guard:
+            if any(self._paths_overlap(key, locked) for locked in self._path_locks):
+                return None
+            self._path_locks.add(key)
+        return key
+
+    def _release_task_path(self, key: str) -> None:
+        if not key:
+            return
+        with self._guard:
+            self._path_locks.discard(key)
+
+    def _mark_preclaim_failure(self, task, error: str) -> None:
+        db.update_local_media_task(
+            task.id, owner=self.owner, status="failed", error=error,
+        )
+        db.update_download_request_for_local_media_task(
+            task.id, "failed", error=error,
+        )
+
+    def _claim_waiting_task(self, task) -> str | None:
         source = db.get_local_media_source(task.source_id, owner=self.owner)
         manual_scan = self._is_manual_scan_task(task)
         error = ""
@@ -466,36 +526,40 @@ class LocalMediaScheduler:
         elif task.trigger == "scan" and not manual_scan:
             error = "目录定时扫描已移除，请使用手动整理重新入队"
         if error:
-            db.update_local_media_task(
-                task.id, owner=self.owner, status="failed", error=error,
-            )
-            db.update_download_request_for_local_media_task(
-                task.id, "failed", error=error,
-            )
-            return False
+            self._mark_preclaim_failure(task, error)
+            return None
         source_error = _source_path_error(source)
         if source_error:
-            db.update_local_media_task(
-                task.id, owner=self.owner, status="failed", error=source_error,
+            self._mark_preclaim_failure(task, source_error)
+            return None
+
+        key = self._acquire_task_path(task)
+        if key is None:
+            return None
+        try:
+            claimed = db.claim_local_media_task(
+                task.id, expected="waiting_stable", owner=self.owner,
             )
-            db.update_download_request_for_local_media_task(
-                task.id, "failed", error=source_error,
-            )
-            return False
-        key = str(Path(task.content_path).expanduser().resolve(strict=False))
-        with self._guard:
-            if key in self._path_locks:
-                return False
-            self._path_locks.add(key)
+        except Exception:
+            self._release_task_path(key)
+            raise
+        if not claimed:
+            self._release_task_path(key)
+            return None
+        return key
+
+    def _execute_claimed_task(
+        self, task, key: str, *, prepare_error: Exception | None = None,
+    ) -> bool:
         qb_client = None
         try:
-            # qB 已通过 API 的完成状态与进度双重确认；TG/Web 显式整理则由用户主动触发。
-            # 直接交给服务层执行一次检查与预览复核，避免调度器额外预扫和固定等待；
-            # 真正移动时仍会基于 inode/size/mtime 再校验源文件身份。
-            if not db.claim_local_media_task(task.id, expected="waiting_stable", owner=self.owner):
-                return False
+            if prepare_error is not None:
+                raise prepare_error
+            # qB Client 只在单 Writer 提交阶段创建，规划 Worker 不触碰下载任务。
             qb_client = self.qb_factory() if task.qb_hash else None
-            result = self.service.execute_task(self.owner, task.id, qb_client=qb_client)
+            result = self.service.execute_task(
+                self.owner, task.id, qb_client=qb_client,
+            )
         except Exception as exc:
             self._complete_captured_task_result(task.id, None)
             current = db.get_local_media_task(task.id, owner=self.owner)
@@ -510,7 +574,10 @@ class LocalMediaScheduler:
                     task.id, owner=self.owner, status=failure_status, error=str(exc),
                 )
                 current = db.get_local_media_task(task.id, owner=self.owner)
-            logger.error("本地媒体任务执行失败 task=%s type=%s", task.id, type(exc).__name__)
+            logger.error(
+                "本地媒体任务执行失败 task=%s type=%s",
+                task.id, type(exc).__name__,
+            )
             if current and current.status in terminal_statuses:
                 try:
                     db.update_download_request_for_local_media_task(
@@ -523,7 +590,9 @@ class LocalMediaScheduler:
                     )
             if not self._is_silent_task(task):
                 try:
-                    notify_local_media_task(task.id, owner=self.owner, error=str(exc))
+                    notify_local_media_task(
+                        task.id, owner=self.owner, error=str(exc),
+                    )
                 except Exception as notify_exc:
                     logger.warning(
                         "本地媒体失败通知发送异常 task=%s type=%s",
@@ -564,16 +633,146 @@ class LocalMediaScheduler:
                 except Exception as close_exc:
                     logger.warning(
                         "关闭本地媒体 qB 客户端失败 task=%s type=%s",
-                        task.id,
-                        type(close_exc).__name__,
+                        task.id, type(close_exc).__name__,
                     )
-            with self._guard:
-                self._path_locks.discard(key)
+            self._release_task_path(key)
+
+    def _process_waiting(self, task) -> bool:
+        try:
+            key = self._claim_waiting_task(task)
+        except Exception as exc:
+            # 保持旧语义：认领阶段异常同样进入统一失败落库与通知。
+            return self._execute_claimed_task(task, "", prepare_error=exc)
+        if key is None:
+            return False
+        return self._execute_claimed_task(task, key)
+
+    def _parallel_planning_worker_count(self) -> int:
+        safe_method = getattr(type(self.service), "parallel_planning_safe", None)
+        create_method = getattr(type(self.service), "create_planning_worker", None)
+        if not callable(safe_method) or not callable(create_method):
+            return 1
+        try:
+            if not bool(self.service.parallel_planning_safe()):
+                return 1
+        except Exception:
+            return 1
+        return resolve_local_media_organize_workers()
+
+    def _task_supports_parallel_planning(self, task) -> bool:
+        source = db.get_local_media_source(task.source_id, owner=self.owner)
+        return source is not None and str(source.media_type or "") != "nsfw"
+
+    def _run_parallel_planning_batch(self, tasks: list, workers: int) -> int:
+        if not tasks:
+            return 0
+        planner_local = threading.local()
+        planner_guard = threading.Lock()
+        planners: list[object] = []
+
+        def planner_for_thread():
+            planner = getattr(planner_local, "service", None)
+            if planner is None:
+                planner = self.service.create_planning_worker()
+                planner_local.service = planner
+                with planner_guard:
+                    planners.append(planner)
+            return planner
+
+        def prepare(task):
+            return planner_for_thread().prepare_task(self.owner, task.id)
+
+        pending: deque[tuple[object, str, Future]] = deque()
+        iterator = iter(tasks)
+        window = min(len(tasks), max(workers, workers * 2))
+        processed = 0
+        pool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="local-media-plan",
+        )
+
+        def fill_window() -> None:
+            nonlocal processed
+            while len(pending) < window and not self._stop_event.is_set():
+                try:
+                    task = next(iterator)
+                except StopIteration:
+                    return
+                try:
+                    key = self._claim_waiting_task(task)
+                except Exception as exc:
+                    processed += int(self._execute_claimed_task(
+                        task, "", prepare_error=exc,
+                    ))
+                    continue
+                if key is None:
+                    continue
+                try:
+                    future = pool.submit(prepare, task)
+                except Exception as exc:
+                    # 规划仅用于预热共享识别/探测缓存；线程池拒绝任务时
+                    # 自动回退权威单 Writer 路径，不能降低原有整理成功率。
+                    logger.warning(
+                        "本地媒体并行预热提交失败，回退串行执行 task=%s type=%s",
+                        task.id, type(exc).__name__,
+                    )
+                    processed += int(self._execute_claimed_task(task, key))
+                    continue
+                pending.append((task, key, future))
+
+        try:
+            fill_window()
+            while pending:
+                task, key, future = pending.popleft()
+                try:
+                    future.result()
+                except Exception as exc:
+                    # 预热失败不代表正式整理失败。Writer 会重新扫描来源、
+                    # 重读最新目标库存并执行完整识别，因此这里安全降级。
+                    logger.warning(
+                        "本地媒体并行预热失败，回退串行执行 task=%s type=%s",
+                        task.id, type(exc).__name__,
+                    )
+                processed += int(self._execute_claimed_task(task, key))
+                fill_window()
+        finally:
+            pool.shutdown(wait=True, cancel_futures=False)
+            for planner in planners:
+                close = getattr(planner, "close", None)
+                if not callable(close):
+                    continue
+                try:
+                    if close() is False:
+                        logger.warning("关闭本地媒体规划 Worker 未完成")
+                except Exception as exc:
+                    logger.warning(
+                        "关闭本地媒体规划 Worker 失败 type=%s",
+                        type(exc).__name__,
+                    )
+        return processed
 
     def run_once(self) -> int:
+        tasks = db.list_waiting_local_media_tasks(owner=self.owner, limit=500)
+        workers = self._parallel_planning_worker_count()
+        if workers <= 1:
+            processed = 0
+            for task in tasks:
+                if self._stop_event.is_set():
+                    break
+                processed += int(self._process_waiting(task))
+            return processed
+
         processed = 0
-        for task in db.list_waiting_local_media_tasks(owner=self.owner, limit=500):
+        batch: list[object] = []
+        for task in tasks:
+            if self._stop_event.is_set():
+                break
+            if self._task_supports_parallel_planning(task):
+                batch.append(task)
+                continue
+            processed += self._run_parallel_planning_batch(batch, workers)
+            batch.clear()
             processed += int(self._process_waiting(task))
+        processed += self._run_parallel_planning_batch(batch, workers)
         return processed
 
     def _loop(self, generation: int) -> None:

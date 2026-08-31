@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -894,6 +896,518 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 {item["reason"] for item in result["sources"]},
                 {"来源处于仅预览模式", "尚未配置归档目标"},
             )
+
+    def test_parallel_planning_uses_two_workers_and_one_stable_writer(self):
+        class ParallelService:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.barrier = threading.Barrier(2)
+                self.planning_active = 0
+                self.planning_peak = 0
+                self.writer_active = 0
+                self.writer_peak = 0
+                self.commit_order: list[int] = []
+                self.closed_workers = 0
+
+            @staticmethod
+            def parallel_planning_safe():
+                return True
+
+            def create_planning_worker(self):
+                parent = self
+
+                class Worker:
+                    def prepare_task(self, owner, task_id):
+                        del owner, task_id
+                        with parent.lock:
+                            parent.planning_active += 1
+                            parent.planning_peak = max(
+                                parent.planning_peak, parent.planning_active,
+                            )
+                        try:
+                            parent.barrier.wait(timeout=2)
+                            time.sleep(0.02)
+                        finally:
+                            with parent.lock:
+                                parent.planning_active -= 1
+                        return {"status": "planned"}
+
+                    def close(self):
+                        with parent.lock:
+                            parent.closed_workers += 1
+                        return True
+
+                return Worker()
+
+            def execute_task(self, owner, task_id, qb_client=None):
+                del qb_client
+                with self.lock:
+                    self.writer_active += 1
+                    self.writer_peak = max(self.writer_peak, self.writer_active)
+                    self.commit_order.append(int(task_id))
+                try:
+                    time.sleep(0.01)
+                    db.update_local_media_task(
+                        task_id, owner=owner, status="completed",
+                        completed_at=db.now(),
+                    )
+                    return {"status": "completed"}
+                finally:
+                    with self.lock:
+                        self.writer_active -= 1
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            files = [root / "A.mkv", root / "B.mkv"]
+            for media in files:
+                media.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="parallel", qb_profile="", qb_path_prefix="",
+                local_root=str(root), stable_seconds=0, owner="admin",
+            )
+            task_ids = [
+                db.create_local_media_task(
+                    source_id, "", str(media), owner="admin", trigger="manual",
+                )
+                for media in files
+            ]
+            service = ParallelService()
+            scheduler = LocalMediaScheduler(service=service)
+
+            with patch(
+                "app.modules.local_media_scheduler.resolve_local_media_organize_workers",
+                return_value=2,
+            ), patch(
+                "app.modules.local_media_scheduler.notify_local_media_task",
+            ):
+                self.assertEqual(scheduler.run_once(), 2)
+
+        self.assertEqual(service.planning_peak, 2)
+        self.assertEqual(service.writer_peak, 1)
+        self.assertEqual(service.commit_order, task_ids)
+        self.assertEqual(service.closed_workers, 2)
+        self.assertTrue(all(
+            db.get_local_media_task(task_id, owner="admin").status == "completed"
+            for task_id in task_ids
+        ))
+
+    def test_parallel_planning_defers_ancestor_descendant_path_overlap(self):
+        class PlanningService:
+            def __init__(self):
+                self.prepared: list[int] = []
+
+            @staticmethod
+            def parallel_planning_safe():
+                return True
+
+            def create_planning_worker(self):
+                parent = self
+
+                class Worker:
+                    def prepare_task(self, owner, task_id):
+                        del owner
+                        parent.prepared.append(int(task_id))
+                        return {"status": "planned"}
+
+                    @staticmethod
+                    def close():
+                        return True
+
+                return Worker()
+
+            @staticmethod
+            def execute_task(owner, task_id, qb_client=None):
+                del qb_client
+                db.update_local_media_task(
+                    task_id, owner=owner, status="completed",
+                    completed_at=db.now(),
+                )
+                return {"status": "completed"}
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            child = root / "Movie.mkv"
+            child.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="overlap", qb_profile="", qb_path_prefix="",
+                local_root=str(root), stable_seconds=0, owner="admin",
+            )
+            parent_task = db.create_local_media_task(
+                source_id, "", str(root), owner="admin", trigger="manual",
+            )
+            child_task = db.create_local_media_task(
+                source_id, "", str(child), owner="admin", trigger="manual",
+            )
+            service = PlanningService()
+            scheduler = LocalMediaScheduler(service=service)
+
+            with patch(
+                "app.modules.local_media_scheduler.resolve_local_media_organize_workers",
+                return_value=2,
+            ), patch(
+                "app.modules.local_media_scheduler.notify_local_media_task",
+            ):
+                self.assertEqual(scheduler.run_once(), 1)
+                self.assertEqual(
+                    db.get_local_media_task(child_task, owner="admin").status,
+                    "waiting_stable",
+                )
+                self.assertEqual(scheduler.run_once(), 1)
+
+        self.assertEqual(service.prepared, [parent_task, child_task])
+
+    def test_parallel_planning_failure_falls_back_to_authoritative_writer(self):
+        class FallbackService(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.prepared: list[int] = []
+                self.closed_workers = 0
+
+            @staticmethod
+            def parallel_planning_safe():
+                return True
+
+            def create_planning_worker(self):
+                parent = self
+
+                class Worker:
+                    def prepare_task(self, owner, task_id):
+                        del owner
+                        parent.prepared.append(int(task_id))
+                        raise RuntimeError("injected warmup failure")
+
+                    def close(self):
+                        parent.closed_workers += 1
+                        return True
+
+                return Worker()
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            media = root / "Fallback.mkv"
+            media.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="fallback", qb_profile="", qb_path_prefix="",
+                local_root=str(root), stable_seconds=0, owner="admin",
+            )
+            task_id = db.create_local_media_task(
+                source_id, "", str(media), owner="admin", trigger="manual",
+            )
+            service = FallbackService()
+            scheduler = LocalMediaScheduler(service=service)
+
+            with patch(
+                "app.modules.local_media_scheduler.resolve_local_media_organize_workers",
+                return_value=2,
+            ), patch(
+                "app.modules.local_media_scheduler.notify_local_media_task",
+            ):
+                self.assertEqual(scheduler.run_once(), 1)
+
+        self.assertEqual(service.prepared, [task_id])
+        self.assertEqual(service.calls[0][1], task_id)
+        self.assertEqual(service.closed_workers, 1)
+        self.assertEqual(
+            db.get_local_media_task(task_id, owner="admin").status,
+            "completed",
+        )
+        self.assertEqual(scheduler._path_locks, set())
+
+    def test_parallel_planning_creates_qb_client_only_for_writer_and_closes_it(self):
+        qb_created = threading.Event()
+        qb_client = Mock()
+
+        class QbService(FakeService):
+            @staticmethod
+            def parallel_planning_safe():
+                return True
+
+            @staticmethod
+            def create_planning_worker():
+                class Worker:
+                    @staticmethod
+                    def prepare_task(owner, task_id):
+                        del owner, task_id
+                        if qb_created.is_set():
+                            raise AssertionError("qB client created during read-only planning")
+                        return {"status": "planned"}
+
+                    @staticmethod
+                    def close():
+                        return True
+
+                return Worker()
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            media = root / "Qb.Movie.mkv"
+            media.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="qb-planning", qb_profile="configured:qb",
+                qb_path_prefix="/downloads", local_root=str(root),
+                stable_seconds=0, owner="admin",
+            )
+            task_id = db.create_local_media_task(
+                source_id, "hash-planning", str(media), owner="admin",
+                trigger="qb_completed",
+            )
+
+            def qb_factory():
+                qb_created.set()
+                return qb_client
+
+            service = QbService()
+            scheduler = LocalMediaScheduler(
+                service=service, qb_factory=qb_factory,
+            )
+            with patch(
+                "app.modules.local_media_scheduler.resolve_local_media_organize_workers",
+                return_value=2,
+            ), patch(
+                "app.modules.local_media_scheduler.notify_local_media_task",
+            ):
+                self.assertEqual(scheduler.run_once(), 1)
+
+        self.assertTrue(qb_created.is_set())
+        self.assertIs(service.calls[0][2], qb_client)
+        qb_client.close.assert_called_once_with()
+        self.assertEqual(
+            db.get_local_media_task(task_id, owner="admin").status,
+            "completed",
+        )
+
+    def test_out_of_order_parallel_reviews_are_captured_by_task_id_once(self):
+        class ReviewService:
+            def __init__(self):
+                self.completed_prepares: list[int] = []
+                self.lock = threading.Lock()
+
+            @staticmethod
+            def parallel_planning_safe():
+                return True
+
+            def create_planning_worker(self):
+                parent = self
+
+                class Worker:
+                    def prepare_task(self, owner, task_id):
+                        del owner
+                        time.sleep({task_ids[0]: 0.05, task_ids[1]: 0.01}.get(
+                            int(task_id), 0.0,
+                        ))
+                        with parent.lock:
+                            parent.completed_prepares.append(int(task_id))
+                        return {"status": "requires_manual"}
+
+                    @staticmethod
+                    def close():
+                        return True
+
+                return Worker()
+
+            @staticmethod
+            def execute_task(owner, task_id, qb_client=None):
+                del qb_client
+                db.update_local_media_task(
+                    task_id, owner=owner, status="requires_manual",
+                    error="人工确认", completed_at=None,
+                )
+                return {
+                    "status": "requires_manual",
+                    "task_id": int(task_id),
+                    "preview": {
+                        "candidate": {"tmdb_id": str(task_id)},
+                        "reason": "人工确认",
+                    },
+                }
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            files = [root / f"Review-{index}.mkv" for index in range(3)]
+            for media in files:
+                media.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="reviews", qb_profile="", qb_path_prefix="",
+                local_root=str(root), stable_seconds=0, owner="admin",
+            )
+            task_ids = [
+                db.create_local_media_task(
+                    source_id, "", str(media), owner="admin", trigger="manual",
+                )
+                for media in files
+            ]
+            service = ReviewService()
+            scheduler = LocalMediaScheduler(service=service)
+            scheduler._capture_result_task_ids.update(task_ids)
+
+            with patch(
+                "app.modules.local_media_scheduler.resolve_local_media_organize_workers",
+                return_value=2,
+            ), patch(
+                "app.modules.local_media_scheduler.notify_local_media_task",
+            ):
+                self.assertEqual(scheduler.run_once(), 3)
+
+            captured = {
+                task_id: scheduler.take_captured_task_result(task_id)
+                for task_id in task_ids
+            }
+
+        self.assertNotEqual(service.completed_prepares[0], task_ids[0])
+        self.assertEqual(
+            {
+                task_id: result["preview"]["candidate"]["tmdb_id"]
+                for task_id, result in captured.items()
+            },
+            {task_id: str(task_id) for task_id in task_ids},
+        )
+        self.assertTrue(all(
+            scheduler.take_captured_task_result(task_id) is None
+            for task_id in task_ids
+        ))
+        self.assertEqual(scheduler._capture_result_task_ids, set())
+
+    def test_nsfw_source_keeps_serial_execution_without_planning_workers(self):
+        class SerialNsfwService(FakeService):
+            def __init__(self):
+                super().__init__()
+                self.worker_calls = 0
+
+            @staticmethod
+            def parallel_planning_safe():
+                return True
+
+            def create_planning_worker(self):
+                self.worker_calls += 1
+                raise AssertionError("NSFW must stay serial")
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            media = root / "FJIN-140.mp4"
+            media.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="nsfw", qb_profile="", qb_path_prefix="",
+                local_root=str(root), stable_seconds=0, owner="admin",
+                media_type="nsfw",
+            )
+            task_id = db.create_local_media_task(
+                source_id, "", str(media), owner="admin", trigger="manual",
+            )
+            service = SerialNsfwService()
+            scheduler = LocalMediaScheduler(service=service)
+
+            with patch(
+                "app.modules.local_media_scheduler.resolve_local_media_organize_workers",
+                return_value=2,
+            ), patch(
+                "app.modules.local_media_scheduler.notify_local_media_task",
+            ):
+                self.assertEqual(scheduler.run_once(), 1)
+
+        self.assertEqual(service.worker_calls, 0)
+        self.assertEqual(service.calls[0][1], task_id)
+
+    def test_shutdown_waits_for_inflight_parallel_planners_before_service_close(self):
+        class OwnedParallelService:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.release = threading.Event()
+                self.planners_entered = threading.Event()
+                self.active_planners = 0
+                self.close_calls = 0
+                self.closed_workers = 0
+
+            @staticmethod
+            def parallel_planning_safe():
+                return True
+
+            def create_planning_worker(self):
+                parent = self
+
+                class Worker:
+                    def prepare_task(self, owner, task_id):
+                        del owner, task_id
+                        with parent.lock:
+                            parent.active_planners += 1
+                            if parent.active_planners == 2:
+                                parent.planners_entered.set()
+                        parent.release.wait(timeout=2)
+                        return {"status": "planned"}
+
+                    def close(self):
+                        with parent.lock:
+                            parent.closed_workers += 1
+                        return True
+
+                return Worker()
+
+            @staticmethod
+            def execute_task(owner, task_id, qb_client=None):
+                del qb_client
+                db.update_local_media_task(
+                    task_id, owner=owner, status="completed",
+                    completed_at=db.now(),
+                )
+                return {"status": "completed"}
+
+            def close(self):
+                with self.lock:
+                    self.close_calls += 1
+                return True
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            files = [root / "One.mkv", root / "Two.mkv"]
+            for media in files:
+                media.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="shutdown-parallel", qb_profile="", qb_path_prefix="",
+                local_root=str(root), stable_seconds=0, owner="admin",
+            )
+            task_ids = [
+                db.create_local_media_task(
+                    source_id, "", str(media), owner="admin", trigger="manual",
+                )
+                for media in files
+            ]
+            service = OwnedParallelService()
+            scheduler = LocalMediaScheduler(
+                service=service, interval=0.2,
+            )
+            scheduler._owns_service = True
+            shutdown_result: list[bool] = []
+            shutdown_thread = threading.Thread(
+                target=lambda: shutdown_result.append(scheduler.shutdown(timeout=2)),
+            )
+            try:
+                with patch(
+                    "app.modules.local_media_scheduler.resolve_local_media_organize_workers",
+                    return_value=2,
+                ), patch(
+                    "app.modules.local_media_scheduler.notify_local_media_task",
+                ):
+                    scheduler.start()
+                    self.assertTrue(service.planners_entered.wait(timeout=1))
+                    shutdown_thread.start()
+                    time.sleep(0.05)
+                    self.assertTrue(shutdown_thread.is_alive())
+                    self.assertEqual(service.close_calls, 0)
+                    service.release.set()
+                    shutdown_thread.join(timeout=2)
+            finally:
+                service.release.set()
+                shutdown_thread.join(timeout=2)
+                scheduler.stop(timeout=2)
+
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertEqual(shutdown_result, [True])
+        self.assertEqual(service.close_calls, 1)
+        self.assertEqual(service.closed_workers, 2)
+        self.assertIsNone(scheduler._thread)
+        self.assertTrue(all(
+            db.get_local_media_task(task_id, owner="admin").status == "completed"
+            for task_id in task_ids
+        ))
 
     def test_start_stop_is_reentrant_and_leaves_no_thread(self):
         scheduler = LocalMediaScheduler(service=FakeService(), interval=0.2)

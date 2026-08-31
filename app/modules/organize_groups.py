@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
@@ -75,6 +76,8 @@ class OrganizeGroupTask:
     etag: str = ""
     updated_at: int = 0
     trigger: str = "manual"
+    # 根目录可被拆成多个独立媒体单元；空元组表示沿用历史的整层扫描。
+    file_ids: tuple[str, ...] = ()
 
     @property
     def key(self) -> str:
@@ -91,6 +94,7 @@ class OrganizeGroupTask:
             "total": int(self.total),
             "is_root": bool(self.is_root),
             "trigger": self.trigger,
+            "file_ids": list(self.file_ids),
         }
 
 
@@ -177,6 +181,132 @@ def _video_extension(name: str) -> str:
     return text.rsplit(".", 1)[-1].lower() if "." in text else ""
 
 
+_EXPLICIT_EPISODE_TOKEN_RE = re.compile(
+    r"(?ix)(?:"
+    r"(?<![A-Z0-9])S(?P<s1>\d{1,2})[\s._-]*E(?:P)?(?P<e1>\d{1,4})"
+    r"|(?<!\d)(?P<s2>\d{1,2})x(?P<e2>\d{1,4})(?!\d)"
+    r"|(?<![A-Z0-9])SEASON[\s._-]*(?P<s3>\d{1,2})[\s._-]*"
+    r"(?:EPISODE|EP|E)[\s._-]*(?P<e3>\d{1,4})"
+    r"|第[\s._-]*(?P<s4>\d{1,2})[\s._-]*季.*?第[\s._-]*"
+    r"(?P<e4>\d{1,4})[\s._-]*(?:集|话|話)"
+    r"|第[\s._-]*(?P<e5>\d{1,4})[\s._-]*(?:集|话|話)"
+    r"|(?<![A-Z0-9])E(?:P)?[\s._-]*(?P<e6>\d{1,4})(?!\d)"
+    r")"
+)
+_EXPLICIT_MULTIPART_TOKEN_RE = re.compile(
+    r"(?i)(?:^|[\s._-])(?:CD|DISC|DISK|PART|PT)[\s._-]*(\d{1,2})"
+    r"(?=$|[\s._-])"
+)
+_PLAIN_EPISODE_TOKEN_RE = re.compile(
+    r"(?i)\s+-\s+(?:\d{1,4}|OVA(?:\s*\d{1,3})?|ONA(?:\s*\d{1,3})?|"
+    r"SP(?:ECIAL)?(?:\s*\d{1,3})?)(?=$|[\s._\-\[(])"
+)
+_MOVIE_RELEASE_YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+_UNIT_KEY_NOISE_RE = re.compile(r"[^0-9a-z\u3400-\u9fff]+", re.IGNORECASE)
+
+
+def _unit_key_text(value: str) -> str:
+    """生成仅用于同批分组的保守比较键，不参与最终媒体识别。"""
+    stem = str(value or "").rsplit(".", 1)[0]
+    return _UNIT_KEY_NOISE_RE.sub(" ", stem.casefold()).strip()
+
+
+def _movie_release_unit_key(name: str) -> str:
+    """用“片名 + 年份”保守合并同一电影的多个规格版本。"""
+    stem = str(name or "").rsplit(".", 1)[0]
+    years = list(_MOVIE_RELEASE_YEAR_RE.finditer(stem))
+    if not years:
+        return ""
+    # 标题本身可能含年份（例如 2001），发布年份通常是最后一个年份标记。
+    year = years[-1]
+    title = _unit_key_text(stem[:year.start()])
+    if not title:
+        # ``2026.Movie`` 一类年份前置名称无法仅靠轻量枚举可靠取标题，
+        # 失败关闭为单文件，避免把同年不同作品错误合并。
+        return ""
+    return f"movie:{title}:{year.group(0)}"
+
+
+def _root_media_unit_key(item, *, nsfw_enabled: bool = False) -> str:
+    """把明确属于同一作品的根目录文件保留在一个规划单元。"""
+    name = str(getattr(item, "name", "") or "")
+    identifier = None
+    if nsfw_enabled:
+        try:
+            from app.modules.nsfw import extract_nsfw_identifier, normalize_code
+
+            identifier = extract_nsfw_identifier(name)
+        except Exception:
+            identifier = None
+    if identifier is not None:
+        code = normalize_code(identifier.code)
+        if code:
+            return f"code:{code}"
+
+    episode = _EXPLICIT_EPISODE_TOKEN_RE.search(name)
+    if episode is not None:
+        title = _unit_key_text(name[:episode.start()])
+        if title:
+            season = next(
+                (
+                    int(value)
+                    for value in (
+                        episode.group("s1"), episode.group("s2"),
+                        episode.group("s3"), episode.group("s4"),
+                    )
+                    if value is not None
+                ),
+                -1,
+            )
+            return f"tv:{title}:s{season}"
+
+    stem = name.rsplit(".", 1)[0]
+    plain_episode = _PLAIN_EPISODE_TOKEN_RE.search(stem)
+    if plain_episode is not None:
+        tail = stem[plain_episode.end():]
+        # ``Movie - 2.2026`` 更像续作而非第 2 集；年份位于数字后方时
+        # 不做轻量季包推断，交给单文件识别。
+        if not _MOVIE_RELEASE_YEAR_RE.search(tail):
+            title = _unit_key_text(stem[:plain_episode.start()])
+            if title:
+                return f"tvplain:{title}"
+
+    multipart = _EXPLICIT_MULTIPART_TOKEN_RE.search(stem)
+    if multipart is not None:
+        base = _unit_key_text(f"{stem[:multipart.start()]} {stem[multipart.end():]}")
+        if base:
+            return f"multipart:{base}"
+
+    movie = _movie_release_unit_key(name)
+    if movie:
+        return movie
+
+    file_id = str(getattr(item, "file_id", "") or "").strip()
+    return f"file:{file_id}"
+
+
+def _root_media_units(
+    root_videos: list[object], *, nsfw_enabled: bool = False,
+) -> list[list[object]] | None:
+    """安全拆分根目录媒体；身份不完整时返回 ``None`` 触发旧路径。"""
+    if not root_videos:
+        return []
+    file_ids = [str(getattr(item, "file_id", "") or "").strip() for item in root_videos]
+    if any(not file_id for file_id in file_ids) or len(set(file_ids)) != len(file_ids):
+        return None
+    units: dict[str, list[object]] = {}
+    for item in root_videos:
+        units.setdefault(_root_media_unit_key(item, nsfw_enabled=nsfw_enabled), []).append(item)
+    return list(units.values())
+
+
+def _root_group_name(items: list[object], fallback: str) -> str:
+    if len(items) != 1:
+        first = str(getattr(items[0], "name", "") or "").rsplit(".", 1)[0].strip()
+        return first or fallback
+    return str(getattr(items[0], "name", "") or "").rsplit(".", 1)[0].strip() or fallback
+
+
 def enumerate_group_tasks(
     client,
     *,
@@ -185,12 +315,14 @@ def enumerate_group_tasks(
     video_exts: set[str] | frozenset[str],
     protected_source_ids: set[str] | frozenset[str] = frozenset(),
     trigger: str = "manual",
+    nsfw_enabled: bool = False,
     cancelled: Callable[[], bool] | None = None,
 ) -> GroupEnumeration:
     """只列举根目录直属媒体与第一层媒体目录，不触发识别或探测。
 
-    根目录直属视频合并为一个 ``__root__`` 组；每个第一层子目录构成一个
-    独立媒体组。深层 Season/Specials 目录由组内完整扫描继续继承本组身份。
+    根目录直属视频按明确媒体身份拆成独立规划单元；季包、同番号和明确
+    CD/Part 分段仍保持为同一单元。无法可靠拆分时回退一个 ``__root__`` 组。
+    每个第一层子目录构成独立媒体组，深层 Season/Specials 继续继承本组身份。
     """
     source_dir_id = str(source_dir_id or "").strip()
     protected = {
@@ -227,13 +359,17 @@ def enumerate_group_tasks(
 
     exts = {str(item).lower() for item in (video_exts or set())}
     tasks: list[OrganizeGroupTask] = []
-    root_videos = 0
-    for item in entries:
-        if getattr(item, "is_dir", False):
-            continue
-        if _video_extension(getattr(item, "name", "")) in exts:
-            root_videos += 1
-    if root_videos:
+    root_videos = [
+        item
+        for item in entries
+        if not getattr(item, "is_dir", False)
+        and _video_extension(getattr(item, "name", "")) in exts
+    ]
+    root_units = _root_media_units(root_videos, nsfw_enabled=nsfw_enabled)
+    if root_videos and (root_units is None or len(root_units) <= 1):
+        # 单一媒体单元和身份异常场景保持历史根组身份；后者不带过滤条件，
+        # 失败关闭为整层扫描，避免缺失/重复 file_id 导致漏整理。
+        only_unit = root_units[0] if root_units else []
         tasks.append(OrganizeGroupTask(
             source_dir_id=source_dir_id,
             source_name=root_name,
@@ -242,7 +378,25 @@ def enumerate_group_tasks(
             group_name=root_name or source_dir_id,
             is_root=True,
             trigger=trigger,
+            file_ids=(
+                tuple(str(getattr(item, "file_id", "")) for item in only_unit)
+                if root_units is not None
+                else ()
+            ),
         ))
+    elif root_units:
+        for unit in root_units:
+            file_ids = tuple(str(getattr(item, "file_id", "")) for item in unit)
+            tasks.append(OrganizeGroupTask(
+                source_dir_id=source_dir_id,
+                source_name=root_name,
+                group_id=file_ids[0],
+                group_path=GROUP_ROOT_PATH,
+                group_name=_root_group_name(unit, root_name or source_dir_id),
+                is_root=True,
+                trigger=trigger,
+                file_ids=file_ids,
+            ))
 
     seen_dirs: set[str] = set()
     for item in entries:

@@ -20,7 +20,13 @@ import re
 import threading
 import time
 import unicodedata
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import (
+    CancelledError,
+    Executor,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from difflib import SequenceMatcher
@@ -116,6 +122,7 @@ from app.modules.organize_groups import (
     merge_group_stats,
 )
 from app.modules.organize_execution import execute_organize_plans
+from app.modules.organize_runtime import OrganizeTaskRuntime
 from app.modules.organize_postprocess import (
     media_role,
     normalize_media_number,
@@ -476,6 +483,10 @@ def _format_phase_timing(stats: dict) -> str:
         ("conflict", "conflict_check_elapsed_seconds"),
         ("execute", "execute_elapsed_seconds"),
         ("cleanup", "cleanup_elapsed_seconds"),
+        ("plan_wall", "parallel_planning_elapsed_seconds"),
+        ("writer_wait", "writer_wait_elapsed_seconds"),
+        ("target_version", "target_revision_check_elapsed_seconds"),
+        ("target_list", "target_inventory_refresh_elapsed_seconds"),
     ):
         value = float(stats.get(key) or 0.0)
         if value > 0:
@@ -491,6 +502,10 @@ def _format_phase_timing(stats: dict) -> str:
         ("probe_online", "media_probe_online_profiles"),
         ("probe_timeouts", "media_probe_timeouts"),
         ("target_refresh", "target_dir_refreshes"),
+        ("target_cache", "target_inventory_cache_hits"),
+        ("target_version_miss", "target_revision_mismatches"),
+        ("recognition_task_cache", "task_recognition_cache_hits"),
+        ("recognition_task_bind", "task_recognition_cache_bindings"),
     ):
         try:
             value = int(stats.get(key) or 0)
@@ -504,14 +519,14 @@ def _format_phase_timing(stats: dict) -> str:
 # 媒体组流水线的来源级探测墙钟上限：每组各有独立预算，防止病态来源
 # 按组数把在线探测放大成小时级任务；到达上限后剩余组只读探测缓存。
 _GROUP_PIPELINE_PROBE_CAP_SECONDS = 300.0
-_DEFAULT_ORGANIZE_WORKERS = 2
+_DEFAULT_ORGANIZE_WORKERS = 3
 _MAX_ORGANIZE_WORKERS = 3
 
 
 def resolve_organize_workers() -> int:
     """返回整理只读规划的全局 worker 预算。
 
-    生产默认开启两个 worker；测试默认保持串行，只有显式配置时才进入
+    生产默认开启三个 Worker；测试默认保持串行，只有显式配置时才进入
     并行路径，避免历史测试桩因线程调度产生无意义的不确定性。
     """
     configured = str(get("GY_ORGANIZE_WORKERS", "") or "").strip()
@@ -634,15 +649,23 @@ class OrganizeContext:
     # 文件名与目录上下文自动判断。本地来源配置和手动刮削可复用同一规划
     # 流水线，而不需要在规划器外再实现一套 match/parse 分支。
     media_type_hint: str = ""
-    # 当前来源可占用的只读规划 worker 数。None 表示按全局预算自动计算；
-    # 多来源调度会显式下发份额，避免来源并发与组内并发相乘。
+    # 当前来源可见的只读规划 Worker 总预算。多来源调度传入共享执行池后，
+    # 该值描述全局池大小，而不是为来源预先切分的固定份额。
     planning_workers: int | None = None
-    # 当前来源可占用的 ffprobe worker 总预算。多来源调度会按同时运行的
-    # 来源数切分，组内 planner 再继续切分，防止嵌套线程池放大并发。
+    # 当前来源可见的 ffprobe 总预算；真正并发量由 media_probe 的进程级
+    # 槽位统一限制，因此多来源之间可以动态复用空闲预算。
     media_probe_workers: int | None = None
+    # 多来源并行时共享的只读规划池。各来源只负责枚举并提交媒体单元，
+    # Worker 完成短目录后可继续领取其他来源的大目录任务。
+    planning_executor: Executor | None = field(default=None, repr=False, compare=False)
     # 多来源并行时共享的单写门。扫描、识别和探测不持有该锁；最终冲突
     # 仲裁、云盘写入、审计与清理必须在锁内完成。
     execution_lock: object | None = field(default=None, repr=False, compare=False)
+    # 同一次后台整理跨来源/媒体组共享的短生命周期运行态。仅缓存已严格
+    # 验证的作品身份与单写入器维护的目标库存，绝不跨任务持久化。
+    task_runtime: OrganizeTaskRuntime | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     @property
     def probe_cache_only(self) -> bool:
@@ -1556,6 +1579,10 @@ class Organizer:
             "directory_identity_cache_groups": 0,
             "recognition_work_cache_hits": 0,
             "recognition_work_cache_groups": 0,
+            "task_recognition_cache_hits": 0,
+            "task_recognition_cache_bindings": 0,
+            "task_recognition_singleflight_waits": 0,
+            "task_recognition_singleflight_wait_seconds": 0.0,
             "directory_package_identity_bindings": 0,
             "directory_identity_attestation_bindings": 0,
             "directory_identity_attestation_hits": 0,
@@ -1891,6 +1918,8 @@ class Organizer:
                 directory_identity_attestation=directory_identity_attestation,
                 recognition_work_cache=recognition_work_cache,
                 recognition_work_cache_key=work_cache_key,
+                task_runtime=context.task_runtime,
+                stats=stats,
                 # 识别阶段只读取预取缓存；在线 ffprobe 在全部身份安全门通过后
                 # 统一有界并发执行，避免数十集逐文件串行阻塞。
                 media_probe_cache_only=True,
@@ -2152,6 +2181,10 @@ class Organizer:
         )
         if not finalize:
             return planning_result
+        if target_inventory_loader is None and context.task_runtime is not None:
+            target_inventory_loader, identity_history_loader = (
+                self._task_conflict_loaders(context, rules, stats)
+            )
         return self._finalize_planning_result(
             scan_result,
             planning_result,
@@ -2161,6 +2194,183 @@ class Organizer:
             target_inventory_loader=target_inventory_loader,
             identity_history_loader=identity_history_loader,
         )
+
+    def _task_conflict_loaders(
+        self,
+        context: OrganizeContext,
+        rules: OrganizeRules,
+        stats: dict,
+    ) -> tuple[
+        Callable[[OrganizePlan], tuple[str | None, list[GuangYaFile], dict[str, str]]],
+        Callable[[OrganizePlan], set[tuple[str, str]]],
+    ]:
+        """构造任务级目标库存/历史身份加载器。
+
+        只读预演会复制返回列表再做批内虚拟仲裁；正式写入由同一个单写器
+        原地维护运行态库存，因此跨媒体组无需重复读取同一目标目录。
+        """
+        runtime = context.task_runtime or OrganizeTaskRuntime()
+
+        def read_target_revision(target_id: str):
+            """读取轻量目录版本；不可用时让调用方严格刷新完整列表。"""
+            started = time.monotonic()
+            try:
+                detail = self.client.file_info(target_id)
+            except Exception as exc:
+                logger.debug(
+                    "规划阶段目标目录版本读取失败 target=%s type=%s",
+                    target_id, type(exc).__name__,
+                )
+                detail = None
+            stats["target_revision_checks"] = int(
+                stats.get("target_revision_checks", 0) or 0
+            ) + 1
+            stats["target_revision_check_elapsed_seconds"] = round(
+                float(stats.get(
+                    "target_revision_check_elapsed_seconds", 0.0
+                ) or 0.0) + max(0.0, time.monotonic() - started),
+                3,
+            )
+            return runtime.inventory_revision(detail)
+
+        def refresh_inventory(
+            target_id: str,
+            *,
+            revision_before: tuple[str, int] | None,
+            revision_checked: bool,
+        ):
+            """读取一个稳定目标快照；读取中持续变化时失败关闭。"""
+            if not revision_checked:
+                revision_before = read_target_revision(target_id)
+            files: list[GuangYaFile] = []
+            stable_revision = None
+            for attempt in range(2):
+                refresh_started = time.monotonic()
+                files = self.client.list_dir(target_id)
+                stats["target_inventory_refresh_elapsed_seconds"] = round(
+                    float(stats.get(
+                        "target_inventory_refresh_elapsed_seconds", 0.0
+                    ) or 0.0) + max(0.0, time.monotonic() - refresh_started),
+                    3,
+                )
+                if revision_before is None:
+                    break
+                revision_after = read_target_revision(target_id)
+                if revision_after is None:
+                    break
+                if revision_after == revision_before:
+                    stable_revision = revision_after
+                    break
+                stats["target_revision_mismatches"] = int(
+                    stats.get("target_revision_mismatches", 0) or 0
+                ) + 1
+                if attempt == 0:
+                    stats["target_inventory_unstable_retries"] = int(
+                        stats.get("target_inventory_unstable_retries", 0) or 0
+                    ) + 1
+                    revision_before = revision_after
+                    continue
+                runtime.invalidate_inventory(target_id)
+                stats["target_inventory_unstable_failures"] = int(
+                    stats.get("target_inventory_unstable_failures", 0) or 0
+                ) + 1
+                raise RuntimeError("目标目录在库存读取期间持续变化，请稍后重试")
+            snapshot = runtime.store_inventory(
+                target_id, files,
+                {
+                    item.file_id: item.name
+                    for item in files
+                    if not item.is_dir
+                },
+                revision=stable_revision,
+            )
+            stats["target_inventory_refreshes"] = int(
+                stats.get("target_inventory_refreshes", 0) or 0
+            ) + 1
+            return snapshot
+
+        def load_inventory(
+            plan: OrganizePlan,
+        ) -> tuple[str | None, list[GuangYaFile], dict[str, str]]:
+            root_id = str(rules.target_dir_id or "")
+            target_path = str(plan.target_path or "").strip("/")
+            target_id = runtime.target_id_for_path(root_id, target_path)
+            if not target_id:
+                with runtime.inventory_lock:
+                    listing_cache = {
+                        file_id: snapshot.files
+                        for file_id, snapshot in runtime.target_inventories.items()
+                        if snapshot.valid
+                    }
+                    known_ids = set(listing_cache)
+                    target_id = self._find_existing_dir_chain(
+                        root_id, target_path, listing_cache,
+                    ) or ""
+                    for file_id, files in listing_cache.items():
+                        if file_id in known_ids:
+                            continue
+                        runtime.store_inventory(
+                            file_id, files,
+                            {
+                                item.file_id: item.name
+                                for item in files
+                                if not item.is_dir
+                            },
+                        )
+                    runtime.remember_target_path(root_id, target_path, target_id)
+            if not target_id:
+                return None, [], {}
+
+            snapshot = runtime.get_inventory(target_id)
+            current_revision = None
+            revision_checked = False
+            if snapshot is not None:
+                current_revision = read_target_revision(target_id)
+                revision_checked = True
+            if (
+                snapshot is not None
+                and snapshot.revision is not None
+                and current_revision == snapshot.revision
+            ):
+                stats["target_inventory_cache_hits"] = int(
+                    stats.get("target_inventory_cache_hits", 0) or 0
+                ) + 1
+            else:
+                if snapshot is not None:
+                    if (
+                        current_revision is not None
+                        and snapshot.revision is not None
+                    ):
+                        stats["target_revision_mismatches"] = int(
+                            stats.get("target_revision_mismatches", 0) or 0
+                        ) + 1
+                    else:
+                        stats["target_revision_fallback_refreshes"] = int(
+                            stats.get("target_revision_fallback_refreshes", 0) or 0
+                        ) + 1
+                snapshot = refresh_inventory(
+                    target_id,
+                    revision_before=current_revision,
+                    revision_checked=revision_checked,
+                )
+            return target_id, snapshot.files, snapshot.evidence_names
+
+        def load_identity_history(plan: OrganizePlan) -> set[tuple[str, str]]:
+            key = str(plan.media_root_path or "").strip("/")
+            if not key:
+                return set()
+            with runtime.inventory_lock:
+                cached = runtime.identity_history_cache.get(key)
+                if cached is not None:
+                    stats["identity_history_cache_hits"] = int(
+                        stats.get("identity_history_cache_hits", 0) or 0
+                    ) + 1
+                    return set(cached)
+                known = self._historical_root_identities(key)
+                runtime.identity_history_cache[key] = set(known)
+                return set(known)
+
+        return load_inventory, load_identity_history
 
     def _finalize_planning_result(
         self,
@@ -2296,6 +2506,45 @@ class Organizer:
                 "目录扫描不完整，已在首次云盘写入前终止，请稍后重试"
             )
 
+    @staticmethod
+    def _known_nonempty_cleanup_report(
+        scanned_dirs: list[tuple],
+        protected_sources: set[str],
+        plans: list[OrganizePlan],
+    ) -> dict | None:
+        """单目录组存在明确未移动视频时，省去一次必然无效的云端复核。
+
+        只处理“恰好一个非保护扫描目录 + 计划阶段已确定至少一个文件留在
+        该目录”的严格场景。多层目录、运行时冲突和全部移动场景仍走原有
+        带版本校验的安全清理链路。
+        """
+        protected = {str(item) for item in protected_sources if str(item)}
+        unique_dirs = {
+            str(item[0] or "").strip()
+            for item in scanned_dirs
+            if len(item) >= 2 and str(item[0] or "").strip()
+        }
+        candidates = unique_dirs - protected
+        if len(candidates) != 1:
+            return None
+        candidate_id = next(iter(candidates))
+        if not any(
+            plan.action != "move"
+            and str(plan.original_parent_id or "").strip() == candidate_id
+            for plan in plans
+        ):
+            return None
+        return {
+            "cleaned": 0,
+            "delete_failures": 0,
+            "unsupported": 0,
+            "candidates": len(unique_dirs),
+            "protected": len(unique_dirs & protected),
+            "not_empty": 1,
+            "unavailable": 0,
+            "reasons": ["目录仍含未移动媒体，已跳过空目录复核"],
+        }
+
     def _run_execution_stage(
         self, scan_result: OrganizeScanResult, planning_result: OrganizePlanningResult,
         context: OrganizeContext, rules: OrganizeRules, stats: dict,
@@ -2324,6 +2573,7 @@ class Organizer:
             cancel_event, source_dir_id=source_dir_id,
             on_progress=on_progress,
             operation_token=context.operation_token,
+            task_runtime=context.task_runtime,
         )
         stats["execute_elapsed_seconds"] = round(
             time.monotonic() - execute_started, 3
@@ -2340,7 +2590,9 @@ class Organizer:
         if rules.clean_empty and cleanup_safe:
             if on_stage is not None:
                 on_stage(GROUP_STAGE_CLEANUP)
-            cleanup_report = self._clean_empty_dirs_report(
+            cleanup_report = self._known_nonempty_cleanup_report(
+                scanned_dirs, protected_sources, plans,
+            ) or self._clean_empty_dirs_report(
                 scanned_dirs,
                 protected_source_ids=protected_sources,
             )
@@ -2422,7 +2674,9 @@ class Organizer:
                  operation_token: str = "",
                  planning_workers: int | None = None,
                  media_probe_workers: int | None = None,
-                 execution_lock: object | None = None) -> tuple[list, dict]:
+                 planning_executor: Executor | None = None,
+                 execution_lock: object | None = None,
+                 task_runtime: OrganizeTaskRuntime | None = None) -> tuple[list, dict]:
         """兼容入口；内部阶段统一通过 :class:`OrganizeContext` 传参。"""
         context = OrganizeContext(
             source_dir_id=str(source_dir_id),
@@ -2445,7 +2699,9 @@ class Organizer:
             operation_token=str(operation_token or "").strip(),
             planning_workers=planning_workers,
             media_probe_workers=media_probe_workers,
+            planning_executor=planning_executor,
             execution_lock=execution_lock,
+            task_runtime=task_runtime,
         )
         return self._organize(context, rules)
 
@@ -2479,6 +2735,8 @@ class Organizer:
     ) -> tuple[list, dict]:
         """按扫描、规划、冲突预演和串行执行阶段完成一次整理。"""
         rules = enforce_fixed_organize_rules(rules)
+        if context.task_runtime is None:
+            context = replace(context, task_runtime=OrganizeTaskRuntime())
         if self._group_pipeline_enabled(context):
             return self._organize_groups(context, rules)
         source_dir_id = context.source_dir_id
@@ -2512,14 +2770,25 @@ class Organizer:
                 finalize=False,
             )
             execution_context = replace(context, post_actions=False)
+            writer_wait_started = time.monotonic()
             with _optional_execution_lock(context.execution_lock):
+                stats["writer_wait_elapsed_seconds"] = round(
+                    float(stats.get("writer_wait_elapsed_seconds", 0.0) or 0.0)
+                    + max(0.0, time.monotonic() - writer_wait_started),
+                    3,
+                )
                 self._existing_variant_cache.clear()
+                target_loader, history_loader = self._task_conflict_loaders(
+                    execution_context, rules, stats,
+                )
                 planning_result = self._finalize_planning_result(
                     scan_result,
                     planning_result,
                     execution_context,
                     rules,
                     stats,
+                    target_inventory_loader=target_loader,
+                    identity_history_loader=history_loader,
                 )
                 self._run_execution_stage(
                     scan_result,
@@ -2553,8 +2822,9 @@ class Organizer:
                 dir_id=task.source_dir_id,
                 rel="",
                 files_only=True,
-                group_id=task.source_dir_id,
-                group_path=GROUP_ROOT_PATH,
+                group_id=task.group_id or task.source_dir_id,
+                group_path=task.group_path or GROUP_ROOT_PATH,
+                file_ids=frozenset(task.file_ids),
             )
         return ScanRestriction(
             dir_id=task.group_id,
@@ -2714,9 +2984,10 @@ class Organizer:
                 global_probe_worker_budget,
                 max(1, int(context.media_probe_workers)),
             )
-        probe_workers_per_planner = max(
-            1, probe_worker_budget // max(1, workers)
-        )
+        # 所有 planner 都可见完整探测预算；media_probe 的进程级槽位门负责
+        # 全局限流。这样短组结束后，其空闲槽位能立即被大组复用，不再按
+        # planner 静态切成 1/2 个 ffprobe worker。
+        probe_workers_per_planner = probe_worker_budget
 
         def planner_for_thread() -> Organizer:
             planner = getattr(planner_local, "organizer", None)
@@ -2762,11 +3033,15 @@ class Organizer:
                         planning_finished_at, time.monotonic()
                     )
 
-        executor = ThreadPoolExecutor(
-            max_workers=workers,
-            thread_name_prefix="organize-plan",
-        )
+        executor = context.planning_executor
+        owns_executor = executor is None
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="organize-plan",
+            )
         futures: dict[str, Future[_PreparedOrganizeGroup]] = {}
+        submitted_futures: set[Future[_PreparedOrganizeGroup]] = set()
         next_submit = 0
         # 只保留每个 planner 一个在途完整组，避免大目录在等待稳定顺序提交时
         # 同时滞留过多扫描快照与计划对象。
@@ -2781,7 +3056,9 @@ class Organizer:
             row = rows[task.key]
             row["status"] = GROUP_STATUS_RUNNING
             row["stage"] = GROUP_STAGE_SCAN
-            futures[task.key] = executor.submit(prepare, task)
+            future = executor.submit(prepare, task)
+            futures[task.key] = future
+            submitted_futures.add(future)
             return True
 
         for _ in range(window):
@@ -2815,6 +3092,7 @@ class Organizer:
                 future = futures.pop(task.key, None)
                 if future is None:
                     future = executor.submit(prepare, task)
+                    submitted_futures.add(future)
                 try:
                     prepared = future.result()
                 except CancelledError:
@@ -2878,16 +3156,25 @@ class Organizer:
                 else:
                     try:
                         _stage(GROUP_STAGE_PLAN)
+                        writer_wait_started = time.monotonic()
                         with _optional_execution_lock(context.execution_lock):
+                            group_stats["writer_wait_elapsed_seconds"] = round(
+                                max(0.0, time.monotonic() - writer_wait_started), 3
+                            )
                             # 前序媒体组或其他来源可能已经改变目标库存；最终
                             # 仲裁必须在同一单写门内基于最新状态重新执行。
                             self._existing_variant_cache.clear()
+                            target_loader, history_loader = self._task_conflict_loaders(
+                                group_context, rules, group_stats,
+                            )
                             finalized = self._finalize_planning_result(
                                 prepared.scan_result,
                                 prepared.planning_result,
                                 group_context,
                                 rules,
                                 group_stats,
+                                target_inventory_loader=target_loader,
+                                identity_history_loader=history_loader,
                             )
                             plans.extend(finalized.plans)
                             self._run_execution_stage(
@@ -2948,9 +3235,15 @@ class Organizer:
                     result.elapsed_seconds,
                 )
         finally:
-            for future in futures.values():
+            for future in submitted_futures:
                 future.cancel()
-            executor.shutdown(wait=True, cancel_futures=True)
+            if owns_executor:
+                executor.shutdown(wait=True, cancel_futures=True)
+            elif submitted_futures:
+                # 共享线程池由任务管理器统一关闭，但本来源创建的 Planner
+                # 必须等其所有 Future 真正退出后才能释放。Future.cancel()
+                # 无法终止已经运行的线程，若直接 close 会形成取消/关闭竞态。
+                wait(submitted_futures)
             for planner in planners:
                 try:
                     planner.close()
@@ -3011,6 +3304,7 @@ class Organizer:
             video_exts=self.video_exts(rules),
             protected_source_ids=set(context.protected_source_ids),
             trigger="automatic" if context.automatic else "manual",
+            nsfw_enabled=rules.nsfw_enabled,
             cancelled=context.cancelled,
         )
         if not enumeration.complete:
@@ -4255,6 +4549,20 @@ class Organizer:
         cloned.metadata = metadata
         return cloned
 
+    @classmethod
+    def _task_identity_neutral_match(cls, match: MatchResult) -> MatchResult:
+        """生成可跨媒体组共享的作品身份结果。
+
+        组内 ``recognition_work_cache`` 仍保留原始识别上下文，以维持目录包
+        证明与逐集范围校验的既有语义；任务级缓存跨越不同目录，只能共享作品
+        身份，因此额外清除首个文件携带的 ``RecognitionResult.context``。命中
+        时会使用当前文件的预处理输入重新构造上下文。
+        """
+        cloned = cls._identity_neutral_work_match(match)
+        if hasattr(cloned, "context"):
+            cloned.context = None
+        return cloned
+
     @staticmethod
     def _accepted_directory_identity_attestation(
         match: MatchResult | None,
@@ -4622,6 +4930,82 @@ class Organizer:
             str(rules.automatic_match_preset or "balanced").strip().lower(),
         )
 
+    def _task_recognition_cache_key(
+        self,
+        *,
+        recognition_name: str,
+        parent_path: str,
+        media_type_hint: str,
+        rules: OrganizeRules,
+        automatic: bool,
+        trusted_match_override: MatchResult | None,
+    ) -> tuple[str, str, str, str, bool, str] | None:
+        """生成跨媒体组可共享的严格 TV 作品身份键。
+
+        仅对普通 TMDB、明确年份、明确剧集位置的输入开放。键不包含具体集号，
+        但缓存值会移除位置证明；每个文件随后仍重新解析并执行 TMDB 季集校验。
+        """
+        if (
+            type(self.scraper) is not TMDBScraper
+            or rules.nsfw_enabled
+            or trusted_match_override is not None
+        ):
+            return None
+        exact_name = str(recognition_name or "").strip()
+        exact_parent = str(parent_path or "").strip()
+        if not exact_name or _has_explicit_tmdb_marker(f"{exact_name} {exact_parent}"):
+            return None
+        try:
+            processed = self.scraper.prepare_recognition(exact_name, exact_parent)
+            recognition_context = extract_recognition_context(
+                processed.filename, processed.parent_path,
+            )
+        except Exception:
+            return None
+        media_type = str(media_type_hint or recognition_context.media_type or "").strip().lower()
+        title = _normalize_media_identity(recognition_context.normalized_title)
+        year = str(
+            recognition_context.filename_year
+            or recognition_context.folder_year
+            or ""
+        ).strip()
+        if (
+            media_type != "tv"
+            or recognition_context.episode is None
+            or not title
+            or title.isdigit()
+            or len(title) < 3
+            or not re.fullmatch(r"(?:19|20)\d{2}", year)
+        ):
+            return None
+        return (
+            "tmdb-tv-identity-v1",
+            title,
+            year,
+            media_type,
+            bool(automatic),
+            str(rules.automatic_match_preset or "balanced").strip().lower(),
+        )
+
+    @classmethod
+    def _cacheable_task_recognition_match(
+        cls, match: MatchResult | None, rules: OrganizeRules,
+    ) -> bool:
+        """只允许高置信普通 TMDB 搜索结果进入跨组短生命周期缓存。"""
+        if (
+            match is None
+            or str(getattr(match, "matched_by", "") or "").strip().lower() != "search"
+        ):
+            return False
+        threshold = automatic_match_policy(
+            rules.automatic_match_preset
+        ).threshold
+        return bool(cls._trusted_directory_tv_identity(
+            match,
+            threshold=threshold,
+            automatic_preset=rules.automatic_match_preset,
+        ))
+
     def _special_position_overrides(
         self, candidates: list[_ScannedVideo]
     ) -> dict[str, tuple[int, int]]:
@@ -4744,6 +5128,9 @@ class Organizer:
         ] | None,
         recognition_work_cache_key: tuple[str, str, str, bool, str] | None,
         parsed_override: tuple[int | None, int | None] | None = None,
+        task_runtime: OrganizeTaskRuntime | None = None,
+        task_recognition_key: tuple[str, str, str, str, bool, str] | None = None,
+        stats: dict | None = None,
     ) -> MatchResult | None:
         """解析单文件身份，并只缓存与具体季集位置无关的确定性结果。"""
         match = copy.deepcopy(match_override) if match_override is not None else None
@@ -4795,29 +5182,75 @@ class Organizer:
         ):
             return self._nsfw_unresolved_match()
         if match is None:
-            if isinstance(self.scraper, TMDBScraper):
-                match = self.scraper.match(
-                    match_name,
-                    parent_path,
-                    media_type_hint=recognition_media_type_hint,
+            def run_scraper_match() -> MatchResult | None:
+                if isinstance(self.scraper, TMDBScraper):
+                    return self.scraper.match(
+                        match_name,
+                        parent_path,
+                        media_type_hint=recognition_media_type_hint,
+                    )
+                if bool(getattr(self.scraper, "supports_parent_path", False)):
+                    if recognition_media_type_hint:
+                        try:
+                            return self.scraper.match(
+                                match_name,
+                                parent_path,
+                                media_type_hint=recognition_media_type_hint,
+                            )
+                        except TypeError as exc:
+                            # 兼容只声明 parent_path、尚未接受类型提示的旧扩展识别器。
+                            if "media_type_hint" not in str(exc):
+                                raise
+                            return self.scraper.match(match_name, parent_path)
+                    return self.scraper.match(match_name, parent_path)
+                return self.scraper.match(match_name)
+
+            if task_runtime is not None and task_recognition_key is not None:
+                match, task_cache_hit, wait_seconds, cache_bound = (
+                    task_runtime.resolve_recognition(
+                        task_recognition_key,
+                        run_scraper_match,
+                        cacheable=lambda value: (
+                            self._cacheable_task_recognition_match(value, rules)
+                        ),
+                        neutralize=self._task_identity_neutral_match,
+                    )
                 )
-            elif bool(getattr(self.scraper, "supports_parent_path", False)):
-                if recognition_media_type_hint:
-                    try:
-                        match = self.scraper.match(
-                            match_name,
-                            parent_path,
-                            media_type_hint=recognition_media_type_hint,
+                if stats is not None:
+                    if task_cache_hit:
+                        stats["task_recognition_cache_hits"] = int(
+                            stats.get("task_recognition_cache_hits", 0) or 0
+                        ) + 1
+                    if cache_bound:
+                        stats["task_recognition_cache_bindings"] = int(
+                            stats.get("task_recognition_cache_bindings", 0) or 0
+                        ) + 1
+                    if wait_seconds > 0:
+                        stats["task_recognition_singleflight_waits"] = int(
+                            stats.get("task_recognition_singleflight_waits", 0) or 0
+                        ) + 1
+                        stats["task_recognition_singleflight_wait_seconds"] = round(
+                            float(stats.get(
+                                "task_recognition_singleflight_wait_seconds", 0.0
+                            ) or 0.0) + wait_seconds,
+                            3,
                         )
-                    except TypeError as exc:
-                        # 兼容只声明 parent_path、尚未接受类型提示的旧扩展识别器。
-                        if "media_type_hint" not in str(exc):
-                            raise
-                        match = self.scraper.match(match_name, parent_path)
-                else:
-                    match = self.scraper.match(match_name, parent_path)
+                if task_cache_hit and match is not None and isinstance(
+                    self.scraper, TMDBScraper
+                ):
+                    try:
+                        processed = self.scraper.prepare_recognition(
+                            match_name, parent_path,
+                        )
+                        match = self.scraper._attach_preprocess(match, processed)
+                        if hasattr(match, "context"):
+                            match.context = extract_recognition_context(
+                                processed.filename, processed.parent_path,
+                            )
+                    except Exception:
+                        match = None
             else:
-                match = self.scraper.match(match_name)
+                match = run_scraper_match()
             if (
                 match is not None
                 and rules.nsfw_exclusive
@@ -5230,6 +5663,8 @@ class Organizer:
         directory_identity_attestation: dict[str, object] | None = None,
         recognition_work_cache: dict[tuple[str, str, str, bool, str], MatchResult] | None = None,
         recognition_work_cache_key: tuple[str, str, str, bool, str] | None = None,
+        task_runtime: OrganizeTaskRuntime | None = None,
+        stats: dict | None = None,
         media_probe_cache_only: bool = False,
         media_probe_cached_payload: str = "",
         media_probe_cache_prefetched: bool = False,
@@ -5242,6 +5677,14 @@ class Organizer:
             and getattr(self.scraper, "episode_override", None) is not None
         )
         effective_parsed_override = None if manual_position_confirmed else parsed_override
+        task_recognition_key = self._task_recognition_cache_key(
+            recognition_name=match_name,
+            parent_path=parent_path,
+            media_type_hint=recognition_media_type_hint,
+            rules=rules,
+            automatic=automatic,
+            trusted_match_override=match_override,
+        ) if task_runtime is not None else None
         match = self._resolve_plan_match(
             file,
             rules,
@@ -5252,6 +5695,9 @@ class Organizer:
             recognition_work_cache=recognition_work_cache,
             recognition_work_cache_key=recognition_work_cache_key,
             parsed_override=effective_parsed_override,
+            task_runtime=task_runtime,
+            task_recognition_key=task_recognition_key,
+            stats=stats,
         )
         plan = OrganizePlan(
             file_id=file.file_id, original_name=file.name,
@@ -6538,18 +6984,20 @@ class Organizer:
             if plan.action != "move":
                 continue
             try:
-                target_id, loaded_files, loaded_evidence = inventory_loader(plan)
-                inventory_key = str(target_id or plan.target_path or "")
-                if inventory_key not in inventory_cache:
+                inventory_key = str(plan.target_path or "")
+                cached_inventory = inventory_cache.get(inventory_key)
+                if cached_inventory is None:
+                    target_id, loaded_files, loaded_evidence = inventory_loader(plan)
                     target_files = list(loaded_files or [])
                     evidence_names = dict(loaded_evidence or {})
                     self._prime_existing_variant_cache(
                         target_files, rules, evidence_names
                     )
-                    inventory_cache[inventory_key] = (
+                    cached_inventory = (
                         target_id, target_files, evidence_names
                     )
-                target_id, target_files, evidence_names = inventory_cache[inventory_key]
+                    inventory_cache[inventory_key] = cached_inventory
+                target_id, target_files, evidence_names = cached_inventory
                 if (
                     plan.original_parent_id
                     and target_id

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import TYPE_CHECKING, Callable
 
+from app.modules.organize_runtime import OrganizeTaskRuntime
 from app.modules.organize_postprocess import (
     companion_target_name,
     media_notification_item,
@@ -37,6 +39,7 @@ def execute_organize_plans(
     source_dir_id: str = "",
     on_progress: Callable[[int, int], None] | None = None,
     operation_token: str = "",
+    task_runtime: OrganizeTaskRuntime | None = None,
 ) -> None:
     # 延迟读取 organize 模块的兼容绑定：既避免循环导入，也保留现有
     # 测试/插件对 app.modules.organize 下审计、删除和日志符号的 patch 契约。
@@ -62,12 +65,134 @@ def execute_organize_plans(
     subtitle_plans_by_video = subtitle_plans_by_video or {}
     moved_companions: set[str] = set()
     directory_stats: dict[str, dict[str, object]] = {}
-    target_files_cache: dict[str, list[GuangYaFile]] = {}
-    target_evidence_cache: dict[str, dict[str, str]] = {}
-    target_episode_inventory_cache: dict[tuple[str, int], list[int]] = {}
+    runtime = task_runtime or OrganizeTaskRuntime()
+    target_episode_inventory_cache = runtime.target_episode_inventory_cache
     # 光鸭目录创建后列表可能短时间仍返回旧数据。同一批整理必须复用
     # 已解析/创建的每一级目录，避免每个剧集重复创建同名媒体目录。
-    directory_chain_cache: dict[tuple[str, str], str] = {}
+    directory_chain_cache = runtime.directory_chain_cache
+
+    def read_target_revision(target_id: str):
+        """读取目录轻量版本；缺少版本字段时返回 None 并走严格刷新。"""
+        started = time.monotonic()
+        try:
+            detail = organizer.client.file_info(target_id)
+        except Exception as exc:  # 版本探测失败不能放宽冲突校验
+            logger.debug(
+                "目标目录版本读取失败 target=%s type=%s",
+                target_id, type(exc).__name__,
+            )
+            detail = None
+        stats["target_revision_checks"] = int(
+            stats.get("target_revision_checks", 0) or 0
+        ) + 1
+        stats["target_revision_check_elapsed_seconds"] = round(
+            float(stats.get("target_revision_check_elapsed_seconds", 0.0) or 0.0)
+            + max(0.0, time.monotonic() - started),
+            3,
+        )
+        return runtime.inventory_revision(detail)
+
+    def load_target_inventory(target_id: str, *, force: bool = False):
+        """读取或复用单写入器维护的目标库存。
+
+        有目录 etag/更新时间时先做轻量版本校验，仅在版本变化、每 32 次写入
+        或 30 秒到期时重新分页读取；版本字段不可用时严格维持逐计划完整刷新。
+        覆盖/删除仍另行执行文件级快照校验，任何写入异常都会立即失效缓存。
+        """
+        snapshot = runtime.get_inventory(target_id)
+        current_revision = None
+        revision_checked = False
+        stale = bool(
+            snapshot is not None
+            and (
+                snapshot.writes_since_refresh >= 32
+                or time.monotonic() - snapshot.refreshed_at >= 30.0
+            )
+        )
+        if snapshot is not None and not force and not stale:
+            current_revision = read_target_revision(target_id)
+            revision_checked = True
+            if (
+                snapshot.revision is not None
+                and current_revision == snapshot.revision
+            ):
+                stats["target_inventory_cache_hits"] = int(
+                    stats.get("target_inventory_cache_hits", 0) or 0
+                ) + 1
+                return snapshot
+            if current_revision is not None and snapshot.revision is not None:
+                stats["target_revision_mismatches"] = int(
+                    stats.get("target_revision_mismatches", 0) or 0
+                ) + 1
+            else:
+                stats["target_revision_fallback_refreshes"] = int(
+                    stats.get("target_revision_fallback_refreshes", 0) or 0
+                ) + 1
+
+        # 首次读取也必须先建立版本基线；否则“先 list_dir、后第一次
+        # file_info”的窗口会把已经过期的列表误标为当前版本。目录在分页
+        # 读取期间变化时重试一次，持续变化则失败关闭，避免基于混合快照替换。
+        revision_before = current_revision
+        if not revision_checked:
+            revision_before = read_target_revision(target_id)
+        files = []
+        stable_revision = None
+        for attempt in range(2):
+            refresh_started = time.monotonic()
+            files = organizer.client.list_dir(target_id)
+            stats["target_inventory_refresh_elapsed_seconds"] = round(
+                float(stats.get(
+                    "target_inventory_refresh_elapsed_seconds", 0.0
+                ) or 0.0) + max(0.0, time.monotonic() - refresh_started),
+                3,
+            )
+            if revision_before is None:
+                break
+            revision_after = read_target_revision(target_id)
+            if revision_after is None:
+                break
+            if revision_after == revision_before:
+                stable_revision = revision_after
+                break
+            stats["target_revision_mismatches"] = int(
+                stats.get("target_revision_mismatches", 0) or 0
+            ) + 1
+            if attempt == 0:
+                stats["target_inventory_unstable_retries"] = int(
+                    stats.get("target_inventory_unstable_retries", 0) or 0
+                ) + 1
+                revision_before = revision_after
+                continue
+            runtime.invalidate_inventory(target_id)
+            stats["target_inventory_unstable_failures"] = int(
+                stats.get("target_inventory_unstable_failures", 0) or 0
+            ) + 1
+            raise RuntimeError("目标目录在库存读取期间持续变化，请稍后重试")
+        snapshot = runtime.store_inventory(
+            target_id, files,
+            {item.file_id: item.name for item in files if not item.is_dir},
+            revision=stable_revision,
+        )
+        stats["target_dir_refreshes"] = int(
+            stats.get("target_dir_refreshes", 0) or 0
+        ) + 1
+        stats["target_inventory_refreshes"] = int(
+            stats.get("target_inventory_refreshes", 0) or 0
+        ) + 1
+        return snapshot
+
+    def checkpoint_target_revision(target_id: str) -> None:
+        """成功写入后记录目录新版本；失败或字段缺失则让下一计划严格刷新。"""
+        revision = read_target_revision(target_id)
+        runtime.set_inventory_revision(target_id, revision)
+        if revision is None:
+            stats["target_revision_checkpoint_fallbacks"] = int(
+                stats.get("target_revision_checkpoint_fallbacks", 0) or 0
+            ) + 1
+        else:
+            stats["target_revision_checkpoints"] = int(
+                stats.get("target_revision_checkpoints", 0) or 0
+            ) + 1
     source_group_rows = {
         f"{str(row.get('id') or '')}\x1f{str(row.get('path') or '')}": row
         for row in (stats.get("source_groups") or [])
@@ -340,16 +465,12 @@ def execute_organize_plans(
                 record_runtime_skip(p, target_id, reason)
                 continue
 
-            # 每个计划都重新读取目标目录，避免前一项移动/用户外部操作后
-            # 继续使用过期冲突视图。
-            target_files_cache[target_id] = organizer.client.list_dir(target_id)
-            target_evidence_cache[target_id] = {
-                item.file_id: item.name
-                for item in target_files_cache[target_id]
-                if not item.is_dir
-            }
-            target_files = target_files_cache[target_id]
-            evidence_names = target_evidence_cache[target_id]
+            runtime.remember_target_path(
+                str(rules.target_dir_id or ""), p.target_path, target_id,
+            )
+            target_snapshot = load_target_inventory(target_id)
+            target_files = target_snapshot.files
+            evidence_names = target_snapshot.evidence_names
             probe_batches, probe_hits = organizer._prime_existing_variant_cache(
                 target_files, rules, evidence_names
             )
@@ -359,9 +480,6 @@ def execute_organize_plans(
             stats["target_probe_cache_hits"] = int(
                 stats.get("target_probe_cache_hits", 0) or 0
             ) + probe_hits
-            stats["target_dir_refreshes"] = int(
-                stats.get("target_dir_refreshes", 0) or 0
-            ) + 1
             existing, conflict_decision, conflict_note = organizer._resolve_variant_conflict(
                 p, target_files, rules, evidence_names
             )
@@ -375,6 +493,8 @@ def execute_organize_plans(
                         f"{existing.name}.mediaflux-backup-{existing.file_id[-8:]}"
                     )
                     organizer.client.rename(existing.file_id, replacement_backup_name)
+                    existing.name = replacement_backup_name
+                    evidence_names[existing.file_id] = replacement_backup_name
                     stats["conflict"] += 1
                 else:
                     runtime_skip_reason = (
@@ -471,12 +591,16 @@ def execute_organize_plans(
                 if existing and replacement_backup_name:
                     try:
                         organizer.client.rename(existing.file_id, existing_original_name)
+                        existing.name = existing_original_name
+                        evidence_names[existing.file_id] = existing_original_name
                     except Exception as restore_exc:
                         rollback_incomplete = True
                         logger.error(
                             "恢复旧文件名失败 file=%s type=%s",
                             existing_original_name, type(restore_exc).__name__,
                         )
+                if target_id:
+                    runtime.invalidate_inventory(target_id)
                 raise
             if existing and replacement_backup_name:
                 candidate = DeleteCandidate(
@@ -493,6 +617,7 @@ def execute_organize_plans(
                         candidate=candidate, replacement=replacement,
                     )
                 else:
+                    refreshed = None
                     try:
                         refreshed, old_detail, new_detail = (
                             organizer._replacement_verification_snapshot(
@@ -518,6 +643,17 @@ def execute_organize_plans(
                             type(verify_exc).__name__,
                         )
                         block_reason = "扫描错误，禁止将旧文件移入回收站"
+                    if refreshed is not None:
+                        target_snapshot = runtime.store_inventory(
+                            target_id, refreshed,
+                            {
+                                item.file_id: item.name
+                                for item in refreshed
+                                if not item.is_dir
+                            },
+                        )
+                        target_files = target_snapshot.files
+                        evidence_names = target_snapshot.evidence_names
                     if block_reason:
                         delete_audit_id = record_blocked_delete(
                             trigger="replacement", reason=block_reason,
@@ -546,15 +682,29 @@ def execute_organize_plans(
                             stats["replacement_cleanup_failed"] = int(
                                 stats.get("replacement_cleanup_failed", 0) or 0
                             ) + 1
-            target_files.append(GuangYaFile(
-                file_id=p.file_id,
-                name=actual_name,
-                is_dir=False,
-                size=p.size,
-                etag=p.etag,
-                parent_id=target_id,
-            ))
+            if not any(item.file_id == p.file_id for item in target_files):
+                target_files.append(GuangYaFile(
+                    file_id=p.file_id,
+                    name=actual_name,
+                    is_dir=False,
+                    size=p.size,
+                    etag=p.etag,
+                    parent_id=target_id,
+                ))
             evidence_names[p.file_id] = f"{p.original_name} {actual_name}"
+            for item, target_name in moved_metadata:
+                if not any(existing_item.file_id == item.file_id for existing_item in target_files):
+                    target_files.append(GuangYaFile(
+                        file_id=item.file_id,
+                        name=target_name,
+                        is_dir=False,
+                        size=item.size,
+                        etag=item.etag,
+                        parent_id=target_id,
+                    ))
+                evidence_names[item.file_id] = target_name
+            runtime.note_inventory_write(target_id)
+            checkpoint_target_revision(target_id)
             if companions:
                 stats["metadata_moved"] += len(companions)
                 stats["subtitle_moved"] += sum(
@@ -717,6 +867,8 @@ def execute_organize_plans(
                 )
 
         except Exception as e:
+            if target_id:
+                runtime.invalidate_inventory(target_id)
             failure_message = _safe_organize_failure(e)
             logger.error(
                 "文件整理失败 file=%s type=%s",

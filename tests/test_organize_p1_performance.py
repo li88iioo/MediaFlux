@@ -421,6 +421,143 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
         self.assertEqual(client.get_download_url.call_count, 1)
         run_probe.assert_not_called()
 
+    def test_ffprobe_slots_are_shared_across_independent_callers(self):
+        state_lock = threading.Lock()
+        release = threading.Event()
+        two_running = threading.Event()
+        active = 0
+        peak = 0
+        results: list[subprocess.CompletedProcess] = []
+        errors: list[BaseException] = []
+
+        def run_process(command, **_kwargs):
+            nonlocal active, peak
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    two_running.set()
+            release.wait(timeout=2)
+            with state_lock:
+                active -= 1
+            return subprocess.CompletedProcess(command, 0, stdout='{"streams": []}', stderr="")
+
+        def invoke(index: int) -> None:
+            try:
+                results.append(_run_ffprobe("ffprobe", f"file-{index}", 2))
+            except BaseException as exc:  # pragma: no cover - 失败内容由主线程断言
+                errors.append(exc)
+
+        threads = [threading.Thread(target=invoke, args=(index,)) for index in range(5)]
+        try:
+            with patch.dict(
+                "app.modules.media_probe.os.environ",
+                {"MEDIAFLUX_MEDIA_PROBE_WORKERS": "2"},
+            ), patch("app.modules.media_probe.subprocess.run", side_effect=run_process):
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(two_running.wait(timeout=1))
+                time.sleep(0.05)
+                self.assertEqual(peak, 2)
+                release.set()
+                for thread in threads:
+                    thread.join(timeout=2)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(peak, 2)
+
+    def test_ffprobe_slot_wait_does_not_consume_process_timeout(self):
+        first_running = threading.Event()
+        release_first = threading.Event()
+        results: dict[str, subprocess.CompletedProcess] = {}
+        errors: list[BaseException] = []
+        received_timeouts: dict[str, float] = {}
+
+        def run_process(command, **kwargs):
+            url = str(command[-1])
+            received_timeouts[url] = float(kwargs.get("timeout") or 0)
+            if url == "first":
+                first_running.set()
+                release_first.wait(timeout=2)
+            return subprocess.CompletedProcess(
+                command, 0, stdout='{"streams": []}', stderr="",
+            )
+
+        def invoke(name: str, timeout: float) -> None:
+            try:
+                results[name] = _run_ffprobe("ffprobe", name, timeout)
+            except BaseException as exc:  # pragma: no cover - 主线程统一断言
+                errors.append(exc)
+
+        first = threading.Thread(target=invoke, args=("first", 1.0))
+        second = threading.Thread(target=invoke, args=("second", 0.1))
+        try:
+            with patch.dict(
+                "app.modules.media_probe.os.environ",
+                {"MEDIAFLUX_MEDIA_PROBE_WORKERS": "1"},
+            ), patch("app.modules.media_probe.subprocess.run", side_effect=run_process):
+                first.start()
+                self.assertTrue(first_running.wait(timeout=1))
+                second.start()
+                # 第二个探测排队时间故意超过它的执行超时。执行超时应从真正
+                # 获得槽位后开始，而不是在全局并发队列中被提前耗尽。
+                time.sleep(0.15)
+                self.assertTrue(second.is_alive())
+                release_first.set()
+                first.join(timeout=2)
+                second.join(timeout=2)
+        finally:
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(set(results), {"first", "second"})
+        self.assertAlmostEqual(received_timeouts["second"], 0.1, places=3)
+
+    def test_waiting_ffprobe_slot_observes_cancellation(self):
+        release = threading.Event()
+        first_running = threading.Event()
+        cancel_event = threading.Event()
+        first_error: list[BaseException] = []
+
+        def run_process(command, **_kwargs):
+            first_running.set()
+            release.wait(timeout=2)
+            return subprocess.CompletedProcess(command, 0, stdout='{"streams": []}', stderr="")
+
+        def occupy() -> None:
+            try:
+                _run_ffprobe("ffprobe", "first", 2)
+            except BaseException as exc:  # pragma: no cover - 失败内容由主线程断言
+                first_error.append(exc)
+
+        thread = threading.Thread(target=occupy)
+        try:
+            with patch.dict(
+                "app.modules.media_probe.os.environ",
+                {"MEDIAFLUX_MEDIA_PROBE_WORKERS": "1"},
+            ), patch("app.modules.media_probe.subprocess.run", side_effect=run_process):
+                thread.start()
+                self.assertTrue(first_running.wait(timeout=1))
+                cancel_event.set()
+                with self.assertRaises(_ProbeCancelled):
+                    _run_ffprobe(
+                        "ffprobe", "second", 1, cancel_event=cancel_event,
+                    )
+        finally:
+            release.set()
+            thread.join(timeout=2)
+
+        self.assertEqual(first_error, [])
+        self.assertFalse(thread.is_alive())
+
     def test_running_ffprobe_is_terminated_when_batch_is_cancelled(self):
         cancel_event = threading.Event()
 
@@ -774,3 +911,189 @@ class OrganizeP1PerformanceTests(IsolatedDatabaseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrganizeTaskRuntimeRecognitionTests(unittest.TestCase):
+    def test_cacheable_recognition_is_single_flight_and_deep_copied(self):
+        from app.modules.organize_runtime import OrganizeTaskRuntime
+
+        runtime = OrganizeTaskRuntime()
+        calls = 0
+        lock = threading.Lock()
+        results: list[tuple[dict, bool, float, bool]] = []
+
+        def loader():
+            nonlocal calls
+            with lock:
+                calls += 1
+            time.sleep(0.05)
+            return {"identity": ["tmdb", "223911"]}
+
+        def run():
+            results.append(runtime.resolve_recognition(
+                ("series", "仙逆", "2023"),
+                loader,
+                cacheable=lambda _value: True,
+                neutralize=lambda value: value,
+            ))
+
+        threads = [threading.Thread(target=run) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(calls, 1)
+        self.assertEqual(sum(1 for _value, hit, _wait, _bound in results if hit), 2)
+        self.assertEqual(sum(1 for _value, _hit, _wait, bound in results if bound), 1)
+        self.assertTrue(any(wait > 0 for _value, _hit, wait, _bound in results))
+        results[0][0]["identity"].append("mutated")
+        self.assertEqual(results[1][0]["identity"], ["tmdb", "223911"])
+
+    def test_uncacheable_followers_resume_in_parallel(self):
+        from app.modules.organize_runtime import OrganizeTaskRuntime
+
+        runtime = OrganizeTaskRuntime()
+        owner_started = threading.Event()
+        release_owner = threading.Event()
+        followers_started = threading.Event()
+        release_followers = threading.Event()
+        calls = 0
+        followers = 0
+        lock = threading.Lock()
+        failures: list[BaseException] = []
+
+        def loader():
+            nonlocal calls, followers
+            with lock:
+                calls += 1
+                index = calls
+            if index == 1:
+                owner_started.set()
+                release_owner.wait(timeout=2)
+            else:
+                with lock:
+                    followers += 1
+                    if followers >= 2:
+                        followers_started.set()
+                release_followers.wait(timeout=2)
+            return {"cacheable": False}
+
+        def run():
+            try:
+                runtime.resolve_recognition(
+                    ("ambiguous", "same-input"),
+                    loader,
+                    cacheable=lambda _value: False,
+                    neutralize=lambda value: value,
+                )
+            except BaseException as exc:  # pragma: no cover - 便于线程失败回传
+                failures.append(exc)
+
+        first = threading.Thread(target=run)
+        first.start()
+        self.assertTrue(owner_started.wait(timeout=1))
+        waiting = [threading.Thread(target=run) for _ in range(2)]
+        for thread in waiting:
+            thread.start()
+        try:
+            release_owner.set()
+            self.assertTrue(followers_started.wait(timeout=1))
+        finally:
+            release_followers.set()
+            release_owner.set()
+        first.join(timeout=2)
+        for thread in waiting:
+            thread.join(timeout=2)
+
+        self.assertFalse(failures)
+        self.assertEqual(calls, 3)
+        self.assertTrue(all(not thread.is_alive() for thread in [first, *waiting]))
+
+    def test_resolve_plan_match_reuses_task_runtime_only_after_strict_binding(self):
+        from app.modules.organize_runtime import OrganizeTaskRuntime
+
+        class _CountingScraper:
+            def __init__(self):
+                self.calls = 0
+
+            def match(self, _filename):
+                self.calls += 1
+                return MatchResult(
+                    tmdb_id="223911",
+                    external_id="223911",
+                    title="仙逆",
+                    year="2023",
+                    media_type="tv",
+                    confidence=1.0,
+                    status="matched",
+                    matched_by="search",
+                    provider="tmdb",
+                )
+
+        scraper = _CountingScraper()
+        organizer = Organizer(client=SimpleNamespace(), scraper=scraper)
+        runtime = OrganizeTaskRuntime()
+        stats = organizer._initial_stats()
+        file = GuangYaFile(
+            "episode-94", "Renegade.Immortal.S01E094.2023.mkv", False,
+            1000, "etag", "source",
+        )
+        kwargs = {
+            "match_name": file.name,
+            "parent_path": "仙逆/第94集",
+            "recognition_media_type_hint": "tv",
+            "match_override": None,
+            "recognition_work_cache": None,
+            "recognition_work_cache_key": None,
+            "task_runtime": runtime,
+            "task_recognition_key": ("tmdb-tv", "renegadeimmortal", "2023"),
+            "stats": stats,
+        }
+        with patch.object(
+            Organizer, "_cacheable_task_recognition_match", return_value=True,
+        ):
+            first = organizer._resolve_plan_match(file, OrganizeRules(), **kwargs)
+            second = organizer._resolve_plan_match(file, OrganizeRules(), **kwargs)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(scraper.calls, 1)
+        self.assertEqual(stats["task_recognition_cache_bindings"], 1)
+        self.assertEqual(stats["task_recognition_cache_hits"], 1)
+
+    def test_task_identity_key_ignores_episode_but_keeps_title_and_year(self):
+        from app.modules.scraper import TMDBScraper
+
+        scraper = TMDBScraper(client=SimpleNamespace(api_key="", base_url=""))
+        organizer = Organizer(client=SimpleNamespace(), scraper=scraper)
+        rules = OrganizeRules()
+        common = {
+            "parent_path": "光鸭/仙逆",
+            "media_type_hint": "",
+            "rules": rules,
+            "automatic": True,
+            "trusted_match_override": None,
+        }
+        first = organizer._task_recognition_cache_key(
+            recognition_name=(
+                "Renegade.Immortal.S01E094.2023.2160p.WEB-DL.mkv"
+            ),
+            **common,
+        )
+        second = organizer._task_recognition_cache_key(
+            recognition_name=(
+                "Renegade.Immortal.S01E099.2023.2160p.WEB-DL.mkv"
+            ),
+            **common,
+        )
+        different_year = organizer._task_recognition_cache_key(
+            recognition_name=(
+                "Renegade.Immortal.S01E099.2024.2160p.WEB-DL.mkv"
+            ),
+            **common,
+        )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, different_year)

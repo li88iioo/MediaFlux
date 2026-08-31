@@ -19,6 +19,7 @@ from app.clients.guangya import close_guangya_client
 from app.logger import get_logger
 from app.modules.media_probe import resolve_media_probe_workers
 from app.modules.organize import OrganizeRules, Organizer, resolve_organize_workers
+from app.modules.organize_runtime import OrganizeTaskRuntime
 from app.modules.organize_results import build_organize_result, read_organize_result
 from app.modules.organize_sources import normalize_organize_sources
 from app.modules.organize_delete_audit import DeleteCandidate, execute_recycle_bin_delete
@@ -1588,11 +1589,22 @@ class OrganizeTaskManager:
                 # 来源并发和来源内部的 ffprobe 池共享同一个全局预算，禁止
                 # 两层线程池相乘压垮家庭网络或云盘接口。
                 source_worker_count = min(source_worker_count, probe_worker_budget)
-            group_worker_budget = max(1, worker_budget // source_worker_count)
-            source_probe_worker_budget = max(
-                1, probe_worker_budget // source_worker_count
+            # 多来源共享同一个媒体组规划池，Worker 不再按来源静态切片；
+            # 小来源结束后空闲 Worker 会自然继续领取剩余大来源的媒体单元。
+            shared_planning_executor = (
+                ThreadPoolExecutor(
+                    max_workers=worker_budget,
+                    thread_name_prefix="organize-plan-global",
+                )
+                if source_worker_count > 1
+                else None
             )
+            group_worker_budget = worker_budget
+            # ffprobe 自身另有进程级槽位门，因此每个规划任务可看到完整预算，
+            # 总并发仍不会超过 MEDIAFLUX_MEDIA_PROBE_WORKERS。
+            source_probe_worker_budget = probe_worker_budget
             execution_gate = threading.Lock() if source_worker_count > 1 else None
+            task_runtime = OrganizeTaskRuntime()
             source_runtime_lock = threading.Lock()
             source_runtime = [
                 {
@@ -1701,7 +1713,9 @@ class OrganizeTaskManager:
                         group_progress=_publish_group_progress,
                         planning_workers=group_worker_budget,
                         media_probe_workers=source_probe_worker_budget,
+                        planning_executor=shared_planning_executor,
                         execution_lock=execution_gate,
+                        task_runtime=task_runtime,
                     )
                     cleanup_context = (
                         execution_gate if execution_gate is not None else nullcontext()
@@ -1787,6 +1801,10 @@ class OrganizeTaskManager:
                         )
                 finally:
                     executor.shutdown(wait=True, cancel_futures=True)
+                    if shared_planning_executor is not None:
+                        shared_planning_executor.shutdown(
+                            wait=True, cancel_futures=True,
+                        )
 
             source_results.extend(
                 completed_sources[index] for index in sorted(completed_sources)

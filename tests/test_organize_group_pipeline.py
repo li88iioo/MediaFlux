@@ -109,6 +109,127 @@ class GroupEnumerationTests(unittest.TestCase):
         self.assertEqual([task.index for task in enumeration.tasks], [1, 2, 3])
         self.assertEqual({task.total for task in enumeration.tasks}, {3})
 
+    def test_independent_root_media_are_split_into_file_scoped_tasks(self):
+        client = _TreeClient({
+            "root": [
+                _video("movie-a", "Movie.A.2025.1080p.mkv", "root"),
+                _video("movie-b", "Movie.B.2026.2160p.mkv", "root"),
+            ],
+        })
+
+        enumeration = self._enumerate(client)
+
+        self.assertEqual([task.group_id for task in enumeration.tasks], ["movie-a", "movie-b"])
+        self.assertEqual([task.file_ids for task in enumeration.tasks], [("movie-a",), ("movie-b",)])
+        self.assertTrue(all(task.is_root for task in enumeration.tasks))
+        self.assertEqual({task.group_path for task in enumeration.tasks}, {GROUP_ROOT_PATH})
+
+    def test_root_season_pack_remains_one_media_unit(self):
+        client = _TreeClient({
+            "root": [
+                _video("episode-1", "Show.S01E01.1080p.mkv", "root"),
+                _video("episode-2", "Show.S01E02.1080p.mkv", "root"),
+            ],
+        })
+
+        enumeration = self._enumerate(client)
+
+        self.assertEqual(len(enumeration.tasks), 1)
+        self.assertEqual(enumeration.tasks[0].group_id, "root")
+        self.assertEqual(enumeration.tasks[0].file_ids, ("episode-1", "episode-2"))
+
+    def test_root_plain_anime_episode_and_ova_remain_one_media_unit(self):
+        client = _TreeClient({
+            "root": [
+                _video("episode-1", "Example Anime - 01.mkv", "root"),
+                _video("episode-2", "Example Anime - 02.mkv", "root"),
+                _video("ova-1", "Example Anime - OVA.mkv", "root"),
+            ],
+        })
+
+        enumeration = self._enumerate(client)
+
+        self.assertEqual(len(enumeration.tasks), 1)
+        self.assertEqual(
+            enumeration.tasks[0].file_ids,
+            ("episode-1", "episode-2", "ova-1"),
+        )
+
+    def test_year_after_hyphen_number_does_not_merge_movie_sequels(self):
+        client = _TreeClient({
+            "root": [
+                _video("movie-1", "Example - 1.2024.1080p.mkv", "root"),
+                _video("movie-2", "Example - 2.2026.1080p.mkv", "root"),
+            ],
+        })
+
+        enumeration = self._enumerate(client)
+
+        self.assertEqual(len(enumeration.tasks), 2)
+        self.assertEqual(
+            [task.file_ids for task in enumeration.tasks],
+            [("movie-1",), ("movie-2",)],
+        )
+
+    def test_root_explicit_multipart_remains_one_media_unit(self):
+        client = _TreeClient({
+            "root": [
+                _video("disc-1", "Concert.CD1.1080p.mkv", "root"),
+                _video("disc-2", "Concert.CD2.1080p.mkv", "root"),
+            ],
+        })
+
+        enumeration = self._enumerate(client)
+
+        self.assertEqual(len(enumeration.tasks), 1)
+        self.assertEqual(enumeration.tasks[0].file_ids, ("disc-1", "disc-2"))
+
+    def test_root_movie_variants_remain_one_arbitration_unit(self):
+        client = _TreeClient({
+            "root": [
+                _video(
+                    "small", "Variant.Movie.2026.2160p.SDR.x265-SMALL.mkv",
+                    "root",
+                ),
+                _video(
+                    "large", "Variant.Movie.2026.2160p.SDR.x265-LARGE.mkv",
+                    "root",
+                ),
+            ],
+        })
+
+        enumeration = self._enumerate(client)
+
+        self.assertEqual(len(enumeration.tasks), 1)
+        self.assertEqual(enumeration.tasks[0].file_ids, ("small", "large"))
+
+    def test_root_nsfw_same_identifier_remains_one_media_unit(self):
+        client = _TreeClient({
+            "root": [
+                _video("part-1", "hhd800.com@FJIN-140-CD1.mp4", "root"),
+                _video("part-2", "hhd800.com@FJIN-140-CD2.mp4", "root"),
+            ],
+        })
+
+        enumeration = self._enumerate(client, nsfw_enabled=True)
+
+        self.assertEqual(len(enumeration.tasks), 1)
+        self.assertEqual(enumeration.tasks[0].file_ids, ("part-1", "part-2"))
+
+    def test_root_media_without_stable_ids_falls_back_to_legacy_group(self):
+        client = _TreeClient({
+            "root": [
+                _video("", "Movie.A.2025.mkv", "root"),
+                _video("movie-b", "Movie.B.2026.mkv", "root"),
+            ],
+        })
+
+        enumeration = self._enumerate(client)
+
+        self.assertEqual(len(enumeration.tasks), 1)
+        self.assertEqual(enumeration.tasks[0].group_id, "root")
+        self.assertEqual(enumeration.tasks[0].file_ids, ())
+
     def test_enumeration_does_not_descend_into_nested_directories(self):
         client = _sample_tree()
 
@@ -427,6 +548,23 @@ class GroupPipelineExecutionTests(unittest.TestCase):
         # 枚举 1 次 + 首组扫描 1 次；其余 99 组的识别耗时不进入首组关键路径。
         self.assertEqual(first_execute_calls, [2])
         self.assertEqual(len(harness.events), 200)
+
+    def test_independent_root_files_are_scanned_in_separate_batches(self):
+        client = _TreeClient({
+            "root": [
+                _video("movie-a", "Movie.A.2025.1080p.mkv", "root"),
+                _video("movie-b", "Movie.B.2026.2160p.mkv", "root"),
+            ],
+        })
+        harness = _PipelineHarness(client)
+        batches: list[int] = []
+        harness.execute_hook = lambda _group, stats: batches.append(stats["moved"])
+
+        _plans, stats = harness.run()
+
+        self.assertEqual(batches, [1, 1])
+        self.assertEqual(stats["source_groups_total"], 2)
+        self.assertEqual(stats["moved"], 2)
 
     def test_group_keeps_full_directory_context_in_one_plan_batch(self):
         client = _TreeClient({

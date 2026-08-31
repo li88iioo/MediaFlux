@@ -41,6 +41,7 @@ class ScanRestriction:
     group_path: str = "__root__"
     etag: str = ""
     updated_at: int = 0
+    file_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,7 @@ class OrganizerScanner:
                     source_group_id=restriction.group_id or restriction.dir_id,
                     source_group_path=restriction.group_path,
                     files_only=True,
+                    selected_file_ids=restriction.file_ids,
                 )
             else:
                 # 组根目录由枚举阶段发现，父级递归不会再登记它；这里显式
@@ -253,6 +255,7 @@ class OrganizerScanner:
         source_group_id: str,
         source_group_path: str,
         files_only: bool = False,
+        selected_file_ids: frozenset[str] = frozenset(),
     ) -> bool:
         stats = accumulator.stats
         if context.cancelled():
@@ -281,6 +284,10 @@ class OrganizerScanner:
                 item.name.rsplit(".", 1)[-1].lower() if "." in item.name else ""
             )
             in accumulator.video_exts
+            and (
+                not selected_file_ids
+                or str(getattr(item, "file_id", "") or "") in selected_file_ids
+            )
         ]
         metadata_here = [
             item
@@ -331,6 +338,11 @@ class OrganizerScanner:
                 continue
             ext = item.name.rsplit(".", 1)[-1].lower() if "." in item.name else ""
             if ext not in accumulator.video_exts:
+                continue
+            if (
+                selected_file_ids
+                and str(getattr(item, "file_id", "") or "") not in selected_file_ids
+            ):
                 continue
             if (
                 rules.small_file_mb
