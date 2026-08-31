@@ -40,7 +40,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = (
     "上次进程在本地媒体写操作期间中断"
@@ -612,6 +612,34 @@ CREATE INDEX IF NOT EXISTS idx_agent_jobs_owner_updated
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_jobs_owner_active
     ON agent_jobs(owner_digest, job_type, dedupe_key)
     WHERE status IN ('pending','running','retry_wait');
+
+CREATE TABLE IF NOT EXISTS agent_provider_plans (
+    plan_id TEXT PRIMARY KEY,
+    owner_digest TEXT NOT NULL,
+    session_digest TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    profile_ref TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    risk TEXT NOT NULL CHECK(risk IN ('low_write','write','danger')),
+    status TEXT NOT NULL DEFAULT 'prepared' CHECK(status IN
+        ('prepared','running','succeeded','failed','stale','outcome_unknown')),
+    arguments_json TEXT NOT NULL DEFAULT '{}',
+    target_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    context_fingerprint TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    summary TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    expires_at REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_provider_plans_owner_updated
+    ON agent_provider_plans(owner_digest,session_digest,updated_at DESC,plan_id);
+CREATE INDEX IF NOT EXISTS idx_agent_provider_plans_expiry
+    ON agent_provider_plans(status,expires_at,plan_id);
 
 CREATE TABLE IF NOT EXISTS agent_maintenance (
     task_key TEXT PRIMARY KEY
@@ -2316,6 +2344,36 @@ def _migrate_agent_guangya_fs_change_jobs_v17(
     )
 
 
+def _migrate_agent_provider_plans_v18(conn: sqlite3.Connection) -> None:
+    """建立 owner/session 隔离且可恢复的 Provider 写计划。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_provider_plans ("
+        "plan_id TEXT PRIMARY KEY,"
+        "owner_digest TEXT NOT NULL,session_digest TEXT NOT NULL,"
+        "provider TEXT NOT NULL,profile_ref TEXT NOT NULL,operation TEXT NOT NULL,"
+        "risk TEXT NOT NULL CHECK(risk IN ('low_write','write','danger')),"
+        "status TEXT NOT NULL DEFAULT 'prepared' CHECK(status IN "
+        "('prepared','running','succeeded','failed','stale','outcome_unknown')),"
+        "arguments_json TEXT NOT NULL DEFAULT '{}',"
+        "target_snapshot_json TEXT NOT NULL DEFAULT '{}',"
+        "context_fingerprint TEXT NOT NULL,result_json TEXT NOT NULL DEFAULT '{}',"
+        "summary TEXT NOT NULL DEFAULT '',error_code TEXT NOT NULL DEFAULT '',"
+        "attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),"
+        "expires_at REAL NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+        "started_at TEXT,finished_at TEXT"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_provider_plans_owner_updated "
+        "ON agent_provider_plans(owner_digest,session_digest,updated_at DESC,plan_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_provider_plans_expiry "
+        "ON agent_provider_plans(status,expires_at,plan_id)"
+    )
+
+
+
 def _migrate_local_media_numbering_mode_v11(conn: sqlite3.Connection) -> None:
     """持久化本地剧集编号方式，保证预览与最终执行使用同一映射。"""
     columns = {
@@ -2625,6 +2683,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     14: _migrate_retire_organize_notification_outbox_v15,
     15: _migrate_retire_telegram_write_confirmations_v16,
     16: _migrate_agent_guangya_fs_change_jobs_v17,
+    17: _migrate_agent_provider_plans_v18,
 }
 
 
@@ -3156,6 +3215,20 @@ def init_db() -> None:
                 "error_code='execution_interrupted',finished_at=?,elapsed_ms=0 "
                 "WHERE status='executing'",
                 (timestamp,),
+            )
+            conn.execute(
+                "UPDATE agent_provider_plans SET status='outcome_unknown',"
+                "summary='进程中断，执行结果需要人工核对',"
+                "error_code='execution_interrupted',finished_at=?,updated_at=? "
+                "WHERE status='running'",
+                (timestamp, timestamp),
+            )
+            conn.execute(
+                "UPDATE agent_provider_plans SET status='stale',"
+                "summary='写计划已过期',error_code='plan_expired',"
+                "finished_at=COALESCE(finished_at,?),updated_at=? "
+                "WHERE status='prepared' AND expires_at<=?",
+                (timestamp, timestamp, time.time()),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             conn.commit()

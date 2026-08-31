@@ -575,37 +575,6 @@ def prepare_guangya_rename_confirmation(
     ), _confirmation_fingerprint(flow, plan)
 
 
-def prepare_guangya_media_hygiene_confirmation(
-    arguments: dict[str, Any], context: ToolContext,
-) -> tuple[ToolResult, str]:
-    flow = _flow(context.owner)
-    if flow is None or str(flow.preview_safe.get("mode") or "") != "media_hygiene":
-        raise AgentToolError(
-            "最近媒体名称清理预览不存在或已过期，请重新生成",
-            code="precondition_failed",
-        )
-    return prepare_guangya_rename_confirmation(arguments, context)
-
-
-def execute_guangya_media_hygiene(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("媒体名称清理必须先预览并确认", code="confirmation_required")
-
-
-def execute_guangya_media_hygiene_confirmed(
-    arguments: dict[str, Any], expected_context: str, context: ToolContext,
-) -> ToolResult:
-    flow = _flow(context.owner)
-    if flow is None or str(flow.preview_safe.get("mode") or "") != "media_hygiene":
-        raise AgentToolError(
-            "媒体名称清理预览已过期，请重新生成", code="confirmation_stale"
-        )
-    return execute_guangya_rename_confirmed(arguments, expected_context, context)
-
-
-def execute_guangya_rename(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("光鸭重命名必须先预览并确认", code="confirmation_required")
-
-
 def execute_guangya_rename_confirmed(
     _arguments: dict[str, Any], expected_context: str, context: ToolContext,
 ) -> ToolResult:

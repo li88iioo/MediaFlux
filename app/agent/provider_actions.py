@@ -1,6 +1,7 @@
 """统一 Provider Gateway 的 Agent 工具入口。"""
 from __future__ import annotations
 
+import re
 import threading
 from typing import Any
 
@@ -93,5 +94,65 @@ def query_provider(
     normalized = provider_query_arguments(arguments)
     try:
         return get_provider_gateway().query(context=context, **normalized)
+    except ProviderGatewayError as exc:
+        raise AgentToolError(exc.safe_message, code=exc.code) from exc
+
+
+def provider_plan_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """写计划预览沿用查询入口的静态 operation 参数封装。"""
+    return provider_query_arguments(arguments)
+
+
+def provider_plan_ref_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict) or set(arguments) != {"plan_ref"}:
+        raise AgentToolError("Provider 写计划操作只接受 plan_ref")
+    plan_ref = str(arguments.get("plan_ref") or "").strip().upper()
+    if not re.fullmatch(r"PP-[0-9A-F]{24}", plan_ref):
+        raise AgentToolError("plan_ref 无效")
+    return {"plan_ref": plan_ref}
+
+
+def preview_provider_change(
+    arguments: dict[str, Any], context: ToolContext
+) -> ToolResult:
+    normalized = provider_plan_arguments(arguments)
+    try:
+        return get_provider_gateway().preview_change(context=context, **normalized)
+    except ProviderGatewayError as exc:
+        raise AgentToolError(exc.safe_message, code=exc.code) from exc
+
+
+def prepare_provider_change_execution(
+    arguments: dict[str, Any], context: ToolContext
+) -> tuple[ToolResult, str]:
+    normalized = provider_plan_ref_arguments(arguments)
+    try:
+        return get_provider_gateway().prepare_change_execution(
+            context=context, **normalized
+        )
+    except ProviderGatewayError as exc:
+        raise AgentToolError(exc.safe_message, code=exc.code) from exc
+
+
+def execute_provider_change_confirmed(
+    arguments: dict[str, Any], expected_context: str, context: ToolContext
+) -> ToolResult:
+    normalized = provider_plan_ref_arguments(arguments)
+    try:
+        return get_provider_gateway().execute_change(
+            context=context,
+            expected_context=expected_context,
+            **normalized,
+        )
+    except ProviderGatewayError as exc:
+        raise AgentToolError(exc.safe_message, code=exc.code) from exc
+
+
+def provider_change_status(
+    arguments: dict[str, Any], context: ToolContext
+) -> ToolResult:
+    normalized = provider_plan_ref_arguments(arguments)
+    try:
+        return get_provider_gateway().change_status(context=context, **normalized)
     except ProviderGatewayError as exc:
         raise AgentToolError(exc.safe_message, code=exc.code) from exc

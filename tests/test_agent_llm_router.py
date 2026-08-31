@@ -483,7 +483,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
             len(read_tools | confirmation_tools),
         )
         self.assertTrue({
-            "downloads.delete_task",
+            "provider.change.execute",
             "downloads.retry_submission",
             "rss.delete_subscription",
             "rss.submit_pending_to_qb",
@@ -664,7 +664,9 @@ class AgentLLMSelectionTests(unittest.TestCase):
             self.assertEqual(message, "检查下载队列有没有异常")
             names = {item["name"] for item in capabilities}
             self.assertTrue(names)
-            self.assertTrue(all(name.startswith("downloads.") for name in names))
+            self.assertTrue(all(
+                name.startswith(("downloads.", "provider.")) for name in names
+            ))
             self.assertLessEqual(len(capabilities), 14)
             return None
 
@@ -719,7 +721,9 @@ class AgentLLMSelectionTests(unittest.TestCase):
             registry.native_tool_name(item["name"]) for item in downloads
         }
         self.assertTrue(download_names)
-        self.assertTrue(all(name.startswith("downloads.") for name in download_names))
+        self.assertTrue(all(
+            name.startswith(("downloads.", "provider.")) for name in download_names
+        ))
         self.assertLessEqual(len(downloads), 14)
 
         series = _native_read_capabilities(
@@ -868,7 +872,9 @@ class AgentLLMSelectionTests(unittest.TestCase):
             )
         }
         self.assertTrue(download_names)
-        self.assertTrue(all(name.startswith("downloads.") for name in download_names))
+        self.assertTrue(all(
+            name.startswith(("downloads.", "provider.")) for name in download_names
+        ))
 
     def test_native_context_inherits_long_explicit_reference_without_polluting_new_topic(self):
         context = [{

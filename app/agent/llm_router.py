@@ -1978,6 +1978,61 @@ def _ensure_objective_source_coverage(
     return chosen
 
 
+def _ensure_objective_workflow_coverage(
+    selected: list[dict[str, Any]],
+    eligible: list[dict[str, Any]],
+    objective: AgentObjectiveContract,
+    *,
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    """补齐 Provider 原生读写链的固定阶段，避免只召回查询却无法完成确认。"""
+    required_by_task = {
+        "download_status": ("provider.capabilities", "provider.query"),
+        "download_control": (
+            "provider.capabilities",
+            "provider.query",
+            "provider.change.preview",
+            "provider.change.execute",
+        ),
+        "media_library_refresh": (
+            "provider.capabilities",
+            "provider.query",
+            "provider.change.preview",
+            "provider.change.execute",
+        ),
+    }
+    required_names = required_by_task.get(objective.task_kind, ())
+    if not required_names:
+        return selected[:max_candidates]
+    by_name = {
+        str(item.get("name") or "").strip(): item
+        for item in eligible
+    }
+    required_names = tuple(name for name in required_names if name in by_name)
+    chosen = list(selected[:max_candidates])
+    chosen_names = {str(item.get("name") or "").strip() for item in chosen}
+    protected = set(required_names)
+    for name in required_names:
+        if name in chosen_names:
+            continue
+        candidate = by_name[name]
+        if len(chosen) < max_candidates:
+            chosen.append(candidate)
+        else:
+            replace_at = next((
+                index for index in range(len(chosen) - 1, -1, -1)
+                if str(chosen[index].get("name") or "").strip() not in protected
+            ), None)
+            if replace_at is None:
+                continue
+            chosen_names.discard(
+                str(chosen[replace_at].get("name") or "").strip()
+            )
+            chosen[replace_at] = candidate
+        chosen_names.add(name)
+    return chosen
+
+
 def _native_read_capabilities(
     registry: ToolRegistry,
     message: str = "",
@@ -2016,6 +2071,9 @@ def _native_read_capabilities(
         max_candidates=max_candidates,
     )
     selected = _ensure_objective_source_coverage(
+        selected, eligible, objective, max_candidates=max_candidates
+    )
+    selected = _ensure_objective_workflow_coverage(
         selected, eligible, objective, max_candidates=max_candidates
     )
     record_agent_capabilities(

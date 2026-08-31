@@ -63,13 +63,13 @@ class AgentGeneralistOperationTests(IsolatedDatabaseTestCase):
                 "local_media_scan", "local_media.scan_sources"
             ),
             "通知 Jellyfin 扫描动漫库": (
-                "media_library_refresh", "library.refresh_library"
+                "media_library_refresh", "provider.change.execute"
             ),
             "重启 Jellyfin 反代实例 1": (
                 "media_proxy_restart", "media_proxy.restart_instance"
             ),
             "暂停第 1 个下载任务": (
-                "download_control", "downloads.pause_task"
+                "download_control", "provider.change.execute"
             ),
             "把 STRM 同步改为每 7 天": (
                 "strm_schedule_policy", "strm.set_schedule_policy"

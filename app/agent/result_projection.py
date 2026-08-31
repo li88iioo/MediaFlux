@@ -99,6 +99,9 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "agent.capabilities": "Agent 能力列表",
     "provider.capabilities": "Provider 能力列表",
     "provider.query": "Provider 实时查询",
+    "provider.change.preview": "Provider 写计划预览",
+    "provider.change.execute": "Provider 写计划执行",
+    "provider.job.status": "Provider 写计划状态",
     "agent.action_history": "Agent 操作记录",
     "agent.read_plan": "综合检查",
     "automation.diagnose_pipeline": "自动化链路诊断",
@@ -211,9 +214,8 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "guangya.fs.change.preview": "光鸭文件变更预览",
     "guangya.fs.change.execute": "光鸭文件变更执行",
     "guangya.media_hygiene.preview": "光鸭媒体名称清理预览",
-    "guangya.media_hygiene.execute": "光鸭媒体名称清理",
     "guangya.rename.preview": "光鸭批量名称转换预览",
-    "guangya.rename.execute": "光鸭批量名称转换执行",
+    "guangya.rename.execute": "光鸭重命名执行",
     "guangya.directory_scrape.inspect": "光鸭刮削检查",
     "guangya.directory_scrape.search": "光鸭刮削匹配搜索",
     "guangya.directory_scrape.preview": "光鸭刮削预览",
@@ -292,7 +294,17 @@ _BANNED_KEY_FRAGMENTS = (
 _PUBLIC_DATA_KEYS: dict[str, str] = {
     "affected": "影响数量",
     "artifact_ref": "查询快照编号",
+    "plan_ref": "写计划编号",
     "profile_ref": "配置引用",
+    "target_snapshot": "目标快照",
+    "targets": "目标",
+    "attempts": "执行次数",
+    "accepted": "已接受",
+    "verification": "核验结果",
+    "observed_count": "已核验数量",
+    "global_refresh": "全库刷新",
+    "refresh_mode": "刷新模式",
+    "delete_files": "删除文件",
     "profiles": "可用配置",
     "operations": "可用操作",
     "rules": "调用规则",
@@ -648,7 +660,6 @@ _PUBLIC_DATA_KEYS: dict[str, str] = {
     "updates": "更新",
     "updates_available": "发现更新",
     "updates_available_count": "发现更新数量",
-    "verification": "核验结果",
     "waiting_count": "等待数量",
     "waiting_total": "等待总数",
     "warnings": "警告",
@@ -717,8 +728,9 @@ _PUBLIC_TEXT_VALUE_KEYS = frozenset({
     "kind", "extension", "location",
     "subscription_status", "stage", "route", "last_seen_at", "coverage",
     "available_names",
-    "artifact_ref", "profile_ref", "description", "name", "type", "product",
+    "artifact_ref", "plan_ref", "profile_ref", "description", "name", "type", "product",
     "version", "collection_type", "series_name", "category", "input_schema",
+    "refresh_mode", "verification", "risk",
 })
 _MAX_DEPTH = 4
 _MAX_MAPPING_ITEMS = 24
@@ -760,7 +772,6 @@ _INFORMATIONAL_GUIDANCE_MARKERS = (
 _INFORMATIONAL_GUIDANCE_KINDS = {"notice", "info", "advisory"}
 
 _PUBLIC_STATUS_LABELS: dict[str, str] = {
-    "accepted": "已提交",
     "active": "运行中",
     "answered": "已回复",
     "attention": "需关注",
@@ -783,6 +794,8 @@ _PUBLIC_STATUS_LABELS: dict[str, str] = {
     "not_run": "尚未运行",
     "outcome_unknown": "结果待确认",
     "partial": "部分完成",
+    "prepared": "等待确认",
+    "preview": "预检完成",
     "pending": "等待执行",
     "ready": "已就绪",
     "review_required": "需人工核对",
@@ -790,6 +803,7 @@ _PUBLIC_STATUS_LABELS: dict[str, str] = {
     "running": "运行中",
     "selection_required": "需要选择目标",
     "success": "已完成",
+    "stale": "已失效",
     "succeeded": "已完成",
     "unavailable": "暂不可用",
     "unknown": "暂无法确认",
@@ -1228,6 +1242,10 @@ def _safe_value(
             artifact_ref = value.strip().upper()
             if re.fullmatch(r"PA-[0-9A-F]{24}", artifact_ref):
                 return artifact_ref
+        if source_key == "plan_ref":
+            plan_ref = value.strip().upper()
+            if re.fullmatch(r"PP-[0-9A-F]{24}", plan_ref):
+                return plan_ref
         if source_key == "object_ref":
             object_ref = value.strip().upper()
             if re.fullmatch(r"PO-[0-9A-F]{24}", object_ref):
@@ -1254,9 +1272,13 @@ def _safe_value(
         return text
     if isinstance(value, Mapping):
         projected: dict[str, Any] = {}
+        has_subscription_name = any(
+            str(key or "").strip().casefold() == "subscription_name"
+            for key in value
+        )
         for raw_key, raw_value in islice(value.items(), _MAX_MAPPING_ITEMS):
             internal_key, public_key = _safe_key(raw_key)
-            if not public_key:
+            if not public_key or (internal_key == "name" and has_subscription_name):
                 continue
             safe_value = _safe_value(
                 raw_value,

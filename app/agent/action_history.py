@@ -21,6 +21,7 @@ _TOOL_LABELS = {
     "downloads.resume_task": "下载任务恢复",
     "downloads.delete_task": "下载任务移除",
     "downloads.retry_submission": "下载请求重新提交",
+    "provider.change.execute": "Provider 原生写计划执行",
     "rss.mark_entries": "RSS 条目标记",
     "rss.submit_entries_to_qb": "RSS 指定条目提交",
     "rss.submit_pending_to_qb": "RSS 待处理条目提交",
@@ -58,8 +59,7 @@ _TOOL_LABELS = {
     "strm.set_schedule_policy": "STRM 调度策略修改",
     "guangya.organize.set_schedule_policy": "光鸭定时整理策略修改",
     "guangya.fs.change.execute": "光鸭文件变更执行",
-    "guangya.media_hygiene.execute": "光鸭媒体名称清理",
-    "guangya.rename.execute": "光鸭批量名称转换执行",
+    "guangya.rename.execute": "光鸭重命名执行",
     "guangya.directory_scrape.run": "光鸭目录刮削执行",
     "guangya.organize.run_once": "光鸭整理任务",
     "guangya.organize.cleanup.execute": "光鸭整理残留清理",
@@ -79,6 +79,10 @@ _SAFE_FIELDS = {
     "downloads.retry_submission": {
         "target", "status", "created", "duplicate", "succeeded", "failed",
         "source_attention_preserved",
+    },
+    "provider.change.execute": {
+        "provider", "operation", "status", "affected", "accepted",
+        "delete_files", "global_refresh",
     },
     "rss.mark_entries": {"affected", "processed"},
     "rss.submit_entries_to_qb": {
@@ -164,9 +168,6 @@ _SAFE_FIELDS = {
         "rename_count", "move_count", "trash_count", "create_directory_count",
         "trigger_strm", "requires_manual",
     },
-    "guangya.media_hygiene.execute": {
-        "queued", "queue_position", "replayed", "rename_count", "requires_manual",
-    },
     "guangya.rename.execute": {
         "queued", "queue_position", "replayed", "rename_count", "requires_manual",
     },
@@ -232,7 +233,7 @@ _COUNT_FIELDS = {
 _BOOL_FIELDS = {
     "accepted", "enabled", "runtime_refreshed", "created", "duplicate", "delete_files",
     "reused", "cancelled", "cancel_requested", "sent", "processed", "queued",
-    "replayed", "mapping_confirmed",
+    "replayed", "mapping_confirmed", "global_refresh",
     "requires_manual",
     "source_attention_preserved",
 }
@@ -262,16 +263,20 @@ _ENUM_FIELDS = {
     "rule_type": {"preprocess_rule", "tmdb_regex_rule", "knowledge_entry"},
     "preferred_server": {"any", "jellyfin", "emby"},
     "preferred_download_target": {"qb", "guangya", "both"},
-    "provider": {"tmdb", "douban", "bangumi"},
+    "provider": {"tmdb", "douban", "bangumi", "media", "qbittorrent"},
     "media_type": {"movie", "tv"},
     "task_status": {"pending", "running", "retry_wait", "not_scheduled"},
     "operation": {
         "pause", "resume", "delete", "enable", "disable", "set_interval",
         "add", "remove", "create", "restore", "retry", "precise_refresh",
         "set_preferences", "clear_preferences", "set_notification_rule",
-        "reset_notification_rule",
+        "reset_notification_rule", "media.library.refresh", "media.item.refresh",
+        "qb.torrents.pause", "qb.torrents.resume", "qb.torrents.delete_task",
     },
-    "status": {"accepted", "submitted", "completed", "partial", "failed", "duplicate"},
+    "status": {
+        "accepted", "submitted", "completed", "partial", "failed", "duplicate",
+        "succeeded", "stale", "outcome_unknown",
+    },
 }
 
 

@@ -47,8 +47,14 @@ from app.agent.pending_action_actions import (
     pending_action_arguments,
 )
 from app.agent.provider_actions import (
+    execute_provider_change_confirmed,
     list_provider_capabilities,
+    prepare_provider_change_execution,
+    preview_provider_change,
     provider_capabilities_arguments,
+    provider_change_status,
+    provider_plan_arguments,
+    provider_plan_ref_arguments,
     provider_query_arguments,
     query_provider,
     reset_provider_gateway_for_tests,
@@ -385,12 +391,10 @@ from app.agent.guangya_cleanup_actions import (
     preview_guangya_cleanup,
 )
 from app.agent.guangya_rename_actions import (
-    execute_guangya_media_hygiene_confirmed,
     execute_guangya_rename_confirmed,
     guangya_media_hygiene_preview_arguments,
     guangya_rename_execute_arguments,
     guangya_rename_preview_arguments,
-    prepare_guangya_media_hygiene_confirmation,
     prepare_guangya_rename_confirmation,
     preview_guangya_media_hygiene,
     preview_guangya_rename,
@@ -1384,7 +1388,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=query_provider,
         validator=provider_query_arguments,
         llm_read=True,
@@ -1400,6 +1403,88 @@ def build_tool_registry() -> ToolRegistry:
             "读取 qBittorrent 下载任务",
             "查看刚才下载任务的文件",
         ),
+    ))
+
+    registry.register(ToolSpec(
+        name="provider.change.preview",
+        description=(
+            "为静态目录中已开放的媒体服务器或 qBittorrent 写操作执行实时预检并冻结短期计划。"
+            "只能使用先前只读查询返回的对象引用；不会在预检阶段修改 Provider。"
+        ),
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["profile_ref", "operation", "arguments"],
+            "properties": {
+                "profile_ref": {"type": "string", "minLength": 1, "maxLength": 80},
+                "operation": {"type": "string", "minLength": 3, "maxLength": 96},
+                "arguments": {"type": "object", "additionalProperties": True},
+            },
+            "additionalProperties": False,
+        },
+        context_handler=preview_provider_change,
+        validator=provider_plan_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        native_alias="mf_provider_change_preview",
+        llm_domains=("media_library", "downloads"),
+        llm_source_kind="provider_change_plan",
+        llm_freshness="live",
+        llm_parallel_safe=False,
+        llm_examples=(
+            "预览刷新刚才选中的媒体库",
+            "预览暂停刚才选中的 qB 下载任务",
+            "预览移除 qB 任务但保留文件",
+        ),
+    ))
+    registry.register(ToolSpec(
+        name="provider.change.execute",
+        description=(
+            "在用户确认后执行一个 owner/session 绑定的冻结 Provider 写计划。"
+            "不能接收新的目标或写参数；计划只能原子认领并执行一次。"
+        ),
+        risk=RiskLevel.WRITE,
+        parameters={
+            "type": "object",
+            "required": ["plan_ref"],
+            "properties": {
+                "plan_ref": {"type": "string", "pattern": "^PP-[0-9A-Fa-f]{24}$"},
+            },
+            "additionalProperties": False,
+        },
+        validator=provider_plan_ref_arguments,
+        requires_confirmation=True,
+        context_confirmation_preparer=prepare_provider_change_execution,
+        context_confirmed_handler=execute_provider_change_confirmed,
+        llm_confirmation=True,
+        native_alias="mf_provider_change_execute",
+        llm_domains=("media_library", "downloads"),
+        llm_source_kind="provider_change_plan",
+        llm_freshness="live",
+        llm_parallel_safe=False,
+        llm_examples=("确认执行刚才的 Provider 写计划",),
+    ))
+    registry.register(ToolSpec(
+        name="provider.job.status",
+        description="读取当前会话中指定 Provider 写计划的持久状态、公开目标摘要与写后核验结果。",
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["plan_ref"],
+            "properties": {
+                "plan_ref": {"type": "string", "pattern": "^PP-[0-9A-Fa-f]{24}$"},
+            },
+            "additionalProperties": False,
+        },
+        context_handler=provider_change_status,
+        validator=provider_plan_ref_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        native_alias="mf_provider_job_status",
+        llm_domains=("media_library", "downloads", "agent"),
+        llm_source_kind="provider_change_plan",
+        llm_freshness="live",
+        llm_examples=("查看刚才 Provider 操作是否完成",),
     ))
 
     registry.register(ToolSpec(
@@ -3167,28 +3252,6 @@ def build_tool_registry() -> ToolRegistry:
         ),
     ))
     registry.register(ToolSpec(
-        name="guangya.media_hygiene.execute",
-        description=(
-            "在用户确认后执行最近一次媒体名称卫生冻结计划。只应用已排除冲突的目录、"
-            "视频和唯一关联伴随文件名称映射；成功改名后自动触发 STRM 全量核对。"
-        ),
-        risk=RiskLevel.DANGER,
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        validator=guangya_rename_execute_arguments,
-        requires_confirmation=True,
-        context_confirmation_preparer=prepare_guangya_media_hygiene_confirmation,
-        context_confirmed_handler=execute_guangya_media_hygiene_confirmed,
-        llm_confirmation=True,
-        llm_domains=("cloud_files", "media_naming", "adult_media", "strm"),
-        llm_source_kind="guangya_rename_plan",
-        llm_freshness="live",
-        llm_parallel_safe=False,
-        llm_examples=(
-            "确认执行刚才的 NSFW 名称清理计划",
-            "按预览清理网站污染标题并刷新 STRM",
-        ),
-    ))
-    registry.register(ToolSpec(
         name="guangya.rename.preview",
         description=(
             "按 1 到 4 个精确光鸭绝对路径只读预览批量名称转换；支持递归删除旧式 Mbps "
@@ -3232,8 +3295,9 @@ def build_tool_registry() -> ToolRegistry:
     registry.register(ToolSpec(
         name="guangya.rename.execute",
         description=(
-            "在用户确认后执行当前会话最近冻结的光鸭批量名称转换计划；不接受文件 ID、路径或"
-            "名称参数，执行前复核凭据、快照和目标冲突，写后按 file_id 验证真实名称。"
+            "在用户确认后执行当前会话最近冻结的光鸭重命名计划，包括批量名称转换和媒体名称"
+            "清理；不接受文件 ID、路径或名称参数，执行前复核凭据、快照和目标冲突，写后按"
+            "file_id 验证真实名称。"
         ),
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},

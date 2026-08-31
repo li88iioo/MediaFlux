@@ -11,6 +11,12 @@ CONTRACT_VERSION = 1
 
 # 文案只描述可观察影响，不包含参数、路径、URL、票据或服务端内部标识。
 _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
+    "provider.change.execute": {
+        "action": "执行 Provider 写计划",
+        "object": "刚才预检并冻结的媒体服务器或 qBittorrent 目标",
+        "impact": "只会执行写计划中已经冻结的精确操作；不能在确认阶段新增目标、修改参数或退化为全库刷新。qB 任务移除始终保留已下载文件。",
+        "reversibility": "暂停和恢复可通过反向操作撤销；媒体刷新请求无法撤回；移除的 qB 任务不会由 MediaFlux 自动恢复，但本地文件会保留。",
+    },
     "downloads.pause_task": {
         "action": "暂停下载任务",
         "object": "你指定的 qBittorrent 任务",
@@ -251,16 +257,10 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "只执行预览中固定的对象和目标；写前复核快照与冲突，回收操作只进入 Provider 回收站，写后逐项验证。",
         "reversibility": "回收项可在光鸭回收站恢复；改名、移动和新建目录需依据私有执行清单手工恢复。",
     },
-    "guangya.media_hygiene.execute": {
-        "action": "清理光鸭媒体名称",
-        "object": "最近预览冻结的域名污染目录、视频和唯一关联伴随文件",
-        "impact": "只应用预览中的名称映射；逐项写后验证，至少一个对象改名成功后自动触发 STRM 全量核对。",
-        "reversibility": "私有清单保留原名称与对象标识，可用于后续受控回滚；不会移动或删除媒体文件。",
-    },
     "guangya.rename.execute": {
-        "action": "执行光鸭批量名称转换",
-        "object": "当前会话最近冻结并排除重名冲突的云盘对象",
-        "impact": "只会应用预览中固定的旧名称到新名称映射；执行前重新核对凭据和文件快照，写入后逐项验证真实名称。",
+        "action": "执行光鸭重命名",
+        "object": "当前会话最近冻结并排除冲突的批量名称转换或媒体名称清理计划",
+        "impact": "只应用冻结计划中的名称映射；不扩大范围、移动或删除对象，执行前复核快照，写后验证真实名称并按计划决定是否核对 STRM。",
         "reversibility": "私有清单会保留 file_id、原目录和原名称，可用于后续受控回滚；本次不会移动或删除文件。",
     },
     "guangya.organize.set_schedule_policy": {

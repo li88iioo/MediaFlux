@@ -136,3 +136,79 @@ def test_qb_transport_reuses_client_and_never_returns_paths(monkeypatch):
         {"torrent_ref": "a" * 40, "limit": 50},
     )
     assert files.data["files"][0]["name"] == "episode.mkv"
+
+
+def test_media_transport_precise_refresh_never_calls_global_refresh(monkeypatch):
+    calls: list[str] = []
+
+    class _RefreshClient(_FakeMediaClient):
+        def refresh_library(self, target_id):
+            calls.append(target_id)
+            return True
+
+        def refresh_all(self):
+            raise AssertionError("Agent 精准刷新不得调用全库刷新")
+
+    transport = MediaServerProviderTransport()
+    profile = MediaServerProfile(
+        source="configured:jellyfin",
+        server_type="jellyfin",
+        label="Jellyfin",
+        url="http://hidden",
+        credential="hidden",
+        enabled=True,
+    )
+    monkeypatch.setattr(
+        "app.agent.providers.media_server.list_configured_profiles",
+        lambda: [profile],
+    )
+    monkeypatch.setattr(transport, "_client", lambda _profile: _RefreshClient())
+
+    preview = transport.preview_write(
+        "configured:jellyfin",
+        "media.library.refresh",
+        {"library_ref": "lib-1"},
+        {"library_ref": {"name": "动漫", "collection_type": "tvshows"}},
+    )
+    assert preview.data["scope"] == "library"
+    result = transport.execute_write(
+        "configured:jellyfin", "media.library.refresh", {"library_ref": "lib-1"}
+    )
+    assert result.data["global_refresh"] is False
+    assert calls == ["lib-1"]
+
+
+def test_qb_transport_writes_are_bounded_and_delete_keeps_files(monkeypatch):
+    calls: list[tuple] = []
+
+    class _WriteQBClient(_FakeQBClient):
+        def pause_torrents(self, hashes):
+            calls.append(("pause", hashes))
+            return True
+
+        def resume_torrents(self, hashes):
+            calls.append(("resume", hashes))
+            return True
+
+        def delete_torrents(self, hashes, delete_files=False):
+            calls.append(("delete", hashes, delete_files))
+            return True
+
+    transport = QBittorrentProviderTransport()
+    monkeypatch.setattr(transport, "_client", lambda _profile_ref: _WriteQBClient())
+    target_hash = "a" * 40
+
+    preview = transport.preview_write(
+        "configured:qbittorrent",
+        "qb.torrents.delete_task",
+        {"torrent_refs": [target_hash]},
+        {"torrent_refs": [{"name": "Demo"}]},
+    )
+    assert preview.data["delete_files"] is False
+    result = transport.execute_write(
+        "configured:qbittorrent",
+        "qb.torrents.delete_task",
+        {"torrent_refs": [target_hash]},
+    )
+    assert result.data["delete_files"] is False
+    assert calls == [("delete", target_hash, False)]

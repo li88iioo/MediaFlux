@@ -1,6 +1,7 @@
 """复用现有 QBittorrentClient 的 Provider transport。"""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app import config
@@ -159,3 +160,131 @@ class QBittorrentProviderTransport:
         finally:
             close_qbittorrent_client(client)
         raise ProviderGatewayError("qBittorrent 操作未实现", code="operation_not_allowed")
+
+    @staticmethod
+    def _selected_tasks(client: QBittorrentClient, hashes: list[str]) -> tuple[list[Any], list[str]]:
+        wanted = {str(value or "").strip().casefold() for value in hashes if value}
+        if not wanted or any(
+            not re.fullmatch(r"[0-9a-f]{40,64}", value) for value in wanted
+        ):
+            raise ProviderGatewayError(
+                "qBittorrent 任务引用已失效", code="confirmation_stale"
+            )
+        tasks = client.list_torrents()
+        selected = [task for task in tasks if str(task.hash or "").casefold() in wanted]
+        found = {str(task.hash or "").casefold() for task in selected}
+        missing = sorted(wanted - found)
+        return selected, missing
+
+    def preview_write(
+        self,
+        profile_ref: str,
+        operation: str,
+        arguments: dict[str, Any],
+        target_snapshot: dict[str, Any],
+    ) -> ProviderPayload:
+        if operation not in {
+            "qb.torrents.pause",
+            "qb.torrents.resume",
+            "qb.torrents.delete_task",
+        }:
+            raise ProviderGatewayError("qBittorrent 写操作未实现", code="operation_not_allowed")
+        hashes = [str(value) for value in arguments.get("torrent_refs") or []]
+        client: QBittorrentClient | None = None
+        try:
+            client = self._client(profile_ref)
+            selected, missing = self._selected_tasks(client, hashes)
+            if missing:
+                raise ProviderGatewayError(
+                    "部分 qBittorrent 任务已不存在，请重新查询",
+                    code="confirmation_stale",
+                )
+            targets = [
+                {
+                    "name": str(task.name or ""),
+                    "state": str(task.state or ""),
+                    "progress": float(task.progress or 0),
+                    "size": int(task.size or 0),
+                }
+                for task in selected
+            ]
+            action = {
+                "qb.torrents.pause": "暂停",
+                "qb.torrents.resume": "恢复",
+                "qb.torrents.delete_task": "移除并保留文件",
+            }[operation]
+            return ProviderPayload(
+                summary=f"将{action} {len(targets)} 个 qBittorrent 任务",
+                data={
+                    "targets": targets,
+                    "target_count": len(targets),
+                    "delete_files": False,
+                },
+                source="qbittorrent_api",
+            )
+        except ProviderGatewayError:
+            raise
+        except Exception as exc:
+            raise ProviderGatewayError(
+                "qBittorrent 写前检查失败", code="provider_unavailable"
+            ) from exc
+        finally:
+            close_qbittorrent_client(client)
+
+    def execute_write(
+        self, profile_ref: str, operation: str, arguments: dict[str, Any]
+    ) -> ProviderPayload:
+        if operation not in {
+            "qb.torrents.pause",
+            "qb.torrents.resume",
+            "qb.torrents.delete_task",
+        }:
+            raise ProviderGatewayError("qBittorrent 写操作未实现", code="operation_not_allowed")
+        hashes = [str(value) for value in arguments.get("torrent_refs") or []]
+        client: QBittorrentClient | None = None
+        try:
+            client = self._client(profile_ref)
+            selected, missing = self._selected_tasks(client, hashes)
+            if missing:
+                raise ProviderGatewayError(
+                    "部分 qBittorrent 任务已不存在，请重新预检",
+                    code="confirmation_stale",
+                )
+            joined = "|".join(hashes)
+            if operation == "qb.torrents.pause":
+                accepted = bool(client.pause_torrents(joined))
+                action = "暂停"
+            elif operation == "qb.torrents.resume":
+                accepted = bool(client.resume_torrents(joined))
+                action = "恢复"
+            else:
+                accepted = bool(client.delete_torrents(joined, delete_files=False))
+                action = "移除"
+            if not accepted:
+                raise ProviderGatewayError(
+                    "qBittorrent 未接受写操作", code="provider_write_failed"
+                )
+            after, after_missing = self._selected_tasks(client, hashes)
+            if operation == "qb.torrents.delete_task":
+                verification = "verified" if len(after_missing) == len(hashes) else "pending"
+            else:
+                verification = "verified" if not after_missing else "partial"
+            return ProviderPayload(
+                summary=f"qBittorrent 已接受 {len(selected)} 个任务的{action}操作",
+                data={
+                    "affected": len(selected),
+                    "accepted": True,
+                    "delete_files": False,
+                    "verification": verification,
+                    "observed_count": len(after),
+                },
+                source="qbittorrent_api",
+            )
+        except ProviderGatewayError:
+            raise
+        except Exception as exc:
+            raise ProviderGatewayError(
+                "qBittorrent 写操作失败", code="provider_write_failed"
+            ) from exc
+        finally:
+            close_qbittorrent_client(client)

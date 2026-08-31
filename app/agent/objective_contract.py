@@ -837,45 +837,55 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
         return AgentObjectiveContract(
             task_kind="download_control",
             primary_domains=("downloads", "jobs"),
-            required_sources=("system_state",),
+            required_sources=("provider_api",),
             forbidden_sources=("public_web", "resource_index", "metadata_catalog"),
             allowed_tools=(
+                "provider.capabilities",
+                "provider.query",
+                "provider.change.preview",
+                "provider.change.execute",
+                "provider.job.status",
                 "downloads.request_summaries",
-                "downloads.diagnose_queue",
-                "downloads.pause_task",
-                "downloads.resume_task",
                 "downloads.retry_submission",
-                "downloads.delete_task",
             ),
-            max_provider_requests=4,
-            max_tool_rounds=3,
-            max_tool_calls=4,
-            max_capabilities=6,
+            max_provider_requests=6,
+            max_tool_rounds=4,
+            max_tool_calls=6,
+            max_capabilities=7,
             parallel_reads=False,
-            completion_rule="先按公开序号锁定下载请求，再生成暂停、恢复、重试或删除的确认票据；不得猜测任务内部标识。",
+            completion_rule=(
+                "先通过 qBittorrent 原生查询取得 owner 绑定对象引用，再冻结暂停、恢复或仅删除任务的写计划；"
+                "删除始终保留文件，不得猜测 hash、名称或内部标识。下载请求重投仍使用项目持久请求记录。"
+            ),
         )
 
     if _DOWNLOAD_STATUS_RE.search(text):
         qb_only = not any(marker in text for marker in ("光鸭", "离线"))
+        qb_tools = (
+            "provider.capabilities",
+            "provider.query",
+            "downloads.request_summaries",
+        )
         return AgentObjectiveContract(
             task_kind="download_status",
             primary_domains=("downloads", "jobs"),
-            required_sources=("system_state",),
+            required_sources=(("provider_api",) if qb_only else ("provider_api", "system_state")),
             forbidden_sources=("public_web", "resource_index", "metadata_catalog"),
             allowed_tools=(
-                ("downloads.request_summaries", "downloads.diagnose_queue")
-                if qb_only else (
-                    "downloads.request_summaries",
-                    "downloads.diagnose_queue",
+                qb_tools
+                if qb_only else qb_tools + (
                     "automation.diagnose_pipeline",
                     "guangya.connection_status",
                 )
             ),
-            max_provider_requests=4,
-            max_tool_rounds=2,
-            max_tool_calls=4,
-            max_capabilities=2 if qb_only else 4,
-            completion_rule="区分 qB 队列、光鸭离线、整理和 STRM 阶段，不把已离线完成误报为仍在下载。",
+            max_provider_requests=5,
+            max_tool_rounds=3,
+            max_tool_calls=5,
+            max_capabilities=3 if qb_only else 5,
+            completion_rule=(
+                "qB 当前状态必须来自 qBittorrent 原生 API；同时区分光鸭离线、整理和 STRM 阶段，"
+                "不把已离线完成误报为仍在下载。"
+            ),
         )
 
     if _CALENDAR_SCOPE_RE.search(text):
@@ -1008,19 +1018,23 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
         return AgentObjectiveContract(
             task_kind="media_library_refresh",
             primary_domains=("library",),
-            required_sources=("local_library",),
+            required_sources=("provider_api",),
             forbidden_sources=("public_web", "resource_index", "metadata_catalog"),
             allowed_tools=(
+                "provider.capabilities",
+                "provider.query",
+                "provider.change.preview",
+                "provider.change.execute",
+                "provider.job.status",
                 "config.diagnose_media_servers",
-                "library.refresh_library",
             ),
             entity_terms=entities,
-            max_provider_requests=2,
-            max_tool_rounds=2,
-            max_tool_calls=2,
-            max_capabilities=2,
+            max_provider_requests=5,
+            max_tool_rounds=4,
+            max_tool_calls=5,
+            max_capabilities=6,
             parallel_reads=False,
-            completion_rule="必须按服务器类型和唯一媒体库名称生成刷新确认；不得接收 URL、路径或内部媒体库 ID。",
+            completion_rule="必须通过媒体服务器原生 API 唯一定位媒体库对象，再冻结精准刷新计划；不得接收 URL、路径或猜测内部媒体库 ID，也不允许全库兜底。",
         )
 
     if _LIBRARY_HEALTH_RE.search(text):

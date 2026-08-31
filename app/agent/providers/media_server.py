@@ -1,6 +1,7 @@
 """复用现有 Jellyfin/Emby client 的 Provider transport。"""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.agent.provider_models import (
@@ -188,3 +189,81 @@ class MediaServerProviderTransport:
                 "媒体服务器当前不可用", code="provider_unavailable"
             ) from exc
         raise ProviderGatewayError("媒体服务器操作未实现", code="operation_not_allowed")
+
+    def preview_write(
+        self,
+        profile_ref: str,
+        operation: str,
+        arguments: dict[str, Any],
+        target_snapshot: dict[str, Any],
+    ) -> ProviderPayload:
+        profile = self._profile(profile_ref)
+        if not profile.enabled or not profile.configured:
+            raise ProviderGatewayError(
+                "媒体服务器尚未启用或配置不完整", code="provider_not_configured"
+            )
+        if operation == "media.library.refresh":
+            target = dict(target_snapshot.get("library_ref") or {})
+            label = str(target.get("name") or "选中媒体库")
+            return ProviderPayload(
+                summary=f"将精准刷新 {label}",
+                data={"target": target, "scope": "library", "refresh_mode": "incremental"},
+                source=f"{profile.server_type}_api",
+            )
+        if operation == "media.item.refresh":
+            target = dict(target_snapshot.get("item_ref") or {})
+            label = str(target.get("name") or "选中媒体条目")
+            return ProviderPayload(
+                summary=f"将精准刷新 {label}",
+                data={"target": target, "scope": "item", "refresh_mode": "incremental"},
+                source=f"{profile.server_type}_api",
+            )
+        raise ProviderGatewayError("媒体服务器写操作未实现", code="operation_not_allowed")
+
+    def execute_write(
+        self, profile_ref: str, operation: str, arguments: dict[str, Any]
+    ) -> ProviderPayload:
+        profile = self._profile(profile_ref)
+        if not profile.enabled or not profile.configured:
+            raise ProviderGatewayError(
+                "媒体服务器尚未启用或配置不完整", code="provider_not_configured"
+            )
+        if operation == "media.library.refresh":
+            target_id = str(arguments.get("library_ref") or "").strip()
+            scope = "library"
+        elif operation == "media.item.refresh":
+            target_id = str(arguments.get("item_ref") or "").strip()
+            scope = "item"
+        else:
+            raise ProviderGatewayError(
+                "媒体服务器写操作未实现", code="operation_not_allowed"
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", target_id):
+            raise ProviderGatewayError("刷新目标已失效", code="confirmation_stale")
+        try:
+            with self._client(profile) as client:
+                accepted = bool(client.refresh_library(target_id))
+        except ProviderGatewayError:
+            raise
+        except TimeoutError as exc:
+            raise ProviderGatewayError(
+                "媒体服务器刷新请求超时", code="upstream_timeout"
+            ) from exc
+        except Exception as exc:
+            raise ProviderGatewayError(
+                "媒体服务器刷新请求失败", code="provider_write_failed"
+            ) from exc
+        if not accepted:
+            raise ProviderGatewayError(
+                "媒体服务器未接受精准刷新请求", code="provider_write_failed"
+            )
+        return ProviderPayload(
+            summary="媒体服务器已接受精准刷新请求",
+            data={
+                "accepted": True,
+                "scope": scope,
+                "verification": "accepted",
+                "global_refresh": False,
+            },
+            source=f"{profile.server_type}_api",
+        )

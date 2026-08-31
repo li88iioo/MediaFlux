@@ -4,13 +4,20 @@ from app.agent.models import ToolContext
 from app.agent.tools import build_tool_registry
 
 
-def test_provider_gateway_tools_are_registered_as_read_only():
+def test_provider_gateway_tools_expose_reads_and_confirmation_gated_writes():
     registry = build_tool_registry()
-    names = {item["name"] for item in registry.capabilities()}
-    assert "provider.capabilities" in names
-    assert "provider.query" in names
+    capabilities = {item["name"]: item for item in registry.capabilities()}
+    assert "provider.capabilities" in capabilities
+    assert "provider.query" in capabilities
+    assert "provider.change.preview" in capabilities
+    assert "provider.change.execute" in capabilities
+    assert "provider.job.status" in capabilities
     assert registry.risk_for("provider.capabilities").value == "read"
     assert registry.risk_for("provider.query").value == "read"
+    assert registry.risk_for("provider.change.preview").value == "read"
+    assert registry.risk_for("provider.job.status").value == "read"
+    assert registry.risk_for("provider.change.execute").value == "write"
+    assert capabilities["provider.change.execute"]["requires_confirmation"] is True
 
 
 def test_provider_capabilities_returns_only_static_non_sensitive_state(monkeypatch):
@@ -57,3 +64,32 @@ def test_provider_capability_projection_keeps_only_safe_operation_contract(monke
     assert "query:string(required)" in serialized
     assert "Token" not in serialized
     assert "http://" not in serialized
+
+
+def test_provider_plan_projection_keeps_opaque_plan_ref_and_drops_internal_ids():
+    from app.agent.result_projection import project_agent_response_for_llm
+
+    projected = project_agent_response_for_llm({
+        "tool_call": {"name": "provider.change.preview", "arguments": {}},
+        "result": {
+            "ok": True,
+            "status": "preview",
+            "summary": "计划已创建",
+            "data": {
+                "plan_ref": "PP-0123456789ABCDEF01234567",
+                "operation": "qb.torrents.pause",
+                "status": "prepared",
+                "target_snapshot": {
+                    "targets": [{"name": "Demo", "hash": "a" * 40}],
+                    "delete_files": False,
+                },
+            },
+            "evidence": [],
+            "suggestions": [],
+            "error": "",
+        },
+    })
+    serialized = repr(projected)
+    assert "PP-0123456789ABCDEF01234567" in serialized
+    assert "qb.torrents.pause" in serialized
+    assert "a" * 40 not in serialized
