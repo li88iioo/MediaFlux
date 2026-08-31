@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from decimal import Decimal
 import json
 import logging
@@ -19,6 +20,7 @@ import re
 import threading
 import time
 import unicodedata
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from difflib import SequenceMatcher
@@ -502,6 +504,46 @@ def _format_phase_timing(stats: dict) -> str:
 # 媒体组流水线的来源级探测墙钟上限：每组各有独立预算，防止病态来源
 # 按组数把在线探测放大成小时级任务；到达上限后剩余组只读探测缓存。
 _GROUP_PIPELINE_PROBE_CAP_SECONDS = 300.0
+_DEFAULT_ORGANIZE_WORKERS = 2
+_MAX_ORGANIZE_WORKERS = 3
+
+
+def resolve_organize_workers() -> int:
+    """返回整理只读规划的全局 worker 预算。
+
+    生产默认开启两个 worker；测试默认保持串行，只有显式配置时才进入
+    并行路径，避免历史测试桩因线程调度产生无意义的不确定性。
+    """
+    configured = str(get("GY_ORGANIZE_WORKERS", "") or "").strip()
+    if configured:
+        try:
+            value = int(configured)
+        except (TypeError, ValueError):
+            value = _DEFAULT_ORGANIZE_WORKERS
+    else:
+        value = (
+            1
+            if os.environ.get("MEDIAFLUX_TEST_MODE", "").strip() == "1"
+            else _DEFAULT_ORGANIZE_WORKERS
+        )
+    return max(1, min(value, _MAX_ORGANIZE_WORKERS))
+
+
+@contextmanager
+def _optional_execution_lock(lock: object | None):
+    """兼容 threading.Lock/RLock 的可选单写上下文。"""
+    if lock is None:
+        yield
+        return
+    acquire = getattr(lock, "acquire", None)
+    release = getattr(lock, "release", None)
+    if not callable(acquire) or not callable(release):
+        raise TypeError("execution_lock 必须实现 acquire/release")
+    acquire()
+    try:
+        yield
+    finally:
+        release()
 
 
 class OrganizeScanUnsafeError(RuntimeError):
@@ -592,6 +634,15 @@ class OrganizeContext:
     # 文件名与目录上下文自动判断。本地来源配置和手动刮削可复用同一规划
     # 流水线，而不需要在规划器外再实现一套 match/parse 分支。
     media_type_hint: str = ""
+    # 当前来源可占用的只读规划 worker 数。None 表示按全局预算自动计算；
+    # 多来源调度会显式下发份额，避免来源并发与组内并发相乘。
+    planning_workers: int | None = None
+    # 当前来源可占用的 ffprobe worker 总预算。多来源调度会按同时运行的
+    # 来源数切分，组内 planner 再继续切分，防止嵌套线程池放大并发。
+    media_probe_workers: int | None = None
+    # 多来源并行时共享的单写门。扫描、识别和探测不持有该锁；最终冲突
+    # 仲裁、云盘写入、审计与清理必须在锁内完成。
+    execution_lock: object | None = field(default=None, repr=False, compare=False)
 
     @property
     def probe_cache_only(self) -> bool:
@@ -607,6 +658,18 @@ class OrganizeContext:
 class OrganizePlanningResult:
     plans: list[OrganizePlan]
     subtitle_plans_by_video: dict[str, list]
+
+
+@dataclass
+class _PreparedOrganizeGroup:
+    """媒体组只读规划结果；由 coordinator 按稳定顺序提交给单 Writer。"""
+
+    task: OrganizeGroupTask
+    stats: dict
+    scan_result: OrganizeScanResult | None = None
+    planning_result: OrganizePlanningResult | None = None
+    planning_elapsed_seconds: float = 0.0
+    error: Exception | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -818,6 +881,7 @@ class Organizer:
         )
         self._detail_cache: dict = {}
         self._forced_detail_refreshes: set[tuple[str, str]] = set()
+        self._forced_detail_refresh_lock = threading.RLock()
         self._existing_variant_cache: dict[tuple[str, str, int, str], MediaVariant] = {}
         self._media_probe_payload_cache: dict[tuple[str, str, int], str] = {}
         self._media_probe_cache_checked: set[tuple[str, str, int]] = set()
@@ -1020,10 +1084,14 @@ class Organizer:
         if not tmdb_id or media_type not in {"tv", "movie"}:
             return self._detail_for_match(match), False
         key = (tmdb_id, media_type)
-        if key in self._forced_detail_refreshes:
-            return self._detail_for_match(match), False
-        self._forced_detail_refreshes.add(key)
-        return self._detail_for_match(match, force_refresh=True), True
+        # 并行媒体组共享该锁与刷新集合。首次调用持锁完成受控刷新；后续
+        # planner 等待刷新落入共享 TMDB 缓存后，再丢弃自身旧快照读取新值。
+        with self._forced_detail_refresh_lock:
+            if key in self._forced_detail_refreshes:
+                self._detail_cache.pop(key, None)
+                return self._detail_for_match(match), False
+            self._forced_detail_refreshes.add(key)
+            return self._detail_for_match(match, force_refresh=True), True
 
     def _retry_inactive_retired_nsfw_locked(self) -> bool:
         """固定为 current + 至多一个 retired；active 旧代也会阻止扩代。"""
@@ -1539,8 +1607,13 @@ class Organizer:
         identity_history_loader: Callable[
             [OrganizePlan], set[tuple[str, str]]
         ] | None = None,
+        finalize: bool = True,
+        media_probe_workers: int | None = None,
+        collect_performance: bool = True,
     ) -> OrganizePlanningResult:
         """识别媒体、生成命名计划、规划伴随文件并完成只读冲突预演。"""
+        if media_probe_workers is None:
+            media_probe_workers = context.media_probe_workers
         scanned_videos = scan_result.scanned_videos
         companion_files = scan_result.companion_files
         video_files_by_path = scan_result.video_files_by_path
@@ -1984,9 +2057,10 @@ class Organizer:
         stats["recognition_elapsed_seconds"] = round(
             time.monotonic() - recognition_started, 3
         )
-        performance_after = self._read_performance_snapshot()
-        for key, value in performance_after.items():
-            stats[key] = max(0, value - performance_before.get(key, 0))
+        if collect_performance:
+            performance_after = self._read_performance_snapshot()
+            for key, value in performance_after.items():
+                stats[key] = max(0, value - performance_before.get(key, 0))
         if media_profile_loader is None:
             # 从真正进入在线探测时才启动墙钟预算，避免 TMDB/AI 识别耗时
             # 提前消耗探测窗口。每个扫描视频仍保留首次和一次瞬态重试额度。
@@ -2009,6 +2083,7 @@ class Organizer:
                 cache_only=probe_cache_only,
                 stats=stats,
                 cancel_event=context.cancel_event,
+                max_workers=media_probe_workers,
             )
         else:
             # 规划策略不关心媒体来自云端还是本地。来源适配器只返回统一
@@ -2071,16 +2146,49 @@ class Organizer:
             for skipped in result.skipped:
                 if skipped.reason not in stats["subtitle_reasons"]:
                     stats["subtitle_reasons"].append(skipped.reason)
+        planning_result = OrganizePlanningResult(
+            plans=plans,
+            subtitle_plans_by_video=subtitle_plans_by_video,
+        )
+        if not finalize:
+            return planning_result
+        return self._finalize_planning_result(
+            scan_result,
+            planning_result,
+            context,
+            rules,
+            stats,
+            target_inventory_loader=target_inventory_loader,
+            identity_history_loader=identity_history_loader,
+        )
+
+    def _finalize_planning_result(
+        self,
+        scan_result: OrganizeScanResult,
+        planning_result: OrganizePlanningResult,
+        context: OrganizeContext,
+        rules: OrganizeRules,
+        stats: dict,
+        *,
+        target_inventory_loader: Callable[
+            [OrganizePlan], tuple[str | None, list[GuangYaFile], dict[str, str]]
+        ] | None = None,
+        identity_history_loader: Callable[
+            [OrganizePlan], set[tuple[str, str]]
+        ] | None = None,
+    ) -> OrganizePlanningResult:
+        """在单写边界内完成确认分组、冲突仲裁与最终识别统计。"""
+        plans = planning_result.plans
         self._apply_nsfw_multipart_policy(plans, rules)
         stats["confirmation_groups"] = self._build_confirmation_groups(
             plans,
-            companion_files,
-            source_dir_id=source_dir_id,
-            source_name=source_root_name,
+            scan_result.companion_files,
+            source_dir_id=context.source_dir_id,
+            source_name=scan_result.source_root_name,
             rules=rules,
         )
-        # 在首次云盘写入前完成身份保护与同批版本仲裁。执行阶段仍会实时
-        # 复核目标目录，以覆盖并发外部修改，但批内败者不会再先移动后替换。
+        # 在首次云盘写入前完成身份保护与同批版本仲裁。并行 planner 只生成
+        # 无副作用计划；这里基于前序组已经产生的最新目标库存做最终裁决。
         conflict_started = time.monotonic()
         if target_inventory_loader is None:
             self._preview_conflicts(plans, rules)
@@ -2092,30 +2200,33 @@ class Organizer:
         stats["conflict_check_elapsed_seconds"] = round(
             time.monotonic() - conflict_started, 3
         )
-        # 统计识别层面（dry_run 与实际执行都统计）
-        for p in plans:
-            if p.action == "move" and p.match and p.match.tmdb_id:
+        for plan in plans:
+            if plan.action == "move" and plan.match and plan.match.tmdb_id:
                 stats["matched"] += 1
-            elif p.action == "conflict":
+            elif plan.action == "conflict":
                 stats["failed"] += 1
-            elif p.action == "skip":
-                if p.match and p.match.need_confirm:
+            elif plan.action == "skip":
+                if plan.match and plan.match.need_confirm:
                     stats["need_confirm"] += 1
-                    summary = self._confirmation_summary(p.match)
-                    if summary and summary not in stats["confirmations"] and len(stats["confirmations"]) < 3:
+                    summary = self._confirmation_summary(plan.match)
+                    if (
+                        summary
+                        and summary not in stats["confirmations"]
+                        and len(stats["confirmations"]) < 3
+                    ):
                         stats["confirmations"].append(summary)
                 else:
                     stats["skipped"] += 1
                     self._append_reason(
-                        stats, "skip_reasons",
-                        p.note or p.conflict_note or (p.match.error if p.match else "")
+                        stats,
+                        "skip_reasons",
+                        plan.note
+                        or plan.conflict_note
+                        or (plan.match.error if plan.match else "")
                         or "未进入整理执行",
                     )
         logger.info("整理扫描完成 %s", _format_scan_summary(stats))
-        return OrganizePlanningResult(
-            plans=plans,
-            subtitle_plans_by_video=subtitle_plans_by_video,
-        )
+        return planning_result
 
     def plan_scan_result(
         self,
@@ -2308,7 +2419,10 @@ class Organizer:
                  automatic: bool = False,
                  group_progress: Callable[[dict], None] | None = None,
                  group_pipeline: bool = True,
-                 operation_token: str = "") -> tuple[list, dict]:
+                 operation_token: str = "",
+                 planning_workers: int | None = None,
+                 media_probe_workers: int | None = None,
+                 execution_lock: object | None = None) -> tuple[list, dict]:
         """兼容入口；内部阶段统一通过 :class:`OrganizeContext` 传参。"""
         context = OrganizeContext(
             source_dir_id=str(source_dir_id),
@@ -2329,6 +2443,9 @@ class Organizer:
             group_progress=group_progress,
             group_pipeline=bool(group_pipeline),
             operation_token=str(operation_token or "").strip(),
+            planning_workers=planning_workers,
+            media_probe_workers=media_probe_workers,
+            execution_lock=execution_lock,
         )
         return self._organize(context, rules)
 
@@ -2348,7 +2465,8 @@ class Organizer:
     def _reset_task_caches(self) -> None:
         """任务级缓存必须逐任务重置，禁止跨任务继承过期快照。"""
         # 受控强制刷新是“每次整理任务、每个 TMDB 身份最多一次”，不能跨任务继承。
-        self._forced_detail_refreshes.clear()
+        with self._forced_detail_refresh_lock:
+            self._forced_detail_refreshes.clear()
         # 一次整理会在预仲裁和执行前复核两次同一目标，媒体探测缓存只需读取一次。
         self._existing_variant_cache.clear()
         self._media_probe_payload_cache.clear()
@@ -2373,14 +2491,48 @@ class Organizer:
         # 快照规划云盘变更，也避免为注定不能执行的任务继续消耗外部请求。
         self._validate_scan_for_execution(context, stats)
 
-        planning_result = self._build_plans(
-            scan_result, context, rules, stats, performance_before,
-        )
-        plans = planning_result.plans
-
-        self._run_execution_stage(
-            scan_result, planning_result, context, rules, stats,
-        )
+        if context.execution_lock is None:
+            planning_result = self._build_plans(
+                scan_result, context, rules, stats, performance_before,
+            )
+            plans = planning_result.plans
+            self._run_execution_stage(
+                scan_result, planning_result, context, rules, stats,
+            )
+        else:
+            # 不支持媒体组流水线的作用域客户端仍可能参与多来源并发。耗时的
+            # 扫描/识别/探测先在锁外完成；最终库存复核、冲突仲裁、移动、
+            # 审计和清理必须与其他来源共享同一个单写门。
+            planning_result = self._build_plans(
+                scan_result,
+                context,
+                rules,
+                stats,
+                performance_before,
+                finalize=False,
+            )
+            execution_context = replace(context, post_actions=False)
+            with _optional_execution_lock(context.execution_lock):
+                self._existing_variant_cache.clear()
+                planning_result = self._finalize_planning_result(
+                    scan_result,
+                    planning_result,
+                    execution_context,
+                    rules,
+                    stats,
+                )
+                self._run_execution_stage(
+                    scan_result,
+                    planning_result,
+                    execution_context,
+                    rules,
+                    stats,
+                )
+            plans = planning_result.plans
+            if context.post_actions and not context.cancelled():
+                self._run_post_actions(
+                    stats, rules, source_name=context.source_name,
+                )
         stats["total_elapsed_seconds"] = round(time.monotonic() - total_started, 3)
         if self._probe_budget is not None:
             stats["media_probe_attempts"] = self._probe_budget.attempted
@@ -2429,6 +2581,417 @@ class Organizer:
             })
         except Exception:
             logger.debug("媒体组进度回调失败", exc_info=True)
+
+    def _group_planning_worker_count(
+        self,
+        context: OrganizeContext,
+        rules: OrganizeRules,
+        task_count: int,
+    ) -> int:
+        """计算当前来源可使用的媒体组规划并发数。"""
+        if task_count < 2 or rules.nsfw_enabled:
+            # MetaTube 目前没有与 TMDB/AI 等价的全局并发治理；第一版保持
+            # NSFW 串行，避免多个实例同时打满同一元数据服务。
+            return 1
+        if type(self.scraper) is not TMDBScraper:
+            # 注入 scraper 可能携带手动状态或不具备并发契约。
+            return 1
+        requested = (
+            resolve_organize_workers()
+            if context.planning_workers is None
+            else int(context.planning_workers)
+        )
+        if (
+            rules.media_info_enabled
+            and rules.media_probe_enabled
+            and not context.probe_cache_only
+        ):
+            from app.modules.media_probe import resolve_media_probe_workers
+
+            probe_worker_budget = resolve_media_probe_workers()
+            if context.media_probe_workers is not None:
+                probe_worker_budget = min(
+                    probe_worker_budget,
+                    max(1, int(context.media_probe_workers)),
+                )
+            requested = min(requested, probe_worker_budget)
+        return max(1, min(requested, _MAX_ORGANIZE_WORKERS, task_count))
+
+    @staticmethod
+    def _copy_probe_budget_stats(organizer: Organizer, stats: dict) -> None:
+        budget = organizer._probe_budget
+        if budget is None:
+            return
+        stats["media_probe_attempts"] = budget.attempted
+        stats["media_probe_failure_cache_hits"] = budget.failure_cache_hits
+        stats["media_probe_budget_skipped"] = budget.skipped_by_budget
+        stats["media_probe_timeouts"] = budget.timeouts
+
+    def _share_parallel_planning_state(self, planner: Organizer) -> None:
+        """让只读 planner 共享任务级 TMDB 强制刷新去重状态。"""
+        planner._forced_detail_refreshes = self._forced_detail_refreshes
+        planner._forced_detail_refresh_lock = self._forced_detail_refresh_lock
+
+    def _prepare_group_plan(
+        self,
+        planner: Organizer,
+        task: OrganizeGroupTask,
+        context: OrganizeContext,
+        rules: OrganizeRules,
+        *,
+        media_probe_workers: int,
+    ) -> _PreparedOrganizeGroup:
+        """只读扫描并识别一个完整媒体组，不执行冲突写入或云盘变更。"""
+        started = time.monotonic()
+        group_stats = planner._initial_stats()
+        try:
+            scan_result = planner._scan_source(
+                context,
+                rules,
+                group_stats,
+                restriction=planner._group_restriction(task),
+            )
+            planner._validate_scan_for_execution(context, group_stats)
+            planning_result = planner._build_plans(
+                scan_result,
+                context,
+                rules,
+                group_stats,
+                {},
+                finalize=False,
+                media_probe_workers=media_probe_workers,
+                collect_performance=False,
+            )
+            self._copy_probe_budget_stats(planner, group_stats)
+            return _PreparedOrganizeGroup(
+                task=task,
+                stats=group_stats,
+                scan_result=scan_result,
+                planning_result=planning_result,
+                planning_elapsed_seconds=round(time.monotonic() - started, 3),
+            )
+        except Exception as exc:  # noqa: BLE001 - 组级失败必须结构化返回给 coordinator
+            self._copy_probe_budget_stats(planner, group_stats)
+            return _PreparedOrganizeGroup(
+                task=task,
+                stats=group_stats,
+                planning_elapsed_seconds=round(time.monotonic() - started, 3),
+                error=exc,
+            )
+
+    def _organize_groups_parallel(
+        self,
+        context: OrganizeContext,
+        rules: OrganizeRules,
+        *,
+        tasks: list[OrganizeGroupTask],
+        rows: dict[str, dict[str, object]],
+        stats: dict,
+        progress: GroupProgress,
+        total_started: float,
+        workers: int,
+    ) -> tuple[list, dict]:
+        """并发完成只读规划，按原始媒体组顺序进入单 Writer。"""
+        from app.modules.media_probe import resolve_media_probe_workers
+
+        group_context = replace(context, post_actions=False)
+        plans: list[OrganizePlan] = []
+        results: list[OrganizeGroupResult] = []
+        planner_local = threading.local()
+        planner_guard = threading.Lock()
+        planners: list[Organizer] = []
+        probe_guard = threading.Lock()
+        probe_elapsed_total = 0.0
+        probe_cap_event = threading.Event()
+        planning_timing_guard = threading.Lock()
+        parallel_started = time.monotonic()
+        planning_finished_at = parallel_started
+        performance_before = self._read_performance_snapshot()
+        global_probe_worker_budget = resolve_media_probe_workers()
+        probe_worker_budget = global_probe_worker_budget
+        if context.media_probe_workers is not None:
+            probe_worker_budget = min(
+                global_probe_worker_budget,
+                max(1, int(context.media_probe_workers)),
+            )
+        probe_workers_per_planner = max(
+            1, probe_worker_budget // max(1, workers)
+        )
+
+        def planner_for_thread() -> Organizer:
+            planner = getattr(planner_local, "organizer", None)
+            if planner is None:
+                planner = Organizer(
+                    client=self.client,
+                    scraper=self.scraper,
+                    traversal_limits=self._traversal_limits,
+                )
+                planner._reset_task_caches()
+                self._share_parallel_planning_state(planner)
+                planner_local.organizer = planner
+                with planner_guard:
+                    planners.append(planner)
+            return planner
+
+        def prepare(task: OrganizeGroupTask) -> _PreparedOrganizeGroup:
+            nonlocal probe_elapsed_total, planning_finished_at
+            try:
+                planner = planner_for_thread()
+                run_context = group_context
+                if probe_cap_event.is_set():
+                    run_context = replace(group_context, media_probe_cache_only=True)
+                prepared = self._prepare_group_plan(
+                    planner,
+                    task,
+                    run_context,
+                    rules,
+                    media_probe_workers=probe_workers_per_planner,
+                )
+                elapsed = float(
+                    prepared.stats.get("media_probe_elapsed_seconds") or 0.0
+                )
+                if elapsed:
+                    with probe_guard:
+                        probe_elapsed_total += elapsed
+                        if probe_elapsed_total >= _GROUP_PIPELINE_PROBE_CAP_SECONDS:
+                            probe_cap_event.set()
+                return prepared
+            finally:
+                with planning_timing_guard:
+                    planning_finished_at = max(
+                        planning_finished_at, time.monotonic()
+                    )
+
+        executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="organize-plan",
+        )
+        futures: dict[str, Future[_PreparedOrganizeGroup]] = {}
+        next_submit = 0
+        # 只保留每个 planner 一个在途完整组，避免大目录在等待稳定顺序提交时
+        # 同时滞留过多扫描快照与计划对象。
+        window = min(len(tasks), max(1, workers))
+
+        def submit_next() -> bool:
+            nonlocal next_submit
+            if next_submit >= len(tasks) or context.cancelled():
+                return False
+            task = tasks[next_submit]
+            next_submit += 1
+            row = rows[task.key]
+            row["status"] = GROUP_STATUS_RUNNING
+            row["stage"] = GROUP_STAGE_SCAN
+            futures[task.key] = executor.submit(prepare, task)
+            return True
+
+        for _ in range(window):
+            if not submit_next():
+                break
+
+        stats["planning_workers"] = workers
+        stats["media_probe_worker_budget"] = probe_worker_budget
+        stats["media_probe_workers_per_planner"] = probe_workers_per_planner
+        try:
+            for task in tasks:
+                row = rows[task.key]
+                if context.cancelled():
+                    stats["stopped"] = 1
+                    row["status"] = GROUP_STATUS_STOPPED
+                    row["stage"] = GROUP_STAGE_DONE
+                    future = futures.pop(task.key, None)
+                    if future is not None:
+                        future.cancel()
+                    continue
+
+                progress.current_index = task.index
+                progress.current_group = task.group_name
+                progress.current_file_index = 0
+                progress.current_file_total = 0
+                stats["current_source_group"] = task.group_name
+                row["status"] = GROUP_STATUS_RUNNING
+                row["stage"] = GROUP_STAGE_SCAN
+                self._publish_group_progress(context, stats, progress)
+
+                future = futures.pop(task.key, None)
+                if future is None:
+                    future = executor.submit(prepare, task)
+                try:
+                    prepared = future.result()
+                except CancelledError:
+                    stats["stopped"] = 1
+                    row["status"] = GROUP_STATUS_STOPPED
+                    row["stage"] = GROUP_STAGE_DONE
+                    continue
+                except Exception as exc:  # noqa: BLE001 - executor 边界需隔离未知 worker 失败
+                    prepared = _PreparedOrganizeGroup(
+                        task=task,
+                        stats=self._initial_stats(),
+                        error=exc,
+                    )
+
+                # 当前结果离开规划窗口后立即补位，让下一组识别与当前组写入重叠。
+                submit_next()
+                group_stats = prepared.stats
+                error = ""
+                started = time.monotonic()
+
+                def _stage(name: str, _row: dict = row) -> None:
+                    progress.current_stage = name
+                    _row["stage"] = name
+                    self._publish_group_progress(context, stats, progress)
+
+                def _file_progress(index: int, total: int) -> None:
+                    progress.current_file_index = index
+                    progress.current_file_total = total
+                    self._publish_group_progress(context, stats, progress)
+
+                if prepared.error is not None:
+                    if isinstance(prepared.error, OrganizeScanUnsafeError):
+                        merge_group_stats(stats, group_stats)
+                        stats["source_groups"] = list(rows.values())
+                        stats["current_source_group"] = ""
+                        raise prepared.error
+                    error = _safe_organize_failure(prepared.error)
+                    group_stats["failed"] = (
+                        int(group_stats.get("failed", 0) or 0) or 1
+                    )
+                    logger.exception(
+                        "媒体组并行规划失败 source=%s group=%s",
+                        context.source_dir_id,
+                        task.group_path,
+                        exc_info=(
+                            type(prepared.error),
+                            prepared.error,
+                            prepared.error.__traceback__,
+                        ),
+                    )
+                elif context.cancelled():
+                    stats["stopped"] = 1
+                    row["status"] = GROUP_STATUS_STOPPED
+                    row["stage"] = GROUP_STAGE_DONE
+                    continue
+                elif prepared.scan_result is None or prepared.planning_result is None:
+                    error = "媒体组规划结果不完整，请稍后重试"
+                    group_stats["failed"] = (
+                        int(group_stats.get("failed", 0) or 0) or 1
+                    )
+                else:
+                    try:
+                        _stage(GROUP_STAGE_PLAN)
+                        with _optional_execution_lock(context.execution_lock):
+                            # 前序媒体组或其他来源可能已经改变目标库存；最终
+                            # 仲裁必须在同一单写门内基于最新状态重新执行。
+                            self._existing_variant_cache.clear()
+                            finalized = self._finalize_planning_result(
+                                prepared.scan_result,
+                                prepared.planning_result,
+                                group_context,
+                                rules,
+                                group_stats,
+                            )
+                            plans.extend(finalized.plans)
+                            self._run_execution_stage(
+                                prepared.scan_result,
+                                finalized,
+                                group_context,
+                                rules,
+                                group_stats,
+                                on_progress=_file_progress,
+                                on_stage=_stage,
+                            )
+                    except OrganizeScanUnsafeError:
+                        merge_group_stats(stats, group_stats)
+                        stats["source_groups"] = list(rows.values())
+                        stats["current_source_group"] = ""
+                        raise
+                    except Exception as exc:
+                        error = _safe_organize_failure(exc)
+                        group_stats["failed"] = (
+                            int(group_stats.get("failed", 0) or 0) or 1
+                        )
+                        logger.exception(
+                            "媒体组整理失败 source=%s group=%s",
+                            context.source_dir_id,
+                            task.group_path,
+                        )
+
+                result = build_group_result(
+                    task,
+                    group_stats,
+                    error=error,
+                    elapsed_seconds=round(
+                        prepared.planning_elapsed_seconds
+                        + (time.monotonic() - started),
+                        3,
+                    ),
+                )
+                results.append(result)
+                merge_group_stats(stats, group_stats)
+                row.update(result.progress_row())
+                stats["source_groups"] = list(rows.values())
+                stats["source_groups_completed"] = sum(
+                    1
+                    for item in rows.values()
+                    if is_terminal_group_status(str(item.get("status") or ""))
+                )
+                progress.completed = int(stats["source_groups_completed"])
+                _stage(GROUP_STAGE_DONE)
+                logger.info(
+                    "媒体组完成 source=%s group=%s(%s/%s) status=%s moved=%s failed=%s %.3fs",
+                    context.source_dir_id,
+                    task.group_path,
+                    task.index,
+                    task.total,
+                    result.status,
+                    result.moved,
+                    result.failed,
+                    result.elapsed_seconds,
+                )
+        finally:
+            for future in futures.values():
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            for planner in planners:
+                try:
+                    planner.close()
+                except Exception:
+                    logger.warning("关闭并行整理规划器失败", exc_info=True)
+
+        performance_after = self._read_performance_snapshot()
+        for key, value in performance_after.items():
+            stats[key] = max(0, value - performance_before.get(key, 0))
+        stats["parallel_planning_elapsed_seconds"] = round(
+            max(0.0, planning_finished_at - parallel_started), 3
+        )
+        if probe_cap_event.is_set():
+            stats["media_probe_wall_clock_capped"] = 1
+        stats["group_results"] = [item.to_dict() for item in results]
+        stats["source_groups"] = list(rows.values())
+        stats["source_groups_completed"] = sum(
+            1
+            for item in rows.values()
+            if is_terminal_group_status(str(item.get("status") or ""))
+        )
+        stats["current_source_group"] = ""
+        progress.completed = int(stats["source_groups_completed"])
+        progress.current_group = ""
+        progress.current_stage = GROUP_STAGE_DONE
+        self._publish_group_progress(context, stats, progress)
+
+        if context.post_actions and not context.cancelled():
+            self._run_post_actions(stats, rules, source_name=context.source_name)
+        stats["total_elapsed_seconds"] = round(time.monotonic() - total_started, 3)
+        logger.info(
+            "媒体组并行流水线完成 source=%s workers=%s groups=%s/%s moved=%s failed=%s total=%.3fs",
+            context.source_dir_id,
+            workers,
+            int(stats.get("source_groups_completed", 0) or 0),
+            len(tasks),
+            int(stats.get("moved", 0) or 0),
+            int(stats.get("failed", 0) or 0),
+            float(stats.get("total_elapsed_seconds", 0.0) or 0.0),
+        )
+        return plans, stats
 
     def _organize_groups(
         self, context: OrganizeContext, rules: OrganizeRules,
@@ -2485,6 +3048,19 @@ class Organizer:
         stats["source_groups_total"] = len(tasks)
         progress = GroupProgress(total=len(tasks), started_at=time.monotonic())
         self._publish_group_progress(context, stats, progress)
+
+        workers = self._group_planning_worker_count(context, rules, len(tasks))
+        if workers > 1 or context.execution_lock is not None:
+            return self._organize_groups_parallel(
+                context,
+                rules,
+                tasks=tasks,
+                rows=rows,
+                stats=stats,
+                progress=progress,
+                total_started=total_started,
+                workers=workers,
+            )
 
         group_context = replace(context, post_actions=False)
         probe_elapsed_total = 0.0
@@ -4551,6 +5127,7 @@ class Organizer:
         cache_only: bool,
         stats: dict,
         cancel_event: threading.Event | None = None,
+        max_workers: int | None = None,
     ) -> None:
         """对已经通过身份安全门的移动计划执行有界并发在线探测。"""
         stats["media_probe_online_candidates"] = 0
@@ -4594,7 +5171,9 @@ class Organizer:
 
         stats["media_probe_online_candidates"] = len(candidates)
         stats["media_probe_workers"] = min(
-            resolve_media_probe_workers(), len(candidates)
+            max(1, int(max_workers or resolve_media_probe_workers())),
+            resolve_media_probe_workers(),
+            len(candidates),
         )
         started = time.monotonic()
         profiles = probe_media_profiles_batch(

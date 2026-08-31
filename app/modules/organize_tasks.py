@@ -9,13 +9,16 @@ import json
 import threading
 import uuid
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable
 
 from app import config, database as db
 from app.clients.guangya import close_guangya_client
 from app.logger import get_logger
-from app.modules.organize import OrganizeRules, Organizer
+from app.modules.media_probe import resolve_media_probe_workers
+from app.modules.organize import OrganizeRules, Organizer, resolve_organize_workers
 from app.modules.organize_results import build_organize_result, read_organize_result
 from app.modules.organize_sources import normalize_organize_sources
 from app.modules.organize_delete_audit import DeleteCandidate, execute_recycle_bin_delete
@@ -46,6 +49,32 @@ from app.modules.directory_scrape_errors import (
 )
 
 logger = get_logger(__name__)
+
+
+def _merge_source_stats(aggregate: dict[str, object], stats: dict[str, Any]) -> None:
+    """稳定合并单来源统计，供串行与并行调度复用。"""
+    for key, value in stats.items():
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and key != "stopped"
+        ):
+            aggregate[key] = int(aggregate.get(key, 0) or 0) + value
+    aggregate.setdefault("strm_changes", []).extend(
+        list(stats.get("strm_changes") or [])
+    )
+    aggregate["strm_force_full"] = bool(
+        aggregate.get("strm_force_full") or stats.get("strm_force_full")
+    )
+    for key in ("media_items", "confirmation_groups", "group_results"):
+        values = stats.get(key) or []
+        if isinstance(values, list):
+            aggregate.setdefault(key, []).extend(
+                item for item in values if isinstance(item, dict)
+            )
+    for key in ("confirmations", "skip_reasons", "empty_dir_cleanup_reasons"):
+        for value in stats.get(key) or []:
+            Organizer._append_reason(aggregate, key, value, limit=10)
 
 
 def _operation_result_is_partial(result: object) -> bool:
@@ -1540,93 +1569,241 @@ class OrganizeTaskManager:
                 for source in sources
                 if str(source.get("id") or "").strip()
             }
-            for source in sources:
-                if self._cancel_event.is_set():
-                    break
-                if not _credential_snapshot_is_current(client, expected_credential_generation):
-                    raise RuntimeError("光鸭登录凭据已变化，已拒绝继续整理")
-                current_source = str(source.get("name") or source.get("id") or "")
-                source_rules = rules.for_source(str(source.get("id") or ""))
-                with self._state_lock:
-                    self._task["current_source"] = current_source
-                    self._task["message"] = f"正在整理：{current_source}"
-                    self._task["group_progress"] = {}
-                    self._task["source_groups"] = []
+            worker_budget = resolve_organize_workers()
+            source_worker_count = min(worker_budget, max(1, len(sources)))
+            source_rules = [
+                rules.for_source(str(source.get("id") or ""))
+                for source in sources
+            ]
+            probe_worker_budget = resolve_media_probe_workers()
+            # 成人来源使用独立 MetaTube 链。当前服务没有与 TMDB/AI 等价的
+            # 全局并发治理，因此只要本轮包含成人来源，就保持来源级串行；
+            # 普通来源仍可在其内部使用媒体组规划并行。
+            if any(source_rule.nsfw_enabled for source_rule in source_rules):
+                source_worker_count = 1
+            elif any(
+                source_rule.media_info_enabled and source_rule.media_probe_enabled
+                for source_rule in source_rules
+            ):
+                # 来源并发和来源内部的 ffprobe 池共享同一个全局预算，禁止
+                # 两层线程池相乘压垮家庭网络或云盘接口。
+                source_worker_count = min(source_worker_count, probe_worker_budget)
+            group_worker_budget = max(1, worker_budget // source_worker_count)
+            source_probe_worker_budget = max(
+                1, probe_worker_budget // source_worker_count
+            )
+            execution_gate = threading.Lock() if source_worker_count > 1 else None
+            source_runtime_lock = threading.Lock()
+            source_runtime = [
+                {
+                    "index": index,
+                    "name": str(source.get("name") or source.get("id") or ""),
+                    "status": "pending",
+                    "progress": {},
+                    "groups": [],
+                }
+                for index, source in enumerate(sources)
+            ]
 
-                def _publish_group_progress(
-                    payload: dict, _source: str = current_source,
-                ) -> None:
-                    """把组级进度投影到任务状态；前端据此局部更新，不整块重绘。"""
-                    progress = dict(payload.get("progress") or {})
-                    groups = [
-                        dict(row) for row in (payload.get("groups") or [])
-                        if isinstance(row, dict)
-                    ]
-                    index = int(progress.get("current_index") or 0)
-                    total = int(progress.get("total") or 0)
-                    label = str(progress.get("current_group") or "")
-                    stage = str(progress.get("current_stage_label") or "")
+            def _publish_source_runtime(
+                index: int,
+                *,
+                status: str | None = None,
+                payload: dict | None = None,
+            ) -> None:
+                """稳定展示最早尚未完成的来源，避免并行回调导致状态来回跳。"""
+                with source_runtime_lock:
+                    row = source_runtime[index]
+                    if status:
+                        row["status"] = status
+                    if payload is not None:
+                        row["progress"] = dict(payload.get("progress") or {})
+                        row["groups"] = [
+                            dict(item) for item in (payload.get("groups") or [])
+                            if isinstance(item, dict)
+                        ]
+                    active = next(
+                        (
+                            item for item in source_runtime
+                            if item["status"] not in {
+                                "completed", "failed", "stopped"
+                            }
+                        ),
+                        None,
+                    )
                     with self._state_lock:
                         if self._task.get("id") != task_id:
                             return
+                        if active is None:
+                            self._task["current_source"] = ""
+                            self._task["group_progress"] = {}
+                            self._task["source_groups"] = []
+                            return
+                        active_name = str(active.get("name") or "")
+                        progress = dict(active.get("progress") or {})
+                        groups = list(active.get("groups") or [])
+                        self._task["current_source"] = active_name
                         self._task["group_progress"] = progress
                         self._task["source_groups"] = groups
-                        if total and index:
-                            detail = f"{index}/{total}"
+                        detail = ""
+                        current_index = int(progress.get("current_index") or 0)
+                        total = int(progress.get("total") or 0)
+                        if total and current_index:
+                            detail = f"{current_index}/{total}"
+                            label = str(progress.get("current_group") or "")
+                            stage = str(progress.get("current_stage_label") or "")
                             if label:
                                 detail = f"{detail} · {label}"
                             if stage:
                                 detail = f"{detail} · {stage}"
-                            self._task["message"] = f"正在整理：{_source} · {detail}"
-
-                organizer._validate_target_outside_source(
-                    source["id"], source_rules.target_dir_id
-                )
-                _plans, stats = organizer.organize(
-                    source["id"], source_rules, dry_run=False,
-                    cancel_event=self._cancel_event, post_actions=False,
-                    source_name=current_source,
-                    require_complete_scan=True,
-                    protected_source_ids=protected_source_ids,
-                    automatic=trigger_type in {"cron", "download", "telegram"},
-                    group_progress=_publish_group_progress,
-                )
-                _cleanup_manual_source_root(
-                    organizer,
-                    source["id"],
-                    current_source,
-                    source_rules,
-                    stats,
-                    trigger_type=trigger_type,
-                )
-                source_results.append({**source, "stats": stats})
-                for key, value in stats.items():
-                    if (
-                        isinstance(value, int)
-                        and not isinstance(value, bool)
-                        and key != "stopped"
-                    ):
-                        aggregate[key] = int(aggregate.get(key, 0) or 0) + value
-                aggregate.setdefault("strm_changes", []).extend(
-                    list(stats.get("strm_changes") or [])
-                )
-                aggregate["strm_force_full"] = bool(
-                    aggregate.get("strm_force_full")
-                    or stats.get("strm_force_full")
-                )
-                for key in ("media_items", "confirmation_groups", "group_results"):
-                    values = stats.get(key) or []
-                    if isinstance(values, list):
-                        aggregate.setdefault(key, []).extend(
-                            item for item in values if isinstance(item, dict)
+                        self._task["message"] = (
+                            f"正在整理：{active_name} · {detail}"
+                            if detail else f"正在整理：{active_name}"
                         )
-                for key in (
-                    "confirmations", "skip_reasons", "empty_dir_cleanup_reasons"
-                ):
-                    for value in stats.get(key) or []:
-                        Organizer._append_reason(aggregate, key, value, limit=10)
+
+            def _run_source(
+                index: int,
+                source: dict[str, str],
+                source_organizer: Organizer | None,
+            ) -> tuple[int, dict[str, str], dict[str, Any] | None, Exception | None]:
+                local_organizer = source_organizer
+                owns_local_organizer = False
+                source_name = str(source.get("name") or source.get("id") or "")
+                if self._cancel_event.is_set():
+                    _publish_source_runtime(index, status="stopped")
+                    return index, source, None, None
+                _publish_source_runtime(index, status="running")
+                try:
+                    if local_organizer is None:
+                        # 共享线程安全的光鸭连接池，各来源持有独立 scraper/cache，
+                        # 杜绝识别上下文在 worker 间串扰。
+                        local_organizer = Organizer(client=organizer.client)
+                        owns_local_organizer = True
+                    if not _credential_snapshot_is_current(
+                        client, expected_credential_generation
+                    ):
+                        raise RuntimeError("光鸭登录凭据已变化，已拒绝继续整理")
+                    source_rule = source_rules[index]
+
+                    def _publish_group_progress(payload: dict) -> None:
+                        _publish_source_runtime(index, payload=payload)
+
+                    local_organizer._validate_target_outside_source(
+                        source["id"], source_rule.target_dir_id
+                    )
+                    _plans, stats = local_organizer.organize(
+                        source["id"], source_rule, dry_run=False,
+                        cancel_event=self._cancel_event, post_actions=False,
+                        source_name=source_name,
+                        require_complete_scan=True,
+                        protected_source_ids=protected_source_ids,
+                        automatic=trigger_type in {"cron", "download", "telegram"},
+                        group_progress=_publish_group_progress,
+                        planning_workers=group_worker_budget,
+                        media_probe_workers=source_probe_worker_budget,
+                        execution_lock=execution_gate,
+                    )
+                    cleanup_context = (
+                        execution_gate if execution_gate is not None else nullcontext()
+                    )
+                    with cleanup_context:
+                        _cleanup_manual_source_root(
+                            local_organizer,
+                            source["id"],
+                            source_name,
+                            source_rule,
+                            stats,
+                            trigger_type=trigger_type,
+                        )
+                    terminal = (
+                        "stopped" if self._cancel_event.is_set() else "completed"
+                    )
+                    _publish_source_runtime(index, status=terminal)
+                    return index, source, stats, None
+                except Exception as exc:  # noqa: BLE001 - 来源级边界需保留同轮其他来源结果
+                    _publish_source_runtime(index, status="failed")
+                    return index, source, None, exc
+                finally:
+                    if owns_local_organizer and local_organizer is not None:
+                        try:
+                            local_organizer.close()
+                        except Exception:
+                            logger.warning(
+                                "关闭来源整理器失败 source=%s",
+                                source_name,
+                                exc_info=True,
+                            )
+
+            def _accept_source_result(
+                result: tuple[
+                    int, dict[str, str], dict[str, Any] | None, Exception | None
+                ],
+                completed: dict[int, dict[str, object]],
+                failures: list[tuple[int, dict[str, str], Exception]],
+            ) -> None:
+                index, source, stats, error = result
+                if error is not None:
+                    failures.append((index, source, error))
+                    return
+                if stats is None:
+                    return
+                completed[index] = {**source, "stats": stats}
+                _merge_source_stats(aggregate, stats)
                 with self._state_lock:
-                    self._task["stats"] = dict(aggregate)
+                    if self._task.get("id") == task_id:
+                        self._task["stats"] = dict(aggregate)
+
+            completed_sources: dict[int, dict[str, object]] = {}
+            source_failures: list[tuple[int, dict[str, str], Exception]] = []
+            if source_worker_count <= 1:
+                for index, source in enumerate(sources):
+                    if self._cancel_event.is_set():
+                        break
+                    _accept_source_result(
+                        _run_source(index, source, organizer),
+                        completed_sources,
+                        source_failures,
+                    )
+                    if source_failures:
+                        break
+            else:
+                executor = ThreadPoolExecutor(
+                    max_workers=source_worker_count,
+                    thread_name_prefix="organize-source",
+                )
+                future_map: dict[Future, int] = {}
+                try:
+                    for index, source in enumerate(sources):
+                        future = executor.submit(
+                            _run_source,
+                            index,
+                            source,
+                            organizer if index == 0 else None,
+                        )
+                        future_map[future] = index
+                    for future in as_completed(future_map):
+                        _accept_source_result(
+                            future.result(), completed_sources, source_failures
+                        )
+                finally:
+                    executor.shutdown(wait=True, cancel_futures=True)
+
+            source_results.extend(
+                completed_sources[index] for index in sorted(completed_sources)
+            )
+            aggregate["organize_worker_budget"] = worker_budget
+            aggregate["source_workers"] = source_worker_count
+            aggregate["media_probe_worker_budget"] = probe_worker_budget
+            aggregate["media_probe_workers_per_source"] = (
+                source_probe_worker_budget
+            )
+            if source_failures:
+                source_failures.sort(key=lambda item: item[0])
+                _index, failed_source, failure = source_failures[0]
+                current_source = str(
+                    failed_source.get("name") or failed_source.get("id") or ""
+                )
+                raise failure
             stopped = self._cancel_event.is_set()
             aggregate["stopped"] = 1 if stopped else int(aggregate.get("stopped", 0) or 0)
             partial = bool(

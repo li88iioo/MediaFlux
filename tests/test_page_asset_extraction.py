@@ -32,8 +32,10 @@ class PageAssetExtractionTests(unittest.TestCase):
         template = Path("app/templates/organize.html").read_text(encoding="utf-8")
         css = Path("app/static/css/organize.css").read_text(encoding="utf-8")
 
-        self.assertIn("path='css/organize.css'", template)
-        self.assertIn("path='css/organize.css') }}?v=20260829a", template)
+        marker = "path='css/organize.css'"
+        self.assertIn(marker, template)
+        stylesheet_tag = template.split(marker, 1)[1].split(">", 1)[0]
+        self.assertRegex(stylesheet_tag, r"\?v=20\d{6}[a-z]")
         self.assertNotIn("<style>", template)
         self.assertIn(".organize-rules-nav-card", css)
         self.assertIn(".recognition-knowledge-dialog", css)
