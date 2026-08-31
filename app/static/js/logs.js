@@ -33,14 +33,14 @@ function animateLogSummary(values) {
 }
 
 function switchTab(tab) {
-    activeTab = tab;
-    document.getElementById('tabOrganize').classList.toggle('active', tab==='organize' || tab==='scrape');
-    document.getElementById('tabRuntime').classList.toggle('active', tab==='runtime');
-    document.getElementById('organizePanel').style.display = tab==='organize' ? '' : 'none';
-    document.getElementById('scrapePanel').style.display = tab==='scrape' ? '' : 'none';
-    document.getElementById('runtimePanel').style.display = tab==='runtime' ? '' : 'none';
-    if(tab==='runtime') startRuntimeLogs(); else stopRuntimeLogs();
-    window.history.replaceState(null,'','#'+tab);
+    const normalizedTab = tab === 'runtime' ? 'runtime' : 'organize';
+    activeTab = normalizedTab;
+    document.getElementById('tabOrganize').classList.toggle('active', normalizedTab === 'organize');
+    document.getElementById('tabRuntime').classList.toggle('active', normalizedTab === 'runtime');
+    document.getElementById('organizePanel').style.display = normalizedTab === 'organize' ? '' : 'none';
+    document.getElementById('runtimePanel').style.display = normalizedTab === 'runtime' ? '' : 'none';
+    if (normalizedTab === 'runtime') startRuntimeLogs(); else stopRuntimeLogs();
+    window.history.replaceState(null, '', `#${normalizedTab}`);
     refreshActive();
 }
 
@@ -160,7 +160,6 @@ async function runOrganizeBatch(action){const rows=[...selectedOrganizeLogs.valu
 document.getElementById('organizeBatchRenameBtn').addEventListener('click',()=>runOrganizeBatch('reorganize'));
 document.getElementById('organizeBatchRevertBtn').addEventListener('click',()=>runOrganizeBatch('revert'));
 document.getElementById('organizeBatchDeleteBtn').addEventListener('click',()=>runOrganizeBatch('delete'));
-document.getElementById('closeScrapeBtn').addEventListener('click',()=>switchTab('organize'));
 document.getElementById('clearOrganizeLogsBtn').addEventListener('click',async(event)=>{
     const confirmed=await appConfirm({
         trigger:event.currentTarget,
@@ -507,74 +506,18 @@ async function clearRuntimeLogs(){
 document.getElementById('runtimeClearBtn').addEventListener('click',clearRuntimeLogs);
 window.addEventListener('beforeunload',stopRuntimeLogs);
 
-function scrapeText(target,value,fallback='—'){
-    const node=typeof target==='string'?document.getElementById(target):target;if(!node)return;
-    const text=String(value??'').trim();node.textContent=text||fallback;
+// 初次加载：已退场的 #scrape 及未知书签统一回落到整理日志。
+const initialTab = window.location.hash.slice(1);
+if (initialTab === 'runtime') {
+    switchTab('runtime');
+} else {
+    if (initialTab) {
+        window.history.replaceState(
+            window.history.state,
+            '',
+            `${window.location.pathname}${window.location.search}#organize`,
+        );
+    }
+    loadOverview();
+    loadOrganize();
 }
-function scrapeSafeImage(id,url,alt){
-    const image=document.getElementById(id);if(!image)return false;const value=String(url||'').trim();
-    const safe=value.startsWith('https://');image.hidden=!safe;if(safe){image.src=value;image.alt=alt||'';}else{image.removeAttribute('src');image.alt='';}return safe;
-}
-function scrapeInfoRows(target,rows){
-    const box=typeof target==='string'?document.getElementById(target):target;if(!box)return;box.replaceChildren();
-    (rows||[]).forEach(([label,value])=>{const text=Array.isArray(value)?value.filter(Boolean).join('、'):String(value??'').trim();if(!text)return;const row=document.createElement('div');row.className='scrape-lab-info-row';const key=document.createElement('span');key.textContent=label;const val=document.createElement('strong');val.textContent=text;row.append(key,val);box.appendChild(row);});
-    if(!box.children.length){const empty=document.createElement('p');empty.className='scrape-lab-inline-empty';empty.textContent='暂无可展示信息';box.appendChild(empty);}
-}
-function scrapeChips(target,values){
-    const box=typeof target==='string'?document.getElementById(target):target;if(!box)return;const nodes=(values||[]).filter(Boolean).map(value=>{const chip=document.createElement('span');chip.className='scrape-lab-chip';chip.textContent=String(value);return chip;});box.replaceChildren(...nodes);
-}
-function setScrapeBusy(busy){
-    const result=document.getElementById('scrapeResult');const button=document.getElementById('scrapeBtn');result.setAttribute('aria-busy',busy?'true':'false');result.dataset.state=busy?'loading':(result.dataset.state==='idle'?'idle':'ready');button.disabled=busy;button.querySelector('span').textContent=busy?'识别中…':'开始识别';
-}
-async function runScrapePreview(){
-    const filename=document.getElementById('scrapeFilename').value.trim();
-    const parent_path=document.getElementById('scrapeParentPath').value.trim();
-    if(!filename){document.getElementById('scrapeFilename').focus();await appAlert({type:'warning',title:'缺少文件名',message:'输入需要识别的媒体文件名后再执行刮削预览。'});return;}
-    setScrapeBusy(true);
-    try{const response=await api('/api/tools/scrape/preview',{method:'POST',body:JSON.stringify({filename,parent_path})});const data=await response.json();if(!response.ok)throw new Error(data.error||'识别失败');renderScrapePreview(data);}
-    catch(error){const diagnostic=document.getElementById('scrapeDiagnostic');diagnostic.hidden=false;diagnostic.className='scrape-lab-diagnostic is-error';scrapeInfoRows(diagnostic,[['识别失败',error.message||'无法生成识别结果']]);}
-    finally{setScrapeBusy(false);}
-}
-function scrapeCandidateBreakdown(candidate){
-    const breakdown=candidate.score_breakdown||{};const box=document.createElement('div');box.className='scrape-lab-candidate-breakdown';
-    const percent=value=>`${Math.round(Number(value||0)*100)}%`;
-    scrapeInfoRows(box,[['标题',percent(breakdown.title_score)],['原名',percent(breakdown.original_title_score)],['别名',percent(breakdown.alias_score)],['年份',percent(breakdown.year_score)],['年份惩罚',percent(breakdown.year_penalty)],['类型约束',percent(breakdown.media_type_score)],['约束惩罚',percent(breakdown.constraint_penalty)],['最终分数',percent(breakdown.final_score)],['命中标题',breakdown.matched_title],['拒绝原因',breakdown.rejected_constraints]]);
-    return box;
-}
-function renderScrapePreview(data){
-    const result=document.getElementById('scrapeResult');const match=data.match||{};const parsed=data.parsed||{};const tags=parsed.resource_tags||{};const diagnostic=data.diagnostic||{};const recognition=data.recognition||{};const folder=recognition.folder_context||{};const decision=recognition.threshold_decision||{};const cleaned=recognition.cleaned_components||{};const ai=recognition.ai||{};const aiInput=ai.input||{};const aiOutput=ai.output||{};const aiSecond=ai.second_search||{};const aiSecondDecision=aiSecond.threshold_decision||{};const naming=data.naming||{};const candidates=Array.isArray(data.candidates)?data.candidates:[];
-    result.dataset.state='ready';document.getElementById('scrapeEmpty').hidden=true;document.getElementById('scrapeHero').hidden=false;document.getElementById('scrapeRecognitionContext').hidden=false;document.getElementById('scrapeAiDiagnostic').hidden=false;document.getElementById('scrapeDetailGrid').hidden=false;
-    const matched=diagnostic.status==='matched';const status=document.getElementById('scrapeMatchStatus');status.className='scrape-lab-status '+(matched?'is-success':diagnostic.status==='low_confidence'?'is-warning':'is-error');scrapeText(status,matched?'识别命中':diagnostic.status==='low_confidence'?'需要人工确认':'识别未通过');
-    const title=match.title||parsed.title||data.filename||'未识别媒体';scrapeText('scrapeTitle',title);scrapeText('scrapeSubtitle',[match.original_title,match.year,match.media_type==='tv'?'剧集':'电影',match.tmdb_id?`TMDB ${match.tmdb_id}`:''].filter(Boolean).join(' · '),'仅完成本地文件名解析');scrapeText('scrapeOverview',match.overview,'TMDB 暂无简介，当前仍可检查解析、规格和候选结果。');
-    const hasPoster=scrapeSafeImage('scrapePoster',match.poster_url,`${title} 海报`);document.getElementById('scrapePosterFallback').hidden=hasPoster;scrapeSafeImage('scrapeBackdrop',match.backdrop_url,`${title} 背景图`);
-    scrapeChips('scrapeHeroChips',[matched?'自动匹配':diagnostic.status==='low_confidence'?'低置信度':'未匹配',ai.attempted?'AI 回退':'确定性识别',match.vote_average?`评分 ${Number(match.vote_average).toFixed(1)}`:'',tags.resolution,tags.source,tags.media,tags.effect]);
-    const diagnosticBox=document.getElementById('scrapeDiagnostic');diagnosticBox.hidden=false;diagnosticBox.className='scrape-lab-diagnostic '+(matched?'is-success':diagnostic.status==='low_confidence'?'is-warning':'is-error');scrapeInfoRows(diagnosticBox,[['识别状态',diagnostic.message||data.error||'匹配成功'],['命中方式',diagnostic.matched_by||'—'],['匹配模式',diagnostic.match_mode||'—'],['置信度',`${Math.round(Number(match.confidence||0)*100)}%`],['通过阈值',`${Math.round(Number(diagnostic.threshold||0)*100)}%`]]);
-    scrapeInfoRows('scrapeParsed',[['原始文件名',data.filename],['父目录',data.parent_path],['搜索标题',parsed.title],['年份',parsed.year],['类型',parsed.type==='tv'?'剧集':'电影'],['季号',parsed.season],['集号',parsed.episode],['显式 TMDB ID',parsed.tmdb_id]]);
-    scrapeInfoRows('scrapeCleanedComponents',[['归一化标题',recognition.normalized_title],['文件标题',recognition.filename_title],['文件年份',recognition.filename_year],['已清理来源 / 发布组前缀',cleaned.release_prefixes],['Checksum',cleaned.checksums],['已清理制作组后缀',cleaned.release_groups],['移除噪声',cleaned.noise_tokens]]);
-    scrapeInfoRows('scrapeFolderContext',[['路径',folder.path],['目录标题',folder.title],['目录年份',folder.year],['媒体类型',folder.media_type==='tv'?'剧集':'电影'],['季号',folder.season],['集号',folder.episode]]);
-    scrapeChips('scrapeQueryVariants',recognition.query_variants||[]);
-    scrapeInfoRows('scrapeThresholdDecision',[['结果',decision.passed?'通过自动阈值':'进入人工确认'],['最终分数',`${Math.round(Number(decision.score||0)*100)}%`],['阈值',`${Math.round(Number(decision.threshold||0)*100)}%`],['原因',decision.reason],['候选拒绝约束',recognition.rejected_constraints]]);
-    const aiReason=({disabled:'功能未启用',deterministic_not_eligible:'确定性结果不需要回退',deterministic_failed:'确定性识别未通过'}[ai.reason]||ai.reason||'未触发');const aiPercent=value=>value===null||value===undefined||value===''?'':`${Math.round(Number(value)*100)}%`;
-    scrapeText('scrapePipelineMode',ai.attempted?'确定性失败 → AI 回退':'确定性优先');
-    scrapeText('scrapeAiStatus',ai.attempted?(ai.error?'调用失败':'已执行'):'未调用');
-    scrapeInfoRows('scrapeAiInput',[['归一化标题',aiInput.normalized_title],['文件标题',aiInput.filename_title],['目录标题',aiInput.folder_title],['目录年份',aiInput.folder_year],['媒体类型',aiInput.media_type==='tv'?'剧集':aiInput.media_type==='movie'?'电影':''],['季号',aiInput.season],['集号',aiInput.episode],['别名',aiInput.aliases]]);
-    scrapeInfoRows('scrapeAiOutput',[['标题',aiOutput.title],['原始标题',aiOutput.original_title],['年份',aiOutput.year],['媒体类型',aiOutput.media_type==='tv'?'剧集':aiOutput.media_type==='movie'?'电影':''],['季号',aiOutput.season],['集号',aiOutput.episode],['别名',aiOutput.aliases],['AI 置信度',aiPercent(aiOutput.confidence)]]);
-    const aiRevalidation=ai.tmdb_revalidation||{};scrapeInfoRows('scrapeAiDecision',[['运行状态',ai.attempted?'已调用结构化回退':'未调用'],['触发原因',aiReason],['AI 阈值',aiPercent(ai.confidence_threshold)],['二次 TMDB 候选',aiSecond.candidate_count],['本地评分结果',aiSecondDecision.passed?'通过':'进入人工确认'],['本地分数',aiPercent(aiSecondDecision.score)],['本地阈值',aiPercent(aiSecondDecision.threshold)],['TMDB 详情复核',aiRevalidation.passed===true?'通过':aiRevalidation.passed===false?'未通过':'未执行'],['诊断',ai.error]]);
-    scrapeInfoRows('scrapeMetadataRows',[['标题',match.title],['原始标题',match.original_title],['上映 / 首播',match.release_date],['状态',match.status],['评分',match.vote_average?`${Number(match.vote_average).toFixed(1)} / 10（${match.vote_count||0}票）`:''],['类型标签',match.genres],['国家 / 地区',match.origin_country],['语言',match.spoken_languages],['播出平台',match.networks],['出品公司',match.production_companies],['季数',match.season_count],['集数',match.episode_count]]);
-    scrapeInfoRows('scrapeResourceRows',[['分辨率',tags.resolution],['来源平台',tags.source],['资源类型',tags.media],['特效标签',tags.effect],['视频编码',tags.video_codec],['音频规格',tags.audio],['制作组',tags.release_group]]);
-    scrapeInfoRows('scrapeNamingRows',[['标准文件名',naming.file_name],['归档目录',naming.show_dir]]);
-    const candidateSection=document.getElementById('scrapeCandidates');const candidateList=document.getElementById('scrapeCandidateList');candidateList.replaceChildren();candidateSection.hidden=!candidates.length;scrapeText('scrapeCandidateCount',`${candidates.length} 个`);
-    candidates.forEach((candidate,index)=>{const card=document.createElement('article');card.className='scrape-lab-candidate';const media=document.createElement('div');media.className='scrape-lab-candidate-poster';const image=document.createElement('img');image.width=342;image.height=513;image.alt=`${candidate.title||'候选'} 海报`;if(String(candidate.poster_url||'').startsWith('https://'))image.src=candidate.poster_url;else image.hidden=true;const fallback=document.createElement('span');fallback.textContent=String(index+1).padStart(2,'0');fallback.hidden=!image.hidden;media.append(image,fallback);const body=document.createElement('div');body.className='scrape-lab-candidate-body';const name=document.createElement('strong');name.textContent=candidate.title||'未命名候选';const meta=document.createElement('span');meta.textContent=[candidate.original_title,candidate.year,`匹配 ${Math.round(Number(candidate.score||0)*100)}%`].filter(Boolean).join(' · ');const overview=document.createElement('p');overview.textContent=candidate.overview||'暂无简介';body.append(name,meta,overview,scrapeCandidateBreakdown(candidate));const action=document.createElement('button');action.type='button';action.className='jump-btn';action.textContent=data.locked&&candidate.tmdb_id===match.tmdb_id?'已锁定':'锁定此结果';action.disabled=Boolean(data.locked&&candidate.tmdb_id===match.tmdb_id);action.addEventListener('click',()=>confirmScrapeLock(data,candidate));card.append(media,body,action);candidateList.appendChild(card);});
-    renderLucideIcons(result);
-}
-async function confirmScrapeLock(preview,candidate){
-    const confirmed=await appConfirm({title:'锁定 TMDB 映射',message:`把当前目录中的该文件锁定为 ${candidate.title||candidate.tmdb_id} (tmdb-${candidate.tmdb_id})。`,confirmText:'锁定映射'});if(!confirmed)return;
-    const response=await api('/api/tools/scrape/confirm',{method:'POST',body:JSON.stringify({filename:preview.filename,parent_path:preview.parent_path||'',tmdb_id:candidate.tmdb_id,title:candidate.title,year:candidate.year,media_type:candidate.media_type,rejected_tmdb_ids:(preview.candidates||[]).map(item=>String(item.tmdb_id||'')).filter(id=>id&&id!==String(candidate.tmdb_id||''))})});const data=await response.json();if(!response.ok)await appAlert({type:'error',title:'映射锁定失败',message:data.error||'锁定失败'});else runScrapePreview();
-}
-document.getElementById('scrapeBtn').addEventListener('click',runScrapePreview);
-['scrapeFilename','scrapeParentPath'].forEach(id=>document.getElementById(id).addEventListener('keydown',event=>{if(event.key==='Enter')runScrapePreview();}));
-
-// 初次加载
-const initialTab=window.location.hash.slice(1);
-if(['organize','scrape','runtime'].includes(initialTab)) switchTab(initialTab);
-else { loadOverview(); loadOrganize(); }

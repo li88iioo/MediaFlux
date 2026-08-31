@@ -3144,8 +3144,6 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .tmdb-lock-head span { margin-top: 3px; color: var(--text-muted); font-size: 10px; }
 .tmdb-lock-search { display: flex; align-items: center; gap: 7px; }
 .tmdb-lock-search .form-input { min-width: 220px; }
-.tools-relocated { min-height: 360px; }
-.tools-relocated-actions { display: flex; justify-content: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .strm-source-list { min-height: var(--strm-source-reserved-height, 52px); display: grid; align-content: start; gap: 8px; margin-top: 4px; overflow-anchor: none; }
 .strm-source-empty { padding: 14px; color: var(--text-muted); background: var(--control-tint); border: 1px dashed var(--border-soft); border-radius: var(--radius-sm); font-size: 12px; text-align: center; }
 .strm-source-item {

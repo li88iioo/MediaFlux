@@ -713,26 +713,18 @@ class ScrapePreviewApiTests(unittest.TestCase):
 
 
 class ScrapePreviewTemplateTests(unittest.TestCase):
-    def test_logs_template_has_rich_regions_and_safe_dom_helpers(self):
-        html = (Path("app/templates/logs.html").read_text(encoding="utf-8") + Path("app/static/js/logs.js").read_text(encoding="utf-8"))
-        for marker in (
-            "scrapeHero", "scrapeDiagnostic", "scrapeMetadata",
-            "scrapeResourceTags", "scrapeCandidates", "scrapeNaming",
-        ):
-            self.assertIn(marker, html)
-        self.assertIn("function scrapeText", html)
-        self.assertIn("textContent", html)
-        self.assertIn("replaceChildren", html)
+    def test_logs_page_excludes_retired_scrape_laboratory(self):
+        html = Path("app/templates/logs.html").read_text(encoding="utf-8")
+        script = Path("app/static/js/logs.js").read_text(encoding="utf-8")
 
-    def test_scrape_preview_css_reserves_media_and_result_space(self):
-        css = Path("app/static/css/scrape-preview.css").read_text(encoding="utf-8")
-        self.assertIn(".scrape-lab", css)
-        self.assertIn(".scrape-lab [hidden]", css)
-        self.assertIn("display: none !important", css)
-        self.assertIn("min-height", css)
-        self.assertIn("aspect-ratio", css)
-        self.assertIn("@media", css)
-        self.assertIn("prefers-reduced-motion", css)
+        for marker in (
+            "scrapePanel", "scrapeFilename", "scrapeHero",
+            "function scrapeText", "/api/tools/scrape/preview",
+        ):
+            self.assertNotIn(marker, html + script)
+        self.assertFalse(Path("app/static/css/scrape-preview.css").exists())
+        self.assertIn("initialTab === 'runtime'", script)
+        self.assertIn("已退场的 #scrape", script)
 
     def test_operation_history_uses_compact_conditional_sections(self):
         html = (Path("app/templates/logs.html").read_text(encoding="utf-8") + Path("app/static/js/logs.js").read_text(encoding="utf-8"))
@@ -749,11 +741,11 @@ class ScrapePreviewTemplateTests(unittest.TestCase):
         self.assertIn(".organize-detail-dialog [hidden] { display: none !important; }", css)
         self.assertIn("namingPreview.replaceChildren();namingPreview.hidden=true", html)
 
-    def test_base_supports_page_scoped_stylesheet(self):
+    def test_base_keeps_page_scoped_styles_without_retired_logs_asset(self):
         base = Path("app/templates/base.html").read_text(encoding="utf-8")
-        logs = (Path("app/templates/logs.html").read_text(encoding="utf-8") + Path("app/static/js/logs.js").read_text(encoding="utf-8"))
+        logs = Path("app/templates/logs.html").read_text(encoding="utf-8")
         self.assertIn("{% block page_styles %}", base)
-        self.assertIn("css/scrape-preview.css", logs)
+        self.assertNotIn("css/scrape-preview.css", logs)
 
 
 class GuangYaFileInfoTests(unittest.TestCase):

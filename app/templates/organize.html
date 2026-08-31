@@ -3,11 +3,11 @@
 {% block body_class %}organize-page{% if organize_view == "rules" %} organize-rules-page{% endif %} persistent-savebar-page{% endblock %}
 {% block page_title %}{{ "整理规则" if organize_view == "rules" else "光鸭整理" }}{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/organize.css') }}?v=20260829a">
+<link rel="stylesheet" href="{{ url_for('static', path='css/organize.css') }}?v=20260831a">
 {% endblock %}
 
 {% block content %}
-<div class="organize-workspace" id="organizeWorkspace">
+<div class="organize-workspace{% if organize_view == 'execute' %} is-config-loading{% endif %}" id="organizeWorkspace" aria-busy="{{ 'true' if organize_view == 'execute' else 'false' }}">
     {% if organize_view == 'rules' %}
     <nav class="organize-rules-nav-card" id="organizeRulesNav" aria-label="整理规则导航">
         <div class="organize-flow-tabs" role="tablist" aria-label="整理规则分类">
@@ -45,14 +45,27 @@
                 <div class="organize-section-title-wrap">
                     <i data-lucide="folder-search" class="organize-section-icon"></i>
                     <span class="organize-section-heading">扫描源目录</span>
-                    <span class="organize-section-subtext" id="organizeSourceCountText">(支持多选 · 已选 0 项)</span>
+                    <span class="organize-section-subtext" id="organizeSourceCountText">(支持多选 · 已选 {{ organize_initial_sources|length }} 项)</span>
                 </div>
-                <button type="button" class="organize-action-link" id="addOrganizeSourceBtn">
+                <button type="button" class="organize-action-link" id="addOrganizeSourceBtn" disabled>
                     <i data-lucide="plus-circle"></i>批量选择源目录
                 </button>
             </div>
 
-            <div class="organize-source-list-box strm-source-list" id="organizeSourceList"></div>
+            <div class="organize-source-list-box strm-source-list" id="organizeSourceList" aria-live="polite">
+                {% for source in organize_initial_sources %}
+                <div class="organize-source-row">
+                    <span class="organize-src-badge">SRC-{{ loop.index }}</span>
+                    <i data-lucide="folder" class="organize-folder-icon"></i>
+                    <div class="organize-source-text-wrap">
+                        <span class="organize-source-id">{{ source.name }} (ID: {{ source.id }})</span>
+                    </div>
+                    <button type="button" class="organize-row-remove" title="配置复核完成后可移除" aria-label="移除 {{ source.name }}" disabled><i data-lucide="x"></i></button>
+                </div>
+                {% else %}
+                <div class="organize-source-empty"><i data-lucide="folder-dashed"></i><span>尚未选择源目录，请点击右上角批量选择</span></div>
+                {% endfor %}
+            </div>
         </div>
 
         <!-- Center Flow Divider -->
@@ -76,12 +89,16 @@
             <div class="organize-target-composite">
                 <div class="organize-target-info-wrap">
                     <i data-lucide="folder" class="organize-target-folder-icon"></i>
-                    <div class="organize-target-value-text" id="organizeTargetValue">
-                        <strong>未选择</strong>
+                    <div class="organize-target-value-text" id="organizeTargetValue" aria-live="polite">
+                        {% if organize_initial_target_id %}
+                        <strong>{% if organize_initial_target_name %}{{ organize_initial_target_name }} (ID: {{ organize_initial_target_id }}){% else %}{{ organize_initial_target_id }}{% endif %}</strong>
+                        {% else %}
+                        <strong>未选择归档目标目录</strong>
                         <span>整理后文件归档到这里</span>
+                        {% endif %}
                     </div>
                 </div>
-                <button type="button" class="jump-btn organize-target-pick-btn" id="pickOrganizeTargetBtn">
+                <button type="button" class="jump-btn organize-target-pick-btn" id="pickOrganizeTargetBtn" disabled>
                     <i data-lucide="folder"></i>选择目标
                 </button>
             </div>
@@ -140,10 +157,10 @@
 
         <!-- 3. Primary Actions: 预览整理计划 & 立即启动整理 -->
         <div class="organize-action-group">
-            <button type="button" class="btn btn-secondary organize-btn-preview" id="previewBtn">
+            <button type="button" class="btn btn-secondary organize-btn-preview" id="previewBtn" disabled>
                 <i data-lucide="eye"></i>预览整理计划
             </button>
-            <button type="button" class="btn btn-primary organize-btn-run" id="runOrganizeBtn">
+            <button type="button" class="btn btn-primary organize-btn-run" id="runOrganizeBtn" disabled>
                 <i data-lucide="play-circle"></i>立即启动整理
             </button>
         </div>
@@ -740,5 +757,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/organize.js') }}?v=20260829a"></script>
+<script src="{{ url_for('static', path='js/organize.js') }}?v=20260831a"></script>
 {% endblock %}

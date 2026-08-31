@@ -4644,22 +4644,6 @@ class RecognitionPreviewContractTests(RecognitionContractMixin, unittest.TestCas
         self.assertNotIn("test-key", serialized)
         self.assertNotIn("signed_url", serialized)
 
-    def test_logs_preview_has_stable_safe_regions_for_new_diagnostics(self):
-        self.recognition_module()
-        html = (Path("app/templates/logs.html").read_text(encoding="utf-8") + Path("app/static/js/logs.js").read_text(encoding="utf-8"))
-        css = Path("app/static/css/scrape-preview.css").read_text(encoding="utf-8")
-
-        for marker in (
-            "scrapeParentPath", "scrapeRecognitionContext", "scrapeQueryVariants",
-            "scrapeThresholdDecision", "scrapeCandidateBreakdown",
-        ):
-            self.assertIn(marker, html)
-        self.assertIn("parent_path", html)
-        self.assertIn("textContent", html)
-        self.assertIn("replaceChildren", html)
-        self.assertIn("min-height", css)
-        self.assertIn(".scrape-lab-recognition", css)
-        self.assertNotIn("score_breakdown).join", html)
 
 
 if __name__ == "__main__":

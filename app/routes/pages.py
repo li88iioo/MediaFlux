@@ -1,7 +1,9 @@
 """FastAPI 页面路由：看板 / 配置 / 各功能页。"""
 from __future__ import annotations
 
+import json
 import re
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
@@ -174,9 +176,50 @@ def media_proxy(request: Request):
     return _page(request, "media_proxy.html", "media_proxy")
 
 
+def _organize_execute_defaults() -> dict[str, object]:
+    """返回整理执行页首帧所需目录，避免异步配置加载前闪出错误空态。"""
+    raw_sources = str(config.get("GY_ORGANIZE_SOURCE_DIRS", "") or "").strip()
+    try:
+        decoded = json.loads(raw_sources) if raw_sources else []
+    except (TypeError, ValueError):
+        decoded = []
+    if not isinstance(decoded, list):
+        decoded = []
+
+    sources: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(decoded):
+        if isinstance(item, str):
+            source_id = item.strip()
+            source_name = f"源目录{index + 1}"
+        elif isinstance(item, dict):
+            source_id = str(item.get("id", "") or "").strip()
+            source_name = str(item.get("name", "") or "").strip()
+        else:
+            continue
+        if not source_id or source_id == "0" or source_id in seen:
+            continue
+        seen.add(source_id)
+        sources.append({
+            "id": source_id,
+            "name": source_name or f"源目录{len(sources) + 1}",
+        })
+
+    return {
+        "organize_initial_sources": sources,
+        "organize_initial_target_id": str(
+            config.get("GY_ORGANIZE_TARGET_DIR", "") or ""
+        ).strip(),
+        "organize_initial_target_name": str(
+            config.get("GY_ORGANIZE_TARGET_DIR_NAME", "") or ""
+        ).strip(),
+    }
+
+
 def _organize_extension_defaults() -> dict[str, list[str]]:
     from app.modules.organize import (
-        DEFAULT_ORGANIZE_METADATA_EXTS, DEFAULT_ORGANIZE_VIDEO_EXTS,
+        DEFAULT_ORGANIZE_METADATA_EXTS,
+        DEFAULT_ORGANIZE_VIDEO_EXTS,
     )
 
     def current_extensions(key: str, defaults: tuple[str, ...]) -> list[str]:
@@ -204,8 +247,12 @@ def _organize_extension_defaults() -> dict[str, list[str]]:
 @router.get("/organize", name="pages.organize")
 def organize(request: Request):
     return _page(
-        request, "organize.html", "organize", organize_view="execute",
+        request,
+        "organize.html",
+        "organize",
+        organize_view="execute",
         **_organize_extension_defaults(),
+        **_organize_execute_defaults(),
     )
 
 
@@ -265,9 +312,13 @@ def discovery(request: Request):
     )
 
 
-@router.get("/tools", name="pages.tools")
+@router.get("/tools", name="pages.tools", include_in_schema=False)
 def tools(request: Request):
-    return _page(request, "tools.html", "tools")
+    """兼容旧书签；原工具页能力已经归入正式业务页面。"""
+    redirect = require_page_login(request)
+    if redirect:
+        return redirect
+    return RedirectResponse("/settings#metadata", status_code=308)
 
 
 @router.get("/logs", name="pages.logs")

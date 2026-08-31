@@ -169,6 +169,12 @@
     color: var(--accent-2);
     text-decoration: underline;
 }
+.organize-action-link:disabled {
+    color: var(--text-muted);
+    cursor: wait;
+    opacity: 0.62;
+    text-decoration: none;
+}
 
 .organize-source-list-box {
     display: grid;

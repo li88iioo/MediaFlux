@@ -1753,11 +1753,9 @@ class AIPreviewAndSettingsTests(unittest.TestCase):
         self.assertNotIn("api_key", rendered.lower())
         self.assertNotIn("secret", rendered.lower())
 
-    def test_settings_and_logs_have_stable_ai_sections_without_key_rendering(self):
+    def test_settings_has_stable_ai_sections_without_key_rendering(self):
         settings = (Path("app/templates/settings.html").read_text(encoding="utf-8") + Path("app/static/js/settings.js").read_text(encoding="utf-8"))
         logs = (Path("app/templates/logs.html").read_text(encoding="utf-8") + Path("app/static/js/logs.js").read_text(encoding="utf-8"))
-        css = Path("app/static/css/scrape-preview.css").read_text(encoding="utf-8")
-
         for key in (
             "AI_RECOGNITION_ENABLED",
             "AI_RECOGNITION_CONFIDENCE_THRESHOLD",
@@ -1778,10 +1776,6 @@ class AIPreviewAndSettingsTests(unittest.TestCase):
             self.assertNotIn(f'data-key="{duplicate_key}"', settings)
         self.assertNotIn("复用 Media Agent 模型连接", settings)
         self.assertIn('type="password"', settings)
-        self.assertIn("scrapeAiDiagnostic", logs)
-        self.assertIn("二次 TMDB 严格评分与详情复核", logs)
-        self.assertIn("scrape-lab-ai", css)
-        self.assertIn("min-height", css)
         self.assertNotIn("AI_RECOGNITION_API_KEY", logs)
         self.assertIn("settings-agent.css') }}?v=20260829b", settings)
 

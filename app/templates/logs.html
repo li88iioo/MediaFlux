@@ -1,10 +1,6 @@
 {% extends "base.html" %}
 {% block title %}日志记录 - MediaFlux{% endblock %}
 {% block page_title %}日志记录{% endblock %}
-{% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/scrape-preview.css') }}?v=20260826a">
-{% endblock %}
-
 {% block content %}
 <div class="logs-summary" id="summary">
     <div class="stat-card organize">
@@ -90,77 +86,6 @@
     <div class="table-pagination is-initializing" id="organizePagination" aria-label="整理日志分页" aria-busy="true" aria-hidden="true">
         <span class="table-pagination-info" id="organizePageInfo">第 1 页</span>
         <div class="table-pagination-actions"><button type="button" class="jump-btn" id="organizePrev" disabled><i data-lucide="chevron-left"></i>上一页</button><button type="button" class="jump-btn" id="organizeNext" disabled>下一页<i data-lucide="chevron-right"></i></button></div>
-    </div>
-</section>
-
-<section class="card card-pad logs-panel scrape-lab" id="scrapePanel" style="display:none;">
-    <div class="panel-head scrape-lab-head">
-        <div>
-            <span class="server-kicker">RECOGNITION LAB</span>
-            <div class="section-title"><i data-lucide="brain-circuit"></i>TMDB 刮削实验室</div>
-            <div class="panel-desc">解析文件名、核对 TMDB 详情与资源规格，在移动文件前锁定正确映射。</div>
-        </div>
-        <button type="button" class="icon-action" id="closeScrapeBtn" title="返回整理日志"><i data-lucide="x"></i></button>
-    </div>
-    <div class="scrape-lab-input">
-        <div class="scrape-lab-input-row">
-            <div class="scrape-lab-input-fields">
-                <label for="scrapeFilename">媒体文件名</label>
-                <input type="text" class="form-input" id="scrapeFilename" placeholder="如 The.Furious.2026.2160p.WEB-DL.H.265-DreamHD.mkv" autocomplete="off">
-                <label for="scrapeParentPath">父目录路径（可选）</label>
-                <input type="text" class="form-input" id="scrapeParentPath" placeholder="如 /剧集/幕府将军 Shogun (2024)/Season 1" autocomplete="off">
-            </div>
-            <button type="button" class="btn btn-primary scrape-go" id="scrapeBtn"><i data-lucide="scan-search"></i><span>开始识别</span></button>
-        </div>
-        <div class="scrape-lab-hints"><span>确定性清洗</span><span>目录上下文</span><span>Top 3 评分</span><span>命名预览</span></div>
-    </div>
-    <div id="scrapeResult" class="scrape-lab-result" data-state="idle" aria-live="polite" aria-busy="false">
-        <div class="scrape-lab-empty" id="scrapeEmpty">
-            <div class="scrape-lab-empty-icon"><i data-lucide="sparkles"></i></div>
-            <strong>等待识别输入</strong>
-            <p>结果将在这里保持稳定展示；再次识别时会保留旧结果，避免页面跳动。</p>
-        </div>
-        <article class="scrape-lab-hero" id="scrapeHero" hidden>
-            <div class="scrape-lab-backdrop"><img id="scrapeBackdrop" alt="" width="1280" height="720" hidden></div>
-            <div class="scrape-lab-hero-content">
-                <div class="scrape-lab-poster"><img id="scrapePoster" alt="" width="500" height="750" hidden><div id="scrapePosterFallback"><i data-lucide="image"></i></div></div>
-                <div class="scrape-lab-hero-copy">
-                    <span class="scrape-lab-status" id="scrapeMatchStatus">等待识别</span>
-                    <h3 id="scrapeTitle">—</h3>
-                    <p class="scrape-lab-subtitle" id="scrapeSubtitle">—</p>
-                    <div class="scrape-lab-chip-row" id="scrapeHeroChips"></div>
-                    <p class="scrape-lab-overview" id="scrapeOverview">暂无简介</p>
-                </div>
-            </div>
-        </article>
-        <section class="scrape-lab-diagnostic" id="scrapeDiagnostic" hidden></section>
-        <section class="scrape-lab-recognition" id="scrapeRecognitionContext" hidden>
-            <div class="scrape-lab-section-head"><div><span class="scrape-lab-eyebrow">DETERMINISTIC PIPELINE</span><h4>识别上下文与阈值决策</h4></div><span id="scrapePipelineMode">确定性优先</span></div>
-            <div class="scrape-lab-recognition-grid">
-                <div class="scrape-lab-context-cell"><span class="scrape-lab-eyebrow">CLEANED</span><div class="scrape-lab-info" id="scrapeCleanedComponents"></div></div>
-                <div class="scrape-lab-context-cell"><span class="scrape-lab-eyebrow">FOLDER</span><div class="scrape-lab-info" id="scrapeFolderContext"></div></div>
-                <div class="scrape-lab-context-cell"><span class="scrape-lab-eyebrow">QUERIES</span><div class="scrape-lab-chip-row scrape-lab-query-list" id="scrapeQueryVariants"></div></div>
-                <div class="scrape-lab-context-cell"><span class="scrape-lab-eyebrow">DECISION</span><div class="scrape-lab-info" id="scrapeThresholdDecision"></div></div>
-            </div>
-        </section>
-        <section class="scrape-lab-ai" id="scrapeAiDiagnostic" hidden>
-            <div class="scrape-lab-section-head"><div><span class="scrape-lab-eyebrow">STRUCTURED AI FALLBACK</span><h4>AI 回退诊断</h4><small>AI 只纠正搜索条件；二次 TMDB 严格评分与详情复核均通过后才可自动命中。</small></div><span id="scrapeAiStatus">未运行</span></div>
-            <div class="scrape-lab-ai-grid">
-                <div class="scrape-lab-ai-cell"><span class="scrape-lab-eyebrow">SANITIZED INPUT</span><div class="scrape-lab-info" id="scrapeAiInput"></div></div>
-                <div class="scrape-lab-ai-cell"><span class="scrape-lab-eyebrow">STRUCTURED OUTPUT</span><div class="scrape-lab-info" id="scrapeAiOutput"></div></div>
-                <div class="scrape-lab-ai-cell"><span class="scrape-lab-eyebrow">LOCAL VERDICT</span><div class="scrape-lab-info" id="scrapeAiDecision"></div></div>
-            </div>
-        </section>
-        <div class="scrape-lab-grid" id="scrapeDetailGrid" hidden>
-            <section class="scrape-lab-card"><span class="scrape-lab-eyebrow">PARSING</span><h4>文件名解析</h4><div class="scrape-lab-info" id="scrapeParsed"></div></section>
-            <section class="scrape-lab-card" id="scrapeMetadata"><span class="scrape-lab-eyebrow">METADATA</span><h4>TMDB 详情</h4><div class="scrape-lab-info" id="scrapeMetadataRows"></div></section>
-            <section class="scrape-lab-card" id="scrapeResourceTags"><span class="scrape-lab-eyebrow">MEDIA TAGS</span><h4>资源规格</h4><div class="scrape-lab-info" id="scrapeResourceRows"></div></section>
-            <section class="scrape-lab-card" id="scrapeNaming"><span class="scrape-lab-eyebrow">OUTPUT</span><h4>命名预览</h4><div class="scrape-lab-info" id="scrapeNamingRows"></div></section>
-        </div>
-        <section class="scrape-lab-candidates" id="scrapeCandidates" hidden>
-            <div class="scrape-lab-section-head"><div><span class="scrape-lab-eyebrow">REVIEW QUEUE</span><h4>候选结果</h4></div><span id="scrapeCandidateCount">0 个</span></div>
-            <div class="scrape-lab-candidate-list" id="scrapeCandidateList"></div>
-        </section>
     </div>
 </section>
 

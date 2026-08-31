@@ -86,6 +86,36 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
         self.assertIn("renderStatus(data)", html)
         self.assertIn("if(organizeActionBusy)return", html)
 
+    def test_execute_page_server_renders_saved_directories_before_config_recheck(self):
+        from unittest.mock import patch
+
+        values = {
+            "GY_ORGANIZE_SOURCE_DIRS": '[{"id":"11","name":"电视剧"},{"id":"22","name":"动漫"}]',
+            "GY_ORGANIZE_TARGET_DIR": "99",
+            "GY_ORGANIZE_TARGET_DIR_NAME": "整理",
+        }
+        with patch("app.routes.pages.config.get", side_effect=lambda key, default="": values.get(key, default)):
+            organize = self.client.get("/organize")
+
+        self.assertEqual(organize.status_code, 200)
+        self.assertIn('class="organize-workspace is-config-loading"', organize.text)
+        self.assertIn('aria-busy="true"', organize.text)
+        self.assertIn('(支持多选 · 已选 2 项)', organize.text)
+        self.assertIn('电视剧 (ID: 11)', organize.text)
+        self.assertIn('动漫 (ID: 22)', organize.text)
+        self.assertIn('整理 (ID: 99)', organize.text)
+        self.assertNotIn('(支持多选 · 已选 0 项)', organize.text)
+        self.assertNotIn('organize-source-skeleton-row', organize.text)
+        self.assertIn('id="addOrganizeSourceBtn" disabled', organize.text)
+        self.assertIn('id="pickOrganizeTargetBtn" disabled', organize.text)
+        self.assertIn('id="previewBtn" disabled', organize.text)
+        self.assertIn('id="runOrganizeBtn" disabled', organize.text)
+
+        script = Path("app/static/js/organize.js").read_text(encoding="utf-8")
+        self.assertIn("workspace.classList.remove('is-config-loading')", script)
+        self.assertIn("workspace.setAttribute('aria-busy','false')", script)
+        self.assertNotIn("MIN_EXECUTE_CONFIG_SKELETON_MS", script)
+
     def test_metatube_enabled_state_is_server_rendered_without_expand_shift(self):
         from unittest.mock import patch
 

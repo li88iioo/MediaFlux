@@ -43,6 +43,12 @@
     let organizeActionBusy=false;
     let organizeStatusRunning=false;
     const configFieldLocks=Array.from(workspace.querySelectorAll('[data-key]'),field=>({field,disabled:field.disabled}));
+    const executeConfigActions=['addOrganizeSourceBtn','pickOrganizeTargetBtn']
+        .map(id=>document.getElementById(id))
+        .filter(Boolean);
+    const executeReadyActions=['previewBtn','runOrganizeBtn']
+        .map(id=>document.getElementById(id))
+        .filter(Boolean);
     configFieldLocks.forEach(({field})=>{field.disabled=true;});
 
     function readExtensionDefaults(kind){
@@ -692,6 +698,12 @@
     function finishConfigLoad(success){
         const button=document.getElementById('saveOrganizeConfigBtn');const state=document.getElementById('organizeSaveState');configReady=success;button.disabled=!success||configSaveBusy;button.setAttribute('aria-busy',configSaveBusy?'true':'false');
         if(success)configFieldLocks.forEach(({field,disabled})=>{field.disabled=disabled;});
+        executeConfigActions.forEach(action=>{action.disabled=!success;});
+        executeReadyActions.forEach(action=>{
+            action.disabled=!success||organizeActionBusy||(action.id==='runOrganizeBtn'&&organizeStatusRunning);
+        });
+        workspace.classList.remove('is-config-loading');
+        workspace.setAttribute('aria-busy','false');
         state.textContent=success?(isRules?'保存后立即成为 Web、TG、定时与本地整理的正式规则':'保存来源与目标，后续执行自动使用统一整理规则'):'配置读取失败，请刷新页面后重试';state.className=success?'':'is-error';
     }
     function saveConfig(){
@@ -981,7 +993,7 @@
             cleanCheckbox.checked=String(config.GY_ORGANIZE_CLEAN_EMPTY)==='true'||config.GY_ORGANIZE_CLEAN_EMPTY===true||config.GY_ORGANIZE_CLEAN_EMPTY==='1'||config.GY_ORGANIZE_CLEAN_EMPTY===1;
         }
         finishConfigLoad(true);
-    }).catch(()=>{renderSources();renderTarget('','');finishConfigLoad(false);});
+    }).catch(()=>{finishConfigLoad(false);});
     startPolling();
     }
 })();
