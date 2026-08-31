@@ -156,6 +156,37 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("DELETE FROM agent_session_context")
 
+    def test_guangya_fs_change_context_is_persisted_and_guarded(self):
+        owner = "guangya-fs-change-owner"
+        guard = self.repository.begin_context(
+            owner=owner, context_type="guangya_fs_change"
+        )
+        stored = self.repository.replace_latest_guarded(
+            owner=owner,
+            context_type="guangya_fs_change",
+            payload={
+                "plan_id": "a" * 32,
+                "fingerprint": "b" * 64,
+                "preview_safe": {"total": 1, "sample_changes": []},
+            },
+            expires_at=1_100.0,
+            guard=guard,
+        )
+
+        self.assertIsNotNone(stored)
+        loaded = self.repository.get_latest(
+            owner=owner, context_type="guangya_fs_change", now=1_000.0
+        )
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.payload["plan_id"], "a" * 32)
+        self.assertTrue(
+            self.repository.consume_latest_guarded(
+                owner=owner,
+                context_type="guangya_fs_change",
+                guard=type(guard)(stored.generation, stored.revision),
+            )
+        )
+
     def test_owner_is_hmac_fingerprinted_and_payload_is_versioned(self):
         owner = "csrf-owner-should-never-be-stored"
         self.repository.replace_latest(

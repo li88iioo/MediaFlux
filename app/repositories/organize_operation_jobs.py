@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 _ALLOWED_KINDS = {
     "agent_directory_scrape", "agent_guangya_cleanup",
-    "agent_guangya_rename", "directory_scrape",
+    "agent_guangya_rename", "agent_guangya_fs_change", "directory_scrape",
 }
 _TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled", "manual_review"}
 _MAX_JSON_BYTES = 131_072
@@ -39,7 +39,7 @@ _ALLOWED_RESULT_STATS = {
     "empty_dir_cleanup_failed", "source_dir_cleanup_failed", "audit_failures",
     "strm_triggered", "strm_trigger_failed",
     "quarantined", "empty_deleted", "verification_failed",
-    "precondition_failed",
+    "precondition_failed", "trashed", "created",
 }
 
 

@@ -40,7 +40,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = (
     "上次进程在本地媒体写操作期间中断"
@@ -1331,7 +1331,7 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_name_id ON task_runs(task_name, id DESC
 CREATE TABLE IF NOT EXISTS organize_operation_jobs (
     job_id TEXT PRIMARY KEY,
     job_kind TEXT NOT NULL
-        CHECK(job_kind IN ('agent_directory_scrape','agent_guangya_cleanup','agent_guangya_rename','directory_scrape')),
+        CHECK(job_kind IN ('agent_directory_scrape','agent_guangya_cleanup','agent_guangya_rename','agent_guangya_fs_change','directory_scrape')),
     owner_digest TEXT NOT NULL,
     operation TEXT NOT NULL,
     reference TEXT NOT NULL DEFAULT '',
@@ -2004,7 +2004,7 @@ def _migrate_organize_operation_jobs_v4(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS organize_operation_jobs ("
         "job_id TEXT PRIMARY KEY,"
         "job_kind TEXT NOT NULL CHECK(job_kind IN "
-        "('agent_directory_scrape','agent_guangya_cleanup','agent_guangya_rename','directory_scrape')),"
+        "('agent_directory_scrape','agent_guangya_cleanup','agent_guangya_rename','agent_guangya_fs_change','directory_scrape')),"
         "owner_digest TEXT NOT NULL,"
         "operation TEXT NOT NULL,reference TEXT NOT NULL DEFAULT '',"
         "payload_json TEXT NOT NULL DEFAULT '{}',payload_auth TEXT NOT NULL DEFAULT '',"
@@ -2223,6 +2223,80 @@ def _migrate_agent_guangya_operation_jobs_v10(
         f"SELECT {columns} FROM organize_operation_jobs_v9"
     )
     conn.execute("DROP TABLE organize_operation_jobs_v9")
+    conn.execute(
+        "CREATE INDEX idx_organize_operation_jobs_pending "
+        "ON organize_operation_jobs(status, created_at, job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_organize_operation_jobs_updated "
+        "ON organize_operation_jobs(updated_at DESC, job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_organize_operation_jobs_owner_updated "
+        "ON organize_operation_jobs(owner_digest, updated_at DESC, job_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_organize_operation_jobs_active_dedupe "
+        "ON organize_operation_jobs(owner_digest,dedupe_digest) "
+        "WHERE status IN ('pending','running')"
+    )
+
+
+def _migrate_agent_guangya_fs_change_jobs_v17(
+    conn: sqlite3.Connection,
+) -> None:
+    """扩展持久操作队列，承载通用光鸭文件系统变更计划。"""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='organize_operation_jobs'"
+    ).fetchone()
+    if row is None:
+        _migrate_organize_operation_jobs_v4(conn)
+        return
+    table_sql = str(row["sql"] or "")
+    if "agent_guangya_fs_change" in table_sql:
+        return
+    for index_name in (
+        "idx_organize_operation_jobs_pending",
+        "idx_organize_operation_jobs_updated",
+        "idx_organize_operation_jobs_owner_updated",
+        "idx_organize_operation_jobs_active_dedupe",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+    conn.execute(
+        "ALTER TABLE organize_operation_jobs "
+        "RENAME TO organize_operation_jobs_v16"
+    )
+    conn.execute(
+        "CREATE TABLE organize_operation_jobs ("
+        "job_id TEXT PRIMARY KEY,"
+        "job_kind TEXT NOT NULL CHECK(job_kind IN "
+        "('agent_directory_scrape','agent_guangya_cleanup',"
+        "'agent_guangya_rename','agent_guangya_fs_change','directory_scrape')),"
+        "owner_digest TEXT NOT NULL,"
+        "operation TEXT NOT NULL,reference TEXT NOT NULL DEFAULT '',"
+        "payload_json TEXT NOT NULL DEFAULT '{}',payload_auth TEXT NOT NULL DEFAULT '',"
+        "dedupe_digest TEXT NOT NULL,"
+        "status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN "
+        "('pending','running','completed','partial','failed','cancelled','manual_review')),"
+        "lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),"
+        "result_json TEXT NOT NULL DEFAULT '{}',error_code TEXT NOT NULL DEFAULT '',"
+        "error TEXT NOT NULL DEFAULT '',"
+        "cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),"
+        "expires_at REAL NOT NULL DEFAULT 0,purged_at TEXT,"
+        "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,started_at TEXT,finished_at TEXT"
+        ")"
+    )
+    columns = (
+        "job_id,job_kind,owner_digest,operation,reference,payload_json,payload_auth,"
+        "dedupe_digest,status,lease_generation,result_json,error_code,error,"
+        "cancel_requested,expires_at,purged_at,created_at,updated_at,started_at,finished_at"
+    )
+    conn.execute(
+        f"INSERT INTO organize_operation_jobs({columns}) "
+        f"SELECT {columns} FROM organize_operation_jobs_v16"
+    )
+    conn.execute("DROP TABLE organize_operation_jobs_v16")
     conn.execute(
         "CREATE INDEX idx_organize_operation_jobs_pending "
         "ON organize_operation_jobs(status, created_at, job_id)"
@@ -2550,6 +2624,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     13: _migrate_organize_confirmation_rollup_v14,
     14: _migrate_retire_organize_notification_outbox_v15,
     15: _migrate_retire_telegram_write_confirmations_v16,
+    16: _migrate_agent_guangya_fs_change_jobs_v17,
 }
 
 

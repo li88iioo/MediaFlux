@@ -296,13 +296,10 @@ def _transformed_name(
     item: GuangYaFile,
     *,
     mode: str,
-    new_name: str = "",
     find_text: str = "",
     replace_text: str = "",
 ) -> str:
-    if mode == "exact":
-        candidate = _validate_name(new_name)
-    elif mode == "remove_bitrate":
+    if mode == "remove_bitrate":
         candidate = _validate_name(remove_legacy_bitrate(item.name))
     elif mode == "replace_text":
         if find_text not in item.name:
@@ -605,7 +602,7 @@ def build_explicit_rename_plan(
     """把内部扫描器产生的精确名称映射冻结为通用重命名计划。"""
     normalized_target = _normalize_path(target)
     safe_mode = str(mode or "").strip().casefold()
-    if safe_mode not in {"media_hygiene", "declarative"}:
+    if safe_mode != "media_hygiene":
         raise GuangYaRenamePlanError("显式重命名计划类型无效")
     safe_limit = max(1, min(int(limit), _MAX_RENAMES))
     if len(changes) > safe_limit:
@@ -637,13 +634,7 @@ def build_explicit_rename_plan(
         scanned_items=scanned_items,
         scanned_dirs=scanned_dirs,
         no_change=no_change,
-        transform={
-            "strategy": (
-                "nsfw_media_hygiene"
-                if safe_mode == "media_hygiene" else "llm_declarative_rename"
-            ),
-            **dict(transform or {}),
-        },
+        transform={"strategy": "nsfw_media_hygiene", **dict(transform or {})},
         extra_stats=extra_stats,
     )
 
@@ -656,7 +647,6 @@ def build_rename_plan(
     mode: str,
     recursive: bool = False,
     limit: int = 100,
-    new_name: str = "",
     find_text: str = "",
     replace_text: str = "",
 ) -> dict[str, Any]:
@@ -665,15 +655,9 @@ def build_rename_plan(
     if not normalized_targets or len(normalized_targets) > _MAX_TARGETS:
         raise GuangYaRenamePlanError(f"一次只能指定 1 到 {_MAX_TARGETS} 个光鸭路径")
     safe_mode = str(mode or "").strip().casefold()
-    if safe_mode not in {"exact", "remove_bitrate", "replace_text"}:
+    if safe_mode not in {"remove_bitrate", "replace_text"}:
         raise GuangYaRenamePlanError("重命名方式无效")
     safe_limit = max(1, min(int(limit), _MAX_RENAMES))
-    if safe_mode == "exact" and len(normalized_targets) != 1:
-        raise GuangYaRenamePlanError("精确改名一次只能指定一个路径")
-    if safe_mode == "exact" and recursive:
-        raise GuangYaRenamePlanError("精确改名不支持递归")
-    if safe_mode == "exact":
-        _validate_name(new_name)
     if safe_mode == "replace_text":
         if not find_text or len(find_text) > 120 or len(replace_text) > 120:
             raise GuangYaRenamePlanError("文本替换参数无效")
@@ -689,7 +673,7 @@ def build_rename_plan(
     def consider(item: GuangYaFile, parent_path: str) -> None:
         nonlocal no_change
         candidate = _transformed_name(
-            item, mode=safe_mode, new_name=new_name,
+            item, mode=safe_mode,
             find_text=find_text, replace_text=replace_text,
         )
         if candidate == item.name:
@@ -705,9 +689,6 @@ def build_rename_plan(
 
     for target in normalized_targets:
         item, parent_path = _resolve_path(client, target, cache)
-        if safe_mode == "exact":
-            consider(item, parent_path)
-            continue
         if not item.is_dir:
             consider(item, parent_path)
             continue
@@ -745,7 +726,6 @@ def build_rename_plan(
         scanned_dirs=scanned_dirs,
         no_change=no_change,
         transform={
-            "new_name": new_name if safe_mode == "exact" else "",
             "find_text": find_text if safe_mode == "replace_text" else "",
             "replace_text": replace_text if safe_mode == "replace_text" else "",
         },

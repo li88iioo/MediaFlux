@@ -86,6 +86,26 @@ class GuangYaRenameTests(unittest.TestCase):
         actions.reset_guangya_rename_context_for_tests()
         self.temp.cleanup()
 
+    def test_exact_mode_is_rejected_in_favor_of_generic_fs_change(self):
+        with self.assertRaisesRegex(Exception, "仅支持 remove_bitrate"):
+            actions.guangya_rename_preview_arguments({
+                "paths": ["/整理/动漫/旧名.mp4"],
+                "mode": "exact",
+            })
+        with self.assertRaisesRegex(Exception, "不支持的工具参数：new_name"):
+            actions.guangya_rename_preview_arguments({
+                "paths": ["/整理/动漫/旧名.mp4"],
+                "mode": "remove_bitrate",
+                "new_name": "新名.mp4",
+            })
+        with self.assertRaisesRegex(Exception, "重命名方式无效"):
+            guangya_rename.build_rename_plan(
+                FakeGuangYaClient(),
+                owner="owner",
+                targets=["/整理/动漫/师兄太稳健.S01E08.2160p.15.1Mbps.60fps.mp4"],
+                mode="exact",
+            )
+
     def test_remove_bitrate_handles_compact_and_spaced_without_damaging_codec(self):
         cases = {
             "Title.H.265.15.1Mbps.60fps.mp4": "Title.H.265.60fps.mp4",

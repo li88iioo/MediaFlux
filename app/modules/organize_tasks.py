@@ -1190,6 +1190,14 @@ class OrganizeTaskManager:
             return execute_durable_guangya_rename_job(
                 payload, cancel_check=cancel_check
             )
+        if kind == "agent_guangya_fs_change":
+            from app.agent.guangya_fs_change_actions import (
+                execute_durable_guangya_fs_change_job,
+            )
+
+            return execute_durable_guangya_fs_change_job(
+                payload, cancel_check=cancel_check
+            )
         raise ValueError("不支持的持久化操作类型")
 
     def _run_durable_operation(self, row: dict[str, Any]) -> None:

@@ -1006,6 +1006,10 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
                 return_value={"removed": 1, "remaining": 0, "bytes": 0},
             ) as workspace_cleanup,
             patch(
+                "app.modules.guangya_fs_change.maintain_fs_change_plans",
+                return_value={"removed": 1, "remaining": 0},
+            ) as fs_change_cleanup,
+            patch(
                 "app.modules.agent_download_verification_scheduler."
                 "db.purge_expired_agent_task_history",
                 return_value={
@@ -1018,6 +1022,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         rename_cleanup.assert_called_once_with()
         residual_cleanup.assert_called_once_with()
         workspace_cleanup.assert_called_once_with()
+        fs_change_cleanup.assert_called_once_with()
         purge.assert_called_once()
 
     def test_history_cleanup_failure_retries_after_five_minutes(self):

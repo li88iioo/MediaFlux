@@ -57,7 +57,9 @@ _TOOL_LABELS = {
     "strm.run_once": "STRM 手动同步",
     "strm.set_schedule_policy": "STRM 调度策略修改",
     "guangya.organize.set_schedule_policy": "光鸭定时整理策略修改",
-    "guangya.rename.execute": "光鸭重命名执行",
+    "guangya.fs.change.execute": "光鸭文件变更执行",
+    "guangya.media_hygiene.execute": "光鸭媒体名称清理",
+    "guangya.rename.execute": "光鸭批量名称转换执行",
     "guangya.directory_scrape.run": "光鸭目录刮削执行",
     "guangya.organize.run_once": "光鸭整理任务",
     "guangya.organize.cleanup.execute": "光鸭整理残留清理",
@@ -157,6 +159,14 @@ _SAFE_FIELDS = {
     "strm.run_once": {"accepted", "trigger"},
     "strm.set_schedule_policy": {"runtime_refreshed"},
     "guangya.organize.set_schedule_policy": {"runtime_refreshed"},
+    "guangya.fs.change.execute": {
+        "queued", "queue_position", "replayed", "operation_ref", "total",
+        "rename_count", "move_count", "trash_count", "create_directory_count",
+        "trigger_strm", "requires_manual",
+    },
+    "guangya.media_hygiene.execute": {
+        "queued", "queue_position", "replayed", "rename_count", "requires_manual",
+    },
     "guangya.rename.execute": {
         "queued", "queue_position", "replayed", "rename_count", "requires_manual",
     },

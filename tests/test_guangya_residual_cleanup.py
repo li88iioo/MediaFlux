@@ -314,6 +314,25 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
             "agent_guangya_cleanup",
         )
 
+    def test_agent_preview_can_target_exact_unconfigured_directory(self):
+        client = FakeCleanupClient()
+        context = ToolContext(owner="owner", session_id="session")
+        arguments = actions.guangya_cleanup_preview_arguments({
+            "path": "/整理源", "max_candidates": 20,
+        })
+        with (
+            mock.patch.object(actions, "GuangYaClient", return_value=client),
+            mock.patch.object(
+                actions, "_configured_cleanup_sources",
+                side_effect=AssertionError("不应读取预配置来源"),
+            ),
+        ):
+            preview = actions.preview_guangya_cleanup(arguments, context)
+        self.assertEqual(preview.status, "selection_required")
+        self.assertEqual(preview.data["source_count"], 1)
+        self.assertEqual(preview.data["empty_dir_count"], 1)
+        self.assertEqual(preview.data["candidate_count"], 1)
+
     def test_agent_reviews_large_frozen_plan_in_rolling_batches(self):
         client = FakeCleanupClient()
         client.directories["source"] = []
@@ -363,11 +382,11 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
     def test_agent_cleanup_validators_cover_full_frozen_plan_range(self):
         self.assertEqual(
             actions.guangya_cleanup_preview_arguments({}),
-            {"max_candidates": 500, "scope": "all"},
+            {"path": "", "max_candidates": 500, "scope": "all"},
         )
         self.assertEqual(
             actions.guangya_cleanup_preview_arguments({"scope": "empty_only"}),
-            {"max_candidates": 500, "scope": "empty_only"},
+            {"path": "", "max_candidates": 500, "scope": "empty_only"},
         )
         self.assertEqual(
             actions.guangya_cleanup_classify_arguments({

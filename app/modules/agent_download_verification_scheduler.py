@@ -214,6 +214,11 @@ class DownloadLibraryVerificationScheduler:
                 "app.modules.guangya_workspace",
                 "maintain_workspace_observations",
             ),
+            (
+                "Agent 光鸭通用变更私有计划",
+                "app.modules.guangya_fs_change",
+                "maintain_fs_change_plans",
+            ),
         )
         for label, module_name, function_name in private_maintainers:
             try:

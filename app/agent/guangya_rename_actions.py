@@ -16,14 +16,6 @@ from app.agent.result_projection import sanitize_public_text
 from app.agent.session_context import AgentContextWriteGuard, AgentSessionContextRepository
 from app.clients.guangya import GuangYaClient
 from app.modules.guangya_media_hygiene import build_media_hygiene_plan
-from app.modules.guangya_workspace import (
-    GuangYaWorkspaceError,
-    build_declarative_rename_plan,
-    load_directory_observation,
-    valid_object_handle,
-    valid_observation_ref,
-)
-from app.agent.guangya_workspace_actions import latest_guangya_observation_ref
 from app.modules.guangya_rename import (
     GuangYaRenamePlanError,
     GuangYaRenamePlanStale,
@@ -43,15 +35,14 @@ _CONTEXT_TYPE = "guangya_rename"
 _TTL_SECONDS = 15 * 60.0
 _PLAN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
-_PUBLIC_RENAME_MODES = {"exact", "remove_bitrate", "replace_text"}
-_PERSISTED_MODES = {*_PUBLIC_RENAME_MODES, "media_hygiene", "declarative"}
+_PUBLIC_RENAME_MODES = {"remove_bitrate", "replace_text"}
+_PERSISTED_MODES = {*_PUBLIC_RENAME_MODES, "media_hygiene"}
 _PREVIEW_COUNT_KEYS = (
     "scope_count", "scanned_items", "scanned_dirs", "matched",
     "rename_count", "conflict_count", "no_change_count",
     "identified_video_count", "unidentified_video_count",
     "video_rename_count", "companion_rename_count",
     "directory_rename_count", "metadata_enriched_count",
-    "proposed_operation_count",
 )
 
 
@@ -290,7 +281,7 @@ def _consume(flow: _Flow) -> bool:
 def _public_error(exc: Exception) -> AgentToolError:
     if isinstance(exc, GuangYaRenamePlanStale):
         return AgentToolError(str(exc), code="confirmation_stale")
-    if isinstance(exc, (GuangYaRenamePlanError, GuangYaWorkspaceError)):
+    if isinstance(exc, GuangYaRenamePlanError):
         return AgentToolError(str(exc), code="precondition_failed")
     logger.warning("Agent 光鸭重命名失败 type=%s", type(exc).__name__)
     return AgentToolError("光鸭重命名当前不可用", code="precondition_failed")
@@ -299,9 +290,7 @@ def _public_error(exc: Exception) -> AgentToolError:
 def guangya_rename_preview_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
-    allowed = {
-        "paths", "mode", "recursive", "limit", "new_name", "find", "replace",
-    }
+    allowed = {"paths", "mode", "recursive", "limit", "find", "replace"}
     extra = set(arguments) - allowed
     if extra:
         raise AgentToolError(f"不支持的工具参数：{', '.join(sorted(extra))}")
@@ -318,7 +307,7 @@ def guangya_rename_preview_arguments(arguments: dict[str, Any]) -> dict[str, Any
         paths.append(path)
     mode = str(arguments.get("mode") or "").strip().casefold()
     if mode not in _PUBLIC_RENAME_MODES:
-        raise AgentToolError("mode 仅支持 exact、remove_bitrate 或 replace_text")
+        raise AgentToolError("mode 仅支持 remove_bitrate 或 replace_text")
     recursive = arguments.get("recursive", False)
     if type(recursive) is not bool:
         raise AgentToolError("recursive 必须是布尔值")
@@ -328,16 +317,7 @@ def guangya_rename_preview_arguments(arguments: dict[str, Any]) -> dict[str, Any
     normalized: dict[str, Any] = {
         "paths": paths, "mode": mode, "recursive": recursive, "limit": limit,
     }
-    if mode == "exact":
-        if len(paths) != 1 or recursive:
-            raise AgentToolError("精确改名一次只能指定一个路径且不能递归")
-        if set(arguments) - {"paths", "mode", "new_name", "limit", "recursive"}:
-            raise AgentToolError("精确改名不接受文本替换参数")
-        new_name = arguments.get("new_name")
-        if not isinstance(new_name, str) or not new_name:
-            raise AgentToolError("精确改名必须提供 new_name")
-        normalized["new_name"] = new_name
-    elif mode == "replace_text":
+    if mode == "replace_text":
         find_text = arguments.get("find")
         replace_text = arguments.get("replace", "")
         if not isinstance(find_text, str) or not find_text:
@@ -345,8 +325,8 @@ def guangya_rename_preview_arguments(arguments: dict[str, Any]) -> dict[str, Any
         if not isinstance(replace_text, str):
             raise AgentToolError("replace 必须是字符串")
         normalized.update({"find_text": find_text, "replace_text": replace_text})
-    elif set(arguments) & {"new_name", "find", "replace"}:
-        raise AgentToolError("去除码率模式不接受额外改名参数")
+    elif set(arguments) & {"find", "replace"}:
+        raise AgentToolError("去除码率模式不接受文本替换参数")
     return normalized
 
 
@@ -380,43 +360,6 @@ def guangya_media_hygiene_preview_arguments(
         "recursive": recursive,
         "limit": limit,
         "enrich_metadata": enrich_metadata,
-    }
-
-
-def guangya_change_plan_preview_arguments(
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    if not isinstance(arguments, dict):
-        raise AgentToolError("声明式变更计划参数必须是对象")
-    allowed = {"observation_ref", "operations", "trigger_strm"}
-    if set(arguments) - allowed:
-        raise AgentToolError("声明式变更计划包含不支持的参数")
-    ref = str(arguments.get("observation_ref") or "").strip().upper()
-    if ref and not valid_observation_ref(ref):
-        raise AgentToolError("observation_ref 格式无效")
-    raw_operations = arguments.get("operations")
-    if not isinstance(raw_operations, list) or not 1 <= len(raw_operations) <= 100:
-        raise AgentToolError("operations 必须包含 1 到 100 项精确改名操作")
-    operations: list[dict[str, str]] = []
-    for raw in raw_operations:
-        if not isinstance(raw, dict) or set(raw) - {"op", "object_ref", "new_name"}:
-            raise AgentToolError("每项操作只接受 op、object_ref 和 new_name")
-        if str(raw.get("op") or "rename").strip().casefold() != "rename":
-            raise AgentToolError("当前声明式计划只开放 rename 操作")
-        handle = str(raw.get("object_ref") or "").strip().upper()
-        new_name = raw.get("new_name")
-        if not valid_object_handle(handle):
-            raise AgentToolError("操作对象引用格式无效")
-        if not isinstance(new_name, str) or not new_name or len(new_name) > 255:
-            raise AgentToolError("new_name 必须是 1 到 255 字符的文件名")
-        operations.append({"handle": handle, "new_name": new_name})
-    trigger_strm = arguments.get("trigger_strm", True)
-    if type(trigger_strm) is not bool:
-        raise AgentToolError("trigger_strm 必须是布尔值")
-    return {
-        "observation_ref": ref,
-        "operations": operations,
-        "trigger_strm": trigger_strm,
     }
 
 
@@ -454,7 +397,6 @@ def _preview_projection(plan: dict[str, Any]) -> dict[str, Any]:
         "companion_rename_count": max(0, int(stats.get("companion_rename_count") or 0)),
         "directory_rename_count": max(0, int(stats.get("directory_rename_count") or 0)),
         "metadata_enriched_count": max(0, int(stats.get("metadata_enriched_count") or 0)),
-        "proposed_operation_count": max(0, int(stats.get("proposed_operation_count") or 0)),
         "mode": str(plan.get("mode") or ""),
         "recursive": bool(plan.get("recursive")),
         "sample_changes": sample_changes,
@@ -572,71 +514,6 @@ def preview_guangya_media_hygiene(
     )
 
 
-def preview_guangya_change_plan(
-    arguments: dict[str, Any], context: ToolContext,
-) -> ToolResult:
-    if not context.owner:
-        raise AgentToolError("声明式变更计划需要已登录会话", code="precondition_failed")
-    ref = str(arguments.get("observation_ref") or "").strip().upper()
-    if not ref:
-        ref = latest_guangya_observation_ref(context.owner)
-    if not ref:
-        raise AgentToolError("最近没有可用的光鸭目录观察，请先读取目标目录", code="precondition_failed")
-    previous, guard = _begin_flow_update(context.owner)
-    client = GuangYaClient()
-    try:
-        if not client.logged_in:
-            raise AgentToolError("光鸭账号尚未连接", code="precondition_failed")
-        observation = load_directory_observation(ref, owner=context.owner)
-        plan = build_declarative_rename_plan(
-            client,
-            owner=context.owner,
-            observation=observation,
-            operations=list(arguments["operations"]),
-            trigger_strm=bool(arguments["trigger_strm"]),
-        )
-    except AgentToolError:
-        raise
-    except (GuangYaWorkspaceError, GuangYaRenamePlanError) as exc:
-        raise _public_error(exc) from exc
-    except Exception as exc:
-        raise _public_error(exc) from exc
-    finally:
-        client.close()
-    preview = _preview_projection(plan)
-    flow = _Flow(
-        owner=context.owner, plan_id=str(plan["plan_id"]),
-        fingerprint=str(plan["fingerprint"]), preview_safe=preview,
-        generation=guard.generation, revision=guard.revision,
-    )
-    if not _save(flow):
-        discard_rename_plan(flow.plan_id)
-        raise AgentToolError("声明式计划已被更新请求取代，请重新生成", code="precondition_failed")
-    _discard_replaced_plan(previous, flow.plan_id)
-    count = int(preview["rename_count"])
-    conflicts = int(preview["conflict_count"])
-    summary = (
-        f"已验证 {count} 个可安全执行的声明式改名"
-        + (f"，另有 {conflicts} 个名称冲突已排除" if conflicts else "")
-        if count else "声明式计划中没有可安全执行的名称变更"
-    )
-    return ToolResult(
-        True,
-        "ready" if count else "no_changes",
-        summary,
-        data=preview,
-        evidence=[Evidence(
-            "guangya_snapshot",
-            "对象引用已映射回 owner-bound 私有快照，并重新核对当前父目录、名称、大小、内容标识、扩展名和目标冲突；未执行云端写入。",
-            _now(),
-        )],
-        suggestions=(
-            ["如改名前后示例符合预期，可以确认执行这份冻结计划。"]
-            if count else ["请根据最新目录观察调整对象引用或目标名称后重新生成。"]
-        ),
-    )
-
-
 def _confirmation_fingerprint(flow: _Flow, plan: dict[str, Any]) -> str:
     return confirmation_context_fingerprint({
         "owner": flow.owner,
@@ -672,17 +549,13 @@ def prepare_guangya_rename_confirmation(
         raise AgentToolError("最近预览没有可执行的名称变更", code="precondition_failed")
     mode = str(flow.preview_safe.get("mode") or "")
     media_hygiene = mode == "media_hygiene"
-    declarative = mode == "declarative"
     strm_linked = bool(flow.preview_safe.get("trigger_strm"))
     return ToolResult(
         True,
         "confirmation_required",
         (
             f"确认后将清理 {count} 个光鸭媒体名称"
-            if media_hygiene else (
-                f"确认后将执行 {count} 个声明式光鸭改名"
-                if declarative else f"确认后将重命名 {count} 个光鸭对象"
-            )
+            if media_hygiene else f"确认后将批量转换 {count} 个光鸭对象名称"
         ),
         data={**flow.preview_safe, "effects": [
             "只执行刚才冻结并排除冲突后的名称映射，不会扩大扫描范围。",
@@ -700,6 +573,37 @@ def prepare_guangya_rename_confirmation(
             _now(),
         )],
     ), _confirmation_fingerprint(flow, plan)
+
+
+def prepare_guangya_media_hygiene_confirmation(
+    arguments: dict[str, Any], context: ToolContext,
+) -> tuple[ToolResult, str]:
+    flow = _flow(context.owner)
+    if flow is None or str(flow.preview_safe.get("mode") or "") != "media_hygiene":
+        raise AgentToolError(
+            "最近媒体名称清理预览不存在或已过期，请重新生成",
+            code="precondition_failed",
+        )
+    return prepare_guangya_rename_confirmation(arguments, context)
+
+
+def execute_guangya_media_hygiene(_arguments: dict[str, Any]) -> ToolResult:
+    raise AgentToolError("媒体名称清理必须先预览并确认", code="confirmation_required")
+
+
+def execute_guangya_media_hygiene_confirmed(
+    arguments: dict[str, Any], expected_context: str, context: ToolContext,
+) -> ToolResult:
+    flow = _flow(context.owner)
+    if flow is None or str(flow.preview_safe.get("mode") or "") != "media_hygiene":
+        raise AgentToolError(
+            "媒体名称清理预览已过期，请重新生成", code="confirmation_stale"
+        )
+    return execute_guangya_rename_confirmed(arguments, expected_context, context)
+
+
+def execute_guangya_rename(_arguments: dict[str, Any]) -> ToolResult:
+    raise AgentToolError("光鸭重命名必须先预览并确认", code="confirmation_required")
 
 
 def execute_guangya_rename_confirmed(
@@ -721,19 +625,10 @@ def execute_guangya_rename_confirmed(
 
         confirmed_mode = str(confirmed.get("mode") or "")
         media_hygiene = confirmed_mode == "media_hygiene"
-        declarative = confirmed_mode == "declarative"
-        operation = (
-            "光鸭媒体名称清理" if media_hygiene else (
-                "光鸭声明式改名" if declarative else "光鸭重命名"
-            )
-        )
+        operation = "光鸭媒体名称清理" if media_hygiene else "光鸭批量名称转换"
         task = get_organize_manager().start_durable_operation(
             operation,
-            (
-                "已确认媒体名称清理计划" if media_hygiene else (
-                    "已确认声明式改名计划" if declarative else "已确认重命名计划"
-                )
-            ),
+            "已确认媒体名称清理计划" if media_hygiene else "已确认批量名称转换计划",
             job_kind="agent_guangya_rename",
             owner=context.owner,
             payload={
@@ -797,10 +692,13 @@ def execute_durable_guangya_rename_job(
     stats = result.setdefault("stats", {})
     plan_mode = str(plan.get("mode") or "")
     transform = plan.get("transform") if isinstance(plan.get("transform"), dict) else {}
-    should_trigger_strm = bool(
-        plan_mode == "media_hygiene"
-        or (plan_mode == "declarative" and str(transform.get("trigger_strm") or "") == "1")
+    # 仅为升级前已经确认并入队的旧声明式计划保留执行兼容；
+    # 注册层、参数校验和新计划构建入口均已移除。
+    legacy_strm_linked = bool(
+        plan_mode == "declarative"
+        and str(transform.get("trigger_strm") or "") == "1"
     )
+    should_trigger_strm = plan_mode == "media_hygiene" or legacy_strm_linked
     if should_trigger_strm and int(stats.get("renamed") or 0) > 0:
         try:
             from app.modules.scheduler import get_scheduler

@@ -18,6 +18,7 @@ from app.agent.session_context import AgentContextWriteGuard, AgentSessionContex
 from app.agent.organize_actions import _configured_sources
 from app.clients.guangya import GuangYaClient
 from app.modules.offline import OfflineRules
+from app.modules.guangya_workspace import resolve_workspace_path
 from app.modules.guangya_residual_cleanup import (
     GuangYaCleanupPlanError,
     GuangYaCleanupPlanStale,
@@ -333,8 +334,18 @@ def _configured_cleanup_sources() -> list[dict[str, str]]:
 def guangya_cleanup_preview_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("残留清理参数必须是对象")
-    if set(arguments) - {"max_candidates", "scope"}:
+    if set(arguments) - {"path", "max_candidates", "scope"}:
         raise AgentToolError("残留清理包含不支持的参数")
+    path = str(arguments.get("path") or "").strip().replace("\\", "/")
+    if path:
+        if not path.startswith("/"):
+            path = "/" + path
+        if (
+            path == "/"
+            or len(path) > 2048
+            or any(part in {".", ".."} for part in path.split("/") if part)
+        ):
+            raise AgentToolError("path 必须是非根目录的精确光鸭绝对路径")
     scope = str(arguments.get("scope") or "all").strip().casefold()
     if scope not in _CLEANUP_SCOPES:
         raise AgentToolError("scope 只能是 all 或 empty_only")
@@ -346,7 +357,7 @@ def guangya_cleanup_preview_arguments(arguments: dict[str, Any]) -> dict[str, An
         raise AgentToolError(
             f"max_candidates 必须在 1 到 {_MAX_FROZEN_CANDIDATES} 之间"
         )
-    return {"max_candidates": maximum, "scope": scope}
+    return {"path": path, "max_candidates": maximum, "scope": scope}
 
 
 def guangya_cleanup_classify_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -493,13 +504,23 @@ def preview_guangya_cleanup(
     if not context.owner:
         raise AgentToolError("残留清理需要已登录会话", code="precondition_failed")
     previous, guard = _begin_update(context.owner)
-    sources = _configured_cleanup_sources()
+    requested_path = str(arguments.get("path") or "").strip()
     scope = str(arguments.get("scope") or "all")
     build_maximum = 1 if scope == "empty_only" else int(arguments["max_candidates"])
     client = GuangYaClient()
     try:
         if not client.logged_in:
             raise AgentToolError("光鸭账号尚未连接", code="precondition_failed")
+        if requested_path:
+            target = resolve_workspace_path(client, requested_path)
+            if not target.is_dir or str(target.file_id) in {"", "0"}:
+                raise AgentToolError(
+                    "指定的光鸭清理范围不是有效目录",
+                    code="precondition_failed",
+                )
+            sources = [{"id": str(target.file_id), "name": str(target.name)}]
+        else:
+            sources = _configured_cleanup_sources()
         plan = build_cleanup_plan(
             client,
             owner=context.owner,

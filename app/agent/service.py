@@ -30,6 +30,10 @@ from app.agent.guangya_workspace_actions import (
     configure_guangya_workspace_context,
     reset_guangya_workspace_context_for_tests,
 )
+from app.agent.guangya_fs_change_actions import (
+    configure_guangya_fs_change_context,
+    reset_guangya_fs_change_context_for_tests,
+)
 from app.agent.recent_download_submissions import (
     RecentDownloadSubmissionStore,
     enqueue_recent_download_library_verification,
@@ -57,6 +61,7 @@ def get_agent_service() -> AgentOrchestrator:
                 configure_guangya_rename_context(context_repository)
                 configure_guangya_cleanup_context(context_repository)
                 configure_guangya_workspace_context(context_repository)
+                configure_guangya_fs_change_context(context_repository)
                 missing_workflow_repository = SQLiteMissingMediaWorkflowRepository()
                 _service = AgentOrchestrator(
                     build_tool_registry(),
@@ -96,3 +101,4 @@ def reset_agent_service_for_tests() -> None:
         reset_guangya_rename_context_for_tests()
         reset_guangya_cleanup_context_for_tests()
         reset_guangya_workspace_context_for_tests()
+        reset_guangya_fs_change_context_for_tests()

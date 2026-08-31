@@ -1,4 +1,5 @@
-"""光鸭目录观察与声明式改名链路测试。"""
+"""光鸭只读工作区快照的持久化与公开投影测试。"""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -8,15 +9,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-from app.agent import guangya_rename_actions as rename_actions
 from app.agent import guangya_workspace_actions as workspace_actions
-from app.agent.models import RiskLevel, ToolContext
-from app.agent.orchestrator import AgentOrchestrator
-from app.agent.registry import AgentToolError
+from app.agent.models import ToolContext
 from app.agent.result_projection import project_agent_response_for_llm
-from app.agent.tools import build_tool_registry
 from app.clients.guangya import GuangYaFile
-from app.modules import guangya_rename
 from app.modules import guangya_workspace
 
 
@@ -61,14 +57,6 @@ class FakeWorkspaceClient:
                     return deepcopy(item)
         return None
 
-    def rename(self, file_id, new_name):
-        for items in self.directories.values():
-            for item in items:
-                if item.file_id == str(file_id):
-                    item.name = str(new_name)
-                    return True
-        raise RuntimeError("missing")
-
     def close(self):
         self.closed = True
 
@@ -76,24 +64,13 @@ class FakeWorkspaceClient:
 class GuangYaWorkspaceAgentTests(unittest.TestCase):
     def setUp(self):
         workspace_actions.reset_guangya_workspace_context_for_tests()
-        rename_actions.reset_guangya_rename_context_for_tests()
         self.temp = tempfile.TemporaryDirectory()
         self.obs_dir = Path(self.temp.name) / "observations"
-        self.rename_dir = Path(self.temp.name) / "rename"
         self.patches = [
             mock.patch.object(guangya_workspace, "_directory", return_value=self.obs_dir),
             mock.patch.object(guangya_workspace, "get_web_secret", return_value="test-secret"),
             mock.patch.object(
                 guangya_workspace, "organize_operation_owner_digest",
-                side_effect=lambda owner: f"digest:{owner}",
-            ),
-            mock.patch.object(guangya_rename, "_plan_directory", return_value=self.rename_dir),
-            mock.patch.object(guangya_rename, "get_web_secret", return_value="test-secret"),
-            mock.patch.object(
-                guangya_rename, "_owner_digest", side_effect=lambda owner: f"digest:{owner}"
-            ),
-            mock.patch.object(
-                rename_actions, "organize_operation_owner_digest",
                 side_effect=lambda owner: f"digest:{owner}",
             ),
         ]
@@ -104,22 +81,21 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
         for patcher in reversed(self.patches):
             patcher.stop()
         workspace_actions.reset_guangya_workspace_context_for_tests()
-        rename_actions.reset_guangya_rename_context_for_tests()
         self.temp.cleanup()
 
-    def _inspect(self, client, **overrides):
-        arguments = workspace_actions.guangya_directory_inspect_arguments({
-            "path": "a", "recursive": True, "page": 1,
+    def _query(self, client, **overrides):
+        arguments = workspace_actions.guangya_fs_query_arguments({
+            "operation": "tree", "path": "/a", "page": 1,
             "page_size": 10, "max_items": 100,
             **overrides,
         })
         with mock.patch.object(workspace_actions, "GuangYaClient", return_value=client):
-            return workspace_actions.inspect_guangya_directory(
+            return workspace_actions.query_guangya_filesystem(
                 arguments, ToolContext(owner="owner", session_id="session")
             )
 
     def test_directory_observation_returns_names_and_opaque_refs_without_ids(self):
-        result = self._inspect(FakeWorkspaceClient())
+        result = self._query(FakeWorkspaceClient())
         self.assertTrue(result.ok)
         self.assertRegex(result.data["observation_ref"], r"^OBS[0-9A-F]{32}$")
         self.assertEqual(result.data["total"], 4)
@@ -133,12 +109,12 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
             self.assertNotIn("path", item)
 
     def test_observation_can_continue_by_ref_and_is_owner_bound(self):
-        first = self._inspect(FakeWorkspaceClient(), page_size=2)
-        arguments = workspace_actions.guangya_directory_inspect_arguments({
+        first = self._query(FakeWorkspaceClient(), page_size=2)
+        arguments = workspace_actions.guangya_fs_query_arguments({
             "observation_ref": first.data["observation_ref"],
             "page": 2, "page_size": 2,
         })
-        second = workspace_actions.inspect_guangya_directory(
+        second = workspace_actions.query_guangya_filesystem(
             arguments, ToolContext(owner="owner", session_id="session")
         )
         self.assertEqual(second.data["page"], 2)
@@ -149,10 +125,10 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
             )
 
     def test_llm_projection_preserves_public_names_and_object_refs(self):
-        observed = self._inspect(FakeWorkspaceClient(), page_size=4)
+        observed = self._query(FakeWorkspaceClient(), page_size=4)
         projected = project_agent_response_for_llm({
             "mode": "read_only",
-            "tool_call": {"name": "guangya.directory.inspect"},
+            "tool_call": {"name": "guangya.fs.query"},
             "result": observed.to_dict(),
         })
         serialized = str(projected)
@@ -163,37 +139,13 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
         self.assertNotIn("内部检查", serialized)
         self.assertNotIn("spam-etag", serialized)
 
-    def test_declarative_preview_uses_latest_observation_and_freezes_safe_rename(self):
-        client = FakeWorkspaceClient()
-        observed = self._inspect(client)
-        spam = next(
-            item for item in observed.data["entries"]
-            if item["object_name"] == "[最新地址]ABC-123.mp4"
-        )
-        arguments = rename_actions.guangya_change_plan_preview_arguments({
-            "operations": [{
-                "op": "rename",
-                "object_ref": spam["object_ref"],
-                "new_name": "ABC-123.mp4",
-            }],
-            "trigger_strm": True,
-        })
-        with mock.patch.object(rename_actions, "GuangYaClient", return_value=client):
-            preview = rename_actions.preview_guangya_change_plan(
-                arguments, ToolContext(owner="owner", session_id="session")
-            )
-        self.assertEqual(preview.status, "ready")
-        self.assertEqual(preview.data["mode"], "declarative")
-        self.assertEqual(preview.data["rename_count"], 1)
-        self.assertTrue(preview.data["trigger_strm"])
-        self.assertIn("ABC-123.mp4", preview.data["sample_changes"][0])
-
     def test_expired_observation_is_removed_by_maintenance(self):
         client = FakeWorkspaceClient()
         with mock.patch.object(guangya_workspace.time, "time", return_value=1_000.0):
-            observed = self._inspect(client)
-        ref = observed.data["observation_ref"]
-        plan_id = guangya_workspace.observation_plan_id(ref)
+            observed = self._query(client)
+        plan_id = guangya_workspace.observation_plan_id(
+            observed.data["observation_ref"]
+        )
         self.assertTrue(guangya_workspace._plan_path(plan_id).is_file())
 
         with mock.patch.object(
@@ -205,171 +157,6 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
         self.assertEqual(result["removed"], 1)
         self.assertEqual(result["remaining"], 0)
         self.assertFalse(guangya_workspace._plan_path(plan_id).exists())
-
-    def test_declarative_preview_rejects_changed_snapshot(self):
-        client = FakeWorkspaceClient()
-        observed = self._inspect(client)
-        spam = next(
-            item for item in observed.data["entries"]
-            if item["object_name"] == "[最新地址]ABC-123.mp4"
-        )
-        client.directories["a"][0].name = "已被外部修改-ABC-123.mp4"
-        arguments = rename_actions.guangya_change_plan_preview_arguments({
-            "observation_ref": observed.data["observation_ref"],
-            "operations": [{
-                "object_ref": spam["object_ref"],
-                "new_name": "ABC-123.mp4",
-            }],
-        })
-        with (
-            mock.patch.object(rename_actions, "GuangYaClient", return_value=client),
-            self.assertRaisesRegex(Exception, "目录对象已变化"),
-        ):
-            rename_actions.preview_guangya_change_plan(
-                arguments, ToolContext(owner="owner", session_id="session")
-            )
-
-    def test_declarative_preview_rejects_extension_change(self):
-        client = FakeWorkspaceClient()
-        observed = self._inspect(client)
-        spam = next(
-            item for item in observed.data["entries"]
-            if item["object_name"] == "[最新地址]ABC-123.mp4"
-        )
-        arguments = rename_actions.guangya_change_plan_preview_arguments({
-            "observation_ref": observed.data["observation_ref"],
-            "operations": [{
-                "object_ref": spam["object_ref"],
-                "new_name": "ABC-123.mkv",
-            }],
-        })
-        with (
-            mock.patch.object(rename_actions, "GuangYaClient", return_value=client),
-            self.assertRaisesRegex(Exception, "扩展名"),
-        ):
-            rename_actions.preview_guangya_change_plan(
-                arguments, ToolContext(owner="owner", session_id="session")
-            )
-
-    def test_declarative_confirmation_submits_existing_durable_rename_queue(self):
-        client = FakeWorkspaceClient()
-        observed = self._inspect(client)
-        spam = next(
-            item for item in observed.data["entries"]
-            if item["object_name"] == "[最新地址]ABC-123.mp4"
-        )
-        arguments = rename_actions.guangya_change_plan_preview_arguments({
-            "observation_ref": observed.data["observation_ref"],
-            "operations": [{
-                "object_ref": spam["object_ref"], "new_name": "ABC-123.mp4"
-            }],
-        })
-        context = ToolContext(owner="owner", session_id="session")
-        with mock.patch.object(rename_actions, "GuangYaClient", return_value=client):
-            rename_actions.preview_guangya_change_plan(arguments, context)
-            service = AgentOrchestrator(build_tool_registry())
-            manager = mock.Mock()
-            manager.start_durable_operation.return_value = {
-                "ok": True, "task_id": "a" * 32,
-                "queued": True, "queue_position": 1,
-            }
-            with mock.patch(
-                "app.modules.organize_tasks.get_organize_manager", return_value=manager
-            ):
-                with self.assertRaises(AgentToolError) as removed:
-                    service.prepare(
-                        "guangya.change_plan.execute", {}, owner="owner"
-                    )
-                self.assertEqual(removed.exception.code, "tool_not_found")
-                prepared = service.prepare(
-                    "guangya.rename.execute", {}, owner="owner"
-                )
-                accepted = service.confirm(
-                    prepared["action_plan"]["plan_id"], owner="owner"
-                )
-        self.assertEqual(prepared["tool_call"]["name"], "guangya.rename.execute")
-        self.assertEqual(accepted["result"]["status"], "accepted")
-        self.assertEqual(
-            manager.start_durable_operation.call_args.kwargs["job_kind"],
-            "agent_guangya_rename",
-        )
-        self.assertEqual(
-            manager.start_durable_operation.call_args.args[0], "光鸭声明式改名"
-        )
-
-    def test_declarative_durable_result_triggers_strm_only_when_requested(self):
-        scheduler = mock.Mock()
-        scheduler.trigger.return_value = {"ok": True, "queued": True}
-        with (
-            mock.patch.object(
-                rename_actions, "load_rename_plan",
-                return_value={"mode": "declarative", "transform": {"trigger_strm": "1"}},
-            ),
-            mock.patch.object(
-                rename_actions, "execute_rename_plan",
-                return_value={"partial": False, "stats": {"renamed": 1}},
-            ),
-            mock.patch("app.modules.scheduler.get_scheduler", return_value=scheduler),
-        ):
-            result = rename_actions.execute_durable_guangya_rename_job({
-                "plan_id": "a" * 32, "plan_fingerprint": "b" * 64,
-            })
-        scheduler.trigger.assert_called_once_with(
-            "organize", force_full=True, sync_mode="full"
-        )
-        self.assertEqual(result["stats"]["strm_triggered"], 1)
-
-
-    def test_declarative_plan_reuses_one_listing_per_parent(self):
-        client = FakeWorkspaceClient()
-        observed = self._inspect(client)
-        selected = [
-            item for item in observed.data["entries"]
-            if item["object_name"] in {"[最新地址]ABC-123.mp4", "DEF-456.mp4"}
-        ]
-        client.list_calls.clear()
-        arguments = rename_actions.guangya_change_plan_preview_arguments({
-            "observation_ref": observed.data["observation_ref"],
-            "operations": [
-                {
-                    "object_ref": selected[0]["object_ref"],
-                    "new_name": "ABC-123.mp4",
-                },
-                {
-                    "object_ref": selected[1]["object_ref"],
-                    "new_name": "DEF-456-clean.mp4",
-                },
-            ],
-        })
-        with mock.patch.object(rename_actions, "GuangYaClient", return_value=client):
-            preview = rename_actions.preview_guangya_change_plan(
-                arguments, ToolContext(owner="owner", session_id="session")
-            )
-        self.assertEqual(preview.data["rename_count"], 2)
-        self.assertEqual(client.list_calls.count("a"), 1)
-
-    def test_declarative_builder_rejects_forged_owner_and_expired_snapshot(self):
-        client = FakeWorkspaceClient()
-        observed = self._inspect(client)
-        payload = guangya_workspace.load_directory_observation(
-            observed.data["observation_ref"], owner="owner"
-        )
-        handle = payload["entries"][0]["handle"]
-        operation = [{"handle": handle, "new_name": "ABC-123.mp4"}]
-
-        forged = deepcopy(payload)
-        forged["owner_digest"] = "digest:other-owner"
-        with self.assertRaisesRegex(Exception, "不属于当前会话"):
-            guangya_workspace.build_declarative_rename_plan(
-                client, owner="owner", observation=forged, operations=operation
-            )
-
-        expired = deepcopy(payload)
-        expired["expires_at_epoch"] = 0
-        with self.assertRaisesRegex(Exception, "已过期"):
-            guangya_workspace.build_declarative_rename_plan(
-                client, owner="owner", observation=expired, operations=operation
-            )
 
     def test_observation_capacity_is_fair_per_owner(self):
         client = FakeWorkspaceClient()
@@ -438,9 +225,9 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
             mock.patch.object(workspace_actions, "GuangYaClient", return_value=client),
             self.assertRaisesRegex(Exception, "更新请求取代"),
         ):
-            workspace_actions.inspect_guangya_directory(
-                workspace_actions.guangya_directory_inspect_arguments({
-                    "path": "/a", "recursive": False, "page": 1,
+            workspace_actions.query_guangya_filesystem(
+                workspace_actions.guangya_fs_query_arguments({
+                    "operation": "list", "path": "/a", "page": 1,
                     "page_size": 10, "max_items": 10,
                 }),
                 ToolContext(owner="owner", session_id="session"),
@@ -450,21 +237,6 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
             [path.stem for path in self.obs_dir.glob("*.json")],
             [previous["plan_id"]],
         )
-
-    def test_registry_exposes_observe_plan_and_confirmed_execute(self):
-        registry = build_tool_registry()
-        capabilities = {item["name"]: item for item in registry.capabilities()}
-        self.assertEqual(
-            capabilities["guangya.directory.inspect"]["risk"], RiskLevel.READ.value
-        )
-        self.assertEqual(
-            capabilities["guangya.change_plan.preview"]["risk"], RiskLevel.READ.value
-        )
-        self.assertNotIn("guangya.change_plan.execute", capabilities)
-        self.assertEqual(
-            capabilities["guangya.rename.execute"]["risk"], RiskLevel.DANGER.value
-        )
-        self.assertTrue(capabilities["guangya.rename.execute"]["requires_confirmation"])
 
 
 if __name__ == "__main__":

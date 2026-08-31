@@ -62,16 +62,30 @@ class AgentCapabilityRetrievalTests(unittest.TestCase):
         self.assertIn("guangya.media_hygiene.preview", names)
         self.assertIn("guangya.organize.cleanup.preview", names)
 
-    def test_guangya_directory_analysis_recalls_observation_and_declarative_plan(self):
+    def test_guangya_directory_analysis_recalls_generic_query_and_change_plan(self):
         names = self._names("看看光鸭 a 目录里面有哪些文件，分析文件名垃圾前缀")
 
-        self.assertIn("guangya.directory.inspect", names)
-        self.assertIn("guangya.change_plan.preview", names)
+        self.assertIn("guangya.fs.query", names)
+        self.assertTrue({
+            "guangya.media_hygiene.preview", "guangya.rename.preview",
+        } & names)
 
-    def test_followup_object_reference_recalls_declarative_plan(self):
+    def test_followup_object_reference_recalls_generic_change_plan(self):
         names = self._names("根据刚才看到的对象引用生成精确改名计划")
 
-        self.assertIn("guangya.change_plan.preview", names)
+        self.assertIn("guangya.fs.change.preview", names)
+
+    def test_exact_guangya_residual_cleanup_recalls_generic_query_and_targeted_cleanup(self):
+        names = self._names("清理光鸭根目录 3 文件夹中的垃圾残余目录")
+
+        self.assertIn("guangya.fs.query", names)
+        self.assertIn("guangya.organize.cleanup.preview", names)
+        self.assertIn("guangya.fs.change.preview", names)
+
+    def test_guangya_recycle_bin_followup_recalls_generic_change_plan(self):
+        names = self._names("把刚才看到的对象移入光鸭回收站")
+
+        self.assertIn("guangya.fs.change.preview", names)
 
     def test_episode_numbering_recalls_fact_sources_without_resource_takeover(self):
         profile = infer_media_intent("第三季第22集是多少集？")

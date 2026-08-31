@@ -28,6 +28,7 @@ _CONTEXT_TYPES = frozenset({
     "guangya_rename",
     "guangya_cleanup",
     "guangya_workspace",
+    "guangya_fs_change",
 })
 _SCHEMA_VERSION = 1
 _DEFAULT_MAX_PAYLOAD_BYTES = 32 * 1024

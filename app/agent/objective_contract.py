@@ -659,18 +659,19 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             required_sources=("system_state",),
             forbidden_sources=("public_web", "resource_index"),
             allowed_tools=(
-                "guangya.directory.inspect",
+                "guangya.fs.query",
+                "guangya.fs.change.preview",
+                "guangya.fs.change.execute",
                 "guangya.media_hygiene.preview",
                 "guangya.rename.preview",
                 "guangya.rename.execute",
-                "guangya.change_plan.preview",
             ),
             max_provider_requests=5,
             max_tool_rounds=4,
             max_tool_calls=5,
-            max_capabilities=5,
+            max_capabilities=8,
             parallel_reads=False,
-            completion_rule="先检查对象并生成冻结改名计划；优先使用专用高置信清理，无法表达时才使用声明式计划，执行前必须确认。",
+            completion_rule="先通过通用文件查询读取对象，再生成冻结变更计划；媒体名称清理优先使用专用高置信流程，执行前必须确认。",
         )
 
     if _GUANGYA_ORGANIZE_STATUS_RE.search(text):
