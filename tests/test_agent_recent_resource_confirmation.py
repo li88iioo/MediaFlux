@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from app import database as db
 from app.agent.action_history import action_history_owner_digest
 from app.agent.confirmation import ConfirmationStore
+from app.agent.ingest_actions import ingest_submit_arguments
 from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
@@ -268,11 +269,11 @@ class RecentResourceSubmitIntentTests(unittest.TestCase):
     def test_batch_parser_requires_multiple_positions_and_target(self):
         self.assertEqual(
             recent_resource_batch_submit_request("把刚才第1个和第2个到 qB"),
-            {"positions": [1, 2], "target": "qb"},
+            {"source_type": "resource_candidates", "positions": [1, 2], "target": "qb"},
         )
         self.assertEqual(
             recent_resource_batch_submit_request("把刚才前3个到光鸭"),
-            {"positions": [1, 2, 3], "target": "guangya"},
+            {"source_type": "resource_candidates", "positions": [1, 2, 3], "target": "guangya"},
         )
         self.assertIsNone(
             recent_resource_batch_submit_request("把刚才第1个到 qB")
@@ -281,15 +282,15 @@ class RecentResourceSubmitIntentTests(unittest.TestCase):
     def test_parser_requires_recent_reference_and_write_action(self):
         self.assertEqual(
             recent_resource_submit_request("下载刚才推荐的第 2 个到 qBittorrent"),
-            {"position": 2, "target": "qb"},
+            {"source_type": "resource_candidates", "positions": [2], "target": "qb"},
         )
         self.assertEqual(
             recent_resource_submit_request("把上次资源结果第一个同时推送到 qB 和光鸭"),
-            {"position": 1, "target": "both"},
+            {"source_type": "resource_candidates", "positions": [1], "target": "both"},
         )
         self.assertEqual(
             recent_resource_submit_request("推送最近的推荐第十项到光鸭"),
-            {"position": 10, "target": "guangya"},
+            {"source_type": "resource_candidates", "positions": [10], "target": "guangya"},
         )
         self.assertTrue(is_recent_resource_submit_message("下载刚才推荐的第1个到qb"))
         self.assertFalse(is_recent_resource_submit_message("推荐几部电影"))
@@ -308,28 +309,28 @@ class RecentResourceSubmitIntentTests(unittest.TestCase):
             )
         self.assertEqual(
             recent_resource_submit_request("下载刚才推荐的第 1 个到 qB 或光鸭"),
-            {"position": 1, "target": None},
+            {"source_type": "resource_candidates", "positions": [1], "target": None},
         )
         self.assertIsNone(recent_resource_submit_request("下载第 2 个"))
         self.assertEqual(
             recent_resource_submit_request("下载第 2 个", allow_implicit=True),
-            {"position": 2, "target": None},
+            {"source_type": "resource_candidates", "positions": [2], "target": None},
         )
         self.assertEqual(
             recent_resource_submit_request("第二个下到光鸭", allow_implicit=True),
-            {"position": 2, "target": "guangya"},
+            {"source_type": "resource_candidates", "positions": [2], "target": "guangya"},
         )
         self.assertEqual(
             recent_resource_submit_request("第 2 个到两边", allow_implicit=True),
-            {"position": 2, "target": "both"},
+            {"source_type": "resource_candidates", "positions": [2], "target": "both"},
         )
         self.assertEqual(
             recent_resource_submit_request("就要3号", allow_implicit=True),
-            {"position": 3, "target": None},
+            {"source_type": "resource_candidates", "positions": [3], "target": None},
         )
         self.assertEqual(
             recent_resource_submit_request("下载34集到qb", allow_implicit=True),
-            {"position": None, "target": "qb", "episode": 34},
+            {"source_type": "resource_candidates", "positions": [], "target": "qb", "episode": 34},
         )
 
 
@@ -340,7 +341,7 @@ class RecentResourceDownloadFollowupDispatchTests(unittest.TestCase):
             (
                 "下载刚才推荐的第 1 个到 qB",
                 "_continue_recent_resource_submit",
-                {"position": 1, "target": "qb"},
+                {"source_type": "resource_candidates", "positions": [1], "target": "qb"},
             ),
             (
                 "刚才下载的缺集入库了吗",
@@ -520,33 +521,43 @@ class RecentResourceConfirmationTests(unittest.TestCase):
                 ],
             })
 
+        def normalize_ingest(arguments: dict):
+            return ingest_submit_arguments(arguments)
+
+        def prepare_ingest(arguments: dict, context: ToolContext):
+            positions = arguments["positions"]
+            if len(positions) == 1:
+                return prepare_one(
+                    {"position": positions[0], "target": arguments["target"]}, context
+                )
+            return prepare_batch(
+                {"positions": positions, "target": arguments["target"]}, context
+            )
+
+        def confirm_ingest(arguments: dict, expected: str, context: ToolContext):
+            positions = arguments["positions"]
+            if len(positions) == 1:
+                result = confirm_one(
+                    {"position": positions[0], "target": arguments["target"]},
+                    expected, context,
+                )
+            else:
+                result = confirm_batch(
+                    {"positions": positions, "target": arguments["target"]},
+                    expected, context,
+                )
+            result.data["source_type"] = "resource_candidates"
+            return result
+
         registry.register(ToolSpec(
-            name="indexer.submit_candidate",
-            description="submit",
+            name="ingest.submit",
+            description="unified resource submit",
             risk=RiskLevel.DANGER,
             parameters={},
-            validator=lambda arguments: {
-                "position": int(arguments.get("position") or 0),
-                "target": str(arguments.get("target") or ""),
-            },
-            handler=lambda _arguments: ToolResult(False, "confirmation_required", "confirm"),
+            validator=normalize_ingest,
             requires_confirmation=True,
-            context_confirmation_preparer=prepare_one,
-            context_confirmed_handler=confirm_one,
-        ))
-        registry.register(ToolSpec(
-            name="indexer.submit_candidates",
-            description="batch submit",
-            risk=RiskLevel.DANGER,
-            parameters={},
-            validator=lambda arguments: {
-                "positions": list(arguments.get("positions") or []),
-                "target": str(arguments.get("target") or ""),
-            },
-            handler=lambda _arguments: ToolResult(False, "confirmation_required", "confirm"),
-            requires_confirmation=True,
-            context_confirmation_preparer=prepare_batch,
-            context_confirmed_handler=confirm_batch,
+            context_confirmation_preparer=prepare_ingest,
+            context_confirmed_handler=confirm_ingest,
         ))
         service = AgentOrchestrator(
             registry,
@@ -568,12 +579,12 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         )
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(
-            prepared["tool_call"]["name"], "indexer.submit_candidates"
+            prepared["tool_call"]["name"], "ingest.submit"
         )
         self.assertEqual(execute_calls, [])
 
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="session-a"
+            prepared["action_plan"]["plan_id"], owner="session-a"
         )
         self.assertEqual(len(execute_calls), 1)
         self.assertEqual(confirmed["result"]["status"], "partial")
@@ -596,7 +607,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             self.assertNotIn(secret, serialized)
         with self.assertRaises(AgentToolError):
             service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="session-a"
+                prepared["action_plan"]["plan_id"], owner="session-a"
             )
 
     def test_same_query_can_prepare_a_staged_owner_bound_resource(self):
@@ -609,8 +620,8 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             )
             result_id = searched["result"]["data"]["items"][0]["result_id"]
             prepared = service.prepare(
-                "indexer.submit_candidate",
-                {"position": 1, "target": "qb"},
+                "ingest.submit",
+                {"source_type": "resource_candidates", "positions": [1], "target": "qb"},
                 owner="session-a",
             )
 
@@ -781,7 +792,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         self.assertEqual(execute_calls, [])
 
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="session-a"
+            prepared["action_plan"]["plan_id"], owner="session-a"
         )
         self.assertEqual(confirmed["mode"], "confirmed_action")
         self.assertEqual(execute_calls, [{
@@ -797,7 +808,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
                 needs_target = service.query("下载第1个", owner="session-a")
                 context = [{
                     "role": "assistant",
-                    "tool_name": "indexer.submit_candidate",
+                    "tool_name": "ingest.submit",
                     "status": "selection_required",
                     "text": needs_target["result"]["summary"],
                 }]
@@ -819,7 +830,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
         needs_target = service.query("下载第1个", owner="session-a")
         context = [{
             "role": "assistant",
-            "tool_name": "indexer.submit_candidate",
+            "tool_name": "ingest.submit",
             "status": "selection_required",
             "text": needs_target["result"]["summary"],
         }]
@@ -844,7 +855,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             owner="session-a",
             conversation_context=[{
                 "role": "assistant",
-                "tool_name": "indexer.submit_candidate",
+                "tool_name": "ingest.submit",
                 "status": "selection_required",
                 "text": "请选择一个下载目标。",
                 "pending_selection": pending,
@@ -1127,11 +1138,11 @@ class RecentResourceConfirmationTests(unittest.TestCase):
 
         response = service.query("下载刚才推荐的第 2 个到 qB", owner="session-a")
         self.assertEqual(response["mode"], "confirmation_required")
-        self.assertEqual(response["confirmation"]["tool"], "indexer.submit_candidate")
+        self.assertEqual(response["tool_call"]["name"], "ingest.submit")
         self.assertEqual(preview_calls, [{"result_id": "resource-result-0002", "target": "qb"}])
         self.assertEqual(execute_calls, [])
 
-        confirmed = service.confirm(response["confirmation"]["confirmation_id"], owner="session-a")
+        confirmed = service.confirm(response["action_plan"]["plan_id"], owner="session-a")
         self.assertEqual(confirmed["mode"], "confirmed_action")
         self.assertEqual(execute_calls, [{"result_id": "resource-result-0002", "target": "qb"}])
         verification = service.recent_download_store.get(owner="session-a")[0].verification
@@ -1175,7 +1186,7 @@ class RecentResourceConfirmationTests(unittest.TestCase):
 
         with self.assertLogs("app.agent.orchestrator", level="WARNING") as captured:
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="session-a"
+                prepared["action_plan"]["plan_id"], owner="session-a"
             )
 
         self.assertEqual(confirmed["mode"], "confirmed_action")
@@ -1305,7 +1316,7 @@ class RecentResourceRepairTrackingIntegrationTests(IsolatedDatabaseTestCase):
             owner="tg:v1:100\x1f200",
         )
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"],
+            prepared["action_plan"]["plan_id"],
             owner="tg:v1:100\x1f200",
         )
 
@@ -1369,7 +1380,7 @@ class RecentResourceRepairTrackingIntegrationTests(IsolatedDatabaseTestCase):
             owner_digest=action_history_owner_digest("tg:v1:100\x1f200"), limit=10
         )
         self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["tool_name"], "indexer.submit_candidate")
+        self.assertEqual(history[0]["tool_name"], "ingest.submit")
         serialized = repr(dict(history[0])) + repr(confirmed)
         for secret in (
             "magnet:",
@@ -1437,12 +1448,13 @@ class RecentResourceConfirmationAPITests(IsolatedDatabaseTestCase):
                 json={"session_id": "test_session_identifier_0001", "message": "下载刚才推荐的第 1 个到 qB"},
             )
             direct_cross_owner = self.client_b.post(
-                "/api/agent/actions/indexer.submit_candidate/prepare",
+                "/api/agent/actions/ingest.submit/prepare",
                 headers=headers_b,
                 json={
                     "session_id": "test_session_identifier_0001",
                     "arguments": {
-                        "result_id": "resource-result-0001",
+                        "source_type": "resource_candidates",
+                        "positions": [1],
                         "target": "qb",
                     },
                 },
@@ -1452,17 +1464,17 @@ class RecentResourceConfirmationAPITests(IsolatedDatabaseTestCase):
                 headers=headers_a,
                 json={"session_id": "test_session_identifier_0001", "message": "下载刚才推荐的第 1 个到 qB"},
             )
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            confirmation_id = prepared.json()["action_plan"]["plan_id"]
             wrong_owner = self.client_b.post(
                 "/api/agent/actions/confirm",
                 headers=headers_b,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(execute_calls, [])
             confirmed = self.client_a.post(
                 "/api/agent/actions/confirm",
                 headers=headers_a,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
 
         self.assertEqual(searched.status_code, 200, searched.text)

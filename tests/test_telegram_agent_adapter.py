@@ -615,6 +615,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             {
                 "action": "prepare_resource",
                 "result_id": "resource_result_123456",
+                "position": 1,
                 "target": "qb",
             },
         )
@@ -3610,7 +3611,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             {
                 "mode": "confirmed_action",
                 "tool_call": {
-                    "name": "indexer.submit_resource",
+                    "name": "ingest.submit",
                     "arguments": {"result_id": "private-result-id"},
                 },
                 "action_plan": {"plan_id": "private-plan-ticket-123456"},
@@ -4729,7 +4730,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                             },
                         },
                         {
-                            "tool": "indexer.submit_resource",
+                            "tool": "ingest.submit",
                             "episode_label": "S02E03",
                             "arguments": {"result_id": "private-result"},
                         },
@@ -5799,7 +5800,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 task_kind="action",
                 presentation="confirmation",
             ),
-            "tool_call": {"name": "indexer.submit_resource", "elapsed_ms": 3},
+            "tool_call": {"name": "ingest.submit", "elapsed_ms": 3},
             "result": {
                 "ok": True,
                 "summary": "确认后提交到 qBittorrent",
@@ -5851,12 +5852,15 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         ):
             handle_agent_callback(bot, prepare_call, _Telebot)
             service.prepare.assert_called_once_with(
-                "indexer.submit_resource",
-                {"result_id": "resource_result_123456", "target": "qb"},
+                "ingest.submit",
+                {
+                    "source_type": "resource_candidates",
+                    "positions": [1],
+                    "target": "qb",
+                },
                 owner="tg:v1:100\x1f200",
                 request_id=ANY,
                 session_id=ANY,
-                trusted_resource_owner_binding=True,
                 expected_owner_generation=1,
             )
             service.confirm.assert_not_called()
@@ -5917,7 +5921,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                     task_kind="action",
                     presentation="confirmation",
                 ),
-                "tool_call": {"name": "indexer.submit_resource", "elapsed_ms": 3},
+                "tool_call": {"name": "ingest.submit", "elapsed_ms": 3},
                 "result": {
                     "ok": True,
                     "summary": "确认后提交到 qBittorrent",
@@ -5987,7 +5991,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 task_kind="action",
                 presentation="confirmation",
             ),
-            "tool_call": {"name": "indexer.submit_resource", "elapsed_ms": 3},
+            "tool_call": {"name": "ingest.submit", "elapsed_ms": 3},
             "result": {
                 "ok": True,
                 "summary": "确认后提交到 qBittorrent",

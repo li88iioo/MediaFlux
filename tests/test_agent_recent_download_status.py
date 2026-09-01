@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app import database as db
 from app.agent.confirmation import ConfirmationStore
+from app.agent.ingest_actions import ingest_submit_arguments
 from app.agent.models import Evidence, RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
@@ -102,7 +103,7 @@ def _submission_agent(
     def confirmation_context(arguments: dict) -> str:
         if context is not None:
             return context["value"]
-        return f"{arguments['result_id']}:{arguments['target']}"
+        return f"{arguments['source_type']}:{arguments['positions']}:{arguments['target']}"
 
     def prepare_submission(arguments: dict) -> tuple[ToolResult, str]:
         return (
@@ -125,14 +126,11 @@ def _submission_agent(
         return result
 
     registry.register(ToolSpec(
-        name="indexer.submit_candidate",
+        name="ingest.submit",
         description="submit",
         risk=RiskLevel.DANGER,
         parameters={},
-        validator=lambda arguments: {
-            "result_id": str(arguments.get("result_id") or ""),
-            "target": str(arguments.get("target") or ""),
-        },
+        validator=ingest_submit_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_submission),
         context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirm_submission),
@@ -478,8 +476,8 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         prepared = service.prepare(
-            "indexer.submit_candidate",
-            {"result_id": "safe-result-00000001", "target": "qb"},
+            "ingest.submit",
+            {"source_type": "resource_candidates", "positions": [1], "target": "qb"},
             owner="session-a",
         )
         before = service.query("刚才下载到哪了", owner="session-a")
@@ -503,8 +501,8 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         prepared = service.prepare(
-            "indexer.submit_candidate",
-            {"result_id": "safe-result-00000001", "target": "qb"},
+            "ingest.submit",
+            {"source_type": "resource_candidates", "positions": [1], "target": "qb"},
             owner="session-a",
         )
         confirmation_id = prepared["action_plan"]["plan_id"]
@@ -534,8 +532,8 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         expired = expired_service.prepare(
-            "indexer.submit_candidate",
-            {"result_id": "safe-result-00000001", "target": "qb"},
+            "ingest.submit",
+            {"source_type": "resource_candidates", "positions": [1], "target": "qb"},
             owner="session-a",
         )
         now[0] = 6.0
@@ -553,8 +551,8 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             "indexer.search_resources", {"title": "Safe Resource"}, owner="session-a"
         )
         stale = stale_service.prepare(
-            "indexer.submit_candidate",
-            {"result_id": "safe-result-00000001", "target": "qb"},
+            "ingest.submit",
+            {"source_type": "resource_candidates", "positions": [1], "target": "qb"},
             owner="session-a",
         )
         context["value"] = "two"
@@ -664,9 +662,9 @@ class RecentDownloadStatusAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(searched.status_code, 200, searched.text)
 
             prepared = self.client_a.post(
-                "/api/agent/actions/indexer.submit_candidate/prepare",
+                "/api/agent/actions/ingest.submit/prepare",
                 headers=headers_a,
-                json={"session_id": "test_session_identifier_0001", "arguments": {"result_id": "safe-result-00000001", "target": "qb"}},
+                json={"session_id": "test_session_identifier_0001", "arguments": {"source_type": "resource_candidates", "positions": [1], "target": "qb"}},
             )
             confirmed = self.client_a.post(
                 "/api/agent/actions/confirm",

@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import app.modules.directory_scrape as directory_scrape_module
 import app.modules.local_media_service as local_media_module
 from app.agent.guangya_schedule_config_actions import get_guangya_connection_status
-from app.agent.indexer_actions import _target_readiness
+from app.agent.indexer_actions import download_target_readiness
 from app.agent.organize_actions import _run_guangya_organize_once
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.clients.tmdb import TMDBClient
@@ -600,7 +600,7 @@ class ClientResourceLifecycleTests(unittest.TestCase):
             "app.agent.indexer_actions.GuangYaClient",
             return_value=indexer_client,
         ):
-            self.assertEqual(_target_readiness("guangya"), {"guangya": True})
+            self.assertEqual(download_target_readiness("guangya"), {"guangya": True})
         indexer_client.close.assert_called_once_with()
 
     def test_share_client_scope_closes_only_internal_client(self) -> None:

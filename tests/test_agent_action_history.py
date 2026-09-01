@@ -159,7 +159,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
     def test_projection_keeps_only_strict_safe_fields(self):
         record_confirmed_result(
             owner=OWNER,
-            tool_name="indexer.submit_candidate",
+            tool_name="ingest.submit",
             risk=RiskLevel.DANGER,
             result=ToolResult(
                 ok=True,
@@ -210,7 +210,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         }
         record_confirmed_result(
             owner=OWNER,
-            tool_name="indexer.submit_candidate",
+            tool_name="ingest.submit",
             risk=RiskLevel.DANGER,
             result=ToolResult(
                 ok=True,

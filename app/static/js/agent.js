@@ -2563,10 +2563,10 @@
         const pending = appendPendingMessage();
         const startedAt = performance.now();
         try {
-            const payload = await fetchJSON('/api/agent/actions/indexer.submit_candidate/prepare', {
+            const payload = await fetchJSON('/api/agent/actions/ingest.submit/prepare', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(sessionPayload({arguments: {position, target}}, requestSessionId)),
+                body: JSON.stringify(sessionPayload({arguments: {source_type: 'resource_candidates', positions: [position], target}}, requestSessionId)),
                 signal: controller.signal,
             });
             await sleep(Math.max(0, MIN_PENDING_MS - (performance.now() - startedAt)));

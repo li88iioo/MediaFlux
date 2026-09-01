@@ -536,8 +536,9 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
         allowed = [
             "indexer.search_resources",
             "indexer.diagnose_readiness",
-            "indexer.submit_candidate",
-            "indexer.submit_candidates",
+            "ingest.inspect",
+            "ingest.submit",
+            "ingest.status",
         ]
         required_sources = ["resource_index"]
         primary_domains = ["indexer", "resource_search"]

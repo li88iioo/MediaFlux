@@ -208,8 +208,7 @@ def _prepare_rate_limit(tool_name: str) -> int:
         "guangya.directory_scrape.run": 3,
         "guangya.organize.run_once": 4,
         "guangya.organize.stop": 4,
-        "indexer.submit_candidate": 6,
-        "indexer.submit_candidates": 4,
+        "ingest.submit": 4,
         "strm.retry_failures": 3,
         "rss.refresh_subscription": 3,
         "rss.refresh_subscriptions": 3,
@@ -1076,7 +1075,7 @@ def query(request: Request, data: Any = Body(default=None)):
         feature_summary_request = is_feature_summary_message(message)
         config_component_request = config_component_explain_request(message) is not None
         if recent_resource_submit:
-            _check_rate_limit(request, "action:prepare:indexer.submit_candidate", limit=6)
+            _check_rate_limit(request, "action:prepare:ingest.submit", limit=4)
         elif recent_download_library_verification:
             _check_rate_limit(request, "recent-download-library-verification", limit=6)
         elif recent_download_explanation:

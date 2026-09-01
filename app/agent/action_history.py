@@ -60,8 +60,7 @@ _TOOL_LABELS = {
     "guangya.organize.run_once": "光鸭整理任务",
     "guangya.organize.cleanup.execute": "光鸭整理残留清理",
     "guangya.organize.stop": "停止光鸭整理任务",
-    "indexer.submit_candidate": "资源下载提交",
-    "indexer.submit_candidates": "批量资源下载提交",
+    "ingest.submit": "资源接入提交",
     "library.set_patrol_policy": "缺集巡检策略修改",
     "library.trigger_patrol_now": "立即全库缺集巡检",
     "library.start_episode_audit": "后台全库剧集检查",
@@ -176,11 +175,9 @@ _SAFE_FIELDS = {
         "residual_dir_count", "selected_count", "kept_count", "requires_manual",
     },
     "guangya.organize.stop": {"accepted"},
-    "indexer.submit_candidate": {
-        "target", "status", "created", "succeeded", "failed", "duplicate",
-    },
-    "indexer.submit_candidates": {
-        "target", "total", "succeeded", "failed", "duplicate",
+    "ingest.submit": {
+        "source_type", "target", "status", "created", "succeeded", "failed",
+        "duplicate", "total", "selected_count", "request_number",
     },
     "library.set_patrol_policy": {"runtime_refreshed"},
     "library.trigger_patrol_now": {"queued", "reused", "task_status"},

@@ -526,7 +526,7 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.evaluate("payload => { window.__agentPrepareResponse = payload; }", {
             "request_id": "season-prepare-test",
             "mode": "confirmation_required",
-            "tool_call": {"name": "indexer.submit_candidate", "elapsed_ms": 5},
+            "tool_call": {"name": "ingest.submit", "elapsed_ms": 5},
             "result": {
                 "ok": True, "status": "ready", "summary": "资源提交预检已完成",
                 "data": {}, "evidence": [], "suggestions": [],
@@ -589,7 +589,11 @@ class AgentBrowserTests(unittest.TestCase):
         request_body = json.loads(prepare_calls[0]["body"])
         self.assertRegex(request_body.pop("session_id"), r"^[A-Za-z0-9_-]{16,64}$")
         self.assertEqual(request_body, {
-            "arguments": {"position": 1, "target": "qb"},
+            "arguments": {
+                "source_type": "resource_candidates",
+                "positions": [1],
+                "target": "qb",
+            },
         })
         self.assertFalse(any(call["url"].endswith("/actions/confirm") for call in calls))
         self.page.locator(".agent-confirmation-cancel").click()
@@ -778,7 +782,7 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.evaluate("payload => { window.__agentPrepareResponse = payload; }", {
             "request_id": "prepare-test",
             "mode": "confirmation_required",
-            "tool_call": {"name": "indexer.submit_candidate", "elapsed_ms": 5},
+            "tool_call": {"name": "ingest.submit", "elapsed_ms": 5},
             "result": {"ok": True, "status": "ready", "summary": "资源提交预检已完成", "data": {}, "evidence": [], "suggestions": []},
             "action_plan": {
                 "version": 1,
@@ -801,7 +805,7 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.evaluate("payload => { window.__agentConfirmResponse = payload; }", {
             "request_id": "confirm-test",
             "mode": "confirmed_action",
-            "tool_call": {"name": "indexer.submit_candidate", "elapsed_ms": 8},
+            "tool_call": {"name": "ingest.submit", "elapsed_ms": 8},
             "result": {"ok": True, "status": "accepted", "summary": "下载任务已提交", "data": {"target": "qb"}, "evidence": [], "suggestions": []},
         })
         self.page.locator("#agentPrompt").fill("搜索《黑镜》的资源")
@@ -825,9 +829,13 @@ class AgentBrowserTests(unittest.TestCase):
         request_body = json.loads(prepare_calls[0]["body"])
         self.assertRegex(request_body.pop("session_id"), r"^[A-Za-z0-9_-]{16,64}$")
         self.assertEqual(request_body, {
-            "arguments": {"position": 1, "target": "qb"},
+            "arguments": {
+                "source_type": "resource_candidates",
+                "positions": [1],
+                "target": "qb",
+            },
         })
-        self.assertFalse(any(call["url"].endswith("/indexer.submit_candidate") for call in calls))
+        self.assertFalse(any(call["url"].endswith("/ingest.submit") for call in calls))
         self.assertNotIn(result_id, self.page.locator("body").inner_text())
         session_calls_before_confirm = len([
             call for call in self.page.evaluate("window.__agentCalls")

@@ -688,7 +688,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             selected_body = selected.json()
             self.assertEqual(selected_body["mode"], "confirmation_required")
             self.assertEqual(
-                selected_body["confirmation"]["tool"], "indexer.submit_candidate"
+                selected_body["confirmation"]["tool"], "ingest.submit"
             )
             preview_submit.assert_called_once_with(
                 {"result_id": second_id, "target": "qb"}

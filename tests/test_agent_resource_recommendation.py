@@ -103,7 +103,7 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertEqual(ranked["download_plan"]["mode"], "read_only")
         self.assertFalse(ranked["download_plan"]["auto_submit"])
         self.assertTrue(ranked["download_plan"]["requires_confirmation"])
-        self.assertEqual(ranked["download_plan"]["prepare_tool"], "indexer.submit_candidate")
+        self.assertEqual(ranked["download_plan"]["prepare_tool"], "ingest.submit")
         self.assertEqual(ranked["download_plan"]["candidate_position"], 1)
 
     def test_exact_episode_marker_wins_over_ambiguous_complete_tag(self):

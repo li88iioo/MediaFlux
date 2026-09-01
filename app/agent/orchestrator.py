@@ -59,6 +59,7 @@ from app.agent.guangya_cleanup_actions import (
 )
 from app.agent.indexer_config_actions import current_indexer_site_ids
 from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
+from app.modules.download_dispatcher import extract_download_url, route_download_url
 from app.agent.llm_router import (
     LLMReadPlan,
     LLMToolSelection,
@@ -79,6 +80,7 @@ from app.agent.missing_media_workflows import (
     workflow_followup_context,
     workflow_ref_from_context,
 )
+from app.agent.ingest_actions import AgentIngestSessionStore
 from app.agent.recent_patrol import RecentPatrolStore
 from app.agent.recent_read_operations import READ_PLAN_OPERATION, RecentReadOperationStore
 from app.agent.recent_resource_candidates import (
@@ -3932,7 +3934,7 @@ def _recent_resource_target_followup_request(
     """承接上一轮已经选定候选、只缺下载目标的安全追问。"""
     previous = _last_assistant_context(conversation_context)
     if (
-        str(previous.get("tool_name") or "").strip() != "indexer.submit_candidate"
+        str(previous.get("tool_name") or "").strip() != "ingest.submit"
         or str(previous.get("status") or "").strip().casefold() != "selection_required"
     ):
         return None
@@ -3952,7 +3954,55 @@ def _recent_resource_target_followup_request(
         position = _recent_resource_selection(previous.get("text"))
     if position is None:
         return None
-    return {"position": position, "target": target}
+    return {"source_type": "resource_candidates", "positions": [position], "target": target}
+
+
+def agent_ingest_link_request(message: str) -> dict[str, str] | None:
+    """只接管明确可下载链接；普通网页仍交给正常 Agent 对话/查询。"""
+    value = extract_download_url(str(message or ""))
+    if not value:
+        return None
+    try:
+        routed = route_download_url(value)
+    except ValueError:
+        return None
+    if routed == "guangya_share":
+        return {"source_type": "guangya_share", "input": value}
+    if routed in {"magnet", "ed2k", "http"}:
+        return {"source_type": "direct_url", "input": value}
+    return None
+
+
+def recent_ingest_submit_request(
+    message: str, *, source_type: str
+) -> dict[str, Any] | None:
+    """承接最近链接/分享检查，只生成统一提交预检参数。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if (
+        not normalized
+        or _is_recent_resource_question(normalized)
+        or any(token in normalized for token in _RECENT_RESOURCE_REJECT_TOKENS)
+    ):
+        return None
+    target, has_target = _recent_resource_target(normalized)
+    if source_type == "direct_url":
+        if not has_target or target not in {"qb", "guangya", "both"}:
+            return None
+        return {"source_type": "direct_url", "target": target}
+    if source_type != "guangya_share":
+        return None
+    if not any(token in normalized for token in ("转存", "保存", "提交", "确认", "全选", "全部")):
+        return None
+    positions: list[int] = []
+    for raw in re.findall(r"(?:第\s*)?([0-9]{1,3})\s*(?:个|项|条|号)", normalized):
+        value = int(raw)
+        if 1 <= value <= 200 and value not in positions:
+            positions.append(value)
+    return {
+        "source_type": "guangya_share",
+        "target": "guangya",
+        "positions": positions,
+    }
 
 
 def recent_resource_batch_submit_request(
@@ -3976,12 +4026,20 @@ def recent_resource_batch_submit_request(
     if not has_action or (not allow_implicit and not has_reference and "刚才" not in normalized):
         return None
     if any(token in normalized for token in ("全部", "所有", "这些", "都下", "都推送")):
-        return {"all": True, "target": target}
+        return {
+            "source_type": "resource_candidates",
+            "all": True,
+            "target": target,
+        }
     front = re.search(r"前\s*([0-9]{1,2})\s*(?:个|项|条)", normalized)
     if front:
         count = int(front.group(1))
         if 2 <= count <= 12:
-            return {"positions": list(range(1, count + 1)), "target": target}
+            return {
+                "source_type": "resource_candidates",
+                "positions": list(range(1, count + 1)),
+                "target": target,
+            }
         return None
     range_match = re.search(
         r"第?\s*([0-9]{1,2})\s*(?:到|至|[-~～])\s*第?\s*([0-9]{1,2})\s*(?:个|项|条)?",
@@ -3990,14 +4048,18 @@ def recent_resource_batch_submit_request(
     if range_match:
         start, end = int(range_match.group(1)), int(range_match.group(2))
         if 1 <= start <= end <= 12 and end - start + 1 >= 2:
-            return {"positions": list(range(start, end + 1)), "target": target}
+            return {
+                "source_type": "resource_candidates",
+                "positions": list(range(start, end + 1)),
+                "target": target,
+            }
         return None
     positions: list[int] = []
     for raw in re.findall(r"第\s*([0-9]{1,2})\s*(?:个|项|条|号)", normalized):
         value = int(raw)
         if 1 <= value <= 12 and value not in positions:
             positions.append(value)
-    return {"positions": positions, "target": target} if len(positions) >= 2 else None
+    return {"source_type": "resource_candidates", "positions": positions, "target": target} if len(positions) >= 2 else None
 
 
 def recent_resource_submit_request(
@@ -4025,7 +4087,11 @@ def recent_resource_submit_request(
         return None
 
     target, _ = _recent_resource_target(normalized)
-    request = {"position": selection, "target": target}
+    request: dict[str, Any] = {
+        "source_type": "resource_candidates",
+        "positions": [selection] if selection is not None else [],
+        "target": target,
+    }
     if episode is not None:
         request["episode"] = episode
     return request
@@ -5805,6 +5871,7 @@ class AgentOrchestrator:
     def __init__(self, registry: ToolRegistry, confirmation_store: ConfirmationStore | None = None,
                  *, recent_patrol_store: RecentPatrolStore | None = None,
                  recent_resource_store: RecentResourceCandidateStore | None = None,
+                 recent_ingest_store: AgentIngestSessionStore | None = None,
                  recent_discovery_store: RecentDiscoveryCandidateStore | None = None,
                  recent_download_store: RecentDownloadSubmissionStore | None = None,
                  recent_read_store: RecentReadOperationStore | None = None,
@@ -5818,6 +5885,11 @@ class AgentOrchestrator:
         self.confirmation_store = confirmation_store or SQLiteConfirmationStore()
         self.recent_patrol_store = recent_patrol_store or RecentPatrolStore()
         self.recent_resource_store = recent_resource_store or RecentResourceCandidateStore()
+        self.recent_ingest_store = (
+            recent_ingest_store
+            or getattr(registry, "agent_ingest_store", None)
+            or AgentIngestSessionStore()
+        )
         self.recent_discovery_store = recent_discovery_store or RecentDiscoveryCandidateStore()
         self.recent_download_store = recent_download_store or RecentDownloadSubmissionStore()
         self.recent_read_store = recent_read_store or RecentReadOperationStore()
@@ -5871,6 +5943,7 @@ class AgentOrchestrator:
                 raise AgentToolError("会话重置暂时无法完成，请稍后重试") from exc
         self.recent_patrol_store.clear_owner(owner=owner_key)
         self.recent_resource_store.clear_owner(owner=owner_key)
+        self.recent_ingest_store.clear_owner(owner=owner_key)
         self.recent_discovery_store.clear_owner(owner=owner_key)
         self.recent_download_store.clear_owner(owner=owner_key)
         self.recent_read_store.clear_owner(owner=owner_key)
@@ -6114,15 +6187,21 @@ class AgentOrchestrator:
                             type(exc).__name__,
                         )
                 # 只记录显式白名单中的幂等只读调用，供“重试/再查一次”安全续接。
-                self.recent_read_store.capture(
-                    owner=owner,
-                    tool_name=tool_name,
-                    arguments=state_arguments,
-                )
+                if tool_name != "ingest.inspect":
+                    self.recent_read_store.capture(
+                        owner=owner,
+                        tool_name=tool_name,
+                        arguments=state_arguments,
+                    )
 
             commit_or_defer_agent_state(commit_followup_state)
+        public_arguments = (
+            {"source_type": normalized_arguments.get("source_type", "auto")}
+            if tool_name == "ingest.inspect"
+            else normalized_arguments
+        )
         return self._response(
-            tool_name, normalized_arguments, result, elapsed_ms,
+            tool_name, public_arguments, result, elapsed_ms,
             request_id=trace_context.request_id,
         )
 
@@ -6379,7 +6458,7 @@ class AgentOrchestrator:
         candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
         if not isinstance(candidates, list) or len(candidates) < 2:
             return self._response(
-                "indexer.submit_candidates",
+                "ingest.submit",
                 {},
                 ToolResult(False, "precondition_failed", "当前会话没有可批量提交的资源候选",
                     error="最近资源候选不存在、已过期或不足两项。"),
@@ -6417,8 +6496,8 @@ class AgentOrchestrator:
             )
         try:
             return self.prepare(
-                "indexer.submit_candidates",
-                {"positions": positions, "target": target},
+                "ingest.submit",
+                {"source_type": "resource_candidates", "positions": positions, "target": target},
                 owner=owner,
             )
         except AgentToolError as exc:
@@ -6431,7 +6510,7 @@ class AgentOrchestrator:
             ):
                 raise
             return self._response(
-                "indexer.submit_candidates",
+                "ingest.submit",
                 {},
                 ToolResult(False, "precondition_failed", "最近资源列表已恢复，但部分下载句柄已经过期",
                     error="请重新搜索资源后再批量提交。"),
@@ -6450,7 +6529,7 @@ class AgentOrchestrator:
         candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
         if not isinstance(candidates, list) or not candidates:
             return self._response(
-                "indexer.submit_candidate",
+                "ingest.submit",
                 {},
                 ToolResult(
                     False,
@@ -6462,7 +6541,12 @@ class AgentOrchestrator:
                 0,
             )
 
-        position = request.get("position")
+        positions = request.get("positions")
+        position = (
+            positions[0]
+            if isinstance(positions, list) and len(positions) == 1
+            else None
+        )
         target = request.get("target")
         episode = request.get("episode")
         if not isinstance(position, int) and isinstance(episode, int):
@@ -6537,8 +6621,8 @@ class AgentOrchestrator:
                 )
         try:
             return self.prepare(
-                "indexer.submit_candidate",
-                {"position": position, "target": target},
+                "ingest.submit",
+                {"source_type": "resource_candidates", "positions": [position], "target": target},
                 owner=owner,
                 followup_context=workflow_followup_context(
                     verification_context,
@@ -6564,7 +6648,7 @@ class AgentOrchestrator:
             ):
                 raise
             return self._response(
-                "indexer.submit_candidate",
+                "ingest.submit",
                 {},
                 ToolResult(
                     False,
@@ -6773,7 +6857,7 @@ class AgentOrchestrator:
                 f"回复：第 {position} 个到两边。",
             ]
         return AgentOrchestrator._response(
-            "indexer.submit_candidate",
+            "ingest.submit",
             {},
             ToolResult(
                 False,
@@ -7180,7 +7264,24 @@ class AgentOrchestrator:
             # 所有确认工具都是受控写操作；统一推进运行代次，拒绝迟到发布。
             invalidate_agent_runtime_generation()
         single_verification_context: dict[str, Any] | None = None
-        if ticket.tool_name == "indexer.submit_candidates":
+        ingest_source_type = (
+            str(ticket.arguments.get("source_type") or "").strip().lower()
+            if ticket.tool_name == "ingest.submit" and isinstance(ticket.arguments, dict)
+            else ""
+        )
+        ingest_positions = (
+            ticket.arguments.get("positions")
+            if isinstance(ticket.arguments, dict)
+            and isinstance(ticket.arguments.get("positions"), list)
+            else []
+        )
+        is_resource_ingest = (
+            ticket.tool_name == "ingest.submit"
+            and ingest_source_type == "resource_candidates"
+        )
+        is_batch_resource_ingest = is_resource_ingest and len(ingest_positions) > 1
+        is_single_resource_ingest = is_resource_ingest and len(ingest_positions) == 1
+        if is_batch_resource_ingest:
             raw_items = result.data.get("items") if isinstance(result.data, dict) else None
             internal_contexts = (
                 result.data.pop("_verification_contexts", [])
@@ -7239,7 +7340,7 @@ class AgentOrchestrator:
                             "Agent 批量下载后自动复核排队失败 type=%s",
                             type(exc).__name__,
                         )
-        if ticket.tool_name == "indexer.submit_candidate":
+        if is_single_resource_ingest:
             internal_verification = (
                 result.data.pop("_verification_context", None)
                 if isinstance(result.data, dict)
@@ -7281,20 +7382,24 @@ class AgentOrchestrator:
                 confirmation_id=ticket.confirmation_id,
                 owner_generation=ticket.owner_generation,
             )
+        if ticket.tool_name == "ingest.submit" and not is_resource_ingest:
+            self.recent_download_store.capture(
+                owner=owner, result=result, verification_context=None
+            )
         public_result = (
             sanitize_submission_confirmation_result(result)
-            if ticket.tool_name == "indexer.submit_candidate"
+            if is_single_resource_ingest
             else sanitize_batch_submission_confirmation_result(result)
-            if ticket.tool_name == "indexer.submit_candidates"
+            if is_batch_resource_ingest
             else result
         )
         verification = (
             parse_recent_download_verification_context(single_verification_context)
-            if ticket.tool_name == "indexer.submit_candidate"
+            if is_single_resource_ingest
             else None
         )
         if (
-            ticket.tool_name == "indexer.submit_candidate"
+            is_single_resource_ingest
             and public_result.ok
             and public_result.status == "accepted"
             and verification is not None
@@ -7438,6 +7543,51 @@ class AgentOrchestrator:
             end_trace_context(trace_token)
             raise
         try:
+            ingest_link = agent_ingest_link_request(message)
+            if ingest_link is not None:
+                if not owner:
+                    response = self._unsupported(
+                        "资源链接检查需要在已登录会话中进行",
+                        ["请登录后重新发送链接。"],
+                    )
+                else:
+                    response = self._invoke_query_read(
+                        "ingest.inspect",
+                        ingest_link,
+                        owner=owner,
+                        rate_identity=query_tool_rate_identity,
+                    )
+                    inline_submit = recent_ingest_submit_request(
+                        message, source_type=ingest_link["source_type"]
+                    )
+                    if response.get("result", {}).get("ok") and inline_submit is not None:
+                        response = self.prepare(
+                            "ingest.submit", inline_submit, owner=owner
+                        )
+                if not present:
+                    return response
+                return self._present_tool_response(
+                    message, response, owner=llm_rate_owner or owner
+                )
+            recent_ingest = (
+                self.recent_ingest_store.get(owner=owner) if owner else None
+            )
+            ingest_followup = (
+                recent_ingest_submit_request(
+                    message, source_type=recent_ingest.source_type
+                )
+                if recent_ingest is not None
+                else None
+            )
+            if ingest_followup is not None:
+                response = self.prepare(
+                    "ingest.submit", ingest_followup, owner=owner
+                )
+                if not present:
+                    return response
+                return self._present_tool_response(
+                    message, response, owner=llm_rate_owner or owner
+                )
             contextual_feature_request = feature_state_followup_request(
                 message, conversation_context
             )
@@ -7572,8 +7722,8 @@ class AgentOrchestrator:
                     self._continue_recent_resource_batch_submit(
                         recent_resource_request, owner=owner
                     )
-                    if "positions" in recent_resource_request
-                    or recent_resource_request.get("all")
+                    if recent_resource_request.get("all")
+                    or len(recent_resource_request.get("positions") or []) >= 2
                     else self._continue_recent_resource_submit(
                         recent_resource_request, owner=owner
                     )

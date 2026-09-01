@@ -78,6 +78,22 @@ def _safe_targets(value: Any) -> list[str]:
     ))
 
 
+def download_request_public_summary(row: Any) -> dict[str, Any]:
+    """投影单条下载请求；统一供列表与资源接入状态查询复用。"""
+    return {
+        "request_number": int(row["id"]),
+        "title": _safe_title(row["title"]),
+        "kind": str(row["kind"] or "unknown")[:24],
+        "targets": _safe_targets(row["targets"]),
+        "status": _safe_request_status(row["status"]),
+        "qb_status": _safe_request_status(row["qb_status"]),
+        "guangya_status": _safe_request_status(row["gy_status"]),
+        "organize_status": _safe_request_status(row["organize_status"]),
+        "strm_status": _safe_request_status(row["strm_status"]),
+        "updated_at": str(row["updated_at"] or "")[:32],
+    }
+
+
 def summarize_download_requests(arguments: dict[str, Any]) -> ToolResult:
     normalized = download_request_summaries_arguments(arguments)
     scope = normalized["scope"]
@@ -92,20 +108,7 @@ def summarize_download_requests(arguments: dict[str, Any]) -> ToolResult:
                 "SELECT * FROM download_requests ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
 
-    items = []
-    for row in rows:
-        items.append({
-            "request_number": int(row["id"]),
-            "title": _safe_title(row["title"]),
-            "kind": str(row["kind"] or "unknown")[:24],
-            "targets": _safe_targets(row["targets"]),
-            "status": _safe_request_status(row["status"]),
-            "qb_status": _safe_request_status(row["qb_status"]),
-            "guangya_status": _safe_request_status(row["gy_status"]),
-            "organize_status": _safe_request_status(row["organize_status"]),
-            "strm_status": _safe_request_status(row["strm_status"]),
-            "updated_at": str(row["updated_at"] or "")[:32],
-        })
+    items = [download_request_public_summary(row) for row in rows]
     label = {"active": "进行中", "attention": "待处理", "recent": "最近"}[scope]
     return ToolResult(
         ok=True,

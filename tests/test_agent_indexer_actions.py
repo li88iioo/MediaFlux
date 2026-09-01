@@ -269,10 +269,10 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         registry = build_tool_registry()
         capabilities = {item["name"]: item for item in registry.capabilities()}
         self.assertEqual(capabilities["indexer.search_resources"]["risk"], "read")
-        self.assertEqual(capabilities["indexer.submit_candidate"]["risk"], "danger")
-        self.assertTrue(capabilities["indexer.submit_candidate"]["requires_confirmation"])
+        self.assertEqual(capabilities["ingest.submit"]["risk"], "danger")
+        self.assertTrue(capabilities["ingest.submit"]["requires_confirmation"])
         with self.assertRaises(AgentToolError) as blocked:
-            registry.execute("indexer.submit_candidate", {"position": 1, "target": "qb"})
+            registry.execute("ingest.submit", {"source_type": "resource_candidates", "positions": [1], "target": "qb"})
         self.assertEqual(blocked.exception.code, "confirmation_required")
 
     def test_preview_is_safe_and_requires_ready_target(self):
@@ -280,7 +280,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         arguments = {"result_id": _RESULT_ID, "target": "qb"}
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
-        ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}):
+        ), patch("app.agent.indexer_actions.download_target_readiness", return_value={"qb": True}):
             result, _context = prepare_submit_resource(arguments)
 
         self.assertTrue(result.ok)
@@ -292,7 +292,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
 
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
-        ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": False}):
+        ), patch("app.agent.indexer_actions.download_target_readiness", return_value={"qb": False}):
             unavailable, _context = prepare_submit_resource(arguments)
         self.assertFalse(unavailable.ok)
         self.assertEqual(unavailable.status, "not_configured")
@@ -325,7 +325,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         arguments = {"result_id": _RESULT_ID, "target": "qb"}
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
-        ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}):
+        ), patch("app.agent.indexer_actions.download_target_readiness", return_value={"qb": True}):
             first = prepare_submit_resource(arguments)[1]
             service.result_store.item = _resource_item(title="Changed Resource")
             second = prepare_submit_resource(arguments)[1]
@@ -648,7 +648,7 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
 
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
-        ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}), patch(
+        ), patch("app.agent.indexer_actions.download_target_readiness", return_value={"qb": True}), patch(
             "app.agent.indexer_actions.download_indexer_result", dispatch
         ):
             searched = self.client.post(
@@ -661,18 +661,18 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
             self.assertNotIn(_SECRET_MAGNET, searched.text)
 
             prepared = self.client.post(
-                "/api/agent/actions/indexer.submit_candidate/prepare",
+                "/api/agent/actions/ingest.submit/prepare",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {"position": 1, "target": "qb"}},
+                json={"session_id": "test_session_identifier_0001", "arguments": {"source_type": "resource_candidates", "positions": [1], "target": "qb"}},
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
             confirmation_id = prepared.json()["action_plan"]["plan_id"]
             dispatch.assert_not_awaited()
 
             direct = self.client.post(
-                "/api/agent/tools/indexer.submit_candidate",
+                "/api/agent/tools/ingest.submit",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {"position": 1, "target": "qb"}},
+                json={"session_id": "test_session_identifier_0001", "arguments": {"source_type": "resource_candidates", "positions": [1], "target": "qb"}},
             )
             self.assertEqual(direct.status_code, 409, direct.text)
 
@@ -738,7 +738,7 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
 
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
-        ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}), patch(
+        ), patch("app.agent.indexer_actions.download_target_readiness", return_value={"qb": True}), patch(
             "app.agent.indexer_actions.download_indexer_result", dispatch
         ):
             searched = self.client.post(
@@ -752,9 +752,9 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(searched.status_code, 200, searched.text)
 
             prepared = self.client.post(
-                "/api/agent/actions/indexer.submit_candidate/prepare",
+                "/api/agent/actions/ingest.submit/prepare",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {"position": 1, "target": "qb"}},
+                json={"session_id": "test_session_identifier_0001", "arguments": {"source_type": "resource_candidates", "positions": [1], "target": "qb"}},
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
             service.result_store.item = _resource_item(download_state="resolvable", download_kinds=("torrent",))

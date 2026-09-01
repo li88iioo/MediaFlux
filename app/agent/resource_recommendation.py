@@ -385,7 +385,7 @@ def rank_episode_search(
         "mode": "read_only",
         "auto_submit": False,
         "requires_confirmation": True,
-        "prepare_tool": "indexer.submit_candidate",
+        "prepare_tool": "ingest.submit",
         "supported_targets": ["qb", "guangya", "both"],
         "candidate_position": 1 if selected_summary else None,
         "note": "当前仅生成建议；提交前将按当前会话候选序号重新校验资源和下载目标。",

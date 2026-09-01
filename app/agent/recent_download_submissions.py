@@ -223,7 +223,7 @@ def _safe_submission(
     if target not in _ALLOWED_TARGETS or dispatch_status not in _ALLOWED_DISPATCH_STATUSES:
         return None
     duplicate = bool(data.get("duplicate"))
-    request_id = _positive_int(data.get("request_id"))
+    request_id = _positive_int(data.get("request_id") or data.get("request_number"))
     if duplicate or dispatch_status == "duplicate" or result.status == "conflict":
         request_id = None
     return RecentDownloadSubmission(

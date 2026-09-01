@@ -219,22 +219,25 @@ def _validate_expected(case_id: str, evaluator: str, expected: Any) -> None:
     if evaluator == "resource_followup":
         if expected is None:
             return
-        if not isinstance(expected, Mapping) or not set(expected).issubset({
-            "position", "episode", "target"
-        }):
+        if not isinstance(expected, Mapping) or set(expected) not in (
+            {"source_type", "positions", "target"},
+            {"source_type", "positions", "target", "episode"},
+        ):
             raise _schema_error(case_id, "资源续句 expected 结构无效")
-        if set(expected) not in (
-            {"position", "target"},
-            {"position", "target", "episode"},
+        if expected.get("source_type") != "resource_candidates":
+            raise _schema_error(case_id, "资源续句 source_type 无效")
+        positions = expected.get("positions")
+        if (
+            not isinstance(positions, list)
+            or len(positions) > 1
+            or any(
+                not isinstance(position, int)
+                or isinstance(position, bool)
+                or position < 1
+                for position in positions
+            )
         ):
-            raise _schema_error(case_id, "资源续句 expected 字段不完整")
-        position = expected.get("position")
-        if position is not None and (
-            not isinstance(position, int)
-            or isinstance(position, bool)
-            or position < 1
-        ):
-            raise _schema_error(case_id, "资源续句 position 无效")
+            raise _schema_error(case_id, "资源续句 positions 无效")
         episode = expected.get("episode")
         if episode is not None and (
             not isinstance(episode, int)

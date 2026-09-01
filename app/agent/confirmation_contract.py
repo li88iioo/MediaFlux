@@ -269,17 +269,12 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "真空目录会在双重复核后进入回收站；仅明确选择隔离的非空残留目录会整体移动到 MediaFlux 隔离区。",
         "reversibility": "隔离目录可手工移回；空目录可从光鸭回收站恢复。明确保留、未完成复核、含媒体元数据或快照变化的目录不会进入任务。",
     },
-    "indexer.submit_candidates": {
-        "action": "批量提交资源下载",
-        "object": "你刚才选择的 2 到 12 个资源候选",
-        "impact": "会逐项向同一下载目标创建任务；各项独立幂等，部分失败不会回滚已成功项目。",
-        "reversibility": "可在目标下载器或云盘任务中分别暂停或删除；已发出的提交请求无法撤回。",
-    },
-    "indexer.submit_candidate": {
-        "action": "提交资源下载",
-        "object": "你刚才选择的资源候选",
-        "impact": "会向所选下载目标创建任务；不会向模型或页面暴露下载链接。",
-        "reversibility": "可在目标下载器或云盘任务中暂停或删除；提交请求无法撤回。",
+    "ingest.submit": {
+        "action": "提交资源接入任务",
+        "object": "最近检查并冻结的下载直链、光鸭分享或资源候选",
+        "impact": "会按确认页列出的来源、候选序号和目标创建幂等下载或转存请求；不会在确认页暴露链接、访问令牌、云端 file_id 或内部下载句柄。",
+        "reversibility": "已发出的下载或转存请求无法从 Agent 撤回；可在对应下载器或光鸭任务中暂停、删除或人工处理。",
+
     },
     "library.trigger_patrol_now": {
         "action": "立即排队全库缺集巡检",

@@ -14,6 +14,49 @@ from typing import Any
 from app import config
 from app import database as db
 from app.agent.action_history import action_history_arguments, list_action_history
+from app.agent.indexer_readiness_actions import (
+    diagnose_indexer_readiness,
+    indexer_readiness_arguments,
+)
+from app.agent.local_media_actions import (
+    diagnose_local_media,
+    local_media_diagnosis_arguments,
+    local_media_history_arguments,
+    local_media_review_queue_arguments,
+    summarize_local_media_history,
+    summarize_local_media_review_queue,
+)
+from app.agent.missing_media_workflows import (
+    list_missing_workflows,
+    missing_workflow_arguments,
+)
+from app.agent.pending_action_actions import (
+    cancel_pending_action,
+    pending_action_arguments,
+)
+from app.agent.provider_actions import (
+    execute_provider_change_confirmed,
+    list_provider_capabilities,
+    prepare_provider_change_execution,
+    preview_provider_change,
+    provider_capabilities_arguments,
+    provider_change_status,
+    provider_plan_arguments,
+    provider_plan_ref_arguments,
+    provider_query_arguments,
+    query_provider,
+    reset_provider_gateway_for_tests,
+)
+from app.agent.recent_resource_candidates import RecentResourceCandidateStore
+from app.agent.rss_actions import (
+    diagnose_rss,
+    get_rss_recent_activity,
+    get_rss_subscription_summary,
+    list_rss_subscription_summaries,
+    rss_diagnosis_arguments,
+    rss_subscription_summaries_arguments,
+    rss_subscription_summary_arguments,
+)
 from app.agent.automation_actions import (
     automation_pipeline_arguments,
     diagnose_automation_pipeline,
@@ -39,7 +82,6 @@ from app.agent.discovery_actions import (
     search_arguments as discovery_search_arguments,
 )
 from app.agent.discovery_mapping_actions import (
-    confirm_discovery_mapping,
     confirm_discovery_mapping_confirmed,
     discovery_confirm_mapping_arguments,
     discovery_detail_arguments,
@@ -49,14 +91,12 @@ from app.agent.discovery_mapping_actions import (
     prepare_confirm_discovery_mapping,
 )
 from app.agent.discovery_watchlist_actions import (
-    add_watchlist,
     add_watchlist_arguments,
     add_watchlist_confirmed,
     get_watchlist_summary,
     list_watchlist_summaries,
     prepare_add_watchlist,
     prepare_remove_watchlist,
-    remove_watchlist,
     remove_watchlist_arguments,
     remove_watchlist_confirmed,
     watchlist_summaries_arguments,
@@ -75,13 +115,11 @@ from app.agent.download_retry_actions import (
 )
 from app.agent.durable_job_actions import (
     agent_job_status_arguments,
-    cancel_agent_job,
     cancel_agent_job_arguments,
     cancel_agent_job_confirmed,
     get_agent_job_status,
     prepare_cancel_agent_job,
     prepare_start_episode_audit,
-    start_episode_audit,
     start_episode_audit_arguments,
     start_episode_audit_confirmed,
 )
@@ -96,21 +134,14 @@ from app.agent.episode_resource_actions import (
     search_missing_season_resources,
 )
 from app.agent.feature_actions import (
-    clear_confirmation_state as clear_feature_confirmation_state,
-)
-from app.agent.feature_actions import (
     feature_state_arguments,
-    feature_state_confirmation_context,
     feature_summary_arguments,
-    preview_set_feature_state,
-    set_feature_state,
     summarize_feature_states,
     verify_feature_state_write,
 )
 from app.agent.feature_gate import is_agent_enabled
 from app.agent.guangya_cleanup_actions import (
     classify_guangya_cleanup_candidates,
-    execute_guangya_cleanup,
     execute_guangya_cleanup_confirmed,
     guangya_cleanup_classify_arguments,
     guangya_cleanup_execute_arguments,
@@ -126,7 +157,6 @@ from app.agent.guangya_directory_scrape_actions import (
     inspect_directory_scrape,
     prepare_run_directory_scrape,
     preview_directory_scrape,
-    run_directory_scrape,
     run_directory_scrape_confirmed,
     search_directory_scrape,
 )
@@ -210,28 +240,11 @@ from app.agent.rss_retry_actions import (
     retry_failed_rss_to_qb_confirmed,
     rss_failure_retry_arguments,
 )
-from app.agent.rss_subscription_control_actions import (
-    create_rss_subscription,
-    create_rss_subscription_confirmed,
-    delete_rss_subscription,
-    delete_rss_subscription_confirmed,
-    prepare_create_rss_subscription,
-    prepare_delete_rss_subscription,
-    prepare_update_rss_subscription,
-    rss_create_subscription_arguments,
-    rss_delete_subscription_arguments,
-    rss_update_subscription_arguments,
-    update_rss_subscription,
-    update_rss_subscription_confirmed,
-)
 from app.agent.safe_policy_actions import (
     SAFE_POLICY_IDS,
     prepare_safe_policy_confirmation,
-    preview_set_safe_policy,
     safe_policy_arguments,
-    safe_policy_confirmation_context,
     safe_policy_summary_arguments,
-    set_safe_policy,
     set_safe_policy_confirmed,
     summarize_safe_policies,
 )
@@ -274,51 +287,11 @@ from app.agent.workspace_briefing_actions import (
 )
 from app.agent.web_search_actions import search_web, web_search_arguments
 from app.agent.media_rating_actions import lookup_media_rating, media_rating_arguments
-from app.agent.discovery_actions import (
-    bangumi_calendar,
-    calendar_arguments as bangumi_calendar_arguments,
-    recommend_arguments as discovery_recommend_arguments,
-    recommend_discovery,
-    search_arguments as discovery_search_arguments,
-    search_discovery,
-)
-from app.agent.discovery_mapping_actions import (
-    confirm_discovery_mapping_confirmed,
-    discovery_confirm_mapping_arguments,
-    discovery_detail_arguments,
-    discovery_mapping_candidates_arguments,
-    get_discovery_detail,
-    get_discovery_mapping_candidates,
-    prepare_confirm_discovery_mapping,
-)
-from app.agent.discovery_watchlist_actions import (
-    add_watchlist_arguments,
-    add_watchlist_confirmed,
-    get_watchlist_summary,
-    list_watchlist_summaries,
-    prepare_add_watchlist,
-    prepare_remove_watchlist,
-    remove_watchlist_arguments,
-    remove_watchlist_confirmed,
-    watchlist_summaries_arguments,
-    watchlist_summary_arguments,
-)
-from app.agent.episode_audit import audit_series_episodes, reset_episode_audit_cache_for_tests
 from app.agent.library_episode_count import (
     count_series_episodes,
     count_series_episodes_arguments,
 )
 from app.agent.library_episode_audit import audit_library_episodes
-from app.agent.durable_job_actions import (
-    agent_job_status_arguments,
-    cancel_agent_job_arguments,
-    cancel_agent_job_confirmed,
-    get_agent_job_status,
-    prepare_cancel_agent_job,
-    prepare_start_episode_audit,
-    start_episode_audit_arguments,
-    start_episode_audit_confirmed,
-)
 from app.agent.library_patrol_status import (
     get_library_patrol_status,
     patrol_status_arguments,
@@ -336,19 +309,9 @@ from app.agent.library_patrol_trigger_actions import (
     trigger_patrol_now_confirmed,
 )
 from app.agent.update_actions import check_library_updates
-from app.agent.episode_resource_actions import (
-    missing_episode_resource_arguments,
-    missing_season_resource_arguments,
-    search_missing_episode_resources,
-    search_missing_season_resources,
-)
 from app.agent.feature_actions import (
-    feature_summary_arguments,
-    feature_state_arguments,
     prepare_feature_state_confirmation,
     set_feature_state_confirmed,
-    summarize_feature_states,
-    verify_feature_state_write,
 )
 from app.agent.indexer_config_actions import (
     indexer_sites_arguments,
@@ -358,47 +321,19 @@ from app.agent.indexer_config_actions import (
     summarize_indexer_sites,
     verify_indexer_sites_write,
 )
-from app.agent.safe_policy_actions import (
-    SAFE_POLICY_IDS,
-    prepare_safe_policy_confirmation,
-    safe_policy_arguments,
-    safe_policy_summary_arguments,
-    set_safe_policy_confirmed,
-    summarize_safe_policies,
-)
 from app.agent.telegram_test_actions import (
     prepare_telegram_test_notification,
     send_telegram_test_notification_confirmed,
     telegram_test_arguments,
 )
-from app.agent.update_actions import check_library_updates
-from app.agent.web_search_actions import search_web, web_search_arguments
-from app.agent.workspace_actions import (
-    _contains_sensitive_text,
-    _safe_status,
-    _safe_title,
-    _safe_year,
-    search_workspace,
-    workspace_search_arguments,
-)
 from app.agent.indexer_actions import search_arguments as indexer_search_arguments
 from app.agent.indexer_actions import search_resources
-from app.agent.indexer_candidate_actions import (
-    IndexerCandidateActions,
-    indexer_candidate_batch_submit_arguments,
-    indexer_candidate_submit_arguments,
-)
-from app.agent.workspace_briefing_actions import (
-    summarize_workspace_briefing,
-    workspace_briefing_arguments,
-)
-from app.agent.workspace_next_actions import (
-    summarize_workspace_next_actions,
-    workspace_next_actions_arguments,
-)
-from app.agent.workspace_todo_actions import (
-    summarize_workspace_todo,
-    workspace_todo_arguments,
+from app.agent.ingest_actions import (
+    AgentIngestSessionStore,
+    IngestActions,
+    ingest_inspect_arguments,
+    ingest_status_arguments,
+    ingest_submit_arguments,
 )
 from app.clients.base import normalize_playback_progress
 from app.indexers.config import INDEXER_SITE_ORDER
@@ -467,15 +402,6 @@ from app.agent.guangya_schedule_config_actions import (
     set_guangya_organize_schedule_policy_confirmed,
     summarize_guangya_organize_schedule_policy,
 )
-from app.agent.guangya_cleanup_actions import (
-    classify_guangya_cleanup_candidates,
-    execute_guangya_cleanup_confirmed,
-    guangya_cleanup_classify_arguments,
-    guangya_cleanup_execute_arguments,
-    guangya_cleanup_preview_arguments,
-    prepare_guangya_cleanup_confirmation,
-    preview_guangya_cleanup,
-)
 from app.agent.guangya_rename_actions import (
     execute_guangya_rename_confirmed,
     guangya_media_hygiene_preview_arguments,
@@ -497,17 +423,6 @@ from app.agent.guangya_fs_change_actions import (
     guangya_fs_change_preview_arguments,
     prepare_guangya_fs_change_confirmation,
     preview_guangya_fs_change,
-)
-from app.agent.guangya_directory_scrape_actions import (
-    directory_scrape_inspect_arguments,
-    directory_scrape_preview_arguments,
-    directory_scrape_run_arguments,
-    directory_scrape_search_arguments,
-    inspect_directory_scrape,
-    prepare_run_directory_scrape,
-    preview_directory_scrape,
-    run_directory_scrape_confirmed,
-    search_directory_scrape,
 )
 from app.agent.organize_actions import (
     preview_guangya_organize,
@@ -1395,10 +1310,15 @@ def search_library(arguments: dict[str, Any]) -> ToolResult:
 
 def build_tool_registry(
     recent_resource_store: RecentResourceCandidateStore | None = None,
+    ingest_store: AgentIngestSessionStore | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
-    candidate_actions = IndexerCandidateActions(
-        recent_resource_store or RecentResourceCandidateStore()
+    resource_store = recent_resource_store or RecentResourceCandidateStore()
+    active_ingest_store = ingest_store or AgentIngestSessionStore()
+    registry.agent_ingest_store = active_ingest_store
+    ingest_actions = IngestActions(
+        store=active_ingest_store,
+        recent_resource_store=resource_store,
     )
     registry.register(ToolSpec(
         name="agent.runtime_status",
@@ -3894,56 +3814,91 @@ def build_tool_registry(
         ),
     ))
     registry.register(ToolSpec(
-        name="indexer.submit_candidate",
-        description="在用户确认后，按当前登录会话最近资源搜索中的候选序号提交到 qBittorrent、光鸭或两者；内部下载句柄不会暴露给模型。",
-        risk=RiskLevel.DANGER,
+        name="ingest.inspect",
+        description=(
+            "统一只读检查资源接入来源：可识别光鸭官方分享、Magnet、ED2K、明确 HTTP(S) 下载直链，"
+            "或读取当前会话最近资源搜索候选。原始链接、分享令牌、file_id 与索引 result_id 只保存在"
+            "owner 绑定的短期服务端快照中；普通网页链接不会创建下载任务。"
+        ),
+        risk=RiskLevel.READ,
         parameters={
             "type": "object",
-            "required": ["position", "target"],
             "properties": {
-                "position": {"type": "integer", "minimum": 1, "maximum": 12},
-                "target": {"type": "string", "enum": ["qb", "guangya", "both"]},
+                "source_type": {
+                    "type": "string",
+                    "enum": ["auto", "direct_url", "guangya_share", "resource_candidates"],
+                    "default": "auto",
+                },
+                "input": {"type": "string", "maxLength": 8192},
             },
             "additionalProperties": False,
         },
-        validator=indexer_candidate_submit_arguments,
-        requires_confirmation=True,
-        context_confirmation_preparer=candidate_actions.prepare_one,
-        context_confirmed_handler=candidate_actions.confirm_one,
-        llm_confirmation=True,
-        llm_examples=(
-            "把刚才第 2 个资源下载到 qB",
-            "提交第一个候选到光鸭",
-        ),
+        context_handler=ingest_actions.inspect,
+        validator=ingest_inspect_arguments,
+        llm_read=True,
+        llm_read_plan=False,
+        llm_domains=("downloads", "resource_search", "cloud_files"),
+        llm_source_kind="ingest_snapshot",
+        llm_freshness="live",
+        llm_parallel_safe=False,
+        llm_examples=("解析这个光鸭分享链接", "检查这个磁力链接能否下载", "查看刚才搜索到的资源候选"),
     ))
     registry.register(ToolSpec(
-        name="indexer.submit_candidates",
-        description="在用户一次确认后，按当前登录会话最近资源搜索中的 2 到 12 个候选序号逐项提交到同一目标；各项独立幂等并报告部分失败。",
+        name="ingest.submit",
+        description=(
+            "在用户确认后统一提交最近检查的直链或光鸭分享，或按最近资源搜索候选序号提交。"
+            "直链和资源候选可选 qB、光鸭或两边；光鸭分享仅转存到光鸭。确认参数不包含链接、"
+            "访问令牌、云端 file_id、内部 result_id 或后端任务标识。"
+        ),
         risk=RiskLevel.DANGER,
         parameters={
             "type": "object",
-            "required": ["positions", "target"],
+            "required": ["source_type"],
             "properties": {
+                "source_type": {"type": "string", "enum": ["direct_url", "guangya_share", "resource_candidates"]},
+                "target": {"type": "string", "enum": ["qb", "guangya", "both"]},
                 "positions": {
                     "type": "array",
-                    "minItems": 2,
-                    "maxItems": 12,
+                    "minItems": 1,
+                    "maxItems": 200,
                     "uniqueItems": True,
-                    "items": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "items": {"type": "integer", "minimum": 1, "maximum": 200},
                 },
-                "target": {"type": "string", "enum": ["qb", "guangya", "both"]},
             },
             "additionalProperties": False,
         },
-        validator=indexer_candidate_batch_submit_arguments,
+        validator=ingest_submit_arguments,
         requires_confirmation=True,
-        context_confirmation_preparer=candidate_actions.prepare_batch,
-        context_confirmed_handler=candidate_actions.confirm_batch,
+        context_confirmation_preparer=ingest_actions.prepare_submit,
+        context_confirmed_handler=ingest_actions.execute_submit,
         llm_confirmation=True,
-        llm_examples=(
-            "把刚才第 1、3 个资源都下到 qB",
-            "提交前两个候选到光鸭",
+        llm_domains=("downloads", "resource_search", "cloud_files"),
+        llm_source_kind="ingest_snapshot",
+        llm_freshness="live",
+        llm_parallel_safe=False,
+        llm_examples=("把刚才的磁力提交到 qB", "把这个光鸭分享全部转存", "把刚才第 1、3 个资源提交到两边"),
+    ))
+    registry.register(ToolSpec(
+        name="ingest.status",
+        description=(
+            "按公开请求编号读取统一资源接入状态，覆盖 qB、光鸭、整理与 STRM 阶段；"
+            "不返回链接、路径、哈希或后端任务标识。"
         ),
+        risk=RiskLevel.READ,
+        parameters={
+            "type": "object",
+            "required": ["request_number"],
+            "properties": {"request_number": {"type": "integer", "minimum": 1}},
+            "additionalProperties": False,
+        },
+        context_handler=ingest_actions.status,
+        validator=ingest_status_arguments,
+        llm_read=True,
+        llm_read_plan=True,
+        llm_domains=("downloads", "organize", "strm"),
+        llm_source_kind="download_request",
+        llm_freshness="live",
+        llm_examples=("查询资源请求 12 的状态", "刚才提交的资源到哪一步了"),
     ))
     registry.register(ToolSpec(
         name="workspace.briefing",

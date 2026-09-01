@@ -132,7 +132,7 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         response = {
             "mode": "confirmed_action",
             "tool_call": {
-                "name": "indexer.submit_candidate",
+                "name": "ingest.submit",
                 "arguments": {
                     "result_id": "private-result-id",
                     "target": "qb",
@@ -538,7 +538,7 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
 
         selection_response = {
             "mode": "tool_result",
-            "tool_call": {"name": "indexer.submit_candidate", "arguments": {}},
+            "tool_call": {"name": "ingest.submit", "arguments": {}},
             "result": {
                 "ok": False,
                 "status": "selection_required",
@@ -1154,7 +1154,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
             "request_id": "confirm-request-secret",
             "mode": "confirmed_action",
             "tool_call": {
-                "name": "indexer.submit_candidate",
+                "name": "ingest.submit",
                 "arguments": {"result_id": "private-result-id", "target": "qb"},
             },
             "action_plan": {
@@ -1196,10 +1196,10 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(detail.status_code, 200, detail.text)
         messages = detail.json()["session"]["messages"]
-        self.assertEqual(messages[0]["data"]["text"], "确认并执行 · 资源下载提交")
+        self.assertEqual(messages[0]["data"]["text"], "确认并执行 · 资源接入提交")
         self.assertEqual(messages[1]["data"]["summary"], "下载任务已提交")
         self.assertEqual(messages[1]["data"]["status"], "accepted")
-        self.assertEqual(messages[1]["data"]["tool_label"], "资源下载提交")
+        self.assertEqual(messages[1]["data"]["tool_label"], "资源接入提交")
         self.assertNotIn("tool_name", messages[1]["data"])
         for forbidden in (
             "confirmation-token-123456",

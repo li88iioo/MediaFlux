@@ -524,9 +524,18 @@ def _resolved_action_payload(
     """统一构造一次性 callback 的公开执行负载。"""
     action = metadata["action"]
     if action == "prepare_resource":
+        arguments = _load_action_json_object(arguments_json)
+        position = arguments.get("position")
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or not 1 <= position <= _RESOURCE_RESULT_LIMIT
+        ):
+            raise ValueError("操作已过期或无效")
         return {
             "action": action,
             "result_id": metadata["result_id"],
+            "position": position,
             "target": metadata["target"],
         }
     if action == "invoke_read_tool":
@@ -721,8 +730,17 @@ class TelegramAgentActionStore:
             items: dict[str, _AgentAction] = {}
             result_items: list[dict[str, Any]] = []
             for offset, candidate in enumerate(layout["page_candidates"]):
+                position = int(layout["page_start"]) + offset + 1
                 qb_id = next(action_ids)
                 guangya_id = next(action_ids)
+                arguments_json = json.dumps(
+                    {
+                        "position": position,
+                        "result_id": candidate["result_id"],
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
                 for action_id, target in ((qb_id, "qb"), (guangya_id, "guangya")):
                     items[action_id] = _AgentAction(
                         action_id=action_id,
@@ -732,9 +750,10 @@ class TelegramAgentActionStore:
                         group_id=group_id,
                         result_id=candidate["result_id"],
                         target=target,
+                        arguments_json=arguments_json,
                     )
                 result_items.append({
-                    "position": int(layout["page_start"]) + offset + 1,
+                    "position": position,
                     "qb_action_id": qb_id,
                     "guangya_action_id": guangya_id,
                 })
@@ -903,7 +922,7 @@ class TelegramAgentActionStore:
                 raise ValueError("操作已过期或无效")
             try:
                 _active_action_expiry(item.expires_at, now=now)
-                return _action_metadata(
+                metadata = _action_metadata(
                     action=item.action,
                     plan_id=item.plan_id,
                     result_id=item.result_id,
@@ -911,6 +930,11 @@ class TelegramAgentActionStore:
                     tool_name=item.tool_name,
                     action_key=item.action_key,
                 )
+                if metadata["action"] == "prepare_resource":
+                    return _resolved_action_payload(
+                        metadata=metadata, arguments_json=item.arguments_json
+                    )
+                return metadata
             except ValueError:
                 self._remove_group_locked(item)
                 raise
@@ -983,7 +1007,7 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
             "action_id TEXT PRIMARY KEY,owner_digest TEXT NOT NULL,"
             "action_kind TEXT NOT NULL,group_id TEXT NOT NULL,"
             "confirmation_id TEXT NOT NULL DEFAULT '',"
-            "result_id TEXT NOT NULL DEFAULT '',target TEXT NOT NULL DEFAULT '',"
+            "target TEXT NOT NULL DEFAULT '',"
             "tool_name TEXT NOT NULL DEFAULT '',"
             "arguments_json TEXT NOT NULL DEFAULT '{}',"
             "action_key TEXT NOT NULL DEFAULT '',expires_at REAL NOT NULL,"
@@ -1077,14 +1101,13 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
                 conn.execute(
                     "INSERT INTO telegram_agent_actions("
                     "action_id,owner_digest,action_kind,group_id,confirmation_id,"
-                    "result_id,target,tool_name,arguments_json,action_key,expires_at,created_at"
-                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "target,tool_name,arguments_json,action_key,expires_at,created_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         action_id,
                         self._owner_digest(owner),
                         action,
                         f"{group_prefix}:{action_id}",
-                        "",
                         "",
                         "",
                         tool_name,
@@ -1124,16 +1147,16 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
             conn.executemany(
                 "INSERT INTO telegram_agent_actions("
                 "action_id,owner_digest,action_kind,group_id,confirmation_id,"
-                "result_id,target,tool_name,arguments_json,action_key,expires_at,created_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "target,tool_name,arguments_json,action_key,expires_at,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     (
                         confirm_id, owner_digest, "confirm", group_id, ticket,
-                        "", "", "", "{}", "", expires_at, created_at,
+                        "", "", "{}", "", expires_at, created_at,
                     ),
                     (
                         cancel_id, owner_digest, "cancel", group_id, ticket,
-                        "", "", "", "{}", "", expires_at, created_at,
+                        "", "", "{}", "", expires_at, created_at,
                     ),
                 ),
             )
@@ -1168,8 +1191,17 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
             rows: list[tuple[Any, ...]] = []
             result_items: list[dict[str, Any]] = []
             for offset, candidate in enumerate(layout["page_candidates"]):
+                position = int(layout["page_start"]) + offset + 1
                 qb_id = next(action_ids)
                 guangya_id = next(action_ids)
+                arguments_json = json.dumps(
+                    {
+                        "position": position,
+                        "result_id": candidate["result_id"],
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
                 for action_id, target in ((qb_id, "qb"), (guangya_id, "guangya")):
                     rows.append((
                         action_id,
@@ -1177,16 +1209,15 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
                         "prepare_resource",
                         group_id,
                         "",
-                        candidate["result_id"],
                         target,
                         "",
-                        "{}",
+                        arguments_json,
                         "",
                         expires_at,
                         created_at,
                     ))
                 result_items.append({
-                    "position": int(layout["page_start"]) + offset + 1,
+                    "position": position,
                     "qb_action_id": qb_id,
                     "guangya_action_id": guangya_id,
                 })
@@ -1203,7 +1234,6 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
                     "",
                     "",
                     "",
-                    "",
                     arguments_json,
                     "",
                     expires_at,
@@ -1214,8 +1244,8 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
                 conn.executemany(
                     "INSERT INTO telegram_agent_actions("
                     "action_id,owner_digest,action_kind,group_id,confirmation_id,"
-                    "result_id,target,tool_name,arguments_json,action_key,expires_at,created_at"
-                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "target,tool_name,arguments_json,action_key,expires_at,created_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     rows,
                 )
             except sqlite3.IntegrityError as exc:
@@ -1240,7 +1270,7 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
         self, conn: Any, *, action_id: str, owner: str
     ) -> Any | None:
         return conn.execute(
-            "SELECT action_id,action_kind,group_id,confirmation_id AS plan_id,result_id,target,"
+            "SELECT action_id,action_kind,group_id,confirmation_id AS plan_id,target,"
             "tool_name,arguments_json,action_key,expires_at FROM telegram_agent_actions "
             "WHERE action_id=? AND owner_digest=?",
             (action_id, self._owner_digest(owner)),
@@ -1248,10 +1278,14 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
 
     @staticmethod
     def _inspect_row(row: Any) -> dict[str, Any]:
+        result_id = ""
+        if str(row["action_kind"] or "") == "prepare_resource":
+            arguments = _load_action_json_object(row["arguments_json"])
+            result_id = str(arguments.get("result_id") or "")
         return _action_metadata(
             action=row["action_kind"],
             plan_id=row["plan_id"],
-            result_id=row["result_id"],
+            result_id=result_id,
             target=row["target"],
             tool_name=row["tool_name"],
             action_key=row["action_key"],
@@ -1293,6 +1327,11 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
             try:
                 _active_action_expiry(row["expires_at"], now=now)
                 metadata = self._inspect_row(row)
+                if metadata["action"] == "prepare_resource":
+                    metadata = _resolved_action_payload(
+                        metadata=metadata,
+                        arguments_json=row["arguments_json"],
+                    )
             except (TypeError, ValueError, OverflowError):
                 self._delete_row_group(
                     conn, row=row, owner_digest=owner_digest
@@ -3134,7 +3173,7 @@ _CALLBACK_MEDIA_CONTEXT_TOOLS = frozenset({
     "discovery.lookup_rating",
     "discovery.add_watchlist",
     "indexer.search_resources",
-    "indexer.submit_resource",
+    "ingest.submit",
 })
 
 
@@ -3184,7 +3223,7 @@ def _safe_callback_media_history(
         media["year"] = year
     media_type = (
         "tv"
-        if tool_name == "indexer.submit_resource"
+        if tool_name == "ingest.submit"
         else str(
             data.get("media_type") or arguments.get("media_type") or ""
         ).strip().lower()
@@ -4904,14 +4943,14 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                     "owner": owner,
                     "request_id": _trace_operation_id(operation),
                     "session_id": _telegram_history_identity(owner)[1],
-                    "trusted_resource_owner_binding": True,
                 }
                 if confirmation_epoch is not None:
                     prepare_kwargs["expected_owner_generation"] = confirmation_epoch
                 response = service.prepare(
-                    "indexer.submit_resource",
+                    "ingest.submit",
                     {
-                        "result_id": action["result_id"],
+                        "source_type": "resource_candidates",
+                        "positions": [action["position"]],
                         "target": action["target"],
                     },
                     **prepare_kwargs,
@@ -4937,6 +4976,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                             if (
                                 claimed.get("action") != "prepare_resource"
                                 or claimed.get("result_id") != action["result_id"]
+                                or claimed.get("position") != action["position"]
                                 or claimed.get("target") != action["target"]
                             ):
                                 raise ValueError("操作已过期或无效")

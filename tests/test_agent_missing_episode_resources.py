@@ -239,7 +239,7 @@ class MissingEpisodeResourceToolTests(unittest.TestCase):
         self.assertFalse(result.data["search"]["download_plan"]["auto_submit"])
         self.assertEqual(
             result.data["search"]["download_plan"]["prepare_tool"],
-            "indexer.submit_candidate",
+            "ingest.submit",
         )
         audit.assert_called_once_with({
             "query": "示例剧",

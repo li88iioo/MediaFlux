@@ -494,8 +494,9 @@ class AgentLLMSelectionTests(unittest.TestCase):
             "guangya.organize.cleanup.execute",
         }.issubset(confirmation_tools))
         self.assertIn("agent.cancel_pending_action", read_tools)
-        self.assertIn("indexer.submit_candidate", confirmation_tools)
-        self.assertIn("indexer.submit_candidates", confirmation_tools)
+        self.assertIn("ingest.submit", confirmation_tools)
+        self.assertIn("ingest.inspect", read_tools)
+        self.assertIn("ingest.status", read_tools)
         exposed_names = read_tools | confirmation_tools
         self.assertFalse(any(
             token in name.casefold()
@@ -3496,7 +3497,12 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
                 self.assertIs(response, fallback)
                 planner.assert_not_called()
                 submit.assert_called_once_with(
-                    {"position": 2, "target": "qb"}, owner="web-session"
+                    {
+                        "source_type": "resource_candidates",
+                        "positions": [2],
+                        "target": "qb",
+                    },
+                    owner="web-session",
                 )
 
     def test_read_only_danger_domain_questions_can_still_use_planner(self):

@@ -17,6 +17,9 @@ _FORBIDDEN_TOOL_NAMES = {
     "indexer.submit_resource_batch",
     "rss.set_subscription_enabled",
     "rss.set_refresh_interval",
+    "guangya.change_plan.execute",
+    "guangya.media_hygiene.execute",
+    "guangya.organize.clean_empty",
 }
 
 _REQUIRED_PROJECT_TOOLS = {
@@ -62,8 +65,9 @@ _REQUIRED_PROJECT_TOOLS = {
     "config.set_indexer_sites",
     "indexer.diagnose_readiness",
     "indexer.search_resources",
-    "indexer.submit_candidate",
-    "indexer.submit_candidates",
+    "ingest.inspect",
+    "ingest.submit",
+    "ingest.status",
     # 探索：搜索、详情、推荐、评分、Web/Tavily 辅助、映射和收藏闭环。
     "web.search",
     "bangumi.calendar",
@@ -98,7 +102,6 @@ _REQUIRED_PROJECT_TOOLS = {
     "guangya.organize.preview",
     "guangya.organize.run_once",
     "guangya.organize.status",
-    "guangya.organize.clean_empty",
     "guangya.organize.cleanup.classify",
     "guangya.organize.cleanup.preview",
     "guangya.organize.cleanup.execute",
@@ -213,5 +216,5 @@ def test_removed_legacy_action_modules_and_web_calls_do_not_return() -> None:
     web_source = (_REPO_ROOT / "app/static/js/agent.js").read_text(encoding="utf-8")
     assert "indexer.submit_resource" not in web_source
     assert "data-agent-resource-id" not in web_source
-    assert "/api/agent/actions/indexer.submit_candidate/prepare" in web_source
+    assert "/api/agent/actions/ingest.submit/prepare" in web_source
     assert "data-agent-resource-position" in web_source

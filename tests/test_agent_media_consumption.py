@@ -323,14 +323,18 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             return_value={"mode": "confirmation_required"},
         ) as prepare_mock:
             response = service._continue_recent_resource_submit(
-                {"position": 1, "target": None}, owner="owner-a"
+                {"source_type": "resource_candidates", "positions": [1], "target": None}, owner="owner-a"
             )
         self.assertEqual(response["mode"], "confirmation_required")
         self.assertEqual(
             prepare_mock.call_args.args[:2],
             (
-                "indexer.submit_candidate",
-                {"position": 1, "target": "qb"},
+                "ingest.submit",
+                {
+                    "source_type": "resource_candidates",
+                    "positions": [1],
+                    "target": "qb",
+                },
             ),
         )
 

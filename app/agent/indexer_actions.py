@@ -339,7 +339,7 @@ def search_resources(
     )
 
 
-def _target_readiness(target: str) -> dict[str, bool]:
+def download_target_readiness(target: str) -> dict[str, bool]:
     readiness: dict[str, bool] = {}
     if target in {"qb", "both"}:
         readiness["qb"] = bool(str(config.get("QB_URL", "") or "").strip())
@@ -397,7 +397,7 @@ def _capture_submit_resource(arguments: dict[str, str]) -> dict[str, Any]:
             "resource_error": exc,
             "fingerprint": f"resource-error:{exc.code}",
         }
-    readiness = _target_readiness(arguments["target"])
+    readiness = download_target_readiness(arguments["target"])
     payload = _resource_confirmation_payload(arguments, item, readiness)
     return {
         "enabled": True,
@@ -649,7 +649,7 @@ def _capture_submit_resource_batch(arguments: dict[str, Any]) -> dict[str, Any]:
             "resource_error": exc,
             "fingerprint": f"resource-error:{exc.code}",
         }
-    readiness = _target_readiness(arguments["target"])
+    readiness = download_target_readiness(arguments["target"])
     payload = {
         "resources": resources,
         "target": arguments["target"],

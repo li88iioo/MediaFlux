@@ -229,7 +229,7 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("library.search_missing_episode_resources", source)
         self.assertIn("resource_followups_truncated", source)
         self.assertIn("当前提供前 ${followups.size} 集快捷搜索", source)
-        self.assertIn("/api/agent/actions/indexer.submit_candidate/prepare", source)
+        self.assertIn("/api/agent/actions/ingest.submit/prepare", source)
         self.assertIn("dataset.agentResourcePosition", source)
         self.assertIn("updates_available: '发现缺集'", source)
         self.assertIn("not_supported: '暂不支持'", source)
