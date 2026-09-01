@@ -77,9 +77,6 @@ def prepare_trigger_patrol_now(_arguments: dict[str, Any]) -> tuple[ToolResult, 
     ), snapshot["fingerprint"]
 
 
-def trigger_patrol_now(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("立即巡检必须先预检并确认", code="confirmation_required")
-
 
 def trigger_patrol_now_confirmed(
     _arguments: dict[str, Any], expected_context: str

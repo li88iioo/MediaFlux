@@ -74,6 +74,26 @@ def _identity(arguments):
     return dict(arguments)
 
 
+def _pending_action_plan(
+    plan_id: str = "opaque-plan-ticket-123456"
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "plan_id": plan_id,
+        "status": "awaiting_approval",
+        "title": "执行受控操作",
+        "target": "当前对象",
+        "impact": "应用预检变更",
+        "reversibility": "可手动撤销",
+        "risk": "write",
+        "preflight_at": "",
+        "decisions": [
+            {"id": "execute", "label": "执行"},
+            {"id": "cancel", "label": "取消"},
+        ],
+    }
+
+
 def _confirmation_registry(*, calls=None) -> ToolRegistry:
     calls = calls if calls is not None else []
     registry = ToolRegistry()
@@ -94,13 +114,18 @@ def _confirmation_registry(*, calls=None) -> ToolRegistry:
             "feature": str(arguments["feature"]),
             "enabled": bool(arguments["enabled"]),
         },
-        handler=lambda arguments: calls.append(dict(arguments)) or ToolResult(
-            True, "changed", "已修改"
-        ),
         requires_confirmation=True,
-        preview_handler=lambda arguments: ToolResult(
-            True, "confirmation_required", "确认后将修改网页搜索开关",
-            data=dict(arguments),
+        confirmation_preparer=lambda arguments: (
+            ToolResult(
+                True,
+                "confirmation_required",
+                "确认后将修改网页搜索开关",
+                data=dict(arguments),
+            ),
+            f"feature-state:{arguments['feature']}:{arguments['enabled']}",
+        ),
+        confirmed_handler=lambda arguments, _expected_context: (
+            calls.append(dict(arguments)) or ToolResult(True, "changed", "已修改")
         ),
         llm_confirmation=True,
     ))
@@ -110,10 +135,13 @@ def _confirmation_registry(*, calls=None) -> ToolRegistry:
         risk=RiskLevel.LOW_WRITE,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         validator=lambda arguments: {},
-        handler=lambda arguments: ToolResult(True, "changed", "changed"),
         requires_confirmation=True,
-        preview_handler=lambda arguments: ToolResult(
-            True, "confirmation_required", "preview"
+        confirmation_preparer=lambda arguments: (
+            ToolResult(True, "confirmation_required", "preview"),
+            "demo-low-write",
+        ),
+        confirmed_handler=lambda arguments, _expected_context: ToolResult(
+            True, "changed", "changed"
         ),
     ))
     registry.register(ToolSpec(
@@ -240,9 +268,14 @@ def _read_registry(*, calls=None) -> ToolRegistry:
         risk=RiskLevel.WRITE,
         parameters={"type": "object", "properties": {}},
         validator=_identity,
-        handler=lambda arguments: ToolResult(True, "ok", "changed"),
         requires_confirmation=True,
-        preview_handler=lambda arguments: ToolResult(True, "preview", "preview"),
+        confirmation_preparer=lambda arguments: (
+            ToolResult(True, "preview", "preview"),
+            "feature-state",
+        ),
+        confirmed_handler=lambda arguments, _expected_context: ToolResult(
+            True, "ok", "changed"
+        ),
     ))
     registry.register(ToolSpec(
         name="demo.read",
@@ -1550,7 +1583,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
         prepared_response = reply.tool_executions[0]["response"]
         self.assertEqual(prepared_response["mode"], "confirmation_required")
         self.assertEqual(
-            prepared_response["confirmation"]["tool"],
+            prepared_response["tool_call"]["name"],
             "config.set_feature_state",
         )
         self.assertTrue(captured["closed"])
@@ -3153,7 +3186,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
                 "arguments": {"subscription_id": 12, "enabled": False},
             },
             "result": ToolResult(True, "confirmation_required", "等待确认").to_dict(),
-            "confirmation": {"confirmation_id": "opaque"},
+            "action_plan": _pending_action_plan(),
         }
         with patch.object(
             agent, "_query_with_model_tools", return_value=planned
@@ -3356,7 +3389,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             "result": ToolResult(
                 True, "confirmation_required", "不相关的确认"
             ).to_dict(),
-            "confirmation": {"confirmation_id": "opaque"},
+            "action_plan": _pending_action_plan(),
         }
         cases = (
             ("删除下载任务 Foo 了吗", "_handle_download_and_media_subscription_requests"),
@@ -3608,9 +3641,9 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(response["mode"], "confirmation_required")
         self.assertEqual(
-            response["confirmation"]["tool"], "config.set_feature_state"
+            response["tool_call"]["name"], "config.set_feature_state"
         )
-        self.assertEqual(response["confirmation"]["risk"], "low_write")
+        self.assertEqual(response["action_plan"]["risk"], "low_write")
         self.assertEqual(calls, [])
 
     def test_confirmation_selector_fallback_uses_shared_tool_rate_limit(self):
@@ -3680,7 +3713,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(response["mode"], "confirmation_required")
         self.assertEqual(
-            response["confirmation"]["tool"], "config.set_feature_state"
+            response["tool_call"]["name"], "config.set_feature_state"
         )
         self.assertIn("尚未执行", response["presentation"]["narrative"])
         self.assertEqual(calls, [])

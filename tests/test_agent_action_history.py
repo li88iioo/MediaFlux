@@ -393,27 +393,46 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
     def test_confirm_records_success_stale_and_replay_only_once(self):
         context = {"value": "one"}
         registry = ToolRegistry()
+        def prepare_run_once(_arguments: dict) -> tuple[ToolResult, str]:
+            return (
+                ToolResult(True, "confirmation_required", "preview"),
+                context["value"],
+            )
+
+        def confirm_run_once(
+            _arguments: dict, expected_context: str
+        ) -> ToolResult:
+            if context["value"] != expected_context:
+                raise AgentToolError(
+                    "STRM 运行上下文已变化，请重新确认",
+                    code="confirmation_stale",
+                )
+            return ToolResult(
+                True,
+                "accepted",
+                "raw /private/path",
+                data={
+                    "accepted": True,
+                    "trigger": "manual",
+                    "path": "/private/path",
+                },
+            )
+
         registry.register(ToolSpec(
             name="strm.run_once",
             description="test",
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda arguments: {},
-            preview_handler=lambda arguments: ToolResult(True, "confirmation_required", "preview"),
-            handler=lambda arguments: ToolResult(
-                True,
-                "accepted",
-                "raw /private/path",
-                data={"accepted": True, "trigger": "manual", "path": "/private/path"},
-            ),
-            confirmation_context=lambda arguments: context["value"],
+            confirmation_preparer=prepare_run_once,
+            confirmed_handler=confirm_run_once,
             requires_confirmation=True,
         ))
         store = ConfirmationStore(token_factory=lambda: "ticket-1234567890abcdef")
         service = AgentOrchestrator(registry, store, record_actions=True)
 
         prepared = service.prepare("strm.run_once", {}, owner="owner")
-        confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(confirmed["result"]["status"], "accepted")
         success = db.list_agent_action_history(
             owner_digest=action_history_owner_digest("owner"), limit=10
@@ -424,7 +443,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
 
         prepared = service.prepare("strm.run_once", {}, owner="owner")
         context["value"] = "two"
-        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        confirmation_id = prepared["action_plan"]["plan_id"]
         with self.assertRaises(AgentToolError) as stale:
             service.confirm(confirmation_id, owner="owner")
         self.assertEqual(stale.exception.code, "confirmation_stale")
@@ -451,8 +470,11 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda arguments: {},
-            preview_handler=lambda arguments: ToolResult(True, "confirmation_required", "preview"),
-            handler=lambda arguments: (
+            confirmation_preparer=lambda arguments: (
+                ToolResult(True, "confirmation_required", "preview"),
+                "strm-run-once",
+            ),
+            confirmed_handler=lambda arguments, _expected_context: (
                 calls.append("executed")
                 or ToolResult(True, "accepted", "done")
             ),
@@ -467,7 +489,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         with patch("app.agent.action_history.db.add_agent_action_history", side_effect=OSError("disk")):
             with self.assertRaises(OSError):
                 service.confirm(
-                    prepared["confirmation"]["confirmation_id"],
+                    prepared["action_plan"]["plan_id"],
                     owner="owner",
                 )
         self.assertEqual(calls, [])
@@ -475,7 +497,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
     def test_interrupted_confirm_is_persisted_as_outcome_unknown(self):
         registry = ToolRegistry()
 
-        def interrupt(_arguments):
+        def interrupt(_arguments, _expected_context):
             raise KeyboardInterrupt("simulated process interruption")
 
         registry.register(ToolSpec(
@@ -484,10 +506,11 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda arguments: {},
-            preview_handler=lambda arguments: ToolResult(
-                True, "confirmation_required", "preview"
+            confirmation_preparer=lambda arguments: (
+                ToolResult(True, "confirmation_required", "preview"),
+                "strm-run-once",
             ),
-            handler=interrupt,
+            confirmed_handler=interrupt,
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -496,7 +519,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             record_actions=True,
         )
         prepared = service.prepare("strm.run_once", {}, owner="owner")
-        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        confirmation_id = prepared["action_plan"]["plan_id"]
 
         with self.assertRaises(KeyboardInterrupt):
             service.confirm(confirmation_id, owner="owner")

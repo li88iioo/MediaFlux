@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 import hashlib
 import json
-import threading
+import secrets
 from typing import Any
 
 from app import config, database as db
@@ -27,14 +27,6 @@ _STRM_CONFIRMATION_KEYS = (
     "STRM_NOTIFY_ENABLED",
     "GY_ORGANIZE_STRM_DETAIL_NOTIFY",
 )
-_CONFIRMATION_STATE = threading.local()
-
-
-def clear_confirmation_state() -> None:
-    _CONFIRMATION_STATE.preview = None
-    _CONFIRMATION_STATE.pending = None
-
-
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -107,10 +99,10 @@ def _breakdown(failures: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
-def preview_strm_failure_retry(arguments: dict[str, Any]) -> ToolResult:
+def _preview_strm_failure_retry(
+    arguments: dict[str, Any], state: dict[str, Any]
+) -> ToolResult:
     """仅查询失败账本并生成安全摘要，不 claim、不访问云盘。"""
-    _CONFIRMATION_STATE.preview = None
-    state = _capture(arguments)
     failures = state["failures"]
     count = len(failures)
     if state["config_error"]:
@@ -138,7 +130,6 @@ def preview_strm_failure_retry(arguments: dict[str, Any]) -> ToolResult:
             suggestions=["请改为只重试 STRM 生成失败，或只重试 STRM 元数据失败。"],
         )
 
-    _CONFIRMATION_STATE.preview = state
     counts = _breakdown(failures)
     return ToolResult(
         ok=True,
@@ -146,7 +137,7 @@ def preview_strm_failure_retry(arguments: dict[str, Any]) -> ToolResult:
         summary=f"确认后将重试 {count} 条 STRM 失败记录",
         data={
             "action": "strm.retry_failures",
-            "scope": arguments["scope"],
+            "scope": state["scope"],
             "selected_count": count,
             "by_action": counts,
             "effects": [
@@ -165,13 +156,11 @@ def preview_strm_failure_retry(arguments: dict[str, Any]) -> ToolResult:
     )
 
 
-def strm_failure_retry_confirmation_context(arguments: dict[str, Any]) -> str:
-    state = getattr(_CONFIRMATION_STATE, "preview", None)
-    _CONFIRMATION_STATE.preview = None
-    if not isinstance(state, dict) or state.get("scope") != arguments["scope"]:
-        state = _capture(arguments)
-    _CONFIRMATION_STATE.pending = state
-    return str(state["fingerprint"])
+def prepare_strm_failure_retry(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    state = _capture(arguments)
+    return _preview_strm_failure_retry(arguments, state), str(state["fingerprint"])
 
 
 def _safe_count(raw: dict[str, Any], key: str) -> int:
@@ -181,18 +170,8 @@ def _safe_count(raw: dict[str, Any], key: str) -> int:
         return 0
 
 
-def retry_strm_failure_records(arguments: dict[str, Any]) -> ToolResult:
-    pending = getattr(_CONFIRMATION_STATE, "pending", None)
-    _CONFIRMATION_STATE.pending = None
-    if not isinstance(pending, dict) or pending.get("scope") != arguments["scope"]:
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="确认上下文不可用，请重新预检",
-            error="确认上下文不可用。",
-        )
-
-    if pending.get("config_error") or not isinstance(pending.get("runtime_config"), dict):
+def _retry_strm_failure_records_state(state: dict[str, Any]) -> ToolResult:
+    if state.get("config_error") or not isinstance(state.get("runtime_config"), dict):
         return ToolResult(
             ok=False,
             status="not_configured",
@@ -200,7 +179,7 @@ def retry_strm_failure_records(arguments: dict[str, Any]) -> ToolResult:
             error="请检查 STRM 配置后重新预检。",
             suggestions=["可询问：为什么 STRM 配置不可用？"],
         )
-    failures = pending.get("failures") if isinstance(pending.get("failures"), list) else []
+    failures = state.get("failures") if isinstance(state.get("failures"), list) else []
     if not failures or len(failures) > _MAX_RETRY_ITEMS:
         return ToolResult(
             ok=False,
@@ -215,7 +194,7 @@ def retry_strm_failure_records(arguments: dict[str, Any]) -> ToolResult:
     raw = retry_strm_failures(
         ids,
         "agent",
-        runtime_config=pending.get("runtime_config") or {},
+        runtime_config=state.get("runtime_config") or {},
     )
     raw = raw if isinstance(raw, dict) else {}
     counts = {
@@ -240,14 +219,14 @@ def retry_strm_failure_records(arguments: dict[str, Any]) -> ToolResult:
             ok=False,
             status="conflict",
             summary="失败项已被其他任务处理，请重新查看",
-            data={**counts, "scope": arguments["scope"]},
+            data={**counts, "scope": state["scope"]},
             error="确认后的失败项状态已变化，本次未执行重试。",
             suggestions=["可再次询问：查看 STRM 失败状态。"],
         )
 
     logger.info(
         "Agent STRM 失败重试完成 scope=%s requested=%s matched=%s resolved=%s failed=%s",
-        arguments["scope"], counts["requested"], counts["matched"],
+        state["scope"], counts["requested"], counts["matched"],
         counts["resolved"], counts["failed"],
     )
     summary = f"STRM 重试完成：已解决 {counts['resolved']} 条"
@@ -262,7 +241,7 @@ def retry_strm_failure_records(arguments: dict[str, Any]) -> ToolResult:
         ok=True,
         status="partial" if counts["failed"] or counts["deferred"] or changed else "completed",
         summary=summary,
-        data={**counts, "scope": arguments["scope"]},
+        data={**counts, "scope": state["scope"]},
         evidence=[Evidence(
             "strm_retry",
             "已通过一次性确认票据重试冻结的失败项集合；仅返回聚合计数，不返回来源、对象、文件、路径或错误正文。",
@@ -270,3 +249,17 @@ def retry_strm_failure_records(arguments: dict[str, Any]) -> ToolResult:
         )],
         suggestions=["可再次询问：查看 STRM 失败状态。"],
     )
+
+
+def retry_strm_failure_records_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    state = _capture(arguments)
+    if not secrets.compare_digest(
+        str(state["fingerprint"]), str(expected_context or "")
+    ):
+        raise AgentToolError(
+            "STRM 失败项或运行配置已变化，请重新预检",
+            code="confirmation_stale",
+        )
+    return _retry_strm_failure_records_state(state)

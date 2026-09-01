@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import secrets
-from typing import Any, Callable
+from typing import Any
 import unicodedata
 
 from app import database as db
@@ -1351,15 +1351,3 @@ def set_media_subscription_policy_confirmed(
             ),
         ],
     )
-
-
-def set_media_subscription_policy(_arguments: dict[str, Any]) -> ToolResult:
-    return _unconfirmed(_arguments)
-
-def _unconfirmed(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该媒体追更订阅操作需要确认", code="confirmation_required")
-
-
-create_media_subscription: Callable[[dict[str, Any]], ToolResult] = _unconfirmed
-delete_media_subscription: Callable[[dict[str, Any]], ToolResult] = _unconfirmed
-set_media_subscription_enabled: Callable[[dict[str, Any]], ToolResult] = _unconfirmed

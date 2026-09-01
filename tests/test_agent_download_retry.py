@@ -155,7 +155,7 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
                 owner="owner",
             )
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "completed")
@@ -183,7 +183,7 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
             )
             db.update_download_request(request_id, title="Changed title")
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertFalse(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "conflict")
@@ -216,7 +216,7 @@ class DownloadRetryTests(IsolatedDatabaseTestCase):
                 owner="owner",
             )
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "partial")

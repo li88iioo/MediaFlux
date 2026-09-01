@@ -141,10 +141,6 @@ def prepare_scan_local_media_sources(
     ), _fingerprint(snapshot)
 
 
-def scan_local_media_sources(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
-
-
 def scan_local_media_sources_confirmed(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:

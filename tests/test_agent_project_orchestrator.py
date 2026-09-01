@@ -26,8 +26,8 @@ from app.agent.objective_contract import infer_agent_objective
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.tools import (
     build_tool_registry,
-    preview_strm_run_once,
-    run_strm_once,
+    prepare_strm_run_once,
+    run_strm_once_confirmed,
     strm_run_arguments,
 )
 
@@ -450,8 +450,8 @@ class AgentScopedWorkflowTests(unittest.TestCase):
             "app.modules.strm.configured_strm_source_plans",
             return_value=(configured, ""),
         ), patch("app.modules.scheduler.get_scheduler", return_value=scheduler):
-            preview = preview_strm_run_once(arguments)
-            result = run_strm_once(arguments)
+            preview, context = prepare_strm_run_once(arguments)
+            result = run_strm_once_confirmed(arguments, context)
 
         self.assertEqual(strm_run_arguments(arguments), arguments)
         self.assertEqual(

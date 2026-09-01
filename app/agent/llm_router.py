@@ -16,6 +16,7 @@ from typing import Any, AsyncIterator, Callable
 import httpx
 
 from app.agent.async_bridge import run_awaitable_sync
+from app.agent.action_plan import sanitize_action_plan
 from app.agent.metrics import agent_metrics
 from app.agent.capability_retrieval import (
     capability_intent_boost,
@@ -598,16 +599,6 @@ def _provider() -> tuple[object, str] | None:
         return None
     protocol = resolve_protocol(get("AGENT_LLM_PROTOCOL", "auto"), raw)
     return location, protocol
-
-
-def _endpoint() -> tuple[str, str] | None:
-    """兼容旧测试/调用：返回当前首选请求端点与 host。"""
-    provider = _provider()
-    if provider is None:
-        return None
-    location, protocol = provider
-    selected = "responses" if protocol == "auto" else protocol
-    return location.endpoint(selected), location.host
 
 
 async def _request_structured_json(
@@ -2062,16 +2053,6 @@ def _native_read_only_subset(
     return selected
 
 
-def _native_read_system_prompt(
-    *, include_confirmations: bool = False, objective_instruction: str = ""
-) -> str:
-    """兼容现有私有入口；提示策略集中在 prompts 包中。"""
-    return native_read_system_prompt(
-        include_confirmations=include_confirmations,
-        objective_instruction=objective_instruction,
-    )
-
-
 def _valid_native_answer(
     value: object, *, forbidden_names: frozenset[str] = frozenset()
 ) -> str:
@@ -2405,11 +2386,10 @@ async def _execute_native_tool_turn(
     for item in prepared:
         if item["payload"] is None and item["confirmation"]:
             index, payload = await _execute(item)
-            confirmation = payload.get("confirmation")
+            action_plan = sanitize_action_plan(payload.get("action_plan"))
             if (
                 payload.get("mode") == "confirmation_required"
-                and isinstance(confirmation, dict)
-                and str(confirmation.get("confirmation_id") or "").strip()
+                and action_plan
             ):
                 state.confirmation_prepared = True
             results[index] = payload
@@ -2520,7 +2500,7 @@ async def _request_native_read_agent(
         user_agent="MediaFlux-Agent-Native-Tools/1.0",
         pin_resolved_address=True,
     )
-    system_prompt = _native_read_system_prompt(
+    system_prompt = native_read_system_prompt(
         include_confirmations=include_confirmations,
         objective_instruction=objective.prompt_instruction(),
     )

@@ -17,7 +17,6 @@ from app.agent.telegram_test_actions import (
     prepare_telegram_test_notification,
     send_telegram_test_notification_confirmed,
     telegram_test_arguments,
-    telegram_test_confirmation_context,
 )
 from app.agent.tools import build_tool_registry
 
@@ -93,7 +92,7 @@ class TelegramTestNotificationTests(unittest.TestCase):
             "app.agent.telegram_test_actions.config.get",
             side_effect=self._config_get(values),
         ):
-            expected = telegram_test_confirmation_context({})
+            _preview, expected = prepare_telegram_test_notification({})
             with patch.dict(sys.modules, {"telebot": fake_telebot}), patch(
                 "app.agent.telegram_test_actions.configure_telebot_logging"
             ):
@@ -128,7 +127,7 @@ class TelegramTestNotificationTests(unittest.TestCase):
             prepared = service.prepare(
                 "telegram.send_test_notification", {}, owner="owner"
             )
-            confirmation_id = prepared["confirmation"]["confirmation_id"]
+            confirmation_id = prepared["action_plan"]["plan_id"]
             values["TG_CHAT_ID"] = "-100987654321"
             with self.assertRaisesRegex(AgentToolError, "已变化|失效"):
                 service.confirm(confirmation_id, owner="owner")
@@ -144,7 +143,7 @@ class TelegramTestNotificationTests(unittest.TestCase):
             prepared = service.prepare(
                 "telegram.send_test_notification", {}, owner="owner"
             )
-            confirmation_id = prepared["confirmation"]["confirmation_id"]
+            confirmation_id = prepared["action_plan"]["plan_id"]
             confirmed = service.confirm(confirmation_id, owner="owner")
             self.assertTrue(confirmed["result"]["ok"])
             with self.assertRaises(AgentToolError):
@@ -165,7 +164,7 @@ class TelegramTestNotificationTests(unittest.TestCase):
             "app.agent.telegram_test_actions.config.get",
             side_effect=self._config_get(values),
         ):
-            expected = telegram_test_confirmation_context({})
+            _preview, expected = prepare_telegram_test_notification({})
             with patch.dict(sys.modules, {"telebot": fake_telebot}), patch(
                 "app.agent.telegram_test_actions.configure_telebot_logging"
             ):

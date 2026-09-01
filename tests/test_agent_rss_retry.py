@@ -17,10 +17,9 @@ from app.agent.orchestrator import (
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError
 from app.agent.rss_retry_actions import (
-    preview_rss_failure_retry,
-    retry_failed_rss_to_qb,
+    prepare_rss_failure_retry,
+    retry_failed_rss_to_qb_confirmed,
     rss_failure_retry_arguments,
-    rss_failure_retry_confirmation_context,
 )
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from app.clients.qbittorrent import QBittorrentClient, TorrentAddResult
@@ -190,7 +189,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         db.update_rss_entries_processed([selected[0]], True)
 
         with patch("app.clients.qbittorrent.QBittorrentClient.add_torrent_detailed") as add:
-            result = preview_rss_failure_retry({"limit": 2})
+            result, _context = prepare_rss_failure_retry({"limit": 2})
         self.assertTrue(result.ok)
         self.assertEqual(result.data["selected_count"], 2)
         self.assertFalse(result.data["has_more"])
@@ -257,7 +256,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         sub_id = self._subscription()
         first = self._failed(sub_id, 1)
         second = self._failed(sub_id, 2)
-        fingerprint = rss_failure_retry_confirmation_context({"limit": 2})
+        fingerprint = prepare_rss_failure_retry({"limit": 2})[1]
         self.assertEqual(len(fingerprint), 64)
         raw = {
             "ok": True, "conflict": False, "requested": 2,
@@ -265,7 +264,9 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "error": "QB_SECRET /private/path qb_unavailable",
         }
         with patch.object(RSSEngine, "retry_failed_qb_snapshot", return_value=raw) as retry:
-            result = retry_failed_rss_to_qb({"limit": 2})
+            result = retry_failed_rss_to_qb_confirmed(
+                {"limit": 2}, fingerprint
+            )
         expected_rows, runtime = retry.call_args.args
         self.assertEqual([item["id"] for item in expected_rows], [second, first])
         self.assertEqual(runtime, self.runtime)
@@ -285,21 +286,23 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         db.record_rss_entry_failure(third, "qb_rate_limited", True)
         with patch.object(RSSEngine, "retry_failed_qb_snapshot") as handler:
             with self.assertRaises(AgentToolError) as stale:
-                service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+                service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(stale.exception.code, "confirmation_stale")
         handler.assert_not_called()
 
     def test_unknown_retry_requires_qb_review_before_another_attempt(self):
         sub_id = self._subscription()
         self._failed(sub_id, 1)
-        rss_failure_retry_confirmation_context({"limit": 1})
         raw = {
             "ok": False, "conflict": False, "requested": 1,
             "claimed": 1, "submitted": 0, "failed": 1,
             "outcome_unknown": 1,
         }
+        fingerprint = prepare_rss_failure_retry({"limit": 1})[1]
         with patch.object(RSSEngine, "retry_failed_qb_snapshot", return_value=raw):
-            result = retry_failed_rss_to_qb({"limit": 1})
+            result = retry_failed_rss_to_qb_confirmed(
+                {"limit": 1}, fingerprint
+            )
 
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "review_required")
@@ -311,14 +314,16 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         sub_id = self._subscription()
         for index in range(1, 4):
             self._failed(sub_id, index)
-        rss_failure_retry_confirmation_context({"limit": 3})
         raw = {
             "ok": False, "conflict": False, "requested": 3,
             "claimed": 3, "submitted": 1, "failed": 2,
             "outcome_unknown": 1,
         }
+        fingerprint = prepare_rss_failure_retry({"limit": 3})[1]
         with patch.object(RSSEngine, "retry_failed_qb_snapshot", return_value=raw):
-            result = retry_failed_rss_to_qb({"limit": 3})
+            result = retry_failed_rss_to_qb_confirmed(
+                {"limit": 3}, fingerprint
+            )
 
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "partial")
@@ -462,7 +467,7 @@ class RssFailureRetryAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(prepared.status_code, 200, prepared.text)
             body = prepared.json()
             self.assertEqual(body["mode"], "confirmation_required")
-            confirmation_id = body["confirmation"]["confirmation_id"]
+            confirmation_id = body["action_plan"]["plan_id"]
 
             direct = self.client.post(
                 "/api/agent/tools/rss.retry_failed_to_qb",
@@ -474,14 +479,14 @@ class RssFailureRetryAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 200, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "completed")
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             retry.assert_called_once()

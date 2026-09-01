@@ -22,9 +22,8 @@ from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError
 from app.agent.service import reset_agent_service_for_tests
 from app.agent.strm_schedule_config_actions import (
-    preview_set_strm_schedule_policy,
+    prepare_strm_schedule_policy_confirmation,
     strm_schedule_policy_arguments,
-    strm_schedule_policy_confirmation_context,
     summarize_strm_schedule_policy,
 )
 from app.agent.tools import build_tool_registry
@@ -124,8 +123,9 @@ class StrmSchedulePolicyUnitTests(unittest.TestCase):
                 config, "_cache", None
             ), patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()):
                 summary = summarize_strm_schedule_policy({})
-                preview = preview_set_strm_schedule_policy({"enabled": True})
-                context = strm_schedule_policy_confirmation_context({"enabled": True})
+                preview, context = prepare_strm_schedule_policy_confirmation(
+                    {"enabled": True}
+                )
         rendered = repr((summary.to_dict(), preview.to_dict(), context))
         self.assertNotIn(secret, rendered)
         self.assertNotIn("GY_TOKEN", rendered)
@@ -244,7 +244,7 @@ class StrmSchedulePolicyApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(prepared.status_code, 200, prepared.text)
         body = prepared.json()
         self.assertEqual(body["mode"], "confirmation_required")
-        self.assertEqual(body["confirmation"]["tool"], "strm.set_schedule_policy")
+        self.assertEqual(body["tool_call"]["name"], "strm.set_schedule_policy")
         self.assertEqual(config._read_env_file(self.env_file)["STRM_SCHEDULE_ENABLED"], "0")
 
         scheduler = Mock()
@@ -252,7 +252,7 @@ class StrmSchedulePolicyApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         self.assertTrue(confirmed.json()["result"]["ok"])
@@ -262,7 +262,7 @@ class StrmSchedulePolicyApiTests(IsolatedDatabaseTestCase):
         replay = self.client.post(
             "/api/agent/actions/confirm",
             headers={"X-CSRF-Token": csrf},
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+            json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
         )
         self.assertEqual(replay.status_code, 409, replay.text)
 
@@ -295,7 +295,7 @@ class StrmSchedulePolicyApiTests(IsolatedDatabaseTestCase):
         stale = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+            json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
         )
         self.assertEqual(stale.status_code, 409, stale.text)
 
@@ -309,7 +309,7 @@ class StrmSchedulePolicyApiTests(IsolatedDatabaseTestCase):
             failed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
             )
         self.assertEqual(failed.status_code, 503, failed.text)
         scheduler.reload.assert_not_called()
@@ -324,7 +324,7 @@ class StrmSchedulePolicyApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]

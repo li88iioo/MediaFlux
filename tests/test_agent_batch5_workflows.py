@@ -1114,7 +1114,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             runtime["password"] = "changed-password"
             with self.assertRaises(AgentToolError) as stale:
                 get_agent_service().confirm(
-                    prepared["confirmation"]["confirmation_id"], owner="owner-hmac"
+                    prepared["action_plan"]["plan_id"], owner="owner-hmac"
                 )
         self.assertEqual(stale.exception.code, "confirmation_stale")
 
@@ -1130,6 +1130,23 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         self.assertEqual(first, reordered)
         self.assertNotEqual(first, other_domain)
         self.assertNotEqual(first, other_secret)
+
+        for invalid_value in (
+            {"value": float("nan")},
+            {"value": object()},
+            {"value": "\ud800"},
+        ):
+            with self.subTest(invalid_value=type(invalid_value["value"]).__name__):
+                with self.assertRaises(ValueError):
+                    confirmation_context_fingerprint(
+                        invalid_value, domain="domain-a"
+                    )
+        for invalid_domain in ("", "确认域", None):
+            with self.subTest(invalid_domain=invalid_domain):
+                with self.assertRaises(ValueError):
+                    confirmation_context_fingerprint(
+                        value_a, domain=invalid_domain  # type: ignore[arg-type]
+                    )
 
         _sid, first_entry, second_entry = self._rss()
         runtime = {
@@ -1184,10 +1201,18 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
                 risk=RiskLevel.LOW_WRITE,
                 parameters={"type": "object"},
                 validator=identity,
-                handler=lambda _arguments: ToolResult(True, "completed", "done"),
                 requires_confirmation=True,
-                preview_handler=lambda arguments: ToolResult(
-                    True, "confirmation_required", "preview", data=dict(arguments)
+                confirmation_preparer=lambda arguments, tool_name=tool_name: (
+                    ToolResult(
+                        True,
+                        "confirmation_required",
+                        "preview",
+                        data=dict(arguments),
+                    ),
+                    f"rate-test:{tool_name}:{arguments!r}",
+                ),
+                confirmed_handler=lambda _arguments, _expected_context: ToolResult(
+                    True, "completed", "done"
                 ),
             ))
         agent = AgentOrchestrator(registry, confirmation_store=ConfirmationStore())
@@ -1262,10 +1287,13 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             risk=RiskLevel.LOW_WRITE,
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             validator=lambda _arguments: {},
-            handler=lambda _arguments: ToolResult(True, "accepted", "queued"),
             requires_confirmation=True,
-            preview_handler=lambda _arguments: ToolResult(
-                True, "confirmation_required", "preview"
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "confirmation_required", "preview"),
+                "patrol-now",
+            ),
+            confirmed_handler=lambda _arguments, _expected_context: ToolResult(
+                True, "accepted", "queued"
             ),
         ))
         agent = AgentOrchestrator(registry, confirmation_store=ConfirmationStore())
@@ -1325,7 +1353,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
                 owner="owner-history",
             )
             confirmed = get_agent_service().confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner-history"
+                prepared["action_plan"]["plan_id"], owner="owner-history"
             )
         self.assertEqual(confirmed["result"]["status"], "review_required")
         item = list_action_history(

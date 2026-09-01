@@ -15,6 +15,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app import config
+from app.agent.action_plan_id import normalize_action_plan_id
 from app.agent.confirmation import confirmation_reply_intent
 from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.metrics import agent_metrics
@@ -120,7 +121,6 @@ from app.agent.feature_gate import (
 )
 from app.agent.llm_router import (
     begin_llm_request_budget,
-    normalize_streamed_answer,
     reset_llm_request_budget,
     stream_existing_answer,
     stream_tool_answer,
@@ -232,6 +232,7 @@ def _agent_error(exc: AgentToolError):
         "confirmation_stale": 409,
         "confirmation_not_supported": 409,
         "confirmation_unavailable": 503,
+        "agent_unavailable": 503,
         "selection_required": 409,
         "precondition_failed": 409,
         "rate_limited": 429,
@@ -239,21 +240,58 @@ def _agent_error(exc: AgentToolError):
     return api_error(exc.safe_message, status_code)
 
 
-def _confirmation_id(value: Any) -> str:
+def _service_is_read_tool(service: Any, tool_name: str) -> bool:
+    """严格读取服务能力；接口缺失或返回非布尔值时拒绝直调。"""
+    try:
+        value = service.is_read_tool(tool_name)
+    except AgentToolError:
+        raise
+    except Exception as exc:
+        raise AgentToolError(
+            "Agent 服务能力暂不可用，请稍后重试",
+            code="agent_unavailable",
+        ) from exc
+    if type(value) is not bool:
+        raise AgentToolError(
+            "Agent 服务能力暂不可用，请稍后重试",
+            code="agent_unavailable",
+        )
+    return value
+
+
+def _agent_runtime_retry_response(exc: AgentRuntimeDisabled):
+    return api_response(
+        {
+            "error": str(exc),
+            "code": "agent_runtime_disabled",
+            "retryable": True,
+        },
+        409,
+    )
+
+
+def _cancel_runtime_changed_operation(
+    *, service: Any, operation: AgentOperationLease
+) -> bool:
+    """只撤销仍由本操作持有的确认 epoch，避免旧请求误伤后继请求。"""
+    return get_agent_operation_coordinator().cancel(
+        owner=operation.owner,
+        operation_id=operation.operation_id,
+        reason="runtime_changed",
+        remember=False,
+        invalidate=lambda: invalidate_query_confirmation_epoch(
+            service, owner=operation.owner
+        ),
+    )
+
+
+def _action_plan_id(value: Any) -> str:
     if not isinstance(value, str):
-        raise AgentToolError("confirmation_id 必须是字符串")
-    token = value.strip()
-    if not 16 <= len(token) <= 256 or not token.isascii() or any(ord(char) < 33 for char in token):
-        raise AgentToolError("confirmation_id 无效")
+        raise AgentToolError("plan_id 必须是字符串")
+    token = normalize_action_plan_id(value)
+    if not token:
+        raise AgentToolError("plan_id 无效")
     return token
-
-
-def _action_plan_id(data: dict[str, Any]) -> str:
-    """兼容旧 confirmation_id，并允许新客户端使用 plan_id。"""
-    keys = [key for key in ("plan_id", "confirmation_id") if key in data]
-    if len(keys) != 1:
-        raise AgentToolError("请求必须且只能包含 plan_id 或 confirmation_id 之一")
-    return _confirmation_id(data.get(keys[0]))
 
 
 def _session_id(value: Any) -> str:
@@ -462,65 +500,6 @@ def _record_query_history(
         logger.warning("Agent 对话历史写入失败 type=%s", type(exc).__name__)
 
 
-def _natural_confirmation_query(
-    request: Request,
-    *,
-    data: dict[str, Any],
-    message: str,
-    owner: str,
-    request_id: str,
-):
-    """在普通 query 轮换 epoch 前消费唯一待确认票据。"""
-    _check_rate_limit(request, "action:natural-confirmation", limit=10)
-    session_key = (
-        _session_id(data.get("session_id")) if "session_id" in data else None
-    )
-    history_generation = (
-        _history_generation(request, session_id=session_key)
-        if session_key is not None
-        else None
-    )
-    service = get_agent_service()
-    coordinator = get_agent_operation_coordinator()
-    operation = coordinator.begin(owner=owner, operation_id=request_id)
-
-    def resolve() -> dict[str, Any]:
-        response = service.resolve_confirmation_reply(
-            message,
-            owner=owner,
-            request_id=operation.operation_id,
-            session_id=session_key or "",
-        )
-        if response is None:
-            raise AgentToolError(
-                "确认回复无法识别，请在确认卡片上操作",
-                code="confirmation_invalid",
-            )
-        if session_key is not None:
-            _record_query_history(
-                request,
-                session_id=session_key,
-                message=message,
-                response=response,
-                expected_generation=history_generation,
-            )
-        return response
-
-    try:
-        published, response = coordinator.finalize_if_current(operation, resolve)
-        if not published or response is None:
-            return api_error("会话状态已变化，请重新生成确认请求", 409)
-    finally:
-        coordinator.finish(operation)
-    result = response.get("result") if isinstance(response.get("result"), dict) else {}
-    if result.get("ok"):
-        return api_response(
-            response,
-            202 if result.get("status") == "accepted" else 200,
-        )
-    return api_response(response, 409)
-
-
 def _ndjson_event(event_type: str, **payload: Any) -> bytes:
     """编码单个 Agent 流事件；每行都是独立、有限的 UTF-8 JSON。"""
     body = {"type": event_type, **payload}
@@ -528,15 +507,6 @@ def _ndjson_event(event_type: str, **payload: Any) -> bytes:
         json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         + "\n"
     ).encode("utf-8")
-
-
-def _apply_streamed_answer(
-    response: dict[str, Any], answer: str
-) -> dict[str, Any]:
-    """兼容旧私有入口；实际合并规则由共享投影层维护。"""
-    return apply_streamed_answer(
-        response, answer, result_projector=project_agent_result_for_user
-    )
 
 
 def _public_deterministic_fallback_response(
@@ -640,6 +610,7 @@ async def _stream_query_events(
         # 只在进程内锁中完成“当前请求”判定与事件快照生成。真正向 ASGI
         # yield 必须发生在锁外，否则慢客户端会阻塞同会话的取消/重置。
         if not agent_runtime_generation_is_current(runtime_generation):
+            _cancel_runtime_changed_operation(service=service, operation=operation)
             return None
         published, event = coordinator.publish_if_current(
             operation,
@@ -690,6 +661,10 @@ async def _stream_query_events(
                     not coordinator.is_current(operation)
                     or not agent_runtime_generation_is_current(runtime_generation)
                 ):
+                    if not agent_runtime_generation_is_current(runtime_generation):
+                        _cancel_runtime_changed_operation(
+                            service=service, operation=operation
+                        )
                     query_task.add_done_callback(consume_detached_query)
                     yield cancelled_event()
                     return
@@ -794,7 +769,11 @@ async def _stream_query_events(
             """在线性化窗口内提交工具状态、保存安全前缀并发布中断事件。"""
             state_buffer.commit()
             partial_answer = projector.published_answer()
-            interrupted_response = _apply_streamed_answer(response, partial_answer)
+            interrupted_response = apply_streamed_answer(
+                response,
+                partial_answer,
+                result_projector=project_agent_result_for_user,
+            )
             result = interrupted_response.get("result")
             if isinstance(result, dict):
                 interrupted_result = dict(result)
@@ -824,10 +803,19 @@ async def _stream_query_events(
             )
 
         def finalize_interrupted() -> bytes | None:
-            published, event = coordinator.finalize_if_current(
-                operation,
-                interrupted_event,
-            )
+            try:
+                with agent_runtime_admission(
+                    expected_generation=runtime_generation
+                ):
+                    published, event = coordinator.finalize_if_current(
+                        operation,
+                        interrupted_event,
+                    )
+            except AgentRuntimeDisabled:
+                _cancel_runtime_changed_operation(
+                    service=service, operation=operation
+                )
+                return None
             return event if published else None
 
         if stream is not None:
@@ -905,7 +893,11 @@ async def _stream_query_events(
             except ProviderStreamError:
                 answer = ""
             if answer:
-                final_response = _apply_streamed_answer(response, answer)
+                final_response = apply_streamed_answer(
+                    response,
+                    answer,
+                    result_projector=project_agent_result_for_user,
+                )
             else:
                 deterministic_public_fallback = True
                 logger.warning(
@@ -951,10 +943,18 @@ async def _stream_query_events(
                 payload=final_response,
             )
 
-        published, final_event = coordinator.finalize_if_current(
-            operation,
-            finalize_response,
-        )
+        try:
+            with agent_runtime_admission(
+                expected_generation=runtime_generation
+            ):
+                published, final_event = coordinator.finalize_if_current(
+                    operation,
+                    finalize_response,
+                )
+        except AgentRuntimeDisabled:
+            _cancel_runtime_changed_operation(service=service, operation=operation)
+            yield cancelled_event()
+            return
         if not published or final_event is None:
             yield cancelled_event()
             return
@@ -1005,12 +1005,10 @@ def query(request: Request, data: Any = Body(default=None)):
         owner = _agent_owner(request, data)
         request_key = _request_id(data.get("request_id"))
         if confirmation_reply_intent(message) is not None:
-            return _natural_confirmation_query(
-                request,
-                data=data,
-                message=message,
-                owner=owner,
-                request_id=request_key,
+            _check_rate_limit(request, "query", limit=30)
+            return api_error(
+                "为确保执行对象准确，请使用行动计划卡片上的执行或取消按钮",
+                409,
             )
         action_history_request = agent_action_history_request(message)
         recent_resource_submit = is_recent_resource_submit_message(message)
@@ -1268,8 +1266,6 @@ def query(request: Request, data: Any = Body(default=None)):
             try:
                 with defer_agent_state_commits(state_buffer):
                     response = service.query(message, **query_kwargs)
-                if not agent_runtime_generation_is_current(runtime_generation):
-                    return api_error("Media Agent 已关闭，本次结果未保存", 409)
             except (AgentInputError, AgentToolError):
                 if not coordinator.is_current(operation):
                     return api_error("本次请求已被更新操作取代", 409)
@@ -1285,11 +1281,20 @@ def query(request: Request, data: Any = Body(default=None)):
                         expected_generation=history_generation,
                     )
 
-            with coordinator.finalization_window_if_current(operation) as published:
-                if published:
-                    state_buffer.commit()
-                    persist_final()
-                    return api_response(response)
+            try:
+                with agent_runtime_admission(
+                    expected_generation=runtime_generation
+                ):
+                    with coordinator.finalization_window_if_current(operation) as published:
+                        if published:
+                            state_buffer.commit()
+                            persist_final()
+                            return api_response(response)
+            except AgentRuntimeDisabled as exc:
+                _cancel_runtime_changed_operation(
+                    service=service, operation=operation
+                )
+                return _agent_runtime_retry_response(exc)
             return api_error("本次请求已被更新操作取代", 409)
         finally:
             state_buffer.discard()
@@ -1362,8 +1367,7 @@ def invoke_tool(request: Request, tool_name: str, data: Any = Body(default=None)
             else None
         )
         request_key = f"tool_{secrets.token_urlsafe(12)}"
-        read_check = getattr(service, "is_read_tool", None)
-        is_read_tool = bool(read_check(tool_name)) if callable(read_check) else True
+        is_read_tool = _service_is_read_tool(service, tool_name)
         if not is_read_tool:
             # 非只读工具仍由 Registry 拒绝直接执行并引导走 prepare/confirm；
             # 无效直调不应撤销用户已经看到的确认票据。
@@ -1376,6 +1380,7 @@ def invoke_tool(request: Request, tool_name: str, data: Any = Body(default=None)
             ))
 
         coordinator = get_agent_operation_coordinator()
+        runtime_generation = current_agent_runtime_generation()
         operation, _ = coordinator.begin_with_context(
             owner=owner,
             operation_id=request_key,
@@ -1409,11 +1414,20 @@ def invoke_tool(request: Request, tool_name: str, data: Any = Body(default=None)
                         expected_generation=history_generation,
                     )
 
-            with coordinator.finalization_window_if_current(operation) as published:
-                if published:
-                    state_buffer.commit()
-                    persist_final()
-                    return api_response(result)
+            try:
+                with agent_runtime_admission(
+                    expected_generation=runtime_generation
+                ):
+                    with coordinator.finalization_window_if_current(operation) as published:
+                        if published:
+                            state_buffer.commit()
+                            persist_final()
+                            return api_response(result)
+            except AgentRuntimeDisabled as exc:
+                _cancel_runtime_changed_operation(
+                    service=service, operation=operation
+                )
+                return _agent_runtime_retry_response(exc)
             return api_error("本次请求已被更新操作取代", 409)
         finally:
             state_buffer.discard()
@@ -1448,6 +1462,7 @@ def invoke_workspace_action(request: Request, data: Any = Body(default=None)):
         service = get_agent_service()
         request_key = f"workspace_{secrets.token_urlsafe(12)}"
         coordinator = get_agent_operation_coordinator()
+        runtime_generation = current_agent_runtime_generation()
         operation, _ = coordinator.begin_with_context(
             owner=owner,
             operation_id=request_key,
@@ -1489,11 +1504,20 @@ def invoke_workspace_action(request: Request, data: Any = Body(default=None)):
                     expected_generation=history_generation,
                 )
 
-            with coordinator.finalization_window_if_current(operation) as published:
-                if published:
-                    state_buffer.commit()
-                    persist_final()
-                    return api_response(response)
+            try:
+                with agent_runtime_admission(
+                    expected_generation=runtime_generation
+                ):
+                    with coordinator.finalization_window_if_current(operation) as published:
+                        if published:
+                            state_buffer.commit()
+                            persist_final()
+                            return api_response(response)
+            except AgentRuntimeDisabled as exc:
+                _cancel_runtime_changed_operation(
+                    service=service, operation=operation
+                )
+                return _agent_runtime_retry_response(exc)
             return api_error("本次请求已被更新操作取代", 409)
         finally:
             state_buffer.discard()
@@ -1526,6 +1550,7 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
             limit=_prepare_rate_limit(tool_name),
         )
         coordinator = get_agent_operation_coordinator()
+        runtime_generation = current_agent_runtime_generation()
         operation, confirmation_epoch = coordinator.begin_with_context(
             owner=owner,
             operation_id=f"prepare_{secrets.token_urlsafe(12)}",
@@ -1541,10 +1566,19 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
             if confirmation_epoch is not None:
                 prepare_kwargs["expected_owner_generation"] = confirmation_epoch
             response = service.prepare(tool_name, arguments, **prepare_kwargs)
-            published, finalized_response = coordinator.finalize_if_current(
-                operation,
-                lambda: response,
-            )
+            try:
+                with agent_runtime_admission(
+                    expected_generation=runtime_generation
+                ):
+                    published, finalized_response = coordinator.finalize_if_current(
+                        operation,
+                        lambda: response,
+                    )
+            except AgentRuntimeDisabled as exc:
+                _cancel_runtime_changed_operation(
+                    service=service, operation=operation
+                )
+                return _agent_runtime_retry_response(exc)
             if not published or finalized_response is None:
                 return api_error("会话状态已变化，请重新预检", 409)
             return api_response(finalized_response)
@@ -1559,11 +1593,11 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
     require_api_login(request)
     if (
         not isinstance(data, dict)
-        or not set(data).issubset({"plan_id", "confirmation_id", "session_id"})
-        or len({"plan_id", "confirmation_id"}.intersection(data)) != 1
+        or not set(data).issubset({"plan_id", "session_id"})
+        or "plan_id" not in data
     ):
         return api_error(
-            "请求必须且只能包含 plan_id 或 confirmation_id 之一，并可附带 session_id",
+            "请求必须包含 plan_id，并可附带 session_id",
             400,
         )
     try:
@@ -1576,7 +1610,7 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
             if session_key is not None
             else None
         )
-        confirmation_id = _action_plan_id(data)
+        plan_id = _action_plan_id(data.get("plan_id"))
         _check_rate_limit(request, "action:confirm", limit=10)
         service = get_agent_service()
         coordinator = get_agent_operation_coordinator()
@@ -1587,7 +1621,7 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
 
         def execute_confirmed_action() -> dict[str, Any]:
             response = service.confirm(
-                confirmation_id,
+                plan_id,
                 owner=owner,
                 request_id=operation.operation_id,
                 session_id=session_key or "",
@@ -1626,7 +1660,8 @@ def confirm_action(request: Request, data: Any = Body(default=None)):
             409 if result.get("status") in conflict_statuses else 503,
         )
     except AgentRuntimeDisabled as exc:
-        return api_error(str(exc), 409)
+        # 确认准入发生在票据领取之前；拒绝不会消费行动计划。
+        return _agent_runtime_retry_response(exc)
     except AgentToolError as exc:
         return _agent_error(exc)
 
@@ -1636,21 +1671,22 @@ def discard_confirmation(request: Request, data: Any = Body(default=None)):
     require_api_login(request)
     if (
         not isinstance(data, dict)
-        or not set(data).issubset({"plan_id", "confirmation_id", "session_id"})
-        or len({"plan_id", "confirmation_id"}.intersection(data)) != 1
+        or not set(data).issubset({"plan_id", "session_id"})
+        or "plan_id" not in data
     ):
         return api_error(
-            "请求必须且只能包含 plan_id 或 confirmation_id 之一，并可附带 session_id",
+            "请求必须包含 plan_id，并可附带 session_id",
             400,
         )
     try:
         owner = _agent_owner(request, data)
-        confirmation_id = _action_plan_id(data)
+        plan_id = _action_plan_id(data.get("plan_id"))
         _check_rate_limit(request, "action:discard", limit=20)
-        discarded = get_agent_service().discard_confirmation(
-            confirmation_id,
-            owner=owner,
-        )
+        with get_agent_operation_coordinator().owner_window(owner):
+            discarded = get_agent_service().discard_confirmation(
+                plan_id,
+                owner=owner,
+            )
         return api_response({"discarded": discarded})
     except AgentToolError as exc:
         return _agent_error(exc)

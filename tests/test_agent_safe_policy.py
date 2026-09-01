@@ -23,9 +23,8 @@ from app.agent.orchestrator import (
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError
 from app.agent.safe_policy_actions import (
-    preview_set_safe_policy,
+    prepare_safe_policy_confirmation,
     safe_policy_arguments,
-    safe_policy_confirmation_context,
     safe_policy_summary_arguments,
     summarize_safe_policies,
 )
@@ -189,10 +188,7 @@ class SafePolicyUnitTests(unittest.TestCase):
                 config, "_cache", None
             ), patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()):
                 summary = summarize_safe_policies({})
-                preview = preview_set_safe_policy(
-                    {"policy": "web_search_timeout_seconds", "value": 15}
-                )
-                context = safe_policy_confirmation_context(
+                preview, context = prepare_safe_policy_confirmation(
                     {"policy": "web_search_timeout_seconds", "value": 15}
                 )
         rendered = repr((summary.to_dict(), preview.to_dict(), context))
@@ -218,13 +214,13 @@ class SafePolicyUnitTests(unittest.TestCase):
             with patch.object(config, "ENV_FILE", env_file), patch.object(
                 config, "_cache", None
             ), patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()):
-                too_long = preview_set_safe_policy(
+                too_long, _ = prepare_safe_policy_confirmation(
                     {"policy": "discovery_cache_ttl_seconds", "value": 604801}
                 )
-                too_short = preview_set_safe_policy(
+                too_short, _ = prepare_safe_policy_confirmation(
                     {"policy": "discovery_stale_ttl_seconds", "value": 21599}
                 )
-                valid = preview_set_safe_policy(
+                valid, _ = prepare_safe_policy_confirmation(
                     {"policy": "discovery_stale_ttl_seconds", "value": 86400}
                 )
         self.assertFalse(too_long.ok)
@@ -316,13 +312,13 @@ class SafePolicyAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(prepared.status_code, 200, prepared.text)
         body = prepared.json()
         self.assertEqual(body["mode"], "confirmation_required")
-        self.assertEqual(body["confirmation"]["tool"], "config.set_safe_policy")
+        self.assertEqual(body["tool_call"]["name"], "config.set_safe_policy")
         self.assertEqual(config._read_env_file(self.env_file)["TAVILY_TIMEOUT_SECONDS"], "10")
 
         confirmed = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+            json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]
@@ -334,7 +330,7 @@ class SafePolicyAPITests(IsolatedDatabaseTestCase):
         replay = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+            json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
         )
         self.assertEqual(replay.status_code, 409, replay.text)
 
@@ -351,7 +347,7 @@ class SafePolicyAPITests(IsolatedDatabaseTestCase):
         stale = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+            json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
         )
         self.assertEqual(stale.status_code, 409, stale.text)
 
@@ -371,7 +367,7 @@ class SafePolicyAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]

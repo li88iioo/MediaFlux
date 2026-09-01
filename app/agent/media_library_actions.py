@@ -142,10 +142,6 @@ def prepare_refresh_media_library(
     ), _fingerprint(scope)
 
 
-def refresh_media_library(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
-
-
 def refresh_media_library_confirmed(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:

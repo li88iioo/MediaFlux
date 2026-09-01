@@ -11,7 +11,10 @@ from fastapi.testclient import TestClient
 
 from app import database as db
 from app.agent.conversation_history import SQLiteAgentConversationHistoryRepository
-from app.agent.operation_coordinator import reset_agent_operation_state_for_tests
+from app.agent.operation_coordinator import (
+    get_agent_operation_coordinator,
+    reset_agent_operation_state_for_tests,
+)
 from app.agent.registry import AgentToolError
 from app.agent.rate_limit import agent_rate_limiter
 from app.config import web_credentials
@@ -912,11 +915,21 @@ class _FakeAgentService:
     def has_tool(self, tool_name: str) -> bool:
         return bool(str(tool_name or "").strip())
 
+    def is_read_tool(self, tool_name: str) -> bool:
+        if not self.has_tool(tool_name):
+            raise AgentToolError("未知 Agent 工具", code="tool_not_found")
+        return True
+
     def invoke(self, tool_name: str, arguments: dict, *, owner: str = "", **_kwargs):
         self.invoke_calls.append((tool_name, dict(arguments), owner))
         return _response()
 
     def begin_query_confirmation_epoch(self, *, owner: str) -> int:
+        del owner
+        self.confirmation_epoch += 1
+        return self.confirmation_epoch
+
+    def invalidate_query_confirmation_epoch(self, *, owner: str) -> int:
         del owner
         self.confirmation_epoch += 1
         return self.confirmation_epoch
@@ -937,7 +950,23 @@ class _FakeAgentService:
             self.prepare_hook()
         return {
             "mode": "confirmation_required",
-            "confirmation": {"confirmation_id": "prepared-confirmation-123456"},
+            "action_plan": {
+                "version": 1,
+                "plan_id": "prepared-confirmation-123456",
+                "status": "awaiting_approval",
+                "title": "执行测试操作",
+                "target": "当前测试会话",
+                "impact": "会执行一次受控写操作。",
+                "reversibility": "可通过对应业务入口撤销。",
+                "risk": "write",
+                "preflight_at": "2026-08-31T12:00:00+08:00",
+                "preflight_summary": "预检通过。",
+                "expires_in": 60,
+                "decisions": [
+                    {"id": "execute", "label": "执行"},
+                    {"id": "cancel", "label": "取消"},
+                ],
+            },
             "result": {
                 "ok": True,
                 "status": "confirmation_required",
@@ -1047,9 +1076,14 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
     def test_discard_confirmation_returns_minimal_contract_without_archiving(self):
         csrf = self._login()
         headers = {"X-CSRF-Token": csrf}
+        coordinator = get_agent_operation_coordinator()
         with patch(
             "app.routes.agent_api.get_agent_service", return_value=self.service
-        ):
+        ), patch.object(
+            coordinator,
+            "owner_window",
+            wraps=coordinator.owner_window,
+        ) as owner_window:
             seeded = self.client.post(
                 "/api/agent/query",
                 headers=headers,
@@ -1060,7 +1094,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm/discard",
                 headers=headers,
                 json={
-                    "confirmation_id": "confirmation-token-123456",
+                    "plan_id": "confirmation-token-123456",
                     "session_id": SESSION_A,
                 },
             )
@@ -1074,6 +1108,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
         confirmation_id, owner = self.service.discard_calls[0]
         self.assertEqual(confirmation_id, "confirmation-token-123456")
         self.assertTrue(owner.startswith("web:v1:"))
+        owner_window.assert_called_once_with(owner)
         self.assertEqual(history_after.status_code, 200, history_after.text)
         self.assertEqual(history_after.json(), history_before.json())
 
@@ -1116,7 +1151,20 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
                 "name": "indexer.submit_resource",
                 "arguments": {"result_id": "private-result-id", "target": "qb"},
             },
-            "confirmation": {"confirmation_id": "do-not-store-confirmation"},
+            "action_plan": {
+                "version": 1,
+                "plan_id": "do-not-store-confirmation",
+                "status": "completed",
+                "title": "提交资源下载",
+                "target": "已选择资源",
+                "impact": "已创建下载任务。",
+                "reversibility": "可在下载器中暂停或删除任务。",
+                "risk": "danger",
+                "preflight_at": "2026-08-31T12:00:00+08:00",
+                "preflight_summary": "预检通过。",
+                "expires_in": 0,
+                "decisions": [],
+            },
             "result": {
                 "ok": True,
                 "status": "accepted",
@@ -1133,7 +1181,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers=headers,
                 json={
-                    "confirmation_id": "confirmation-token-123456",
+                    "plan_id": "confirmation-token-123456",
                     "session_id": SESSION_A,
                 },
             )
@@ -1178,7 +1226,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers=headers,
                 json={
-                    "confirmation_id": "confirmation-token-123456",
+                    "plan_id": "confirmation-token-123456",
                     "session_id": SESSION_A,
                 },
             )
@@ -1200,7 +1248,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
             response = self.client.post(
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
-                json={"confirmation_id": "confirmation-token-123456"},
+                json={"plan_id": "confirmation-token-123456"},
             )
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(self.client.get("/api/agent/sessions").json()["sessions"], [])
@@ -1219,7 +1267,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers=headers,
                 json={
-                    "confirmation_id": "confirmation-token-123456",
+                    "plan_id": "confirmation-token-123456",
                     "session_id": SESSION_A,
                 },
             )
@@ -1254,7 +1302,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
                     "/api/agent/actions/confirm",
                     headers=headers,
                     json={
-                        "confirmation_id": "confirmation-token-123456",
+                        "plan_id": "confirmation-token-123456",
                         "session_id": SESSION_A,
                     },
                 )
@@ -1310,7 +1358,7 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
                     "/api/agent/actions/confirm",
                     headers=headers,
                     json={
-                        "confirmation_id": "confirmation-token-123456",
+                        "plan_id": "confirmation-token-123456",
                         "session_id": SESSION_A,
                     },
                 )

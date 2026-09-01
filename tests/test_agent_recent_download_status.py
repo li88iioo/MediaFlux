@@ -99,6 +99,31 @@ def _submission_agent(
             },
         ),
     ))
+    def confirmation_context(arguments: dict) -> str:
+        if context is not None:
+            return context["value"]
+        return f"{arguments['result_id']}:{arguments['target']}"
+
+    def prepare_submission(arguments: dict) -> tuple[ToolResult, str]:
+        return (
+            ToolResult(
+                True,
+                "confirmation_required",
+                "preview",
+                data=dict(arguments),
+            ),
+            confirmation_context(arguments),
+        )
+
+    def confirm_submission(arguments: dict, expected_context: str) -> ToolResult:
+        if confirmation_context(arguments) != expected_context:
+            raise AgentToolError(
+                "资源提交上下文已变化，请重新确认",
+                code="confirmation_stale",
+            )
+        calls.append(dict(arguments))
+        return result
+
     registry.register(ToolSpec(
         name="indexer.submit_resource",
         description="submit",
@@ -108,16 +133,9 @@ def _submission_agent(
             "result_id": str(arguments.get("result_id") or ""),
             "target": str(arguments.get("target") or ""),
         },
-        preview_handler=lambda arguments: ToolResult(
-            True, "confirmation_required", "preview", data=dict(arguments)
-        ),
-        handler=lambda arguments: calls.append(dict(arguments)) or result,
         requires_confirmation=True,
-        confirmation_context=(
-            (lambda _arguments: context["value"])
-            if context is not None
-            else (lambda arguments: f"{arguments['result_id']}:{arguments['target']}")
-        ),
+        confirmation_preparer=prepare_submission,
+        confirmed_handler=confirm_submission,
     ))
     service = AgentOrchestrator(
         registry,
@@ -468,7 +486,7 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
         self.assertEqual(before["result"]["status"], "precondition_failed")
         self.assertEqual(calls, [])
 
-        confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="session-a")
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="session-a")
         self.assertEqual(len(calls), 1)
         self.assertFalse(_contains_key(confirmed["result"]["data"], "request_id"))
 
@@ -489,7 +507,7 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
             {"result_id": "safe-result-00000001", "target": "qb"},
             owner="session-a",
         )
-        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        confirmation_id = prepared["action_plan"]["plan_id"]
         with self.assertRaises(AgentToolError) as wrong_owner:
             service.confirm(confirmation_id, owner="session-b")
         self.assertEqual(wrong_owner.exception.code, "confirmation_invalid")
@@ -522,7 +540,7 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
         )
         now[0] = 6.0
         with self.assertRaises(AgentToolError) as expired_error:
-            expired_service.confirm(expired["confirmation"]["confirmation_id"], owner="session-a")
+            expired_service.confirm(expired["action_plan"]["plan_id"], owner="session-a")
         self.assertEqual(expired_error.exception.code, "confirmation_invalid")
         self.assertEqual(expired_calls, [])
         self.assertEqual(expired_service.recent_download_store.get(owner="session-a"), ())
@@ -541,7 +559,7 @@ class RecentDownloadStatusOrchestratorTests(IsolatedDatabaseTestCase):
         )
         context["value"] = "two"
         with self.assertRaises(AgentToolError) as stale_error:
-            stale_service.confirm(stale["confirmation"]["confirmation_id"], owner="session-a")
+            stale_service.confirm(stale["action_plan"]["plan_id"], owner="session-a")
         self.assertEqual(stale_error.exception.code, "confirmation_stale")
         self.assertEqual(stale_calls, [])
         self.assertEqual(stale_service.recent_download_store.get(owner="session-a"), ())
@@ -653,7 +671,7 @@ class RecentDownloadStatusAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client_a.post(
                 "/api/agent/actions/confirm",
                 headers=headers_a,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
             )
             own = self.client_a.post(
                 "/api/agent/query", headers=headers_a, json={"session_id": "test_session_identifier_0001", "message": "刚才下载到哪了"}

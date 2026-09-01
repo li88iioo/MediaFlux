@@ -584,10 +584,6 @@ def prepare_guangya_cleanup_confirmation(
     ), _confirmation_fingerprint(flow, plan)
 
 
-def execute_guangya_cleanup(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("光鸭残留清理必须先预览并确认", code="confirmation_required")
-
-
 def execute_guangya_cleanup_confirmed(
     _arguments: dict[str, Any], expected_context: str, context: ToolContext,
 ) -> ToolResult:

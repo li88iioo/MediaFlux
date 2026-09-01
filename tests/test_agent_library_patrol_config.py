@@ -15,9 +15,7 @@ from app import config
 from app.agent import library_patrol_config_actions
 from app.agent.library_patrol_config_actions import (
     patrol_policy_arguments,
-    patrol_policy_confirmation_context,
     prepare_patrol_policy_confirmation,
-    preview_set_patrol_policy,
     summarize_patrol_policy,
 )
 from app.agent.models import RiskLevel
@@ -180,8 +178,9 @@ class PatrolPolicyUnitTests(unittest.TestCase):
                 config, "_cache", None
             ), patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()):
                 summary = summarize_patrol_policy({})
-                preview = preview_set_patrol_policy({"notify_enabled": False})
-                context = patrol_policy_confirmation_context({"notify_enabled": False})
+                preview, context = prepare_patrol_policy_confirmation(
+                    {"notify_enabled": False}
+                )
         rendered = repr((summary.to_dict(), preview.to_dict(), context))
         self.assertNotIn(secret, rendered)
         self.assertNotIn("TMDB_API_KEY", rendered)
@@ -345,7 +344,7 @@ class PatrolPolicyApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(prepared.status_code, 200, prepared.text)
         body = prepared.json()
         self.assertEqual(body["mode"], "confirmation_required")
-        self.assertEqual(body["confirmation"]["tool"], "library.set_patrol_policy")
+        self.assertEqual(body["tool_call"]["name"], "library.set_patrol_policy")
         self.assertIn("丢弃", " ".join(body["result"]["suggestions"]))
         self.assertEqual(
             body["result"]["data"]["changed_fields"],
@@ -357,7 +356,7 @@ class PatrolPolicyApiTests(IsolatedDatabaseTestCase):
         )
 
         scheduler = Mock()
-        confirmation_id = body["confirmation"]["confirmation_id"]
+        confirmation_id = body["action_plan"]["plan_id"]
         with patch(
             "app.modules.agent_library_patrol_scheduler.get_agent_library_patrol_scheduler",
             return_value=scheduler,
@@ -365,7 +364,7 @@ class PatrolPolicyApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]
@@ -390,7 +389,7 @@ class PatrolPolicyApiTests(IsolatedDatabaseTestCase):
         replay = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+            json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
         )
         self.assertEqual(replay.status_code, 409, replay.text)
         self.assertNotIn("must-not-leak", prepared.text + confirmed.text + summary.text)
@@ -442,14 +441,14 @@ class PatrolPolicyApiTests(IsolatedDatabaseTestCase):
         csrf = self.login()
         headers = {"X-CSRF-Token": csrf}
         prepared = self.prepare(csrf, {"enabled": True})
-        confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+        confirmation_id = prepared.json()["action_plan"]["plan_id"]
         values = config._read_env_file(self.env_file)
         values["UNRELATED_SETTING"] = "changed"
         config.write_env_file(self.env_file, values, replace=True)
         stale = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+            json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
         )
         self.assertEqual(stale.status_code, 409, stale.text)
         self.assertEqual(
@@ -469,7 +468,7 @@ class PatrolPolicyApiTests(IsolatedDatabaseTestCase):
             failed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
             )
         self.assertEqual(failed.status_code, 503, failed.text)
         result = failed.json()["result"]
@@ -490,7 +489,7 @@ class PatrolPolicyApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]

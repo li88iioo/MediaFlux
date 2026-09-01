@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import unittest
 
-from app.agent.models import ToolResult
+from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import AgentOrchestrator
+from app.agent.registry import ToolRegistry
 from app.agent.progress_events import (
     AgentProgressEvent,
     bind_agent_progress_listener,
@@ -11,9 +12,17 @@ from app.agent.progress_events import (
 )
 
 
-class _ReadRegistry:
-    def execute(self, name, arguments=None, *, context=None):
-        return ToolResult(True, "healthy", "检查完成"), 12
+def _read_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(ToolSpec(
+        name="workspace.health",
+        description="检查工作区状态",
+        risk=RiskLevel.READ,
+        parameters={},
+        validator=lambda arguments: dict(arguments),
+        handler=lambda _arguments: ToolResult(True, "healthy", "检查完成"),
+    ))
+    return registry
 
 
 class AgentProgressEventTests(unittest.TestCase):
@@ -36,7 +45,7 @@ class AgentProgressEventTests(unittest.TestCase):
 
     def test_orchestrator_emits_real_tool_boundaries_without_arguments(self):
         events: list[AgentProgressEvent] = []
-        service = AgentOrchestrator(_ReadRegistry())
+        service = AgentOrchestrator(_read_registry())
 
         with bind_agent_progress_listener(events.append):
             response = service.invoke(

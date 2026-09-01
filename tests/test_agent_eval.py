@@ -376,16 +376,19 @@ class AgentEvalNativeToolE2ETests(unittest.TestCase):
                 "feature": str(arguments["feature"]),
                 "enabled": bool(arguments["enabled"]),
             },
-            handler=lambda arguments: (
+            requires_confirmation=True,
+            confirmation_preparer=lambda arguments: (
+                ToolResult(
+                    True,
+                    "confirmation_required",
+                    "确认后将修改网页搜索开关",
+                    data=dict(arguments),
+                ),
+                f"feature-state:{arguments['feature']}:{arguments['enabled']}",
+            ),
+            confirmed_handler=lambda arguments, _expected_context: (
                 calls.append(dict(arguments))
                 or ToolResult(True, "changed", "已修改")
-            ),
-            requires_confirmation=True,
-            preview_handler=lambda arguments: ToolResult(
-                True,
-                "confirmation_required",
-                "确认后将修改网页搜索开关",
-                data=dict(arguments),
             ),
             llm_confirmation=True,
         ))
@@ -516,10 +519,10 @@ class AgentEvalNativeToolE2ETests(unittest.TestCase):
 
         self.assertEqual(response["mode"], "confirmation_required")
         self.assertEqual(
-            response["confirmation"]["tool"],
+            response["tool_call"]["name"],
             "config.set_feature_state",
         )
-        self.assertEqual(response["confirmation"]["risk"], "low_write")
+        self.assertEqual(response["action_plan"]["risk"], "low_write")
         self.assertEqual(write_calls, [])
         self.assertIn("尚未执行", response["presentation"]["narrative"])
 

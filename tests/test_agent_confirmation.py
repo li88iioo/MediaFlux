@@ -9,7 +9,11 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app.agent.confirmation import ConfirmationStore, confirmation_reply_intent
-from app.agent.confirmation_contract import build_confirmation_contract
+from app.agent.confirmation_contract import (
+    build_confirmation_contract,
+    sanitize_confirmation_contract,
+)
+from app.agent.feature_gate import AgentRuntimeDisabled
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
@@ -17,14 +21,62 @@ from app.agent.orchestrator import (
     _is_strm_run_action,
 )
 from app.agent.registry import AgentToolError, ToolRegistry
-from app.agent.service import reset_agent_service_for_tests
-from app.agent.tools import build_tool_registry, preview_strm_run_once, run_strm_once
+from app.agent.service import get_agent_service, reset_agent_service_for_tests
+from app.agent.tools import (
+    build_tool_registry,
+    prepare_strm_run_once,
+    run_strm_once_confirmed,
+)
 from app.agent.rate_limit import agent_rate_limiter
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
 
 
 class ConfirmationStoreTests(unittest.TestCase):
+    def test_expected_owner_generation_rejects_bool_even_when_epoch_is_one(self):
+        store = ConfirmationStore(
+            token_factory=lambda: "ticket-generation-bool-1234"
+        )
+        with patch("app.agent.confirmation.secrets.randbits", return_value=1):
+            self.assertEqual(store.owner_generation(owner="owner-a"), 1)
+
+        with self.assertRaises(AgentToolError) as invalid:
+            store.issue(
+                owner="owner-a",
+                tool_name="write.test",
+                arguments={},
+                expected_owner_generation=True,
+            )
+
+        self.assertEqual(invalid.exception.code, "confirmation_invalid")
+        self.assertEqual(store.list_active_tickets(owner="owner-a"), [])
+
+    def test_claim_rejects_non_string_plan_id_without_consuming_ticket(self):
+        store = ConfirmationStore(
+            token_factory=lambda: "ticket-strict-plan-id-123456"
+        )
+        ticket = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": 1}
+        )
+
+        class StringLikePlanId:
+            def __str__(self) -> str:
+                return ticket.confirmation_id
+
+        with self.assertRaises(AgentToolError) as invalid:
+            store.claim_and_rotate_owner(
+                owner="owner-a",
+                confirmation_id=StringLikePlanId(),  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(invalid.exception.code, "confirmation_invalid")
+        self.assertEqual(
+            store.claim_and_rotate_owner(
+                owner="owner-a", confirmation_id=ticket.confirmation_id
+            ).arguments,
+            {"id": 1},
+        )
+
     def test_media_subscription_confirmations_have_specific_public_copy(self):
         preview = ToolResult(True, "preview", "预检通过")
         created = build_confirmation_contract(
@@ -43,6 +95,54 @@ class ConfirmationStoreTests(unittest.TestCase):
         self.assertEqual(deleted["action"], "删除媒体追更订阅")
         self.assertIn("删除不可撤销", deleted["reversibility"])
 
+    def test_confirmation_contract_rejects_boolean_version(self):
+        contract = build_confirmation_contract(
+            tool_name="media.create_subscription",
+            risk=RiskLevel.LOW_WRITE,
+            preview=ToolResult(True, "preview", "预检通过"),
+        )
+        contract["version"] = True
+
+        self.assertEqual(sanitize_confirmation_contract(contract), {})
+
+    def test_confirmation_contract_rejects_coercible_version(self):
+        for version in ("1", 1.0):
+            with self.subTest(version=version):
+                contract = build_confirmation_contract(
+                    tool_name="media.create_subscription",
+                    risk=RiskLevel.LOW_WRITE,
+                    preview=ToolResult(True, "preview", "预检通过"),
+                )
+                contract["version"] = version
+                self.assertEqual(sanitize_confirmation_contract(contract), {})
+
+    def test_confirmation_contract_rejects_fabricated_time_or_risk(self):
+        contract = build_confirmation_contract(
+            tool_name="media.create_subscription",
+            risk=RiskLevel.DANGER,
+            preview=ToolResult(True, "preview", "预检通过"),
+            preflight_at="2026-08-31T12:00:00+08:00",
+        )
+        for value in (None, "", "not-a-time", "2026-08-31T12:00:00", True):
+            with self.subTest(preflight_at=value):
+                tampered = dict(contract)
+                tampered["preflight_at"] = value
+                self.assertEqual(sanitize_confirmation_contract(tampered), {})
+
+        for risk in (None, "", "read", "root"):
+            with self.subTest(risk=risk):
+                tampered = dict(contract)
+                tampered["risk"] = risk
+                self.assertEqual(sanitize_confirmation_contract(tampered), {})
+
+        with self.assertRaises(ValueError):
+            build_confirmation_contract(
+                tool_name="media.create_subscription",
+                risk=RiskLevel.DANGER,
+                preview=ToolResult(True, "preview", "预检通过"),
+                preflight_at="not-a-time",
+            )
+
     def test_confirmation_reply_intent_is_explicit_and_non_ambiguous(self):
         for value in ("确认", "好的帮我执行。", "YES", "取消", "算了！"):
             with self.subTest(value=value):
@@ -50,6 +150,45 @@ class ConfirmationStoreTests(unittest.TestCase):
         for value in ("请确认状态", "确认第三个", "好的，但是先检查", "不要取消"):
             with self.subTest(value=value):
                 self.assertIsNone(confirmation_reply_intent(value))
+
+    def test_listing_unknown_owner_is_read_only(self):
+        store = ConfirmationStore()
+        with patch("app.agent.confirmation.secrets.randbits") as random_generation:
+            self.assertEqual(store.list_active_tickets(owner="owner-missing"), [])
+        random_generation.assert_not_called()
+
+    def test_claim_generation_failure_does_not_record_execution(self):
+        store = ConfirmationStore(
+            token_factory=lambda: "ticket-audit-order-123456"
+        )
+        ticket = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": 1}
+        )
+
+        with (
+            patch(
+                "app.agent.confirmation.secrets.randbits",
+                return_value=ticket.owner_generation,
+            ),
+            patch(
+                "app.agent.action_history.record_confirmation_claimed"
+            ) as record_claimed,
+        ):
+            with self.assertRaises(AgentToolError) as unavailable:
+                store.claim_and_rotate_owner(
+                    owner="owner-a",
+                    confirmation_id=ticket.confirmation_id,
+                    record_execution=True,
+                )
+
+        self.assertEqual(unavailable.exception.code, "confirmation_unavailable")
+        record_claimed.assert_not_called()
+        self.assertEqual(
+            store.claim_and_rotate_owner(
+                owner="owner-a", confirmation_id=ticket.confirmation_id
+            ).arguments,
+            {"id": 1},
+        )
 
     def test_list_active_tickets_returns_current_generation_without_consuming(self):
         store = ConfirmationStore(token_factory=lambda: "ticket-list-active-123456")
@@ -60,7 +199,7 @@ class ConfirmationStoreTests(unittest.TestCase):
 
         self.assertEqual([item.confirmation_id for item in first], [ticket.confirmation_id])
         self.assertEqual([item.confirmation_id for item in second], [ticket.confirmation_id])
-        self.assertEqual(store.claim(owner="owner-a", confirmation_id=ticket.confirmation_id).arguments, {"id": 1})
+        self.assertEqual(store.claim_and_rotate_owner(owner="owner-a", confirmation_id=ticket.confirmation_id).arguments, {"id": 1})
 
     def test_claim_and_rotate_revokes_same_owner_but_not_other_owner(self):
         tokens = iter((
@@ -114,7 +253,7 @@ class ConfirmationStoreTests(unittest.TestCase):
         followup_context["verification"]["episode"] = 4
         confirmation_contract["object"] = "已被调用方修改"
 
-        claimed = store.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+        claimed = store.claim_and_rotate_owner(owner="owner-a", confirmation_id=ticket.confirmation_id)
         self.assertEqual(claimed.arguments, {"items": ["one"]})
         self.assertEqual(claimed.followup_context, {"verification": {"episode": 3}})
         self.assertEqual(claimed.confirmation_contract["object"], "候选资源")
@@ -123,8 +262,69 @@ class ConfirmationStoreTests(unittest.TestCase):
         self.assertEqual(ticket.followup_context, {"verification": {"episode": 3}})
         self.assertEqual(ticket.confirmation_contract["impact"], "会创建下载任务")
         with self.assertRaises(AgentToolError) as replay:
-            store.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-a", confirmation_id=ticket.confirmation_id)
         self.assertEqual(replay.exception.code, "confirmation_invalid")
+
+    def test_returned_ticket_cannot_mutate_pending_execution_payload(self):
+        store = ConfirmationStore(
+            token_factory=lambda: "ticket-detached-return-123456"
+        )
+        ticket = store.issue(
+            owner="owner-a",
+            tool_name="write.test",
+            arguments={"items": ["one"]},
+            followup_context={"verification": {"episode": 3}},
+            confirmation_contract={"action": "测试动作"},
+        )
+
+        ticket.arguments["items"].append("tampered")
+        ticket.followup_context["verification"]["episode"] = 99
+        ticket.confirmation_contract["action"] = "已篡改"
+
+        claimed = store.claim_and_rotate_owner(
+            owner="owner-a", confirmation_id=ticket.confirmation_id
+        )
+        self.assertEqual(claimed.arguments, {"items": ["one"]})
+        self.assertEqual(claimed.followup_context, {"verification": {"episode": 3}})
+        self.assertEqual(claimed.confirmation_contract, {"action": "测试动作"})
+
+    def test_invalid_json_payload_is_rejected_before_store_mutation(self):
+        token_factory = Mock(return_value="ticket-json-validation-123456")
+        store = ConfirmationStore(max_entries=1, token_factory=token_factory)
+        existing = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "old"}
+        )
+        token_factory.reset_mock()
+        invalid_calls = (
+            {"arguments": []},
+            {"arguments": {"value": float("nan")}},
+            {"arguments": {"value": object()}},
+            {"arguments": {"value": "\ud800"}},
+            {"arguments": {}, "followup_context": []},
+            {"arguments": {}, "confirmation_contract": []},
+        )
+
+        for kwargs in invalid_calls:
+            with self.subTest(kwargs=tuple(kwargs)):
+                with self.assertRaises(AgentToolError) as invalid:
+                    store.issue(
+                        owner="owner-b",
+                        tool_name="write.test",
+                        **kwargs,  # type: ignore[arg-type]
+                    )
+                self.assertEqual(invalid.exception.code, "confirmation_invalid")
+                self.assertEqual(token_factory.call_count, 0)
+                self.assertEqual(
+                    [item.confirmation_id for item in store.list_active_tickets(owner="owner-a")],
+                    [existing.confirmation_id],
+                )
+
+        self.assertEqual(
+            store.claim_and_rotate_owner(
+                owner="owner-a", confirmation_id=existing.confirmation_id
+            ).arguments,
+            {"id": "old"},
+        )
 
     def test_expiry_and_wrong_owner_do_not_leak_or_steal_ticket(self):
         now = [100.0]
@@ -135,14 +335,14 @@ class ConfirmationStoreTests(unittest.TestCase):
         )
         ticket = store.issue(owner="owner-a", tool_name="write.test", arguments={})
         with self.assertRaises(AgentToolError):
-            store.claim(owner="owner-b", confirmation_id=ticket.confirmation_id)
-        claimed = store.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-b", confirmation_id=ticket.confirmation_id)
+        claimed = store.claim_and_rotate_owner(owner="owner-a", confirmation_id=ticket.confirmation_id)
         self.assertEqual(claimed.owner, "owner-a")
 
         ticket = store.issue(owner="owner-a", tool_name="write.test", arguments={})
         now[0] += 10
         with self.assertRaises(AgentToolError) as expired:
-            store.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-a", confirmation_id=ticket.confirmation_id)
         self.assertEqual(expired.exception.code, "confirmation_invalid")
 
     def test_owner_generation_rejects_ticket_issued_after_reset_race(self):
@@ -174,7 +374,7 @@ class ConfirmationStoreTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "confirmation_unavailable")
         self.assertEqual(
-            store.claim(
+            store.claim_and_rotate_owner(
                 owner="owner-a", confirmation_id=existing.confirmation_id
             ).arguments,
             {"id": "old"},
@@ -200,9 +400,9 @@ class ConfirmationStoreTests(unittest.TestCase):
 
         self.assertEqual(len(store.list_active_tickets(owner="owner-a")), 1)
         with self.assertRaises(AgentToolError):
-            store.claim(owner="owner-a", confirmation_id=previous.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-a", confirmation_id=previous.confirmation_id)
         self.assertEqual(
-            store.claim(
+            store.claim_and_rotate_owner(
                 owner="owner-a", confirmation_id=current.confirmation_id
             ).arguments,
             {"id": "new"},
@@ -234,13 +434,13 @@ class ConfirmationStoreTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            store.claim(owner="owner-b", confirmation_id=other.confirmation_id).arguments,
+            store.claim_and_rotate_owner(owner="owner-b", confirmation_id=other.confirmation_id).arguments,
             {"id": "b"},
         )
         with self.assertRaises(AgentToolError):
-            store.claim(owner="owner-a", confirmation_id=previous.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-a", confirmation_id=previous.confirmation_id)
         self.assertEqual(
-            store.claim(
+            store.claim_and_rotate_owner(
                 owner="owner-a", confirmation_id=replacement.confirmation_id
             ).arguments,
             {"id": "new"},
@@ -284,7 +484,7 @@ class ConfirmationStoreTests(unittest.TestCase):
         self.assertNotEqual(current_epoch, previous_epoch)
         self.assertEqual(store.owner_generation(owner="owner-a"), current_epoch)
         with self.assertRaises(AgentToolError) as stale:
-            store.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-a", confirmation_id=ticket.confirmation_id)
         self.assertEqual(stale.exception.code, "confirmation_invalid")
 
     def test_pruned_owner_epoch_never_accepts_pre_reset_prepare(self):
@@ -315,7 +515,7 @@ class ConfirmationStoreTests(unittest.TestCase):
         def claim() -> None:
             barrier.wait()
             try:
-                store.claim(owner="owner", confirmation_id=ticket.confirmation_id)
+                store.claim_and_rotate_owner(owner="owner", confirmation_id=ticket.confirmation_id)
                 outcomes.append("ok")
             except AgentToolError:
                 outcomes.append("blocked")
@@ -343,15 +543,182 @@ class ConfirmationStoreTests(unittest.TestCase):
         self.assertTrue(store.discard(owner="owner-a", confirmation_id=first.confirmation_id))
         self.assertEqual(store.revoke_owner(owner="owner-a"), 1)
         with self.assertRaises(AgentToolError):
-            store.claim(owner="owner-a", confirmation_id=second.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-a", confirmation_id=second.confirmation_id)
         self.assertEqual(
-            store.claim(owner="owner-b", confirmation_id=other.confirmation_id).owner,
+            store.claim_and_rotate_owner(owner="owner-b", confirmation_id=other.confirmation_id).owner,
             "owner-b",
         )
 
 
 class ConfirmedToolRegistryTests(unittest.TestCase):
-    def test_orchestrator_prepare_returns_stable_human_confirmation_contract(self):
+    def test_registry_rejects_duplicate_direct_handler_modes(self):
+        registry = ToolRegistry()
+        with self.assertRaisesRegex(ValueError, "duplicate direct handler modes"):
+            registry.register(ToolSpec(
+                name="read.duplicate-handler-modes",
+                description="test",
+                risk=RiskLevel.READ,
+                parameters={},
+                validator=lambda arguments: dict(arguments),
+                handler=lambda _arguments: ToolResult(True, "completed", "plain"),
+                context_handler=lambda _arguments, _context: ToolResult(
+                    True, "completed", "context"
+                ),
+            ))
+
+    def test_registry_requires_canonical_preparer_for_confirmation_tool(self):
+        registry = ToolRegistry()
+        with self.assertRaisesRegex(ValueError, "requires preparer"):
+            registry.register(ToolSpec(
+                name="write.incomplete-preparer",
+                description="test",
+                risk=RiskLevel.WRITE,
+                parameters={},
+                validator=lambda arguments: dict(arguments),
+                requires_confirmation=True,
+                confirmed_handler=lambda _arguments, _context: ToolResult(
+                    True, "completed", "done"
+                ),
+            ))
+
+    def test_registry_requires_explicit_confirmed_handler_for_canonical_preparer(self):
+        registry = ToolRegistry()
+        with self.assertRaisesRegex(ValueError, "requires confirmed handler"):
+            registry.register(ToolSpec(
+                name="write.incomplete",
+                description="test",
+                risk=RiskLevel.WRITE,
+                parameters={},
+                validator=lambda arguments: dict(arguments),
+                requires_confirmation=True,
+                confirmation_preparer=lambda _arguments: (
+                    ToolResult(True, "confirmation_required", "preview"),
+                    "fingerprint",
+                ),
+            ))
+
+    def test_confirmation_preparers_reject_invalid_outputs_without_issuing_ticket(self):
+        preview = ToolResult(True, "confirmation_required", "preview")
+        cases = (
+            ("plain_result", False, (object(), "fingerprint")),
+            ("plain_fingerprint", False, (preview, object())),
+            ("context_result", True, (object(), "fingerprint")),
+            ("context_fingerprint", True, (preview, object())),
+        )
+        for name, contextual, prepared_output in cases:
+            with self.subTest(name=name):
+                registry = ToolRegistry()
+                handler_kwargs = (
+                    {
+                        "context_confirmation_preparer": (
+                            lambda _arguments, _context, output=prepared_output: output
+                        ),
+                        "context_confirmed_handler": (
+                            lambda _arguments, _fingerprint, _context: ToolResult(
+                                True, "completed", "done"
+                            )
+                        ),
+                    }
+                    if contextual
+                    else {
+                        "confirmation_preparer": (
+                            lambda _arguments, output=prepared_output: output
+                        ),
+                        "confirmed_handler": (
+                            lambda _arguments, _fingerprint: ToolResult(
+                                True, "completed", "done"
+                            )
+                        ),
+                    }
+                )
+                registry.register(ToolSpec(
+                    name=f"write.invalid-preparer-{name}",
+                    description="test",
+                    risk=RiskLevel.WRITE,
+                    parameters={},
+                    validator=lambda _arguments: {},
+                    requires_confirmation=True,
+                    **handler_kwargs,
+                ))
+                service = AgentOrchestrator(
+                    registry,
+                    ConfirmationStore(
+                        token_factory=lambda: "ticket-invalid-preparer-1234"
+                    ),
+                )
+
+                with self.assertRaises(AgentToolError) as unavailable:
+                    service.prepare(
+                        f"write.invalid-preparer-{name}", {}, owner="owner-a"
+                    )
+
+                self.assertEqual(unavailable.exception.code, "confirmation_unavailable")
+                self.assertEqual(
+                    service.confirmation_store.list_active_tickets(owner="owner-a"),
+                    [],
+                )
+
+    def test_invalid_confirmed_handler_result_fails_closed_after_single_claim(self):
+        for contextual in (False, True):
+            with self.subTest(contextual=contextual):
+                registry = ToolRegistry()
+                handler_kwargs = (
+                    {
+                        "context_confirmation_preparer": (
+                            lambda _arguments, _context: (
+                                ToolResult(True, "confirmation_required", "preview"),
+                                "context-fingerprint",
+                            )
+                        ),
+                        "context_confirmed_handler": (
+                            lambda _arguments, _fingerprint, _context: {"ok": True}
+                        ),
+                    }
+                    if contextual
+                    else {
+                        "confirmation_preparer": lambda _arguments: (
+                            ToolResult(True, "confirmation_required", "preview"),
+                            "context-fingerprint",
+                        ),
+                        "confirmed_handler": (
+                            lambda _arguments, _fingerprint: {"ok": True}
+                        ),
+                    }
+                )
+                registry.register(ToolSpec(
+                    name=f"write.invalid-confirmed-{int(contextual)}",
+                    description="test",
+                    risk=RiskLevel.WRITE,
+                    parameters={},
+                    validator=lambda _arguments: {},
+                    requires_confirmation=True,
+                    **handler_kwargs,
+                ))
+                service = AgentOrchestrator(
+                    registry,
+                    ConfirmationStore(
+                        token_factory=lambda: "ticket-invalid-confirmed-1234"
+                    ),
+                )
+                prepared = service.prepare(
+                    f"write.invalid-confirmed-{int(contextual)}",
+                    {},
+                    owner="owner-a",
+                )
+
+                response = service.confirm(
+                    prepared["action_plan"]["plan_id"], owner="owner-a"
+                )
+
+                self.assertFalse(response["result"]["ok"])
+                self.assertEqual(response["result"]["status"], "unavailable")
+                self.assertEqual(response["action_plan"]["status"], "failed")
+                with self.assertRaises(AgentToolError):
+                    service.confirm(
+                        prepared["action_plan"]["plan_id"], owner="owner-a"
+                    )
+
+    def test_orchestrator_prepare_returns_stable_human_action_plan(self):
         registry = ToolRegistry()
         registry.register(ToolSpec(
             name="config.set_feature_state",
@@ -362,12 +729,17 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 "feature": str(arguments.get("feature") or "discovery"),
                 "enabled": bool(arguments.get("enabled")),
             },
-            preview_handler=lambda _arguments: ToolResult(
-                True,
-                "confirmation_required",
-                "预检通过：保存后会更新功能状态。",
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(
+                    True,
+                    "confirmation_required",
+                    "预检通过：保存后会更新功能状态。",
+                ),
+                "feature-state",
             ),
-            handler=lambda _arguments: ToolResult(True, "completed", "done"),
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "completed", "done"
+            ),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -382,16 +754,17 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual(response["mode"], "confirmation_required")
-        contract = response["confirmation"]["contract"]
-        self.assertEqual(contract["version"], 1)
-        self.assertEqual(contract["action"], "切换项目功能状态")
-        self.assertEqual(contract["object"], "本次预检指向的功能")
-        self.assertIn("改变该功能的可用状态", contract["impact"])
-        self.assertIn("再次切换回原状态", contract["reversibility"])
-        self.assertEqual(contract["risk"], "write")
-        self.assertEqual(contract["preflight_summary"], "预检通过:保存后会更新功能状态。")
+        self.assertNotIn("confirmation", response)
+        plan = response["action_plan"]
+        self.assertEqual(plan["version"], 1)
+        self.assertEqual(plan["title"], "切换项目功能状态")
+        self.assertEqual(plan["target"], "本次预检指向的功能")
+        self.assertIn("改变该功能的可用状态", plan["impact"])
+        self.assertIn("再次切换回原状态", plan["reversibility"])
+        self.assertEqual(plan["risk"], "write")
+        self.assertEqual(plan["preflight_summary"], "预检通过:保存后会更新功能状态。")
         self.assertRegex(
-            contract["preflight_at"],
+            plan["preflight_at"],
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$",
         )
 
@@ -399,15 +772,25 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
         context = {"value": "one"}
         calls: list[dict] = []
         registry = ToolRegistry()
+        def confirmed(arguments, expected_context):
+            if context["value"] != expected_context:
+                raise AgentToolError("stale", code="confirmation_stale")
+            calls.append(dict(arguments))
+            return ToolResult(True, "accepted", "done")
+
         registry.register(ToolSpec(
             name="write.test",
             description="test",
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda arguments: {"value": str(arguments.get("value", "")).strip()},
-            preview_handler=lambda arguments: ToolResult(True, "confirmation_required", "preview", data=arguments),
-            handler=lambda arguments: calls.append(arguments) or ToolResult(True, "accepted", "done"),
-            confirmation_context=lambda _arguments: context["value"],
+            confirmation_preparer=lambda arguments: (
+                ToolResult(
+                    True, "confirmation_required", "preview", data=arguments
+                ),
+                context["value"],
+            ),
+            confirmed_handler=confirmed,
             requires_confirmation=True,
         ))
 
@@ -445,8 +828,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda arguments: {"value": str(arguments.get("value", "")).strip()},
-            preview_handler=lambda _arguments: ToolResult(True, "preview", "preview"),
-            handler=lambda arguments: ToolResult(
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "preview", "preview"), "verify"
+            ),
+            confirmed_handler=lambda arguments, _context: ToolResult(
                 True, "completed", "done", data={"value": arguments["value"]}
             ),
             requires_confirmation=True,
@@ -469,8 +854,12 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            preview_handler=lambda _arguments: ToolResult(True, "preview", "preview"),
-            handler=lambda _arguments: ToolResult(True, "completed", "write completed"),
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "preview", "preview"), "verify-failure"
+            ),
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "completed", "write completed"
+            ),
             requires_confirmation=True,
             post_write_verifier=lambda _arguments, _result: (_ for _ in ()).throw(
                 OSError("must-not-leak")
@@ -502,10 +891,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda _arguments: {},
-            preview_handler=lambda _arguments: ToolResult(True, "preview", "preview"),
-            handler=lambda _arguments: ToolResult(False, "failed", "fallback"),
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "preview", "preview"), "bound-context"
+            ),
             confirmed_handler=confirmed,
-            confirmation_context=lambda _arguments: "bound-context",
             requires_confirmation=True,
         ))
 
@@ -524,10 +913,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
         release_preview = threading.Event()
         registry = ToolRegistry()
 
-        def preview(_arguments):
+        def prepare_confirmation(_arguments):
             preview_started.set()
             self.assertTrue(release_preview.wait(timeout=2))
-            return ToolResult(True, "confirmation_required", "preview")
+            return ToolResult(True, "confirmation_required", "preview"), "race"
 
         registry.register(ToolSpec(
             name="write.race",
@@ -535,8 +924,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            preview_handler=preview,
-            handler=lambda _arguments: ToolResult(True, "accepted", "done"),
+            confirmation_preparer=prepare_confirmation,
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "accepted", "done"
+            ),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -567,10 +958,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
         release_preview = threading.Event()
         registry = ToolRegistry()
 
-        def preview(_arguments):
+        def prepare_confirmation(_arguments):
             preview_started.set()
             self.assertTrue(release_preview.wait(timeout=2))
-            return ToolResult(True, "confirmation_required", "preview")
+            return ToolResult(True, "confirmation_required", "preview"), "cancelled"
 
         registry.register(ToolSpec(
             name="write.cancelled-query",
@@ -578,8 +969,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            preview_handler=preview,
-            handler=lambda _arguments: ToolResult(True, "accepted", "done"),
+            confirmation_preparer=prepare_confirmation,
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "accepted", "done"
+            ),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -620,10 +1013,12 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            preview_handler=lambda _arguments: ToolResult(
-                True, "confirmation_required", "preview"
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "confirmation_required", "preview"), "epoch"
             ),
-            handler=lambda _arguments: ToolResult(True, "accepted", "done"),
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "accepted", "done"
+            ),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -639,7 +1034,7 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             expected_owner_generation=confirm_epoch,
         )
         service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner-a"
+            prepared["action_plan"]["plan_id"], owner="owner-a"
         )
         with self.assertRaises(AgentToolError) as late_confirm:
             service.prepare(
@@ -658,7 +1053,7 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             expected_owner_generation=discard_epoch,
         )
         self.assertTrue(service.discard_confirmation(
-            prepared["confirmation"]["confirmation_id"], owner="owner-a"
+            prepared["action_plan"]["plan_id"], owner="owner-a"
         ))
         with self.assertRaises(AgentToolError) as late_discard:
             service.prepare(
@@ -668,6 +1063,102 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 expected_owner_generation=discard_epoch,
             )
         self.assertEqual(late_discard.exception.code, "confirmation_invalid")
+
+    def test_orchestrator_rejects_coercible_confirmation_generations(self):
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="write.strict-epoch",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={},
+            validator=lambda _arguments: {},
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "confirmation_required", "preview"), "epoch"
+            ),
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "accepted", "done"
+            ),
+            requires_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "ticket-strict-epoch-1234"),
+        )
+
+        for generation in (True, "1", 1.0, 0, -1):
+            with self.subTest(prepare_generation=generation):
+                with self.assertRaises(AgentToolError) as invalid:
+                    service.prepare(
+                        "write.strict-epoch",
+                        {},
+                        owner="owner-a",
+                        expected_owner_generation=generation,
+                    )
+                self.assertEqual(invalid.exception.code, "confirmation_invalid")
+
+            with self.subTest(query_generation=generation):
+                with self.assertRaises(AgentToolError) as invalid:
+                    service.query(
+                        "你好",
+                        owner="owner-a",
+                        confirmation_owner_generation=generation,
+                    )
+                self.assertEqual(invalid.exception.code, "confirmation_invalid")
+
+        self.assertEqual(
+            service.confirmation_store.list_active_tickets(owner="owner-a"), []
+        )
+
+    def test_unpublished_plan_cleanup_preserves_newer_query_epoch(self):
+        tokens = iter((
+            "ticket-hidden-plan-old-1234",
+            "ticket-hidden-plan-new-1234",
+        ))
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="write.hidden-plan",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={},
+            validator=lambda _arguments: {},
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "confirmation_required", "preview"), "epoch"
+            ),
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "accepted", "done"
+            ),
+            requires_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry, ConfirmationStore(token_factory=lambda: next(tokens))
+        )
+
+        old_epoch = service.begin_query_confirmation_epoch(owner="owner-a")
+        hidden = service.prepare(
+            "write.hidden-plan",
+            {},
+            owner="owner-a",
+            expected_owner_generation=old_epoch,
+        )
+        newer_epoch = service.begin_query_confirmation_epoch(owner="owner-a")
+
+        self.assertTrue(service.discard_confirmation(
+            hidden["action_plan"]["plan_id"],
+            owner="owner-a",
+            advance_owner_epoch=False,
+        ))
+        replacement = service.prepare(
+            "write.hidden-plan",
+            {},
+            owner="owner-a",
+            expected_owner_generation=newer_epoch,
+        )
+
+        self.assertEqual(
+            service.confirmation_store.list_active_tickets(owner="owner-a")[0]
+            .confirmation_id,
+            replacement["action_plan"]["plan_id"],
+        )
 
     def test_new_action_plan_atomically_supersedes_previous_plan(self):
         tokens = iter((
@@ -686,10 +1177,15 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             validator=lambda arguments: {"value": str(arguments["value"])},
-            preview_handler=lambda arguments: ToolResult(
-                True, "confirmation_required", f"preview {arguments['value']}"
+            confirmation_preparer=lambda arguments: (
+                ToolResult(
+                    True, "confirmation_required", f"preview {arguments['value']}"
+                ),
+                f"single-plan:{arguments['value']}",
             ),
-            handler=lambda _arguments: ToolResult(True, "accepted", "done"),
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "accepted", "done"
+            ),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -728,10 +1224,15 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             validator=lambda arguments: {"value": str(arguments["value"])},
-            preview_handler=lambda arguments: ToolResult(
-                True, "confirmation_required", f"preview {arguments['value']}"
+            confirmation_preparer=lambda arguments: (
+                ToolResult(
+                    True, "confirmation_required", f"preview {arguments['value']}"
+                ),
+                f"replacement-plan:{arguments['value']}",
             ),
-            handler=lambda _arguments: ToolResult(True, "accepted", "done"),
+            confirmed_handler=lambda _arguments, _context: ToolResult(
+                True, "accepted", "done"
+            ),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -769,7 +1270,7 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
     def test_orchestrator_consumes_ticket_before_failed_handler(self):
         calls = Mock()
         registry = ToolRegistry()
-        def failed_handler(_arguments):
+        def failed_handler(_arguments, _expected_context):
             calls()
             return ToolResult(False, "conflict", "busy")
 
@@ -779,8 +1280,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda _arguments: {},
-            preview_handler=lambda _arguments: ToolResult(True, "confirmation_required", "preview"),
-            handler=failed_handler,
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "confirmation_required", "preview"), "failed"
+            ),
+            confirmed_handler=failed_handler,
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -788,7 +1291,7 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             ConfirmationStore(token_factory=lambda: "ticket-failed-123456789"),
         )
         prepared = service.query("立即执行 STRM 同步", owner="owner")
-        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        confirmation_id = prepared["action_plan"]["plan_id"]
         response = service.confirm(confirmation_id, owner="owner")
         self.assertEqual(response["result"]["status"], "conflict")
         with self.assertRaises(AgentToolError):
@@ -818,8 +1321,8 @@ class StrmConfirmedToolTests(unittest.TestCase):
         scheduler.status.return_value = {"running": False, "sources": [{"id": "secret-source"}]}
         scheduler.trigger.return_value = {"ok": True, "message": "raw"}
         with patch("app.modules.scheduler.get_scheduler", return_value=scheduler):
-            preview = preview_strm_run_once({})
-            result = run_strm_once({})
+            preview, context = prepare_strm_run_once({})
+            result = run_strm_once_confirmed({}, context)
         self.assertTrue(preview.ok)
         self.assertNotIn("secret-source", str(preview.to_dict()))
         self.assertEqual(result.data, {"accepted": True, "trigger": "manual"})
@@ -829,7 +1332,7 @@ class StrmConfirmedToolTests(unittest.TestCase):
         scheduler = Mock()
         scheduler.validate_config.return_value = "raw /secret/path config error"
         with patch("app.modules.scheduler.get_scheduler", return_value=scheduler):
-            preview = preview_strm_run_once({})
+            preview, _context = prepare_strm_run_once({})
         self.assertFalse(preview.ok)
         self.assertNotIn("/secret/path", str(preview.to_dict()))
         scheduler.trigger.assert_not_called()
@@ -837,7 +1340,8 @@ class StrmConfirmedToolTests(unittest.TestCase):
         scheduler.validate_config.return_value = ""
         scheduler.trigger.return_value = {"ok": False, "error": "raw /secret/path lock error"}
         with patch("app.modules.scheduler.get_scheduler", return_value=scheduler):
-            result = run_strm_once({})
+            _preview, context = prepare_strm_run_once({})
+            result = run_strm_once_confirmed({}, context)
         self.assertEqual(result.status, "conflict")
         self.assertNotIn("/secret/path", str(result.to_dict()))
 
@@ -901,7 +1405,7 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(prepared.status_code, 200, prepared.text)
             body = prepared.json()
             self.assertEqual(body["mode"], "confirmation_required")
-            confirmation_id = body["confirmation"]["confirmation_id"]
+            confirmation_id = body["action_plan"]["plan_id"]
             self.assertEqual(body["action_plan"]["plan_id"], confirmation_id)
             self.assertEqual(body["action_plan"]["status"], "awaiting_approval")
             self.assertEqual(
@@ -933,12 +1437,12 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             scheduler.trigger.assert_called_once_with("manual")
 
-    def test_query_accepts_natural_language_confirmation_without_rotating_ticket(self):
+    def test_query_rejects_natural_language_confirmation_and_preserves_plan(self):
         csrf = self.login()
         scheduler = Mock()
         scheduler.validate_config.return_value = ""
@@ -961,27 +1465,27 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
                 json={"session_id": session_id, "message": "立即执行 STRM 同步"},
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            plan_id = prepared.json()["action_plan"]["plan_id"]
 
-            confirmed = self.client.post(
+            rejected = self.client.post(
                 "/api/agent/query",
                 headers=headers,
                 json={"session_id": session_id, "message": "好的帮我执行", "stream": True},
             )
 
-            self.assertEqual(confirmed.status_code, 202, confirmed.text)
-            self.assertEqual(confirmed.json()["mode"], "confirmed_action")
-            self.assertEqual(confirmed.json()["result"]["status"], "accepted")
-            scheduler.trigger.assert_called_once_with("manual")
+            self.assertEqual(rejected.status_code, 409, rejected.text)
+            self.assertIn("行动计划卡片", rejected.text)
+            scheduler.trigger.assert_not_called()
 
-            replay = self.client.post(
+            confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": session_id, "confirmation_id": confirmation_id},
+                json={"session_id": session_id, "plan_id": plan_id},
             )
-            self.assertEqual(replay.status_code, 409, replay.text)
+            self.assertEqual(confirmed.status_code, 202, confirmed.text)
+            scheduler.trigger.assert_called_once_with("manual")
 
-    def test_query_accepts_natural_language_cancellation(self):
+    def test_query_rejects_natural_language_cancellation_and_preserves_plan(self):
         csrf = self.login()
         scheduler = Mock()
         scheduler.validate_config.return_value = ""
@@ -1002,21 +1506,29 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
                 headers=headers,
                 json={"session_id": session_id, "message": "立即执行 STRM 同步"},
             )
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            plan_id = prepared.json()["action_plan"]["plan_id"]
 
-            cancelled = self.client.post(
+            rejected = self.client.post(
                 "/api/agent/query",
                 headers=headers,
                 json={"session_id": session_id, "message": "取消"},
             )
 
-            self.assertEqual(cancelled.status_code, 200, cancelled.text)
-            self.assertEqual(cancelled.json()["result"]["status"], "cancelled")
+            self.assertEqual(rejected.status_code, 409, rejected.text)
+            self.assertIn("行动计划卡片", rejected.text)
             scheduler.trigger.assert_not_called()
+
+            discarded = self.client.post(
+                "/api/agent/actions/confirm/discard",
+                headers=headers,
+                json={"session_id": session_id, "plan_id": plan_id},
+            )
+            self.assertEqual(discarded.status_code, 200, discarded.text)
+            self.assertTrue(discarded.json()["discarded"])
             stale = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": session_id, "confirmation_id": confirmation_id},
+                json={"session_id": session_id, "plan_id": plan_id},
             )
             self.assertEqual(stale.status_code, 409, stale.text)
 
@@ -1049,12 +1561,12 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
                 json={"session_id": "test_session_identifier_0001", "arguments": {}},
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            confirmation_id = prepared.json()["action_plan"]["plan_id"]
             values["STRM_ROOT"] = "/root/two"
             stale = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(stale.status_code, 409, stale.text)
             self.assertIn("配置已变化", stale.json()["error"])
@@ -1063,12 +1575,15 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
     def test_confirm_requires_csrf_and_strict_shape(self):
         csrf = self.login()
         missing_csrf = self.client.post(
-            "/api/agent/actions/confirm", json={"session_id": "test_session_identifier_0001", "confirmation_id": "x" * 24}
+            "/api/agent/actions/confirm", json={"session_id": "test_session_identifier_0001", "plan_id": "x" * 24}
         )
         self.assertEqual(missing_csrf.status_code, 403)
         headers = {"X-CSRF-Token": csrf}
         for payload in (
             {},
+            {"plan_id": 1},
+            {"plan_id": "short"},
+            {"plan_id": "x" * 24, "arguments": {}},
             {"confirmation_id": 1},
             {"confirmation_id": "short"},
             {"confirmation_id": "x" * 24, "arguments": {}},
@@ -1077,6 +1592,159 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             with self.subTest(payload=payload):
                 response = self.client.post("/api/agent/actions/confirm", headers=headers, json=payload)
                 self.assertEqual(response.status_code, 400, response.text)
+
+    def test_runtime_disable_before_confirm_keeps_plan_retryable(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        session_id = "runtime-retry-1234567890abcdef"
+        scheduler = Mock()
+        scheduler.validate_config.return_value = ""
+        scheduler.status.return_value = {"running": False}
+        scheduler.trigger.return_value = {"ok": True}
+        values = {
+            "AGENT_ENABLED": "1",
+            "GY_STRM_SOURCE_DIRS": '[{"id":"one","name":"One"}]',
+            "GY_STRM_BASE_URL": "http://service",
+            "STRM_ROOT": "/root/one",
+        }
+        with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch(
+            "app.agent.tools.config.get", side_effect=self._config_get(values)
+        ), patch("app.agent.feature_gate.is_agent_enabled", return_value=True):
+            prepared = self.client.post(
+                "/api/agent/actions/strm.run_once/prepare",
+                headers=headers,
+                json={"arguments": {}, "session_id": session_id},
+            )
+            self.assertEqual(prepared.status_code, 200, prepared.text)
+            plan_id = prepared.json()["action_plan"]["plan_id"]
+
+            with patch(
+                "app.routes.agent_api.agent_runtime_admission",
+                side_effect=AgentRuntimeDisabled("Media Agent 已关闭"),
+            ):
+                blocked = self.client.post(
+                    "/api/agent/actions/confirm",
+                    headers=headers,
+                    json={"plan_id": plan_id, "session_id": session_id},
+                )
+
+            self.assertEqual(blocked.status_code, 409, blocked.text)
+            self.assertEqual(blocked.json()["code"], "agent_runtime_disabled")
+            self.assertTrue(blocked.json()["retryable"])
+            scheduler.trigger.assert_not_called()
+
+            confirmed = self.client.post(
+                "/api/agent/actions/confirm",
+                headers=headers,
+                json={"plan_id": plan_id, "session_id": session_id},
+            )
+            self.assertEqual(confirmed.status_code, 202, confirmed.text)
+            scheduler.trigger.assert_called_once_with("manual")
+
+    def test_runtime_change_during_direct_prepare_revokes_unpublished_plan(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        session_id = "prepare-runtime-race-123456789"
+        scheduler = Mock()
+        scheduler.validate_config.return_value = ""
+        scheduler.status.return_value = {"running": False}
+        scheduler.trigger.return_value = {"ok": True}
+        values = {
+            "AGENT_ENABLED": "1",
+            "GY_STRM_SOURCE_DIRS": '[{"id":"one","name":"One"}]',
+            "GY_STRM_BASE_URL": "http://service",
+            "STRM_ROOT": "/root/one",
+        }
+        service = get_agent_service()
+        original_prepare = service.prepare
+        captured: dict[str, str] = {}
+
+        def capture_prepare(*args, **kwargs):
+            response = original_prepare(*args, **kwargs)
+            captured["plan_id"] = response["action_plan"]["plan_id"]
+            return response
+
+        with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch(
+            "app.agent.tools.config.get", side_effect=self._config_get(values)
+        ), patch("app.agent.feature_gate.is_agent_enabled", return_value=True), patch.object(
+            service, "prepare", side_effect=capture_prepare
+        ), patch(
+            "app.routes.agent_api.agent_runtime_admission",
+            side_effect=AgentRuntimeDisabled("Media Agent 状态已变化"),
+        ):
+            blocked = self.client.post(
+                "/api/agent/actions/strm.run_once/prepare",
+                headers=headers,
+                json={"arguments": {}, "session_id": session_id},
+            )
+
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertEqual(blocked.json()["code"], "agent_runtime_disabled")
+        self.assertTrue(blocked.json()["retryable"])
+        self.assertIn("plan_id", captured)
+
+        with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch(
+            "app.agent.feature_gate.is_agent_enabled", return_value=True
+        ):
+            stale = self.client.post(
+                "/api/agent/actions/confirm",
+                headers=headers,
+                json={"plan_id": captured["plan_id"], "session_id": session_id},
+            )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        scheduler.trigger.assert_not_called()
+
+    def test_runtime_change_before_query_publication_revokes_generated_plan(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        session_id = "query-runtime-race-12345678901"
+        scheduler = Mock()
+        scheduler.validate_config.return_value = ""
+        scheduler.status.return_value = {"running": False}
+        scheduler.trigger.return_value = {"ok": True}
+        values = {
+            "AGENT_ENABLED": "1",
+            "GY_STRM_SOURCE_DIRS": '[{"id":"one","name":"One"}]',
+            "GY_STRM_BASE_URL": "http://service",
+            "STRM_ROOT": "/root/one",
+        }
+        service = get_agent_service()
+        original_query = service.query
+        captured: dict[str, str] = {}
+
+        def capture_query(*args, **kwargs):
+            response = original_query(*args, **kwargs)
+            captured["plan_id"] = response["action_plan"]["plan_id"]
+            return response
+
+        with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch(
+            "app.agent.tools.config.get", side_effect=self._config_get(values)
+        ), patch("app.agent.feature_gate.is_agent_enabled", return_value=True), patch.object(
+            service, "query", side_effect=capture_query
+        ), patch(
+            "app.routes.agent_api.agent_runtime_admission",
+            side_effect=AgentRuntimeDisabled("Media Agent 状态已变化"),
+        ):
+            blocked = self.client.post(
+                "/api/agent/query",
+                headers=headers,
+                json={"message": "立即执行 STRM 同步", "session_id": session_id},
+            )
+
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertEqual(blocked.json()["code"], "agent_runtime_disabled")
+        self.assertIn("plan_id", captured)
+
+        with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch(
+            "app.agent.feature_gate.is_agent_enabled", return_value=True
+        ):
+            stale = self.client.post(
+                "/api/agent/actions/confirm",
+                headers=headers,
+                json={"plan_id": captured["plan_id"], "session_id": session_id},
+            )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        scheduler.trigger.assert_not_called()
 
     def test_web_sessions_isolate_reset_and_confirmation_tickets(self):
         csrf = self.login()
@@ -1102,12 +1770,12 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
                 json={"arguments": {}, "session_id": session_a},
             )
             self.assertEqual(prepared_a.status_code, 200, prepared_a.text)
-            ticket_a = prepared_a.json()["confirmation"]["confirmation_id"]
+            ticket_a = prepared_a.json()["action_plan"]["plan_id"]
 
             wrong_session = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"confirmation_id": ticket_a, "session_id": session_b},
+                json={"plan_id": ticket_a, "session_id": session_b},
             )
             self.assertEqual(wrong_session.status_code, 409, wrong_session.text)
 
@@ -1121,7 +1789,7 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             stale = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"confirmation_id": ticket_a, "session_id": session_a},
+                json={"plan_id": ticket_a, "session_id": session_a},
             )
             self.assertEqual(stale.status_code, 409, stale.text)
 
@@ -1130,7 +1798,7 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
                 headers=headers,
                 json={"arguments": {}, "session_id": session_b},
             )
-            ticket_b = prepared_b.json()["confirmation"]["confirmation_id"]
+            ticket_b = prepared_b.json()["action_plan"]["plan_id"]
             self.client.post(
                 "/api/agent/session/reset",
                 headers=headers,
@@ -1139,7 +1807,7 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             confirmed_b = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"confirmation_id": ticket_b, "session_id": session_b},
+                json={"plan_id": ticket_b, "session_id": session_b},
             )
             self.assertEqual(confirmed_b.status_code, 202, confirmed_b.text)
             scheduler.trigger.assert_called_once_with("manual")

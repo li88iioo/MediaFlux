@@ -10,13 +10,12 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 
 from app.agent.indexer_actions import (
-    preview_submit_resource,
+    _submit_resource,
+    _submit_resource_batch,
+    prepare_submit_resource,
     search_arguments,
     search_resources,
     submit_arguments,
-    submit_confirmation_context,
-    submit_resource,
-    submit_resource_batch,
 )
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import AgentOrchestrator
@@ -243,7 +242,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}):
-            result = preview_submit_resource(arguments)
+            result, _context = prepare_submit_resource(arguments)
 
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "confirmation_required")
@@ -255,7 +254,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": False}):
-            unavailable = preview_submit_resource(arguments)
+            unavailable, _context = prepare_submit_resource(arguments)
         self.assertFalse(unavailable.ok)
         self.assertEqual(unavailable.status, "not_configured")
 
@@ -264,7 +263,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ):
-            expired = preview_submit_resource({
+            expired, _context = prepare_submit_resource({
                 "result_id": "expired-result-1234",
                 "target": "qb",
             })
@@ -272,7 +271,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
                 download_state="unavailable",
                 download_kinds=(),
             )
-            blocked = preview_submit_resource({
+            blocked, _context = prepare_submit_resource({
                 "result_id": _RESULT_ID,
                 "target": "qb",
             })
@@ -288,9 +287,9 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}):
-            first = submit_confirmation_context(arguments)
+            first = prepare_submit_resource(arguments)[1]
             service.result_store.item = _resource_item(title="Changed Resource")
-            second = submit_confirmation_context(arguments)
+            second = prepare_submit_resource(arguments)[1]
         self.assertNotEqual(first, second)
         self.assertNotIn("Changed", first + second)
 
@@ -312,7 +311,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch("app.agent.indexer_actions.download_result", dispatch):
-            result = submit_resource({"result_id": _RESULT_ID, "target": "both"})
+            result = _submit_resource({"result_id": _RESULT_ID, "target": "both"})
 
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "accepted")
@@ -357,7 +356,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
                 "app.agent.indexer_actions.download_result",
                 AsyncMock(return_value={**payload, "error": "private backend detail"}),
             ):
-                result = submit_resource({"result_id": _RESULT_ID, "target": "qb"})
+                result = _submit_resource({"result_id": _RESULT_ID, "target": "qb"})
             self.assertFalse(result.ok)
             self.assertEqual(result.status, expected_status)
             self.assertNotIn("private backend detail", str(result.to_dict()))
@@ -370,7 +369,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             "app.agent.indexer_actions.download_result",
             AsyncMock(side_effect=RuntimeError("secret internal error")),
         ):
-            internal = submit_resource({"result_id": _RESULT_ID, "target": "qb"})
+            internal = _submit_resource({"result_id": _RESULT_ID, "target": "qb"})
         self.assertFalse(internal.ok)
         self.assertEqual(internal.status, "unavailable")
         self.assertNotIn("secret internal error", str(internal.to_dict()))
@@ -392,7 +391,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch("app.agent.indexer_actions.download_result", dispatch):
-            result = submit_resource({"result_id": _RESULT_ID, "target": "guangya"})
+            result = _submit_resource({"result_id": _RESULT_ID, "target": "guangya"})
 
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "review_required")
@@ -419,7 +418,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch("app.agent.indexer_actions.download_result_public", dispatch):
-            result = submit_resource_batch({"result_ids": result_ids, "target": "guangya"})
+            result = _submit_resource_batch({"result_ids": result_ids, "target": "guangya"})
 
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "review_required")
@@ -607,7 +606,7 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
                 json={"session_id": "test_session_identifier_0001", "arguments": {"result_id": _RESULT_ID, "target": "qb"}},
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            confirmation_id = prepared.json()["action_plan"]["plan_id"]
             dispatch.assert_not_awaited()
 
             direct = self.client.post(
@@ -620,7 +619,7 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 202, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "accepted")
@@ -629,7 +628,7 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             self.assertEqual(dispatch.await_count, 1)
@@ -702,7 +701,7 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
             stale = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": prepared.json()["action_plan"]["plan_id"]},
             )
             self.assertEqual(stale.status_code, 409, stale.text)
             self.assertIn("变化", stale.json()["error"])

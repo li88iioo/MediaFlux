@@ -49,9 +49,15 @@ class AgentCoreTests(unittest.TestCase):
             description="test",
             risk=RiskLevel.WRITE,
             parameters={},
-            handler=lambda _arguments: ToolResult(True, "success", "done"),
             validator=_identity,
             requires_confirmation=True,
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "confirmation_required", "preview"),
+                "write-test",
+            ),
+            confirmed_handler=lambda _arguments, _expected_context: ToolResult(
+                True, "success", "done"
+            ),
         ))
         with self.assertRaises(AgentToolError) as blocked:
             registry.execute("write.test", {})
@@ -676,6 +682,19 @@ class AgentToolTests(unittest.TestCase):
 
 
 class _FakeAgentService:
+    def __init__(self):
+        self.confirmation_epoch = 0
+
+    def begin_query_confirmation_epoch(self, *, owner: str) -> int:
+        del owner
+        self.confirmation_epoch += 1
+        return self.confirmation_epoch
+
+    def invalidate_query_confirmation_epoch(self, *, owner: str) -> int:
+        del owner
+        self.confirmation_epoch += 1
+        return self.confirmation_epoch
+
     def capabilities(self):
         return {"tools": [{"name": "config.diagnose"}], "mode": "read_only"}
 
@@ -703,6 +722,11 @@ class _FakeAgentService:
     def has_tool(self, tool_name):
         return tool_name != "missing" and not str(tool_name).startswith("missing-")
 
+    def is_read_tool(self, tool_name):
+        if not self.has_tool(tool_name):
+            raise AgentToolError("未知 Agent 工具", code="tool_not_found")
+        return True
+
     def invoke(self, tool_name, arguments, *, owner="", **_kwargs):
         if not self.has_tool(tool_name):
             raise AgentToolError("未知 Agent 工具", code="tool_not_found")
@@ -721,7 +745,7 @@ class _FakeAgentService:
             "tool": tool_name,
             "arguments": arguments,
             "owner": bool(owner),
-            "confirmation": {"confirmation_id": "x" * 24},
+            "action_plan": {"plan_id": "x" * 24},
         }
 
     def confirm(self, confirmation_id, *, owner, **_kwargs):
@@ -928,6 +952,8 @@ class AgentAPIRealServiceTests(IsolatedDatabaseTestCase):
             "TMDB_API_KEY": "",
         }
         with patch("app.routes.agent_api.is_agent_enabled", return_value=True), patch(
+            "app.agent.feature_gate.is_agent_enabled", return_value=True
+        ), patch(
             "app.agent.tools.config.all_items", return_value=dict(values)
         ), patch(
             "app.agent.tools.config.get",

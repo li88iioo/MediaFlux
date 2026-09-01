@@ -40,9 +40,11 @@ def invalidate_agent_runtime_generation() -> int:
 
 
 def agent_runtime_generation_is_current(generation: int) -> bool:
-    """仅当运行代次未变化时允许任务继续发布副作用。"""
+    """仅严格整数代次与当前值一致时允许继续发布副作用。"""
+    if not isinstance(generation, int) or isinstance(generation, bool):
+        return False
     with _runtime_generation_lock:
-        return int(generation) == _runtime_generation
+        return generation == _runtime_generation
 
 
 class AgentRuntimeDisabled(RuntimeError):
@@ -60,6 +62,7 @@ def agent_runtime_transition() -> Iterator[None]:
 def agent_runtime_admission(
     *,
     require_telegram: bool = False,
+    expected_generation: int | None = None,
     agent_enabled_check: Callable[[], bool] | None = None,
     telegram_enabled_check: Callable[[], bool] | None = None,
 ) -> Iterator[int]:
@@ -77,6 +80,12 @@ def agent_runtime_admission(
         if require_telegram and not telegram_enabled():
             raise AgentRuntimeDisabled("Telegram Agent 已关闭")
         generation = current_agent_runtime_generation()
+        if expected_generation is not None and (
+            not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation != generation
+        ):
+            raise AgentRuntimeDisabled("Media Agent 状态已变化")
         yield generation
 
 

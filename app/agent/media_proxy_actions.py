@@ -330,10 +330,6 @@ def prepare_set_media_proxy_instance_enabled(
     return preview, _fingerprint(state)
 
 
-def set_media_proxy_instance_enabled(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("媒体反代实例启停需要确认", code="confirmation_required")
-
-
 def set_media_proxy_instance_enabled_confirmed(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:
@@ -464,10 +460,6 @@ def prepare_restart_media_proxy_instance(
             _now(),
         )],
     ), _fingerprint(state)
-
-
-def restart_media_proxy_instance(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("媒体反代实例重启需要确认", code="confirmation_required")
 
 
 def restart_media_proxy_instance_confirmed(

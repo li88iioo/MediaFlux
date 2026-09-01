@@ -1117,10 +1117,6 @@ def prepare_retry_local_media_task(
     ), _fingerprint(snapshot)
 
 
-def retry_local_media_task(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
-
-
 def retry_local_media_task_confirmed(
     arguments: dict[str, Any], expected_context: str, context: ToolContext
 ) -> ToolResult:
@@ -1348,10 +1344,6 @@ def prepare_refresh_local_media_task_library(
             _now(),
         )],
     ), _fingerprint(snapshot)
-
-
-def refresh_local_media_task_library(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
 
 
 def refresh_local_media_task_library_confirmed(

@@ -173,7 +173,7 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
                     ).fetchone()
                 self.assertEqual(int(before["disabled"]), 0)
                 confirmed = service.confirm(
-                    prepared["confirmation"]["confirmation_id"],
+                    prepared["action_plan"]["plan_id"],
                     owner=f"owner-{rule_type}",
                 )
                 with db.get_conn() as conn:
@@ -207,7 +207,7 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
             "recognition_preprocess_rules.invalidate_active_cache"
         ) as invalidate:
             service.confirm(
-                prepared["confirmation"]["confirmation_id"],
+                prepared["action_plan"]["plan_id"],
                 owner="owner-preprocess",
             )
         invalidate.assert_called_once_with()
@@ -229,7 +229,7 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
             "recognition_knowledge.invalidate_active_cache"
         ) as invalidate:
             service.confirm(
-                prepared["confirmation"]["confirmation_id"],
+                prepared["action_plan"]["plan_id"],
                 owner="owner-knowledge",
             )
         invalidate.assert_called_once_with()
@@ -252,7 +252,7 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
                 ("SECRET changed name", db.now(), rule["id"]),
             )
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertEqual(confirmed["result"]["status"], "conflict")
         with db.get_conn() as conn:

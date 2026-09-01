@@ -384,14 +384,6 @@ def _preview_from_state(state: dict[str, Any]) -> ToolResult:
     )
 
 
-def preview_set_safe_policy(arguments: dict[str, Any]) -> ToolResult:
-    return _preview_from_state(_capture(arguments))
-
-
-def safe_policy_confirmation_context(arguments: dict[str, Any]) -> str:
-    return _fingerprint(_capture(arguments))
-
-
 def prepare_safe_policy_confirmation(
     arguments: dict[str, Any],
 ) -> tuple[ToolResult, str]:
@@ -508,11 +500,9 @@ def set_safe_policy_confirmed(
 ) -> ToolResult:
     state = _capture(arguments)
     if not secrets.compare_digest(_fingerprint(state), str(expected_context or "")):
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="目标策略已被其他操作修改，请重新预检",
-            error="配置已变化。",
+        raise AgentToolError(
+            "目标策略配置已变化，请重新预检",
+            code="confirmation_stale",
         )
     failed = _precondition_failure(state)
     if failed is not None:
@@ -573,19 +563,11 @@ def set_safe_policy_confirmed(
     )
 
 
-def set_safe_policy(arguments: dict[str, Any]) -> ToolResult:
-    del arguments
-    raise AgentToolError("该工具需要确认，不能直接执行", code="confirmation_required")
-
-
 __all__ = [
     "SAFE_POLICY_IDS",
     "prepare_safe_policy_confirmation",
-    "preview_set_safe_policy",
     "safe_policy_arguments",
-    "safe_policy_confirmation_context",
     "safe_policy_summary_arguments",
-    "set_safe_policy",
     "set_safe_policy_confirmed",
     "summarize_safe_policies",
 ]

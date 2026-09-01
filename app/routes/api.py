@@ -1364,9 +1364,6 @@ def save_config(request: Request, data: Any = Body(default=None)):
     changed_keys = frozenset(persisted_updates)
     previous_values = {key: config.get(key, "") for key in changed_keys}
     persist_started = time.perf_counter()
-    agent_transition_changed = bool(
-        {"AGENT_ENABLED", "TG_AGENT_ENABLED"} & changed_keys
-    )
     strm_reconcile_required = bool(
         new_strm_sources is not None and "GY_STRM_SOURCE_DIRS" in changed_keys
     )
@@ -1405,13 +1402,17 @@ def save_config(request: Request, data: Any = Body(default=None)):
     config_persisted = False
     try:
         with _CONFIG_SAVE_TRANSACTION_LOCK:
-            if agent_transition_changed:
-                from app.agent.feature_gate import agent_runtime_transition
+            from app.agent.feature_gate import (
+                agent_runtime_transition,
+                invalidate_agent_runtime_generation,
+            )
 
-                with agent_runtime_transition():
-                    retired_source_ids = publish_config_updates()
-            else:
+            with agent_runtime_transition():
                 retired_source_ids = publish_config_updates()
+                # Agent 的只读结论、行动计划和外部连接都可能依赖项目配置。
+                # 任意真实配置变更均与代次推进共用同一发布窗口，避免新增
+                # 配置项后遗漏白名单，导致旧请求在新配置下迟到发布。
+                invalidate_agent_runtime_generation()
     except (config.AtomicPublishError, OSError) as exc:
         return config_write_api_error(
             exc,
@@ -1448,17 +1449,6 @@ def save_config(request: Request, data: Any = Body(default=None)):
 
     warnings: list[str] = []
     restart_required = False
-    if "AGENT_ENABLED" in changed_keys:
-        try:
-            from app.agent.feature_gate import invalidate_agent_runtime_generation
-
-            invalidate_agent_runtime_generation()
-        except Exception as exc:
-            warnings.append("Agent 配置已保存，但运行时切换未完成；重启后生效")
-            restart_required = True
-            logger.warning(
-                "Agent 运行代次更新失败 type=%s", type(exc).__name__
-            )
     if _AI_RECOGNITION_KEYS & changed_keys:
         try:
             from app.modules.ai_recognition_governance import (

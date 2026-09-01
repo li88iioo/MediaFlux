@@ -206,8 +206,7 @@ def _precondition_failure(state: dict[str, Any]) -> ToolResult | None:
     return None
 
 
-def preview_set_indexer_sites(arguments: dict[str, Any]) -> ToolResult:
-    state = _capture(arguments)
+def _preview_set_indexer_sites(state: dict[str, Any]) -> ToolResult:
     failed = _precondition_failure(state)
     if failed is not None:
         return failed
@@ -254,8 +253,11 @@ def preview_set_indexer_sites(arguments: dict[str, Any]) -> ToolResult:
     )
 
 
-def indexer_sites_confirmation_context(arguments: dict[str, Any]) -> str:
-    return _fingerprint(_capture(arguments))
+def prepare_indexer_sites_confirmation(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    state = _capture(arguments)
+    return _preview_set_indexer_sites(state), _fingerprint(state)
 
 
 def _refresh_runtime() -> dict[str, bool]:
@@ -296,11 +298,9 @@ def set_indexer_sites_confirmed(
 ) -> ToolResult:
     state = _capture(arguments)
     if not secrets.compare_digest(_fingerprint(state), str(expected_context or "")):
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="配置已被其他操作修改，请重新预检",
-            error="配置已变化。",
+        raise AgentToolError(
+            "配置已变化，请重新预检",
+            code="confirmation_stale",
         )
     failed = _precondition_failure(state)
     if failed is not None:
@@ -401,9 +401,3 @@ def verify_indexer_sites_write(
         suggestions=suggestions,
         error="",
     )
-
-
-def set_indexer_sites(arguments: dict[str, Any]) -> ToolResult:
-    """防御性占位；该写工具只能通过确认后的 confirmed_handler 执行。"""
-    del arguments
-    raise AgentToolError("该工具需要确认，不能直接执行", code="confirmation_required")

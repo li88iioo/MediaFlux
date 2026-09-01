@@ -157,18 +157,18 @@ class AgentPresentationStreamTests(unittest.TestCase):
         self.assertEqual(response["result"]["summary"], "旧摘要")
         self.assertEqual(response["display"]["summary"], "旧展示")
 
-    def test_streamed_tool_answer_preserves_structured_result_and_confirmation(self):
+    def test_streamed_tool_answer_preserves_structured_result_and_action_plan(self):
         response = {
             "mode": "answer",
             "tool_call": {"name": "downloads.diagnose_queue", "arguments": {}},
             "result": {"ok": True, "summary": "确定性摘要", "items": [1]},
-            "confirmation": {"confirmation_id": "ticket"},
+            "action_plan": {"plan_id": "ticket"},
         }
 
         presented = apply_streamed_answer(response, "自然语言说明。")
 
         self.assertEqual(presented["result"], response["result"])
-        self.assertEqual(presented["confirmation"], response["confirmation"])
+        self.assertEqual(presented["action_plan"], response["action_plan"])
         self.assertEqual(presented["presentation"]["narrative"], "自然语言说明。")
         self.assertEqual(response["result"]["summary"], "确定性摘要")
 

@@ -71,8 +71,6 @@ class ToolContext:
 ContextualToolHandler = Callable[[dict[str, Any], ToolContext], ToolResult]
 ConfirmedToolHandler = Callable[[dict[str, Any], str], ToolResult]
 ContextualConfirmedToolHandler = Callable[[dict[str, Any], str, ToolContext], ToolResult]
-ConfirmationContextProvider = Callable[[dict[str, Any]], str]
-ConfirmationStateCleaner = Callable[[], None]
 ConfirmationPreparer = Callable[[dict[str, Any]], tuple[ToolResult, str]]
 ContextualConfirmationPreparer = Callable[
     [dict[str, Any], ToolContext], tuple[ToolResult, str]
@@ -85,12 +83,9 @@ class ToolSpec:
     description: str
     risk: RiskLevel
     parameters: dict[str, Any]
-    handler: ToolHandler
     validator: ArgumentsValidator
+    handler: ToolHandler | None = None
     requires_confirmation: bool = False
-    preview_handler: ToolHandler | None = None
-    confirmation_context: ConfirmationContextProvider | None = None
-    confirmation_state_cleaner: ConfirmationStateCleaner | None = None
     confirmed_handler: ConfirmedToolHandler | None = None
     confirmation_preparer: ConfirmationPreparer | None = None
     context_handler: ContextualToolHandler | None = None

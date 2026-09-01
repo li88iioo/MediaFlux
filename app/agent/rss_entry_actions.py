@@ -190,10 +190,6 @@ def prepare_mark_rss_entries(arguments: dict[str, Any]) -> tuple[ToolResult, str
     ), state["fingerprint"]
 
 
-def mark_rss_entries(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("RSS 条目标记必须先预检并确认", code="confirmation_required")
-
-
 def mark_rss_entries_confirmed(arguments: dict[str, Any], expected_context: str) -> ToolResult:
     state = _mark_snapshot(arguments)
     if not state["eligible"] or state["fingerprint"] != str(expected_context or ""):
@@ -275,10 +271,6 @@ def prepare_submit_rss_entries(arguments: dict[str, Any]) -> tuple[ToolResult, s
         ]},
         evidence=[Evidence("sqlite:rss_entries", "已只读冻结精确条目集合和当前 qB 配置。", _now())],
     ), state["fingerprint"]
-
-
-def submit_rss_entries(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("RSS 条目下载必须先预检并确认", code="confirmation_required")
 
 
 def submit_rss_entries_confirmed(arguments: dict[str, Any], expected_context: str) -> ToolResult:

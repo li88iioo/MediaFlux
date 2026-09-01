@@ -61,9 +61,14 @@ def _registry(*, calls=None, fail_download=False) -> ToolRegistry:
         risk=RiskLevel.WRITE,
         parameters={"type": "object", "properties": {}},
         validator=lambda arguments: dict(arguments),
-        handler=lambda arguments: ToolResult(True, "ok", "changed"),
         requires_confirmation=True,
-        preview_handler=lambda arguments: ToolResult(True, "preview", "preview"),
+        confirmation_preparer=lambda arguments: (
+            ToolResult(True, "preview", "preview"),
+            "feature-state",
+        ),
+        confirmed_handler=lambda arguments, _expected_context: ToolResult(
+            True, "ok", "changed"
+        ),
     ))
     return registry
 

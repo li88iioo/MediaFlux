@@ -726,10 +726,6 @@ def prepare_guangya_change_plan_confirmation(
     return prepare_guangya_rename_confirmation(arguments, context)
 
 
-def execute_guangya_change_plan(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("声明式改名必须先预览并确认", code="confirmation_required")
-
-
 def execute_guangya_change_plan_confirmed(
     arguments: dict[str, Any], expected_context: str, context: ToolContext,
 ) -> ToolResult:
@@ -741,10 +737,6 @@ def execute_guangya_change_plan_confirmed(
     return execute_guangya_rename_confirmed(arguments, expected_context, context)
 
 
-def execute_guangya_media_hygiene(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("媒体名称清理必须先预览并确认", code="confirmation_required")
-
-
 def execute_guangya_media_hygiene_confirmed(
     arguments: dict[str, Any], expected_context: str, context: ToolContext,
 ) -> ToolResult:
@@ -754,10 +746,6 @@ def execute_guangya_media_hygiene_confirmed(
             "媒体名称清理预览已过期，请重新生成", code="confirmation_stale"
         )
     return execute_guangya_rename_confirmed(arguments, expected_context, context)
-
-
-def execute_guangya_rename(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("光鸭重命名必须先预览并确认", code="confirmation_required")
 
 
 def execute_guangya_rename_confirmed(

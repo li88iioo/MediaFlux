@@ -205,7 +205,7 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         self.assertTrue(after_prepare.enabled)
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(
-            prepared["confirmation"]["contract"]["action"],
+            prepared["action_plan"]["title"],
             "切换本地媒体来源触发方式",
         )
 
@@ -215,7 +215,7 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
             return_value=scheduler,
         ):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertTrue(confirmed["result"]["ok"])
         self.assertFalse(confirmed["result"]["data"]["enabled"])
@@ -258,12 +258,12 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         )
         db.update_local_media_source(self.source_one, stable_seconds=301)
         stale = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertFalse(stale["result"]["ok"])
         self.assertEqual(stale["result"]["status"], "conflict")
         with self.assertRaises(AgentToolError):
-            service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+            service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
 
         reset_agent_service_for_tests()
         service = get_agent_service()
@@ -274,7 +274,7 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         )
         self.assertTrue(db.delete_local_media_source(self.source_one))
         ordinal = service.confirm(
-            ordinal_ticket["confirmation"]["confirmation_id"], owner="owner"
+            ordinal_ticket["action_plan"]["plan_id"], owner="owner"
         )
         self.assertFalse(ordinal["result"]["ok"])
         self.assertEqual(ordinal["result"]["status"], "conflict")
@@ -354,7 +354,7 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(
-            prepared["confirmation"]["tool"],
+            prepared["tool_call"]["name"],
             "local_media.set_source_trigger_enabled",
         )
         ambiguous = service.query("暂停所有本地媒体来源的目录自动扫描", owner="owner")

@@ -215,7 +215,7 @@ class AgentMediaProxyTests(IsolatedDatabaseTestCase):
             )
             self.assertEqual(int(db.get_media_proxy_instance(internal_id)["enabled"]), 1)
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         self.assertEqual(int(db.get_media_proxy_instance(internal_id)["enabled"]), 0)
@@ -245,7 +245,7 @@ class AgentMediaProxyTests(IsolatedDatabaseTestCase):
             return_value=manager,
         ):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         self.assertEqual(confirmed["result"]["status"], "conflict")

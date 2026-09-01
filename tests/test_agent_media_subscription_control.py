@@ -76,7 +76,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             owner="owner",
         )
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         return prepared, confirmed
 
@@ -168,7 +168,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
                 db.get_media_subscription(self.sid)["download_target"], "guangya"
             )
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertEqual(confirmed["result"]["status"], "completed")
         after = db.get_media_subscription(self.sid)
@@ -177,7 +177,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(after["check_interval_minutes"], 120)
         with self.assertRaises(AgentToolError):
             service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
     def test_subscription_policy_enforces_effective_tv_season_invariant(self) -> None:
@@ -222,7 +222,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             return_value=True,
         ):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertEqual(confirmed["result"]["status"], "completed")
         after = db.get_media_subscription(self.sid)
@@ -276,15 +276,15 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         preview = prepared["result"]["data"]
         self.assertEqual(preview["in_flight_dispatches_at_preflight"], 1)
         self.assertTrue(any("无法" in item for item in preview["effects"]))
-        contract = prepared["confirmation"]["contract"]
-        self.assertIn("无需再次确认", contract["impact"])
-        self.assertIn("提交阶段", contract["reversibility"])
+        plan = prepared["action_plan"]
+        self.assertIn("无需再次确认", plan["impact"])
+        self.assertIn("提交阶段", plan["reversibility"])
         with patch(
             "app.agent.media_subscription_actions._reload_scheduler",
             return_value=True,
         ):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertEqual(confirmed["result"]["data"]["in_flight_dispatches"], 1)
         self.assertEqual(db.get_media_subscription(self.sid)["action"], "notify")
@@ -321,7 +321,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         ))
 
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertEqual(confirmed["result"]["status"], "conflict")
         unchanged = db.get_media_subscription(self.sid)
@@ -337,7 +337,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         )
         db.update_media_subscription_config(self.sid, action="notify")
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertEqual(confirmed["result"]["status"], "conflict")
         self.assertEqual(
@@ -703,7 +703,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             return_value=scheduler,
         ):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["data"]["expired_candidates"], 1)
@@ -761,7 +761,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             return_value=scheduler,
         ):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         self.assertTrue(confirmed["result"]["ok"])
@@ -801,12 +801,12 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         )
         db.update_media_subscription_config(self.sid, check_interval_minutes=120)
         stale = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertFalse(stale["result"]["ok"])
         self.assertEqual(stale["result"]["status"], "conflict")
         with self.assertRaises(AgentToolError):
-            service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+            service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
 
     def test_scheduler_reload_failure_does_not_leak_and_history_is_safe(self) -> None:
         with patch(
@@ -862,7 +862,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertEqual(
-            prepared["confirmation"]["tool"], "media.create_subscription"
+            prepared["tool_call"]["name"], "media.create_subscription"
         )
         self.assertIsNone(self._subscription_by_identity("999", "tv"))
 
@@ -874,7 +874,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             return_value=scheduler,
         ):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         self.assertTrue(confirmed["result"]["ok"])
@@ -894,7 +894,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             {"subscription_id": self.sid},
             owner="owner",
         )
-        self.assertEqual(prepared["confirmation"]["risk"], "danger")
+        self.assertEqual(prepared["action_plan"]["risk"], "danger")
         self.assertIsNotNone(db.get_media_subscription(self.sid))
 
         with patch(
@@ -902,7 +902,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             return_value=scheduler,
         ):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         self.assertTrue(confirmed["result"]["ok"])
@@ -959,7 +959,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             )
         self.assertEqual(selected["mode"], "confirmation_required")
         self.assertEqual(
-            selected["confirmation"]["tool"], "media.create_subscription"
+            selected["tool_call"]["name"], "media.create_subscription"
         )
         self.assertEqual(selected["result"]["data"]["season"], 2)
 
@@ -1009,7 +1009,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         service = get_agent_service()
         result = service.query(f"暂停媒体订阅 {self.sid}", owner="owner")
         self.assertEqual(result["mode"], "confirmation_required")
-        self.assertEqual(result["confirmation"]["tool"], "media.set_subscription_enabled")
+        self.assertEqual(result["tool_call"]["name"], "media.set_subscription_enabled")
         bulk = service.query("暂停所有媒体订阅", owner="owner")
         self.assertEqual(bulk["mode"], "read_only")
         self.assertEqual(bulk["result"]["status"], "unsupported")
@@ -1017,7 +1017,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         deleted = service.query(f"删除媒体订阅 {self.sid}", owner="owner")
         self.assertEqual(deleted["mode"], "confirmation_required")
         self.assertEqual(
-            deleted["confirmation"]["tool"], "media.delete_subscription"
+            deleted["tool_call"]["name"], "media.delete_subscription"
         )
 
 

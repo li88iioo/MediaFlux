@@ -181,10 +181,6 @@ def prepare_start_episode_audit(
     ), context_hash
 
 
-def start_episode_audit(_arguments: dict[str, Any]) -> ToolResult:
-    """Fail closed：该写入只允许通过 owner 绑定的确认处理器执行。"""
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
-
 
 def start_episode_audit_confirmed(
     arguments: dict[str, Any], expected_context: str, context: ToolContext
@@ -501,9 +497,6 @@ def prepare_cancel_agent_job(
         suggestions=["取消不会删除媒体文件，也不会回滚已保存的只读检查进度。"],
     ), context_hash
 
-
-def cancel_agent_job(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
 
 
 def cancel_agent_job_confirmed(

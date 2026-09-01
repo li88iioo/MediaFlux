@@ -238,7 +238,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             )
             self.assertEqual(db.get_local_media_task(task_id, owner="admin").status, "failed")
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner-a"
+                prepared["action_plan"]["plan_id"], owner="owner-a"
             )
         after = db.get_local_media_task(task_id, owner="admin")
         self.assertEqual(confirmed["result"]["status"], "accepted")
@@ -250,7 +250,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         scheduler.reload.assert_called_once_with()
         with self.assertRaises(AgentToolError):
-            service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner-a")
+            service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
 
     def test_retry_stale_or_non_retryable_task_fails_closed(self) -> None:
         task_id = self._task(status="failed")
@@ -265,7 +265,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         db.update_local_media_task(task_id, owner="admin", warning="changed")
         with self.assertRaises(AgentToolError) as stale:
-            service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner-a")
+            service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         self.assertEqual(stale.exception.code, "confirmation_stale")
         self.assertEqual(db.get_local_media_task(task_id, owner="admin").status, "failed")
 
@@ -316,7 +316,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             self.assertNotIn("/private", repr(prepared))
             client.refresh_for_paths.assert_not_called()
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner-a"
+                prepared["action_plan"]["plan_id"], owner="owner-a"
             )
         self.assertEqual(confirmed["result"]["status"], "completed")
         client.refresh_for_paths.assert_called_once_with(
@@ -345,7 +345,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             db.update_local_media_task(task_id, owner="admin", warning="binding-drift")
             with self.assertRaises(AgentToolError) as stale:
                 service.confirm(
-                    prepared["confirmation"]["confirmation_id"], owner="owner-a"
+                    prepared["action_plan"]["plan_id"], owner="owner-a"
                 )
         self.assertEqual(stale.exception.code, "confirmation_stale")
 
@@ -678,7 +678,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             )
             with self.assertRaises(AgentToolError) as stale:
                 service.confirm(
-                    prepared["confirmation"]["confirmation_id"], owner="owner-a"
+                    prepared["action_plan"]["plan_id"], owner="owner-a"
                 )
         self.assertEqual(stale.exception.code, "confirmation_stale")
         client.refresh_for_paths.assert_not_called()
@@ -715,7 +715,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             )
             with self.assertRaises(AgentToolError) as stale:
                 service.confirm(
-                    prepared["confirmation"]["confirmation_id"], owner="owner-a"
+                    prepared["action_plan"]["plan_id"], owner="owner-a"
                 )
         self.assertEqual(stale.exception.code, "confirmation_stale")
         client.refresh_for_paths.assert_not_called()
@@ -772,7 +772,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             tickets = [
                 service.prepare(
                     "local_media.refresh_task_library", {"task_number": 1}, owner="owner-a"
-                )["confirmation"]["confirmation_id"]
+                )["action_plan"]["plan_id"]
                 for _ in range(2)
             ]
 
@@ -818,7 +818,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                     "local_media.refresh_task_library",
                     {"task_number": 1},
                     owner=owner,
-                )["confirmation"]["confirmation_id"]
+                )["action_plan"]["plan_id"]
                 for owner in ("owner-a", "owner-b")
             }
 

@@ -20,6 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.agent.action_plan import sanitize_action_plan
 from app.agent.capability_retrieval import infer_media_intent
 from app.agent.confirmation import ConfirmationStore
 from app.agent.intents import match_read_intent
@@ -495,17 +496,18 @@ def build_offline_agent_eval_registry() -> ToolRegistry:
             risk=RiskLevel.LOW_WRITE,
             parameters={"type": "object"},
             validator=_identity,
-            handler=lambda _arguments, name=tool_name: ToolResult(
-                True,
-                "changed",
-                name,
-            ),
             requires_confirmation=True,
-            preview_handler=lambda arguments, name=tool_name: ToolResult(
-                True,
-                "confirmation_required",
-                name,
-                data=dict(arguments),
+            confirmation_preparer=lambda arguments, name=tool_name: (
+                ToolResult(
+                    True,
+                    "confirmation_required",
+                    name,
+                    data=dict(arguments),
+                ),
+                f"offline-eval:{name}:{arguments!r}",
+            ),
+            confirmed_handler=lambda _arguments, _expected_context, name=tool_name: (
+                ToolResult(True, "changed", name)
             ),
         ))
     return registry
@@ -543,16 +545,12 @@ def _offline_route_projection(
         return None
     arguments = tool_call.get("arguments")
     if response.get("mode") == "confirmation_required":
-        confirmation = response.get("confirmation")
-        confirmation_id = (
-            str(confirmation.get("confirmation_id") or "").strip()
-            if isinstance(confirmation, Mapping)
-            else ""
-        )
-        if confirmation_id:
-            ticket = confirmation_store.claim(
+        action_plan = sanitize_action_plan(response.get("action_plan"))
+        if action_plan:
+            plan_id = action_plan["plan_id"]
+            ticket = confirmation_store.claim_and_rotate_owner(
                 owner=owner,
-                confirmation_id=confirmation_id,
+                confirmation_id=plan_id,
             )
             arguments = ticket.arguments
     return {

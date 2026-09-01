@@ -16,10 +16,9 @@ from app.agent.orchestrator import (
 from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError
 from app.agent.rss_download_actions import (
-    preview_rss_pending_download,
+    prepare_rss_pending_download,
     rss_pending_download_arguments,
-    rss_pending_download_confirmation_context,
-    submit_pending_rss_to_qb,
+    submit_pending_rss_to_qb_confirmed,
 )
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from app.main import create_app
@@ -111,7 +110,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         db.update_rss_entry_status(ids[0], "downloaded")
 
         with patch("app.clients.qbittorrent.QBittorrentClient.add_torrent") as add:
-            result = preview_rss_pending_download({"limit": 2})
+            result, _context = prepare_rss_pending_download({"limit": 2})
         self.assertTrue(result.ok)
         self.assertEqual(result.data["selected_count"], 2)
         self.assertTrue(result.data["has_more"])
@@ -127,7 +126,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         sub_id = self._subscription()
         first = self._entry(sub_id, 1)
         second = self._entry(sub_id, 2)
-        fingerprint = rss_pending_download_confirmation_context({"limit": 2})
+        fingerprint = prepare_rss_pending_download({"limit": 2})[1]
         self.assertEqual(len(fingerprint), 64)
         raw = {
             "ok": True,
@@ -139,7 +138,9 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             "error": "QB_SECRET /private/path",
         }
         with patch.object(RSSEngine, "submit_pending_qb_snapshot", return_value=raw) as submit:
-            result = submit_pending_rss_to_qb({"limit": 2})
+            result = submit_pending_rss_to_qb_confirmed(
+                {"limit": 2}, fingerprint
+            )
         expected_rows, runtime = submit.call_args.args
         self.assertEqual([item["id"] for item in expected_rows], [second, first])
         self.assertEqual(runtime, self.runtime)
@@ -156,14 +157,16 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
     def test_unknown_submission_requires_qb_review_before_retry(self):
         sub_id = self._subscription()
         self._entry(sub_id, 1)
-        rss_pending_download_confirmation_context({"limit": 1})
         raw = {
             "ok": False, "conflict": False, "requested": 1,
             "claimed": 1, "submitted": 0, "failed": 1,
             "outcome_unknown": 1,
         }
+        fingerprint = prepare_rss_pending_download({"limit": 1})[1]
         with patch.object(RSSEngine, "submit_pending_qb_snapshot", return_value=raw):
-            result = submit_pending_rss_to_qb({"limit": 1})
+            result = submit_pending_rss_to_qb_confirmed(
+                {"limit": 1}, fingerprint
+            )
 
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "review_required")
@@ -176,14 +179,16 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         sub_id = self._subscription()
         for index in range(1, 4):
             self._entry(sub_id, index)
-        rss_pending_download_confirmation_context({"limit": 3})
         raw = {
             "ok": False, "conflict": False, "requested": 3,
             "claimed": 3, "submitted": 1, "failed": 2,
             "outcome_unknown": 1,
         }
+        fingerprint = prepare_rss_pending_download({"limit": 3})[1]
         with patch.object(RSSEngine, "submit_pending_qb_snapshot", return_value=raw):
-            result = submit_pending_rss_to_qb({"limit": 3})
+            result = submit_pending_rss_to_qb_confirmed(
+                {"limit": 3}, fingerprint
+            )
 
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "partial")
@@ -200,7 +205,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         self._entry(sub_id, 2)
         with patch.object(RSSEngine, "submit_pending_qb_snapshot") as submit:
             with self.assertRaises(AgentToolError) as stale:
-                service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+                service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(stale.exception.code, "confirmation_stale")
         submit.assert_not_called()
 
@@ -477,7 +482,7 @@ class RssPendingDownloadAPITests(IsolatedDatabaseTestCase):
             body = prepared.json()
             self.assertEqual(body["mode"], "confirmation_required")
             self.assertEqual(body["result"]["data"]["selected_count"], 1)
-            confirmation_id = body["confirmation"]["confirmation_id"]
+            confirmation_id = body["action_plan"]["plan_id"]
             submit.assert_not_called()
 
             direct = self.client.post(
@@ -490,7 +495,7 @@ class RssPendingDownloadAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 200, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "completed")
@@ -501,7 +506,7 @@ class RssPendingDownloadAPITests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             submit.assert_called_once()

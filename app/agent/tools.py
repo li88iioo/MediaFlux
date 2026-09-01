@@ -5,6 +5,7 @@ from datetime import date, datetime
 import hashlib
 import json
 import re
+import secrets
 import threading
 import time
 from typing import Any
@@ -28,21 +29,17 @@ from app.agent.download_actions import (
     summarize_download_requests,
 )
 from app.agent.download_control_actions import (
-    delete_download_task,
     delete_download_task_confirmed,
     download_task_arguments,
-    pause_download_task,
     pause_download_task_confirmed,
     prepare_delete_download_task,
     prepare_pause_download_task,
     prepare_resume_download_task,
-    resume_download_task,
     resume_download_task_confirmed,
 )
 from app.agent.download_retry_actions import (
     download_retry_submission_arguments,
     prepare_retry_download_submission,
-    retry_download_submission,
     retry_download_submission_confirmed,
 )
 from app.agent.pending_action_actions import (
@@ -64,38 +61,29 @@ from app.agent.rss_actions import (
     rss_subscription_summary_arguments,
 )
 from app.agent.rss_download_actions import (
-    clear_confirmation_state as clear_rss_download_confirmation_state,
-    preview_rss_pending_download,
+    prepare_rss_pending_download,
     rss_pending_download_arguments,
-    rss_pending_download_confirmation_context,
-    submit_pending_rss_to_qb,
+    submit_pending_rss_to_qb_confirmed,
 )
 from app.agent.rss_entry_actions import (
     list_rss_entry_summaries,
-    mark_rss_entries,
     mark_rss_entries_confirmed,
     prepare_mark_rss_entries,
     prepare_submit_rss_entries,
     rss_entry_summaries_arguments,
     rss_mark_entries_arguments,
     rss_submit_entries_arguments,
-    submit_rss_entries,
     submit_rss_entries_confirmed,
 )
 from app.agent.rss_refresh_actions import (
-    clear_confirmation_state as clear_rss_refresh_confirmation_state,
+    prepare_rss_subscription_refresh,
     prepare_rss_subscriptions_refresh,
-    preview_rss_subscription_refresh,
-    preview_rss_subscriptions_refresh,
-    refresh_rss_subscription,
-    refresh_rss_subscriptions,
+    refresh_rss_subscription_confirmed,
     refresh_rss_subscriptions_confirmed,
     rss_refresh_subscription_arguments,
-    rss_refresh_subscription_confirmation_context,
     rss_refresh_subscriptions_arguments,
 )
 from app.agent.rss_subscription_control_actions import (
-    delete_rss_subscription,
     delete_rss_subscription_confirmed,
     prepare_delete_rss_subscription,
     prepare_set_rss_refresh_interval,
@@ -103,15 +91,11 @@ from app.agent.rss_subscription_control_actions import (
     rss_delete_subscription_arguments,
     rss_refresh_interval_arguments,
     rss_subscription_enabled_arguments,
-    set_rss_refresh_interval,
     set_rss_refresh_interval_confirmed,
-    set_rss_subscription_enabled,
     set_rss_subscription_enabled_confirmed,
 )
 from app.agent.media_subscription_actions import (
-    create_media_subscription,
     create_media_subscription_confirmed,
-    delete_media_subscription,
     delete_media_subscription_confirmed,
     get_media_subscription_policy,
     get_media_subscription_summary,
@@ -129,13 +113,10 @@ from app.agent.media_subscription_actions import (
     prepare_delete_media_subscription,
     prepare_set_media_subscription_enabled,
     prepare_set_media_subscription_policy,
-    set_media_subscription_enabled,
     set_media_subscription_enabled_confirmed,
-    set_media_subscription_policy,
     set_media_subscription_policy_confirmed,
 )
 from app.agent.media_consumption_actions import (
-    clear_preferences,
     clear_preferences_confirmed,
     continue_watching_arguments,
     empty_arguments as media_consumption_empty_arguments,
@@ -150,19 +131,14 @@ from app.agent.media_consumption_actions import (
     prepare_reset_subscription_notification_rule,
     prepare_set_preferences,
     prepare_set_subscription_notification_rule,
-    reset_subscription_notification_rule,
     reset_subscription_notification_rule_confirmed,
-    set_preferences,
     set_preferences_confirmed,
-    set_subscription_notification_rule,
     set_subscription_notification_rule_confirmed,
 )
 from app.agent.rss_retry_actions import (
-    clear_confirmation_state as clear_rss_retry_confirmation_state,
-    preview_rss_failure_retry,
-    retry_failed_rss_to_qb,
+    prepare_rss_failure_retry,
+    retry_failed_rss_to_qb_confirmed,
     rss_failure_retry_arguments,
-    rss_failure_retry_confirmation_context,
 )
 from app.agent.strm_history_actions import (
     get_strm_run_history,
@@ -173,19 +149,14 @@ from app.agent.strm_failure_actions import (
     triage_strm_failures,
 )
 from app.agent.strm_retry_actions import (
-    clear_confirmation_state as clear_strm_retry_confirmation_state,
-    preview_strm_failure_retry,
-    retry_strm_failure_records,
+    prepare_strm_failure_retry,
+    retry_strm_failure_records_confirmed,
     strm_failure_retry_arguments,
-    strm_failure_retry_confirmation_context,
 )
 from app.agent.strm_schedule_config_actions import (
     prepare_strm_schedule_policy_confirmation,
-    preview_set_strm_schedule_policy,
-    set_strm_schedule_policy,
     set_strm_schedule_policy_confirmed,
     strm_schedule_policy_arguments,
-    strm_schedule_policy_confirmation_context,
     strm_schedule_policy_summary_arguments,
     summarize_strm_schedule_policy,
 )
@@ -217,7 +188,6 @@ from app.agent.discovery_actions import (
     search_discovery,
 )
 from app.agent.discovery_mapping_actions import (
-    confirm_discovery_mapping,
     confirm_discovery_mapping_confirmed,
     discovery_confirm_mapping_arguments,
     discovery_detail_arguments,
@@ -227,14 +197,12 @@ from app.agent.discovery_mapping_actions import (
     prepare_confirm_discovery_mapping,
 )
 from app.agent.discovery_watchlist_actions import (
-    add_watchlist,
     add_watchlist_arguments,
     add_watchlist_confirmed,
     get_watchlist_summary,
     list_watchlist_summaries,
     prepare_add_watchlist,
     prepare_remove_watchlist,
-    remove_watchlist,
     remove_watchlist_arguments,
     remove_watchlist_confirmed,
     watchlist_summaries_arguments,
@@ -248,13 +216,11 @@ from app.agent.library_episode_count import (
 from app.agent.library_episode_audit import audit_library_episodes
 from app.agent.durable_job_actions import (
     agent_job_status_arguments,
-    cancel_agent_job,
     cancel_agent_job_arguments,
     cancel_agent_job_confirmed,
     get_agent_job_status,
     prepare_cancel_agent_job,
     prepare_start_episode_audit,
-    start_episode_audit,
     start_episode_audit_arguments,
     start_episode_audit_confirmed,
 )
@@ -264,18 +230,14 @@ from app.agent.library_patrol_status import (
 )
 from app.agent.library_patrol_config_actions import (
     patrol_policy_arguments,
-    patrol_policy_confirmation_context,
     patrol_policy_summary_arguments,
     prepare_patrol_policy_confirmation,
-    preview_set_patrol_policy,
-    set_patrol_policy,
     set_patrol_policy_confirmed,
     summarize_patrol_policy,
 )
 from app.agent.library_patrol_trigger_actions import (
     patrol_trigger_arguments,
     prepare_trigger_patrol_now,
-    trigger_patrol_now,
     trigger_patrol_now_confirmed,
 )
 from app.agent.update_actions import check_library_updates
@@ -286,21 +248,17 @@ from app.agent.episode_resource_actions import (
     search_missing_season_resources,
 )
 from app.agent.feature_actions import (
-    clear_confirmation_state as clear_feature_confirmation_state,
     feature_summary_arguments,
     feature_state_arguments,
-    feature_state_confirmation_context,
-    preview_set_feature_state,
-    set_feature_state,
+    prepare_feature_state_confirmation,
+    set_feature_state_confirmed,
     summarize_feature_states,
     verify_feature_state_write,
 )
 from app.agent.indexer_config_actions import (
     indexer_sites_arguments,
-    indexer_sites_confirmation_context,
     indexer_sites_summary_arguments,
-    preview_set_indexer_sites,
-    set_indexer_sites,
+    prepare_indexer_sites_confirmation,
     set_indexer_sites_confirmed,
     summarize_indexer_sites,
     verify_indexer_sites_write,
@@ -308,37 +266,29 @@ from app.agent.indexer_config_actions import (
 from app.agent.safe_policy_actions import (
     SAFE_POLICY_IDS,
     prepare_safe_policy_confirmation,
-    preview_set_safe_policy,
     safe_policy_arguments,
-    safe_policy_confirmation_context,
     safe_policy_summary_arguments,
-    set_safe_policy,
     set_safe_policy_confirmed,
     summarize_safe_policies,
 )
 from app.agent.telegram_test_actions import (
     prepare_telegram_test_notification,
-    preview_telegram_test_notification,
-    send_telegram_test_notification,
     send_telegram_test_notification_confirmed,
     telegram_test_arguments,
-    telegram_test_confirmation_context,
 )
 from app.agent.indexer_readiness_actions import (
     diagnose_indexer_readiness,
     indexer_readiness_arguments,
 )
 from app.agent.indexer_actions import (
-    preview_submit_resource,
-    preview_submit_resource_batch,
+    prepare_submit_resource,
+    prepare_submit_resource_batch,
     search_arguments as indexer_search_arguments,
     search_resources,
     submit_arguments as indexer_submit_arguments,
     submit_batch_arguments as indexer_submit_batch_arguments,
-    submit_batch_confirmation_context,
-    submit_confirmation_context,
-    submit_resource,
-    submit_resource_batch,
+    submit_resource_batch_confirmed,
+    submit_resource_confirmed,
 )
 from app.agent.local_media_actions import (
     diagnose_local_media,
@@ -358,16 +308,13 @@ from app.agent.local_media_task_actions import (
     prepare_refresh_local_media_task_library,
     prepare_retry_local_media_task,
     preview_local_media_task,
-    refresh_local_media_task_library,
     refresh_local_media_task_library_confirmed,
-    retry_local_media_task,
     retry_local_media_task_confirmed,
     verify_local_media_task_library_visibility,
 )
 from app.agent.local_media_scan_actions import (
     local_media_scan_arguments,
     prepare_scan_local_media_sources,
-    scan_local_media_sources,
     scan_local_media_sources_confirmed,
 )
 from app.agent.local_media_source_actions import (
@@ -377,13 +324,11 @@ from app.agent.local_media_source_actions import (
     local_media_source_summary_arguments,
     local_media_source_trigger_arguments,
     prepare_set_local_media_source_trigger_enabled,
-    set_local_media_source_trigger_enabled,
     set_local_media_source_trigger_enabled_confirmed,
 )
 from app.agent.media_library_actions import (
     media_library_refresh_arguments,
     prepare_refresh_media_library,
-    refresh_media_library,
     refresh_media_library_confirmed,
 )
 from app.agent.media_server_actions import (
@@ -398,9 +343,7 @@ from app.agent.media_proxy_actions import (
     media_proxy_test_arguments,
     prepare_restart_media_proxy_instance,
     prepare_set_media_proxy_instance_enabled,
-    restart_media_proxy_instance,
     restart_media_proxy_instance_confirmed,
-    set_media_proxy_instance_enabled,
     set_media_proxy_instance_enabled_confirmed,
     summarize_media_proxy_playback_failures,
     summarize_media_proxy_status,
@@ -409,7 +352,6 @@ from app.agent.media_proxy_actions import (
 from app.agent.recognition_toggle_actions import (
     prepare_set_recognition_rule_enabled,
     recognition_rule_enabled_arguments,
-    set_recognition_rule_enabled,
     set_recognition_rule_enabled_confirmed,
 )
 from app.agent.media_health_actions import (
@@ -421,17 +363,13 @@ from app.agent.guangya_schedule_config_actions import (
     get_guangya_connection_status,
     guangya_connection_status_arguments,
     guangya_organize_schedule_policy_arguments,
-    guangya_organize_schedule_policy_confirmation_context,
     guangya_organize_schedule_policy_summary_arguments,
     prepare_guangya_organize_schedule_policy_confirmation,
-    preview_set_guangya_organize_schedule_policy,
-    set_guangya_organize_schedule_policy,
     set_guangya_organize_schedule_policy_confirmed,
     summarize_guangya_organize_schedule_policy,
 )
 from app.agent.guangya_cleanup_actions import (
     classify_guangya_cleanup_candidates,
-    execute_guangya_cleanup,
     execute_guangya_cleanup_confirmed,
     guangya_cleanup_classify_arguments,
     guangya_cleanup_execute_arguments,
@@ -440,11 +378,8 @@ from app.agent.guangya_cleanup_actions import (
     preview_guangya_cleanup,
 )
 from app.agent.guangya_rename_actions import (
-    execute_guangya_change_plan,
     execute_guangya_change_plan_confirmed,
-    execute_guangya_media_hygiene,
     execute_guangya_media_hygiene_confirmed,
-    execute_guangya_rename,
     execute_guangya_rename_confirmed,
     guangya_change_plan_preview_arguments,
     guangya_media_hygiene_preview_arguments,
@@ -469,26 +404,16 @@ from app.agent.guangya_directory_scrape_actions import (
     inspect_directory_scrape,
     prepare_run_directory_scrape,
     preview_directory_scrape,
-    run_directory_scrape,
     run_directory_scrape_confirmed,
     search_directory_scrape,
 )
 from app.agent.organize_actions import (
-    clean_empty_guangya_organize_sources,
     clean_empty_guangya_organize_sources_confirmed,
-    organize_clean_empty_confirmation_context,
-    organize_confirmation_context,
-    organize_stop_confirmation_context,
     preview_guangya_organize,
-    preview_guangya_organize_clean_empty,
     prepare_guangya_organize_clean_empty,
     prepare_guangya_organize_run_once,
-    preview_guangya_organize_run_once,
-    preview_guangya_organize_stop,
     prepare_guangya_organize_stop,
-    run_guangya_organize_once,
     run_guangya_organize_once_confirmed,
-    stop_guangya_organize,
     stop_guangya_organize_confirmed,
 )
 from app.agent.organize_audit_actions import (
@@ -796,31 +721,52 @@ _STRM_CONFIRMATION_KEYS = (
 )
 
 
-def _strm_confirmation_context(arguments: dict[str, Any]) -> str:
-    """绑定本次确认时的 STRM 执行配置与选定来源；摘要只保留在服务端。"""
-    selected, selection_error = _selected_strm_sources(arguments)
-    payload = {key: config.get(key, "") for key in _STRM_CONFIRMATION_KEYS}
-    payload["selected_source_ids"] = [str(item.get("id") or "") for item in selected]
-    payload["selection_error"] = selection_error
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def preview_strm_run_once(arguments: dict[str, Any]) -> ToolResult:
-    """只做运行前检查，不启动任务。"""
+def _capture_strm_run(arguments: dict[str, Any]) -> dict[str, Any]:
+    """原子捕获本次 STRM 预检、确认绑定与执行所需的服务端状态。"""
     from app.modules.scheduler import get_scheduler
 
     selected_sources, selection_error = _selected_strm_sources(arguments)
-    if selection_error:
+    scheduler = get_scheduler()
+    validation_error = str(scheduler.validate_config(auto_only=False) or "")
+    raw_status = scheduler.status()
+    running = isinstance(raw_status, dict) and raw_status.get("running") is True
+    payload = {key: config.get(key, "") for key in _STRM_CONFIRMATION_KEYS}
+    payload.update(
+        {
+            "selected_source_ids": [
+                str(item.get("id") or "") for item in selected_sources
+            ],
+            "selection_error": selection_error,
+            "validation_error": validation_error,
+            "running": running,
+        }
+    )
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "scheduler": scheduler,
+        "selected_sources": selected_sources,
+        "selection_error": selection_error,
+        "validation_error": validation_error,
+        "running": running,
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _preview_strm_run_once(
+    arguments: dict[str, Any], state: dict[str, Any]
+) -> ToolResult:
+    """只做运行前检查，不启动任务。"""
+    if state["selection_error"]:
         return ToolResult(
             ok=False,
             status="not_configured",
             summary="STRM 来源选择无效",
-            error=selection_error,
+            error=str(state["selection_error"]),
             suggestions=["请使用设置页中已配置且名称唯一的 STRM 来源。"],
         )
-    scheduler = get_scheduler()
-    if scheduler.validate_config(auto_only=False):
+    if state["validation_error"]:
         return ToolResult(
             ok=False,
             status="not_configured",
@@ -828,8 +774,7 @@ def preview_strm_run_once(arguments: dict[str, Any]) -> ToolResult:
             error="请先补全 STRM 来源、播放地址和输出目录。",
             suggestions=["请先检查 STRM 配置，再重新发起预检。"],
         )
-    raw = scheduler.status()
-    if bool(raw.get("running")):
+    if state["running"]:
         return ToolResult(
             ok=False,
             status="conflict",
@@ -837,62 +782,94 @@ def preview_strm_run_once(arguments: dict[str, Any]) -> ToolResult:
             error="请等待当前任务结束后再试。",
             suggestions=["可询问：查看 STRM 同步进度。"],
         )
+    selected_sources = list(state["selected_sources"])
+    scoped = bool(arguments.get("source_names"))
     return ToolResult(
         ok=True,
         status="confirmation_required",
         summary=(
             "确认后将同步选定 STRM 来源"
-            if arguments.get("source_names")
+            if scoped
             else "确认后将启动一次 STRM 全量同步"
         ),
         data={
             "action": "strm.run_once",
             "trigger": "manual",
-            **({
-                "source_count": len(selected_sources),
-                "source_names": [str(item.get("name") or "") for item in selected_sources],
-            } if arguments.get("source_names") else {}),
+            **(
+                {
+                    "source_count": len(selected_sources),
+                    "source_names": [
+                        str(item.get("name") or "") for item in selected_sources
+                    ],
+                }
+                if scoped
+                else {}
+            ),
             "effects": [
                 (
                     "仅扫描本次选定的 STRM 来源"
-                    if arguments.get("source_names")
+                    if scoped
                     else "扫描当前配置的全部 STRM 来源"
                 ),
                 "按现有规则创建、更新或清理 STRM 与伴随元数据",
                 "根据现有配置执行通知和媒体库刷新",
             ],
         },
-        evidence=[Evidence("strm_scheduler", "已完成脱敏运行前检查；尚未启动任务。", _now())],
+        evidence=[
+            Evidence(
+                "strm_scheduler",
+                "已完成脱敏运行前检查；尚未启动任务。",
+                _now(),
+            )
+        ],
         suggestions=["确认前请核对 STRM 来源、输出目录和清理规则。"],
     )
 
 
-def run_strm_once(arguments: dict[str, Any]) -> ToolResult:
-    """确认后固定以 manual 触发一次全部或指定来源 STRM 同步。"""
-    from app.modules.scheduler import get_scheduler
+def prepare_strm_run_once(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    state = _capture_strm_run(arguments)
+    return _preview_strm_run_once(arguments, state), str(state["fingerprint"])
 
-    selected_sources, selection_error = _selected_strm_sources(arguments)
-    if selection_error:
+
+def _run_strm_once_state(
+    arguments: dict[str, Any], state: dict[str, Any]
+) -> ToolResult:
+    """固定以 manual 触发一次全部或指定来源 STRM 同步。"""
+    if state["selection_error"]:
         return ToolResult(
             ok=False,
             status="not_configured",
             summary="STRM 来源选择已失效",
-            error=selection_error,
+            error=str(state["selection_error"]),
         )
-    scheduler = get_scheduler()
-    if scheduler.validate_config(auto_only=False):
+    if state["validation_error"]:
         return ToolResult(
             ok=False,
             status="not_configured",
             summary="STRM 当前无法启动",
             error="相关配置无效，请重新检查后再发起确认。",
         )
+    if state["running"]:
+        return ToolResult(
+            ok=False,
+            status="conflict",
+            summary="STRM 同步任务已在运行",
+            error="当前任务未重复提交。",
+            suggestions=["可询问：查看 STRM 同步进度。"],
+        )
+    selected_sources = list(state["selected_sources"])
+    scheduler = state["scheduler"]
+    scoped = bool(arguments.get("source_names"))
     triggered = (
         scheduler.trigger(
             "manual",
-            selected_source_ids=[str(item.get("id") or "") for item in selected_sources],
+            selected_source_ids=[
+                str(item.get("id") or "") for item in selected_sources
+            ],
         )
-        if arguments.get("source_names")
+        if scoped
         else scheduler.trigger("manual")
     )
     if not bool(triggered.get("ok")):
@@ -910,15 +887,35 @@ def run_strm_once(arguments: dict[str, Any]) -> ToolResult:
         data={
             "accepted": True,
             "trigger": "manual",
-            **({
-                "source_count": len(selected_sources),
-                "scoped": True,
-            } if arguments.get("source_names") else {}),
+            **(
+                {"source_count": len(selected_sources), "scoped": True}
+                if scoped
+                else {}
+            ),
         },
-        evidence=[Evidence("strm_scheduler", "已通过一次性确认票据提交手动同步；未返回目录或运行详情。", _now())],
+        evidence=[
+            Evidence(
+                "strm_scheduler",
+                "已通过一次性确认票据提交手动同步；未返回目录或运行详情。",
+                _now(),
+            )
+        ],
         suggestions=["可询问：查看 STRM 同步进度。"],
     )
 
+
+def run_strm_once_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    state = _capture_strm_run(arguments)
+    if not secrets.compare_digest(
+        str(state["fingerprint"]), str(expected_context or "")
+    ):
+        raise AgentToolError(
+            "STRM 配置已变化（来源或运行状态可能已更新），请重新预检",
+            code="confirmation_stale",
+        )
+    return _run_strm_once_state(arguments, state)
 
 def strm_runtime_status(_arguments: dict[str, Any]) -> ToolResult:
     """读取 STRM 调度器和可选择来源名称的脱敏运行快照。"""
@@ -1334,9 +1331,6 @@ def build_tool_registry() -> ToolRegistry:
         ),
         risk=RiskLevel.READ,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=lambda _arguments: ToolResult(
-            True, "control_available", "可取消当前会话待确认行动计划。"
-        ),
         context_handler=cancel_pending_action,
         validator=pending_action_arguments,
         llm_read=True,
@@ -1455,7 +1449,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_local_media_source_trigger_enabled,
         validator=local_media_source_trigger_arguments,
         requires_confirmation=True,
         confirmed_handler=set_local_media_source_trigger_enabled_confirmed,
@@ -1478,7 +1471,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=scan_local_media_sources,
         validator=local_media_scan_arguments,
         requires_confirmation=True,
         confirmation_preparer=prepare_scan_local_media_sources,
@@ -1514,7 +1506,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=list_local_media_task_summaries,
         validator=local_media_task_summaries_arguments,
         llm_read=True,
@@ -1530,7 +1521,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"task_number": {"type": "integer", "minimum": 1}},
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=inspect_local_media_task,
         validator=local_media_task_number_arguments,
         llm_read=True,
@@ -1545,7 +1535,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"inspection_number": {"type": "integer", "minimum": 1}},
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=preview_local_media_task,
         validator=local_media_inspection_arguments,
         llm_read=True,
@@ -1560,7 +1549,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"task_number": {"type": "integer", "minimum": 1}},
             "additionalProperties": False,
         },
-        handler=retry_local_media_task,
         validator=local_media_task_number_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_retry_local_media_task,
@@ -1577,7 +1565,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"task_number": {"type": "integer", "minimum": 1}},
             "additionalProperties": False,
         },
-        handler=refresh_local_media_task_library,
         validator=local_media_task_number_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_refresh_local_media_task_library,
@@ -1594,7 +1581,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"task_number": {"type": "integer", "minimum": 1}},
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=verify_local_media_task_library_visibility,
         validator=local_media_task_number_arguments,
         llm_read=True,
@@ -1661,7 +1647,6 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后暂停一个名称完全匹配的 qBittorrent 任务；不暴露 hash 或路径。",
         risk=RiskLevel.LOW_WRITE,
         parameters=download_task_parameters,
-        handler=pause_download_task,
         validator=download_task_arguments,
         requires_confirmation=True,
         confirmed_handler=pause_download_task_confirmed,
@@ -1673,7 +1658,6 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后恢复一个名称完全匹配的 qBittorrent 暂停任务；不暴露 hash 或路径。",
         risk=RiskLevel.LOW_WRITE,
         parameters=download_task_parameters,
-        handler=resume_download_task,
         validator=download_task_arguments,
         requires_confirmation=True,
         confirmed_handler=resume_download_task_confirmed,
@@ -1685,7 +1669,6 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后只从 qBittorrent 移除一个名称完全匹配的任务；绝不删除下载文件。",
         risk=RiskLevel.DANGER,
         parameters=download_task_parameters,
-        handler=delete_download_task,
         validator=download_task_arguments,
         requires_confirmation=True,
         confirmed_handler=delete_download_task_confirmed,
@@ -1712,7 +1695,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=retry_download_submission,
         validator=download_retry_submission_arguments,
         requires_confirmation=True,
         confirmed_handler=retry_download_submission_confirmed,
@@ -1780,7 +1762,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_rss_subscription_enabled,
         validator=rss_subscription_enabled_arguments,
         requires_confirmation=True,
         confirmed_handler=set_rss_subscription_enabled_confirmed,
@@ -1800,7 +1781,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_rss_refresh_interval,
         validator=rss_refresh_interval_arguments,
         requires_confirmation=True,
         confirmed_handler=set_rss_refresh_interval_confirmed,
@@ -1819,7 +1799,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=delete_rss_subscription,
         validator=rss_delete_subscription_arguments,
         requires_confirmation=True,
         confirmed_handler=delete_rss_subscription_confirmed,
@@ -1921,7 +1900,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_media_subscription_policy,
         validator=media_subscription_policy_update_arguments,
         requires_confirmation=True,
         confirmed_handler=set_media_subscription_policy_confirmed,
@@ -1948,7 +1926,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=create_media_subscription,
         validator=media_subscription_create_arguments,
         requires_confirmation=True,
         confirmed_handler=create_media_subscription_confirmed,
@@ -1972,7 +1949,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=delete_media_subscription,
         validator=media_subscription_delete_arguments,
         requires_confirmation=True,
         confirmed_handler=delete_media_subscription_confirmed,
@@ -1996,7 +1972,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_media_subscription_enabled,
         validator=media_subscription_enabled_arguments,
         requires_confirmation=True,
         confirmed_handler=set_media_subscription_enabled_confirmed,
@@ -2015,7 +1990,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=get_continue_watching,
         validator=continue_watching_arguments,
         llm_read=True,
@@ -2026,7 +2000,6 @@ def build_tool_registry() -> ToolRegistry:
         description="读取当前会话显式保存的媒体服务器与下载目标偏好；不从聊天摘要或模型记忆推断。",
         risk=RiskLevel.READ,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=get_preferences,
         validator=media_consumption_empty_arguments,
         llm_read=True,
@@ -2044,7 +2017,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_preferences,
         validator=preferences_update_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_set_preferences,
@@ -2057,7 +2029,6 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后清除当前会话保存的显式媒体偏好，恢复产品默认值。",
         risk=RiskLevel.LOW_WRITE,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=clear_preferences,
         validator=media_consumption_empty_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_clear_preferences,
@@ -2069,7 +2040,6 @@ def build_tool_registry() -> ToolRegistry:
         description="按本机今天的日期汇总全局管理员范围内的追更检查、整理入库、RSS 与下载内容事件；不返回路径、磁力、凭据或错误正文。",
         risk=RiskLevel.READ,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=get_today_summary,
         validator=media_consumption_empty_arguments,
         llm_read=True,
@@ -2086,7 +2056,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"subscription_number": {"type": "integer", "minimum": 1}},
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=get_subscription_notification_rule,
         validator=notification_rule_arguments,
         llm_read=True,
@@ -2108,7 +2077,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_subscription_notification_rule,
         validator=notification_rule_update_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_set_subscription_notification_rule,
@@ -2126,7 +2094,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"subscription_number": {"type": "integer", "minimum": 1}},
             "additionalProperties": False,
         },
-        handler=reset_subscription_notification_rule,
         validator=notification_rule_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_reset_subscription_notification_rule,
@@ -2187,7 +2154,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=mark_rss_entries,
         validator=rss_mark_entries_arguments,
         requires_confirmation=True,
         confirmed_handler=mark_rss_entries_confirmed,
@@ -2210,7 +2176,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=submit_rss_entries,
         validator=rss_submit_entries_arguments,
         requires_confirmation=True,
         confirmed_handler=submit_rss_entries_confirmed,
@@ -2231,12 +2196,10 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=refresh_rss_subscription,
         validator=rss_refresh_subscription_arguments,
         requires_confirmation=True,
-        preview_handler=preview_rss_subscription_refresh,
-        confirmation_context=rss_refresh_subscription_confirmation_context,
-        confirmation_state_cleaner=clear_rss_refresh_confirmation_state,
+        confirmation_preparer=prepare_rss_subscription_refresh,
+        confirmed_handler=refresh_rss_subscription_confirmed,
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2258,11 +2221,8 @@ def build_tool_registry() -> ToolRegistry:
                 },
                 "scope": {
                     "type": "string",
-                    "enum": ["all_configured", "all_enabled"],
-                    "description": (
-                        "all_configured 手动刷新全部已配置订阅（含停用项）；"
-                        "all_enabled 仅刷新启用项，保留用于兼容旧调用。"
-                    ),
+                    "enum": ["all_configured"],
+                    "description": "all_configured 手动刷新全部已配置订阅（含停用项）。",
                 },
             },
             "oneOf": [
@@ -2271,10 +2231,8 @@ def build_tool_registry() -> ToolRegistry:
             ],
             "additionalProperties": False,
         },
-        handler=refresh_rss_subscriptions,
         validator=rss_refresh_subscriptions_arguments,
         requires_confirmation=True,
-        preview_handler=preview_rss_subscriptions_refresh,
         confirmed_handler=refresh_rss_subscriptions_confirmed,
         confirmation_preparer=prepare_rss_subscriptions_refresh,
         llm_confirmation=True,
@@ -2295,12 +2253,10 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=submit_pending_rss_to_qb,
         validator=rss_pending_download_arguments,
         requires_confirmation=True,
-        preview_handler=preview_rss_pending_download,
-        confirmation_context=rss_pending_download_confirmation_context,
-        confirmation_state_cleaner=clear_rss_download_confirmation_state,
+        confirmation_preparer=prepare_rss_pending_download,
+        confirmed_handler=submit_pending_rss_to_qb_confirmed,
         llm_confirmation=True,
         llm_examples=(
             "把最近 10 条 RSS 待处理内容提交到 qB",
@@ -2323,12 +2279,10 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=retry_failed_rss_to_qb,
         validator=rss_failure_retry_arguments,
         requires_confirmation=True,
-        preview_handler=preview_rss_failure_retry,
-        confirmation_context=rss_failure_retry_confirmation_context,
-        confirmation_state_cleaner=clear_rss_retry_confirmation_state,
+        confirmation_preparer=prepare_rss_failure_retry,
+        confirmed_handler=retry_failed_rss_to_qb_confirmed,
         llm_confirmation=True,
         llm_examples=(
             "重试 RSS 失败条目",
@@ -2419,7 +2373,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_media_proxy_instance_enabled,
         validator=media_proxy_enabled_arguments,
         requires_confirmation=True,
         confirmation_preparer=prepare_set_media_proxy_instance_enabled,
@@ -2438,7 +2391,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=restart_media_proxy_instance,
         validator=media_proxy_restart_arguments,
         requires_confirmation=True,
         confirmation_preparer=prepare_restart_media_proxy_instance,
@@ -2470,7 +2422,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_recognition_rule_enabled,
         validator=recognition_rule_enabled_arguments,
         requires_confirmation=True,
         confirmation_preparer=prepare_set_recognition_rule_enabled,
@@ -2509,11 +2460,9 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_indexer_sites,
         validator=indexer_sites_arguments,
         requires_confirmation=True,
-        preview_handler=preview_set_indexer_sites,
-        confirmation_context=indexer_sites_confirmation_context,
+        confirmation_preparer=prepare_indexer_sites_confirmation,
         confirmed_handler=set_indexer_sites_confirmed,
         post_write_verifier=verify_indexer_sites_write,
         llm_confirmation=True,
@@ -2523,11 +2472,8 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后向当前已配置会话发送一条固定 Telegram 连接测试消息；不接受消息、凭据或会话参数。",
         risk=RiskLevel.LOW_WRITE,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=send_telegram_test_notification,
         validator=telegram_test_arguments,
         requires_confirmation=True,
-        preview_handler=preview_telegram_test_notification,
-        confirmation_context=telegram_test_confirmation_context,
         confirmed_handler=send_telegram_test_notification_confirmed,
         confirmation_preparer=prepare_telegram_test_notification,
         llm_confirmation=True,
@@ -2560,11 +2506,8 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_safe_policy,
         validator=safe_policy_arguments,
         requires_confirmation=True,
-        preview_handler=preview_set_safe_policy,
-        confirmation_context=safe_policy_confirmation_context,
         confirmed_handler=set_safe_policy_confirmed,
         confirmation_preparer=prepare_safe_policy_confirmation,
         llm_confirmation=True,
@@ -2589,12 +2532,10 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_feature_state,
         validator=feature_state_arguments,
         requires_confirmation=True,
-        preview_handler=preview_set_feature_state,
-        confirmation_context=feature_state_confirmation_context,
-        confirmation_state_cleaner=clear_feature_confirmation_state,
+        confirmation_preparer=prepare_feature_state_confirmation,
+        confirmed_handler=set_feature_state_confirmed,
         post_write_verifier=verify_feature_state_write,
         llm_confirmation=True,
     ))
@@ -2660,12 +2601,10 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=retry_strm_failure_records,
         validator=strm_failure_retry_arguments,
         requires_confirmation=True,
-        preview_handler=preview_strm_failure_retry,
-        confirmation_context=strm_failure_retry_confirmation_context,
-        confirmation_state_cleaner=clear_strm_retry_confirmation_state,
+        confirmation_preparer=prepare_strm_failure_retry,
+        confirmed_handler=retry_strm_failure_records_confirmed,
         llm_confirmation=True,
         llm_examples=(
             "重试 STRM 失败项",
@@ -2692,11 +2631,10 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=run_strm_once,
         validator=strm_run_arguments,
         requires_confirmation=True,
-        preview_handler=preview_strm_run_once,
-        confirmation_context=_strm_confirmation_context,
+        confirmation_preparer=prepare_strm_run_once,
+        confirmed_handler=run_strm_once_confirmed,
         llm_confirmation=True,
         llm_domains=("strm",),
         llm_source_kind="system_state",
@@ -2749,11 +2687,8 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_strm_schedule_policy,
         validator=strm_schedule_policy_arguments,
         requires_confirmation=True,
-        preview_handler=preview_set_strm_schedule_policy,
-        confirmation_context=strm_schedule_policy_confirmation_context,
         confirmed_handler=set_strm_schedule_policy_confirmed,
         confirmation_preparer=prepare_strm_schedule_policy_confirmation,
         llm_confirmation=True,
@@ -2792,11 +2727,8 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_guangya_organize_schedule_policy,
         validator=guangya_organize_schedule_policy_arguments,
         requires_confirmation=True,
-        preview_handler=preview_set_guangya_organize_schedule_policy,
-        confirmation_context=guangya_organize_schedule_policy_confirmation_context,
         confirmed_handler=set_guangya_organize_schedule_policy_confirmed,
         confirmation_preparer=prepare_guangya_organize_schedule_policy_confirmation,
         llm_confirmation=True,
@@ -2815,7 +2747,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda arguments: guangya_organize_status(arguments, ToolContext()),
         context_handler=guangya_organize_status,
         validator=guangya_organize_status_arguments,
         llm_read=True,
@@ -2867,7 +2798,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=preview_guangya_cleanup,
         validator=guangya_cleanup_preview_arguments,
         llm_read=True,
@@ -2917,7 +2847,6 @@ def build_tool_registry() -> ToolRegistry:
             "required": ["decisions"],
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=classify_guangya_cleanup_candidates,
         validator=guangya_cleanup_classify_arguments,
         llm_read=True,
@@ -2941,7 +2870,6 @@ def build_tool_registry() -> ToolRegistry:
         ),
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=execute_guangya_cleanup,
         validator=guangya_cleanup_execute_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_guangya_cleanup_confirmation,
@@ -2978,7 +2906,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=inspect_guangya_directory,
         validator=guangya_directory_inspect_arguments,
         llm_read=True,
@@ -3027,7 +2954,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=preview_guangya_change_plan,
         validator=guangya_change_plan_preview_arguments,
         llm_read=True,
@@ -3049,7 +2975,6 @@ def build_tool_registry() -> ToolRegistry:
         ),
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=execute_guangya_change_plan,
         validator=guangya_rename_execute_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_guangya_change_plan_confirmation,
@@ -3083,7 +3008,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=preview_guangya_media_hygiene,
         validator=guangya_media_hygiene_preview_arguments,
         llm_read=True,
@@ -3106,7 +3030,6 @@ def build_tool_registry() -> ToolRegistry:
         ),
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=execute_guangya_media_hygiene,
         validator=guangya_rename_execute_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_guangya_media_hygiene_confirmation,
@@ -3150,7 +3073,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=preview_guangya_rename,
         validator=guangya_rename_preview_arguments,
         llm_read=True,
@@ -3173,7 +3095,6 @@ def build_tool_registry() -> ToolRegistry:
         ),
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=execute_guangya_rename,
         validator=guangya_rename_execute_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_guangya_rename_confirmation,
@@ -3209,7 +3130,6 @@ def build_tool_registry() -> ToolRegistry:
             ],
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=inspect_directory_scrape,
         validator=directory_scrape_inspect_arguments,
         llm_read=True,
@@ -3235,7 +3155,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=search_directory_scrape,
         validator=directory_scrape_search_arguments,
         llm_read=True,
@@ -3261,7 +3180,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=preview_directory_scrape,
         validator=directory_scrape_preview_arguments,
         llm_read=True,
@@ -3275,7 +3193,6 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后把当前会话最近的光鸭刮削预览提交到现有整理互斥队列；执行前会重新核对内容与计划。",
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=run_directory_scrape,
         validator=directory_scrape_run_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_run_directory_scrape,
@@ -3302,11 +3219,8 @@ def build_tool_registry() -> ToolRegistry:
         description="预览并在用户确认后按当前配置启动一次光鸭网盘整理，不接受执行参数。",
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=run_guangya_organize_once,
         validator=_no_arguments,
         requires_confirmation=True,
-        preview_handler=preview_guangya_organize_run_once,
-        confirmation_context=organize_confirmation_context,
         confirmed_handler=run_guangya_organize_once_confirmed,
         confirmation_preparer=prepare_guangya_organize_run_once,
         llm_confirmation=True,
@@ -3320,11 +3234,8 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后协作式停止当前光鸭整理任务；已完成的云盘操作不会回滚。",
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=stop_guangya_organize,
         validator=_no_arguments,
         requires_confirmation=True,
-        preview_handler=preview_guangya_organize_stop,
-        confirmation_context=organize_stop_confirmation_context,
         confirmed_handler=stop_guangya_organize_confirmed,
         confirmation_preparer=prepare_guangya_organize_stop,
         llm_confirmation=True,
@@ -3338,11 +3249,8 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后清理全部已配置光鸭整理来源中的空子目录。",
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=clean_empty_guangya_organize_sources,
         validator=_no_arguments,
         requires_confirmation=True,
-        preview_handler=preview_guangya_organize_clean_empty,
-        confirmation_context=organize_clean_empty_confirmation_context,
         confirmed_handler=clean_empty_guangya_organize_sources_confirmed,
         confirmation_preparer=prepare_guangya_organize_clean_empty,
         llm_confirmation=True,
@@ -3477,7 +3385,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=get_discovery_detail,
         validator=discovery_detail_arguments,
         llm_read=True,
@@ -3497,7 +3404,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda _arguments: ToolResult(False, "unavailable", "缺少会话上下文"),
         context_handler=get_discovery_mapping_candidates,
         validator=discovery_mapping_candidates_arguments,
         llm_read=True,
@@ -3513,7 +3419,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"candidate_number": {"type": "integer", "minimum": 1, "maximum": 5}},
             "additionalProperties": False,
         },
-        handler=confirm_discovery_mapping,
         validator=discovery_confirm_mapping_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_confirm_discovery_mapping,
@@ -3559,7 +3464,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=add_watchlist,
         validator=add_watchlist_arguments,
         requires_confirmation=True,
         confirmed_handler=add_watchlist_confirmed,
@@ -3576,7 +3480,6 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {"watchlist_number": {"type": "integer", "minimum": 1}},
             "additionalProperties": False,
         },
-        handler=remove_watchlist,
         validator=remove_watchlist_arguments,
         requires_confirmation=True,
         confirmed_handler=remove_watchlist_confirmed,
@@ -3719,11 +3622,10 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=submit_resource,
         validator=indexer_submit_arguments,
         requires_confirmation=True,
-        preview_handler=preview_submit_resource,
-        confirmation_context=submit_confirmation_context,
+        confirmation_preparer=prepare_submit_resource,
+        confirmed_handler=submit_resource_confirmed,
     ))
     registry.register(ToolSpec(
         name="indexer.submit_resource_batch",
@@ -3743,11 +3645,10 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=submit_resource_batch,
         validator=indexer_submit_batch_arguments,
         requires_confirmation=True,
-        preview_handler=preview_submit_resource_batch,
-        confirmation_context=submit_batch_confirmation_context,
+        confirmation_preparer=prepare_submit_resource_batch,
+        confirmed_handler=submit_resource_batch_confirmed,
     ))
     registry.register(ToolSpec(
         name="workspace.briefing",
@@ -3937,7 +3838,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda arguments: list_missing_workflows(arguments, ToolContext()),
         validator=missing_workflow_arguments,
         context_handler=list_missing_workflows,
         llm_read=True,
@@ -3988,7 +3888,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=refresh_media_library,
         validator=media_library_refresh_arguments,
         requires_confirmation=True,
         confirmation_preparer=prepare_refresh_media_library,
@@ -4033,7 +3932,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=start_episode_audit,
         validator=start_episode_audit_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_start_episode_audit,
@@ -4053,7 +3951,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda arguments: get_agent_job_status(arguments, ToolContext()),
         validator=agent_job_status_arguments,
         context_handler=get_agent_job_status,
         llm_read=True,
@@ -4071,7 +3968,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=cancel_agent_job,
         validator=cancel_agent_job_arguments,
         requires_confirmation=True,
         context_confirmation_preparer=prepare_cancel_agent_job,
@@ -4116,11 +4012,8 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=set_patrol_policy,
         validator=patrol_policy_arguments,
         requires_confirmation=True,
-        preview_handler=preview_set_patrol_policy,
-        confirmation_context=patrol_policy_confirmation_context,
         confirmed_handler=set_patrol_policy_confirmed,
         confirmation_preparer=prepare_patrol_policy_confirmation,
         llm_confirmation=True,
@@ -4131,7 +4024,6 @@ def build_tool_registry() -> ToolRegistry:
         description="预检并在用户确认后，按当前全库缺集巡检策略把单例后台任务排到现在；不修改策略、不搜索资源、不下载。",
         risk=RiskLevel.LOW_WRITE,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=trigger_patrol_now,
         validator=patrol_trigger_arguments,
         requires_confirmation=True,
         confirmed_handler=trigger_patrol_now_confirmed,
@@ -4215,7 +4107,6 @@ def build_tool_registry() -> ToolRegistry:
             },
             "additionalProperties": False,
         },
-        handler=lambda arguments: list_action_history(arguments, ToolContext()),
         validator=action_history_arguments,
         context_handler=list_action_history,
         llm_read=True,

@@ -12,10 +12,8 @@ from fastapi.testclient import TestClient
 
 from app import config
 from app.agent.feature_actions import (
-    _CONFIRMATION_STATE,
     feature_state_arguments,
-    feature_state_confirmation_context,
-    preview_set_feature_state,
+    prepare_feature_state_confirmation,
 )
 from app.agent.models import RiskLevel
 from app.agent.orchestrator import (
@@ -32,9 +30,6 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class FeatureStateUnitTests(unittest.TestCase):
-    def tearDown(self):
-        _CONFIRMATION_STATE.pending = None
-
     def test_arguments_are_strict_aliases_and_boolean_only(self):
         self.assertEqual(
             feature_state_arguments({"feature": "discovery", "enabled": False}),
@@ -151,7 +146,7 @@ class FeatureStateUnitTests(unittest.TestCase):
                 conversation_context=context,
             )
         self.assertEqual(response["mode"], "confirmation_required")
-        self.assertEqual(response["confirmation"]["tool"], "config.set_feature_state")
+        self.assertEqual(response["tool_call"]["name"], "config.set_feature_state")
         self.assertEqual(response["result"]["data"]["feature"], "indexer_search")
 
         correction_context = [
@@ -172,7 +167,7 @@ class FeatureStateUnitTests(unittest.TestCase):
                 conversation_context=correction_context,
             )
         self.assertEqual(corrected["mode"], "confirmation_required")
-        self.assertEqual(corrected["confirmation"]["tool"], "config.set_feature_state")
+        self.assertEqual(corrected["tool_call"]["name"], "config.set_feature_state")
         self.assertTrue(corrected["result"]["data"]["requested_enabled"])
 
         for unsafe_correction in ("别关", "不要关闭", "说反了，还是打开吗？"):
@@ -260,17 +255,17 @@ class FeatureStateUnitTests(unittest.TestCase):
             ), patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()), patch.dict(
                 os.environ, {"DISCOVERY_ENABLED": ""}, clear=False
             ), patch("app.agent.feature_actions.config.update_runtime_env_file") as writer:
-                result = preview_set_feature_state(
+                result, first = prepare_feature_state_confirmation(
                     {"feature": "discovery", "enabled": False}
                 )
-                first = feature_state_confirmation_context(
-                    {"feature": "discovery", "enabled": False}
-                )
-                second = feature_state_confirmation_context(
+                first_preview = result
+                second_preview, second = prepare_feature_state_confirmation(
                     {"feature": "discovery", "enabled": False}
                 )
 
             self.assertTrue(result.ok)
+            self.assertTrue(first_preview.ok)
+            self.assertTrue(second_preview.ok)
             self.assertEqual(result.status, "confirmation_required")
             self.assertEqual(first, second)
             self.assertRegex(first, r"^[0-9a-f]{64}$")
@@ -284,7 +279,6 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
     def setUp(self):
         reset_agent_service_for_tests()
         agent_rate_limiter.reset()
-        _CONFIRMATION_STATE.pending = None
         self.temp = tempfile.TemporaryDirectory()
         self.env_file = Path(self.temp.name) / "user.env"
         self.feature_keys = {
@@ -345,7 +339,6 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
             if value is not None:
                 os.environ[key] = value
         self.temp.cleanup()
-        _CONFIRMATION_STATE.pending = None
         reset_agent_service_for_tests()
         agent_rate_limiter.reset()
 
@@ -382,7 +375,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
         confirmed = self.client.post(
             "/api/agent/actions/confirm",
             headers={"X-CSRF-Token": csrf},
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": prepared["confirmation"]["confirmation_id"]},
+            json={"session_id": "test_session_identifier_0001", "plan_id": prepared["action_plan"]["plan_id"]},
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         return prepared["result"], confirmed.json()["result"]
@@ -401,9 +394,9 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(prepared.status_code, 200, prepared.text)
             body = prepared.json()
             self.assertEqual(body["mode"], "confirmation_required")
-            self.assertEqual(body["confirmation"]["tool"], "config.set_feature_state")
-            self.assertEqual(body["confirmation"]["risk"], "low_write")
-            confirmation_id = body["confirmation"]["confirmation_id"]
+            self.assertEqual(body["tool_call"]["name"], "config.set_feature_state")
+            self.assertEqual(body["action_plan"]["risk"], "low_write")
+            confirmation_id = body["action_plan"]["plan_id"]
             self.assertEqual(config._read_env_file(self.env_file)["DISCOVERY_ENABLED"], "1")
 
             direct = self.client.post(
@@ -416,7 +409,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 200, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "completed")
@@ -437,7 +430,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
 
@@ -530,7 +523,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
             )
 
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
@@ -592,7 +585,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
         config.write_env_file(self.env_file, values, replace=True)
         config._cache = None
 
-        enabled = preview_set_feature_state(
+        enabled, _context = prepare_feature_state_confirmation(
             {"feature": "resource_results", "enabled": True}
         )
         self.assertTrue(enabled.ok)
@@ -602,7 +595,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
         values["DISCOVERY_RESOURCE_RESULTS_ENABLED"] = "1"
         config.write_env_file(self.env_file, values, replace=True)
         config._cache = None
-        disabled = preview_set_feature_state(
+        disabled, _context = prepare_feature_state_confirmation(
             {"feature": "resource_results", "enabled": False}
         )
         self.assertTrue(any("不会取消已经发出的外部请求" in item for item in disabled.suggestions))
@@ -623,7 +616,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
                     json={"session_id": "test_session_identifier_0001", "arguments": {"feature": "discovery", "enabled": False}},
                 )
                 self.assertEqual(prepared.status_code, 200, prepared.text)
-                confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+                confirmation_id = prepared.json()["action_plan"]["plan_id"]
                 with patch(
                     "app.agent.feature_actions.config.update_runtime_env_file",
                     side_effect=error,
@@ -635,7 +628,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
                     confirmed = self.client.post(
                         "/api/agent/actions/confirm",
                         headers=headers,
-                        json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                        json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
                     )
 
                 self.assertEqual(confirmed.status_code, expected_status, confirmed.text)
@@ -695,14 +688,14 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
             json={"session_id": "test_session_identifier_0001", "arguments": {"feature": "douban", "enabled": False}},
         )
         self.assertEqual(prepared.status_code, 200, prepared.text)
-        confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+        confirmation_id = prepared.json()["action_plan"]["plan_id"]
         values = config._read_env_file(self.env_file)
         values["UNRELATED_SETTING"] = "changed"
         config.write_env_file(self.env_file, values, replace=True)
         stale = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+            json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
         )
         self.assertEqual(stale.status_code, 409, stale.text)
         self.assertIn("配置已变化", stale.text)
@@ -712,7 +705,7 @@ class FeatureStateAPITests(IsolatedDatabaseTestCase):
         self.login()
         response = self.client.post(
             "/api/agent/actions/confirm",
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": "x" * 24},
+            json={"session_id": "test_session_identifier_0001", "plan_id": "x" * 24},
         )
         self.assertEqual(response.status_code, 403)
 

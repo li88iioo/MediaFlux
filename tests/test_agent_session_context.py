@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 
 from app import database as db
 from app.agent.models import ToolResult
+from app.agent.orchestrator import AgentOrchestrator
+from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.owner_routes import web_agent_owner
 from app.agent.recent_discovery_candidates import RecentDiscoveryCandidateStore
 from app.agent.recent_download_submissions import RecentDownloadSubmissionStore
@@ -1106,6 +1108,27 @@ class AgentServiceSessionContextTests(IsolatedDatabaseTestCase):
         reset_agent_service_for_tests()
         with db.get_conn() as conn:
             conn.execute("DELETE FROM agent_session_context")
+
+    def test_reset_requires_generation_aware_repository_contract(self):
+        class LegacyDeleteOnlyRepository:
+            def __init__(self) -> None:
+                self.delete_calls = 0
+
+            def delete_owner(self, *, owner: str) -> int:
+                del owner
+                self.delete_calls += 1
+                return 1
+
+        repository = LegacyDeleteOnlyRepository()
+        service = AgentOrchestrator(
+            ToolRegistry(),
+            session_context_repository=repository,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaises(AgentToolError):
+            service.reset_session(owner="legacy-session-owner")
+
+        self.assertEqual(repository.delete_calls, 0)
 
     def test_service_singleton_recreation_restores_restart_safe_context(self):
         owner = "stable-session-owner"

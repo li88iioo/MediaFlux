@@ -26,12 +26,12 @@ class AgentActionPlanTests(unittest.TestCase):
 
     def test_builds_stable_execute_cancel_plan_without_tool_or_arguments(self):
         plan = build_action_plan(
-            plan_id="plan-safe-token",
+            plan_id="plan-safe-token-1234",
             confirmation_contract=self._contract(),
             expires_in=120,
         )
         self.assertEqual(plan["version"], ACTION_PLAN_VERSION)
-        self.assertEqual(plan["plan_id"], "plan-safe-token")
+        self.assertEqual(plan["plan_id"], "plan-safe-token-1234")
         self.assertEqual(plan["status"], "awaiting_approval")
         self.assertEqual(plan["risk"], "danger")
         self.assertEqual(
@@ -44,6 +44,31 @@ class AgentActionPlanTests(unittest.TestCase):
     def test_sanitizer_rejects_invalid_or_tampered_plan(self):
         self.assertEqual(sanitize_action_plan({}), {})
         self.assertEqual(
+            build_action_plan(
+                plan_id="short",
+                confirmation_contract=self._contract(),
+                expires_in=60,
+            ),
+            {},
+        )
+        self.assertEqual(
+            build_action_plan(
+                plan_id="plan id with spaces",
+                confirmation_contract=self._contract(),
+                expires_in=60,
+            ),
+            {},
+        )
+        self.assertEqual(
+            build_action_plan(
+                plan_id="plan-invalid-status-1234",
+                confirmation_contract=self._contract(),
+                expires_in=60,
+                status="typo",
+            ),
+            {},
+        )
+        self.assertEqual(
             sanitize_action_plan({
                 "version": ACTION_PLAN_VERSION,
                 "plan_id": "x",
@@ -52,6 +77,19 @@ class AgentActionPlanTests(unittest.TestCase):
             }),
             {},
         )
+
+    def test_sanitizer_rejects_missing_or_invalid_preflight_time(self):
+        plan = build_action_plan(
+            plan_id="plan-safe-token-1234",
+            confirmation_contract=self._contract(),
+            expires_in=60,
+        )
+        self.assertTrue(plan)
+        for value in (None, "", "not-a-time", "2026-08-31T12:00:00", True):
+            with self.subTest(preflight_at=value):
+                tampered = dict(plan)
+                tampered["preflight_at"] = value
+                self.assertEqual(sanitize_action_plan(tampered), {})
 
     def test_terminal_plan_does_not_advertise_replay_decisions(self):
         for status in ("completed", "failed", "cancelled", "expired"):
@@ -71,12 +109,36 @@ class AgentActionPlanTests(unittest.TestCase):
             "status": "awaiting_approval",
             "risk": "write",
         }), {})
-        plan = build_action_plan(
-            plan_id="plan-safe-token",
-            confirmation_contract=self._contract(),
-            expires_in=float("inf"),
-        )
-        self.assertNotIn("expires_in", plan)
+        self.assertEqual(sanitize_action_plan({
+            "version": True,
+            "plan_id": "plan-safe-token-1234",
+            "status": "awaiting_approval",
+            "risk": "write",
+        }), {})
+        for version in ("1", 1.0):
+            with self.subTest(version=version):
+                self.assertEqual(sanitize_action_plan({
+                    "version": version,
+                    "plan_id": "plan-safe-token-1234",
+                    "status": "awaiting_approval",
+                    "risk": "write",
+                }), {})
+        for expires_in in (float("inf"), True, "60", 60.0):
+            with self.subTest(expires_in=expires_in):
+                plan = build_action_plan(
+                    plan_id="plan-safe-token-1234",
+                    confirmation_contract=self._contract(),
+                    expires_in=expires_in,
+                )
+                self.assertNotIn("expires_in", plan)
+
+                valid = build_action_plan(
+                    plan_id="plan-safe-token-1234",
+                    confirmation_contract=self._contract(),
+                    expires_in=60,
+                )
+                valid["expires_in"] = expires_in
+                self.assertNotIn("expires_in", sanitize_action_plan(valid))
 
     def test_model_context_excludes_execution_token(self):
         plan = build_action_plan(
@@ -103,10 +165,15 @@ class AgentActionPlanTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             validator=lambda _arguments: {},
-            preview_handler=lambda _arguments: ToolResult(
-                True, "confirmation_required", "预检通过：将执行测试操作"
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(
+                    True,
+                    "confirmation_required",
+                    "预检通过：将执行测试操作",
+                ),
+                "write-demo",
             ),
-            handler=lambda _arguments: ToolResult(
+            confirmed_handler=lambda _arguments, _expected_context: ToolResult(
                 True, "accepted", "测试操作已执行"
             ),
             requires_confirmation=True,
@@ -126,7 +193,7 @@ class AgentActionPlanTests(unittest.TestCase):
 
         prepared = service.prepare("write.demo", {}, owner="owner-a")
         plan = prepared["action_plan"]
-        self.assertEqual(plan["plan_id"], prepared["confirmation"]["confirmation_id"])
+        self.assertNotIn("confirmation", prepared)
         self.assertEqual(plan["status"], "awaiting_approval")
         self.assertEqual([item["label"] for item in plan["decisions"]], ["执行", "取消"])
         self.assertNotIn("write.demo", str(plan))
@@ -137,14 +204,13 @@ class AgentActionPlanTests(unittest.TestCase):
         self.assertEqual(completed["action_plan"]["plan_id"], plan["plan_id"])
 
         prepared_again = service.prepare("write.demo", {}, owner="owner-a")
-        cancelled = service.resolve_confirmation_reply("取消", owner="owner-a")
-        self.assertIsNotNone(cancelled)
-        self.assertEqual(cancelled["mode"], "cancelled_action")
-        self.assertEqual(cancelled["action_plan"]["status"], "cancelled")
-        self.assertEqual(
-            cancelled["action_plan"]["plan_id"],
-            prepared_again["action_plan"]["plan_id"],
+        discarded_plan_id = prepared_again["action_plan"]["plan_id"]
+        self.assertTrue(
+            service.discard_confirmation(discarded_plan_id, owner="owner-a")
         )
+        with self.assertRaises(AgentToolError) as stale:
+            service.confirm(discarded_plan_id, owner="owner-a")
+        self.assertEqual(stale.exception.code, "confirmation_invalid")
 
     def test_failed_confirmed_action_has_failed_terminal_plan(self):
         registry = ToolRegistry()
@@ -154,10 +220,11 @@ class AgentActionPlanTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             validator=lambda _arguments: {},
-            preview_handler=lambda _arguments: ToolResult(
-                True, "confirmation_required", "预检通过"
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "confirmation_required", "预检通过"),
+                "write-failed",
             ),
-            handler=lambda _arguments: ToolResult(
+            confirmed_handler=lambda _arguments, _expected_context: ToolResult(
                 False, "conflict", "测试操作未执行"
             ),
             requires_confirmation=True,
@@ -188,11 +255,12 @@ class AgentActionPlanTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={"type": "object", "additionalProperties": False},
             validator=lambda _arguments: {},
-            preview_handler=lambda _arguments: ToolResult(
-                True, "confirmation_required", "预检通过"
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "confirmation_required", "预检通过"),
+                "write-demo",
             ),
-            handler=lambda _arguments: calls.append("executed") or ToolResult(
-                True, "accepted", "done"
+            confirmed_handler=lambda _arguments, _expected_context: (
+                calls.append("executed") or ToolResult(True, "accepted", "done")
             ),
             requires_confirmation=True,
             llm_confirmation=True,

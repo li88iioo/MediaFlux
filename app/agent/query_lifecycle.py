@@ -1,22 +1,53 @@
-"""跨入口共享的 Agent 查询生命周期小工具。"""
+"""跨入口共享的 Agent 查询确认生命周期契约。"""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
+
+from app.agent.registry import AgentToolError
 
 
-def begin_query_confirmation_epoch(service: Any, *, owner: str) -> int | None:
-    """开始新查询并返回确认世代；旧实现或异常返回值安全降级为 ``None``。"""
-    begin = getattr(service, "begin_query_confirmation_epoch", None)
-    if not callable(begin):
-        return None
-    generation = begin(owner=owner)
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
-        return None
-    return generation
+class QueryConfirmationLifecycle(Protocol):
+    """所有 Agent 查询入口必须实现的确认世代能力。"""
+
+    def begin_query_confirmation_epoch(self, *, owner: str) -> int: ...
+
+    def invalidate_query_confirmation_epoch(self, *, owner: str) -> int: ...
 
 
-def invalidate_query_confirmation_epoch(service: Any, *, owner: str) -> None:
-    """使 owner 现有确认失效；兼容尚未实现该能力的服务。"""
-    invalidate = getattr(service, "invalidate_query_confirmation_epoch", None)
-    if callable(invalidate):
-        invalidate(owner=owner)
+def _lifecycle_method(service: Any, name: str):
+    method = getattr(service, name, None)
+    if not callable(method):
+        raise AgentToolError(
+            "确认生命周期暂不可用，请稍后重试",
+            code="confirmation_unavailable",
+        )
+    return method
+
+
+def _lifecycle_integer(value: Any, *, minimum: int) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+    ):
+        raise AgentToolError(
+            "确认生命周期返回了无效状态，请稍后重试",
+            code="confirmation_unavailable",
+        )
+    return value
+
+
+def begin_query_confirmation_epoch(
+    service: QueryConfirmationLifecycle, *, owner: str
+) -> int:
+    """开始新查询并返回确认世代；缺失能力时显式拒绝而非绕过。"""
+    begin = _lifecycle_method(service, "begin_query_confirmation_epoch")
+    return _lifecycle_integer(begin(owner=owner), minimum=1)
+
+
+def invalidate_query_confirmation_epoch(
+    service: QueryConfirmationLifecycle, *, owner: str
+) -> int:
+    """使 owner 现有确认失效；缺失能力时显式拒绝而非静默跳过。"""
+    invalidate = _lifecycle_method(service, "invalidate_query_confirmation_epoch")
+    return _lifecycle_integer(invalidate(owner=owner), minimum=0)

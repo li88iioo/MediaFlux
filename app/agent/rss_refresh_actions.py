@@ -6,7 +6,6 @@ from datetime import datetime
 import hashlib
 import json
 import secrets
-import threading
 from typing import Any
 
 from app import database as db
@@ -16,12 +15,6 @@ from app.logger import get_logger
 from app.modules.rss import rss_subscription_refresh_revision
 
 logger = get_logger(__name__)
-_CONFIRMATION_STATE = threading.local()
-
-
-def clear_confirmation_state() -> None:
-    _CONFIRMATION_STATE.preview = None
-    _CONFIRMATION_STATE.pending = None
 _BULK_EXPLICIT_LIMIT = 32
 _BULK_SCOPE_LIMIT = 32
 _BULK_DISPLAY_LIMIT = 100
@@ -72,10 +65,10 @@ def _capture(arguments: dict[str, int]) -> dict[str, Any]:
     return _capture_row(subscription_id, db.get_rss_subscription(subscription_id))
 
 
-def preview_rss_subscription_refresh(arguments: dict[str, int]) -> ToolResult:
+def _preview_rss_subscription_refresh(
+    arguments: dict[str, int], state: dict[str, Any]
+) -> ToolResult:
     """只读确认订阅存在且可刷新；不访问订阅源。"""
-    _CONFIRMATION_STATE.preview = None
-    state = _capture(arguments)
     if not state["exists"]:
         return ToolResult(
             ok=False,
@@ -91,7 +84,6 @@ def preview_rss_subscription_refresh(arguments: dict[str, int]) -> ToolResult:
             error="请先在 RSS 订阅页补充订阅地址。",
         )
 
-    _CONFIRMATION_STATE.preview = state
     return ToolResult(
         ok=True,
         status="confirmation_required",
@@ -105,45 +97,43 @@ def preview_rss_subscription_refresh(arguments: dict[str, int]) -> ToolResult:
                 "不会自动提交下载任务。",
             ],
         },
-        evidence=[Evidence(
-            "rss_database",
-            "仅核对本地订阅配置；未访问订阅源、未写入条目、未触发下载。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_database",
+                "仅核对本地订阅配置；未访问订阅源、未写入条目、未触发下载。",
+                _now(),
+            )
+        ],
         suggestions=["确认前请核对订阅 ID；确认后仅执行一次刷新。"],
     )
 
 
-def rss_refresh_subscription_confirmation_context(arguments: dict[str, int]) -> str:
-    state = getattr(_CONFIRMATION_STATE, "preview", None)
-    _CONFIRMATION_STATE.preview = None
-    if not isinstance(state, dict) or state.get("subscription_id") != arguments["subscription_id"]:
-        state = _capture(arguments)
-    _CONFIRMATION_STATE.pending = state
-    return str(state["revision"])
+def prepare_rss_subscription_refresh(
+    arguments: dict[str, int],
+) -> tuple[ToolResult, str]:
+    state = _capture(arguments)
+    return _preview_rss_subscription_refresh(arguments, state), str(state["revision"])
 
 
-def refresh_rss_subscription(arguments: dict[str, int]) -> ToolResult:
-    state = getattr(_CONFIRMATION_STATE, "pending", None)
-    _CONFIRMATION_STATE.pending = None
-    subscription_id = arguments["subscription_id"]
+def _refresh_rss_subscription_state(state: dict[str, Any]) -> ToolResult:
+    subscription_id = int(state["subscription_id"])
     if (
-        not isinstance(state, dict)
-        or state.get("subscription_id") != subscription_id
-        or not state.get("exists")
+        not state.get("exists")
         or not state.get("has_urls")
         or not state.get("revision")
     ):
         return ToolResult(
             ok=False,
             status="conflict",
-            summary="RSS 刷新确认上下文已失效",
+            summary="RSS 刷新条件已变化",
             error="请重新预检后再确认。",
         )
 
     from app.modules.rss import RSSEngine
 
-    raw = RSSEngine().refresh(subscription_id, expected_revision=str(state["revision"]))
+    raw = RSSEngine().refresh(
+        subscription_id, expected_revision=str(state["revision"])
+    )
     if raw.get("busy"):
         return ToolResult(
             ok=False,
@@ -195,32 +185,43 @@ def refresh_rss_subscription(arguments: dict[str, int]) -> ToolResult:
         summary=(
             f"RSS 订阅刷新部分完成：拉取 {total}，新增 {new}，排除 {skipped}，"
             f"暂不可用源 {failed_sources}"
-            if partial else
-            f"RSS 订阅刷新完成：拉取 {total}，新增 {new}，排除 {skipped}"
+            if partial
+            else f"RSS 订阅刷新完成：拉取 {total}，新增 {new}，排除 {skipped}"
         ),
         data=data,
-        evidence=[Evidence(
-            "rss_refresh",
-            "已按确认时绑定的订阅配置执行一次刷新；响应仅包含聚合计数。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_refresh",
+                "已按确认时绑定的订阅配置执行一次刷新；响应仅包含聚合计数。",
+                _now(),
+            )
+        ],
         suggestions=(
-            ["其余订阅源已处理；请稍后核对暂不可用源。"]
-            if partial else []
+            ["其余订阅源已处理；请稍后核对暂不可用源。"] if partial else []
         ),
     )
+
+
+def refresh_rss_subscription_confirmed(
+    arguments: dict[str, int], expected_context: str
+) -> ToolResult:
+    state = _capture(arguments)
+    if not secrets.compare_digest(
+        str(state["revision"]), str(expected_context or "")
+    ):
+        raise AgentToolError("RSS 订阅配置已变化，请重新预检", code="confirmation_stale")
+    return _refresh_rss_subscription_state(state)
 
 def rss_refresh_subscriptions_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) == {"scope"}:
-        scope = arguments.get("scope")
-        if scope not in {"all_configured", "all_enabled"}:
-            raise AgentToolError("scope 只支持 all_configured 或 all_enabled")
-        return {"scope": str(scope)}
+        if arguments.get("scope") != "all_configured":
+            raise AgentToolError("scope 只支持 all_configured")
+        return {"scope": "all_configured"}
     if set(arguments) != {"subscription_ids"}:
         raise AgentToolError(
-            "rss.refresh_subscriptions 只接受 subscription_ids、all_configured 或 all_enabled scope"
+            "rss.refresh_subscriptions 只接受 subscription_ids 或 all_configured scope"
         )
     raw_ids = arguments.get("subscription_ids")
     if not isinstance(raw_ids, list) or not raw_ids:
@@ -244,14 +245,12 @@ def rss_refresh_subscriptions_arguments(arguments: dict[str, Any]) -> dict[str, 
 
 def _capture_many(arguments: dict[str, Any]) -> dict[str, Any]:
     requested_scope = arguments.get("scope")
-    if requested_scope in {"all_configured", "all_enabled"}:
-        rows = (
-            db.list_rss_subscriptions()
-            if requested_scope == "all_configured"
-            else db.list_enabled_rss_subscriptions()
-        )
-        states = [_capture_row(int(row["id"]), row) for row in rows]
-        scope = str(requested_scope)
+    if requested_scope == "all_configured":
+        states = [
+            _capture_row(int(row["id"]), row)
+            for row in db.list_rss_subscriptions()
+        ]
+        scope = "all_configured"
     else:
         states = [_capture({"subscription_id": item}) for item in arguments["subscription_ids"]]
         scope = "selected"
@@ -274,7 +273,7 @@ def _capture_many(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def _bulk_scope_limit_failure(state: dict[str, Any]) -> ToolResult | None:
     if (
-        state.get("scope") in {"all_configured", "all_enabled"}
+        state.get("scope") == "all_configured"
         and len(state.get("states") or []) > _BULK_SCOPE_LIMIT
     ):
         return ToolResult(
@@ -295,18 +294,11 @@ def _preview_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
     if limit_failure is not None:
         return limit_failure
     if not state["states"]:
-        all_configured = state.get("scope") == "all_configured"
         return ToolResult(
             ok=False,
             status="precondition_failed",
-            summary=(
-                "当前没有已配置的 RSS 订阅"
-                if all_configured else "当前没有已启用的 RSS 订阅"
-            ),
-            error=(
-                "请先创建并配置至少一个 RSS 订阅。"
-                if all_configured else "请先启用至少一个 RSS 订阅。"
-            ),
+            summary="当前没有已配置的 RSS 订阅",
+            error="请先创建并配置至少一个 RSS 订阅。",
         )
     missing = [item["subscription_id"] for item in state["states"] if not item["exists"]]
     unconfigured = [
@@ -360,21 +352,12 @@ def _preview_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
     )
 
 
-def preview_rss_subscriptions_refresh(arguments: dict[str, Any]) -> ToolResult:
-    return _preview_rss_subscriptions_state(_capture_many(arguments))
-
-
 def prepare_rss_subscriptions_refresh(
     arguments: dict[str, Any],
 ) -> tuple[ToolResult, str]:
     """生成完整快照；批量 scope 不把全部内部 ID 写入确认参数。"""
     state = _capture_many(arguments)
     return _preview_rss_subscriptions_state(state), str(state["fingerprint"])
-
-
-def rss_refresh_subscriptions_confirmation_context(arguments: dict[str, Any]) -> str:
-    """兼容旧调用方；新工具注册使用原子 confirmation_preparer。"""
-    return str(_capture_many(arguments)["fingerprint"])
 
 
 def _refresh_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
@@ -485,11 +468,6 @@ def _refresh_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
             "部分订阅源暂不可用。" if has_partial else ""
         ),
     )
-
-
-def refresh_rss_subscriptions(arguments: dict[str, Any]) -> ToolResult:
-    """兼容内部调用；注册表仍会阻止绕过确认直接执行。"""
-    return _refresh_rss_subscriptions_state(_capture_many(arguments))
 
 
 def refresh_rss_subscriptions_confirmed(

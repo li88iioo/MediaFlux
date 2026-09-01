@@ -207,11 +207,6 @@ def prepare_retry_download_submission(
     return _preview(state), str(state["fingerprint"])
 
 
-def retry_download_submission(arguments: dict[str, Any]) -> ToolResult:
-    download_retry_submission_arguments(arguments)
-    raise AgentToolError("重新提交下载请求必须先预检并由用户确认", code="confirmation_required")
-
-
 def retry_download_submission_confirmed(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:

@@ -338,17 +338,30 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
 }
 
 
-def _safe_time(value: str | None = None) -> str:
-    if value:
-        try:
-            parsed = datetime.fromisoformat(str(value).strip())
-        except (TypeError, ValueError):
-            parsed = None
-        if parsed is not None:
-            if parsed.tzinfo is None:
-                parsed = parsed.astimezone()
-            return parsed.isoformat(timespec="seconds")
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+def normalize_confirmation_timestamp(value: Any) -> str:
+    """规范化带时区的 ISO 时间；无效或缺失时返回空字符串。"""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > 80:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        offset = parsed.utcoffset()
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if parsed.tzinfo is None or offset is None:
+        return ""
+    return parsed.isoformat(timespec="seconds")
+
+
+def _build_preflight_timestamp(value: str | None) -> str:
+    if value is None:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+    normalized = normalize_confirmation_timestamp(value)
+    if not normalized:
+        raise ValueError("invalid confirmation preflight timestamp")
+    return normalized
 
 
 def _safe_contract_text(value: Any, *, fallback: str) -> str:
@@ -375,7 +388,7 @@ def build_confirmation_contract(
         "reversibility": _safe_contract_text(
             copy.get("reversibility"), fallback="执行后可能需要在对应功能页手动撤销。"
         ),
-        "preflight_at": _safe_time(preflight_at),
+        "preflight_at": _build_preflight_timestamp(preflight_at),
         "risk": risk.value,
     }
     # 预检摘要只作为补充说明，完全通过公开文本净化；不安全时直接省略。
@@ -389,15 +402,13 @@ def sanitize_confirmation_contract(value: Any) -> dict[str, Any]:
     """重新投影已有契约，供 API、Telegram 和审计记录安全复用。"""
     if not isinstance(value, Mapping):
         return {}
-    try:
-        version = int(value.get("version") or 0)
-    except (TypeError, ValueError):
-        version = 0
-    if version != CONTRACT_VERSION:
+    raw_version = value.get("version")
+    if type(raw_version) is not int or raw_version != CONTRACT_VERSION:
         return {}
     risk = str(value.get("risk") or "").strip().lower()
-    if risk not in {"low_write", "write", "danger"}:
-        risk = "write"
+    preflight_at = normalize_confirmation_timestamp(value.get("preflight_at"))
+    if risk not in {"low_write", "write", "danger"} or not preflight_at:
+        return {}
     projected = {
         "version": CONTRACT_VERSION,
         "action": _safe_contract_text(value.get("action"), fallback="执行受控操作"),
@@ -408,7 +419,7 @@ def sanitize_confirmation_contract(value: Any) -> dict[str, Any]:
         "reversibility": _safe_contract_text(
             value.get("reversibility"), fallback="执行后可能需要在对应功能页手动撤销。"
         ),
-        "preflight_at": _safe_time(str(value.get("preflight_at") or "")),
+        "preflight_at": preflight_at,
         "risk": risk,
     }
     preview_summary = sanitize_public_text(value.get("preflight_summary"), limit=160)

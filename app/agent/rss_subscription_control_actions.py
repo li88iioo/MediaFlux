@@ -5,7 +5,7 @@ from datetime import datetime
 import hashlib
 import json
 import secrets
-from typing import Any, Callable
+from typing import Any
 
 from app import database as db
 from app.agent.models import Evidence, ToolResult
@@ -348,11 +348,6 @@ def _confirmed_delete(arguments: dict[str, int], expected_context: str) -> ToolR
         ],
     )
 
-
-def _unconfirmed(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该 RSS 订阅操作需要确认", code="confirmation_required")
-
-
 def prepare_set_rss_subscription_enabled(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
     return _prepare_enabled(arguments)
 
@@ -381,8 +376,3 @@ def delete_rss_subscription_confirmed(
     arguments: dict[str, int], expected_context: str
 ) -> ToolResult:
     return _confirmed_delete(arguments, expected_context)
-
-
-set_rss_subscription_enabled: Callable[[dict[str, Any]], ToolResult] = _unconfirmed
-set_rss_refresh_interval: Callable[[dict[str, Any]], ToolResult] = _unconfirmed
-delete_rss_subscription: Callable[[dict[str, Any]], ToolResult] = _unconfirmed

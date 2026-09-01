@@ -38,6 +38,11 @@ def build_response_contract(
     ):
         raise ValueError("resource candidate presentation requires primary candidates")
     if (
+        normalized_presentation == "confirmation"
+        and normalized_task != "action"
+    ):
+        raise ValueError("confirmation presentation requires action task")
+    if (
         normalized_resource_role == "primary"
         and normalized_task not in {"resource_search", "action"}
     ):
@@ -47,6 +52,20 @@ def build_response_contract(
         "presentation": normalized_presentation,
         "resource_candidates": normalized_resource_role,
     }
+
+
+def _set_response_contract(
+    response: dict[str, Any], contract: dict[str, str]
+) -> dict[str, Any]:
+    response["response_contract"] = contract
+    try:
+        from app.agent.turn_runtime import record_agent_response_contract
+
+        record_agent_response_contract(contract)
+    except Exception:
+        # 运行态埋点是可选观测能力，不能阻断响应协议落盘。
+        pass
+    return response
 
 
 def attach_response_contract(
@@ -64,14 +83,7 @@ def attach_response_contract(
         presentation=presentation,
         resource_candidates=resource_candidates,
     )
-    response["response_contract"] = contract
-    try:
-        from app.agent.turn_runtime import record_agent_response_contract
-
-        record_agent_response_contract(contract)
-    except Exception:
-        pass
-    return response
+    return _set_response_contract(response, contract)
 
 
 def response_contract(value: Any) -> dict[str, str]:
@@ -98,40 +110,56 @@ _ACTION_MODES = frozenset({
 
 
 def infer_response_contract(response: Any) -> dict[str, str]:
-    """从服务端稳定字段推导旧响应的语义契约。
+    """从服务端稳定字段推导响应语义契约。
 
     推导只发生在响应生产边界，消息渠道不得再重复猜测。显式附加的有效契约
-    始终优先；此函数主要覆盖确定性工具、确认结果和兼容回退响应。
+    始终优先；此函数覆盖确定性工具与受控行动计划结果。
     """
-    current = response_contract(response)
-    if current:
-        return current
     if not isinstance(response, dict):
         return {}
 
     mode = str(response.get("mode") or "").strip().lower()
+    current = response_contract(response)
+    if mode in _ACTION_MODES:
+        if mode == "confirmation_required":
+            # 延迟导入避免 action_plan -> result_projection -> response_contract 的
+            # 模块初始化环；确认展示只能由有效、待审批的服务端计划决定。
+            from app.agent.action_plan import sanitize_action_plan
+
+            action_plan = sanitize_action_plan(response.get("action_plan"))
+            if action_plan.get("status") == "awaiting_approval":
+                return build_response_contract(
+                    task_kind="action",
+                    presentation="confirmation",
+                )
+        elif mode == "confirmed_action" and current == build_response_contract(
+            task_kind="action",
+            presentation="resource_candidates",
+            resource_candidates="primary",
+        ):
+            # 少数复合动作会在确认写入成功后立即继续资源检索。只有编排器
+            # 显式声明的 action/primary 契约可以保留候选展示；工具名本身
+            # 不能把普通终态行动重新解释为资源搜索。
+            return current
+        # 行动模式是服务端权威状态。计划损坏、终态或冲突的显式展示契约
+        # 都只能退化为行动叙述，不能被资源候选工具名重新解释。
+        return build_response_contract(
+            task_kind="action",
+            presentation="narrative",
+        )
+    if current:
+        return current
+
     tool_call = response.get("tool_call")
     tool_name = (
         str(tool_call.get("name") or "").strip()
         if isinstance(tool_call, dict) else ""
     )
-    has_confirmation = isinstance(response.get("confirmation"), dict)
-
-    if mode == "confirmation_required" or has_confirmation:
-        return build_response_contract(
-            task_kind="action",
-            presentation="confirmation",
-        )
     if tool_name in RESOURCE_CANDIDATE_TOOLS:
         return build_response_contract(
             task_kind="resource_search",
             presentation="resource_candidates",
             resource_candidates="primary",
-        )
-    if mode in _ACTION_MODES:
-        return build_response_contract(
-            task_kind="action",
-            presentation="narrative",
         )
     if mode == "conversation":
         return build_response_contract(
@@ -149,20 +177,4 @@ def ensure_response_contract(response: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(response, dict):
         raise TypeError("response must be a dictionary")
     contract = infer_response_contract(response)
-    if contract:
-        response["response_contract"] = contract
-        try:
-            from app.agent.turn_runtime import record_agent_response_contract
-
-            record_agent_response_contract(contract)
-        except Exception:
-            pass
-    return response
-
-
-def resource_candidates_are_primary(value: Any) -> bool | None:
-    """返回契约判断；``None`` 表示旧版响应尚无该契约。"""
-    contract = response_contract(value)
-    if not contract:
-        return None
-    return contract["resource_candidates"] == "primary"
+    return _set_response_contract(response, contract) if contract else response

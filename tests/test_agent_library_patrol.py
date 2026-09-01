@@ -111,12 +111,14 @@ class LibraryPatrolContractTests(unittest.TestCase):
             description="durable",
             risk=RiskLevel.LOW_WRITE,
             parameters={},
-            handler=lambda arguments: ToolResult(True, "accepted", "durable", data=arguments),
             validator=_identity,
             requires_confirmation=True,
             confirmation_preparer=lambda arguments: (
                 ToolResult(True, "confirmation_required", "confirm", data=arguments),
                 "ctx",
+            ),
+            confirmed_handler=lambda arguments, _context: ToolResult(
+                True, "completed", "started", data=arguments
             ),
         ))
         agent = AgentOrchestrator(registry)

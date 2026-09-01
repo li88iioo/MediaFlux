@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import errno
 import json
 import re
@@ -284,7 +285,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertNotIn("deployment-secret", serialized)
         self.assertNotIn("llm-deployment-secret", serialized)
 
-    def test_unchanged_agent_values_do_not_persist_or_restart_runtime(self):
+    def test_only_real_config_changes_persist_and_advance_agent_runtime(self):
         values = {
             "AGENT_ENABLED": "1",
             "AGENT_LLM_MODEL": "old-model",
@@ -298,7 +299,9 @@ class AgentSettingsUiTests(unittest.TestCase):
             "app.modules.agent_runtime.request_agent_runtime_reconcile"
         ) as reconcile, patch(
             "app.bot.handlers.request_command_menu_refresh"
-        ) as refresh_menu:
+        ) as refresh_menu, patch(
+            "app.agent.feature_gate.invalidate_agent_runtime_generation"
+        ) as invalidate:
             unchanged = save_config(self._request(), {"AGENT_ENABLED": "1"})
             changed = save_config(
                 self._request(),
@@ -311,6 +314,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         restart.assert_not_called()
         reconcile.assert_not_called()
         refresh_menu.assert_not_called()
+        invalidate.assert_called_once_with()
 
     def test_agent_feature_gate_hot_toggle_queues_runtime_without_bot_restart(self):
         request = self._request()
@@ -325,15 +329,47 @@ class AgentSettingsUiTests(unittest.TestCase):
             "app.modules.agent_runtime.request_agent_runtime_reconcile"
         ) as reconcile, patch(
             "app.bot.handlers.request_command_menu_refresh"
-        ) as refresh_menu:
+        ) as refresh_menu, patch(
+            "app.agent.feature_gate.invalidate_agent_runtime_generation"
+        ) as invalidate:
             response = save_config(request, {"AGENT_ENABLED": "0"})
 
         self.assertEqual(response, {"success": True})
         restart.assert_not_called()
         reconcile.assert_called_once_with()
         refresh_menu.assert_called_once_with()
+        invalidate.assert_called_once_with()
 
-    def test_telegram_agent_toggle_only_refreshes_menu(self):
+    def test_agent_toggle_publishes_config_and_generation_in_one_transition(self):
+        events: list[str] = []
+
+        @contextmanager
+        def transition():
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": "1" if key == "AGENT_ENABLED" else default,
+        ), patch(
+            "app.routes.api.config.set_and_save",
+            side_effect=lambda _updates: events.append("persist"),
+        ), patch(
+            "app.agent.feature_gate.agent_runtime_transition",
+            side_effect=transition,
+        ), patch(
+            "app.agent.feature_gate.invalidate_agent_runtime_generation",
+            side_effect=lambda: events.append("invalidate") or 1,
+        ), patch("app.services.clear_dashboard_cache"):
+            response = save_config(self._request(), {"AGENT_ENABLED": "0"})
+
+        self.assertEqual(response, {"success": True})
+        self.assertEqual(events, ["enter", "persist", "invalidate", "exit"])
+
+    def test_telegram_agent_toggle_refreshes_menu_and_runtime_generation(self):
         request = self._request()
         request.app.state.background_services_enabled = True
 
@@ -355,7 +391,40 @@ class AgentSettingsUiTests(unittest.TestCase):
         restart.assert_not_called()
         reconcile.assert_not_called()
         refresh_menu.assert_called_once_with()
-        invalidate.assert_not_called()
+        invalidate.assert_called_once_with()
+
+    def test_telegram_identity_changes_advance_runtime_generation(self):
+        cases = (
+            ("TG_BOT_TOKEN", "123:old-token", "123:new-token"),
+            ("TG_CHAT_ID", "100", "101"),
+            ("TG_AGENT_ALLOWED_USER_IDS", "200", "201"),
+        )
+        for key, old_value, new_value in cases:
+            with self.subTest(key=key):
+                values = {
+                    "TG_AGENT_ENABLED": "0",
+                    "TG_BOT_TOKEN": "123:old-token",
+                    "TG_CHAT_ID": "100",
+                    "TG_AGENT_ALLOWED_USER_IDS": "200",
+                    key: old_value,
+                }
+                with patch(
+                    "app.routes.api.config.get",
+                    side_effect=lambda name, default="": values.get(name, default),
+                ), patch(
+                    "app.routes.api.config.set_and_save"
+                ) as persist, patch(
+                    "app.notifier.reset"
+                ), patch(
+                    "app.services.clear_dashboard_cache"
+                ), patch(
+                    "app.agent.feature_gate.invalidate_agent_runtime_generation"
+                ) as invalidate:
+                    response = save_config(self._request(), {key: new_value})
+
+                self.assertEqual(response, {"success": True})
+                persist.assert_called_once_with({key: new_value})
+                invalidate.assert_called_once_with()
 
     def test_download_verification_notification_toggle_reloads_scheduler(self):
         request = self._request()

@@ -5,9 +5,14 @@
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
-from app.agent.confirmation_contract import sanitize_confirmation_contract
+from app.agent.action_plan_id import normalize_action_plan_id
+from app.agent.confirmation_contract import (
+    normalize_confirmation_timestamp,
+    sanitize_confirmation_contract,
+)
 from app.agent.result_projection import sanitize_public_text
 
 ACTION_PLAN_VERSION = 1
@@ -18,11 +23,9 @@ _ACTION_PLAN_RISKS = frozenset({"low_write", "write", "danger"})
 
 
 def _safe_positive_int(value: Any, *, maximum: int = 86_400) -> int:
-    try:
-        normalized = int(value)
-    except (TypeError, ValueError, OverflowError):
+    if type(value) is not int:
         return 0
-    return normalized if 0 < normalized <= maximum else 0
+    return value if 0 < value <= maximum else 0
 
 
 def _decisions_for_status(status: str) -> list[dict[str, str]]:
@@ -42,18 +45,19 @@ def build_action_plan(
     status: str = "awaiting_approval",
 ) -> dict[str, Any]:
     """从服务端确认契约构造不含执行参数的公开行动计划。"""
-    normalized_id = str(plan_id or "").strip()
-    if not normalized_id or len(normalized_id) > 256:
+    normalized_id = normalize_action_plan_id(plan_id)
+    if not normalized_id:
         return {}
     contract = sanitize_confirmation_contract(confirmation_contract)
     if not contract:
         return {}
     normalized_status = str(status or "").strip().lower()
     if normalized_status not in _ACTION_PLAN_STATUSES:
-        normalized_status = "awaiting_approval"
-    risk = str(contract.get("risk") or "write").strip().lower()
-    if risk not in _ACTION_PLAN_RISKS:
-        risk = "write"
+        return {}
+    risk = str(contract.get("risk") or "").strip().lower()
+    preflight_at = normalize_confirmation_timestamp(contract.get("preflight_at"))
+    if risk not in _ACTION_PLAN_RISKS or not preflight_at:
+        return {}
     plan: dict[str, Any] = {
         "version": ACTION_PLAN_VERSION,
         "plan_id": normalized_id,
@@ -68,7 +72,7 @@ def build_action_plan(
             contract.get("reversibility"), limit=160
         ) or "执行后可能需要在对应功能页手动撤销。",
         "risk": risk,
-        "preflight_at": str(contract.get("preflight_at") or "").strip(),
+        "preflight_at": preflight_at,
         "decisions": _decisions_for_status(normalized_status),
     }
     ttl = _safe_positive_int(expires_in)
@@ -84,20 +88,18 @@ def sanitize_action_plan(value: Any) -> dict[str, Any]:
     """严格重投影外部行动计划；无效结构返回空映射。"""
     if not isinstance(value, Mapping):
         return {}
-    try:
-        version = int(value.get("version") or 0)
-    except (TypeError, ValueError, OverflowError):
+    raw_version = value.get("version")
+    if type(raw_version) is not int or raw_version != ACTION_PLAN_VERSION:
         return {}
-    if version != ACTION_PLAN_VERSION:
-        return {}
-    plan_id = str(value.get("plan_id") or "").strip()
+    plan_id = normalize_action_plan_id(value.get("plan_id"))
     status = str(value.get("status") or "").strip().lower()
     risk = str(value.get("risk") or "").strip().lower()
+    preflight_at = normalize_confirmation_timestamp(value.get("preflight_at"))
     if (
         not plan_id
-        or len(plan_id) > 256
         or status not in _ACTION_PLAN_STATUSES
         or risk not in _ACTION_PLAN_RISKS
+        or not preflight_at
     ):
         return {}
     projected = {
@@ -113,7 +115,7 @@ def sanitize_action_plan(value: Any) -> dict[str, Any]:
         "reversibility": sanitize_public_text(value.get("reversibility"), limit=160)
         or "执行后可能需要在对应功能页手动撤销。",
         "risk": risk,
-        "preflight_at": sanitize_public_text(value.get("preflight_at"), limit=64),
+        "preflight_at": preflight_at,
         "decisions": _decisions_for_status(status),
     }
     ttl = _safe_positive_int(value.get("expires_in"))

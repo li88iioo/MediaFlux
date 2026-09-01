@@ -317,10 +317,15 @@ class WorkspaceNextActionsRoutingTests(IsolatedDatabaseTestCase):
             description="danger",
             risk=RiskLevel.DANGER,
             parameters={},
-            handler=lambda arguments: ToolResult(True, "success", "should-not-run"),
             validator=lambda arguments: dict(arguments),
             requires_confirmation=True,
-            preview_handler=lambda arguments: ToolResult(True, "ready", "preview"),
+            confirmation_preparer=lambda arguments: (
+                ToolResult(True, "ready", "preview"),
+                "danger-write-preview",
+            ),
+            confirmed_handler=lambda arguments, _expected_context: ToolResult(
+                True, "success", "should-not-run"
+            ),
         ))
         agent = AgentOrchestrator(registry)
         resolution = {

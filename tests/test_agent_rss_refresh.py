@@ -19,8 +19,8 @@ from app.agent.orchestrator import (
 from app.agent.rate_limit import agent_rate_limiter, tool_rate_limit_policy
 from app.agent.registry import AgentToolError
 from app.agent.rss_refresh_actions import (
-    preview_rss_subscription_refresh,
-    preview_rss_subscriptions_refresh,
+    prepare_rss_subscription_refresh,
+    prepare_rss_subscriptions_refresh,
     rss_refresh_subscription_arguments,
     rss_refresh_subscriptions_arguments,
 )
@@ -686,7 +686,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
 
     def test_preview_is_local_only_and_sanitized(self):
         with patch.object(RSSEngine, "refresh") as refresh:
-            result = preview_rss_subscription_refresh({"subscription_id": self.sid})
+            result, _context = prepare_rss_subscription_refresh({"subscription_id": self.sid})
         self.assertTrue(result.ok)
         refresh.assert_not_called()
         serialized = json.dumps(result.to_dict(), ensure_ascii=False)
@@ -701,7 +701,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         with patch.object(RSSEngine, "refresh", return_value={
             "total": 7, "new": 3, "skipped": 2,
         }) as refresh:
-            confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+            confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         refresh.assert_called_once()
         self.assertEqual(refresh.call_args.args, (self.sid,))
         self.assertIn("expected_revision", refresh.call_args.kwargs)
@@ -739,7 +739,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
             "partial": True, "failed_sources": 1,
         }):
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         result = confirmed["result"]
@@ -756,12 +756,10 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         )
         arguments = {"subscription_ids": [self.sid, second_id]}
         self.assertEqual(rss_refresh_subscriptions_arguments(arguments), arguments)
-        for scope in ("all_configured", "all_enabled"):
-            with self.subTest(scope=scope):
-                self.assertEqual(
-                    rss_refresh_subscriptions_arguments({"scope": scope}),
-                    {"scope": scope},
-                )
+        self.assertEqual(
+            rss_refresh_subscriptions_arguments({"scope": "all_configured"}),
+            {"scope": "all_configured"},
+        )
         invalid_arguments = (
             {},
             {"subscription_ids": []},
@@ -771,6 +769,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
             {"subscription_ids": list(range(1, 34))},
             {"subscription_ids": [self.sid], "all": True},
             {"scope": "selected"},
+            {"scope": "all_enabled"},
             {"scope": "all_configured", "subscription_ids": [self.sid]},
             {"scope": "all_enabled", "subscription_ids": [self.sid]},
         )
@@ -785,11 +784,11 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         self.assertFalse(spec["parameters"]["additionalProperties"])
         self.assertEqual(
             spec["parameters"]["properties"]["scope"]["enum"],
-            ["all_configured", "all_enabled"],
+            ["all_configured"],
         )
 
         with patch.object(RSSEngine, "refresh") as refresh:
-            preview = preview_rss_subscriptions_refresh(arguments)
+            preview, _context = prepare_rss_subscriptions_refresh(arguments)
         refresh.assert_not_called()
         self.assertTrue(preview.ok)
         self.assertEqual(preview.status, "confirmation_required")
@@ -814,7 +813,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
             ],
         ) as refresh:
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         self.assertEqual(refresh.call_count, 2)
@@ -891,7 +890,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
             return_value={"total": 1, "new": 1, "skipped": 0},
         ) as refresh:
             confirmed = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         expected_ids = [*ids, disabled_id]
@@ -932,19 +931,16 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         self.assertNotIn("confirmation", response)
         refresh.assert_not_called()
 
-    def test_legacy_all_enabled_scope_still_excludes_disabled_subscriptions(self):
-        disabled_id = db.add_rss_subscription(
-            "Disabled", "https://disabled.invalid/rss"
-        )
-        db.update_rss_subscription(disabled_id, {"enabled": False})
+    def test_removed_all_enabled_scope_is_rejected(self):
+        with self.assertRaises(AgentToolError) as invalid:
+            get_agent_service().prepare(
+                "rss.refresh_subscriptions",
+                {"scope": "all_enabled"},
+                owner="owner",
+            )
 
-        prepared = get_agent_service().prepare(
-            "rss.refresh_subscriptions", {"scope": "all_enabled"}, owner="owner"
-        )
-
-        self.assertEqual(prepared["result"]["data"]["scope"], "all_enabled")
-        self.assertEqual(prepared["result"]["data"]["subscription_count"], 1)
-        self.assertNotIn("Disabled", json.dumps(prepared, ensure_ascii=False))
+        self.assertEqual(invalid.exception.code, "invalid_tool_call")
+        self.assertIn("all_configured", invalid.exception.safe_message)
 
     def test_refresh_all_configured_confirmation_stales_when_membership_changes(self):
         prepared = get_agent_service().query("刷新所有 RSS", owner="owner")
@@ -954,7 +950,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
             AgentToolError
         ) as stale:
             get_agent_service().confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
 
         self.assertEqual(stale.exception.code, "confirmation_stale")
@@ -967,7 +963,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         )
         db.update_rss_subscription(self.sid, {"urls": "https://changed.invalid/rss"})
         with patch.object(RSSEngine, "refresh") as refresh, self.assertRaises(AgentToolError) as stale:
-            service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+            service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(stale.exception.code, "confirmation_stale")
         refresh.assert_not_called()
 
@@ -979,7 +975,7 @@ class RSSRefreshAgentTests(IsolatedDatabaseTestCase):
         with patch.object(RSSEngine, "refresh", return_value={
             "error": RSS_REFRESH_BUSY_ERROR, "busy": True,
         }):
-            confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+            confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertFalse(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "busy")
         self.assertNotIn("secret", json.dumps(confirmed, ensure_ascii=False).casefold())
@@ -1038,21 +1034,21 @@ class RSSRefreshAgentApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(prepared.status_code, 200, prepared.text)
         body = prepared.json()
         self.assertEqual(body["mode"], "confirmation_required")
-        confirmation_id = body["confirmation"]["confirmation_id"]
+        confirmation_id = body["action_plan"]["plan_id"]
         with patch.object(RSSEngine, "refresh", return_value={
             "error": RSS_REFRESH_BUSY_ERROR, "busy": True,
         }):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
         self.assertEqual(confirmed.status_code, 409, confirmed.text)
         self.assertEqual(confirmed.json()["result"]["status"], "busy")
         replay = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+            json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
         )
         self.assertEqual(replay.status_code, 409, replay.text)
 
@@ -1087,14 +1083,14 @@ class RSSRefreshAgentApiTests(IsolatedDatabaseTestCase):
         prepared_body = prepared.json()
         self.assertEqual(prepared_body["mode"], "confirmation_required")
         self.assertEqual(
-            prepared_body["confirmation"]["tool"], "rss.refresh_subscription"
+            prepared_body["tool_call"]["name"], "rss.refresh_subscription"
         )
-        confirmation_id = prepared_body["confirmation"]["confirmation_id"]
+        confirmation_id = prepared_body["action_plan"]["plan_id"]
 
         discarded = self.client.post(
             "/api/agent/actions/confirm/discard",
             headers=headers,
-            json={"confirmation_id": confirmation_id, "session_id": session_id},
+            json={"plan_id": confirmation_id, "session_id": session_id},
         )
         self.assertEqual(discarded.status_code, 200, discarded.text)
         self.assertEqual(discarded.json(), {"discarded": True})
@@ -1103,7 +1099,7 @@ class RSSRefreshAgentApiTests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"confirmation_id": confirmation_id, "session_id": session_id},
+                json={"plan_id": confirmation_id, "session_id": session_id},
             )
         self.assertEqual(replay.status_code, 409, replay.text)
         refresh.assert_not_called()

@@ -13,10 +13,9 @@ from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from app.agent.strm_retry_actions import (
-    preview_strm_failure_retry,
-    retry_strm_failure_records,
+    prepare_strm_failure_retry,
+    retry_strm_failure_records_confirmed,
     strm_failure_retry_arguments,
-    strm_failure_retry_confirmation_context,
 )
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
@@ -85,7 +84,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
         self._record(1, "generate")
         self._record(2, "metadata")
         with patch("app.modules.strm.retry_strm_failures") as retry:
-            result = preview_strm_failure_retry({"scope": "all"})
+            result, _context = prepare_strm_failure_retry({"scope": "all"})
         self.assertTrue(result.ok)
         self.assertEqual(result.data["selected_count"], 2)
         self.assertEqual(result.data["by_action"], {"generate": 1, "metadata": 1})
@@ -96,7 +95,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
 
         for index in range(3, 103):
             self._record(index)
-        limited = preview_strm_failure_retry({"scope": "all"})
+        limited, _context = prepare_strm_failure_retry({"scope": "all"})
         self.assertFalse(limited.ok)
         self.assertEqual(limited.status, "conflict")
         self.assertNotIn("private-", json.dumps(limited.to_dict(), ensure_ascii=False))
@@ -104,7 +103,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
     def test_confirmation_context_freezes_ids_and_handler_returns_only_counts(self):
         first = self._record(1, "generate")
         second = self._record(2, "metadata")
-        fingerprint = strm_failure_retry_confirmation_context({"scope": "all"})
+        fingerprint = prepare_strm_failure_retry({"scope": "all"})[1]
         self.assertEqual(len(fingerprint), 64)
         raw = {
             "ok": True,
@@ -118,7 +117,9 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "failures": [{"filename": "private.mkv"}],
         }
         with patch("app.modules.strm.retry_strm_failures", return_value=raw) as retry:
-            result = retry_strm_failure_records({"scope": "all"})
+            result = retry_strm_failure_records_confirmed(
+                {"scope": "all"}, fingerprint
+            )
         retry.assert_called_once_with([second, first], "agent", runtime_config=self.runtime_config)
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "partial")
@@ -162,7 +163,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             prepared = service.prepare(
                 "strm.retry_failures", {"scope": "all"}, owner="owner-token"
             )
-            confirmation_id = prepared["confirmation"]["confirmation_id"]
+            confirmation_id = prepared["action_plan"]["plan_id"]
             self._record(1)
         with patch("app.modules.strm.retry_strm_failures") as retry:
             with self.assertRaises(AgentToolError) as stale:
@@ -176,7 +177,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "app.modules.strm.capture_strm_retry_runtime_config",
             return_value=({}, "secret /private/path token=SECRET"),
         ):
-            result = preview_strm_failure_retry({"scope": "all"})
+            result, _context = prepare_strm_failure_retry({"scope": "all"})
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "not_configured")
         serialized = json.dumps(result.to_dict(), ensure_ascii=False)
@@ -186,7 +187,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
     def test_partially_claimed_snapshot_reports_partial_completion(self):
         self._record(1)
         self._record(2)
-        strm_failure_retry_confirmation_context({"scope": "all"})
+        fingerprint = prepare_strm_failure_retry({"scope": "all"})[1]
         raw = {
             "ok": True,
             "requested": 2,
@@ -197,14 +198,16 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "stale": 0,
         }
         with patch("app.modules.strm.retry_strm_failures", return_value=raw):
-            result = retry_strm_failure_records({"scope": "all"})
+            result = retry_strm_failure_records_confirmed(
+                {"scope": "all"}, fingerprint
+            )
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "partial")
         self.assertIn("状态已变化", result.summary)
 
     def test_zero_matches_after_confirmation_is_reported_as_conflict(self):
         self._record(1)
-        strm_failure_retry_confirmation_context({"scope": "all"})
+        fingerprint = prepare_strm_failure_retry({"scope": "all"})[1]
         raw = {
             "ok": True,
             "requested": 1,
@@ -215,7 +218,9 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "stale": 0,
         }
         with patch("app.modules.strm.retry_strm_failures", return_value=raw):
-            result = retry_strm_failure_records({"scope": "all"})
+            result = retry_strm_failure_records_confirmed(
+                {"scope": "all"}, fingerprint
+            )
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "conflict")
         self.assertEqual(result.data["matched"], 0)
@@ -226,7 +231,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
         prepared = service.prepare(
             "strm.retry_failures", {"scope": "all"}, owner="owner-token"
         )
-        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        confirmation_id = prepared["action_plan"]["plan_id"]
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE strm_failures SET updated_at=? WHERE id=?",
@@ -342,7 +347,7 @@ class StrmFailureRetryAPITests(IsolatedDatabaseTestCase):
             body = prepared.json()
             self.assertEqual(body["mode"], "confirmation_required")
             self.assertEqual(body["result"]["data"]["selected_count"], 1)
-            confirmation_id = body["confirmation"]["confirmation_id"]
+            confirmation_id = body["action_plan"]["plan_id"]
             retry.assert_not_called()
 
             direct = self.client.post(
@@ -356,7 +361,7 @@ class StrmFailureRetryAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 200, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "completed")
@@ -365,7 +370,7 @@ class StrmFailureRetryAPITests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             retry.assert_called_once()

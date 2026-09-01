@@ -6,14 +6,12 @@ from unittest.mock import Mock, patch
 
 from app import database as db
 from app.agent.discovery_watchlist_actions import (
-    add_watchlist,
     add_watchlist_arguments,
     add_watchlist_confirmed,
     get_watchlist_summary,
     list_watchlist_summaries,
     prepare_add_watchlist,
     prepare_remove_watchlist,
-    remove_watchlist,
     remove_watchlist_arguments,
     remove_watchlist_confirmed,
     watchlist_summaries_arguments,
@@ -151,7 +149,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                 owner="owner-a",
             )
         self.assertIsNone(db.get_media_watchlist("tmdb", "8801", "movie"))
-        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        confirmation_id = prepared["action_plan"]["plan_id"]
         with self.assertRaises(AgentToolError):
             service.confirm(confirmation_id, owner="owner-b")
         confirmed = service.confirm(confirmation_id, owner="owner-a")
@@ -178,7 +176,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             )
         db.add_media_watchlist("tmdb", "8802", "movie", "并发收藏", "2026", "")
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertEqual(confirmed["result"]["status"], "conflict")
 
@@ -196,7 +194,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                 "UPDATE media_watchlist SET title=? WHERE id=?", ("状态已变化", number)
             )
         stale = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertEqual(stale["result"]["status"], "conflict")
         self.assertIsNotNone(db.get_media_watchlist_by_id(number))
@@ -210,7 +208,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                 owner="owner",
             )
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertEqual(confirmed["result"]["status"], "completed")
         self.assertIsNone(db.get_media_watchlist_by_id(number))
@@ -265,7 +263,6 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             risk=RiskLevel.LOW_WRITE,
             parameters={},
             validator=add_watchlist_arguments,
-            handler=add_watchlist,
             requires_confirmation=True,
             confirmed_handler=add_watchlist_confirmed,
             confirmation_preparer=prepare_add_watchlist,
@@ -276,7 +273,6 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             risk=RiskLevel.LOW_WRITE,
             parameters={},
             validator=remove_watchlist_arguments,
-            handler=remove_watchlist,
             requires_confirmation=True,
             confirmed_handler=remove_watchlist_confirmed,
             confirmation_preparer=prepare_remove_watchlist,
@@ -418,7 +414,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                     ("99901", "tv"),
                 ).fetchone())
             confirmed = agent.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertEqual(confirmed["result"]["status"], "completed")
         with db.get_conn() as conn:

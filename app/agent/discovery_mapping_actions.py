@@ -507,10 +507,6 @@ def prepare_confirm_discovery_mapping(
     ), fingerprint
 
 
-def confirm_discovery_mapping(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("映射保存必须先预检并确认", code="confirmation_required")
-
-
 def confirm_discovery_mapping_confirmed(
     arguments: dict[str, Any], expected_context: str, context: ToolContext
 ) -> ToolResult:

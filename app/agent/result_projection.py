@@ -1541,10 +1541,10 @@ def attach_public_fallback_presentation(
         and presentation.get("kind") == "narrative"
         and sanitize_public_multiline_text(presentation.get("narrative"), limit=1800)
     ):
-        return response
+        return ensure_response_contract(response)
     fallback = build_public_fallback_presentation(response)
     if fallback is None:
-        return response
+        return ensure_response_contract(response)
     projected = dict(response)
     projected["presentation"] = fallback
     if not isinstance(projected.get("display"), Mapping):

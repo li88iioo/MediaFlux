@@ -925,10 +925,6 @@ def prepare_run_directory_scrape(
     ), fingerprint
 
 
-def run_directory_scrape(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("目录刮削执行必须先预检并确认", code="confirmation_required")
-
-
 def run_directory_scrape_confirmed(
     _arguments: dict[str, Any], expected_context: str, context: ToolContext
 ) -> ToolResult:

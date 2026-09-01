@@ -80,7 +80,7 @@ class DownloadControlTests(IsolatedDatabaseTestCase):
             prepared = service.prepare(
                 "downloads.pause_task", {"task_name": "Example.Show.S01E01"}, owner="owner"
             )
-            confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+            confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
 
         self.assertEqual(prepared["mode"], "confirmation_required")
         self.assertTrue(confirmed["result"]["ok"])
@@ -107,7 +107,7 @@ class DownloadControlTests(IsolatedDatabaseTestCase):
             prepared = service.prepare(
                 "downloads.pause_task", {"task_name": "Example.Show.S01E01"}, owner="owner"
             )
-            confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+            confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertFalse(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "conflict")
         client.pause_torrents.assert_not_called()
@@ -120,7 +120,7 @@ class DownloadControlTests(IsolatedDatabaseTestCase):
             prepared = service.prepare(
                 "downloads.delete_task", {"task_name": "Example.Show.S01E01"}, owner="owner"
             )
-            confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+            confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertTrue(confirmed["result"]["ok"])
         client.delete_torrents.assert_called_once_with("a" * 40, delete_files=False)
         self.assertFalse(confirmed["result"]["data"]["delete_files"])

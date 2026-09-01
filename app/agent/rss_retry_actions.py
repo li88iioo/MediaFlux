@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-import threading
+import secrets
 from typing import Any
 
 from app import database as db
@@ -15,14 +15,6 @@ logger = get_logger(__name__)
 
 _DEFAULT_LIMIT = 10
 _MAX_ITEMS = 20
-_CONFIRMATION_STATE = threading.local()
-
-
-def clear_confirmation_state() -> None:
-    _CONFIRMATION_STATE.preview = None
-    _CONFIRMATION_STATE.pending = None
-
-
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -84,10 +76,10 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def preview_rss_failure_retry(arguments: dict[str, Any]) -> ToolResult:
+def _preview_rss_failure_retry(
+    arguments: dict[str, Any], state: dict[str, Any]
+) -> ToolResult:
     """只读选择可安全重试的 failed qB 条目，不 claim、不访问网络。"""
-    _CONFIRMATION_STATE.preview = None
-    state = _capture(arguments)
     count = len(state["entries"])
     if count == 0:
         return ToolResult(
@@ -106,7 +98,6 @@ def preview_rss_failure_retry(arguments: dict[str, Any]) -> ToolResult:
             suggestions=["可询问：为什么下载器配置不可用？"],
         )
 
-    _CONFIRMATION_STATE.preview = state
     return ToolResult(
         ok=True,
         status="confirmation_required",
@@ -137,25 +128,14 @@ def preview_rss_failure_retry(arguments: dict[str, Any]) -> ToolResult:
     )
 
 
-def rss_failure_retry_confirmation_context(arguments: dict[str, Any]) -> str:
-    state = getattr(_CONFIRMATION_STATE, "preview", None)
-    _CONFIRMATION_STATE.preview = None
-    if not isinstance(state, dict) or state.get("limit") != arguments["limit"]:
-        state = _capture(arguments)
-    _CONFIRMATION_STATE.pending = state
-    return str(state["fingerprint"])
+def prepare_rss_failure_retry(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    state = _capture(arguments)
+    return _preview_rss_failure_retry(arguments, state), str(state["fingerprint"])
 
 
-def retry_failed_rss_to_qb(arguments: dict[str, Any]) -> ToolResult:
-    state = getattr(_CONFIRMATION_STATE, "pending", None)
-    _CONFIRMATION_STATE.pending = None
-    if not isinstance(state, dict) or state.get("limit") != arguments["limit"]:
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="RSS 失败重试确认上下文已失效",
-            error="请重新预检后再确认。",
-        )
+def _retry_failed_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
     entries = list(state.get("entries") or [])
     runtime_config = dict(state.get("runtime_config") or {})
     if not entries or len(entries) > _MAX_ITEMS or not runtime_config.get("url"):
@@ -245,3 +225,17 @@ def retry_failed_rss_to_qb(arguments: dict[str, Any]) -> ToolResult:
             ("RSS 失败条目重试未全部成功。" if failed else "")
         ),
     )
+
+
+def retry_failed_rss_to_qb_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    state = _capture(arguments)
+    if not secrets.compare_digest(
+        str(state["fingerprint"]), str(expected_context or "")
+    ):
+        raise AgentToolError(
+            "RSS 失败条目或 qBittorrent 配置已变化，请重新预检",
+            code="confirmation_stale",
+        )
+    return _retry_failed_rss_to_qb_state(state)

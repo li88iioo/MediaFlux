@@ -113,23 +113,11 @@ def _preview_from_state(state: dict[str, Any]) -> ToolResult:
     )
 
 
-def preview_telegram_test_notification(_arguments: dict[str, Any]) -> ToolResult:
-    return _preview_from_state(_private_state())
-
-
-def telegram_test_confirmation_context(_arguments: dict[str, Any]) -> str:
-    return _fingerprint(_private_state())
-
-
 def prepare_telegram_test_notification(
     _arguments: dict[str, Any],
 ) -> tuple[ToolResult, str]:
     state = _private_state()
     return _preview_from_state(state), _fingerprint(state)
-
-
-def send_telegram_test_notification(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("Telegram 测试通知需要确认", code="confirmation_required")
 
 
 def _failure_from_exception(exc: Exception) -> ToolResult:
@@ -172,11 +160,9 @@ def send_telegram_test_notification_confirmed(
     telegram_test_arguments(arguments)
     state = _private_state()
     if not hmac.compare_digest(_fingerprint(state), str(expected_context or "")):
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="Telegram 通知配置已变化，请重新预检",
-            error="确认快照已失效。",
+        raise AgentToolError(
+            "Telegram 通知配置已变化，请重新预检",
+            code="confirmation_stale",
         )
     failed = _precondition_failure(state)
     if failed is not None:
@@ -219,9 +205,6 @@ def send_telegram_test_notification_confirmed(
 
 __all__ = [
     "prepare_telegram_test_notification",
-    "preview_telegram_test_notification",
-    "send_telegram_test_notification",
     "send_telegram_test_notification_confirmed",
     "telegram_test_arguments",
-    "telegram_test_confirmation_context",
 ]

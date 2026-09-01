@@ -319,7 +319,12 @@ class DownloadDiagnosisAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(self.client.post(path, json={"session_id": "test_session_identifier_0001", "arguments": {}}).status_code, 403)
         headers = {"X-CSRF-Token": csrf}
 
-        with patch("app.agent.download_actions.config.get", return_value=""):
+        with patch(
+            "app.agent.download_actions.config.get",
+            side_effect=lambda key, default="": (
+                "1" if key == "AGENT_ENABLED" else ""
+            ),
+        ):
             for _ in range(4):
                 response = self.client.post(path, headers=headers, json={"session_id": "test_session_identifier_0001", "arguments": {}})
                 self.assertEqual(response.status_code, 200, response.text)

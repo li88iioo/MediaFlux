@@ -52,6 +52,17 @@ class _FakeService:
     def __init__(self, response: dict) -> None:
         self.response = response
         self.calls: list[tuple[str, dict]] = []
+        self.confirmation_epoch = 0
+
+    def begin_query_confirmation_epoch(self, *, owner: str) -> int:
+        del owner
+        self.confirmation_epoch += 1
+        return self.confirmation_epoch
+
+    def invalidate_query_confirmation_epoch(self, *, owner: str) -> int:
+        del owner
+        self.confirmation_epoch += 1
+        return self.confirmation_epoch
 
     def query(self, message: str, **kwargs):
         self.calls.append((message, kwargs))
@@ -353,6 +364,43 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(saved["presentation"]["status"], "interrupted")
         self.assertEqual(service.state_commits, ["检查下载队列状态"])
 
+    def test_runtime_change_during_partial_stream_discards_state_and_history(self):
+        csrf = self._login()
+        service = _StatefulFakeService(_tool_response())
+        history = Mock()
+
+        async def broken_stream(*_args, **_kwargs):
+            from app.agent.feature_gate import invalidate_agent_runtime_generation
+
+            yield "下载队列已完成检查。"
+            invalidate_agent_runtime_generation()
+            raise ProviderStreamError("runtime changed")
+
+        with (
+            patch("app.routes.agent_api.get_agent_service", return_value=service),
+            patch("app.routes.agent_api.stream_tool_answer", broken_stream),
+            patch("app.routes.agent_api._record_query_history", history),
+        ):
+            response = self.client.post(
+                "/api/agent/query",
+                headers={"X-CSRF-Token": csrf},
+                json={
+                    "message": "检查下载队列状态",
+                    "session_id": SESSION_ID,
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        events = self._events(response)
+        self.assertEqual(
+            [item["type"] for item in events],
+            ["status", "status", "status", "delta", "cancelled"],
+        )
+        self.assertEqual(events[-1]["reason"], "runtime_changed")
+        history.assert_not_called()
+        self.assertEqual(service.state_commits, [])
+
     def test_split_unsafe_stream_token_falls_back_to_deterministic_result(self):
         csrf = self._login()
         unsafe_response = _tool_response()
@@ -573,7 +621,21 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         csrf = self._login()
         response_payload = _tool_response()
         response_payload["mode"] = "confirmation_required"
-        response_payload["confirmation"] = {"confirmation_id": "confirmation-1"}
+        response_payload["action_plan"] = {
+            "version": 1,
+            "plan_id": "confirmation-1",
+            "status": "awaiting_approval",
+            "title": "执行受控操作",
+            "target": "当前对象",
+            "impact": "应用预检变更",
+            "reversibility": "可手动撤销",
+            "risk": "write",
+            "preflight_at": "2026-08-31T12:00:00+08:00",
+            "decisions": [
+                {"id": "execute", "label": "执行"},
+                {"id": "cancel", "label": "取消"},
+            ],
+        }
         service = _FakeService(response_payload)
 
         async def should_not_stream(*_args, **_kwargs):
@@ -784,6 +846,60 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(second["type"], "cancelled")
         self.assertEqual(second["reason"], "user_cancelled")
 
+    def test_direct_tool_rejects_incomplete_service_contract(self):
+        csrf = self._login()
+
+        class IncompleteService:
+            invoke = Mock()
+
+            @staticmethod
+            def has_tool(_tool_name: str) -> bool:
+                return True
+
+        service = IncompleteService()
+        with patch("app.routes.agent_api.get_agent_service", return_value=service):
+            response = self.client.post(
+                "/api/agent/tools/downloads.diagnose_queue",
+                headers={"X-CSRF-Token": csrf},
+                json={"session_id": SESSION_ID, "arguments": {}},
+            )
+
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertIn("Agent 服务能力暂不可用", response.json()["error"])
+        service.invoke.assert_not_called()
+
+    def test_runtime_change_discards_slow_direct_tool_state(self):
+        from app.agent.feature_gate import invalidate_agent_runtime_generation
+
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _BlockingInvokeService(_tool_response())
+        direct_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        direct_client.cookies.update(self.client.cookies)
+
+        try:
+            with patch("app.routes.agent_api.get_agent_service", return_value=service):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(
+                        direct_client.post,
+                        "/api/agent/tools/downloads.diagnose_queue",
+                        headers=headers,
+                        json={"session_id": SESSION_ID, "arguments": {}},
+                    )
+                    self.assertTrue(service.started.wait(timeout=1))
+                    invalidate_agent_runtime_generation()
+                    service.release.set()
+                    response = pending.result(timeout=2)
+        finally:
+            service.release.set()
+            direct_client.close()
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["code"], "agent_runtime_disabled")
+        self.assertEqual(service.state_commits, [])
+
     def test_slow_direct_tool_cannot_overwrite_newer_query_state(self):
         csrf = self._login()
         headers = {"X-CSRF-Token": csrf}
@@ -915,6 +1031,41 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
             workspace_client.close()
 
         self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(service.state_commits, [])
+
+    def test_runtime_change_discards_slow_workspace_action_state(self):
+        from app.agent.feature_gate import invalidate_agent_runtime_generation
+
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _BlockingWorkspaceService(_tool_response())
+        workspace_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        workspace_client.cookies.update(self.client.cookies)
+
+        try:
+            with patch("app.routes.agent_api.get_agent_service", return_value=service):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(
+                        workspace_client.post,
+                        "/api/agent/workspace-actions/invoke",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "action_key": "review_library_patrol",
+                        },
+                    )
+                    self.assertTrue(service.started.wait(timeout=1))
+                    invalidate_agent_runtime_generation()
+                    service.release.set()
+                    response = pending.result(timeout=2)
+        finally:
+            service.release.set()
+            workspace_client.close()
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["code"], "agent_runtime_disabled")
         self.assertEqual(service.state_commits, [])
 
     def test_request_id_is_validated_for_query_and_cancel(self):

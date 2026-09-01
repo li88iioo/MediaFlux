@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
-import threading
+import secrets
 from typing import Any
 
 from app import config
@@ -93,12 +93,6 @@ _FEATURES: dict[str, FeatureDefinition] = {
 }
 _INDEXER_SITE_IDS = frozenset(INDEXER_SITE_ORDER)
 _ALLOWED_ARGUMENTS = {"feature", "enabled"}
-_CONFIRMATION_STATE = threading.local()
-
-
-def clear_confirmation_state() -> None:
-    _CONFIRMATION_STATE.preview = None
-    _CONFIRMATION_STATE.pending = None
 
 
 def _now() -> str:
@@ -314,8 +308,7 @@ def _effects(state: dict[str, Any]) -> tuple[list[str], list[str]]:
     return effects, suggestions
 
 
-def preview_set_feature_state(arguments: dict[str, Any]) -> ToolResult:
-    state = _capture(arguments)
+def _preview_feature_state(state: dict[str, Any]) -> ToolResult:
     failed = _precondition_failure(state)
     if failed is not None:
         return failed
@@ -360,18 +353,13 @@ def _fingerprint_payload(state: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def feature_state_confirmation_context(arguments: dict[str, Any]) -> str:
+def prepare_feature_state_confirmation(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    """在同一配置快照上生成预览和确认指纹。"""
     state = _capture(arguments)
-    fingerprint = _fingerprint_payload(state)
-    # execute_confirmed 会在同一调用链中立即调用 handler；保存精确快照以封闭
-    # “重算上下文后、实际发布前”发生文件竞争的窗口。
-    _CONFIRMATION_STATE.pending = {
-        "feature": state["feature"],
-        "requested_enabled": state["requested_enabled"],
-        "snapshot": state["snapshot"],
-        "fingerprint": fingerprint,
-    }
-    return fingerprint
+    preview = _preview_feature_state(state)
+    return preview, _fingerprint_payload(state) if preview.ok else ""
 
 
 def _refresh_runtime(definition: FeatureDefinition) -> bool:
@@ -423,21 +411,19 @@ def verify_feature_state_write(
     )
 
 
-def set_feature_state(arguments: dict[str, Any]) -> ToolResult:
-    pending = getattr(_CONFIRMATION_STATE, "pending", None)
-    _CONFIRMATION_STATE.pending = None
-    if not isinstance(pending, dict) or (
-        pending.get("feature") != arguments["feature"]
-        or pending.get("requested_enabled") is not arguments["enabled"]
+def set_feature_state_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    """只按已确认的快照指纹执行一次白名单配置写入。"""
+    state = _capture(arguments)
+    if not secrets.compare_digest(
+        _fingerprint_payload(state), str(expected_context or "")
     ):
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="确认上下文不可用，请重新预检",
-            error="确认上下文不可用。",
+        raise AgentToolError(
+            "配置已变化，请重新预检",
+            code="confirmation_stale",
         )
 
-    state = _capture(arguments)
     failed = _precondition_failure(state)
     if failed is not None:
         return failed
@@ -447,7 +433,7 @@ def set_feature_state(arguments: dict[str, Any]) -> ToolResult:
         config.update_runtime_env_file(
             config.ENV_FILE,
             {definition.key: target},
-            expected=pending["snapshot"],
+            expected=state["snapshot"],
         )
     except config.ConcurrentConfigUpdateError:
         return ToolResult(

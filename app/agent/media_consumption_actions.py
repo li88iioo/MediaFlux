@@ -249,9 +249,6 @@ def prepare_set_preferences(
     ), _fingerprint(snapshot)
 
 
-def set_preferences(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
-
 
 def set_preferences_confirmed(
     arguments: dict[str, Any], expected_context: str, context: ToolContext
@@ -284,9 +281,6 @@ def prepare_clear_preferences(
         data={"current": _public_preferences(current), "defaults": default_media_preferences()},
     ), _fingerprint(current)
 
-
-def clear_preferences(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
 
 
 def clear_preferences_confirmed(
@@ -356,9 +350,6 @@ def prepare_set_subscription_notification_rule(
     ), _fingerprint(snapshot)
 
 
-def set_subscription_notification_rule(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
-
 
 def set_subscription_notification_rule_confirmed(
     arguments: dict[str, Any], expected_context: str, _context: ToolContext
@@ -404,9 +395,6 @@ def prepare_reset_subscription_notification_rule(
         },
     ), _fingerprint(current)
 
-
-def reset_subscription_notification_rule(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该动作需要先预检并确认", code="confirmation_required")
 
 
 def reset_subscription_notification_rule_confirmed(

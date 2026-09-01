@@ -6,7 +6,7 @@ import hashlib
 import json
 import secrets
 import unicodedata
-from typing import Any, Callable
+from typing import Any
 
 from app import config
 from app.agent.download_actions import _bounded_progress, _safe_state, _safe_title
@@ -241,11 +241,6 @@ def _confirmed(arguments: dict[str, str], expected_context: str, *, action: str)
     finally:
         close_qbittorrent_client(client)
 
-
-def _unconfirmed(_arguments: dict[str, str]) -> ToolResult:
-    raise AgentToolError("该下载任务操作需要确认", code="confirmation_required")
-
-
 def prepare_pause_download_task(arguments: dict[str, str]) -> tuple[ToolResult, str]:
     return _prepare(arguments, action="pause")
 
@@ -268,8 +263,3 @@ def resume_download_task_confirmed(arguments: dict[str, str], expected_context: 
 
 def delete_download_task_confirmed(arguments: dict[str, str], expected_context: str) -> ToolResult:
     return _confirmed(arguments, expected_context, action="delete")
-
-
-pause_download_task: Callable[[dict[str, str]], ToolResult] = _unconfirmed
-resume_download_task: Callable[[dict[str, str]], ToolResult] = _unconfirmed
-delete_download_task: Callable[[dict[str, str]], ToolResult] = _unconfirmed

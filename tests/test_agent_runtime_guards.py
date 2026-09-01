@@ -184,6 +184,12 @@ class AgentRuntimeGenerationTests(unittest.TestCase):
         self.assertFalse(agent_runtime_generation_is_current(previous))
         self.assertTrue(agent_runtime_generation_is_current(current))
 
+    def test_runtime_generation_comparison_rejects_coercible_values(self):
+        current = current_agent_runtime_generation()
+        self.assertFalse(agent_runtime_generation_is_current(str(current)))
+        self.assertFalse(agent_runtime_generation_is_current(True))
+        self.assertFalse(agent_runtime_generation_is_current(False))
+
     def test_runtime_transition_waits_for_admitted_confirmation(self):
         admitted = threading.Event()
         release = threading.Event()
@@ -218,6 +224,17 @@ class AgentRuntimeGenerationTests(unittest.TestCase):
             with self.assertRaises(AgentRuntimeDisabled):
                 with agent_runtime_admission():
                     self.fail("disabled Agent must not admit a confirmation")
+
+    def test_runtime_admission_rejects_stale_expected_generation(self):
+        previous = current_agent_runtime_generation()
+        current = invalidate_agent_runtime_generation()
+
+        with patch("app.agent.feature_gate.config.get_bool", return_value=True):
+            with self.assertRaises(AgentRuntimeDisabled):
+                with agent_runtime_admission(expected_generation=previous):
+                    self.fail("stale runtime work must not publish")
+            with agent_runtime_admission(expected_generation=current) as admitted:
+                self.assertEqual(admitted, current)
 
     def test_runtime_transition_waits_for_started_external_effect(self):
         generation = current_agent_runtime_generation()

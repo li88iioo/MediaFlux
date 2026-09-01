@@ -5,7 +5,7 @@ from datetime import datetime
 import hashlib
 import json
 import re
-from typing import Any, Callable
+from typing import Any
 import unicodedata
 
 from app import config, database as db
@@ -426,11 +426,3 @@ def remove_watchlist_confirmed(arguments: dict[str, Any], expected_context: str)
             _now(),
         )],
     )
-
-
-def _unconfirmed(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("该探索收藏操作需要确认", code="confirmation_required")
-
-
-add_watchlist: Callable[[dict[str, Any]], ToolResult] = _unconfirmed
-remove_watchlist: Callable[[dict[str, Any]], ToolResult] = _unconfirmed

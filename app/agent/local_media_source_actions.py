@@ -236,10 +236,6 @@ def prepare_set_local_media_source_trigger_enabled(
     ), _fingerprint(snapshot)
 
 
-def set_local_media_source_trigger_enabled(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("本地媒体来源触发器启停需要确认", code="confirmation_required")
-
-
 def set_local_media_source_trigger_enabled_confirmed(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:

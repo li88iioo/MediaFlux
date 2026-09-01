@@ -284,10 +284,12 @@ class AgentConfigConnectionTests(unittest.TestCase):
 
 class AgentConfigConnectionAPITests(IsolatedDatabaseTestCase):
     def setUp(self):
-        self.agent_gate_patch = patch(
-            "app.routes.agent_api.is_agent_enabled", return_value=True
+        self.agent_gate_patches = (
+            patch("app.routes.agent_api.is_agent_enabled", return_value=True),
+            patch("app.agent.feature_gate.is_agent_enabled", return_value=True),
         )
-        self.agent_gate_patch.start()
+        for gate_patch in self.agent_gate_patches:
+            gate_patch.start()
         reset_agent_service_for_tests()
         agent_rate_limiter.reset()
         self.client = TestClient(create_app(start_background=False), raise_server_exceptions=False)
@@ -295,7 +297,8 @@ class AgentConfigConnectionAPITests(IsolatedDatabaseTestCase):
 
     def tearDown(self):
         self.client.__exit__(None, None, None)
-        self.agent_gate_patch.stop()
+        for gate_patch in reversed(self.agent_gate_patches):
+            gate_patch.stop()
         reset_agent_service_for_tests()
         agent_rate_limiter.reset()
 

@@ -86,20 +86,6 @@ def _serialize_organize_context(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def organize_confirmation_context(_arguments: dict[str, Any]) -> str:
-    """绑定来源、规则与凭据世代；原始值不离开服务端。"""
-    sources, rules, _error = _configured_inputs()
-    client = GuangYaClient()
-    try:
-        return _serialize_organize_context(
-            sources,
-            rules,
-            _credential_generation(client),
-        )
-    finally:
-        close_guangya_client(client)
-
-
 def _credential_generation(client: GuangYaClient) -> int:
     try:
         return max(0, int(getattr(client, "credential_generation", 0) or 0))
@@ -131,18 +117,6 @@ def _serialize_organize_clean_empty_context(
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def organize_clean_empty_confirmation_context(_arguments: dict[str, Any]) -> str:
-    """绑定整理来源与凭据世代；原始内容仅保存在服务端确认票据中。"""
-    client = GuangYaClient()
-    try:
-        return _serialize_organize_clean_empty_context(
-            _configured_sources(),
-            _credential_generation(client),
-        )
-    finally:
-        close_guangya_client(client)
 
 
 def _task_running() -> bool:
@@ -326,10 +300,6 @@ def preview_guangya_organize(_arguments: dict[str, Any]) -> ToolResult:
     return _organize_preview(for_confirmation=False)
 
 
-def preview_guangya_organize_run_once(_arguments: dict[str, Any]) -> ToolResult:
-    return _organize_preview(for_confirmation=True)
-
-
 def prepare_guangya_organize_run_once(
     _arguments: dict[str, Any],
 ) -> tuple[ToolResult, str]:
@@ -427,11 +397,6 @@ def prepare_guangya_organize_clean_empty(
         close_guangya_client(client)
 
 
-def preview_guangya_organize_clean_empty(_arguments: dict[str, Any]) -> ToolResult:
-    """预检空目录清理；不扫描或返回目录内容。"""
-    return _preview_guangya_organize_clean_empty_sources(_configured_sources())
-
-
 def _clean_empty_guangya_organize_sources(
     sources: list[dict[str, str]],
     *,
@@ -519,11 +484,6 @@ def _clean_empty_guangya_organize_sources(
             close_guangya_client(client)
 
 
-def clean_empty_guangya_organize_sources(_arguments: dict[str, Any]) -> ToolResult:
-    """确认执行回退路径：使用调用时的来源快照。"""
-    return _clean_empty_guangya_organize_sources(_configured_sources())
-
-
 def clean_empty_guangya_organize_sources_confirmed(
     _arguments: dict[str, Any],
     expected_context: str,
@@ -566,11 +526,6 @@ def _serialize_organize_stop_context(task: dict[str, Any]) -> str:
     )
 
 
-def organize_stop_confirmation_context(_arguments: dict[str, Any]) -> str:
-    """返回仅保存在服务端确认票据中的任务快照。"""
-    return _serialize_organize_stop_context(_organize_stop_context_payload())
-
-
 def _preview_guangya_organize_stop_task(task: dict[str, Any]) -> ToolResult:
     if task["status"] != "running":
         return ToolResult(
@@ -608,10 +563,6 @@ def prepare_guangya_organize_stop(
     """用同一份任务快照生成预检结果和确认上下文。"""
     task = _organize_stop_context_payload()
     return _preview_guangya_organize_stop_task(task), _serialize_organize_stop_context(task)
-
-
-def preview_guangya_organize_stop(_arguments: dict[str, Any]) -> ToolResult:
-    return _preview_guangya_organize_stop_task(_organize_stop_context_payload())
 
 
 def _parse_organize_stop_context(expected_context: str) -> dict[str, Any]:
@@ -669,11 +620,6 @@ def stop_guangya_organize_confirmed(
     )
 
 
-def stop_guangya_organize(_arguments: dict[str, Any]) -> ToolResult:
-    """仅供确认执行回退路径使用；调用时仍按当前任务上下文做原子校验。"""
-    context = organize_stop_confirmation_context({})
-    return stop_guangya_organize_confirmed({}, context)
-
 def _run_guangya_organize_once(
     sources: list[dict[str, str]],
     rules: OrganizeRules,
@@ -726,17 +672,6 @@ def _run_guangya_organize_once(
             close_guangya_client(client)
 
 
-def run_guangya_organize_once(_arguments: dict[str, Any]) -> ToolResult:
-    """确认执行回退路径：按调用时配置和凭据快照启动。"""
-    sources, rules, config_error = _configured_inputs()
-    return _run_guangya_organize_once(
-        sources,
-        rules,
-        config_error,
-        GuangYaClient(),
-    )
-
-
 def run_guangya_organize_once_confirmed(
     _arguments: dict[str, Any],
     expected_context: str,
@@ -751,7 +686,10 @@ def run_guangya_organize_once_confirmed(
             _credential_generation(client),
         )
         if not secrets.compare_digest(current_context, str(expected_context or "")):
-            raise AgentToolError("光鸭整理配置或登录凭据已变化，请重新预检", code="confirmation_stale")
+            raise AgentToolError(
+                "光鸭整理配置已变化或登录凭据已更新，请重新预检",
+                code="confirmation_stale",
+            )
     except Exception:
         close_guangya_client(client)
         raise

@@ -179,7 +179,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         before = service.invoke("media.preferences", {}, owner="owner-a")
         self.assertFalse(before["result"]["data"]["explicit"])
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner-a"
+            prepared["action_plan"]["plan_id"], owner="owner-a"
         )
         self.assertEqual(confirmed["result"]["status"], "completed")
 
@@ -191,7 +191,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         self.assertFalse(owner_b["result"]["data"]["explicit"])
 
         clear = service.prepare("media.clear_preferences", {}, owner="owner-a")
-        service.confirm(clear["confirmation"]["confirmation_id"], owner="owner-a")
+        service.confirm(clear["action_plan"]["plan_id"], owner="owner-a")
         cleared = service.invoke("media.preferences", {}, owner="owner-a")
         self.assertFalse(cleared["result"]["data"]["explicit"])
         self.assertEqual(cleared["result"]["data"]["preferred_download_target"], "guangya")
@@ -212,7 +212,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         self.assertIsNotNone(changed)
         with self.assertRaises(AgentToolError) as captured:
             service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner-a"
+                prepared["action_plan"]["plan_id"], owner="owner-a"
             )
         self.assertEqual(captured.exception.code, "confirmation_stale")
 
@@ -236,7 +236,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             },
             owner="owner-a",
         )
-        service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner-a")
+        service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         explicit = service.invoke(
             "media.subscription_notification_rule",
             {"subscription_number": self.sid},
@@ -251,7 +251,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             {"subscription_number": self.sid},
             owner="owner-a",
         )
-        service.confirm(reset["confirmation"]["confirmation_id"], owner="owner-a")
+        service.confirm(reset["action_plan"]["plan_id"], owner="owner-a")
         restored = service.invoke(
             "media.subscription_notification_rule",
             {"subscription_number": self.sid},
@@ -297,7 +297,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             {"preferred_download_target": "qb"},
             owner="owner-a",
         )
-        service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner-a")
+        service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         service.recent_resource_store.capture(
             owner="owner-a",
             result=ToolResult(

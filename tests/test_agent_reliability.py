@@ -6,7 +6,7 @@ import re
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -24,6 +24,76 @@ from tests.support import IsolatedDatabaseTestCase
 class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         SQLiteConfirmationStore().reset()
+
+    def test_expected_owner_generation_rejects_bool_even_when_epoch_is_one(self):
+        store = SQLiteConfirmationStore(
+            token_factory=lambda: "persistent-generation-bool-1234"
+        )
+        with patch("app.agent.confirmation.secrets.randbits", return_value=1):
+            self.assertEqual(store.owner_generation(owner="owner-a"), 1)
+
+        with self.assertRaises(AgentToolError) as invalid:
+            store.issue(
+                owner="owner-a",
+                tool_name="write.test",
+                arguments={},
+                expected_owner_generation=True,
+            )
+
+        self.assertEqual(invalid.exception.code, "confirmation_invalid")
+        self.assertEqual(store.list_active_tickets(owner="owner-a"), [])
+
+    def test_claim_rejects_non_string_plan_id_without_consuming_ticket(self):
+        store = SQLiteConfirmationStore(
+            token_factory=lambda: "persistent-strict-plan-id-1234"
+        )
+        ticket = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": 1}
+        )
+
+        class StringLikePlanId:
+            def __str__(self) -> str:
+                return ticket.confirmation_id
+
+        with self.assertRaises(AgentToolError) as invalid:
+            store.claim_and_rotate_owner(
+                owner="owner-a",
+                confirmation_id=StringLikePlanId(),  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(invalid.exception.code, "confirmation_invalid")
+        self.assertEqual(
+            store.claim_and_rotate_owner(
+                owner="owner-a", confirmation_id=ticket.confirmation_id
+            ).arguments,
+            {"id": 1},
+        )
+
+    def test_corrupted_owner_epoch_is_rotated_without_leaking_raw_error(self):
+        store = SQLiteConfirmationStore(
+            token_factory=lambda: "persistent-corrupt-epoch-1234"
+        )
+        ticket = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": 1}
+        )
+        owner_digest = store._owner_digest("owner-a")
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE agent_confirmation_epochs SET generation=? "
+                "WHERE owner_digest=?",
+                ("corrupt", owner_digest),
+            )
+
+        recovered_generation = store.owner_generation(owner="owner-a")
+
+        self.assertGreater(recovered_generation, 0)
+        self.assertNotEqual(recovered_generation, ticket.owner_generation)
+        self.assertEqual(store.list_active_tickets(owner="owner-a"), [])
+        with self.assertRaises(AgentToolError) as invalid:
+            store.claim_and_rotate_owner(
+                owner="owner-a", confirmation_id=ticket.confirmation_id
+            )
+        self.assertEqual(invalid.exception.code, "confirmation_invalid")
 
     def test_ticket_survives_store_recreation_and_owner_is_hashed(self) -> None:
         first = SQLiteConfirmationStore(
@@ -46,14 +116,106 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
         self.assertNotEqual(row["owner_digest"], "owner-a")
         self.assertRegex(str(row["owner_digest"]), r"^[0-9a-f]{64}$")
 
-        claimed = SQLiteConfirmationStore().claim(
+        claimed = SQLiteConfirmationStore().claim_and_rotate_owner(
             owner="owner-a", confirmation_id=ticket.confirmation_id
         )
         self.assertEqual(claimed.arguments, {"items": ["one"]})
         self.assertEqual(claimed.context_fingerprint, "snapshot")
         self.assertEqual(claimed.followup_context, {"episode": 3})
         with self.assertRaises(AgentToolError):
-            first.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+            first.claim_and_rotate_owner(owner="owner-a", confirmation_id=ticket.confirmation_id)
+
+    def test_invalid_json_payload_is_rejected_before_sqlite_mutation(self) -> None:
+        token_factory = Mock(
+            return_value="persistent-json-validation-1234"
+        )
+        store = SQLiteConfirmationStore(max_entries=1, token_factory=token_factory)
+        existing = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "old"}
+        )
+        token_factory.reset_mock()
+
+        with self.assertRaises(AgentToolError) as invalid:
+            store.issue(
+                owner="owner-b",
+                tool_name="write.test",
+                arguments={"value": float("nan")},
+            )
+
+        self.assertEqual(invalid.exception.code, "confirmation_invalid")
+        token_factory.assert_not_called()
+        self.assertEqual(
+            store.claim_and_rotate_owner(
+                owner="owner-a", confirmation_id=existing.confirmation_id
+            ).arguments,
+            {"id": "old"},
+        )
+
+    def test_corrupted_sqlite_ticket_is_revoked_without_execution_claim(self) -> None:
+        tokens = iter((
+            "persistent-corrupt-selected-1234",
+            "persistent-corrupt-sibling-12345",
+        ))
+        store = SQLiteConfirmationStore(token_factory=lambda: next(tokens))
+        selected = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "selected"}
+        )
+        sibling = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": "sibling"}
+        )
+        previous_generation = selected.owner_generation
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE agent_confirmations SET arguments_json=? "
+                "WHERE confirmation_id=?",
+                ("{broken", selected.confirmation_id),
+            )
+        risk_for = Mock(return_value=RiskLevel.WRITE)
+
+        with self.assertRaises(AgentToolError) as invalid:
+            store.claim_and_rotate_owner(
+                owner="owner-a",
+                confirmation_id=selected.confirmation_id,
+                record_execution=True,
+                execution_risk_for=risk_for,
+            )
+
+        self.assertEqual(invalid.exception.code, "confirmation_invalid")
+        risk_for.assert_not_called()
+        self.assertEqual(store.list_active_tickets(owner="owner-a"), [])
+        self.assertNotEqual(
+            store.owner_generation(owner="owner-a"), previous_generation
+        )
+        with self.assertRaises(AgentToolError):
+            store.claim_and_rotate_owner(
+                owner="owner-a", confirmation_id=sibling.confirmation_id
+            )
+
+    def test_listing_corrupted_sqlite_ticket_revokes_owner_group(self) -> None:
+        tokens = iter((
+            "persistent-corrupt-list-first-12",
+            "persistent-corrupt-list-second-1",
+        ))
+        store = SQLiteConfirmationStore(token_factory=lambda: next(tokens))
+        first = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": 1}
+        )
+        second = store.issue(
+            owner="owner-a", tool_name="write.test", arguments={"id": 2}
+        )
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE agent_confirmations SET confirmation_contract_json=? "
+                "WHERE confirmation_id=?",
+                ("[]", second.confirmation_id),
+            )
+
+        self.assertEqual(store.list_active_tickets(owner="owner-a"), [])
+        for ticket in (first, second):
+            with self.assertRaises(AgentToolError):
+                store.claim_and_rotate_owner(
+                    owner="owner-a", confirmation_id=ticket.confirmation_id
+                )
 
     def test_concurrent_claim_is_atomic_across_store_instances(self) -> None:
         issuer = SQLiteConfirmationStore(
@@ -65,7 +227,7 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
         def claim_once() -> str:
             barrier.wait(timeout=3)
             try:
-                SQLiteConfirmationStore().claim(
+                SQLiteConfirmationStore().claim_and_rotate_owner(
                     owner="owner-a", confirmation_id=ticket.confirmation_id
                 )
             except AgentToolError as exc:
@@ -124,9 +286,9 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(len(store.list_active_tickets(owner="owner-a")), 1)
         with self.assertRaises(AgentToolError):
-            store.claim(owner="owner-a", confirmation_id=previous.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-a", confirmation_id=previous.confirmation_id)
         self.assertEqual(
-            store.claim(
+            store.claim_and_rotate_owner(
                 owner="owner-a", confirmation_id=current.confirmation_id
             ).arguments,
             {"id": "new"},
@@ -158,13 +320,13 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
         )
 
         self.assertEqual(
-            store.claim(owner="owner-b", confirmation_id=other.confirmation_id).arguments,
+            store.claim_and_rotate_owner(owner="owner-b", confirmation_id=other.confirmation_id).arguments,
             {"id": "b"},
         )
         with self.assertRaises(AgentToolError):
-            store.claim(owner="owner-a", confirmation_id=previous.confirmation_id)
+            store.claim_and_rotate_owner(owner="owner-a", confirmation_id=previous.confirmation_id)
         self.assertEqual(
-            store.claim(
+            store.claim_and_rotate_owner(
                 owner="owner-a", confirmation_id=replacement.confirmation_id
             ).arguments,
             {"id": "new"},
@@ -187,7 +349,7 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
         self.assertEqual([item.confirmation_id for item in active], [ticket.confirmation_id])
         self.assertEqual(active[0].owner_generation, generation)
         self.assertEqual(
-            SQLiteConfirmationStore().claim(
+            SQLiteConfirmationStore().claim_and_rotate_owner(
                 owner="owner-a", confirmation_id=ticket.confirmation_id
             ).arguments,
             {"id": 1},
@@ -202,7 +364,7 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
         self.assertEqual(revoked, 1)
         self.assertGreater(generation, 0)
         with self.assertRaises(AgentToolError):
-            first.claim(owner="owner-a", confirmation_id=ticket.confirmation_id)
+            first.claim_and_rotate_owner(owner="owner-a", confirmation_id=ticket.confirmation_id)
 
     def test_orchestrator_prepare_and_confirm_across_default_store_instances(self) -> None:
         calls: list[dict[str, str]] = []
@@ -213,10 +375,11 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
             risk=RiskLevel.WRITE,
             parameters={"type": "object"},
             validator=lambda arguments: {"value": str(arguments.get("value") or "")},
-            preview_handler=lambda arguments: ToolResult(
-                True, "confirmation_required", "preview", data=arguments
+            confirmation_preparer=lambda arguments: (
+                ToolResult(True, "confirmation_required", "preview", data=arguments),
+                f"write-test:{arguments['value']}",
             ),
-            handler=lambda arguments: (
+            confirmed_handler=lambda arguments, _expected_context: (
                 calls.append(dict(arguments))
                 or ToolResult(True, "completed", "done")
             ),
@@ -228,7 +391,7 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
         prepared = issuer.prepare(
             "write.test", {"value": "cross-worker"}, owner="owner-cross"
         )
-        confirmation_id = prepared["confirmation"]["confirmation_id"]
+        confirmation_id = prepared["action_plan"]["plan_id"]
         confirmed = confirmer.confirm(confirmation_id, owner="owner-cross")
 
         self.assertEqual(confirmed["result"]["status"], "completed")
@@ -253,7 +416,6 @@ class AgentTraceAndMetricsTests(IsolatedDatabaseTestCase):
             risk=RiskLevel.READ,
             parameters={},
             validator=lambda arguments: {},
-            handler=lambda _arguments: ToolResult(True, "completed", "ok"),
             context_handler=lambda _arguments, context: (
                 seen.append(context) or ToolResult(True, "completed", "ok")
             ),

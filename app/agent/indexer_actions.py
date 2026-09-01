@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import re
+import secrets
 import unicodedata
 from datetime import datetime
 from typing import Any
@@ -342,8 +343,8 @@ def _target_readiness(target: str) -> dict[str, bool]:
     return readiness
 
 
-def _stored_resource(arguments: dict[str, str]):
-    service = get_indexer_service()
+def _stored_resource(arguments: dict[str, str], *, service: Any | None = None):
+    service = service or get_indexer_service()
     item = service.result_store.get(arguments["result_id"])
     enabled = set(getattr(service, "enabled_site_ids", ()))
     if item.site_id not in enabled:
@@ -352,19 +353,77 @@ def _stored_resource(arguments: dict[str, str]):
             public_message="资源来源当前未启用",
         )
     if item.download_state not in {"ready", "resolvable"} or not item.download_kinds:
-        raise IndexerValidationError("stored result is not downloadable", public_message="该资源当前不可下载")
+        raise IndexerValidationError(
+            "stored result is not downloadable", public_message="该资源当前不可下载"
+        )
     return service, item
 
 
-def preview_submit_resource(arguments: dict[str, str]) -> ToolResult:
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
-        return ToolResult(False, "disabled", "资源检索功能已关闭", error="资源检索功能未启用。")
-    try:
-        _service, item = _stored_resource(arguments)
-    except IndexerError as exc:
-        return ToolResult(False, exc.code, exc.public_message, error=exc.public_message)
+def _resource_confirmation_payload(
+    arguments: dict[str, str], item: Any, readiness: dict[str, bool]
+) -> dict[str, Any]:
+    return {
+        "result_id": arguments["result_id"],
+        "target": arguments["target"],
+        "site_id": str(item.site_id),
+        "title": str(item.title),
+        "download_state": str(item.download_state),
+        "download_kinds": sorted(str(kind) for kind in item.download_kinds),
+        "backends": readiness,
+        "enabled": True,
+    }
 
+
+def _capture_submit_resource(arguments: dict[str, str]) -> dict[str, Any]:
+    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+        return {"enabled": False, "fingerprint": "disabled"}
+    try:
+        service, item = _stored_resource(arguments)
+    except IndexerError as exc:
+        return {
+            "enabled": True,
+            "resource_error": exc,
+            "fingerprint": f"resource-error:{exc.code}",
+        }
     readiness = _target_readiness(arguments["target"])
+    payload = _resource_confirmation_payload(arguments, item, readiness)
+    return {
+        "enabled": True,
+        "service": service,
+        "item": item,
+        "readiness": readiness,
+        "fingerprint": hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _preview_submit_resource(
+    arguments: dict[str, str], state: dict[str, Any]
+) -> ToolResult:
+    if not state.get("enabled"):
+        return ToolResult(
+            False,
+            "disabled",
+            "资源检索功能已关闭",
+            error="资源检索功能未启用。",
+        )
+    resource_error = state.get("resource_error")
+    if isinstance(resource_error, IndexerError):
+        return ToolResult(
+            False,
+            resource_error.code,
+            resource_error.public_message,
+            error=resource_error.public_message,
+        )
+
+    item = state["item"]
+    readiness = dict(state["readiness"])
     unavailable = [name for name, ready in readiness.items() if not ready]
     if unavailable:
         labels = {"qb": "qBittorrent", "guangya": "光鸭"}
@@ -396,7 +455,11 @@ def preview_submit_resource(arguments: dict[str, str]) -> ToolResult:
             },
             "target": arguments["target"],
             "backends": readiness,
-            "effects": ["服务端解析短期资源结果", "创建下载请求", "向所选下载后端提交任务"],
+            "effects": [
+                "服务端解析短期资源结果",
+                "创建下载请求",
+                "向所选下载后端提交任务",
+            ],
         },
         evidence=[
             Evidence(
@@ -409,31 +472,16 @@ def preview_submit_resource(arguments: dict[str, str]) -> ToolResult:
     )
 
 
-def submit_confirmation_context(arguments: dict[str, str]) -> str:
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
-        raise IndexerValidationError("indexer disabled")
-    _service, item = _stored_resource(arguments)
-    payload = {
-        "result_id": arguments["result_id"],
-        "target": arguments["target"],
-        "site_id": item.site_id,
-        "title": item.title,
-        "download_state": item.download_state,
-        "download_kinds": sorted(item.download_kinds),
-        "backends": _target_readiness(arguments["target"]),
-        "enabled": True,
-    }
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+def prepare_submit_resource(
+    arguments: dict[str, str],
+) -> tuple[ToolResult, str]:
+    state = _capture_submit_resource(arguments)
+    return _preview_submit_resource(arguments, state), str(state["fingerprint"])
 
 
-def submit_resource(arguments: dict[str, str]) -> ToolResult:
+def _submit_resource(
+    arguments: dict[str, str], *, service: Any | None = None
+) -> ToolResult:
     if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
         return ToolResult(
             False,
@@ -450,7 +498,7 @@ def submit_resource(arguments: dict[str, str]) -> ToolResult:
             "资源提交当前调用上下文不可用",
             error="请从同步 Agent 查询入口提交资源。",
         )
-    service = get_indexer_service()
+    service = service or get_indexer_service()
     try:
         result = run_indexer_awaitable_sync(
             download_result(
@@ -463,11 +511,17 @@ def submit_resource(arguments: dict[str, str]) -> ToolResult:
     except IndexerError as exc:
         return ToolResult(False, "conflict", exc.public_message, error=exc.public_message)
     except InvalidDownloadData:
-        return ToolResult(False, "unavailable", "资源下载数据无效", error="资源下载数据无效。")
+        return ToolResult(
+            False, "unavailable", "资源下载数据无效", error="资源下载数据无效。"
+        )
     except DownloadRequestCreationError:
-        return ToolResult(False, "unavailable", "下载请求创建失败", error="下载请求创建失败。")
+        return ToolResult(
+            False, "unavailable", "下载请求创建失败", error="下载请求创建失败。"
+        )
     except Exception:
-        return ToolResult(False, "unavailable", "下载处理失败", error="下载处理失败，请稍后重试。")
+        return ToolResult(
+            False, "unavailable", "下载处理失败", error="下载处理失败，请稍后重试。"
+        )
 
     public = {
         key: result.get(key)
@@ -521,6 +575,17 @@ def submit_resource(arguments: dict[str, str]) -> ToolResult:
         suggestions=["可前往下载任务页查看进度。"],
     )
 
+
+def submit_resource_confirmed(
+    arguments: dict[str, str], expected_context: str
+) -> ToolResult:
+    state = _capture_submit_resource(arguments)
+    if not secrets.compare_digest(
+        str(state["fingerprint"]), str(expected_context or "")
+    ):
+        raise AgentToolError("资源或下载配置已变化，请重新预检", code="confirmation_stale")
+    return _submit_resource(arguments, service=state.get("service"))
+
 def submit_batch_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     _reject_extra(arguments, {"result_ids", "target"})
     raw_ids = arguments.get("result_ids")
@@ -541,25 +606,81 @@ def submit_batch_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"result_ids": result_ids, "target": target}
 
 
-def preview_submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
+def _capture_submit_resource_batch(arguments: dict[str, Any]) -> dict[str, Any]:
     if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
-        return ToolResult(False, "disabled", "资源检索功能已关闭", error="资源检索功能未启用。")
+        return {"enabled": False, "fingerprint": "disabled"}
+    service = get_indexer_service()
     resources: list[dict[str, Any]] = []
+    items: list[Any] = []
     try:
         for result_id in arguments["result_ids"]:
-            _service, item = _stored_resource({
-                "result_id": result_id,
-                "target": arguments["target"],
-            })
-            resources.append({
-                "position": len(resources) + 1,
-                "site_name": _safe_text(item.site_name, 80),
-                "title": _safe_text(item.title, 300),
-                "download_state": item.download_state,
-            })
+            _service, item = _stored_resource(
+                {"result_id": result_id, "target": arguments["target"]},
+                service=service,
+            )
+            items.append(item)
+            resources.append(
+                {
+                    "result_id": result_id,
+                    "site_id": str(item.site_id),
+                    "site_name": str(item.site_name),
+                    "title": str(item.title),
+                    "download_state": str(item.download_state),
+                    "download_kinds": sorted(
+                        str(kind) for kind in item.download_kinds
+                    ),
+                }
+            )
     except IndexerError as exc:
-        return ToolResult(False, exc.code, exc.public_message, error=exc.public_message)
+        return {
+            "enabled": True,
+            "resource_error": exc,
+            "fingerprint": f"resource-error:{exc.code}",
+        }
     readiness = _target_readiness(arguments["target"])
+    payload = {
+        "resources": resources,
+        "target": arguments["target"],
+        "backends": readiness,
+        "enabled": True,
+    }
+    return {
+        "enabled": True,
+        "service": service,
+        "items": items,
+        "resources": resources,
+        "readiness": readiness,
+        "fingerprint": hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _preview_submit_resource_batch(
+    arguments: dict[str, Any], state: dict[str, Any]
+) -> ToolResult:
+    if not state.get("enabled"):
+        return ToolResult(
+            False,
+            "disabled",
+            "资源检索功能已关闭",
+            error="资源检索功能未启用。",
+        )
+    resource_error = state.get("resource_error")
+    if isinstance(resource_error, IndexerError):
+        return ToolResult(
+            False,
+            resource_error.code,
+            resource_error.public_message,
+            error=resource_error.public_message,
+        )
+    items = list(state["items"])
+    readiness = dict(state["readiness"])
     unavailable = [name for name, ready in readiness.items() if not ready]
     if unavailable:
         labels = {"qb": "qBittorrent", "guangya": "光鸭"}
@@ -570,6 +691,15 @@ def preview_submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
             data={"target": arguments["target"], "backends": readiness},
             error="所选下载目标尚未就绪。",
         )
+    resources = [
+        {
+            "position": position,
+            "site_name": _safe_text(item.site_name, 80),
+            "title": _safe_text(item.title, 300),
+            "download_state": item.download_state,
+        }
+        for position, item in enumerate(items, start=1)
+    ]
     return ToolResult(
         True,
         "confirmation_required",
@@ -585,66 +715,69 @@ def preview_submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
                 "部分失败不会回滚已经成功的项目",
             ],
         },
-        evidence=[Evidence(
-            "indexer_result_store",
-            "已逐项校验短期资源标识和下载后端就绪状态；未返回磁力、路径或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "indexer_result_store",
+                "已逐项校验短期资源标识和下载后端就绪状态；未返回磁力、路径或凭据。",
+                _now(),
+            )
+        ],
         suggestions=["请核对批量资源标题和统一下载目标后再确认。"],
     )
 
 
-def submit_batch_confirmation_context(arguments: dict[str, Any]) -> str:
-    payload: list[dict[str, Any]] = []
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
-        raise IndexerValidationError("indexer disabled")
-    for result_id in arguments["result_ids"]:
-        _service, item = _stored_resource({
-            "result_id": result_id,
-            "target": arguments["target"],
-        })
-        payload.append({
-            "result_id": result_id,
-            "site_id": item.site_id,
-            "title": item.title,
-            "download_state": item.download_state,
-            "download_kinds": sorted(item.download_kinds),
-        })
-    context = {
-        "resources": payload,
-        "target": arguments["target"],
-        "backends": _target_readiness(arguments["target"]),
-        "enabled": True,
-    }
-    return hashlib.sha256(json.dumps(
-        context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")).hexdigest()
+def prepare_submit_resource_batch(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
+    state = _capture_submit_resource_batch(arguments)
+    return _preview_submit_resource_batch(arguments, state), str(state["fingerprint"])
 
 
-def submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
+def _submit_resource_batch(
+    arguments: dict[str, Any], *, service: Any | None = None
+) -> ToolResult:
     if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
-        return ToolResult(False, "conflict", "资源检索功能已关闭", error="相关配置已变化，请重新搜索。")
+        return ToolResult(
+            False,
+            "conflict",
+            "资源检索功能已关闭",
+            error="相关配置已变化，请重新搜索。",
+        )
     try:
         ensure_sync_bridge_available()
     except AsyncBridgeUnavailable:
-        return ToolResult(False, "unavailable", "批量资源提交当前调用上下文不可用", error="请从同步 Agent 查询入口提交资源。")
-    service = get_indexer_service()
+        return ToolResult(
+            False,
+            "unavailable",
+            "批量资源提交当前调用上下文不可用",
+            error="请从同步 Agent 查询入口提交资源。",
+        )
+    service = service or get_indexer_service()
 
     async def submit_all() -> list[dict[str, Any]]:
-        return list(await asyncio.gather(*(
-            download_result_public(
-                service,
-                result_id,
-                arguments["target"],
-                origin_namespace="agent",
+        return list(
+            await asyncio.gather(
+                *(
+                    download_result_public(
+                        service,
+                        result_id,
+                        arguments["target"],
+                        origin_namespace="agent",
+                    )
+                    for result_id in arguments["result_ids"]
+                )
             )
-            for result_id in arguments["result_ids"]
-        )))
+        )
 
     try:
         items = run_indexer_awaitable_sync(submit_all())
     except Exception:
-        return ToolResult(False, "unavailable", "批量下载处理失败", error="下载处理失败，请稍后重试。")
+        return ToolResult(
+            False,
+            "unavailable",
+            "批量下载处理失败",
+            error="下载处理失败，请稍后重试。",
+        )
     counts = {
         status: sum(item.get("status") == status for item in items)
         for status in ("submitted", "partial", "manual_review", "failed", "duplicate")
@@ -654,7 +787,10 @@ def submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
     if accepted and not counts["failed"] and not counts["duplicate"] and not review_required:
         status, summary = "accepted", f"{accepted} 个下载任务已提交"
     elif accepted:
-        status, summary = "partial", f"批量提交完成：{accepted} 个已受理，{len(items) - accepted} 个未受理"
+        status, summary = (
+            "partial",
+            f"批量提交完成：{accepted} 个已受理，{len(items) - accepted} 个未受理",
+        )
     elif review_required:
         status, summary = "review_required", f"{review_required} 个下载任务提交结果待核对"
     elif counts["duplicate"] and not counts["failed"]:
@@ -674,16 +810,30 @@ def submit_resource_batch(arguments: dict[str, Any]) -> ToolResult:
             "duplicate": counts["duplicate"],
             "items": items,
         },
-        evidence=[Evidence(
-            "download_dispatcher",
-            "逐项通过服务器端资源解析和下载分发器提交；各项独立幂等且允许部分失败。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "download_dispatcher",
+                "逐项通过服务器端资源解析和下载分发器提交；各项独立幂等且允许部分失败。",
+                _now(),
+            )
+        ],
         suggestions=["可询问：刚才批量下载到哪了。"],
         error=(
             "部分下载任务提交结果待核对，请先核对下载器，勿直接重复提交。"
             if review_required
-            else "部分或全部资源未被下载后端接受。" if accepted < len(items)
+            else "部分或全部资源未被下载后端接受。"
+            if accepted < len(items)
             else ""
         ),
     )
+
+
+def submit_resource_batch_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
+    state = _capture_submit_resource_batch(arguments)
+    if not secrets.compare_digest(
+        str(state["fingerprint"]), str(expected_context or "")
+    ):
+        raise AgentToolError("资源集合或下载配置已变化，请重新预检", code="confirmation_stale")
+    return _submit_resource_batch(arguments, service=state.get("service"))

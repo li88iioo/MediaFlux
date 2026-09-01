@@ -18,17 +18,11 @@ from app.agent.orchestrator import (
 )
 from app.agent.organize_actions import (
     _configured_sources,
-    clean_empty_guangya_organize_sources,
-    organize_clean_empty_confirmation_context,
-    organize_confirmation_context,
-    organize_stop_confirmation_context,
+    clean_empty_guangya_organize_sources_confirmed,
+    prepare_guangya_organize_clean_empty,
     prepare_guangya_organize_run_once,
     prepare_guangya_organize_stop,
     preview_guangya_organize,
-    preview_guangya_organize_clean_empty,
-    preview_guangya_organize_run_once,
-    preview_guangya_organize_stop,
-    run_guangya_organize_once,
     run_guangya_organize_once_confirmed,
     stop_guangya_organize_confirmed,
 )
@@ -140,17 +134,21 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         ), patch(
             "app.agent.organize_actions.GuangYaClient",
             side_effect=client_factory,
+        ), patch(
+            "app.agent.organize_actions._organize_preview_snapshot",
+            return_value=ToolResult(True, "preview", "preview"),
         ):
-            first = organize_confirmation_context({})
-            self.assertEqual(first, organize_confirmation_context({}))
+            _preview, first = prepare_guangya_organize_run_once({})
+            _preview, repeated = prepare_guangya_organize_run_once({})
+            self.assertEqual(first, repeated)
             current["rules"] = OrganizeRules(
                 target_dir_id="secret-target-two",
                 clean_empty=False,
             )
-            rules_changed = organize_confirmation_context({})
+            _preview, rules_changed = prepare_guangya_organize_run_once({})
             current["rules"] = OrganizeRules(target_dir_id="secret-target")
             current["generation"] = 8
-            credential_changed = organize_confirmation_context({})
+            _preview, credential_changed = prepare_guangya_organize_run_once({})
 
         self.assertNotEqual(first, rules_changed)
         self.assertNotEqual(first, credential_changed)
@@ -169,11 +167,15 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
                 logged_in=True,
                 credential_generation=7,
             ),
+        ), patch(
+            "app.agent.organize_actions._preview_guangya_organize_clean_empty_sources",
+            return_value=ToolResult(True, "preview", "preview"),
         ):
-            first = organize_clean_empty_confirmation_context({})
-            self.assertEqual(first, organize_clean_empty_confirmation_context({}))
+            _preview, first = prepare_guangya_organize_clean_empty({})
+            _preview, repeated = prepare_guangya_organize_clean_empty({})
+            self.assertEqual(first, repeated)
             current.append({"id": "secret-source-two", "name": "Secret Two"})
-            second = organize_clean_empty_confirmation_context({})
+            _preview, second = prepare_guangya_organize_clean_empty({})
 
         self.assertNotEqual(first, second)
         self.assertRegex(first, r"^[0-9a-f]{64}$")
@@ -200,8 +202,8 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             "app.agent.organize_actions.GuangYaClient",
             return_value=_atomic_clean_client(),
         ):
-            preview = preview_guangya_organize_clean_empty({})
-            completed = clean_empty_guangya_organize_sources({})
+            preview, context = prepare_guangya_organize_clean_empty({})
+            completed = clean_empty_guangya_organize_sources_confirmed({}, context)
 
         self.assertTrue(preview.ok)
         self.assertEqual(preview.data, {"source_count": 1})
@@ -238,7 +240,8 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             "app.agent.organize_actions.GuangYaClient",
             return_value=_atomic_clean_client(),
         ):
-            result = clean_empty_guangya_organize_sources({})
+            _preview, context = prepare_guangya_organize_clean_empty({})
+            result = clean_empty_guangya_organize_sources_confirmed({}, context)
 
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "partial")
@@ -438,19 +441,16 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         )
         client.delete_empty_directory.assert_not_called()
 
-    def test_clean_empty_confirm_rejects_toctou_source_change(self):
+    def test_clean_empty_confirm_rejects_source_change_after_preflight(self):
         original_sources = [{"id": "source-old", "name": "Old Source"}]
         current_sources = list(original_sources)
         replacement_sources = [{"id": "source-new", "name": "New Source"}]
         calls = 0
 
         def configured_sources():
-            nonlocal calls, current_sources
+            nonlocal calls
             calls += 1
-            snapshot = list(current_sources)
-            if calls == 2:
-                current_sources = list(replacement_sources)
-            return snapshot
+            return list(current_sources)
 
         manager = Mock()
         manager.task_status.return_value = {"status": "idle"}
@@ -476,15 +476,16 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
                 {},
                 owner="owner-a",
             )
+            current_sources = list(replacement_sources)
             with self.assertRaises(AgentToolError) as stale:
                 service.confirm(
-                    prepared["confirmation"]["confirmation_id"],
+                    prepared["action_plan"]["plan_id"],
                     owner="owner-a",
                 )
 
         self.assertEqual(stale.exception.code, "confirmation_stale")
         manager.clean_empty.assert_not_called()
-        self.assertEqual(calls, 3)
+        self.assertEqual(calls, 2)
 
     def test_clean_empty_confirmation_rejects_credential_generation_change(self):
         sources = [{"id": "source", "name": "Source"}]
@@ -512,7 +513,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             )
             with self.assertRaises(AgentToolError) as stale:
                 service.confirm(
-                    prepared["confirmation"]["confirmation_id"],
+                    prepared["action_plan"]["plan_id"],
                     owner="owner-a",
                 )
 
@@ -548,8 +549,11 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         with patch(
             "app.agent.organize_actions._configured_sources",
             return_value=[],
+        ), patch(
+            "app.agent.organize_actions.GuangYaClient",
+            return_value=_atomic_clean_client(),
         ):
-            missing = preview_guangya_organize_clean_empty({})
+            missing, _context = prepare_guangya_organize_clean_empty({})
         manager.task_status.return_value = {"status": "running"}
         with patch(
             "app.agent.organize_actions._configured_sources",
@@ -557,8 +561,11 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         ), patch(
             "app.agent.organize_actions.get_organize_manager",
             return_value=manager,
+        ), patch(
+            "app.agent.organize_actions.GuangYaClient",
+            return_value=_atomic_clean_client(),
         ):
-            running = preview_guangya_organize_clean_empty({})
+            running, _context = prepare_guangya_organize_clean_empty({})
         manager.task_status.return_value = {"status": "idle"}
         with patch(
             "app.agent.organize_actions._configured_sources",
@@ -570,7 +577,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             "app.agent.organize_actions.GuangYaClient",
             return_value=SimpleNamespace(logged_in=False),
         ):
-            logged_out = preview_guangya_organize_clean_empty({})
+            logged_out, _context = prepare_guangya_organize_clean_empty({})
 
         self.assertEqual(missing.status, "not_configured")
         self.assertEqual(running.status, "conflict")
@@ -687,7 +694,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             "app.agent.organize_actions.Organizer",
             return_value=organizer,
         ):
-            incomplete = preview_guangya_organize_run_once({})
+            incomplete, _context = prepare_guangya_organize_run_once({})
 
         self.assertFalse(incomplete.ok)
         self.assertEqual(incomplete.status, "inconclusive")
@@ -709,7 +716,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             "app.agent.organize_actions.Organizer",
             return_value=organizer,
         ):
-            empty = preview_guangya_organize_run_once({})
+            empty, _context = prepare_guangya_organize_run_once({})
 
         self.assertFalse(empty.ok)
         self.assertEqual(empty.status, "no_changes")
@@ -734,8 +741,12 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         ), patch(
             "app.agent.organize_actions.get_organize_manager",
             return_value=manager,
+        ), patch(
+            "app.agent.organize_actions._organize_preview_snapshot",
+            return_value=ToolResult(True, "preview", "preview"),
         ):
-            result = run_guangya_organize_once({})
+            _preview, context = prepare_guangya_organize_run_once({})
+            result = run_guangya_organize_once_confirmed({}, context)
 
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "accepted")
@@ -797,8 +808,11 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         ), patch(
             "app.agent.organize_actions.GuangYaClient",
             return_value=_atomic_clean_client(credential_generation=7),
+        ), patch(
+            "app.agent.organize_actions._organize_preview_snapshot",
+            return_value=ToolResult(True, "preview", "preview"),
         ):
-            expected = organize_confirmation_context({})
+            _preview, expected = prepare_guangya_organize_run_once({})
 
         with patch(
             "app.agent.organize_actions._configured_inputs",
@@ -848,8 +862,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             "app.agent.organize_actions.get_organize_manager",
             return_value=manager,
         ):
-            preview = preview_guangya_organize_stop({})
-            context = organize_stop_confirmation_context({})
+            preview, context = prepare_guangya_organize_stop({})
             result = stop_guangya_organize_confirmed({}, context)
 
         self.assertTrue(preview.ok)
@@ -932,7 +945,7 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             "app.agent.organize_actions.get_organize_manager",
             return_value=manager,
         ):
-            context = organize_stop_confirmation_context({})
+            _preview, context = prepare_guangya_organize_stop({})
             current["id"] = "secret-task-b"
             with self.assertRaises(AgentToolError) as stale:
                 stop_guangya_organize_confirmed({}, context)
@@ -949,11 +962,11 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             manager.task_status.return_value = {
                 "id": "", "status": "idle", "stoppable": False, "started_at": "",
             }
-            idle = preview_guangya_organize_stop({})
+            idle, _context = prepare_guangya_organize_stop({})
             manager.task_status.return_value = {
                 "id": "secret", "status": "running", "stoppable": False, "started_at": "now",
             }
-            atomic = preview_guangya_organize_stop({})
+            atomic, _context = prepare_guangya_organize_stop({})
 
         self.assertFalse(idle.ok)
         self.assertEqual(idle.status, "conflict")
@@ -982,50 +995,58 @@ class GuangYaOrganizeRoutingTests(unittest.TestCase):
             description="run",
             risk=RiskLevel.DANGER,
             parameters={},
-            handler=lambda arguments: (
+            validator=_no_arguments,
+            requires_confirmation=True,
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "preview", "确认后执行"),
+                "stable-context",
+            ),
+            confirmed_handler=lambda arguments, _expected_context: (
                 self.calls.append(("run", dict(arguments)))
                 or ToolResult(True, "accepted", "done")
             ),
-            validator=_no_arguments,
-            requires_confirmation=True,
-            preview_handler=lambda _arguments: ToolResult(
-                True,
-                "preview",
-                "确认后执行",
-            ),
-            confirmation_context=lambda _arguments: "stable-context",
         ))
         registry.register(ToolSpec(
             name="guangya.organize.stop",
             description="stop",
             risk=RiskLevel.DANGER,
             parameters={},
-            handler=lambda arguments: (
-                self.calls.append(("stop", dict(arguments)))
-                or ToolResult(True, "accepted", "stopping", data={"requested": True})
-            ),
             validator=_no_arguments,
             requires_confirmation=True,
-            preview_handler=lambda _arguments: ToolResult(
-                True,
-                "preview",
-                "确认后停止",
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "preview", "确认后停止"),
+                "stable-stop-context",
             ),
-            confirmation_context=lambda _arguments: "stable-stop-context",
+            confirmed_handler=lambda arguments, _expected_context: (
+                self.calls.append(("stop", dict(arguments)))
+                or ToolResult(
+                    True,
+                    "accepted",
+                    "stopping",
+                    data={"requested": True},
+                )
+            ),
         ))
         registry.register(ToolSpec(
             name="guangya.organize.clean_empty",
             description="clean empty",
             risk=RiskLevel.DANGER,
             parameters={},
-            handler=lambda arguments: (
-                self.calls.append(("clean_empty", dict(arguments)))
-                or ToolResult(True, "completed", "cleaned", data={"cleaned": 1})
-            ),
             validator=_no_arguments,
             requires_confirmation=True,
-            preview_handler=lambda _arguments: ToolResult(True, "preview", "确认后清理"),
-            confirmation_context=lambda _arguments: "stable-clean-context",
+            confirmation_preparer=lambda _arguments: (
+                ToolResult(True, "preview", "确认后清理"),
+                "stable-clean-context",
+            ),
+            confirmed_handler=lambda arguments, _expected_context: (
+                self.calls.append(("clean_empty", dict(arguments)))
+                or ToolResult(
+                    True,
+                    "completed",
+                    "cleaned",
+                    data={"cleaned": 1},
+                )
+            ),
         ))
         self.service = AgentOrchestrator(registry)
 
@@ -1042,11 +1063,11 @@ class GuangYaOrganizeRoutingTests(unittest.TestCase):
 
         prepared = self.service.query("立即整理光鸭云盘", owner="owner-a")
         self.assertEqual(prepared["mode"], "confirmation_required")
-        self.assertEqual(prepared["confirmation"]["tool"], "guangya.organize.run_once")
+        self.assertEqual(prepared["tool_call"]["name"], "guangya.organize.run_once")
         self.assertNotIn(("run", {}), self.calls)
 
         confirmed = self.service.confirm(
-            prepared["confirmation"]["confirmation_id"],
+            prepared["action_plan"]["plan_id"],
             owner="owner-a",
         )
         self.assertEqual(confirmed["result"]["status"], "accepted")
@@ -1054,10 +1075,10 @@ class GuangYaOrganizeRoutingTests(unittest.TestCase):
 
         stop_prepared = self.service.query("停止光鸭云盘整理任务", owner="owner-a")
         self.assertEqual(stop_prepared["mode"], "confirmation_required")
-        self.assertEqual(stop_prepared["confirmation"]["tool"], "guangya.organize.stop")
+        self.assertEqual(stop_prepared["tool_call"]["name"], "guangya.organize.stop")
         self.assertNotIn(("stop", {}), self.calls)
         stop_confirmed = self.service.confirm(
-            stop_prepared["confirmation"]["confirmation_id"],
+            stop_prepared["action_plan"]["plan_id"],
             owner="owner-a",
         )
         self.assertEqual(stop_confirmed["result"]["status"], "accepted")
@@ -1068,12 +1089,12 @@ class GuangYaOrganizeRoutingTests(unittest.TestCase):
         clean_prepared = self.service.query("清理光鸭整理源空目录", owner="owner-a")
         self.assertEqual(clean_prepared["mode"], "confirmation_required")
         self.assertEqual(
-            clean_prepared["confirmation"]["tool"],
+            clean_prepared["tool_call"]["name"],
             "guangya.organize.clean_empty",
         )
         self.assertNotIn(("clean_empty", {}), self.calls)
         clean_confirmed = self.service.confirm(
-            clean_prepared["confirmation"]["confirmation_id"],
+            clean_prepared["action_plan"]["plan_id"],
             owner="owner-a",
         )
         self.assertEqual(clean_confirmed["result"]["status"], "completed")
@@ -1211,7 +1232,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
             self.assertEqual(prepared.json()["mode"], "confirmation_required")
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            confirmation_id = prepared.json()["action_plan"]["plan_id"]
             manager.start.assert_not_called()
 
             direct = self.client.post(
@@ -1225,7 +1246,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 202, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "accepted")
@@ -1241,7 +1262,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             self.assertEqual(manager.start.call_count, 1)
@@ -1288,10 +1309,10 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(prepared.status_code, 200, prepared.text)
             self.assertEqual(prepared.json()["mode"], "confirmation_required")
             self.assertEqual(
-                prepared.json()["confirmation"]["tool"],
+                prepared.json()["tool_call"]["name"],
                 "guangya.organize.clean_empty",
             )
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            confirmation_id = prepared.json()["action_plan"]["plan_id"]
             manager.clean_empty.assert_not_called()
 
             direct = self.client.post(
@@ -1305,7 +1326,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 200, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "completed")
@@ -1320,7 +1341,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             self.assertEqual(manager.clean_empty.call_count, 1)
@@ -1338,7 +1359,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers=headers,
                 json={"session_id": "test_session_identifier_0001",
-                    "confirmation_id": stale_prepare.json()["confirmation"]["confirmation_id"]
+                    "plan_id": stale_prepare.json()["action_plan"]["plan_id"]
                 },
             )
             self.assertEqual(stale.status_code, 409, stale.text)
@@ -1407,10 +1428,10 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(prepared.status_code, 200, prepared.text)
             self.assertEqual(prepared.json()["mode"], "confirmation_required")
             self.assertEqual(
-                prepared.json()["confirmation"]["tool"],
+                prepared.json()["tool_call"]["name"],
                 "guangya.organize.stop",
             )
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            confirmation_id = prepared.json()["action_plan"]["plan_id"]
             manager.stop.assert_not_called()
 
             direct = self.client.post(
@@ -1423,7 +1444,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(confirmed.status_code, 202, confirmed.text)
             self.assertEqual(confirmed.json()["result"]["status"], "accepted")
@@ -1435,7 +1456,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             replay = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(replay.status_code, 409, replay.text)
             self.assertEqual(manager.stop.call_count, 1)
@@ -1452,7 +1473,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers=headers,
                 json={"session_id": "test_session_identifier_0001",
-                    "confirmation_id": stale_prepare.json()["confirmation"]["confirmation_id"]
+                    "plan_id": stale_prepare.json()["action_plan"]["plan_id"]
                 },
             )
             self.assertEqual(stale.status_code, 409, stale.text)
@@ -1493,7 +1514,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
                 json={"session_id": "test_session_identifier_0001", "arguments": {}},
             )
             self.assertEqual(prepared.status_code, 200, prepared.text)
-            confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+            confirmation_id = prepared.json()["action_plan"]["plan_id"]
             current["rules"] = OrganizeRules(
                 target_dir_id="target-two",
                 clean_empty=False,
@@ -1502,7 +1523,7 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             stale = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
             self.assertEqual(stale.status_code, 409, stale.text)
             self.assertIn("配置已变化", stale.json()["error"])

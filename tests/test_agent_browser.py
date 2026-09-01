@@ -21,6 +21,28 @@ MAIN_STYLES = ROOT / "app" / "static" / "css" / "main.css"
 AGENT_STYLES = ROOT / "app" / "static" / "css" / "agent.css"
 
 
+def _pending_action_plan(
+    plan_id: str, *, risk: str = "write", expires_in: int = 120
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "plan_id": plan_id,
+        "status": "awaiting_approval",
+        "title": "执行受控操作",
+        "target": "当前选择的对象",
+        "impact": "会执行行动计划中列出的写操作。",
+        "reversibility": "可按对应业务流程撤销或重新调整。",
+        "risk": risk,
+        "preflight_at": "2026-08-31T12:00:00+08:00",
+        "preflight_summary": "预检通过。",
+        "expires_in": expires_in,
+        "decisions": [
+            {"id": "execute", "label": "执行"},
+            {"id": "cancel", "label": "取消"},
+        ],
+    }
+
+
 @unittest.skipIf(sync_playwright is None, "系统环境未安装 Playwright")
 class AgentBrowserTests(unittest.TestCase):
     @classmethod
@@ -102,6 +124,7 @@ class AgentBrowserTests(unittest.TestCase):
             window.__agentPrepareGate = null;
             window.__agentPrepareSignal = null;
             window.__agentConfirmResponse = {};
+            window.__agentConfirmError = null;
             window.__agentSessionsDelayMs = Number(config.sessionsDelayMs || 0);
             window.__agentSessionsResponse = config.sessionsResponse || {sessions: []};
             window.__agentSessionDetails = config.sessionDetails || {};
@@ -116,6 +139,7 @@ class AgentBrowserTests(unittest.TestCase):
                 window.__agentCalls.push({url: requestUrl, method: options.method || 'GET', body: options.body || ''});
                 const method = String(options.method || 'GET').toUpperCase();
                 let payload = window.__agentQueryResponse;
+                let responseStatus = 200;
                 if (requestUrl === '/api/agent/capabilities') {
                     payload = {tools: [{name: 'library.search', requires_confirmation: false}]};
                 } else if (requestUrl === '/api/agent/sessions') {
@@ -229,13 +253,18 @@ class AgentBrowserTests(unittest.TestCase):
                     payload = {discarded: true};
                 } else if (requestUrl.endsWith('/actions/confirm')) {
                     if (window.__agentConfirmGate) await window.__agentConfirmGate;
-                    payload = window.__agentConfirmResponse;
+                    if (window.__agentConfirmError) {
+                        payload = window.__agentConfirmError.payload;
+                        responseStatus = Number(window.__agentConfirmError.status || 500);
+                    } else {
+                        payload = window.__agentConfirmResponse;
+                    }
                 } else if (requestUrl.endsWith('/session/reset')) {
                     if (window.__agentResetGate) await window.__agentResetGate;
                     payload = {reset: true};
                 }
                 return new Response(JSON.stringify(payload), {
-                    status: 200,
+                    status: responseStatus,
                     headers: {'Content-Type': 'application/json'},
                 });
             };
@@ -346,7 +375,9 @@ class AgentBrowserTests(unittest.TestCase):
         self.assertIn("下载队列状态正常", transcript)
 
     def test_late_stream_events_do_not_overwrite_stopped_message(self):
-        self.page.evaluate("window.__agentLateStreamDelayMs = 250")
+        # 全量套件高负载下，250ms 可能先于 Playwright 完成真实点击而结束流，
+        # 给停止操作留出稳定窗口，同时仍等待迟到事件实际到达后再断言。
+        self.page.evaluate("window.__agentLateStreamDelayMs = 2000")
         self.page.locator("#agentPrompt").fill("检查迟到流事件")
         self.page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
         self.page.locator(".agent-streaming").wait_for()
@@ -354,7 +385,7 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.locator("#agentStop").click()
         cancelled = self.page.locator(".agent-cancelled")
         cancelled.wait_for()
-        self.page.wait_for_timeout(450)
+        self.page.wait_for_timeout(2300)
 
         self.assertIn("任务已停止", cancelled.inner_text())
         self.assertNotIn("不应出现的迟到文本", self.page.locator("#agentTranscript").inner_text())
@@ -499,11 +530,9 @@ class AgentBrowserTests(unittest.TestCase):
                 "ok": True, "status": "ready", "summary": "资源提交预检已完成",
                 "data": {}, "evidence": [], "suggestions": [],
             },
-            "confirmation": {
-                "confirmation_id": "confirm-season-demo",
-                "risk": "danger",
-                "expires_in": 120,
-            },
+            "action_plan": _pending_action_plan(
+                "confirm-season-demo", risk="danger"
+            ),
         })
         self._set_query_response({
             "request_id": "season-resource-test",
@@ -753,7 +782,6 @@ class AgentBrowserTests(unittest.TestCase):
             "mode": "confirmation_required",
             "tool_call": {"name": "indexer.submit_resource", "elapsed_ms": 5},
             "result": {"ok": True, "status": "ready", "summary": "资源提交预检已完成", "data": {}, "evidence": [], "suggestions": []},
-            "confirmation": {"confirmation_id": "legacy-confirm-demo", "risk": "danger", "expires_in": 120},
             "action_plan": {
                 "version": 1,
                 "plan_id": "plan-confirm-demo-123456",
@@ -821,7 +849,7 @@ class AgentBrowserTests(unittest.TestCase):
             confirm_body["session_id"],
             r"^[A-Za-z0-9_-]{16,64}$",
         )
-        self.assertEqual(confirm_body["confirmation_id"], "plan-confirm-demo-123456")
+        self.assertEqual(confirm_body["plan_id"], "plan-confirm-demo-123456")
         self.assertEqual(self.page.locator(".agent-confirmation-submit").count(), 0)
 
     def test_new_conversation_aborts_inflight_resource_prepare(self):
@@ -985,10 +1013,7 @@ class AgentBrowserTests(unittest.TestCase):
             "request_id": "reset-confirmation-race",
             "mode": "confirmation_required",
             "tool_call": {"name": "cloud.organize", "elapsed_ms": 4},
-            "confirmation": {
-                "confirmation_id": "confirm-reset-race", "risk": "write", "expires_in": 120,
-                "summary": "等待确认",
-            },
+            "action_plan": _pending_action_plan("confirm-reset-race"),
             "result": {
                 "ok": True, "status": "confirmation_required", "summary": "等待确认",
                 "data": {}, "evidence": [], "suggestions": [],
@@ -1023,12 +1048,7 @@ class AgentBrowserTests(unittest.TestCase):
             "request_id": "active-session-confirmation",
             "mode": "confirmation_required",
             "tool_call": {"name": "cloud.organize", "elapsed_ms": 4},
-            "confirmation": {
-                "confirmation_id": "confirm-active-session",
-                "risk": "write",
-                "expires_in": 120,
-                "summary": "等待确认",
-            },
+            "action_plan": _pending_action_plan("confirm-active-session"),
             "result": {
                 "ok": True,
                 "status": "confirmation_required",
@@ -1090,9 +1110,9 @@ class AgentBrowserTests(unittest.TestCase):
             "request_id": "confirm-countdown-race",
             "mode": "confirmation_required",
             "tool_call": {"name": "cloud.organize", "elapsed_ms": 4},
-            "confirmation": {
-                "confirmation_id": "confirm-countdown-race", "risk": "write", "expires_in": 1,
-            },
+            "action_plan": _pending_action_plan(
+                "confirm-countdown-race", expires_in=1
+            ),
             "result": {
                 "ok": True, "status": "confirmation_required", "summary": "等待确认",
                 "data": {}, "evidence": [], "suggestions": [],
@@ -1126,6 +1146,72 @@ class AgentBrowserTests(unittest.TestCase):
         self.page.wait_for_function("document.querySelectorAll('.agent-confirmation-submit').length === 0")
         self.assertIn("任务已提交", self.page.locator("#agentTranscript").inner_text())
         self.assertFalse(self.page.locator("#agentNewSession").is_disabled())
+
+    def test_runtime_disable_confirm_error_preserves_card_for_same_plan_retry(self):
+        plan_id = "runtime-retry-plan-123456"
+        self._set_query_response({
+            "request_id": "runtime-retry-query",
+            "mode": "confirmation_required",
+            "tool_call": {"name": "strm.run_once", "elapsed_ms": 4},
+            "action_plan": _pending_action_plan(plan_id, expires_in=120),
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "等待确认",
+                "data": {},
+                "evidence": [],
+                "suggestions": [],
+            },
+        })
+        self.page.evaluate("""() => {
+            window.__agentConfirmError = {
+                status: 409,
+                payload: {
+                    error: 'Media Agent 已关闭',
+                    code: 'agent_runtime_disabled',
+                    retryable: true,
+                },
+            };
+            window.__agentConfirmResponse = {
+                request_id: 'runtime-retry-confirmed',
+                mode: 'confirmed_action',
+                tool_call: {name: 'strm.run_once', elapsed_ms: 6},
+                action_plan: {status: 'completed'},
+                result: {
+                    ok: true,
+                    status: 'accepted',
+                    summary: 'STRM 同步已提交',
+                    data: {},
+                    evidence: [],
+                    suggestions: [],
+                },
+            };
+        }""")
+        self.page.locator("#agentPrompt").fill("立即执行 STRM 同步")
+        self.page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+        card = self.page.locator(".agent-confirmation-card")
+        card.wait_for()
+        deadline = card.get_attribute("data-plan-expires-at")
+
+        self.page.locator(".agent-confirmation-submit").click()
+        self.page.get_by_text(
+            "Media Agent 状态已变化，本次未执行；重新启用后可再次点击执行。",
+            exact=True,
+        ).wait_for()
+        self.assertEqual(card.get_attribute("data-plan-id"), plan_id)
+        self.assertEqual(card.get_attribute("data-plan-expires-at"), deadline)
+        self.assertNotIn("is-expired", card.get_attribute("class") or "")
+        self.assertFalse(self.page.locator(".agent-confirmation-submit").is_disabled())
+        self.assertFalse(self.page.locator(".agent-confirmation-cancel").is_disabled())
+
+        self.page.evaluate("window.__agentConfirmError = null")
+        self.page.locator(".agent-confirmation-submit").click()
+        self.page.get_by_text("STRM 同步已提交", exact=True).wait_for()
+        confirm_calls = self.page.evaluate("""() => window.__agentCalls.filter(
+            call => call.url.endsWith('/actions/confirm')
+        )""")
+        self.assertEqual(len(confirm_calls), 2)
+        self.assertTrue(all(json.loads(call["body"])["plan_id"] == plan_id for call in confirm_calls))
 
     def test_session_delete_requires_two_deliberate_clicks(self):
         session_id = "agent_session_history_0001"

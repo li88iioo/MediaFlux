@@ -188,10 +188,6 @@ def prepare_set_recognition_rule_enabled(
     return preview, _fingerprint(snapshot)
 
 
-def set_recognition_rule_enabled(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("识别规则启停需要确认", code="confirmation_required")
-
-
 def _update_enabled(conn: Any, *, rule_type: str, rule_id: int, enabled: bool) -> None:
     disabled = 0 if enabled else 1
     timestamp = db.now()

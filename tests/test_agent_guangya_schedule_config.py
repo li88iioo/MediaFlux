@@ -16,8 +16,7 @@ from app.agent import guangya_schedule_config_actions
 from app.agent.guangya_schedule_config_actions import (
     get_guangya_connection_status,
     guangya_organize_schedule_policy_arguments,
-    guangya_organize_schedule_policy_confirmation_context,
-    preview_set_guangya_organize_schedule_policy,
+    prepare_guangya_organize_schedule_policy_confirmation,
     summarize_guangya_organize_schedule_policy,
 )
 from app.agent.models import RiskLevel
@@ -187,9 +186,10 @@ class GuangyaSchedulePolicyUnitTests(unittest.TestCase):
                 return_value=scheduler,
             ):
                 summary = summarize_guangya_organize_schedule_policy({})
-                preview = preview_set_guangya_organize_schedule_policy({"enabled": True})
-                context = guangya_organize_schedule_policy_confirmation_context(
-                    {"enabled": True}
+                preview, context = (
+                    prepare_guangya_organize_schedule_policy_confirmation(
+                        {"enabled": True}
+                    )
                 )
         rendered = repr((summary.to_dict(), preview.to_dict(), context))
         self.assertNotIn(secret, rendered)
@@ -327,7 +327,7 @@ class GuangyaSchedulePolicyApiTests(IsolatedDatabaseTestCase):
         body = prepared.json()
         self.assertEqual(body["mode"], "confirmation_required")
         self.assertEqual(
-            body["confirmation"]["tool"],
+            body["tool_call"]["name"],
             "guangya.organize.set_schedule_policy",
         )
         self.assertEqual(
@@ -344,7 +344,7 @@ class GuangyaSchedulePolicyApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
                 json={"session_id": "test_session_identifier_0001",
-                    "confirmation_id": body["confirmation"]["confirmation_id"]
+                    "plan_id": body["action_plan"]["plan_id"]
                 },
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
@@ -358,7 +358,7 @@ class GuangyaSchedulePolicyApiTests(IsolatedDatabaseTestCase):
         replay = self.client.post(
             "/api/agent/actions/confirm",
             headers={"X-CSRF-Token": csrf},
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+            json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
         )
         self.assertEqual(replay.status_code, 409, replay.text)
 
@@ -394,7 +394,7 @@ class GuangyaSchedulePolicyApiTests(IsolatedDatabaseTestCase):
             "/api/agent/actions/confirm",
             headers=headers,
             json={"session_id": "test_session_identifier_0001",
-                "confirmation_id": prepared.json()["confirmation"]["confirmation_id"]
+                "plan_id": prepared.json()["action_plan"]["plan_id"]
             },
         )
         self.assertEqual(stale.status_code, 409, stale.text)
@@ -413,9 +413,7 @@ class GuangyaSchedulePolicyApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers=headers,
                 json={"session_id": "test_session_identifier_0001",
-                    "confirmation_id": prepared.json()["confirmation"][
-                        "confirmation_id"
-                    ]
+                    "plan_id": prepared.json()["action_plan"]["plan_id"]
                 },
             )
         self.assertEqual(failed.status_code, 503, failed.text)
@@ -435,9 +433,7 @@ class GuangyaSchedulePolicyApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
                 json={"session_id": "test_session_identifier_0001",
-                    "confirmation_id": prepared.json()["confirmation"][
-                        "confirmation_id"
-                    ]
+                    "plan_id": prepared.json()["action_plan"]["plan_id"]
                 },
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)

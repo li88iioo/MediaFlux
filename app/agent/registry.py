@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-import secrets
 from time import monotonic
 from typing import Any
 
@@ -56,8 +55,6 @@ class ToolRegistry:
             raise ValueError(f"read-only tool cannot require confirmation: {name}")
         if spec.confirmed_handler is not None and not spec.requires_confirmation:
             raise ValueError(f"confirmed handler requires confirmation: {name}")
-        if spec.confirmation_state_cleaner is not None and not spec.requires_confirmation:
-            raise ValueError(f"confirmation state cleaner requires confirmation: {name}")
         if spec.confirmation_preparer is not None and not spec.requires_confirmation:
             raise ValueError(f"confirmation preparer requires confirmation: {name}")
         if spec.context_confirmation_preparer is not None and not spec.requires_confirmation:
@@ -68,6 +65,34 @@ class ToolRegistry:
             raise ValueError(f"duplicate confirmation preparer modes: {name}")
         if spec.confirmed_handler is not None and spec.context_confirmed_handler is not None:
             raise ValueError(f"duplicate confirmed handler modes: {name}")
+        if spec.handler is not None and spec.context_handler is not None:
+            raise ValueError(f"duplicate direct handler modes: {name}")
+        if spec.requires_confirmation:
+            if spec.handler is not None or spec.context_handler is not None:
+                raise ValueError(
+                    f"confirmation tool cannot register direct handler: {name}"
+                )
+            if (
+                spec.confirmation_preparer is None
+                and spec.context_confirmation_preparer is None
+            ):
+                raise ValueError(f"confirmation tool requires preparer: {name}")
+            if (
+                spec.confirmed_handler is None
+                and spec.context_confirmed_handler is None
+            ):
+                raise ValueError(f"confirmation tool requires confirmed handler: {name}")
+        elif spec.handler is None and spec.context_handler is None:
+            raise ValueError(f"tool requires handler: {name}")
+        if spec.confirmation_preparer is not None and spec.confirmed_handler is None:
+            raise ValueError(f"confirmation preparer requires confirmed handler: {name}")
+        if (
+            spec.context_confirmation_preparer is not None
+            and spec.context_confirmed_handler is None
+        ):
+            raise ValueError(
+                f"context confirmation preparer requires context confirmed handler: {name}"
+            )
         if spec.llm_read and (spec.risk is not RiskLevel.READ or spec.requires_confirmation):
             raise ValueError(f"LLM read tool must be confirmation-free READ: {name}")
         if spec.llm_read_plan and not spec.llm_read:
@@ -99,8 +124,7 @@ class ToolRegistry:
             spec.risk is RiskLevel.READ
             or not spec.requires_confirmation
             or (
-                spec.preview_handler is None
-                and spec.confirmation_preparer is None
+                spec.confirmation_preparer is None
                 and spec.context_confirmation_preparer is None
             )
         ):
@@ -230,7 +254,7 @@ class ToolRegistry:
         return self._get_spec(name).risk
 
     def result_presentation_for(self, name: str) -> str:
-        """返回工具声明的结果展示语义，并兼容旧 ToolSpec。"""
+        """返回工具声明的结果展示语义。"""
         spec = self._get_spec(name)
         if spec.result_presentation != "narrative":
             return spec.result_presentation
@@ -277,7 +301,10 @@ class ToolRegistry:
                 normalized,
                 context or ToolContext(),
             )
-        return self._call(spec.name, spec.handler, normalized, context or ToolContext())
+        handler = spec.handler
+        if handler is None:  # pragma: no cover - register() 已保证只读工具具备执行器
+            raise AgentToolError("该工具不可执行", code="tool_not_executable")
+        return self._call(spec.name, handler, normalized, context or ToolContext())
 
     def prepare_confirmation(
         self,
@@ -287,17 +314,10 @@ class ToolRegistry:
         context: ToolContext | None = None,
     ) -> tuple[ToolSpec, dict[str, Any], str, ToolResult, int]:
         spec = self._get_spec(name)
-        self._clear_confirmation_state(spec)
-        if (
-            spec.risk is RiskLevel.READ
-            or not spec.requires_confirmation
-            or (
-                spec.preview_handler is None
-                and spec.confirmation_preparer is None
-                and spec.context_confirmation_preparer is None
+        if spec.risk is RiskLevel.READ or not spec.requires_confirmation:
+            raise AgentToolError(
+                "该工具不支持确认执行", code="confirmation_not_supported"
             )
-        ):
-            raise AgentToolError("该工具不支持确认执行", code="confirmation_not_supported")
         normalized = self._normalize_arguments(spec, arguments)
         if spec.context_confirmation_preparer is not None:
             result, context_fingerprint, elapsed_ms = self._call_context_preparer(
@@ -313,29 +333,15 @@ class ToolRegistry:
                 normalized,
                 context or ToolContext(),
             )
-        else:
-            result, elapsed_ms = self._call(
-                spec.name, spec.preview_handler, normalized, context or ToolContext()
+        else:  # pragma: no cover - register() 已保证确认工具具备唯一预检器
+            raise AgentToolError(
+                "该工具不支持确认执行", code="confirmation_not_supported"
             )
-            context_fingerprint = ""
-            if spec.confirmation_context is not None:
-                try:
-                    context_fingerprint = str(spec.confirmation_context(dict(normalized)) or "")
-                except Exception as exc:
-                    self._clear_confirmation_state(spec)
-                    logger.warning(
-                        "Agent 确认上下文生成失败 tool=%s type=%s",
-                        spec.name,
-                        type(exc).__name__,
-                    )
-                    raise AgentToolError(
-                        "暂时无法创建确认请求",
-                        code="confirmation_unavailable",
-                    ) from exc
         if not result.ok:
-            self._clear_confirmation_state(spec)
-            raise AgentToolError(result.error or result.summary or "动作预检未通过", code="precondition_failed")
-        self._clear_confirmation_state(spec)
+            raise AgentToolError(
+                result.error or result.summary or "动作预检未通过",
+                code="precondition_failed",
+            )
         return spec, normalized, context_fingerprint, result, elapsed_ms
 
     def execute_confirmed(
@@ -347,42 +353,31 @@ class ToolRegistry:
         context: ToolContext | None = None,
     ) -> tuple[ToolResult, int]:
         spec = self._get_spec(name)
-        self._clear_confirmation_state(spec)
         if spec.risk is RiskLevel.READ or not spec.requires_confirmation:
-            raise AgentToolError("该工具不支持确认执行", code="confirmation_not_supported")
+            raise AgentToolError(
+                "该工具不支持确认执行", code="confirmation_not_supported"
+            )
         normalized = self._normalize_arguments(spec, arguments)
-        if spec.confirmation_context is not None:
-            try:
-                current_context = str(spec.confirmation_context(dict(normalized)) or "")
-            except Exception as exc:
-                logger.warning("Agent 确认上下文校验失败 tool=%s type=%s", spec.name, type(exc).__name__)
-                raise AgentToolError("确认请求已失效，请重新预检", code="confirmation_stale") from exc
-            if not secrets.compare_digest(current_context, str(expected_context or "")):
-                self._clear_confirmation_state(spec)
-                raise AgentToolError("相关配置已变化，请重新预检", code="confirmation_stale")
-        try:
-            if spec.context_confirmed_handler is not None:
-                result, elapsed_ms = self._call_context_confirmed(
-                    spec.name,
-                    spec.context_confirmed_handler,
-                    normalized,
-                    str(expected_context or ""),
-                    context or ToolContext(),
-                )
-            elif spec.confirmed_handler is not None:
-                result, elapsed_ms = self._call_confirmed(
-                    spec.name,
-                    spec.confirmed_handler,
-                    normalized,
-                    str(expected_context or ""),
-                    context or ToolContext(),
-                )
-            else:
-                result, elapsed_ms = self._call(
-                    spec.name, spec.handler, normalized, context or ToolContext()
-                )
-        finally:
-            self._clear_confirmation_state(spec)
+        if spec.context_confirmed_handler is not None:
+            result, elapsed_ms = self._call_context_confirmed(
+                spec.name,
+                spec.context_confirmed_handler,
+                normalized,
+                str(expected_context or ""),
+                context or ToolContext(),
+            )
+        elif spec.confirmed_handler is not None:
+            result, elapsed_ms = self._call_confirmed(
+                spec.name,
+                spec.confirmed_handler,
+                normalized,
+                str(expected_context or ""),
+                context or ToolContext(),
+            )
+        else:  # pragma: no cover - register() 已保证确认工具具备唯一执行器
+            raise AgentToolError(
+                "该工具不支持确认执行", code="confirmation_not_supported"
+            )
         if result.ok and spec.post_write_verifier is not None:
             result, verify_elapsed_ms = self._call_post_write_verifier(
                 spec.name,
@@ -392,20 +387,6 @@ class ToolRegistry:
             )
             elapsed_ms += verify_elapsed_ms
         return result, elapsed_ms
-
-    @staticmethod
-    def _clear_confirmation_state(spec: ToolSpec) -> None:
-        cleaner = spec.confirmation_state_cleaner
-        if cleaner is None:
-            return
-        try:
-            cleaner()
-        except Exception as exc:
-            logger.warning(
-                "Agent 确认临时状态清理失败 tool=%s type=%s",
-                spec.name,
-                type(exc).__name__,
-            )
 
     def _get_spec(self, name: str) -> ToolSpec:
         tool_name = str(name or "").strip()
@@ -476,6 +457,25 @@ class ToolRegistry:
         return verified, elapsed_ms
 
     @staticmethod
+    def _confirmation_preparer_output(value: Any) -> tuple[ToolResult, str]:
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise TypeError("confirmation preparer must return (ToolResult, fingerprint)")
+        result, fingerprint = value
+        if not isinstance(result, ToolResult):
+            raise TypeError("confirmation preparer returned invalid ToolResult")
+        if fingerprint is None:
+            return result, ""
+        if type(fingerprint) is not str:
+            raise TypeError("confirmation preparer returned invalid fingerprint")
+        return result, fingerprint
+
+    @staticmethod
+    def _confirmed_tool_result(value: Any) -> ToolResult:
+        if not isinstance(value, ToolResult):
+            raise TypeError("confirmed handler returned invalid ToolResult")
+        return value
+
+    @staticmethod
     def _call_context_preparer(
         tool_name: str,
         handler: ContextualConfirmationPreparer,
@@ -484,7 +484,9 @@ class ToolRegistry:
     ) -> tuple[ToolResult, str, int]:
         started = monotonic()
         try:
-            result, fingerprint = handler(arguments, context)
+            result, fingerprint = ToolRegistry._confirmation_preparer_output(
+                handler(arguments, context)
+            )
         except AgentToolError:
             elapsed_ms = max(0, int((monotonic() - started) * 1000))
             agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
@@ -502,7 +504,7 @@ class ToolRegistry:
             ) from exc
         elapsed_ms = max(0, int((monotonic() - started) * 1000))
         agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=result.ok)
-        return result, str(fingerprint or ""), elapsed_ms
+        return result, fingerprint, elapsed_ms
 
     @staticmethod
     def _call_context_confirmed(
@@ -514,7 +516,9 @@ class ToolRegistry:
     ) -> tuple[ToolResult, int]:
         started = monotonic()
         try:
-            result = handler(arguments, expected_context, context)
+            result = ToolRegistry._confirmed_tool_result(
+                handler(arguments, expected_context, context)
+            )
         except AgentToolError:
             elapsed_ms = max(0, int((monotonic() - started) * 1000))
             agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
@@ -544,7 +548,9 @@ class ToolRegistry:
     ) -> tuple[ToolResult, str, int]:
         started = monotonic()
         try:
-            result, fingerprint = handler(arguments)
+            result, fingerprint = ToolRegistry._confirmation_preparer_output(
+                handler(arguments)
+            )
         except AgentToolError:
             elapsed_ms = max(0, int((monotonic() - started) * 1000))
             agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)
@@ -563,7 +569,7 @@ class ToolRegistry:
             ) from exc
         elapsed_ms = max(0, int((monotonic() - started) * 1000))
         agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=result.ok)
-        return result, str(fingerprint or ""), elapsed_ms
+        return result, fingerprint, elapsed_ms
 
     @staticmethod
     def _call_confirmed(
@@ -575,7 +581,9 @@ class ToolRegistry:
     ) -> tuple[ToolResult, int]:
         started = monotonic()
         try:
-            result = handler(arguments, expected_context)
+            result = ToolRegistry._confirmed_tool_result(
+                handler(arguments, expected_context)
+            )
         except AgentToolError:
             elapsed_ms = max(0, int((monotonic() - started) * 1000))
             agent_metrics.record_tool(tool_name, elapsed_ms=elapsed_ms, ok=False)

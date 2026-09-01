@@ -18,27 +18,22 @@ from app import database as db
 from app.agent.action_plan import (
     action_plan_model_context,
     build_action_plan,
+    sanitize_action_plan,
 )
 from app.agent.action_history import (
-    record_confirmation_claimed,
     record_confirmation_error,
     record_confirmation_interrupted,
     record_confirmed_result,
 )
 from app.agent.capability_retrieval import capability_semantics, infer_media_intent
 from app.agent.objective_contract import infer_agent_objective
-from app.agent.confirmation import (
-    ConfirmationStore,
-    SQLiteConfirmationStore,
-    confirmation_reply_intent,
-)
+from app.agent.confirmation import ConfirmationStore, SQLiteConfirmationStore
 from app.agent.confirmation_contract import (
     build_confirmation_contract,
-    sanitize_confirmation_contract,
 )
 from app.agent.media_case import normalize_media_case_stage
 from app.agent.media_facts import absolute_episode_answer, derive_media_facts
-from app.agent.models import LLMToolDisposition, RiskLevel, ToolContext, ToolResult
+from app.agent.models import LLMToolDisposition, RiskLevel, ToolResult
 from app.agent.metrics import agent_metrics
 from app.agent.messages import (
     AGENT_RATE_LIMITED,
@@ -69,10 +64,8 @@ from app.agent.llm_router import (
     compose_tool_answer,
     is_agent_action_request,
     is_compound_read_request,
-    is_confirmation_planning_request,
     reset_llm_request_budget,
     run_native_read_agent,
-    select_confirmation_tool,
     select_orchestration_tool,
     select_read_tool,
     select_read_plan,
@@ -101,6 +94,7 @@ from app.agent.recent_download_submissions import (
     sanitize_submission_confirmation_result,
 )
 from app.agent.episode_audit import invalidate_episode_audit_cache
+from app.agent.feature_gate import invalidate_agent_runtime_generation
 from app.agent.progress_events import emit_agent_progress
 from app.agent.rate_limit import allow_agent_tool
 from app.agent.registry import AgentToolError, ToolRegistry
@@ -119,8 +113,13 @@ from app.agent.turn_runtime import (
     begin_agent_turn,
     reset_agent_turn,
 )
+from app.indexers.errors import IndexerResultExpired, IndexerResultNotFound
 
 logger = logging.getLogger(__name__)
+_EXPIRED_RESOURCE_RESULT_MESSAGES = frozenset({
+    IndexerResultNotFound.default_public_message,
+    IndexerResultExpired.default_public_message,
+})
 _QUERY_CONFIRMATION_EPOCH: ContextVar[tuple[str, int] | None] = ContextVar(
     "agent_query_confirmation_epoch", default=None
 )
@@ -151,6 +150,15 @@ _NATIVE_RESOURCE_CAPTURE: ContextVar[_NativeResourceCapture | None] = ContextVar
 _CONFIRMATION_FALLBACK_NARRATIVE = (
     "操作尚未执行。预检已完成，请核对下面的影响范围；只有确认后系统才会执行。"
 )
+
+
+def _strict_confirmation_generation(value: Any) -> int:
+    if type(value) is not int or value <= 0:
+        raise AgentToolError(
+            "确认请求代次无效，请重新生成确认请求",
+            code="confirmation_invalid",
+        )
+    return value
 
 
 def _safe_confirmation_narrative(value: str) -> str:
@@ -5723,13 +5731,10 @@ def _is_pure_negated_danger_action_message(message: str) -> bool:
 
 
 def _is_confirmation_response(response: Any) -> bool:
-    """响应侧防线：只读/否定请求不得接受任何确认票据。"""
+    """响应侧防线：只读/否定请求拒绝任何确认模式响应。"""
     return bool(
         isinstance(response, dict)
-        and (
-            str(response.get("mode") or "").strip() == "confirmation_required"
-            or isinstance(response.get("confirmation"), dict)
-        )
+        and str(response.get("mode") or "").strip() == "confirmation_required"
     )
 
 
@@ -5791,22 +5796,14 @@ class AgentOrchestrator:
         persisted = 0
         if self.session_context_repository is not None:
             try:
-                invalidate_owner = getattr(
-                    self.session_context_repository, "invalidate_owner", None
+                persisted = self.session_context_repository.invalidate_owner(
+                    owner=owner_key,
+                    context_types=(
+                        "discovery_mapping",
+                        "directory_scrape",
+                        "local_media_tasks",
+                    ),
                 )
-                if callable(invalidate_owner):
-                    persisted = invalidate_owner(
-                        owner=owner_key,
-                        context_types=(
-                            "discovery_mapping",
-                            "directory_scrape",
-                            "local_media_tasks",
-                        ),
-                    )
-                else:
-                    persisted = self.session_context_repository.delete_owner(
-                        owner=owner_key
-                    )
             except Exception as exc:
                 logger.warning("Agent 会话持久化上下文清理失败 type=%s", type(exc).__name__)
                 raise AgentToolError("会话重置暂时无法完成，请稍后重试") from exc
@@ -5884,7 +5881,13 @@ class AgentOrchestrator:
             response["action_plan"] = plan
         return response
 
-    def discard_confirmation(self, confirmation_id: str, *, owner: str) -> bool:
+    def discard_confirmation(
+        self,
+        confirmation_id: str,
+        *,
+        owner: str,
+        advance_owner_epoch: bool = True,
+    ) -> bool:
         ticket = next(
             (
                 item
@@ -5908,7 +5911,7 @@ class AgentOrchestrator:
                 and owner_key
                 and secrets.compare_digest(query_epoch[0], owner_key)
             )
-            if not in_current_query:
+            if advance_owner_epoch and not in_current_query:
                 self.invalidate_query_confirmation_epoch(owner=owner_key)
             agent_metrics.record_confirmation("discarded")
             ref = workflow_ref_from_context(
@@ -5940,72 +5943,6 @@ class AgentOrchestrator:
             )
             return 0
 
-    def resolve_confirmation_reply(
-        self,
-        value: Any,
-        *,
-        owner: str,
-        request_id: str = "",
-        session_id: str = "",
-    ) -> dict[str, Any] | None:
-        """在新查询轮换确认世代前，确定性处理唯一待确认票据。"""
-        intent = confirmation_reply_intent(value)
-        if intent is None:
-            return None
-        owner_key = str(owner or "").strip()
-        if not owner_key:
-            raise AgentToolError("当前会话无法处理确认请求", code="confirmation_invalid")
-        tickets = self.confirmation_store.list_active_tickets(owner=owner_key)
-        self._reconcile_missing_confirmations(owner_key, tickets)
-        if not tickets:
-            return self._clarification_response(
-                "当前没有等待确认的操作，或者原确认窗口已经过期。",
-                ["重新提交原任务生成新的预检"],
-            )
-        if len(tickets) != 1:
-            return self._clarification_response(
-                "当前有多个等待确认的操作。为避免执行错误，请在对应确认卡片上选择确认或取消。",
-                ["在目标确认卡片上点击确认并执行", "取消不需要的确认卡片"],
-            )
-        ticket = tickets[0]
-        if intent == "confirm":
-            return self.confirm(
-                ticket.confirmation_id,
-                owner=owner_key,
-                request_id=request_id,
-                session_id=session_id,
-            )
-
-        discarded = self.discard_confirmation(
-            ticket.confirmation_id,
-            owner=owner_key,
-        )
-        if not discarded:
-            return self._clarification_response(
-                "确认票据已经失效，没有执行任何写操作。",
-                ["重新提交原任务生成新的预检"],
-            )
-        action = result_projection.sanitize_public_text(
-            ticket.confirmation_contract.get("action"), limit=120
-        ) or "本次受控操作"
-        result = ToolResult(
-            ok=True,
-            status="cancelled",
-            summary=f"已取消“{action}”，没有执行任何写操作。",
-            suggestions=["需要时可以重新提交原任务生成新的预检。"],
-        )
-        response = self._response(
-            ticket.tool_name,
-            {},
-            result,
-            0,
-            mode="cancelled_action",
-            request_id=request_id,
-        )
-        return self._attach_terminal_action_plan(
-            response, ticket=ticket, status="cancelled"
-        )
-
     def capabilities(self) -> dict[str, Any]:
         return {"tools": self.registry.capabilities(), "mode": "confirmation_gated"}
 
@@ -6029,13 +5966,11 @@ class AgentOrchestrator:
         trace_context = current_tool_context(
             owner=owner, request_id=request_id, session_id=session_id
         )
-        normalized_arguments = arguments or {}
-        if isinstance(self.registry, ToolRegistry):
-            # 最近重试必须保存 handler 实际收到的默认值/规范化参数；同时保留
-            # 轻量测试 registry 仅实现既有 execute() 契约的兼容性。
-            normalized_arguments = self.registry.validate_read_call(
-                tool_name, normalized_arguments
-            )
+        # 最近重试必须保存 handler 实际收到的默认值/规范化参数；编排器只
+        # 接受完整 ToolRegistry 契约，不再为测试型简化 registry 保留旁路。
+        normalized_arguments = self.registry.validate_read_call(
+            tool_name, arguments or {}
+        )
         emit_agent_progress("tool_start", tool_name=tool_name)
         try:
             result, elapsed_ms = self.registry.execute(
@@ -6434,7 +6369,13 @@ class AgentOrchestrator:
                 followup_context={"kind": "resource_batch", "items": followup_items},
             )
         except AgentToolError as exc:
-            if exc.code != "confirmation_unavailable":
+            if not (
+                exc.code == "confirmation_unavailable"
+                or (
+                    exc.code == "precondition_failed"
+                    and exc.safe_message in _EXPIRED_RESOURCE_RESULT_MESSAGES
+                )
+            ):
                 raise
             return self._response(
                 "indexer.submit_resource_batch",
@@ -6561,7 +6502,13 @@ class AgentOrchestrator:
                         "revision": workflow_ref.revision,
                     },
                 )
-            if exc.code != "confirmation_unavailable":
+            if not (
+                exc.code == "confirmation_unavailable"
+                or (
+                    exc.code == "precondition_failed"
+                    and exc.safe_message in _EXPIRED_RESOURCE_RESULT_MESSAGES
+                )
+            ):
                 raise
             return self._response(
                 "indexer.submit_resource",
@@ -6908,7 +6855,7 @@ class AgentOrchestrator:
         owner_generation = (
             self.confirmation_store.owner_generation(owner=owner)
             if expected_owner_generation is None
-            else int(expected_owner_generation)
+            else _strict_confirmation_generation(expected_owner_generation)
         )
         emit_agent_progress("preview_start", tool_name=tool_name)
         try:
@@ -6948,13 +6895,6 @@ class AgentOrchestrator:
             "mode": "confirmation_required",
             "tool_call": {"name": spec.name, "elapsed_ms": elapsed_ms},
             "result": preview.to_dict(),
-            "confirmation": {
-                "confirmation_id": ticket.confirmation_id,
-                "tool": spec.name,
-                "risk": spec.risk.value,
-                "expires_in": self.confirmation_store.ttl_seconds,
-                "contract": sanitize_confirmation_contract(ticket.confirmation_contract),
-            },
             "action_plan": build_action_plan(
                 plan_id=ticket.confirmation_id,
                 confirmation_contract=ticket.confirmation_contract,
@@ -7158,44 +7098,18 @@ class AgentOrchestrator:
             owner=owner, request_id=request_id, session_id=session_id
         )
         try:
-            claim_and_rotate = getattr(
-                self.confirmation_store, "claim_and_rotate_owner", None
+            ticket = self.confirmation_store.claim_and_rotate_owner(
+                owner=owner,
+                confirmation_id=confirmation_id,
+                record_execution=self.record_actions,
+                execution_risk_for=self.registry.risk_for,
             )
-            if callable(claim_and_rotate):
-                builtin_store = isinstance(
-                    self.confirmation_store,
-                    (ConfirmationStore, SQLiteConfirmationStore),
-                )
-                claim_kwargs = {
-                    "owner": owner,
-                    "confirmation_id": confirmation_id,
-                }
-                if builtin_store:
-                    claim_kwargs["record_execution"] = self.record_actions
-                    claim_kwargs["execution_risk_for"] = self.registry.risk_for
-                ticket = claim_and_rotate(**claim_kwargs)
-                self._reconcile_missing_confirmations(owner, ())
-            else:
-                builtin_store = False
-                ticket = self.confirmation_store.claim(
-                    owner=owner, confirmation_id=confirmation_id
-                )
-                # 兼容外部自定义 store；内置 store 会在同一事务中领取并推进 epoch。
-                self.invalidate_query_confirmation_epoch(owner=owner)
+            self._reconcile_missing_confirmations(owner, ())
         except AgentToolError:
             agent_metrics.record_confirmation("invalid")
             raise
         agent_metrics.record_confirmation("claimed")
         risk = self.registry.risk_for(ticket.tool_name)
-        if self.record_actions and not builtin_store:
-            record_confirmation_claimed(
-                owner=owner,
-                confirmation_id=ticket.confirmation_id,
-                owner_generation=ticket.owner_generation,
-                tool_name=ticket.tool_name,
-                risk=risk,
-                confirmation_contract=ticket.confirmation_contract,
-            )
         try:
             result, elapsed_ms = self.registry.execute_confirmed(
                 ticket.tool_name,
@@ -7226,6 +7140,12 @@ class AgentOrchestrator:
                     confirmation_contract=ticket.confirmation_contract,
                 )
             raise
+        if result.ok:
+            # 所有确认工具都是受控写操作。统一在服务层推进运行代次，避免
+            # Web/TG 或具体工具各自维护“哪些写入会让旧读结果失效”的名单。
+            # 生产调用在 agent_runtime_admission 终态窗口内执行，因此旧请求
+            # 只能在本次写入完成后取得锁，并会因代次变化而拒绝迟到发布。
+            invalidate_agent_runtime_generation()
         if ticket.tool_name == "indexer.submit_resource_batch":
             raw_items = result.data.get("items") if isinstance(result.data, dict) else None
             context_items = (
@@ -7356,6 +7276,12 @@ class AgentOrchestrator:
                         f"{public_result.summary}。{str(followup_result.get('summary') or '').strip()}"
                     ).strip("。")
                     followup["mode"] = "confirmed_action"
+                    followup = attach_response_contract(
+                        followup,
+                        task_kind="action",
+                        presentation="resource_candidates",
+                        resource_candidates="primary",
+                    )
                     followup = result_projection.attach_public_display(followup)
                     return self._attach_terminal_action_plan(
                         followup, ticket=ticket, status="completed"
@@ -7425,9 +7351,17 @@ class AgentOrchestrator:
         try:
             llm_budget_token = begin_llm_request_budget(llm_rate_owner or owner)
             owner_key = str(owner or "").strip()
-            if confirmation_owner_generation is not None and owner_key:
+            if confirmation_owner_generation is not None:
+                owner_generation = _strict_confirmation_generation(
+                    confirmation_owner_generation
+                )
+                if not owner_key:
+                    raise AgentToolError(
+                        "当前会话无法创建确认请求",
+                        code="confirmation_invalid",
+                    )
                 confirmation_token = _QUERY_CONFIRMATION_EPOCH.set(
-                    (owner_key, int(confirmation_owner_generation))
+                    (owner_key, owner_generation)
                 )
             query_rate_identity = str(query_tool_rate_identity or "").strip()
             if query_rate_identity:
@@ -8007,10 +7941,8 @@ class AgentOrchestrator:
                 execution
                 for execution in executions
                 if isinstance(execution.get("response"), dict)
-                and (
-                    execution["response"].get("mode") == "confirmation_required"
-                    or isinstance(execution["response"].get("confirmation"), dict)
-                )
+                and execution["response"].get("mode") == "confirmation_required"
+                and sanitize_action_plan(execution["response"].get("action_plan"))
             ),
             None,
         )
