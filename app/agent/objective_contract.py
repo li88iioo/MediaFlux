@@ -1355,8 +1355,8 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             any(year >= date.today().year for year in years)
             or any(marker in text for marker in ("今年", "最新", "近期", "即将", "待播"))
             or re.search(
-                rf"(?:最近|近期).{{0,16}}(?:有|有哪些|推荐).{{0,8}}"
-                rf"(?:新剧|新番|新动画|国漫|国创)",
+                r"(?:最近|近期).{0,16}(?:有|有哪些|推荐).{0,8}"
+                r"(?:新剧|新番|新动画|国漫|国创)",
                 text,
                 re.IGNORECASE,
             )

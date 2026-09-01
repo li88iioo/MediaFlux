@@ -1,11 +1,8 @@
 """页面路由、看板样式与设置页遥测联动测试。"""
 from __future__ import annotations
 
-import re
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD_CSS = ROOT / "app" / "static" / "css" / "dashboard-workbench.css"
@@ -104,7 +101,7 @@ class PagesUiContractTests(unittest.TestCase):
         self.assertRegex(media_recent_html, r"css/media-hub\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
 
         agent_html = AGENT_HTML.read_text(encoding="utf-8")
-        self.assertRegex(agent_html, r"css/agent\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
+        self.assertRegex(agent_html, r"css/agent\.css'\) \}\}\?v=20260901b")
 
         login_html = LOGIN_HTML.read_text(encoding="utf-8")
         self.assertRegex(login_html, r"css/core-layout\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")

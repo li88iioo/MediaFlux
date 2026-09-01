@@ -233,7 +233,9 @@ jobs:
                       "retry_wait",
                       2,
                       3,
-                      "2026-09-01 12:02:00",
+                      # Keep the retry non-due while the live notifier starts,
+                      # otherwise the smoke assertion races the background drain.
+                      "2099-01-01 00:00:00",
                       "temporary",
                       None,
                       "2026-09-01 12:00:00",
@@ -309,7 +311,7 @@ jobs:
                   "retry_wait",
                   2,
                   3,
-                  "2026-09-01 12:02:00",
+                  "2099-01-01 00:00:00",
                   "temporary",
                   None,
               ), legacy_notification
