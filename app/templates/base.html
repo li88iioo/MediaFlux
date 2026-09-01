@@ -8,9 +8,9 @@
     <meta name="global-search-url" content="{{ url_for('pages.global_search') }}">
     <title>{% block title %}MediaFlux{% endblock %}</title>
     {% include "_theme_bootstrap.html" %}
-    <script src="{{ url_for('static', path='js/viewport-inset.js') }}?v=20260829b"></script>
-    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='favicon.svg') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='css/main.css') }}?v=20260831c">
+    <script src="{{ static_url('js/viewport-inset.js') }}"></script>
+    <link rel="icon" type="image/svg+xml" href="{{ static_url('favicon.svg') }}">
+    <link rel="stylesheet" href="{{ static_url('css/main.css') }}">
     {% block page_styles %}{% endblock %}
 </head>
 <body class="{% block body_class %}{% endblock %}{% if active in ['logs', 'local_media', 'organize', 'organize_rules', 'downloads', 'rss', 'guangya', 'guangya_offline', 'guangya_more', 'share_transfer', 'guangya_strm', 'media_proxy', 'gcid', 'media_libraries'] %} compact-workspace-page{% endif %}">
@@ -114,12 +114,12 @@
         </div>
     </div>
     <div class="app-toast-container" id="appToastContainer" aria-live="polite" aria-atomic="true"></div>
-    <script src="{{ url_for('static', path='js/lucide.min.js') }}?v=20260816a"></script>
+    <script src="{{ static_url('js/lucide.min.js') }}"></script>
     {% if active in ['dashboard', 'agent', 'downloads', 'guangya_strm', 'local_media', 'logs', 'rss'] %}
-    <script src="{{ url_for('static', path='js/vendor/gsap.min.js') }}?v=20260818a"></script>
-    <script src="{{ url_for('static', path='js/motion.js') }}?v=20260820a"></script>
+    <script src="{{ static_url('js/vendor/gsap.min.js') }}"></script>
+    <script src="{{ static_url('js/motion.js') }}"></script>
     {% endif %}
-    <script src="{{ url_for('static', path='js/app.js') }}?v=20260824a"></script>
+    <script src="{{ static_url('js/app.js') }}"></script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

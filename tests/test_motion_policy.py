@@ -27,4 +27,4 @@ def test_global_page_motion_keeps_cards_static_and_numbers_animated():
     assert ".organize-config-panel.active { animation: none; }" in main_css
     assert re.search(r"\.discovery-card\s*\{[^}]*animation:\s*none", main_css)
     assert ".dashboard-page .content { width: 100%; padding: 26px 28px 42px; animation: none; }" in dashboard_css
-    assert "motion.js') }}?v=20260820a" in base
+    assert "static_url('js/motion.js')" in base

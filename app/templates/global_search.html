@@ -3,8 +3,8 @@
 {% block title %}全局搜索 - MediaFlux{% endblock %}
 {% block body_class %}dashboard-page media-hub-page global-search-page{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/dashboard-workbench.css') }}?v=20260820a">
-<link rel="stylesheet" href="{{ url_for('static', path='css/media-hub.css') }}?v=20260826b">
+<link rel="stylesheet" href="{{ static_url('css/dashboard-workbench.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/media-hub.css') }}">
 {% endblock %}
 {% block workspace_bar %}
 <header class="dashboard-topbar media-hub-topbar">
@@ -141,5 +141,5 @@
     });
 })();
 </script>
-{% if discovery_enabled %}<script src="{{ url_for('static', path='js/discovery.js') }}?v=20260825a" defer></script>{% endif %}
+{% if discovery_enabled %}<script src="{{ static_url('js/discovery.js') }}" defer></script>{% endif %}
 {% endblock %}

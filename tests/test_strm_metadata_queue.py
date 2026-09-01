@@ -27,7 +27,7 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         with db.get_conn() as conn:
             conn.execute("DELETE FROM strm_metadata_queue")
-            conn.execute("DELETE FROM strm_metadata_refresh_outbox")
+            conn.execute("DELETE FROM strm_refresh_outbox")
 
     def _rows(self, status: str = "all") -> list[dict]:
         return [dict(row) for row in db.list_strm_metadata_queue(status=status)]
@@ -167,10 +167,49 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         )
 
         self.assertEqual(state, "completed")
-        self.assertEqual(db.list_strm_metadata_refresh_paths(), [refresh_path])
-        self.assertEqual(db.count_strm_metadata_refresh_paths(), 1)
-        self.assertEqual(db.acknowledge_strm_metadata_refresh_paths([refresh_path]), 1)
-        self.assertEqual(db.list_strm_metadata_refresh_paths(), [])
+        self.assertEqual(
+            db.list_strm_refresh_entries(),
+            [{"path": refresh_path, "allow_emby": True}],
+        )
+        self.assertEqual(db.count_strm_refresh_paths(), 1)
+        self.assertEqual(db.acknowledge_strm_refresh_paths([refresh_path]), 1)
+        self.assertEqual(db.list_strm_refresh_entries(), [])
+
+    def test_refresh_outbox_preserves_provider_scope_for_same_path(self):
+        refresh_path = "/strm/剧集/Example/Season 01"
+
+        self.assertEqual(
+            db.enqueue_strm_refresh_paths([refresh_path], allow_emby=False), 1
+        )
+        self.assertEqual(
+            db.enqueue_strm_refresh_paths([refresh_path], allow_emby=True), 1
+        )
+
+        self.assertEqual(
+            db.list_strm_refresh_entries(),
+            [
+                {"path": refresh_path, "allow_emby": False},
+                {"path": refresh_path, "allow_emby": True},
+            ],
+        )
+        self.assertEqual(db.count_strm_refresh_paths(), 2)
+        self.assertEqual(
+            db.acknowledge_strm_refresh_paths(
+                [refresh_path], allow_emby=False
+            ),
+            1,
+        )
+        self.assertEqual(
+            db.list_strm_refresh_entries(),
+            [{"path": refresh_path, "allow_emby": True}],
+        )
+        self.assertEqual(
+            db.acknowledge_strm_refresh_paths(
+                [refresh_path], allow_emby=True
+            ),
+            1,
+        )
+        self.assertEqual(db.list_strm_refresh_entries(), [])
 
     def test_failures_use_exponential_retry_and_end_in_failed(self):
         db.enqueue_strm_metadata_jobs([_job()], max_attempts=2)
@@ -302,7 +341,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         with db.get_conn() as conn:
             conn.execute("DELETE FROM strm_metadata_queue")
-            conn.execute("DELETE FROM strm_metadata_refresh_outbox")
+            conn.execute("DELETE FROM strm_refresh_outbox")
             conn.execute("DELETE FROM strm_index")
             conn.execute("DELETE FROM strm_failures")
 
@@ -415,7 +454,10 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
             side_effect=[{"Jellyfin": "failed"}, {"Jellyfin": "queued"}],
         ) as refresh:
             worker._flush_media_refresh(force=True)
-            self.assertEqual(db.list_strm_metadata_refresh_paths(), [path])
+            self.assertEqual(
+                db.list_strm_refresh_entries(),
+                [{"path": path, "allow_emby": True}],
+            )
             self.assertTrue(worker._refresh_retry_pending)
 
             # 进程停止或显式 flush 必须立即重试，不能因普通批处理节流丢失刷新。
@@ -424,7 +466,7 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         self.assertEqual(refresh.call_count, 2)
         self.assertEqual(refresh.call_args_list[0].args[0], [path])
         self.assertTrue(refresh.call_args_list[0].kwargs["immediate"])
-        self.assertEqual(db.list_strm_metadata_refresh_paths(), [])
+        self.assertEqual(db.list_strm_refresh_entries(), [])
         self.assertFalse(worker._refresh_retry_pending)
 
     def test_new_worker_replays_durable_media_refresh_after_restart(self):
@@ -456,7 +498,45 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         refresh.assert_called_once()
         self.assertEqual(refresh.call_args.args[0], [path])
         self.assertFalse(refresh.call_args.kwargs["immediate"])
-        self.assertEqual(db.count_strm_metadata_refresh_paths(), 0)
+        self.assertEqual(db.count_strm_refresh_paths(), 0)
+
+    def test_worker_flushes_each_provider_scope_and_acks_only_success(self):
+        from unittest.mock import patch
+
+        from app.modules.strm_metadata_worker import STRMMetadataWorker
+
+        path = "/strm/剧集/Example/Season 01"
+        db.enqueue_strm_refresh_paths([path], allow_emby=False)
+        db.enqueue_strm_refresh_paths([path], allow_emby=True)
+        worker = STRMMetadataWorker()
+
+        with patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            side_effect=[
+                {"Jellyfin": "queued"},
+                {"Jellyfin": "queued", "Emby": "failed"},
+                {"Jellyfin": "queued", "Emby": "queued"},
+            ],
+        ) as refresh:
+            worker._flush_media_refresh(force=True)
+
+            self.assertEqual(refresh.call_count, 2)
+            self.assertEqual(refresh.call_args_list[0].args[0], [path])
+            self.assertFalse(refresh.call_args_list[0].kwargs["allow_emby"])
+            self.assertEqual(refresh.call_args_list[1].args[0], [path])
+            self.assertTrue(refresh.call_args_list[1].kwargs["allow_emby"])
+            self.assertEqual(
+                db.list_strm_refresh_entries(),
+                [{"path": path, "allow_emby": True}],
+            )
+            self.assertTrue(worker._refresh_retry_pending)
+
+            worker._flush_media_refresh(force=True)
+
+        self.assertEqual(refresh.call_count, 3)
+        self.assertTrue(refresh.call_args_list[2].kwargs["allow_emby"])
+        self.assertEqual(db.list_strm_refresh_entries(), [])
+        self.assertFalse(worker._refresh_retry_pending)
 
     def test_stop_does_not_discard_worker_restarted_during_join(self):
         from unittest.mock import patch

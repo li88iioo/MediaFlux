@@ -5,7 +5,6 @@ import unittest
 from datetime import datetime
 from unittest.mock import Mock, patch
 
-from app.clients.base import DashboardData
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 

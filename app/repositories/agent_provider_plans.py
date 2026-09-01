@@ -460,6 +460,13 @@ def finish_provider_plan(
         ).rowcount
         if updated != 1:
             raise AgentToolError("Provider 写计划状态已变化", code="outcome_unknown")
+        _database().finalize_provider_action_history_for_plan(
+            conn,
+            plan_ref=normalized,
+            status=normalized_status,
+            error_code=persisted_error,
+            timestamp=stamp,
+        )
         conn.execute(
             "DELETE FROM agent_provider_plans "
             "WHERE plan_id=? AND context_fingerprint=''",

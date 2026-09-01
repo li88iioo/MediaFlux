@@ -1255,6 +1255,103 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
         self.assertIn("回读验证", " ".join(result.suggestions))
         self.assertNotIn("must-not-leak", str(result.to_dict()))
 
+    def test_confirm_success_survives_recent_download_capture_failure(self):
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="ingest.submit",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={},
+            validator=lambda arguments: dict(arguments),
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(
+                lambda _arguments: (
+                    ToolResult(True, "confirmation_required", "preview"),
+                    "ingest-capture-failure",
+                )
+            ),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(
+                lambda _arguments, _context: ToolResult(
+                    True, "accepted", "download submitted", data={"accepted": True}
+                )
+            ),
+            requires_confirmation=True,
+        ))
+        recent_download_store = Mock()
+        recent_download_store.capture.side_effect = OSError("local cache unavailable")
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "ticket-capture-failure-123456"),
+            recent_download_store=recent_download_store,
+            record_actions=True,
+        )
+        prepared = service.prepare(
+            "ingest.submit", {"source_type": "magnet"}, owner="owner-a"
+        )
+
+        with patch(
+            "app.agent.action_history.record_confirmation_claimed"
+        ), patch(
+            "app.agent.orchestrator.record_confirmed_result"
+        ) as record_result:
+            response = service.confirm(
+                prepared["action_plan"]["plan_id"], owner="owner-a"
+            )
+
+        self.assertTrue(response["result"]["ok"])
+        self.assertEqual(response["result"]["status"], "accepted")
+        recent_download_store.capture.assert_called_once()
+        record_result.assert_called_once()
+
+    def test_confirm_success_survives_indexer_followup_failure(self):
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="config.set_indexer_sites",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={},
+            validator=lambda arguments: dict(arguments),
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(
+                lambda _arguments: (
+                    ToolResult(True, "confirmation_required", "preview"),
+                    "indexer-followup-failure",
+                )
+            ),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(
+                lambda _arguments, _context: ToolResult(
+                    True,
+                    "completed",
+                    "站点选择已经保存",
+                    data={"runtime_refresh": {"web": True}},
+                )
+            ),
+            requires_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "ticket-followup-failure-1234"),
+        )
+        prepared = service.prepare(
+            "config.set_indexer_sites",
+            {},
+            owner="owner-a",
+            followup_context={
+                "kind": "indexer_search_after_config",
+                "title": "测试影片",
+                "limit": 10,
+            },
+        )
+
+        with patch.object(
+            service, "invoke", side_effect=RuntimeError("search unavailable")
+        ):
+            response = service.confirm(
+                prepared["action_plan"]["plan_id"], owner="owner-a"
+            )
+
+        self.assertTrue(response["result"]["ok"])
+        self.assertEqual(response["action_plan"]["status"], "completed")
+        self.assertIn("自动搜索暂时不可用", str(response))
+
     def test_confirmed_handler_receives_bound_context_and_propagates_stale(self):
         calls = []
         registry = ToolRegistry()

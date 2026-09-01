@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import logging
 import secrets
-from pathlib import Path
+from functools import lru_cache
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -13,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 from jinja2 import pass_context
 
 APP_DIR = Path(__file__).resolve().parent
+STATIC_DIR = (APP_DIR / "static").resolve()
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
 
@@ -34,7 +37,61 @@ def relative_url_for(context: Any, name: str, **params: Any) -> str:
     return relative
 
 
+@lru_cache(maxsize=512)
+def _static_asset_digest(
+    resolved_path: str, signature: tuple[int, int, int, int, int],
+) -> str:
+    """按实际静态文件字节生成短内容指纹。
+
+    ``signature`` 参与缓存键，使开发态覆盖写入与 Docker 构建期压缩后的
+    同名文件都能获得与真实内容一致的 URL，而不是依赖模板人工维护版本号。
+    """
+    del signature
+    digest = hashlib.sha256()
+    with Path(resolved_path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(128 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def _resolve_static_asset(path: str) -> tuple[str, Path]:
+    normalized = str(path or "").strip().replace("\\", "/")
+    pure_path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or pure_path.is_absolute()
+        or any(part in {"", ".", ".."} for part in normalized.split("/"))
+    ):
+        raise ValueError("静态资源路径无效")
+    resolved = (STATIC_DIR / Path(*pure_path.parts)).resolve(strict=True)
+    try:
+        resolved.relative_to(STATIC_DIR)
+    except ValueError as exc:
+        raise ValueError("静态资源路径越界") from exc
+    if not resolved.is_file():
+        raise ValueError("静态资源必须是文件")
+    return pure_path.as_posix(), resolved
+
+
+@pass_context
+def static_url(context: Any, path: str) -> str:
+    """生成同源、内容指纹化的静态资源 URL。"""
+    normalized, resolved = _resolve_static_asset(path)
+    stat = resolved.stat()
+    signature = (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+    )
+    version = _static_asset_digest(str(resolved), signature)
+    base = relative_url_for(context, "static", path=normalized)
+    return f"{base}{'&' if '?' in base else '?'}v={version}"
+
+
 templates.env.globals["url_for"] = relative_url_for
+templates.env.globals["static_url"] = static_url
 
 
 def csrf_token(request: Request) -> str:

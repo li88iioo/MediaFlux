@@ -34,7 +34,7 @@ class MediaProfileInPlaceUiContractTests(unittest.TestCase):
     def test_search_and_subscription_pages_mount_the_shared_profile_host(self):
         for template in (self.global_search, self.rss):
             self.assertIn('{% include "_media_profile_host.html" %}', template)
-            self.assertIn("js/discovery.js') }}?v=20260825a", template)
+            self.assertIn("static_url('js/discovery.js')", template)
         self.assertIn('data-discovery-profile-host="true"', self.host)
         self.assertIn('{% include "_media_profile_dialog.html" %}', self.host)
         self.assertIn('id="discovery-detail-dialog"', self.dialog)

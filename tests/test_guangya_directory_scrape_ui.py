@@ -139,9 +139,9 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
             "updated_desc", "updated_asc", "type_asc", "size_desc", "size_asc",
         ):
             self.assertIn(f'value="{value}"', response.text)
-        self.assertIn("guangya-directory-scrape.css?v=20260828c", response.text)
-        self.assertIn("media-scrape-position.js?v=20260828a", response.text)
-        self.assertIn("guangya-directory-scrape.js?v=20260829a", response.text)
+        self.assertRegex(response.text, r"/static/css/guangya-directory-scrape\.css\?v=[0-9a-f]{16}")
+        self.assertRegex(response.text, r"/static/js/media-scrape-position\.js\?v=[0-9a-f]{16}")
+        self.assertRegex(response.text, r"/static/js/guangya-directory-scrape\.js\?v=[0-9a-f]{16}")
         self.assertIn('aria-label="列表视图" aria-pressed="true"', response.text)
         self.assertIn('aria-label="网格视图" aria-pressed="false"', response.text)
         self.assertNotIn('title="列表视图"', response.text)

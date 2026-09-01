@@ -1818,11 +1818,23 @@ class STRMScheduler:
                 "fallback_used": fallback_used,
                 "fallback_reason": fallback_reason,
             }
-            partial = bool(
+            strm_partial = bool(
                 int(stats.get("failed", 0) or 0)
                 or int(stats.get("metadata_failed", 0) or 0)
                 or stats.get("clean_skipped")
-                or any(value in {False, "failed"} for value in media_refresh.values())
+            )
+            refresh_pending = any(
+                value in {False, "failed"} for value in media_refresh.values()
+            )
+            partial = bool(strm_partial or refresh_pending)
+            result["strm_partial"] = strm_partial
+            result["refresh_pending"] = refresh_pending
+            partial_error = (
+                "STRM 同步部分完成，请查看运行记录"
+                if strm_partial
+                else "STRM 已完成，媒体库刷新等待后台重试"
+                if refresh_pending
+                else ""
             )
             terminal_status = "partial" if partial else "completed"
             db.finish_task_run(
@@ -1832,7 +1844,7 @@ class STRMScheduler:
             for request_id in request_ids:
                 db.update_download_request(
                     request_id, strm_status=terminal_status,
-                    strm_error=("STRM 同步部分完成，请查看运行记录" if partial else ""),
+                    strm_error=partial_error,
                     strm_finished_at=db.now(),
                 )
             # 先结算业务状态和变化目标，再发布通知。通知 outbox 短暂故障
@@ -1842,17 +1854,17 @@ class STRMScheduler:
                 lease_heartbeat = None
             self._settle_change_targets(
                 claimed_targets,
-                "failed" if partial else "completed",
-                error="STRM 同步部分完成，等待重试" if partial else "",
+                "failed" if strm_partial else "completed",
+                error="STRM 同步部分完成，等待重试" if strm_partial else "",
                 empty_retry_delay=1.0,
             )
             refresh_label = _refresh_notification_label(media_refresh)
             _publish_linked_notification_threads(
                 options,
-                strm_status="部分完成" if partial else "完成",
+                strm_status="部分完成" if strm_partial else "完成",
                 media_refresh=refresh_label,
                 partial=partial,
-                error=("STRM 同步部分完成，请查看 Web 运行记录" if partial else ""),
+                error=partial_error,
             )
             if not _has_linked_notification_thread(options):
                 _run_notification_side_effect(
@@ -2029,15 +2041,44 @@ class STRMScheduler:
 
         from app.modules.media_refresh_coordinator import enqueue_media_refresh_paths
 
-        results = enqueue_media_refresh_paths(
-            list(plan.targets),
-            immediate=bool(immediate),
-            allow_emby=True if emby_enabled is None else bool(emby_enabled),
-        )
+        targets = list(plan.targets)
+        allow_emby = True if emby_enabled is None else bool(emby_enabled)
+        # STRM 已经落盘，媒体库刷新必须独立交接。先写 durable outbox，再尝试
+        # 投递统一刷新队列；投递失败只重试刷新，绝不重新生成 STRM。
+        db.enqueue_strm_refresh_paths(targets, allow_emby=allow_emby)
+        try:
+            results = enqueue_media_refresh_paths(
+                targets,
+                immediate=bool(immediate),
+                allow_emby=allow_emby,
+            )
+        except Exception as exc:
+            logger.warning(
+                "媒体库刷新入队异常，STRM 变化已保留等待后台重试 type=%s",
+                type(exc).__name__,
+            )
+            return {"媒体库": "failed"}
+
+        refresh_failed = any(value == "failed" for value in results.values())
+        if not refresh_failed:
+            try:
+                db.acknowledge_strm_refresh_paths(
+                    targets, allow_emby=allow_emby
+                )
+            except Exception:
+                # 统一刷新队列已经持久接管；保留 outbox 只会触发幂等补投，
+                # 不能反向把本轮 STRM 标记为失败。
+                logger.exception(
+                    "媒体库刷新已入队，但 STRM outbox 确认失败，将幂等重试"
+                )
+        else:
+            logger.warning(
+                "媒体库刷新未全部入队，STRM 变化已保留等待后台重试"
+            )
         logger.info(
             "媒体库刷新已提交统一队列 immediate=%s targets=%s providers=%s",
             bool(immediate),
-            len(plan.targets),
+            len(targets),
             ",".join(f"{name}:{status}" for name, status in results.items()) or "none",
         )
         return results

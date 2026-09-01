@@ -3,7 +3,7 @@
 {% block page_title %}本地媒体{% endblock %}
 {% block body_class %}local-media-page{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/local-media.css') }}?v=20260829j">
+<link rel="stylesheet" href="{{ static_url('css/local-media.css') }}">
 <script>
 (() => {
     const hashTab = (window.location.hash || '').replace('#', '').trim();
@@ -217,6 +217,6 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260828a"></script>
-<script src="{{ url_for('static', path='js/local-media.js') }}?v=20260829c"></script>
+<script src="{{ static_url('js/media-scrape-position.js') }}"></script>
+<script src="{{ static_url('js/local-media.js') }}"></script>
 {% endblock %}

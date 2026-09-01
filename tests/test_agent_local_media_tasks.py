@@ -110,7 +110,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
 
     def test_task_list_is_owner_bound_and_redacts_internal_fields(self) -> None:
-        task_id = self._task(status="requires_manual")
+        self._task(status="requires_manual")
         service = get_agent_service()
         listed = service.invoke(
             "local_media.task_summaries",

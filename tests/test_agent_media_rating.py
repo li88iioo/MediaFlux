@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from app.agent.media_rating_actions import (
     _rating_from_douban_html,

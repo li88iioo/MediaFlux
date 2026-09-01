@@ -29,7 +29,9 @@ class MediaLibrariesUIContractTests(unittest.TestCase):
         self.assertIn("{% block page_title %}媒体库{% endblock %}", self.template)
         self.assertIn("css/media-libraries.css", self.template)
         self.assertIn("js/media-libraries.js", self.template)
-        self.assertIn("?v=20260829c", self.template)
+        self.assertIn("static_url('css/media-libraries.css')", self.template)
+        self.assertIn("static_url('js/media-libraries.js')", self.template)
+        self.assertNotRegex(self.template, r"\?v=20\d{6}[a-z]")
         self.assertIn('id="mediaLibrariesPage"', self.template)
         self.assertIn('data-loading="true"', self.template)
         for element_id in ("mlSummary", "mlServerCount", "mlLibraryCount", "mlMappingCount", "mlBindingCount"):

@@ -418,7 +418,6 @@ class AutomaticSpecialsTests(IsolatedDatabaseTestCase):
 
     def test_specials_in_sibling_directories_share_one_episode_sequence(self):
         client = _TreeClient()
-        show = client.info["show"]
         endings = GuangYaFile("endings", "SPs", True, parent_id="show")
         client.tree["show"].append(endings)
         client.tree["extra"] = [
@@ -449,7 +448,6 @@ class AutomaticSpecialsTests(IsolatedDatabaseTestCase):
 
     def test_release_batch_directories_share_special_episode_sequence(self):
         client = _TreeClient()
-        show = client.info["show"]
         batch_a = GuangYaFile(
             "batch-a",
             "[KTXP][Isekai_Maou_to_Shoukan_Shoujo_no_Dorei_Majutsu][01-10][GB]",
@@ -593,7 +591,6 @@ class AutomaticSpecialsTests(IsolatedDatabaseTestCase):
 
     def test_sps_ncop_and_omnibus_use_show_context_and_specials_target(self):
         client = _TreeClient()
-        show = client.info["show"]
         sps = GuangYaFile("sps", "SPs", True, parent_id="show")
         client.tree["show"].extend([
             GuangYaFile("root-ncop", "NCOP.mkv", False, 250, "root-op", "show"),

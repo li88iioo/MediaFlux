@@ -1777,7 +1777,7 @@ class AIPreviewAndSettingsTests(unittest.TestCase):
         self.assertNotIn("复用 Media Agent 模型连接", settings)
         self.assertIn('type="password"', settings)
         self.assertNotIn("AI_RECOGNITION_API_KEY", logs)
-        self.assertIn("settings-agent.css') }}?v=20260829b", settings)
+        self.assertIn("static_url('css/settings-agent.css')", settings)
 
 
 class AIRecognitionConfigTests(unittest.TestCase):

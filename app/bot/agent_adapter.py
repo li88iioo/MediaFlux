@@ -3914,8 +3914,9 @@ def _confirmation_markup(
     *,
     owner: str,
     plan_id: str,
+    store: TelegramAgentActionStore | None = None,
 ):
-    store = get_telegram_agent_action_store()
+    store = store or get_telegram_agent_action_store()
     confirm_id, cancel_id = store.create_confirmation_pair(
         owner=owner, plan_id=plan_id
     )
@@ -4429,6 +4430,23 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
     stream_target = None
     progress: _TelegramAgentProgress | None = None
     message_chat_id, _source_message_id, message_thread_id = _message_context(message)
+    pending_confirmation_plan_id = ""
+    pending_confirmation_store: TelegramAgentActionStore | None = None
+
+    def discard_pending_confirmation() -> None:
+        nonlocal pending_confirmation_plan_id, pending_confirmation_store
+        if not pending_confirmation_plan_id:
+            return
+        store = pending_confirmation_store or get_telegram_agent_action_store()
+        _discard_unpublished_telegram_confirmation(
+            service,
+            store,
+            owner=owner,
+            plan_id=pending_confirmation_plan_id,
+        )
+        pending_confirmation_plan_id = ""
+        pending_confirmation_store = None
+
     typing_heartbeat = _TelegramTypingHeartbeat(
         bot,
         message_chat_id,
@@ -4582,17 +4600,22 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         if isinstance(response, dict):
             response = attach_public_fallback_presentation(response)
 
+        primary_action_plan = sanitize_action_plan(
+            response.get("action_plan") if isinstance(response, dict) else None
+        )
+        if _confirmation_is_primary(response) and primary_action_plan:
+            pending_confirmation_plan_id = primary_action_plan["plan_id"]
+            pending_confirmation_store = get_telegram_agent_action_store()
+
         def prepare_final_output() -> tuple[str, Any]:
-            action_plan = sanitize_action_plan(
-                response.get("action_plan") if isinstance(response, dict) else None
-            )
             markup = None
             rendered = render_agent_response(response)
-            if _confirmation_is_primary(response) and action_plan:
+            if pending_confirmation_plan_id and primary_action_plan:
                 markup = _confirmation_markup(
                     telebot,
                     owner=owner,
-                    plan_id=action_plan["plan_id"],
+                    plan_id=pending_confirmation_plan_id,
+                    store=pending_confirmation_store,
                 )
                 rendered = render_agent_response(response, confirmation=True)
             else:
@@ -4682,16 +4705,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             not isinstance(publish_result, _TelegramPublishResult)
             or not publish_result.sent
         ):
-            unpublished_plan = sanitize_action_plan(
-                response.get("action_plan") if isinstance(response, dict) else None
-            )
-            if unpublished_plan:
-                _discard_unpublished_telegram_confirmation(
-                    service,
-                    get_telegram_agent_action_store(),
-                    owner=owner,
-                    plan_id=unpublished_plan["plan_id"],
-                )
+            discard_pending_confirmation()
             logger.warning("Telegram Agent 最终消息未送达，未提交会话状态")
             return True
 
@@ -4709,11 +4723,15 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             )
 
         finalized, _ = finalize_if_current(finalize_conversation)
+        if finalized:
+            pending_confirmation_plan_id = ""
+            pending_confirmation_store = None
         if not finalized:
             if isinstance(publish_result, _TelegramPublishResult):
                 _delete_stale_telegram_delivery(bot, publish_result.delivery)
             raise AgentOperationCancelled("Telegram Agent 操作已失效")
     except AgentOperationCancelled:
+        discard_pending_confirmation()
         # 运行态/TG 开关变化时，查询可能已经在不可中断的同步调用中签发了
         # 尚未发布的确认票据或生成了按钮。只撤销仍持有当前 lease 的状态；
         # 若已被新消息抢占，cancel 会失败且不会误伤新请求。
@@ -4726,6 +4744,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         _delete_stale_telegram_delivery(bot, stream_target)
         logger.info("Telegram Agent 旧请求已停止发布 owner=%s", owner)
     except AgentToolError as exc:
+        discard_pending_confirmation()
         logger.info("Telegram Agent 请求被拒绝 code=%s", exc.code)
         rendered = "Agent 无法处理该请求，请调整问题后重试。"
 
@@ -4761,6 +4780,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                     owner=owner,
                 )
     except Exception as exc:
+        discard_pending_confirmation()
         logger.warning("Telegram Agent 请求失败 type=%s", type(exc).__name__)
         rendered = "Agent 暂时不可用，请稍后重试。"
 
@@ -4872,7 +4892,7 @@ def handle_agent_patrol_callback(
             operation_id=_telegram_callback_operation_id(
                 owner, call, action=action
             ),
-            initialize=lambda: invalidate_query_confirmation_epoch(
+            initialize=lambda: begin_query_confirmation_epoch(
                 service, owner=owner
             ),
         )
@@ -5527,7 +5547,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                         operation_id=_telegram_callback_operation_id(
                             owner, call, action=action_kind
                         ),
-                        initialize=lambda: invalidate_query_confirmation_epoch(
+                        initialize=lambda: begin_query_confirmation_epoch(
                             service, owner=owner
                         ),
                     )
@@ -5549,7 +5569,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                     operation_id=_telegram_callback_operation_id(
                         owner, call, action=action_kind
                     ),
-                    initialize=lambda: invalidate_query_confirmation_epoch(
+                    initialize=lambda: begin_query_confirmation_epoch(
                         service, owner=owner
                     ),
                 )

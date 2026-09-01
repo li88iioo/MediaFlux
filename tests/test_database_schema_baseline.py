@@ -16,6 +16,42 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
+    def test_v18_strm_refresh_outbox_is_migrated_without_dual_track(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                "CREATE TABLE strm_metadata_refresh_outbox ("
+                "path TEXT PRIMARY KEY,created_at TEXT NOT NULL,"
+                "updated_at TEXT NOT NULL);"
+                "INSERT INTO strm_metadata_refresh_outbox(path,created_at,updated_at) "
+                "VALUES('/data/strm/剧集/作品','2026-08-31 23:59:00',"
+                "'2026-09-01 00:00:00');"
+            )
+
+            db._migrate_strm_refresh_outbox_v19(conn)
+
+            rows = conn.execute(
+                "SELECT path,allow_emby,created_at,updated_at "
+                "FROM strm_refresh_outbox"
+            ).fetchall()
+            legacy = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='strm_metadata_refresh_outbox'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            rows,
+            [(
+                "/data/strm/剧集/作品",
+                1,
+                "2026-08-31 23:59:00",
+                "2026-09-01 00:00:00",
+            )],
+        )
+        self.assertIsNone(legacy)
+
     @staticmethod
     def _create_legacy_organize_notification_outbox(
         conn: sqlite3.Connection,

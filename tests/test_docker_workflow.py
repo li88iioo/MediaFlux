@@ -89,7 +89,8 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("docker_upgrade_sentinel", smoke_job)
         self.assertIn("PRAGMA user_version=1", smoke_job)
         self.assertIn("mediaflux-v014-upgrade", smoke_job)
-        self.assertIn("strm_metadata_refresh_outbox", smoke_job)
+        self.assertIn("strm_refresh_outbox", smoke_job)
+        self.assertIn("legacy_strm_outbox is None", smoke_job)
         self.assertIn("PRAGMA integrity_check", smoke_job)
         self.assertIn("PRAGMA foreign_key_check", smoke_job)
         self.assertIn("docker stop --timeout 60 mediaflux-v014-upgrade", smoke_job)
@@ -99,7 +100,13 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("npm ci --ignore-scripts --no-audit --no-fund", test_job)
         self.assertIn("--require-hashes -r requirements-release-runtime.lock", test_job)
         self.assertIn('python -m pip install "pytest==9.1.1"', test_job)
+        self.assertIn('python -m pip install "ruff==0.16.5"', test_job)
         self.assertIn('version("pytest") == "9.1.1"', test_job)
+        self.assertIn('version("ruff") == "0.16.5"', test_job)
+        self.assertIn(
+            "ruff check app packaging tests --select F,E9",
+            test_job,
+        )
         self.assertLess(test_job.index("npm ci"), test_job.index("python -m pytest tests"))
         self.assertLess(
             test_job.index("requirements-release-runtime.lock"),
@@ -109,6 +116,20 @@ class DockerWorkflowTests(unittest.TestCase):
             test_job.index('version("pytest") == "9.1.1"'),
             test_job.index("python -m pytest tests"),
         )
+        self.assertLess(
+            test_job.index("ruff check app packaging tests --select F,E9"),
+            test_job.index("python -m pytest tests"),
+        )
+
+    def test_runtime_lock_is_generated_with_production_python(self) -> None:
+        header = "\n".join(
+            Path("requirements-release-runtime.lock")
+            .read_text(encoding="utf-8")
+            .splitlines()[:8]
+        )
+
+        self.assertIn("pip-compile with Python 3.13", header)
+        self.assertNotIn("pip-compile with Python 3.12", header)
 
     def test_full_test_job_has_dependency_free_source_syntax_gate(self) -> None:
         test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]

@@ -11,7 +11,6 @@ from unittest.mock import patch
 from app.modules.scraper import TMDBScraper, extract_recognition_context
 from tests.support import release_parse_fields
 from tests.recognition_eval_helpers import (
-    FIELDS,
     classify_field,
     evaluate_projection,
     format_recognition_report,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 import importlib.util, json, os, tempfile, unittest
 from pathlib import Path
-from unittest.mock import patch
 from app.version import BuildInfo
 
 P=Path('packaging/scripts/generate_build_info.py'); S=importlib.util.spec_from_file_location('build_info_generator',P); assert S and S.loader; M=importlib.util.module_from_spec(S); import sys; sys.modules[S.name]=M; S.loader.exec_module(M)

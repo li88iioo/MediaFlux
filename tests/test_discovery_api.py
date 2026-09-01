@@ -540,7 +540,7 @@ class DiscoveryPosterTests(_BaseClientTests):
             upstream = self._image_response()
             session = self._mock_session(upstream)
             token = encode_poster_token(provider, key)
-            with self.subTest(provider=provider), patch("app.routes.discovery_image._get_poster_session", return_value=session) as get:
+            with self.subTest(provider=provider), patch("app.routes.discovery_image._get_poster_session", return_value=session):
                 result = self.client.get(f"/discovery-poster/{provider}/{token}")
             self.assertEqual(result.status_code, 200)
             self.assertEqual(session.get.call_args.args[0], expected)

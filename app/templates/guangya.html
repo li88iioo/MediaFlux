@@ -2,7 +2,7 @@
 {% block title %}光鸭云盘 - MediaFlux{% endblock %}
 {% block page_title %}光鸭云盘{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/guangya-directory-scrape.css') }}?v=20260828c">
+<link rel="stylesheet" href="{{ static_url('css/guangya-directory-scrape.css') }}">
 {% endblock %}
 
 {% block content %}
@@ -154,8 +154,8 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/media-scrape-position.js') }}?v=20260828a"></script>
-<script src="{{ url_for('static', path='js/guangya-directory-scrape.js') }}?v=20260829a"></script>
+<script src="{{ static_url('js/media-scrape-position.js') }}"></script>
+<script src="{{ static_url('js/guangya-directory-scrape.js') }}"></script>
 <script>
 function gyApi(path, opts){
     return fetch('/api/guangya'+path, opts).then(async response=>{

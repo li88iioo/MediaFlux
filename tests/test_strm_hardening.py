@@ -108,7 +108,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         super().setUp()
         with db.get_conn() as conn:
             conn.execute("DELETE FROM strm_metadata_queue")
-            conn.execute("DELETE FROM strm_metadata_refresh_outbox")
+            conn.execute("DELETE FROM strm_refresh_outbox")
     def test_standard_strm_name_matches_sidecar_basename(self):
         video = GuangYaFile("video", "Show.S01E01.mkv", False, 100, "etag")
         sidecar = GuangYaFile("nfo", "Show.S01E01.nfo", False, 10, "meta")

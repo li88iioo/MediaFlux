@@ -12,7 +12,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -799,7 +799,6 @@ class CliRuntimeTests(unittest.TestCase):
 
 
     def test_container_fresh_start_opens_web_setup_without_credentials(self) -> None:
-        import app.main
         from app import cli
 
         web_app = SimpleNamespace(state=SimpleNamespace())
@@ -830,7 +829,6 @@ class CliRuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["workers"], 1)
 
     def test_container_preseeded_credentials_can_start_without_manual_secret(self) -> None:
-        import app.main
         from app import cli
 
         web_app = SimpleNamespace(state=SimpleNamespace())

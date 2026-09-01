@@ -6,8 +6,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% if setup_mode %}00 // INITIALIZE{% else %}01 // CONTROL SURFACE{% endif %} - MediaFlux</title>
     {% include "_theme_bootstrap.html" %}
-    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='favicon.svg') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='css/core-layout.css') }}?v=20260818c">
+    <link rel="icon" type="image/svg+xml" href="{{ static_url('favicon.svg') }}">
+    <link rel="stylesheet" href="{{ static_url('css/core-layout.css') }}">
 </head>
 <body>
     <div class="login-page{% if login_wallpaper and not setup_mode %} login-page--wallpaper{% endif %}"{% if login_wallpaper and not setup_mode %} style="--login-wallpaper: url('{{ login_wallpaper.image_url }}');"{% endif %}>
@@ -118,8 +118,8 @@
         </footer>
     </div>
 
-    <script src="{{ url_for('static', path='js/lucide.min.js') }}?v=20260816a"></script>
-    <script src="{{ url_for('static', path='js/app.js') }}?v=20260824a"></script>
+    <script src="{{ static_url('js/lucide.min.js') }}"></script>
+    <script src="{{ static_url('js/app.js') }}"></script>
 
     <!-- 交互画布与跑马灯日志脚本 -->
     <script>

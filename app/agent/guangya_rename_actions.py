@@ -19,6 +19,7 @@ from app.modules.guangya_media_hygiene import build_media_hygiene_plan
 from app.modules.guangya_rename import (
     GuangYaRenamePlanError,
     GuangYaRenamePlanStale,
+    CANONICAL_RENAME_PLAN_MODES,
     build_rename_plan,
     confirm_rename_plan,
     discard_rename_plan,
@@ -36,7 +37,6 @@ _TTL_SECONDS = 15 * 60.0
 _PLAN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _PUBLIC_RENAME_MODES = {"remove_bitrate", "replace_text"}
-_PERSISTED_MODES = {*_PUBLIC_RENAME_MODES, "media_hygiene"}
 _PREVIEW_COUNT_KEYS = (
     "scope_count", "scanned_items", "scanned_dirs", "matched",
     "rename_count", "conflict_count", "no_change_count",
@@ -93,7 +93,7 @@ def _safe_preview(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     mode = str(value.get("mode") or "").strip().casefold()
-    if mode not in _PERSISTED_MODES:
+    if mode not in CANONICAL_RENAME_PLAN_MODES:
         return None
     try:
         counts = {
@@ -668,16 +668,8 @@ def execute_durable_guangya_rename_job(
     )
     result = execute_rename_plan(payload, cancel_check=cancel_check)
     stats = result.setdefault("stats", {})
-    plan_mode = str(plan.get("mode") or "")
-    transform = plan.get("transform") if isinstance(plan.get("transform"), dict) else {}
-    # 仅为升级前已经确认并入队的旧声明式计划保留执行兼容；
-    # 注册层、参数校验和新计划构建入口均已移除。
-    legacy_strm_linked = bool(
-        plan_mode == "declarative"
-        and str(transform.get("trigger_strm") or "") == "1"
-    )
-    should_trigger_strm = plan_mode == "media_hygiene" or legacy_strm_linked
-    if should_trigger_strm and int(stats.get("renamed") or 0) > 0:
+    plan_mode = str(plan.get("mode") or "").strip().casefold()
+    if plan_mode == "media_hygiene" and int(stats.get("renamed") or 0) > 0:
         try:
             from app.modules.scheduler import get_scheduler
 

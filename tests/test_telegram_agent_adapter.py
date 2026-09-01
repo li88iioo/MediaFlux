@@ -68,6 +68,21 @@ class _Telebot:
     )
 
 
+class _FailingMarkup:
+    def __init__(self, row_width=2):
+        del row_width
+        raise RuntimeError("markup construction failed")
+
+
+class _FailingMarkupTelebot:
+    types = SimpleNamespace(
+        InlineKeyboardMarkup=_FailingMarkup,
+        InlineKeyboardButton=lambda text, callback_data: SimpleNamespace(
+            text=text, callback_data=callback_data
+        ),
+    )
+
+
 class _Bot:
     def __init__(self):
         self.replies = []
@@ -2089,6 +2104,61 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         )
         history.assert_not_called()
         for action_id in ("direct-offline-confirm", "direct-offline-cancel"):
+            with self.assertRaises(ValueError):
+                store.inspect(action_id, owner="tg:v1:100\x1f200")
+
+    def test_confirmation_markup_failure_revokes_hidden_plan_and_callbacks(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        service = _agent_service_mock()
+        service.query.return_value = {
+            "mode": "confirmation_required",
+            "response_contract": build_response_contract(
+                task_kind="action", presentation="confirmation"
+            ),
+            "tool_call": {"name": "strm.run_once", "elapsed_ms": 4},
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "确认后执行 STRM 同步",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": _pending_action_plan(
+                "markup-failure-confirmation-plan-123456"
+            ),
+        }
+        tokens = iter(("markup-failure-confirm", "markup-failure-cancel"))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        history = Mock()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_conversation", history
+        ):
+            self.assertTrue(handle_agent_message(
+                _Bot(),
+                _FailingMarkupTelebot,
+                _message("执行 STRM 同步", message_id=1499),
+            ))
+
+        service.discard_confirmation.assert_called_once_with(
+            "markup-failure-confirmation-plan-123456",
+            owner="tg:v1:100\x1f200",
+            advance_owner_epoch=False,
+        )
+        history.assert_not_called()
+        for action_id in ("markup-failure-confirm", "markup-failure-cancel"):
             with self.assertRaises(ValueError):
                 store.inspect(action_id, owner="tg:v1:100\x1f200")
 
@@ -5412,7 +5482,12 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 _Telebot,
             )
 
-        self.assertEqual(service.invalidate_query_confirmation_epoch.call_count, 2)
+        service.begin_query_confirmation_epoch.assert_called_once_with(
+            owner="tg:v1:100\x1f200"
+        )
+        service.invalidate_query_confirmation_epoch.assert_called_once_with(
+            owner="tg:v1:100\x1f200"
+        )
         history.assert_not_called()
         self.assertFalse(any("关闭后不应发布" in item[1] for item in bot.replies))
         self.assertIn("本次未执行", bot.replies[-1][1])
@@ -5543,9 +5618,10 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             )
 
         self.assertEqual(limiter.call_count, 2)
-        service.invalidate_query_confirmation_epoch.assert_called_once_with(
+        service.begin_query_confirmation_epoch.assert_called_once_with(
             owner="tg:v1:100\x1f200"
         )
+        service.invalidate_query_confirmation_epoch.assert_not_called()
         service.invoke_workspace_action.assert_called_once_with(
             "review_rss",
             owner="tg:v1:100\x1f200",
@@ -6119,9 +6195,10 @@ class TelegramAgentAdapterTests(unittest.TestCase):
 
         self.assertEqual(events[0:2], ["typing_stop", "terminal_publish"])
         heartbeat.stop.assert_called_once()
-        service.invalidate_query_confirmation_epoch.assert_called_once_with(
+        service.begin_query_confirmation_epoch.assert_called_once_with(
             owner=owner
         )
+        service.invalidate_query_confirmation_epoch.assert_not_called()
 
     def test_runtime_disable_during_patrol_callback_suppresses_result_and_history(self):
         bot = _Bot()
@@ -6149,7 +6226,12 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 bot, _callback("agp:summary", callback_id="patrol-runtime-race"), _Telebot
             )
 
-        self.assertEqual(service.invalidate_query_confirmation_epoch.call_count, 2)
+        service.begin_query_confirmation_epoch.assert_called_once_with(
+            owner="tg:v1:100\x1f200"
+        )
+        service.invalidate_query_confirmation_epoch.assert_called_once_with(
+            owner="tg:v1:100\x1f200"
+        )
         history.assert_not_called()
         self.assertFalse(
             any("关闭后不应发布巡检结果" in item[1] for item in bot.replies)
@@ -6194,9 +6276,10 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         )
         service.prepare.assert_not_called()
         service.confirm.assert_not_called()
-        service.invalidate_query_confirmation_epoch.assert_called_once_with(
+        service.begin_query_confirmation_epoch.assert_called_once_with(
             owner="tg:v1:100\x1f200"
         )
+        service.invalidate_query_confirmation_epoch.assert_not_called()
         self.assertEqual(len(bot.replies), 1)
         self.assertEqual(bot.edits, [])
         self.assertIn("最近巡检发现", bot.replies[0][1])

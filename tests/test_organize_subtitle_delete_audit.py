@@ -452,7 +452,6 @@ class AutomaticReplacementDeleteTests(IsolatedDatabaseTestCase):
     def test_all_circuit_breaker_reasons_are_fail_closed(self):
         old = cloud_file("old", "old.backup.mkv", size=10, etag="same")
         new = cloud_file("new", "new.mkv", size=20, etag="new")
-        duplicate = cloud_file("other", "copy.mkv", size=10, etag="same")
         cases = [
             ({"scan_errors": ["source unavailable"], "old_detail": old, "new_detail": new,
               "target_files": [old, new]}, "扫描错误"),

@@ -8,7 +8,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
 
 from app.runtime_paths import RuntimePaths, configure_runtime_paths
 

@@ -53,9 +53,7 @@ from app.modules.episode_mapping import (
 )
 from app.modules.directory_scrape_errors import (
     DirectoryScrapeConflictError,
-    DirectoryScrapePublicError,
     DirectoryScrapeStateError,
-    public_error_message,
     safe_organize_failure,
 )
 from app.modules.naming import (

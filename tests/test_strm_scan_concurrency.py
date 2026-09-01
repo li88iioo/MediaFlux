@@ -3,7 +3,6 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaReadMetrics

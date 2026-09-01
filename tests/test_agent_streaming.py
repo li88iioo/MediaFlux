@@ -145,7 +145,10 @@ class _ConfirmationRaceService(_FakeService):
         return True
 
     def begin_query_confirmation_epoch(self, *, owner: str) -> int:
-        _revoked, generation = self.confirmation_store.rotate_owner(owner=owner)
+        self.owner = owner
+        _revoked, generation = self.confirmation_store.rotate_owner(
+            owner=owner, preserve_active=True
+        )
         return generation
 
     def invalidate_query_confirmation_epoch(self, *, owner: str) -> int:
@@ -167,6 +170,9 @@ class _ConfirmationRaceService(_FakeService):
         return self.response
 
     def invoke(self, _tool_name: str, _arguments: dict, **_kwargs):
+        return self.response
+
+    def invoke_workspace_action(self, _action_key: str, **_kwargs):
         return self.response
 
 
@@ -1196,6 +1202,71 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(
             service.confirmation_store.list_active_tickets(owner=service.owner),
             [],
+        )
+
+    def test_direct_read_preserves_already_published_confirmation(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _ConfirmationRaceService(_tool_response())
+        endpoint = "/api/agent/tools/downloads.diagnose_queue"
+        payload = {"session_id": SESSION_ID, "arguments": {}}
+
+        with patch("app.routes.agent_api.get_agent_service", return_value=service):
+            first = self.client.post(endpoint, headers=headers, json=payload)
+            self.assertEqual(first.status_code, 200, first.text)
+            generation = service.confirmation_store.owner_generation(
+                owner=service.owner
+            )
+            ticket = service.confirmation_store.issue(
+                owner=service.owner,
+                tool_name="test.write",
+                arguments={"enabled": True},
+                expected_owner_generation=generation,
+            )
+
+            second = self.client.post(endpoint, headers=headers, json=payload)
+
+        self.assertEqual(second.status_code, 200, second.text)
+        active = service.confirmation_store.list_active_tickets(
+            owner=service.owner
+        )
+        self.assertEqual(
+            [item.confirmation_id for item in active],
+            [ticket.confirmation_id],
+        )
+
+    def test_workspace_read_preserves_already_published_confirmation(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _ConfirmationRaceService(_tool_response())
+        endpoint = "/api/agent/workspace-actions/invoke"
+        payload = {
+            "session_id": SESSION_ID,
+            "action_key": "review_library_patrol",
+        }
+
+        with patch("app.routes.agent_api.get_agent_service", return_value=service):
+            first = self.client.post(endpoint, headers=headers, json=payload)
+            self.assertEqual(first.status_code, 200, first.text)
+            generation = service.confirmation_store.owner_generation(
+                owner=service.owner
+            )
+            ticket = service.confirmation_store.issue(
+                owner=service.owner,
+                tool_name="test.write",
+                arguments={"enabled": True},
+                expected_owner_generation=generation,
+            )
+
+            second = self.client.post(endpoint, headers=headers, json=payload)
+
+        self.assertEqual(second.status_code, 200, second.text)
+        active = service.confirmation_store.list_active_tickets(
+            owner=service.owner
+        )
+        self.assertEqual(
+            [item.confirmation_id for item in active],
+            [ticket.confirmation_id],
         )
 
     def test_slow_workspace_action_cannot_overwrite_newer_query_state(self):

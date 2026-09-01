@@ -7572,6 +7572,24 @@ class AgentOrchestrator:
             return RiskLevel.WRITE
         return self.registry.risk_for(normalized)
 
+    def _capture_recent_download_best_effort(
+        self, *, owner: str, result: ToolResult,
+        verification_context: dict[str, Any] | None, batch: bool = False,
+    ) -> None:
+        """下载已经提交后，最近记录失败不得反向改写确认结果。"""
+        try:
+            self.recent_download_store.capture(
+                owner=owner,
+                result=result,
+                verification_context=verification_context,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Agent %s下载记录更新失败 type=%s",
+                "批量" if batch else "",
+                type(exc).__name__,
+            )
+
     def confirm(
         self, confirmation_id: str, *, owner: str, request_id: str = "",
         session_id: str = "",
@@ -7627,6 +7645,19 @@ class AgentOrchestrator:
                     confirmation_contract=ticket.confirmation_contract,
                 )
             raise
+        if self.record_actions:
+            # 写入已经结束，先收束审计终态；后续下载记录、自动复核与展示
+            # 丰富均为辅助步骤，失败不得让调用方误以为副作用没有发生。
+            record_confirmed_result(
+                owner=owner,
+                tool_name=ticket.tool_name,
+                risk=risk,
+                result=result,
+                elapsed_ms=elapsed_ms,
+                confirmation_contract=ticket.confirmation_contract,
+                confirmation_id=ticket.confirmation_id,
+                owner_generation=ticket.owner_generation,
+            )
         if result.ok:
             # 所有确认工具都是受控写操作；统一推进运行代次，拒绝迟到发布。
             invalidate_agent_runtime_generation()
@@ -7686,7 +7717,7 @@ class AgentOrchestrator:
                     and isinstance(internal_contexts[index], dict)
                     else verification_by_result.get(str(raw.get("result_id") or ""))
                 )
-                self.recent_download_store.capture(
+                self._capture_recent_download_best_effort(
                     owner=owner,
                     result=item_result,
                     verification_context=(
@@ -7694,6 +7725,7 @@ class AgentOrchestrator:
                         if isinstance(verification_context, dict)
                         else None
                     ),
+                    batch=True,
                 )
                 if self.automatic_verification_enqueuer is not None:
                     try:
@@ -7720,7 +7752,7 @@ class AgentOrchestrator:
                 if isinstance(internal_verification, dict)
                 else None
             )
-            self.recent_download_store.capture(
+            self._capture_recent_download_best_effort(
                 owner=owner,
                 result=result,
                 verification_context=single_verification_context,
@@ -7738,19 +7770,8 @@ class AgentOrchestrator:
                         "Agent 下载后媒体库自动复核排队失败 type=%s",
                         type(exc).__name__,
                     )
-        if self.record_actions:
-            record_confirmed_result(
-                owner=owner,
-                tool_name=ticket.tool_name,
-                risk=risk,
-                result=result,
-                elapsed_ms=elapsed_ms,
-                confirmation_contract=ticket.confirmation_contract,
-                confirmation_id=ticket.confirmation_id,
-                owner_generation=ticket.owner_generation,
-            )
         if ticket.tool_name == "ingest.submit" and not is_resource_ingest:
-            self.recent_download_store.capture(
+            self._capture_recent_download_best_effort(
                 owner=owner, result=result, verification_context=None
             )
         public_result = (
@@ -7791,29 +7812,39 @@ class AgentOrchestrator:
             runtime_refresh = result_data.get("runtime_refresh")
             web_runtime_ready = not isinstance(runtime_refresh, dict) or runtime_refresh.get("web") is not False
             if title and web_runtime_ready:
-                followup = self.invoke(
-                    "indexer.search_resources",
-                    {"title": title, "limit": limit},
-                    owner=owner,
-                    request_id=trace_context.request_id,
-                    session_id=trace_context.session_id,
-                )
-                followup_result = followup.get("result")
-                if isinstance(followup_result, dict):
-                    followup_result["summary"] = (
-                        f"{public_result.summary}。{str(followup_result.get('summary') or '').strip()}"
-                    ).strip("。")
-                    followup["mode"] = "confirmed_action"
-                    followup = attach_response_contract(
-                        followup,
-                        task_kind="action",
-                        presentation="resource_candidates",
-                        resource_candidates="primary",
+                try:
+                    followup = self.invoke(
+                        "indexer.search_resources",
+                        {"title": title, "limit": limit},
+                        owner=owner,
+                        request_id=trace_context.request_id,
+                        session_id=trace_context.session_id,
                     )
-                    followup = result_projection.attach_public_display(followup)
-                    return self._attach_terminal_action_plan(
-                        followup, ticket=ticket, status="completed"
+                except Exception as exc:
+                    logger.warning(
+                        "Agent 站点配置后自动搜索失败 type=%s",
+                        type(exc).__name__,
                     )
+                    suggestion = "站点选择已经保存；自动搜索暂时不可用，可稍后重新搜索。"
+                    if suggestion not in public_result.suggestions:
+                        public_result.suggestions.append(suggestion)
+                else:
+                    followup_result = followup.get("result")
+                    if isinstance(followup_result, dict):
+                        followup_result["summary"] = (
+                            f"{public_result.summary}。{str(followup_result.get('summary') or '').strip()}"
+                        ).strip("。")
+                        followup["mode"] = "confirmed_action"
+                        followup = attach_response_contract(
+                            followup,
+                            task_kind="action",
+                            presentation="resource_candidates",
+                            resource_candidates="primary",
+                        )
+                        followup = result_projection.attach_public_display(followup)
+                        return self._attach_terminal_action_plan(
+                            followup, ticket=ticket, status="completed"
+                        )
             if title and not web_runtime_ready:
                 suggestion = (
                     f"站点选择已经保存，但当前 Web 搜索服务尚未刷新；"

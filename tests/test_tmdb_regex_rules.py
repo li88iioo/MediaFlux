@@ -726,7 +726,7 @@ class TmdbRegexRulePersistenceTests(IsolatedDatabaseTestCase):
     def test_priority_disabled_target_media_type_and_season_override(self):
         from app.modules import tmdb_regex_rules as rules
 
-        disabled = rules.create_rule(self.payload(
+        rules.create_rule(self.payload(
             name="disabled", pattern="Disabled", tmdb_id="1", priority=999,
             media_type="any", disabled=True,
         ))

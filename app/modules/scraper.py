@@ -179,6 +179,14 @@ class _SearchOutcome:
 
 
 @dataclass
+class _TMDBFlight:
+    """一次 TMDB 同键请求的进程内共享结果。"""
+
+    event: threading.Event = field(default_factory=threading.Event)
+    result: object = None
+
+
+@dataclass
 class RecognitionContext:
     """从文件名和父目录提取出的、可序列化的确定性识别上下文。"""
 
@@ -3473,6 +3481,7 @@ class TMDBScraper:
         self._tmdb_consecutive_failures = 0
         self._tmdb_circuit_open_until = 0.0
         self._tmdb_state_lock = threading.RLock()
+        self._tmdb_inflight: dict[tuple[str, object], _TMDBFlight] = {}
         self._ai_lock = threading.RLock()
         self._ai_clients: dict[tuple[str, int, int], AIRecognitionClient] = {}
         self._ai_result_cache: dict[str, tuple[float, AIRecognitionResult]] = {}
@@ -3495,6 +3504,7 @@ class TMDBScraper:
             "ai_requests": 0,
             "tmdb_failure_cache_hits": 0,
             "tmdb_circuit_rejections": 0,
+            "tmdb_singleflight_hits": 0,
             "ai_cache_hits": 0,
             "tavily_hint_lookups": 0,
             "tavily_hint_requests": 0,
@@ -3516,6 +3526,41 @@ class TMDBScraper:
     @staticmethod
     def _clone_search_results(results: list[dict]) -> list[dict]:
         return [dict(item) for item in results if isinstance(item, dict)]
+
+    @classmethod
+    def _clone_search_outcome(cls, outcome: _SearchOutcome) -> _SearchOutcome:
+        return replace(
+            outcome,
+            results=tuple(cls._clone_search_results(list(outcome.results))),
+        )
+
+    def _begin_tmdb_flight(
+        self, kind: str, key: object
+    ) -> tuple[_TMDBFlight, bool]:
+        flight_key = (str(kind), key)
+        with self._tmdb_state_lock:
+            flight = self._tmdb_inflight.get(flight_key)
+            if flight is not None:
+                self._performance_counters["tmdb_singleflight_hits"] += 1
+                return flight, False
+            flight = _TMDBFlight()
+            self._tmdb_inflight[flight_key] = flight
+            return flight, True
+
+    def _finish_tmdb_flight(
+        self, kind: str, key: object, flight: _TMDBFlight, result: object
+    ) -> None:
+        flight_key = (str(kind), key)
+        with self._tmdb_state_lock:
+            flight.result = result
+            if self._tmdb_inflight.get(flight_key) is flight:
+                self._tmdb_inflight.pop(flight_key, None)
+            flight.event.set()
+
+    @staticmethod
+    def _wait_tmdb_flight(flight: _TMDBFlight) -> object:
+        flight.event.wait()
+        return flight.result
 
     @staticmethod
     def _transient_tmdb_error(exc: Exception) -> bool:
@@ -3663,6 +3708,31 @@ class TMDBScraper:
             status="matched" if cloned else "no_result",
         )
 
+    def _cached_search_outcome(
+        self, cache_key: tuple[str, str, str]
+    ) -> _SearchOutcome | None:
+        with self._tmdb_state_lock:
+            cached = self._search_cache.get(cache_key)
+            if not cached:
+                return None
+            cached_at, cached_results = cached
+            ttl = (
+                _SEARCH_CACHE_TTL_SECONDS
+                if cached_results
+                else _EMPTY_SEARCH_CACHE_TTL_SECONDS
+            )
+            if time.monotonic() - cached_at > ttl:
+                self._search_cache.pop(cache_key, None)
+                return None
+            self._performance_counters["tmdb_search_cache_hits"] += 1
+            cloned = tuple(self._clone_search_results(cached_results))
+            return _SearchOutcome(
+                results=cloned,
+                status="matched" if cloned else "no_result",
+                cache_hit=True,
+                empty_cache_hit=not bool(cloned),
+            )
+
     def _search_with_outcome(
         self, title: str, year: str, media_type: str,
     ) -> _SearchOutcome:
@@ -3670,45 +3740,62 @@ class TMDBScraper:
         normalized_title = " ".join(str(title or "").split()).casefold()
         normalized_year = str(year or "").strip()
         cache_key = (normalized_type, normalized_title, normalized_year)
-        with self._tmdb_state_lock:
-            cached = self._search_cache.get(cache_key)
-            if cached:
-                cached_at, cached_results = cached
-                ttl = (
-                    _SEARCH_CACHE_TTL_SECONDS
-                    if cached_results else _EMPTY_SEARCH_CACHE_TTL_SECONDS
-                )
-                if time.monotonic() - cached_at <= ttl:
-                    self._performance_counters["tmdb_search_cache_hits"] += 1
-                    cloned = tuple(self._clone_search_results(cached_results))
-                    return _SearchOutcome(
-                        results=cloned,
-                        status="matched" if cloned else "no_result",
-                        cache_hit=True,
-                        empty_cache_hit=not bool(cloned),
-                    )
-                self._search_cache.pop(cache_key, None)
-        failed_message = self._active_tmdb_failure(
-            self._search_failure_cache, cache_key
-        )
-        if failed_message:
-            return _SearchOutcome(status="request_error", error=failed_message)
-        if self._tmdb_circuit_blocked():
+        cached = self._cached_search_outcome(cache_key)
+        if cached is not None:
+            return cached
+
+        flight, leader = self._begin_tmdb_flight("search", cache_key)
+        if not leader:
+            shared = self._wait_tmdb_flight(flight)
+            if isinstance(shared, _SearchOutcome):
+                return self._clone_search_outcome(shared)
             return _SearchOutcome(
                 status="request_error",
-                error="TMDB 服务暂时不可用，已进入短时保护",
+                error="TMDB 同步请求未返回有效结果",
             )
 
-        raw_config_error = getattr(self.client, "config_error", "")
-        config_error = raw_config_error.strip() if isinstance(raw_config_error, str) else ""
-        if config_error:
-            logger.error(config_error)
-            return _SearchOutcome(status="config_error", error=config_error)
-        if not self.api_key:
-            error = "未配置 TMDB_API_KEY"
-            logger.error(error)
-            return _SearchOutcome(status="config_error", error=error)
+        outcome = _SearchOutcome(
+            status="request_error",
+            error="TMDB 请求未完成",
+        )
         try:
+            cached = self._cached_search_outcome(cache_key)
+            if cached is not None:
+                outcome = cached
+                return outcome
+            failed_message = self._active_tmdb_failure(
+                self._search_failure_cache, cache_key
+            )
+            if failed_message:
+                outcome = _SearchOutcome(
+                    status="request_error", error=failed_message
+                )
+                return outcome
+            if self._tmdb_circuit_blocked():
+                outcome = _SearchOutcome(
+                    status="request_error",
+                    error="TMDB 服务暂时不可用，已进入短时保护",
+                )
+                return outcome
+
+            raw_config_error = getattr(self.client, "config_error", "")
+            config_error = (
+                raw_config_error.strip()
+                if isinstance(raw_config_error, str)
+                else ""
+            )
+            if config_error:
+                logger.error(config_error)
+                outcome = _SearchOutcome(
+                    status="config_error", error=config_error
+                )
+                return outcome
+            if not self.api_key:
+                error = "未配置 TMDB_API_KEY"
+                logger.error(error)
+                outcome = _SearchOutcome(status="config_error", error=error)
+                return outcome
+
             with self._tmdb_state_lock:
                 self._performance_counters["tmdb_search_requests"] += 1
             results = self._clone_search_results(
@@ -3725,10 +3812,11 @@ class TMDBScraper:
                     time.monotonic(), self._clone_search_results(results),
                 )
             cloned = tuple(self._clone_search_results(results))
-            return _SearchOutcome(
+            outcome = _SearchOutcome(
                 results=cloned,
                 status="matched" if cloned else "no_result",
             )
+            return outcome
         except Exception as e:
             error = redact_sensitive_text(f"TMDB 请求失败：{e}")[:500]
             if self._transient_tmdb_error(e):
@@ -3740,15 +3828,23 @@ class TMDBScraper:
                 "TMDB 搜索失败 [%s] [%s] [%s]: %s",
                 redact_sensitive_text(title), year, media_type, redact_sensitive_text(e),
             )
-            return _SearchOutcome(status="request_error", error=error)
+            outcome = _SearchOutcome(status="request_error", error=error)
+            return outcome
+        finally:
+            self._finish_tmdb_flight(
+                "search",
+                cache_key,
+                flight,
+                self._clone_search_outcome(outcome),
+            )
 
     def search(self, title: str, year: str, media_type: str) -> list[dict]:
         outcome = self._search_with_outcome(title, year, media_type)
         self._publish_search_outcome(outcome)
         return self._clone_search_results(list(outcome.results))
 
-    @staticmethod
     def _remember_detail(
+        self,
         cache: dict[tuple[str, str], dict],
         key: tuple[str, str],
         detail: dict,
@@ -3757,9 +3853,10 @@ class TMDBScraper:
     ) -> None:
         if not isinstance(detail, dict) or not detail:
             return
-        if key not in cache and len(cache) >= limit:
-            cache.pop(next(iter(cache)))
-        cache[key] = dict(detail)
+        with self._tmdb_state_lock:
+            if key not in cache and len(cache) >= limit:
+                cache.pop(next(iter(cache)))
+            cache[key] = dict(detail)
 
     def get_detail(
         self, tmdb_id: str, media_type: str, *, force_refresh: bool = False
@@ -3780,20 +3877,39 @@ class TMDBScraper:
                 self._recognition_detail_cache.pop(key, None)
                 self._recognition_detail_failures.discard(key)
                 self._detail_failure_cache.pop(key, None)
-        cached = self._credits_detail_cache.get(key) or self._detail_cache.get(key)
-        if cached:
-            self._performance_counters["tmdb_detail_cache_hits"] += 1
-            return dict(cached)
-        if self._active_tmdb_failure(self._detail_failure_cache, key):
-            return {}
-        if self._tmdb_circuit_blocked():
-            return {}
+        with self._tmdb_state_lock:
+            cached = self._credits_detail_cache.get(key) or self._detail_cache.get(key)
+            if cached:
+                self._performance_counters["tmdb_detail_cache_hits"] += 1
+                return dict(cached)
+
+        flight, leader = self._begin_tmdb_flight("detail", key)
+        if not leader:
+            shared = self._wait_tmdb_flight(flight)
+            return dict(shared) if isinstance(shared, dict) else {}
+
+        result: dict = {}
         try:
-            self._performance_counters["tmdb_detail_requests"] += 1
+            with self._tmdb_state_lock:
+                cached = (
+                    self._credits_detail_cache.get(key)
+                    or self._detail_cache.get(key)
+                )
+                if cached:
+                    self._performance_counters["tmdb_detail_cache_hits"] += 1
+                    result = dict(cached)
+                    return dict(result)
+            if self._active_tmdb_failure(self._detail_failure_cache, key):
+                return {}
+            if self._tmdb_circuit_blocked():
+                return {}
+            with self._tmdb_state_lock:
+                self._performance_counters["tmdb_detail_requests"] += 1
             detail = self.client.detail(key[1], normalized)
             self._record_tmdb_success()
             self._remember_detail(self._detail_cache, key, detail)
-            return dict(detail) if isinstance(detail, dict) else {}
+            result = dict(detail) if isinstance(detail, dict) else {}
+            return dict(result)
         except Exception as e:
             if self._transient_tmdb_error(e):
                 self._remember_tmdb_failure(
@@ -3802,6 +3918,8 @@ class TMDBScraper:
                 self._record_tmdb_failure(e)
             logger.error("TMDB 详情失败 tmdb=%s type=%s error=%s", tmdb_id, normalized, type(e).__name__)
             return {}
+        finally:
+            self._finish_tmdb_flight("detail", key, flight, dict(result))
 
     def _season_episodes(self, tmdb_id: str, season_number: int | None) -> list | None:
         """读取季逐集清单；接口失败按证据不足处理，不得据此淘汰候选。"""
@@ -3832,26 +3950,49 @@ class TMDBScraper:
             with self._tmdb_state_lock:
                 self._season_detail_cache.pop(key, None)
                 self._season_detail_failure_cache.pop(key, None)
-        cached = self._season_detail_cache.get(key)
-        if cached:
-            self._performance_counters["tmdb_season_detail_cache_hits"] += 1
-            return dict(cached)
-        if self._active_tmdb_failure(self._season_detail_failure_cache, key):
-            return {}
-        if self._tmdb_circuit_blocked():
-            return {}
+        with self._tmdb_state_lock:
+            cached = self._season_detail_cache.get(key)
+            if cached:
+                self._performance_counters["tmdb_season_detail_cache_hits"] += 1
+                return dict(cached)
+
+        flight, leader = self._begin_tmdb_flight("season_detail", key)
+        if not leader:
+            shared = self._wait_tmdb_flight(flight)
+            return dict(shared) if isinstance(shared, dict) else {}
+
+        result: dict = {}
         try:
-            self._performance_counters["tmdb_season_detail_requests"] += 1
+            with self._tmdb_state_lock:
+                cached = self._season_detail_cache.get(key)
+                if cached:
+                    self._performance_counters[
+                        "tmdb_season_detail_cache_hits"
+                    ] += 1
+                    result = dict(cached)
+                    return dict(result)
+            if self._active_tmdb_failure(
+                self._season_detail_failure_cache, key
+            ):
+                return {}
+            if self._tmdb_circuit_blocked():
+                return {}
+            with self._tmdb_state_lock:
+                self._performance_counters["tmdb_season_detail_requests"] += 1
             detail = self.client.tv_season_detail(key[0], key[1])
             self._record_tmdb_success()
             if isinstance(detail, dict) and detail:
-                if (
-                    key not in self._season_detail_cache
-                    and len(self._season_detail_cache) >= 128
-                ):
-                    self._season_detail_cache.pop(next(iter(self._season_detail_cache)))
-                self._season_detail_cache[key] = dict(detail)
-                return dict(detail)
+                with self._tmdb_state_lock:
+                    if (
+                        key not in self._season_detail_cache
+                        and len(self._season_detail_cache) >= 128
+                    ):
+                        self._season_detail_cache.pop(
+                            next(iter(self._season_detail_cache))
+                        )
+                    self._season_detail_cache[key] = dict(detail)
+                result = dict(detail)
+                return dict(result)
             return {}
         except Exception as e:
             if self._transient_tmdb_error(e):
@@ -3865,6 +4006,10 @@ class TMDBScraper:
                 "TMDB 季详情失败 [%s] [S%02d]: %s", tmdb_id, season_number, e
             )
             return {}
+        finally:
+            self._finish_tmdb_flight(
+                "season_detail", key, flight, dict(result)
+            )
 
     def get_detail_with_credits(self, tmdb_id: str, media_type: str) -> dict:
         """获取候选详情及演职员；搜索与预览复用同一成功响应。"""
@@ -3872,16 +4017,31 @@ class TMDBScraper:
             return {}
         normalized = "tv" if media_type == "tv" else "movie"
         key = (normalized, str(tmdb_id).strip())
-        cached = self._credits_detail_cache.get(key)
-        if cached:
-            self._performance_counters["tmdb_detail_cache_hits"] += 1
-            return dict(cached)
-        if self._active_tmdb_failure(self._detail_failure_cache, key):
-            return {}
-        if self._tmdb_circuit_blocked():
-            return {}
+        with self._tmdb_state_lock:
+            cached = self._credits_detail_cache.get(key)
+            if cached:
+                self._performance_counters["tmdb_detail_cache_hits"] += 1
+                return dict(cached)
+
+        flight, leader = self._begin_tmdb_flight("credits_detail", key)
+        if not leader:
+            shared = self._wait_tmdb_flight(flight)
+            return dict(shared) if isinstance(shared, dict) else {}
+
+        result: dict = {}
         try:
-            self._performance_counters["tmdb_detail_requests"] += 1
+            with self._tmdb_state_lock:
+                cached = self._credits_detail_cache.get(key)
+                if cached:
+                    self._performance_counters["tmdb_detail_cache_hits"] += 1
+                    result = dict(cached)
+                    return dict(result)
+            if self._active_tmdb_failure(self._detail_failure_cache, key):
+                return {}
+            if self._tmdb_circuit_blocked():
+                return {}
+            with self._tmdb_state_lock:
+                self._performance_counters["tmdb_detail_requests"] += 1
             detail = self._get(
                 f"/{normalized}/{key[1]}",
                 {"append_to_response": "credits"},
@@ -3889,7 +4049,8 @@ class TMDBScraper:
             self._record_tmdb_success()
             self._remember_detail(self._credits_detail_cache, key, detail)
             self._remember_detail(self._detail_cache, key, detail)
-            return dict(detail) if isinstance(detail, dict) else {}
+            result = dict(detail) if isinstance(detail, dict) else {}
+            return dict(result)
         except Exception as e:
             if self._transient_tmdb_error(e):
                 self._remember_tmdb_failure(
@@ -3898,6 +4059,10 @@ class TMDBScraper:
                 self._record_tmdb_failure(e)
             logger.error("TMDB 演职员详情失败 tmdb=%s type=%s error=%s", tmdb_id, normalized, type(e).__name__)
             return {}
+        finally:
+            self._finish_tmdb_flight(
+                "credits_detail", key, flight, dict(result)
+            )
 
     def search_candidates(self, query: str, year: str = "",
                           media_type: str = "movie") -> list[Candidate]:

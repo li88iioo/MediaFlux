@@ -320,9 +320,23 @@ class STRMMetadataWorker:
                 self._current_job_id = 0
 
     def _flush_media_refresh(self, *, force: bool) -> None:
-        paths = db.list_strm_metadata_refresh_paths(limit=20000)
-        if not paths:
+        entries = db.list_strm_refresh_entries(limit=20000)
+        if not entries:
             return
+        grouped_paths = {
+            False: list(dict.fromkeys(
+                str(entry.get("path") or "").strip()
+                for entry in entries
+                if not bool(entry.get("allow_emby"))
+                and str(entry.get("path") or "").strip()
+            )),
+            True: list(dict.fromkeys(
+                str(entry.get("path") or "").strip()
+                for entry in entries
+                if bool(entry.get("allow_emby"))
+                and str(entry.get("path") or "").strip()
+            )),
+        }
         batch_size = max(
             50, min(get_int("STRM_METADATA_REFRESH_BATCH_SIZE", 500), 5000)
         )
@@ -337,27 +351,47 @@ class STRMMetadataWorker:
         )
         if self._refresh_retry_pending and not force and elapsed < interval:
             return
-        if not force and len(paths) < batch_size and elapsed < interval:
+        if not force and len(entries) < batch_size and elapsed < interval:
             return
         self._last_refresh_at = now_mono
-        try:
-            from app.modules.media_refresh_coordinator import (
-                enqueue_media_refresh_paths,
-            )
+        from app.modules.media_refresh_coordinator import (
+            enqueue_media_refresh_paths,
+        )
 
-            results = enqueue_media_refresh_paths(paths, immediate=bool(force))
-        except Exception:
-            self._refresh_retry_pending = True
-            logger.exception("STRM 元数据落盘后的媒体库刷新入队失败，将保留变更稍后重试")
-            return
-        if any(value == "failed" for value in results.values()):
-            self._refresh_retry_pending = True
-            logger.warning("STRM 元数据已落盘，但媒体库刷新未全部入队，将稍后重试")
-            return
-        # 统一刷新队列已持久接管这些路径；后续媒体服务器失败只重试刷新，
-        # 不再让元数据 worker 重复提交同一变化。
-        db.acknowledge_strm_metadata_refresh_paths(paths)
-        self._refresh_retry_pending = False
+        retry_pending = False
+        for allow_emby, paths in grouped_paths.items():
+            if not paths:
+                continue
+            try:
+                results = enqueue_media_refresh_paths(
+                    paths,
+                    immediate=bool(force),
+                    allow_emby=allow_emby,
+                )
+            except Exception:
+                retry_pending = True
+                logger.exception(
+                    "STRM 落盘后的媒体库刷新入队失败，将保留变更稍后重试"
+                )
+                continue
+            if any(value == "failed" for value in results.values()):
+                retry_pending = True
+                logger.warning(
+                    "STRM 已落盘，但媒体库刷新未全部入队，将稍后重试"
+                )
+                continue
+            # 统一刷新队列已持久接管这些路径；后续媒体服务器失败只重试刷新，
+            # 不再让 STRM 或元数据 worker 重复提交同一文件变化。
+            try:
+                db.acknowledge_strm_refresh_paths(
+                    paths, allow_emby=allow_emby
+                )
+            except Exception:
+                retry_pending = True
+                logger.exception(
+                    "STRM 媒体库刷新 outbox 确认失败，将保留记录幂等重试"
+                )
+        self._refresh_retry_pending = retry_pending
 
 
 _worker = STRMMetadataWorker()

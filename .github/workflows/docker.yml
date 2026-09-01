@@ -42,8 +42,13 @@ jobs:
           npm ci --ignore-scripts --no-audit --no-fund
           python -m pip install --require-hashes -r requirements-release-runtime.lock
           python -m pip install "pytest==9.1.1"
+          python -m pip install "ruff==0.16.5"
           python -c 'from importlib.metadata import version; assert version("pytest") == "9.1.1"'
+          python -c 'from importlib.metadata import version; assert version("ruff") == "0.16.5"'
           python -m pip check
+
+      - name: Run Python static quality gate
+        run: ruff check app packaging tests --select F,E9
 
       - name: Validate Python and JavaScript syntax
         run: |
@@ -275,6 +280,10 @@ jobs:
               ).fetchone()
               outbox = connection.execute(
                   "SELECT 1 FROM sqlite_master WHERE type='table' "
+                  "AND name='strm_refresh_outbox'"
+              ).fetchone()
+              legacy_strm_outbox = connection.execute(
+                  "SELECT 1 FROM sqlite_master WHERE type='table' "
                   "AND name='strm_metadata_refresh_outbox'"
               ).fetchone()
               legacy_organize_table = connection.execute(
@@ -296,6 +305,7 @@ jobs:
               assert version == SCHEMA_VERSION, (version, SCHEMA_VERSION)
               assert sentinel == ("preserved",), sentinel
               assert outbox == (1,), outbox
+              assert legacy_strm_outbox is None, legacy_strm_outbox
               assert legacy_organize_table is None, legacy_organize_table
               assert legacy_notification is not None, legacy_notification
               assert legacy_notification[:3] == ("organize", "result", "100")

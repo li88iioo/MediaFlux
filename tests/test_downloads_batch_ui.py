@@ -195,10 +195,9 @@ class DownloadBatchUiContractTests(unittest.TestCase):
             self.styles,
         )
 
-    def test_main_stylesheet_cache_key_includes_download_batch_toolbar_release(self):
-        match = re.search(r"css/main\.css'\) }}\?v=(\d{8}[a-z])", self.base_template)
-        self.assertIsNotNone(match, "main.css 应带静态资源缓存版本")
-        self.assertGreaterEqual(match.group(1), "20260809f")
+    def test_main_stylesheet_uses_content_hash_authority(self):
+        self.assertIn("static_url('css/main.css')", self.base_template)
+        self.assertNotRegex(self.base_template, r"css/main\.css[^\n]*\?v=20\d{6}[a-z]")
 
     def test_issue_batch_actions_support_qb_guangya_both_and_safe_cleanup(self):
         for contract in (

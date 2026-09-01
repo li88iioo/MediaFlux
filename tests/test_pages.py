@@ -38,7 +38,7 @@ class PagesUiContractTests(unittest.TestCase):
         self.assertNotIn("width: min(1760px, 100%);", css)
 
         dashboard_html = DASHBOARD_HTML.read_text(encoding="utf-8")
-        self.assertIn("css/dashboard-workbench.css') }}?v=20260820a", dashboard_html)
+        self.assertIn("static_url('css/dashboard-workbench.css')", dashboard_html)
 
     def test_dashboard_topbar_mobile_responsive_contract(self):
         css = DASHBOARD_CSS.read_text(encoding="utf-8")
@@ -85,26 +85,21 @@ class PagesUiContractTests(unittest.TestCase):
         self.assertNotIn("--mf-content-max: 1560px;", core_layout_css)
         self.assertIn(".content {\n    flex: 1;\n    width: 100%;\n    max-width: none;\n    margin: 0;", core_layout_css)
 
-        # 验证各页面 HTML 缓存版本戳
-        base_html = BASE_HTML.read_text(encoding="utf-8")
-        self.assertRegex(base_html, r"css/main\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
-
-        local_media_html = LOCAL_MEDIA_HTML.read_text(encoding="utf-8")
-        self.assertRegex(local_media_html, r"css/local-media\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
-
-        global_search_html = GLOBAL_SEARCH_HTML.read_text(encoding="utf-8")
-        self.assertRegex(global_search_html, r"css/dashboard-workbench\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
-        self.assertRegex(global_search_html, r"css/media-hub\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
-
-        media_recent_html = MEDIA_RECENT_HTML.read_text(encoding="utf-8")
-        self.assertRegex(media_recent_html, r"css/dashboard-workbench\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
-        self.assertRegex(media_recent_html, r"css/media-hub\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
-
-        agent_html = AGENT_HTML.read_text(encoding="utf-8")
-        self.assertRegex(agent_html, r"css/agent\.css'\) \}\}\?v=20260901c")
-
-        login_html = LOGIN_HTML.read_text(encoding="utf-8")
-        self.assertRegex(login_html, r"css/core-layout\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
+        # 所有页面只声明资源路径；真实内容指纹由 Web 公共层统一生成。
+        expected_assets = {
+            BASE_HTML: ("css/main.css",),
+            LOCAL_MEDIA_HTML: ("css/local-media.css",),
+            GLOBAL_SEARCH_HTML: ("css/dashboard-workbench.css", "css/media-hub.css"),
+            MEDIA_RECENT_HTML: ("css/dashboard-workbench.css", "css/media-hub.css"),
+            AGENT_HTML: ("css/agent.css",),
+            LOGIN_HTML: ("css/core-layout.css",),
+        }
+        for template_path, assets in expected_assets.items():
+            html = template_path.read_text(encoding="utf-8")
+            with self.subTest(template=template_path.name):
+                for asset in assets:
+                    self.assertIn(f"static_url('{asset}')", html)
+                self.assertNotRegex(html, r"\?v=20\d{6}[a-z]")
 
     def test_settings_telegram_quick_commands(self):
         html = (SETTINGS_HTML.read_text(encoding="utf-8") + SETTINGS_JS.read_text(encoding="utf-8"))
@@ -154,7 +149,7 @@ class PagesUiContractTests(unittest.TestCase):
 
     def test_settings_large_screen_layout_and_network_2col_contract(self):
         html = (SETTINGS_HTML.read_text(encoding="utf-8") + SETTINGS_JS.read_text(encoding="utf-8"))
-        self.assertIn("css/settings-agent.css') }}?v=20260829b", html)
+        self.assertIn("static_url('css/settings-agent.css')", html)
         self.assertIn('id="settings-panel-network"', html)
         self.assertIn('class="settings-layout-2col"', html)
         self.assertIn('aria-label="网络代理遥测与探针"', html)

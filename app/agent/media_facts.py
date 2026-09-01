@@ -228,7 +228,7 @@ def _season_counts_from_answer(answer: str, *, source: str) -> list[dict[str, An
     counts: dict[int, int] = {}
     patterns = (
         rf"第\s*({_HUMAN_NUMBER_RE})\s*季[^。；;\n]{{0,24}}?(?:共|总共|合计|全)\s*([0-9]{{1,4}})\s*集",
-        rf"(?<![A-Za-z0-9])S\s*0*([0-9]{{1,3}})[^。；;\n]{{0,20}}?(?:共|总共|合计|全)\s*([0-9]{{1,4}})\s*集",
+        r"(?<![A-Za-z0-9])S\s*0*([0-9]{1,3})[^。；;\n]{0,20}?(?:共|总共|合计|全)\s*([0-9]{1,4})\s*集",
     )
     for pattern in patterns:
         for raw_season, raw_count in re.findall(pattern, answer, flags=re.IGNORECASE):

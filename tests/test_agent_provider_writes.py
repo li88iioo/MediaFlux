@@ -21,6 +21,7 @@ from app.agent.registry import AgentToolError
 from app.repositories.agent_provider_plans import (
     claim_provider_plan,
     create_provider_plan,
+    finish_provider_plan,
     get_latest_prepared_provider_plan,
     invalidate_provider_plans_for_owner,
 )
@@ -162,6 +163,102 @@ def _insert_provider_executing_audit(
         finished_at=stamp,
         confirmation_id=confirmation_id,
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "error_code", "expected_error", "expected_ok"),
+    [
+        ("succeeded", "", "", 1),
+        ("failed", "Provider.Fail-Code", "provider_fail_code", 0),
+        ("stale", "", "confirmation_stale", 0),
+        ("outcome_unknown", "execution-interrupted", "execution_interrupted", 0),
+    ],
+)
+def test_provider_terminal_transaction_converges_existing_action_audit(
+    isolated_provider_db, status, error_code, expected_error, expected_ok,
+):
+    plan = create_provider_plan(
+        owner="owner-a",
+        session_id="session-a",
+        provider="demo",
+        profile_ref="configured:demo",
+        operation="demo.items.update",
+        risk="write",
+        arguments={"item_ref": "private-item"},
+        target_snapshot={"title": "private-target"},
+        context_fingerprint="context-terminal-audit",
+    )
+    claim_provider_plan(
+        owner="owner-a",
+        session_id="session-a",
+        plan_ref=plan["plan_ref"],
+        expected_context="context-terminal-audit",
+    )
+    confirmation_id = f"provider-terminal-{status}"
+    _insert_provider_executing_audit(plan["plan_ref"], confirmation_id)
+
+    finish_provider_plan(
+        plan_ref=plan["plan_ref"],
+        status=status,
+        result={"private": "must-not-enter-audit"},
+        summary="private provider summary",
+        error_code=error_code,
+    )
+
+    with db.get_conn() as conn:
+        audit = conn.execute(
+            "SELECT status,ok,summary,safe_details,error_code FROM "
+            "agent_action_history WHERE confirmation_id=?",
+            (confirmation_id,),
+        ).fetchone()
+    assert audit is not None
+    assert audit["status"] == status
+    assert audit["ok"] == expected_ok
+    assert audit["error_code"] == expected_error
+    assert json.loads(audit["safe_details"]) == {"plan_ref": plan["plan_ref"]}
+    assert "private" not in audit["summary"]
+
+
+def test_provider_terminal_transaction_does_not_resurrect_purged_audit(
+    isolated_provider_db,
+):
+    plan = create_provider_plan(
+        owner="owner-a",
+        session_id="session-a",
+        provider="demo",
+        profile_ref="configured:demo",
+        operation="demo.items.update",
+        risk="write",
+        arguments={"item_ref": "private-item"},
+        target_snapshot={"title": "private-target"},
+        context_fingerprint="context-no-resurrection",
+    )
+    claim_provider_plan(
+        owner="owner-a",
+        session_id="session-a",
+        plan_ref=plan["plan_ref"],
+        expected_context="context-no-resurrection",
+    )
+    _insert_provider_executing_audit(plan["plan_ref"], "provider-purged-audit")
+    with db.get_conn() as conn:
+        conn.execute(
+            "DELETE FROM agent_action_history WHERE confirmation_id=?",
+            ("provider-purged-audit",),
+        )
+
+    finish_provider_plan(
+        plan_ref=plan["plan_ref"],
+        status="succeeded",
+        result={"accepted": True},
+        summary="completed",
+    )
+
+    with db.get_conn() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM agent_action_history WHERE safe_details LIKE ?",
+            (f"%{plan['plan_ref']}%",),
+        ).fetchone()[0]
+    assert count == 0
 
 
 def _preview(gateway: ProviderGateway, context: ToolContext):

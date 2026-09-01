@@ -9,7 +9,7 @@
     if(target&&target!=='console'&&['telegram','agent','metadata','discovery','downloads','network'].includes(target))document.documentElement.dataset.settingsBoot='pending';
 })();
 </script>
-<link rel="stylesheet" href="{{ url_for('static', path='css/settings-agent.css') }}?v=20260829b">
+<link rel="stylesheet" href="{{ static_url('css/settings-agent.css') }}">
 {% endblock %}
 
 {% block content %}
@@ -707,5 +707,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/settings.js') }}?v=20260825h"></script>
+<script src="{{ static_url('js/settings.js') }}"></script>
 {% endblock %}

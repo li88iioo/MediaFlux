@@ -4,8 +4,6 @@ import hashlib
 import json
 import unittest
 from dataclasses import FrozenInstanceError
-from pathlib import Path
-from unittest.mock import patch
 
 from app import database as db
 from app.clients.guangya import GuangYaFile

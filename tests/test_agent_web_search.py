@@ -11,7 +11,7 @@ from app import database as db
 from app.agent.models import ToolResult
 from app.agent.rate_limit import AgentRateLimiter, agent_rate_limiter
 from app.agent.orchestrator import AgentOrchestrator, is_discovery_search_message, is_web_search_message
-from app.agent.registry import AgentToolError, ToolRegistry
+from app.agent.registry import AgentToolError
 from app.agent.tools import build_tool_registry
 from app.agent.web_search_actions import (
     _map_response,

@@ -336,7 +336,7 @@ class SubscriptionMotionContractTests(unittest.TestCase):
         self.assertIn("requestAnimationFrame(() => window.requestAnimationFrame", script)
         self.assertIn("preserve && hadContent ? lockElementHeight", script)
         self.assertIn("delete document.documentElement.dataset.subscriptionInitialTab", script)
-        self.assertIn("subscriptions.js?v=20260831a", template)
+        self.assertIn("static_url('js/subscriptions.js')", template)
 
         self.assertIn(".subscription-tab,", styles)
         self.assertIn(".media-subscription-card,", styles)

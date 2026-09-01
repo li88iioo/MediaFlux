@@ -912,6 +912,15 @@ class MediaServerPreciseRefreshTests(unittest.TestCase):
 class SchedulerRefreshWiringTests(unittest.TestCase):
     """调度器只规划变化路径并提交统一持久刷新队列。"""
 
+    def setUp(self):
+        self.enqueue_outbox = patch(
+            "app.modules.scheduler.db.enqueue_strm_refresh_paths"
+        ).start()
+        self.ack_outbox = patch(
+            "app.modules.scheduler.db.acknowledge_strm_refresh_paths"
+        ).start()
+        self.addCleanup(patch.stopall)
+
     @staticmethod
     def _settings():
         return {"STRM_ROOT": "/data/strm"}
@@ -934,6 +943,12 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             )
 
         self.assertEqual(results, {"Jellyfin": "queued"})
+        self.enqueue_outbox.assert_called_once_with(
+            [f"{ROOT}/剧集/作品 A/Season 01"], allow_emby=True
+        )
+        self.ack_outbox.assert_called_once_with(
+            [f"{ROOT}/剧集/作品 A/Season 01"], allow_emby=True
+        )
         enqueue.assert_called_once_with(
             [f"{ROOT}/剧集/作品 A/Season 01"],
             immediate=False,
@@ -977,6 +992,12 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             )
 
         self.assertEqual(results, {"Jellyfin": "queued"})
+        self.enqueue_outbox.assert_called_once_with(
+            [f"{ROOT}/剧集/作品 A"], allow_emby=False
+        )
+        self.ack_outbox.assert_called_once_with(
+            [f"{ROOT}/剧集/作品 A"], allow_emby=False
+        )
         self.assertFalse(enqueue.call_args.kwargs["allow_emby"])
 
     def test_unified_refresh_override_disables_queueing(self):
@@ -1050,6 +1071,27 @@ class SchedulerRefreshWiringTests(unittest.TestCase):
             )
 
         self.assertEqual(results, {"Jellyfin": "failed"})
+        self.enqueue_outbox.assert_called_once()
+        self.ack_outbox.assert_not_called()
+
+    def test_queue_exception_is_reported_and_keeps_durable_outbox(self):
+        from app.modules.scheduler import STRMScheduler
+
+        settings = self._settings()
+        with patch(
+            "app.modules.scheduler.get",
+            side_effect=lambda key, default="": settings.get(key, default),
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            side_effect=RuntimeError("queue unavailable"),
+        ):
+            results = STRMScheduler._refresh_media_servers(
+                has_changes=True, changed_dirs=[f"{ROOT}/剧集/作品 A"],
+            )
+
+        self.assertEqual(results, {"媒体库": "failed"})
+        self.enqueue_outbox.assert_called_once()
+        self.ack_outbox.assert_not_called()
 
     def test_no_changes_skips_refresh_entirely(self):
         from app.modules.scheduler import STRMScheduler

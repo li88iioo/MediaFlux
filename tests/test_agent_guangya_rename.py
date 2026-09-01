@@ -158,6 +158,32 @@ class GuangYaRenameTests(unittest.TestCase):
         self.assertEqual(stored["execution"]["renamed"], 2)
         self.assertTrue((self.plan_dir / f"{plan['plan_id']}.jsonl").is_file())
 
+    def test_legacy_persisted_mode_is_rejected_and_removed(self):
+        client = FakeGuangYaClient()
+        plan = guangya_rename.build_rename_plan(
+            client,
+            owner="owner",
+            targets=[
+                "/整理/动漫/师兄太稳健.S01E08.2160p.15.1Mbps.60fps.mp4"
+            ],
+            mode="remove_bitrate",
+        )
+        stored = guangya_rename.load_rename_plan(plan["plan_id"], owner="owner")
+        stored["mode"] = "declarative"
+        stored["transform"] = {"trigger_strm": "1"}
+        guangya_rename._atomic_write_plan(
+            self.plan_dir / f"{plan['plan_id']}.json", stored
+        )
+
+        with self.assertRaisesRegex(
+            guangya_rename.GuangYaRenamePlanStale, "已停用的旧链路"
+        ):
+            guangya_rename.load_rename_plan(plan["plan_id"], owner="owner")
+
+        result = guangya_rename.maintain_rename_plans()
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse((self.plan_dir / f"{plan['plan_id']}.json").exists())
+
     def test_provider_rejection_is_partial_not_false_success(self):
         client = FakeGuangYaClient(reject_ids={"f2"})
         plan = guangya_rename.build_rename_plan(

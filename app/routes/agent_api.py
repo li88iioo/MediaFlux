@@ -1460,7 +1460,7 @@ def invoke_tool(request: Request, tool_name: str, data: Any = Body(default=None)
         operation, _ = coordinator.begin_with_context(
             owner=owner,
             operation_id=request_key,
-            initialize=lambda: invalidate_query_confirmation_epoch(
+            initialize=lambda: begin_query_confirmation_epoch(
                 service, owner=owner
             ),
         )
@@ -1542,7 +1542,7 @@ def invoke_workspace_action(request: Request, data: Any = Body(default=None)):
         operation, _ = coordinator.begin_with_context(
             owner=owner,
             operation_id=request_key,
-            initialize=lambda: invalidate_query_confirmation_epoch(
+            initialize=lambda: begin_query_confirmation_epoch(
                 service, owner=owner
             ),
         )

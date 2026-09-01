@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 import guessit as guessit_module
 
-from app.modules import scraper as scraper_module
 from app.modules.recognition.extractors import guessit_adapter
 from app.modules.scraper import extract_recognition_context
 from tests.recognition_eval_helpers import load_release_recognition_cases

@@ -193,7 +193,7 @@ class MediaProbeTests(unittest.TestCase):
     def test_cached_profile_recomputes_filename_derived_source(self):
         import json
 
-        from app.modules.media_probe import MediaProfile, media_profile_from_cache
+        from app.modules.media_probe import media_profile_from_cache
 
         payload = json.dumps({
             "resolution": "2160p",

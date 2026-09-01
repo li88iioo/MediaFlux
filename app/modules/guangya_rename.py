@@ -25,6 +25,9 @@ from app.private_files import protect_private_file
 from app.repositories.organize_operation_jobs import organize_operation_owner_digest
 
 _PLAN_VERSION = 1
+CANONICAL_RENAME_PLAN_MODES = frozenset({
+    "remove_bitrate", "replace_text", "media_hygiene",
+})
 _PLAN_TTL_SECONDS = 15 * 60
 _CONFIRMED_TTL_SECONDS = 60 * 60
 _MAX_TARGETS = 4
@@ -192,6 +195,11 @@ def load_rename_plan(
     require_confirmed: bool = False,
 ) -> dict[str, Any]:
     payload = _read_plan(plan_id)
+    mode = str(payload.get("mode") or "").strip().casefold()
+    if mode not in CANONICAL_RENAME_PLAN_MODES:
+        raise GuangYaRenamePlanStale(
+            "重命名计划来自已停用的旧链路，请重新预览"
+        )
     if owner is not None and not hmac.compare_digest(
         str(payload.get("owner_digest") or ""), _owner_digest(owner),
     ):
@@ -407,12 +415,13 @@ def maintain_rename_plans() -> dict[str, int]:
             except GuangYaRenamePlanError:
                 payload = {}
             status = str(payload.get("status") or "").strip().casefold()
+            mode = str(payload.get("mode") or "").strip().casefold()
             updated_epoch = max(
                 float(payload.get("created_at_epoch") or 0),
                 float(path.stat().st_mtime or 0),
             )
-            remove = False
-            if status == "preview":
+            remove = mode not in CANONICAL_RENAME_PLAN_MODES
+            if not remove and status == "preview":
                 remove = float(payload.get("expires_at_epoch") or 0) <= current
             elif status == "confirmed":
                 remove = float(payload.get("execute_until_epoch") or 0) <= current
@@ -536,6 +545,9 @@ def _finalize_rename_plan(
     }
     for key, value in (extra_stats or {}).items():
         stats[str(key)] = max(0, int(value or 0))
+    safe_mode = str(mode or "").strip().casefold()
+    if safe_mode not in CANONICAL_RENAME_PLAN_MODES:
+        raise GuangYaRenamePlanError("重命名计划类型无效")
     payload: dict[str, Any] = {
         "version": _PLAN_VERSION,
         "plan_id": plan_id,
@@ -545,7 +557,7 @@ def _finalize_rename_plan(
         "expires_at_epoch": current + _PLAN_TTL_SECONDS,
         "status": "preview",
         "credential_generation": int(client.credential_generation),
-        "mode": str(mode or "").strip().casefold(),
+        "mode": safe_mode,
         "recursive": bool(recursive),
         "targets": list(targets),
         "limit": max(1, min(int(limit), _MAX_RENAMES)),

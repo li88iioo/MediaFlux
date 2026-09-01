@@ -76,7 +76,7 @@ class MediaLibrariesAPITests(IsolatedDatabaseTestCase):
         self.login()
         page = self.client.get("/media-libraries")
         self.assertEqual(page.status_code, 200, page.text)
-        self.assertIn("css/media-libraries.css?v=20260829c", page.text)
+        self.assertRegex(page.text, r"/static/css/media-libraries\.css\?v=[0-9a-f]{16}")
         self.assertIn('id="mediaLibrariesPage"', page.text)
         self.assertEqual(
             self.client.post("/api/media-libraries/path-test", json={}).status_code,

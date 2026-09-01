@@ -68,10 +68,9 @@ class GuangyaOfflineUiContractTests(unittest.TestCase):
         self.assertNotIn("offline-protocol-card--policy", self.styles)
         self.assertNotIn("offline-protocol-policy-badge", self.styles)
 
-    def test_main_stylesheet_cache_key_includes_offline_protocol_release(self):
-        match = re.search(r"css/main\.css'\) }}\?v=(\d{8}[a-z])", self.base_template)
-        self.assertIsNotNone(match, "main.css 应带静态资源缓存版本")
-        self.assertGreaterEqual(match.group(1), "20260809i")
+    def test_main_stylesheet_uses_content_hash_authority(self):
+        self.assertIn("static_url('css/main.css')", self.base_template)
+        self.assertNotRegex(self.base_template, r"css/main\.css[^\n]*\?v=20\d{6}[a-z]")
 
 
 if __name__ == "__main__":

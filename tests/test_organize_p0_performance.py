@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -43,6 +44,96 @@ class _DetailClient:
         })
 
 
+class _SingleFlightClient:
+    api_key = "test-key"
+    base_url = "https://api.example"
+    config_error = ""
+    session = None
+
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def _result(self, endpoint: str, value):
+        if endpoint != self.endpoint:
+            raise AssertionError(f"unexpected endpoint: {endpoint}")
+        with self._lock:
+            self.calls += 1
+        self.started.set()
+        if not self.release.wait(timeout=3):
+            raise TimeoutError("singleflight test was not released")
+        return value
+
+    def search(self, _title, _year, _media_type):
+        return self._result("search", [{"id": 100, "name": "Example Show"}])
+
+    def detail(self, tmdb_id, media_type):
+        return self._result(
+            "detail", {"id": int(tmdb_id), "media_type": media_type}
+        )
+
+    def tv_season_detail(self, tmdb_id, season_number):
+        return self._result(
+            "season_detail",
+            {
+                "id": int(tmdb_id),
+                "season_number": season_number,
+                "episodes": [],
+            },
+        )
+
+    def get(self, path, params=None):
+        return self._result(
+            "credits_detail",
+            {"id": int(path.rsplit("/", 1)[-1]), "credits": {}, "params": params},
+        )
+
+
+class _ParallelDetailClient:
+    api_key = "test-key"
+    base_url = "https://api.example"
+    config_error = ""
+    session = None
+
+    def __init__(self):
+        self.barrier = threading.Barrier(2)
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def detail(self, tmdb_id, media_type):
+        with self._lock:
+            self.calls += 1
+        self.barrier.wait(timeout=2)
+        return {"id": int(tmdb_id), "media_type": media_type}
+
+
+class _FailOnceDetailClient:
+    api_key = "test-key"
+    base_url = "https://api.example"
+    config_error = ""
+    session = None
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def detail(self, tmdb_id, media_type):
+        with self._lock:
+            self.calls += 1
+            call_number = self.calls
+        if call_number == 1:
+            self.started.set()
+            if not self.release.wait(timeout=3):
+                raise TimeoutError("singleflight failure test was not released")
+            raise RuntimeError("one-off failure")
+        return {"id": int(tmdb_id), "media_type": media_type}
+
+
 class _EmptyOrganizerClient:
     @staticmethod
     def file_info(_file_id):
@@ -79,6 +170,85 @@ class _TreeClient:
 
 
 class OrganizeP0PerformanceTests(IsolatedDatabaseTestCase):
+    @staticmethod
+    def _wait_for_singleflight_waiters(
+        scraper: TMDBScraper, expected: int
+    ) -> None:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if (
+                scraper.performance_snapshot()["tmdb_singleflight_hits"]
+                >= expected
+            ):
+                return
+            time.sleep(0.005)
+        raise AssertionError("concurrent callers did not join the TMDB flight")
+
+    def test_tmdb_same_key_requests_are_coalesced_for_all_cached_endpoints(self):
+        cases = (
+            ("search", lambda scraper: scraper.search("Example", "2026", "tv")),
+            ("detail", lambda scraper: scraper.get_detail("100", "tv")),
+            (
+                "season_detail",
+                lambda scraper: scraper.get_tv_season_detail("100", 1),
+            ),
+            (
+                "credits_detail",
+                lambda scraper: scraper.get_detail_with_credits("100", "tv"),
+            ),
+        )
+        for endpoint, invoke in cases:
+            with self.subTest(endpoint=endpoint):
+                client = _SingleFlightClient(endpoint)
+                scraper = TMDBScraper(client=client)
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(invoke, scraper) for _ in range(4)]
+                    self.assertTrue(client.started.wait(timeout=1))
+                    self._wait_for_singleflight_waiters(scraper, 3)
+                    client.release.set()
+                    results = [future.result(timeout=2) for future in futures]
+
+                self.assertEqual(client.calls, 1)
+                self.assertTrue(all(result == results[0] for result in results))
+                self.assertEqual(
+                    scraper.performance_snapshot()["tmdb_singleflight_hits"],
+                    3,
+                )
+
+    def test_tmdb_different_detail_keys_remain_parallel(self):
+        client = _ParallelDetailClient()
+        scraper = TMDBScraper(client=client)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(scraper.get_detail, "100", "tv")
+            second = pool.submit(scraper.get_detail, "101", "tv")
+            results = [first.result(timeout=3), second.result(timeout=3)]
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual({result["id"] for result in results}, {100, 101})
+        self.assertEqual(
+            scraper.performance_snapshot()["tmdb_singleflight_hits"], 0
+        )
+
+    def test_tmdb_failed_flight_releases_waiters_and_allows_retry(self):
+        client = _FailOnceDetailClient()
+        scraper = TMDBScraper(client=client)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(scraper.get_detail, "100", "tv") for _ in range(3)]
+            self.assertTrue(client.started.wait(timeout=1))
+            self._wait_for_singleflight_waiters(scraper, 2)
+            client.release.set()
+            self.assertEqual(
+                [future.result(timeout=2) for future in futures], [{}, {}, {}]
+            )
+
+        self.assertEqual(
+            scraper.get_detail("100", "tv"),
+            {"id": 100, "media_type": "tv"},
+        )
+        self.assertEqual(client.calls, 2)
+
     def test_tmdb_search_cache_reuses_equivalent_query_within_ttl(self):
         client = _SearchClient()
         scraper = TMDBScraper(client=client)

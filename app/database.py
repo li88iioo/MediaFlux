@@ -40,7 +40,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = (
     "上次进程在本地媒体写操作期间中断"
@@ -1098,15 +1098,17 @@ CREATE INDEX IF NOT EXISTS idx_strm_metadata_queue_lease
 CREATE INDEX IF NOT EXISTS idx_strm_metadata_queue_diagnostics
     ON strm_metadata_queue(status, source_id, updated_at DESC, id DESC);
 
--- 元数据已经落盘但媒体库尚未确认刷新的持久化 outbox。文件写入与入队在
--- 同一事务完成，进程在两者之间退出也不会永久漏掉 Jellyfin/Emby 刷新。
-CREATE TABLE IF NOT EXISTS strm_metadata_refresh_outbox (
-    path TEXT PRIMARY KEY,
+-- STRM 文件或伴随元数据已经落盘、但尚未由统一媒体库刷新队列接管的持久
+-- outbox。allow_emby 保存本轮明确的 provider 边界，重试不会扩大刷新范围。
+CREATE TABLE IF NOT EXISTS strm_refresh_outbox (
+    path TEXT NOT NULL,
+    allow_emby INTEGER NOT NULL DEFAULT 1 CHECK(allow_emby IN (0,1)),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(path, allow_emby)
 );
-CREATE INDEX IF NOT EXISTS idx_strm_metadata_refresh_outbox_updated
-    ON strm_metadata_refresh_outbox(updated_at, path);
+CREATE INDEX IF NOT EXISTS idx_strm_refresh_outbox_updated
+    ON strm_refresh_outbox(updated_at, path, allow_emby);
 
 CREATE TABLE IF NOT EXISTS strm_retired_sources (
     source_id TEXT PRIMARY KEY,
@@ -2664,6 +2666,35 @@ def _migrate_retire_telegram_write_confirmations_v16(
     conn.execute("DROP TABLE IF EXISTS telegram_write_confirmations")
 
 
+def _migrate_strm_refresh_outbox_v19(conn: sqlite3.Connection) -> None:
+    """把仅覆盖元数据的旧 outbox 合并为统一 STRM 刷新交接队列。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS strm_refresh_outbox ("
+        "path TEXT NOT NULL,"
+        "allow_emby INTEGER NOT NULL DEFAULT 1 CHECK(allow_emby IN (0,1)),"
+        "created_at TEXT NOT NULL,updated_at TEXT NOT NULL,"
+        "PRIMARY KEY(path,allow_emby))"
+    )
+    legacy = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='strm_metadata_refresh_outbox'"
+    ).fetchone()
+    if legacy is not None:
+        conn.execute(
+            "INSERT INTO strm_refresh_outbox("
+            "path,allow_emby,created_at,updated_at) "
+            "SELECT path,1,created_at,updated_at "
+            "FROM strm_metadata_refresh_outbox WHERE COALESCE(path,'')<>'' "
+            "ON CONFLICT(path,allow_emby) DO UPDATE SET "
+            "updated_at=MAX(strm_refresh_outbox.updated_at,excluded.updated_at)"
+        )
+        conn.execute("DROP TABLE strm_metadata_refresh_outbox")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strm_refresh_outbox_updated "
+        "ON strm_refresh_outbox(updated_at,path,allow_emby)"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2683,6 +2714,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     15: _migrate_retire_telegram_write_confirmations_v16,
     16: _migrate_agent_guangya_fs_change_jobs_v17,
     17: _migrate_agent_provider_plans_v18,
+    18: _migrate_strm_refresh_outbox_v19,
 }
 
 
@@ -2868,6 +2900,74 @@ def _sync_missing_schema_columns(conn: sqlite3.Connection) -> None:
         mem.close()
 
 
+def finalize_provider_action_history_for_plan(
+    conn: sqlite3.Connection, *, plan_ref: str, status: str,
+    error_code: str, timestamp: str,
+) -> int:
+    """把 Provider 计划终态投影到已经存在的确认审计。
+
+    这里只更新现有 ``executing`` 行，绝不补插。这样 Provider 计划终态与
+    审计在同一事务内收敛，同时不会在隐私清理后重新创建主体记录。
+    """
+    normalized_plan = str(plan_ref or "").strip().upper()
+    normalized_status = str(status or "").strip().casefold()
+    if not normalized_plan or normalized_status not in {
+        "succeeded", "failed", "stale", "outcome_unknown",
+    }:
+        return 0
+    labels = {
+        "succeeded": "Provider 原生写计划执行：已完成",
+        "failed": "Provider 原生写计划执行：失败",
+        "stale": "Provider 原生写计划执行：计划失效",
+        "outcome_unknown": "Provider 原生写计划执行：结果待核对",
+    }
+    fallback_errors = {
+        "succeeded": "",
+        "failed": "provider_write_failed",
+        "stale": "confirmation_stale",
+        "outcome_unknown": "outcome_unknown",
+    }
+    normalized_error = re.sub(
+        r"[^a-z0-9_]+", "_", str(error_code or "").strip().casefold()
+    ).strip("_")[:64]
+    if not normalized_error:
+        normalized_error = fallback_errors[normalized_status]
+
+    history_ids: list[int] = []
+    for row in conn.execute(
+        "SELECT id,safe_details FROM agent_action_history "
+        "WHERE tool_name='provider.change.execute' AND status='executing'"
+    ).fetchall():
+        try:
+            details = json.loads(str(row["safe_details"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(details, dict)
+            and str(details.get("plan_ref") or "").strip().upper()
+            == normalized_plan
+        ):
+            history_ids.append(int(row["id"]))
+    if not history_ids:
+        return 0
+    conn.executemany(
+        "UPDATE agent_action_history SET status=?,ok=?,summary=?,error_code=?,"
+        "finished_at=?,elapsed_ms=0 WHERE id=? AND status='executing'",
+        [
+            (
+                normalized_status,
+                1 if normalized_status == "succeeded" else 0,
+                labels[normalized_status],
+                normalized_error,
+                str(timestamp or now()),
+                history_id,
+            )
+            for history_id in history_ids
+        ],
+    )
+    return len(history_ids)
+
+
 def recover_interrupted_provider_plans(
     conn: sqlite3.Connection, *, timestamp: str
 ) -> int:
@@ -2885,30 +2985,14 @@ def recover_interrupted_provider_plans(
         "WHERE status='running'",
         (timestamp, timestamp),
     ).rowcount
-    if running_plan_ids:
-        history_ids: list[int] = []
-        for row in conn.execute(
-            "SELECT id,safe_details FROM agent_action_history "
-            "WHERE tool_name='provider.change.execute' AND status='executing'"
-        ).fetchall():
-            try:
-                details = json.loads(str(row["safe_details"] or "{}"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if (
-                isinstance(details, dict)
-                and str(details.get("plan_ref") or "").strip().upper()
-                in running_plan_ids
-            ):
-                history_ids.append(int(row["id"]))
-        if history_ids:
-            conn.executemany(
-                "UPDATE agent_action_history SET status='outcome_unknown',ok=0,"
-                "summary='Provider 原生写计划执行：结果待核对',"
-                "error_code='execution_interrupted',finished_at=?,elapsed_ms=0 "
-                "WHERE id=? AND status='executing'",
-                [(timestamp, history_id) for history_id in history_ids],
-            )
+    for plan_id in running_plan_ids:
+        finalize_provider_action_history_for_plan(
+            conn,
+            plan_ref=plan_id,
+            status="outcome_unknown",
+            error_code="execution_interrupted",
+            timestamp=timestamp,
+        )
     # 隐私清理已抹除上下文的运行计划只为等待旧 writer 收束；确认已无存活
     # 执行者后直接删除，避免重新保留主体数据。
     conn.execute("DELETE FROM agent_provider_plans WHERE context_fingerprint=''")
@@ -2961,6 +3045,7 @@ def init_db() -> None:
                 # 已被统一 Telegram 通知中心取代的旧整理通知队列。
                 _migrate_retire_organize_notification_outbox_v15(connection)
                 _migrate_retire_telegram_write_confirmations_v16(connection)
+                _migrate_strm_refresh_outbox_v19(connection)
 
             _run_schema_savepoint(conn, operation=prepare_schema_baseline)
             _run_schema_savepoint(
@@ -4727,7 +4812,7 @@ from app.repositories.strm import (  # noqa: E402,F401
     complete_strm_change_target,
     count_due_strm_change_targets,
     count_strm_metadata_jobs,
-    count_strm_metadata_refresh_paths,
+    count_strm_refresh_paths,
     count_pending_strm_change_targets,
     delete_strm_index_ids,
     enqueue_strm_metadata_jobs,
@@ -4736,7 +4821,7 @@ from app.repositories.strm import (  # noqa: E402,F401
     fail_strm_change_target,
     group_changes_by_target,
     list_strm_metadata_queue,
-    list_strm_metadata_refresh_paths,
+    list_strm_refresh_entries,
     list_strm_change_queue,
     list_strm_index,
     list_strm_index_by_prefix,
@@ -4748,7 +4833,8 @@ from app.repositories.strm import (  # noqa: E402,F401
     seconds_until_next_strm_change_target,
     renew_strm_change_target_leases,
     renew_strm_metadata_job_lease,
-    acknowledge_strm_metadata_refresh_paths,
+    acknowledge_strm_refresh_paths,
+    enqueue_strm_refresh_paths,
     requeue_strm_metadata_jobs,
     release_strm_change_targets,
     strm_metadata_job_is_current,

@@ -3036,8 +3036,8 @@ class SecurityTests(InitializedWebTestCase):
         login = self.client.get("/login")
         self.assertEqual(login.status_code, 200)
         self.assertEqual(login.headers["cache-control"], "no-store")
-        self.assertIn("/static/js/lucide.min.js?v=20260816a", login.text)
-        self.assertIn("/static/js/app.js?v=20260824a", login.text)
+        self.assertRegex(login.text, r"/static/js/lucide\.min\.js\?v=[0-9a-f]{16}")
+        self.assertRegex(login.text, r"/static/js/app\.js\?v=[0-9a-f]{16}")
 
     def test_authenticated_html_is_no_store_without_affecting_static_assets(self):
         self._authenticated()
@@ -3046,8 +3046,8 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(settings.status_code, 200)
         self.assertTrue(settings.headers["content-type"].startswith("text/html"))
         self.assertEqual(settings.headers["cache-control"], "no-store")
-        self.assertIn("/static/js/lucide.min.js?v=20260816a", settings.text)
-        self.assertRegex(settings.text, r"/static/js/app\.js\?v=202608(?:1[0-9]|2[0-9])[a-z]")
+        self.assertRegex(settings.text, r"/static/js/lucide\.min\.js\?v=[0-9a-f]{16}")
+        self.assertRegex(settings.text, r"/static/js/app\.js\?v=[0-9a-f]{16}")
 
         static = self.client.get("/static/js/app.js")
         self.assertEqual(static.status_code, 200)
@@ -4198,8 +4198,8 @@ class SecurityTests(InitializedWebTestCase):
             self.assertIn('class="brand-mark-svg', html)
             self.assertIn("brand-mark-upper", html)
             self.assertIn("brand-mark-lower", html)
-        self.assertRegex(login.text, r"css/core-layout\.css\?v=2026081[0-9][a-z]")
-        self.assertRegex(settings.text, r"css/main\.css\?v=202608(?:[12][0-9]|3[01])[a-z]")
+        self.assertRegex(login.text, r"/static/css/core-layout\.css\?v=[0-9a-f]{16}")
+        self.assertRegex(settings.text, r"/static/css/main\.css\?v=[0-9a-f]{16}")
         self.assertIn("brand-wordmark-media", login.text)
         self.assertIn("brand-wordmark-media", settings.text)
 
@@ -4259,7 +4259,8 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn(".compact-workspace-page .workspace-kicker::after", css)
         self.assertNotIn(".local-media-page .workspace-bar", local_media_css)
         local_media_template = (root / "app" / "templates" / "local_media.html").read_text(encoding="utf-8")
-        self.assertRegex(local_media_template, r"local-media\.css'\) \}\}\?v=202608(?:1[8-9]|2[0-9])[a-z]")
+        self.assertIn("static_url('css/local-media.css')", local_media_template)
+        self.assertNotRegex(local_media_template, r"\?v=20\d{6}[a-z]")
         self.assertNotIn("organize-rules-workspace-heading", organize_template)
         self.assertNotIn("updateOrganizeRulesHeader", organize_template)
 
@@ -4412,7 +4413,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn("const motionDisabled = reducedMotion || saveData;", login.text)
         self.assertIn("const particleCount = Math.min(42", login.text)
         self.assertNotIn("const particleCount = 75", login.text)
-        self.assertRegex(login.text, r"css/core-layout\.css\?v=2026081[0-9][a-z]")
+        self.assertRegex(login.text, r"/static/css/core-layout\.css\?v=[0-9a-f]{16}")
         self.assertNotIn("@import url(", css)
         self.assertNotIn("@import url(", login_css)
 

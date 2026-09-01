@@ -4,18 +4,15 @@ import asyncio
 import json
 import os
 import re
-import tempfile
 import time
 import unittest
 from collections import OrderedDict
 from contextlib import contextmanager
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from app import database as db
-from app.config import web_credentials
 from app.main import create_app
 from app.modules import media_proxy
 from app.modules.media_proxy_safety import safe_media_name

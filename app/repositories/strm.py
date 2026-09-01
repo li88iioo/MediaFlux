@@ -400,38 +400,81 @@ def complete_strm_metadata_job(
             return "stale"
         normalized_path = str(refresh_path or "").strip()
         if status == "completed" and normalized_path:
-            conn.execute(
-                "INSERT INTO strm_metadata_refresh_outbox(path,created_at,updated_at) "
-                "VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET updated_at=excluded.updated_at",
-                (normalized_path, stamp, stamp),
+            _enqueue_strm_refresh_paths(
+                conn, (normalized_path,), stamp=stamp, allow_emby=True
             )
         return status
 
 
-def list_strm_metadata_refresh_paths(*, limit: int = 5000) -> list[str]:
-    """读取尚未确认完成媒体库刷新的元数据路径。"""
+def _normalize_refresh_paths(paths: object) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        str(path or "").strip()
+        for path in (paths or ())
+        if str(path or "").strip()
+    ))
+
+
+def _enqueue_strm_refresh_paths(
+    conn: sqlite3.Connection,
+    paths: object,
+    *,
+    stamp: str,
+    allow_emby: bool,
+) -> int:
+    normalized = _normalize_refresh_paths(paths)
+    for path in normalized:
+        conn.execute(
+            "INSERT INTO strm_refresh_outbox("
+            "path,allow_emby,created_at,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(path,allow_emby) DO UPDATE SET "
+            "updated_at=excluded.updated_at",
+            (path, 1 if allow_emby else 0, stamp, stamp),
+        )
+    return len(normalized)
+
+
+def enqueue_strm_refresh_paths(
+    paths: object, *, allow_emby: bool = True
+) -> int:
+    """持久登记尚未由统一媒体库刷新队列接管的 STRM 变化路径。"""
+    database = _database()
+    with database.get_conn() as conn:
+        return _enqueue_strm_refresh_paths(
+            conn, paths, stamp=database.now(), allow_emby=bool(allow_emby)
+        )
+
+
+def list_strm_refresh_entries(*, limit: int = 5000) -> list[dict[str, object]]:
+    """读取尚未由统一媒体库刷新队列接管的 STRM 变化及 provider 边界。"""
     safe_limit = max(1, min(int(limit or 5000), 20000))
     with _database().get_conn() as conn:
         rows = conn.execute(
-            "SELECT path FROM strm_metadata_refresh_outbox "
-            "ORDER BY updated_at,path LIMIT ?",
+            "SELECT path,allow_emby FROM strm_refresh_outbox "
+            "ORDER BY updated_at,path,allow_emby LIMIT ?",
             (safe_limit,),
         ).fetchall()
-    return [str(row["path"] or "") for row in rows if str(row["path"] or "")]
+    return [
+        {
+            "path": str(row["path"] or ""),
+            "allow_emby": bool(row["allow_emby"]),
+        }
+        for row in rows
+        if str(row["path"] or "")
+    ]
 
 
-def count_strm_metadata_refresh_paths() -> int:
+def count_strm_refresh_paths() -> int:
     with _database().get_conn() as conn:
         return int(conn.execute(
-            "SELECT COUNT(*) FROM strm_metadata_refresh_outbox"
+            "SELECT COUNT(*) FROM strm_refresh_outbox"
         ).fetchone()[0] or 0)
 
 
-def acknowledge_strm_metadata_refresh_paths(paths: object) -> int:
-    """媒体库刷新成功后按路径确认 outbox；失败时不调用即可安全重试。"""
-    normalized = tuple(dict.fromkeys(
-        str(path or "").strip() for path in (paths or ()) if str(path or "").strip()
-    ))
+def acknowledge_strm_refresh_paths(
+    paths: object, *, allow_emby: bool = True
+) -> int:
+    """统一刷新队列接管成功后确认 outbox；入队失败时保留并安全重试。"""
+    normalized = _normalize_refresh_paths(paths)
     if not normalized:
         return 0
     deleted = 0
@@ -440,8 +483,9 @@ def acknowledge_strm_metadata_refresh_paths(paths: object) -> int:
             batch = normalized[offset:offset + 500]
             placeholders = ",".join("?" for _ in batch)
             cur = conn.execute(
-                f"DELETE FROM strm_metadata_refresh_outbox WHERE path IN ({placeholders})",
-                batch,
+                f"DELETE FROM strm_refresh_outbox WHERE allow_emby=? "
+                f"AND path IN ({placeholders})",
+                [1 if allow_emby else 0, *batch],
             )
             deleted += int(cur.rowcount or 0)
     return deleted

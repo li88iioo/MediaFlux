@@ -57,7 +57,7 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertRegex(css, r"\.lm-review-list\s*\{[^}]*min-height:\s*220px")
         self.assertIn(".lm-source-card,", css)
         self.assertIn(".lm-review-item,", css)
-        self.assertIn("?v=20260828", template)
+        self.assertIn("static_url('js/local-media.js')", template)
 
     def test_media_source_dialog_stays_inside_mobile_viewport_and_defers_archive_mapping(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")
@@ -98,7 +98,8 @@ class LocalMediaResponsiveUITests(unittest.TestCase):
         self.assertIn("opacity: 0", css)
         self.assertIn(".lm-initial-loading.is-visible", css)
         self.assertIn(".lm-initial-loading svg", css)
-        self.assertIn("?v=20260829j", template)
+        self.assertIn("static_url('css/local-media.css')", template)
+        self.assertNotRegex(template, r"\?v=20\d{6}[a-z]")
 
     def test_initial_hash_tab_is_prepainted_before_page_script_loads(self):
         template = Path("app/templates/local_media.html").read_text(encoding="utf-8")

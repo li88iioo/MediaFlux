@@ -6,7 +6,6 @@ import json
 import threading
 import unittest
 from datetime import date, timedelta
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 from tests.support import release_parse_fields
@@ -918,7 +917,7 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
         )
 
     def test_common_release_groups_and_source_prefixes_are_removed_safely(self):
-        scraper = self.recognition_module()
+        self.recognition_module()
         cases = [
             (
                 "[DBD-Raws] Example Show - 01 [1080p][WEB-DL].mkv",

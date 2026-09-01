@@ -3,7 +3,7 @@
 {% block page_title %}媒体库{% endblock %}
 {% block body_class %}media-libraries-page{% endblock %}
 {% block page_styles %}
-<link rel="stylesheet" href="{{ url_for('static', path='css/media-libraries.css') }}?v=20260829c">
+<link rel="stylesheet" href="{{ static_url('css/media-libraries.css') }}">
 {% endblock %}
 
 {% block content %}
@@ -84,5 +84,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', path='js/media-libraries.js') }}?v=20260829c"></script>
+<script src="{{ static_url('js/media-libraries.js') }}"></script>
 {% endblock %}

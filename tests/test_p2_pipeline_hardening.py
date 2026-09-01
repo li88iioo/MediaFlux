@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
-import unittest
 import uuid
 from pathlib import Path
 from unittest.mock import patch
@@ -588,7 +587,6 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
             self.assertEqual(row["etag"], "etag-1")
 
     def test_external_write_after_install_is_not_overwritten_by_rollback(self) -> None:
-        import app.modules.strm as strm_module
 
         source_id = f"rollback-race-{uuid.uuid4().hex}"
         source_key = f"guangya:{source_id}"

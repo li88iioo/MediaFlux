@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 class PageAssetExtractionTests(unittest.TestCase):
-    def test_templates_use_route_generated_static_urls_and_one_shared_css_version(self) -> None:
+    def test_templates_use_one_content_hashed_static_url_authority(self) -> None:
         templates = {
             path.name: path.read_text(encoding="utf-8")
             for path in Path("app/templates").glob("*.html")
@@ -13,19 +13,16 @@ class PageAssetExtractionTests(unittest.TestCase):
         for name, source in templates.items():
             with self.subTest(template=name):
                 self.assertNotRegex(source, r'(?:src|href)=["\']/static/')
+                self.assertNotIn("url_for('static'", source)
+                self.assertNotRegex(source, r"\?v=20\d{6}[a-z]")
 
-        rss = templates["rss.html"]
         self.assertIn(
-            "{{ url_for('static', path='js') }}/subscriptions.js?v=20260831a",
-            rss,
+            "{{ static_url('js/subscriptions.js') }}",
+            templates["rss.html"],
         )
-        versions = set()
-        marker = "path='css/dashboard-workbench.css') }}?v="
+        marker = "{{ static_url('css/dashboard-workbench.css') }}"
         for name in ("dashboard.html", "global_search.html", "media_recent.html"):
-            source = templates[name]
-            self.assertIn(marker, source)
-            versions.add(source.split(marker, 1)[1].split('"', 1)[0].split("'", 1)[0])
-        self.assertEqual(versions, {"20260820a"})
+            self.assertIn(marker, templates[name])
 
     def test_large_page_scripts_are_cacheable_classic_assets(self) -> None:
         targets = {
@@ -40,11 +37,11 @@ class PageAssetExtractionTests(unittest.TestCase):
                 template = Path("app/templates", template_name).read_text(encoding="utf-8")
                 asset = Path("app/static/js", asset_name)
                 source = asset.read_text(encoding="utf-8")
-                marker = f"path='js/{asset_name}'"
+                marker = f"static_url('js/{asset_name}')"
 
                 self.assertIn(marker, template)
                 script_tag = template.split(marker, 1)[1].split("</script>", 1)[0]
-                self.assertRegex(script_tag, r"\?v=20\d{6}[a-z]")
+                self.assertNotIn("?v=", script_tag)
                 self.assertNotIn("defer", script_tag)
                 self.assertGreater(len(source), 10_000)
                 self.assertNotIn("{{", source)
@@ -54,10 +51,10 @@ class PageAssetExtractionTests(unittest.TestCase):
         template = Path("app/templates/organize.html").read_text(encoding="utf-8")
         css = Path("app/static/css/organize.css").read_text(encoding="utf-8")
 
-        marker = "path='css/organize.css'"
+        marker = "static_url('css/organize.css')"
         self.assertIn(marker, template)
         stylesheet_tag = template.split(marker, 1)[1].split(">", 1)[0]
-        self.assertRegex(stylesheet_tag, r"\?v=20\d{6}[a-z]")
+        self.assertNotIn("?v=", stylesheet_tag)
         self.assertNotIn("<style>", template)
         self.assertIn(".organize-rules-nav-card", css)
         self.assertIn(".recognition-knowledge-dialog", css)

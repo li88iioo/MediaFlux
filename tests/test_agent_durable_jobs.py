@@ -16,10 +16,6 @@ from app.agent.library_patrol_progress import empty_patrol_projection
 from app.agent.models import ToolContext, ToolResult
 from app.agent.registry import AgentToolError
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
-from app.repositories.agent_jobs import (
-    get_agent_job,
-    list_agent_jobs,
-)
 from tests.support import IsolatedDatabaseTestCase
 
 

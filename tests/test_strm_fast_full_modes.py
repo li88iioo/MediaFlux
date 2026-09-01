@@ -99,6 +99,39 @@ class StrmFastFullModeTests(IsolatedDatabaseTestCase):
         settle.assert_called_once()
         self.assertEqual(settle.call_args.args[1], "completed")
 
+    def test_refresh_only_failure_does_not_requeue_completed_strm_changes(self):
+        changes = [{
+            "source_id": "source", "kind": "video", "action": "upsert",
+            "file_id": "video-1", "name": "Episode.mkv",
+        }]
+        aggregate = self.scheduler._empty_stats()
+        aggregate.update({"total": 1, "generated": 1})
+        source_results = [{"id": "source", "name": "来源", "stats": aggregate}]
+        patches = self._patch_runtime()
+        with patches[0], patches[1], patches[2], patches[3], patch.object(
+            self.scheduler,
+            "_refresh_media_servers",
+            return_value={"Jellyfin": "failed"},
+        ), patches[5], patches[6], patches[7], patches[8], patch.object(
+            self.scheduler,
+            "_claim_change_targets",
+            return_value=[{"changes": changes}],
+        ), patch.object(
+            self.scheduler,
+            "_run_full_sources",
+            return_value=(aggregate, source_results, False),
+        ), patch.object(
+            self.scheduler, "_settle_change_targets"
+        ) as settle:
+            result = self.scheduler.run_blocking("manual", sync_mode="full")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["partial"])
+        self.assertFalse(result["strm_partial"])
+        self.assertTrue(result["refresh_pending"])
+        settle.assert_called_once()
+        self.assertEqual(settle.call_args.args[1], "completed")
+
     def test_fast_mode_never_auto_expands_to_full_cleanup_on_fallback(self):
         changes = [{
             "source_id": "source", "kind": "video", "action": "upsert",

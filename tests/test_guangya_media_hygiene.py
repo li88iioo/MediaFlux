@@ -207,6 +207,29 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
         )
         self.assertEqual(result["stats"]["strm_triggered"], 1)
 
+    def test_removed_legacy_mode_cannot_trigger_strm(self):
+        scheduler = mock.Mock()
+        with (
+            mock.patch.object(
+                actions, "load_rename_plan", return_value={"mode": "declarative"}
+            ),
+            mock.patch.object(
+                actions,
+                "execute_rename_plan",
+                return_value={"partial": False, "stats": {"renamed": 2, "failed": 0}},
+            ),
+            mock.patch(
+                "app.modules.scheduler.get_scheduler", return_value=scheduler
+            ) as get_scheduler,
+        ):
+            result = actions.execute_durable_guangya_rename_job({
+                "plan_id": "a" * 32, "plan_fingerprint": "b" * 64,
+            })
+
+        get_scheduler.assert_not_called()
+        scheduler.trigger.assert_not_called()
+        self.assertNotIn("strm_triggered", result["stats"])
+
     def test_terminal_private_plan_is_removed_after_retention(self):
         client = FakeHygieneClient()
         plan = hygiene.build_media_hygiene_plan(
