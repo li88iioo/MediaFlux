@@ -44,7 +44,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
     def _confirm(self, tool: str, arguments: dict):
         service = get_agent_service()
         prepared = service.prepare(tool, arguments, owner="owner")
-        confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         return prepared, confirmed
 
     def test_validators_registry_and_natural_language_are_strict(self):
@@ -137,7 +137,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             owner="owner",
         )
         db.update_rss_subscription(self.sid, {"exclude_keywords": "CHANGED_SECRET"})
-        confirmed = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertFalse(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "conflict")
         self.assertEqual(int(db.get_rss_subscription(self.sid)["enabled"]), 1)
@@ -151,7 +151,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             "rss.delete_subscription", {"subscription_id": self.sid}, owner="owner"
         )
         db.add_rss_entry(self.sid, "LATE_PRIVATE_TITLE", "late-guid")
-        conflict = service.confirm(prepared["confirmation"]["confirmation_id"], owner="owner")
+        conflict = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(conflict["result"]["status"], "conflict")
         self.assertIsNotNone(db.get_rss_subscription(self.sid))
 
@@ -220,7 +220,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             serialized = json.dumps(prepared, ensure_ascii=False)
             self.assertNotIn("feed.example", serialized)
             created = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertTrue(created["result"]["ok"])
         created_id = int(created["result"]["data"]["subscription_id"])
@@ -238,7 +238,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
                 "rss.update_subscription", update_arguments, owner="owner"
             )
             updated = service.confirm(
-                prepared["confirmation"]["confirmation_id"], owner="owner"
+                prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertTrue(updated["result"]["ok"])
         row = db.get_rss_subscription(created_id)
@@ -254,7 +254,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
         )
         db.update_rss_subscription(self.sid, {"refresh_interval_minutes": 31})
         confirmed = service.confirm(
-            prepared["confirmation"]["confirmation_id"], owner="owner"
+            prepared["action_plan"]["plan_id"], owner="owner"
         )
         self.assertFalse(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["status"], "conflict")
@@ -264,7 +264,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
         service = get_agent_service()
         result = service.query(f"停用 RSS 订阅 {self.sid}", owner="owner")
         self.assertEqual(result["mode"], "confirmation_required")
-        self.assertEqual(result["confirmation"]["tool"], "rss.update_subscription")
+        self.assertEqual(result["tool_call"]["name"], "rss.update_subscription")
 
     def test_orchestrator_resolves_unique_subscription_name_for_controls(self):
         service = get_agent_service()
@@ -276,7 +276,7 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
             with self.subTest(message=message):
                 result = service.query(message, owner="owner")
                 self.assertEqual(result["mode"], "confirmation_required")
-                self.assertEqual(result["confirmation"]["tool"], tool)
+                self.assertEqual(result["tool_call"]["name"], tool)
                 serialized = json.dumps(result, ensure_ascii=False)
                 self.assertNotIn("secret.invalid", serialized)
                 self.assertNotIn("RSS_SECRET", serialized)

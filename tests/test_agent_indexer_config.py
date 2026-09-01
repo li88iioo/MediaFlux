@@ -14,8 +14,7 @@ from fastapi.testclient import TestClient
 from app import config
 from app.agent.indexer_config_actions import (
     indexer_sites_arguments,
-    indexer_sites_confirmation_context,
-    preview_set_indexer_sites,
+    prepare_indexer_sites_confirmation,
     summarize_indexer_sites,
 )
 from app.agent.models import RiskLevel, ToolResult
@@ -403,8 +402,9 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
                 config, "_cache", None
             ), patch.object(config, "_STARTUP_ENV_OVERRIDES", frozenset()):
                 summary = summarize_indexer_sites({})
-                preview = preview_set_indexer_sites({"site_ids": ["nyaa", "tpb"]})
-                context = indexer_sites_confirmation_context({"site_ids": ["nyaa", "tpb"]})
+                preview, context = prepare_indexer_sites_confirmation(
+                    {"site_ids": ["nyaa", "tpb"]}
+                )
 
             rendered = repr((summary.to_dict(), preview.to_dict(), context))
             self.assertNotIn(secret, rendered)
@@ -507,14 +507,14 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(prepared.status_code, 200, prepared.text)
         body = prepared.json()
         self.assertEqual(body["mode"], "confirmation_required")
-        self.assertEqual(body["confirmation"]["tool"], "config.set_indexer_sites")
+        self.assertEqual(body["tool_call"]["name"], "config.set_indexer_sites")
         with patch("app.indexers.runtime.shutdown_indexer_service"), patch(
             "app.modules.telegram_resource_search.shutdown_telegram_indexer_worker"
         ):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]
@@ -532,19 +532,19 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(prepared.status_code, 200, prepared.text)
         body = prepared.json()
         self.assertEqual(body["mode"], "confirmation_required")
-        self.assertEqual(body["confirmation"]["tool"], "config.set_indexer_sites")
+        self.assertEqual(body["tool_call"]["name"], "config.set_indexer_sites")
         self.assertEqual(body["result"]["data"]["requested_count"], 3)
         before = config._read_env_file(self.env_file)
         self.assertEqual(before["INDEXER_ENABLED_SITES"], "nyaa,mikan")
 
-        confirmation_id = body["confirmation"]["confirmation_id"]
+        confirmation_id = body["action_plan"]["plan_id"]
         with patch("app.indexers.runtime.shutdown_indexer_service") as shutdown, patch(
             "app.modules.telegram_resource_search.shutdown_telegram_indexer_worker"
         ) as shutdown_telegram:
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]
@@ -569,7 +569,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
         replay = self.client.post(
             "/api/agent/actions/confirm",
             headers=headers,
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+            json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
         )
         self.assertEqual(replay.status_code, 409, replay.text)
         self.assertNotIn("must-not-leak", confirmed.text + summary.text + replay.text)
@@ -623,12 +623,10 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
         )
 
         with patch("app.agent.tools.search_resources", return_value=searched) as search, patch(
-            "app.agent.indexer_candidate_actions.preview_submit_resource", return_value=preview
+            "app.agent.indexer_candidate_actions.prepare_submit_resource",
+            return_value=(preview, "resource:test:second:qb"),
         ) as preview_submit, patch(
-            "app.agent.indexer_candidate_actions.submit_confirmation_context",
-            return_value="resource:test:second:qb",
-        ), patch(
-            "app.agent.indexer_candidate_actions.submit_resource", return_value=accepted
+            "app.agent.indexer_candidate_actions.submit_resource_confirmed", return_value=accepted
         ) as submit, patch(
             "app.agent.orchestrator.compose_tool_answer", return_value=None
         ), patch(
@@ -648,7 +646,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             enable_body = enable.json()
             self.assertEqual(enable_body["mode"], "confirmation_required")
             self.assertEqual(
-                enable_body["confirmation"]["tool"], "config.set_indexer_sites"
+                enable_body["tool_call"]["name"], "config.set_indexer_sites"
             )
             self.assertEqual(
                 [site["site_id"] for site in enable_body["result"]["data"]["requested_sites"]],
@@ -663,7 +661,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers=headers,
                 json={
-                    "confirmation_id": enable_body["confirmation"]["confirmation_id"],
+                    "plan_id": enable_body["action_plan"]["plan_id"],
                     "session_id": session_id,
                 },
             )
@@ -688,7 +686,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             selected_body = selected.json()
             self.assertEqual(selected_body["mode"], "confirmation_required")
             self.assertEqual(
-                selected_body["confirmation"]["tool"], "ingest.submit"
+                selected_body["tool_call"]["name"], "ingest.submit"
             )
             preview_submit.assert_called_once_with(
                 {"result_id": second_id, "target": "qb"}
@@ -698,13 +696,16 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
                 "/api/agent/actions/confirm",
                 headers=headers,
                 json={
-                    "confirmation_id": selected_body["confirmation"]["confirmation_id"],
+                    "plan_id": selected_body["action_plan"]["plan_id"],
                     "session_id": session_id,
                 },
             )
 
         self.assertEqual(confirmed.status_code, 202, confirmed.text)
-        submit.assert_called_once_with({"result_id": second_id, "target": "qb"})
+        submit.assert_called_once_with(
+            {"result_id": second_id, "target": "qb"},
+            "resource:test:second:qb",
+        )
         search.assert_called_once_with({
             "title": "光阴之外",
             "original_title": "",
@@ -744,7 +745,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             self.assertEqual(prepared.status_code, 200, prepared.text)
             body = prepared.json()
             self.assertEqual(body["mode"], "confirmation_required")
-            self.assertEqual(body["confirmation"]["tool"], "config.set_indexer_sites")
+            self.assertEqual(body["tool_call"]["name"], "config.set_indexer_sites")
             self.assertEqual(
                 [site["site_id"] for site in body["result"]["data"]["requested_sites"]],
                 list(DEFAULT_INDEXER_SITE_IDS),
@@ -757,13 +758,18 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
             )
 
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         confirmed_body = confirmed.json()
         self.assertEqual(confirmed_body["mode"], "confirmed_action")
         self.assertEqual(confirmed_body["tool_call"]["name"], "indexer.search_resources")
+        self.assertEqual(confirmed_body["response_contract"], {
+            "task_kind": "action",
+            "presentation": "resource_candidates",
+            "resource_candidates": "primary",
+        })
         self.assertEqual(confirmed_body["result"]["data"]["query"], "师兄啊师兄")
         self.assertIn("已开启多站资源索引", confirmed_body["result"]["summary"])
         self.assertIn("已找到《师兄啊师兄》的 2 项资源", confirmed_body["result"]["summary"])
@@ -805,7 +811,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": body["confirmation"]["confirmation_id"]},
+                json={"session_id": "test_session_identifier_0001", "plan_id": body["action_plan"]["plan_id"]},
             )
 
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
@@ -898,14 +904,14 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
     def test_confirm_rejects_stale_snapshot_without_writing(self):
         csrf = self.login()
         prepared = self.prepare(csrf, ["nyaa", "tpb"])
-        confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+        confirmation_id = prepared.json()["action_plan"]["plan_id"]
         values = config._read_env_file(self.env_file)
         values["UNRELATED_SETTING"] = "changed"
         config.write_env_file(self.env_file, values, replace=True)
         stale = self.client.post(
             "/api/agent/actions/confirm",
             headers={"X-CSRF-Token": csrf},
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+            json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
         )
         self.assertEqual(stale.status_code, 409, stale.text)
         self.assertIn("配置已变化", stale.text)
@@ -925,7 +931,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
         for error, expected_status, expected_result_status in cases:
             with self.subTest(error=type(error).__name__):
                 prepared = self.prepare(csrf, ["nyaa", "tpb"])
-                confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+                confirmation_id = prepared.json()["action_plan"]["plan_id"]
                 with patch(
                     "app.agent.indexer_config_actions.config.update_runtime_env_file",
                     side_effect=error,
@@ -935,7 +941,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
                     confirmed = self.client.post(
                         "/api/agent/actions/confirm",
                         headers={"X-CSRF-Token": csrf},
-                        json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                        json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
                     )
                 self.assertEqual(confirmed.status_code, expected_status, confirmed.text)
                 self.assertEqual(
@@ -949,7 +955,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
     def test_runtime_refresh_failure_reports_deferred_success(self):
         csrf = self.login()
         prepared = self.prepare(csrf, ["nyaa", "tpb"])
-        confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+        confirmation_id = prepared.json()["action_plan"]["plan_id"]
         with patch(
             "app.indexers.runtime.shutdown_indexer_service",
             side_effect=RuntimeError("simulated"),
@@ -959,7 +965,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]
@@ -979,7 +985,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
     def test_telegram_refresh_timeout_reports_deferred_success(self):
         csrf = self.login()
         prepared = self.prepare(csrf, ["nyaa", "tpb"])
-        confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+        confirmation_id = prepared.json()["action_plan"]["plan_id"]
         with patch("app.indexers.runtime.shutdown_indexer_service") as shutdown, patch(
             "app.modules.telegram_resource_search.shutdown_telegram_indexer_worker",
             return_value=False,
@@ -987,7 +993,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         result = confirmed.json()["result"]
@@ -1005,7 +1011,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
     def test_web_refresh_timeout_is_bounded_and_reports_restart(self):
         csrf = self.login()
         prepared = self.prepare(csrf, ["nyaa", "tpb"])
-        confirmation_id = prepared.json()["confirmation"]["confirmation_id"]
+        confirmation_id = prepared.json()["action_plan"]["plan_id"]
 
         async def delayed_shutdown():
             await asyncio.sleep(1)
@@ -1023,7 +1029,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
             confirmed = self.client.post(
                 "/api/agent/actions/confirm",
                 headers={"X-CSRF-Token": csrf},
-                json={"session_id": "test_session_identifier_0001", "confirmation_id": confirmation_id},
+                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
             )
 
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
@@ -1064,7 +1070,7 @@ class IndexerSiteConfigApiTests(IsolatedDatabaseTestCase):
         self.login()
         response = self.client.post(
             "/api/agent/actions/confirm",
-            json={"session_id": "test_session_identifier_0001", "confirmation_id": "x" * 24},
+            json={"session_id": "test_session_identifier_0001", "plan_id": "x" * 24},
         )
         self.assertEqual(response.status_code, 403)
 

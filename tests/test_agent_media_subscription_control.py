@@ -1115,7 +1115,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             )
         self.assertEqual(selected["mode"], "confirmation_required")
         self.assertEqual(
-            selected["confirmation"]["tool"], "media.create_subscription"
+            selected["tool_call"]["name"], "media.create_subscription"
         )
         self.assertEqual(
             selected["result"]["data"]["check_interval_minutes"], 10080
