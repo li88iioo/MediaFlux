@@ -16,6 +16,7 @@ from app.modules import organize_confirmations as confirmation_module
 from app.modules import telegram_notification_center as notification_center
 from app.modules.organize_confirmations import (
     _confirmation_result_event,
+    _confirmation_strm_debounce_seconds,
     _dispatch_next_queued_confirmation,
     _local_confirmation_result_event,
     cancel_confirmation,
@@ -75,6 +76,26 @@ class ConfirmationTerminalNotificationTests(unittest.TestCase):
 
         self.assertIn("部分完成", event.title)
         self.assertIn(("媒体库刷新", "刷新失败 ❌"), event.fields)
+
+
+class ConfirmationPostActionDebounceTests(unittest.TestCase):
+    def test_batch_confirmations_default_to_long_merge_window(self):
+        payload = {
+            "organize_rollup": {"version": 1, "actionable_groups": 13},
+        }
+        with patch("app.modules.organize_confirmations.get", return_value=""):
+            self.assertEqual(_confirmation_strm_debounce_seconds(payload), 30)
+
+    def test_single_confirmation_keeps_short_window_and_override_wins(self):
+        with patch("app.modules.organize_confirmations.get", return_value=""):
+            self.assertEqual(_confirmation_strm_debounce_seconds({}), 8)
+        with patch("app.modules.organize_confirmations.get", return_value="4"):
+            self.assertEqual(
+                _confirmation_strm_debounce_seconds({
+                    "organize_rollup": {"actionable_groups": 13},
+                }),
+                4,
+            )
 
 
 class ConfirmationGroupingTests(unittest.TestCase):

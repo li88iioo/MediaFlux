@@ -197,22 +197,65 @@ def _event_downstream_failed(event: NotificationEvent) -> bool:
     )
 
 
+def _join_inventory_issues(issues: tuple[str, ...]) -> str:
+    if len(issues) <= 1:
+        return f"{issues[0]}项" if issues else ""
+    return f"{'、'.join(issues[:-1])}或{issues[-1]}项"
+
+
+def _confirmation_inventory_status(
+    counts: Mapping[str, int],
+    *,
+    stopped: bool,
+    scan_incomplete: bool,
+    expired: int,
+) -> str:
+    """根据确认后的真实剩余问题重算媒体详情状态。"""
+    issues = tuple(
+        label
+        for active, label in (
+            (safe_int(counts.get("skipped"), 0, minimum=0), "跳过"),
+            (safe_int(counts.get("confirm"), 0, minimum=0), "待确认"),
+            (safe_int(counts.get("failed"), 0, minimum=0), "失败"),
+            (safe_int(expired, 0, minimum=0), "过期未处理"),
+            (scan_incomplete, "扫描未完成"),
+        )
+        if active
+    )
+    remaining = _join_inventory_issues(issues)
+    if stopped:
+        prefix = "本次整理已停止"
+        if remaining:
+            prefix += f"，且仍有{remaining}"
+        return f"{prefix}，暂不生成最终缺集结论"
+    if remaining:
+        return f"本次整理仍有{remaining}，暂不生成最终缺集结论"
+    return ""
+
+
 def _confirmation_media_lines(
-    lines: tuple[str, ...], *, inventory_final: bool,
+    lines: tuple[str, ...], *, inventory_status: str,
 ) -> tuple[str, ...]:
-    """确认全部成功后移除已失效的“仍待确认”说明。
+    """刷新媒体详情中的整理状态，移除已失效的待确认原因。
 
     原汇总只持久化了已入库媒体的有界文本投影，无法安全重算整个季库存；
-    因此这里只删除已经确定不成立的状态行，不猜测缺集或改写其它统计。
+    因此这里只按剩余问题改写或删除状态行，不猜测缺集和其它库存统计。
     """
-    if not inventory_final:
-        return lines
     settled: list[str] = []
     for block in lines:
-        filtered = "\n".join(
-            line for line in str(block).splitlines()
-            if _INCOMPLETE_MEDIA_STATUS_MARKER not in line
-        )
+        updated_lines: list[str] = []
+        for line in str(block).splitlines():
+            if _INCOMPLETE_MEDIA_STATUS_MARKER not in line:
+                updated_lines.append(line)
+                continue
+            if not inventory_status:
+                continue
+            label, separator, _old_status = line.partition("：")
+            updated_lines.append(
+                f"{label}{separator}{inventory_status}"
+                if separator else inventory_status
+            )
+        filtered = "\n".join(updated_lines)
         if filtered.strip():
             settled.append(filtered)
     return tuple(settled)
@@ -461,11 +504,17 @@ def update_organize_lifecycle_confirmations(
         lifecycle_state = "partial"
     else:
         lifecycle_state = "completed"
+    inventory_status = _confirmation_inventory_status(
+        counts,
+        stopped=stopped,
+        scan_incomplete=scan_incomplete,
+        expired=expired,
+    )
     event = NotificationEvent(
         title,
         fields=fields,
         lines=_confirmation_media_lines(
-            previous.lines, inventory_final=not attention,
+            previous.lines, inventory_status=inventory_status,
         ),
         footer=footer,
         actions=previous.actions,

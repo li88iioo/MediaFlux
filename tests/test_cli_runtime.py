@@ -804,14 +804,25 @@ class CliRuntimeTests(unittest.TestCase):
 
         web_app = SimpleNamespace(state=SimpleNamespace())
 
-        with patch.dict(
-            os.environ,
-            {"MEDIAFLUX_CONTAINER": "1"},
-            clear=True,
-        ), patch("app.modules.first_run.needs_initialization", return_value=True), patch(
-            "app.main.app", web_app
-        ), patch("app.cli.uvicorn.run") as run:
-            exit_code = cli._start(None, None, None)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = RuntimePaths(
+                program_dir=root / "program",
+                data_dir=root / "data",
+                config_dir=root / "config",
+                cache_dir=root / "cache",
+                log_dir=root / "logs",
+                strm_dir=root / "strm-data",
+                trash_dir=root / "trash",
+            )
+            with patch.dict(
+                os.environ,
+                {"MEDIAFLUX_CONTAINER": "1"},
+                clear=True,
+            ), patch("app.cli.get_runtime_paths", return_value=paths), patch(
+                "app.modules.first_run.needs_initialization", return_value=True
+            ), patch("app.main.app", web_app), patch("app.cli.uvicorn.run") as run:
+                exit_code = cli._start(None, None, None)
 
         self.assertEqual(exit_code, 0)
         self.assertIs(run.call_args.args[0], web_app)
@@ -824,18 +835,29 @@ class CliRuntimeTests(unittest.TestCase):
 
         web_app = SimpleNamespace(state=SimpleNamespace())
 
-        with patch.dict(
-            os.environ,
-            {
-                "MEDIAFLUX_CONTAINER": "1",
-                "ENV_WEB_PASSPORT": "admin",
-                "ENV_WEB_PASSWORD": "correct-horse",
-            },
-            clear=True,
-        ), patch("app.modules.first_run.needs_initialization", return_value=False), patch(
-            "app.main.app", web_app
-        ), patch("app.cli.uvicorn.run") as run:
-            exit_code = cli._start(None, None, None)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = RuntimePaths(
+                program_dir=root / "program",
+                data_dir=root / "data",
+                config_dir=root / "config",
+                cache_dir=root / "cache",
+                log_dir=root / "logs",
+                strm_dir=root / "strm-data",
+                trash_dir=root / "trash",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "MEDIAFLUX_CONTAINER": "1",
+                    "ENV_WEB_PASSPORT": "admin",
+                    "ENV_WEB_PASSWORD": "correct-horse",
+                },
+                clear=True,
+            ), patch("app.cli.get_runtime_paths", return_value=paths), patch(
+                "app.modules.first_run.needs_initialization", return_value=False
+            ), patch("app.main.app", web_app), patch("app.cli.uvicorn.run") as run:
+                exit_code = cli._start(None, None, None)
 
         self.assertEqual(exit_code, 0)
         self.assertIs(run.call_args.args[0], web_app)

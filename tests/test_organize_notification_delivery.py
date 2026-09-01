@@ -344,6 +344,120 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         ))
         self.assertTrue(any("将夜" in line for line in event.lines))
 
+    def test_rollup_rewrites_media_status_to_only_remaining_skip_reason(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "total": 5,
+            "moved": 1,
+            "skipped": 3,
+            "notification_actionable_confirmation_files": 1,
+            "notification_actionable_confirmation_groups": 1,
+            "media_items": [{
+                "title": "仙逆",
+                "year": "2023",
+                "media_type": "tv",
+                "tmdb_id": "223911",
+                "season": 1,
+                "episode": 156,
+                "season_total": 200,
+                "season_present_episodes": [156],
+            }],
+        })
+        previous = build_organize_lifecycle_event(
+            stats,
+            source_name="来源",
+            strm_status="完成",
+            media_refresh="Jellyfin 已刷新",
+        )
+        published = []
+        with patch(
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
+            return_value=previous,
+        ), patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event) or _accepted()
+            ),
+        ):
+            update_organize_lifecycle_confirmations(
+                "task-confirmation",
+                chat_id="100",
+                baseline=build_organize_confirmation_rollup(stats),
+                outcomes={
+                    "groups": 1, "resolved_files": 1, "moved": 1,
+                    "metadata": 0, "skipped": 0, "failed": 0, "expired": 0,
+                },
+            )
+
+        event = published[-1]
+        status_lines = [
+            line
+            for block in event.lines
+            for line in block.splitlines()
+            if "暂不生成最终缺集结论" in line
+        ]
+        self.assertEqual(event.title, "⚠️ 光鸭整理部分完成")
+        self.assertEqual(status_lines, [
+            "- ⚠️ 整理状态：本次整理仍有跳过项，暂不生成最终缺集结论",
+        ])
+        self.assertNotIn("待确认", status_lines[0])
+
+    def test_rollup_keeps_only_unresolved_web_confirmation_reason(self) -> None:
+        stats = _stats_with_confirmation()
+        stats.update({
+            "total": 3,
+            "need_confirm": 2,
+            "notification_actionable_confirmation_files": 1,
+            "notification_actionable_confirmation_groups": 1,
+            "media_items": [{
+                "title": "将夜",
+                "year": "2026",
+                "media_type": "tv",
+                "tmdb_id": "282136",
+                "season": 1,
+                "episode": 6,
+                "season_total": 20,
+                "season_present_episodes": [6],
+            }],
+        })
+        previous = build_organize_lifecycle_event(
+            stats,
+            source_name="来源",
+            strm_status="完成",
+            media_refresh="Jellyfin 已刷新",
+        )
+        published = []
+        with patch(
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
+            return_value=previous,
+        ), patch(
+            "app.modules.telegram_organize_lifecycle.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event) or _accepted()
+            ),
+        ):
+            update_organize_lifecycle_confirmations(
+                "task-confirmation",
+                chat_id="100",
+                baseline=build_organize_confirmation_rollup(stats),
+                outcomes={
+                    "groups": 1, "resolved_files": 1, "moved": 1,
+                    "metadata": 0, "skipped": 0, "failed": 0, "expired": 0,
+                },
+            )
+
+        event = published[-1]
+        status_lines = [
+            line
+            for block in event.lines
+            for line in block.splitlines()
+            if "暂不生成最终缺集结论" in line
+        ]
+        self.assertEqual(status_lines, [
+            "- ⚠️ 整理状态：本次整理仍有待确认项，暂不生成最终缺集结论",
+        ])
+        self.assertIn(("整理", "视频 3 · 入库 1 · 待确认 1"), event.fields)
+
     def test_expired_confirmation_rollup_is_explicit_and_terminal(self) -> None:
         stats = _stats_with_confirmation()
         stats.update({

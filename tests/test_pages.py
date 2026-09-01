@@ -90,24 +90,24 @@ class PagesUiContractTests(unittest.TestCase):
 
         # 验证各页面 HTML 缓存版本戳
         base_html = BASE_HTML.read_text(encoding="utf-8")
-        self.assertRegex(base_html, r"css/main\.css'\) \}\}\?v=202608(?:1[0-9]|2[0-9])[a-z]")
+        self.assertRegex(base_html, r"css/main\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
 
         local_media_html = LOCAL_MEDIA_HTML.read_text(encoding="utf-8")
-        self.assertRegex(local_media_html, r"css/local-media\.css'\) \}\}\?v=202608(?:1[0-9]|2[0-9])[a-z]")
+        self.assertRegex(local_media_html, r"css/local-media\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
 
         global_search_html = GLOBAL_SEARCH_HTML.read_text(encoding="utf-8")
-        self.assertRegex(global_search_html, r"css/dashboard-workbench\.css'\) \}\}\?v=202608(?:1[0-9]|2[0-9])[a-z]")
-        self.assertRegex(global_search_html, r"css/media-hub\.css'\) \}\}\?v=202608(?:1[0-9]|2[0-9])[a-z]")
+        self.assertRegex(global_search_html, r"css/dashboard-workbench\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
+        self.assertRegex(global_search_html, r"css/media-hub\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
 
         media_recent_html = MEDIA_RECENT_HTML.read_text(encoding="utf-8")
-        self.assertRegex(media_recent_html, r"css/dashboard-workbench\.css'\) \}\}\?v=202608(?:1[0-9]|2[0-9])[a-z]")
-        self.assertRegex(media_recent_html, r"css/media-hub\.css'\) \}\}\?v=202608(?:1[0-9]|2[0-9])[a-z]")
+        self.assertRegex(media_recent_html, r"css/dashboard-workbench\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
+        self.assertRegex(media_recent_html, r"css/media-hub\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
 
         agent_html = AGENT_HTML.read_text(encoding="utf-8")
-        self.assertRegex(agent_html, r"css/agent\.css'\) \}\}\?v=202608(?:1[0-9]|2[0-9])[a-z]")
+        self.assertRegex(agent_html, r"css/agent\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
 
         login_html = LOGIN_HTML.read_text(encoding="utf-8")
-        self.assertRegex(login_html, r"css/core-layout\.css'\) \}\}\?v=202608(?:1[0-9]|2[0-9])[a-z]")
+        self.assertRegex(login_html, r"css/core-layout\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
 
     def test_settings_telegram_quick_commands(self):
         html = (SETTINGS_HTML.read_text(encoding="utf-8") + SETTINGS_JS.read_text(encoding="utf-8"))

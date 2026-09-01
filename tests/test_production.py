@@ -4188,7 +4188,7 @@ class SecurityTests(InitializedWebTestCase):
             self.assertIn("brand-mark-upper", html)
             self.assertIn("brand-mark-lower", html)
         self.assertRegex(login.text, r"css/core-layout\.css\?v=2026081[0-9][a-z]")
-        self.assertRegex(settings.text, r"css/main\.css\?v=202608(?:1[0-9]|2[0-9])[a-z]")
+        self.assertRegex(settings.text, r"css/main\.css\?v=202608(?:[12][0-9]|3[01])[a-z]")
         self.assertIn("brand-wordmark-media", login.text)
         self.assertIn("brand-wordmark-media", settings.text)
 

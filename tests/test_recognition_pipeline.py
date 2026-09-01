@@ -3807,6 +3807,30 @@ class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
         self.assertEqual(result.tmdb_id, "229676")
         self.assertNotIn("distinctive_title_tokens_missing", result.rejected_constraints)
 
+    def test_exact_pinyin_remainder_covers_same_chinese_title(self):
+        scraper_module = self.recognition_module()
+        client = _DeterministicClient([{
+            "id": 223911,
+            "name": "仙逆",
+            "original_name": "仙逆",
+            "first_air_date": "2023-09-25",
+            "media_type": "tv",
+        }], {
+            "223911": {"seasons": [{"season_number": 1, "episode_count": 200}]},
+        })
+        tmdb = scraper_module.TMDBScraper(client=client)
+
+        result = tmdb.deterministic_recognize(
+            "Xian.Ni.S01E145.2160p.WEB-DL.HEVC.AAC-BlackTV.mp4",
+            "【高清剧集网发布 www.BBHDTV.com】仙逆.年番1[第145集]"
+            "[国语配音+中文字幕].Xian.Ni.S01.2160p.WEB-DL."
+            "HEVC.AAC-BlackTV",
+        )
+
+        self.assertEqual(result.status, "matched")
+        self.assertEqual(result.tmdb_id, "223911")
+        self.assertNotIn("distinctive_title_tokens_missing", result.rejected_constraints)
+
     def test_unofficial_bilingual_remainder_still_requires_confirmation(self):
         scraper_module = self.recognition_module()
         client = _DeterministicClient([{

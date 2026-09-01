@@ -472,6 +472,11 @@ _CHINESE_SEASON_TOKEN = re.compile(r"第\s*([零〇一二两三四五六七八�
 _CHINESE_SEASON_COMPLETION_TOKEN = re.compile(
     r"第\s*(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*季\s*(?:全集|全季)"
 )
+# 国漫发布目录中的“年番1/年番4”描述具体播出批次，不属于作品正式标题。
+# 未编号的“年番”可能是稳定节目名的一部分（如“斗破苍穹 年番”），必须保留。
+_CHINESE_ANNUAL_RELEASE_TOKEN = re.compile(
+    r"(?<![\u3400-\u9fff])年番\s*\d{1,2}(?![\u3400-\u9fff])"
+)
 _SEASON_RANGE_TOKEN = re.compile(
     r"(?i)(?:\bs\d{1,2}\s*[-~～–—]\s*s\d{1,2}\b"
     r"|第\s*[零〇一二两三四五六七八九十\d]{1,3}\s*"
@@ -888,14 +893,38 @@ def _ambiguous_latin_ordinal_attack_alias(
     return False
 
 
+def _exact_latin_pinyin_equivalent(source_part: str, candidate_value: str) -> bool:
+    """只把完整拉丁拼音视为同一中文标题的辅助覆盖证据。
+
+    来源常同时写 ``仙逆 Xian Ni``，而 TMDB 只提供中文正式名。这里要求
+    拉丁片段至少包含两个词、去分隔符后不少于六个字符，并与候选纯中文
+    标题的完整拼音逐字相等。该证据只参与双语标题的“每段均已覆盖”校验，
+    不会让单独的拼音查询绕过正常候选消歧。
+    """
+    latin = _comparison_key(source_part)
+    tokens = re.findall(r"[a-z]+", latin)
+    if len(tokens) < 2 or " ".join(tokens) != latin:
+        return False
+    compact_latin = "".join(tokens)
+    if len(compact_latin) < 6:
+        return False
+
+    candidate = _comparison_key(candidate_value).replace(" ", "")
+    if not candidate or not re.fullmatch(r"[\u3400-\u9fff]+", candidate):
+        return False
+    candidate_pinyin = _han_pinyin_key(candidate).casefold()
+    return bool(candidate_pinyin and compact_latin == candidate_pinyin)
+
+
 def _primary_title_parts_covered(primary_queries: list[str], candidate_values: list[str]) -> bool:
     """候选的标题、原名和别名可共同覆盖双语完整标题。
 
     TMDB 的 ``original_name`` 偶尔会把拉丁标题和日文标题写在同一个字段里，
     例如 ``Übel Blatt～ユーベルブラット～``。来源标题则常写成
     ``魔域英雄传说 Ubel Blatt``。覆盖校验既要看到中文正式名，也要从原名中
-    提取出受变音符号影响的拉丁片名；但仍要求来源的每个有效标题片段都由
-    TMDB 官方标题、原名或别名解释，不能凭发布名中的任意英文残片放行。
+    提取出受变音符号影响的拉丁片名；若拉丁片段是同一中文正式名的完整
+    拼音，也可作为严格等价证据。但仍要求来源的每个有效标题片段都由 TMDB
+    官方标题、原名或别名解释，不能凭发布名中的任意英文残片放行。
     """
     coverage_values: list[str] = list(candidate_values)
     for value in candidate_values:
@@ -917,6 +946,11 @@ def _primary_title_parts_covered(primary_queries: list[str], candidate_values: l
                 (_title_similarity_score(part, value) for value in coverage_values if value),
                 default=0.0,
             ) >= 0.9
+            or any(
+                _exact_latin_pinyin_equivalent(part, value)
+                for value in coverage_values
+                if value
+            )
             for part in parts
         ):
             return True
@@ -1216,6 +1250,7 @@ def _strip_season_tokens(value: str) -> str:
     if _SEASON_RANGE_TOKEN.search(source):
         return source
     cleaned = _CHINESE_SEASON_COMPLETION_TOKEN.sub(" ", source)
+    cleaned = _CHINESE_ANNUAL_RELEASE_TOKEN.sub(" ", cleaned)
     cleaned = _ORDINAL_SEASON_TOKEN.sub(" ", cleaned)
     cleaned = _ENGLISH_ORDINAL_SEASON_TOKEN.sub(" ", cleaned)
     cleaned = _SEASON_TOKEN.sub(" ", cleaned)

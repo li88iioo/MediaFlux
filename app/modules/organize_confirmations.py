@@ -66,6 +66,26 @@ def _timestamp(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _confirmation_strm_debounce_seconds(payload: dict) -> int:
+    """批量候选使用更长静默窗，合并连续人工确认的 STRM 后处理。"""
+    rollup = payload.get("organize_rollup")
+    actionable_groups = safe_int(
+        rollup.get("actionable_groups") if isinstance(rollup, dict) else 0,
+        0,
+        minimum=0,
+    )
+    default_seconds = 30 if actionable_groups > 1 else 8
+    configured = str(
+        get("GY_ORGANIZE_CONFIRM_STRM_DEBOUNCE_SECONDS", "") or ""
+    ).strip()
+    if not configured:
+        return default_seconds
+    try:
+        return max(0, min(int(float(configured)), 30))
+    except (TypeError, ValueError, OverflowError):
+        return default_seconds
+
+
 def _candidate_provider(candidate: dict) -> str:
     provider = str(candidate.get("provider") or "").strip().lower()
     if not provider and str(candidate.get("tmdb_id") or "").strip():
@@ -1873,12 +1893,7 @@ def _execute_guangya_confirmation(
             if learning_warnings:
                 stats.setdefault("warnings", []).extend(learning_warnings)
         scope_name = str(payload.get("directory") or payload.get("source_name") or "TG 人工确认")
-        try:
-            confirm_debounce = max(0, min(int(float(
-                get("GY_ORGANIZE_CONFIRM_STRM_DEBOUNCE_SECONDS", "8") or 8
-            )), 30))
-        except (TypeError, ValueError, OverflowError):
-            confirm_debounce = 8
+        confirm_debounce = _confirmation_strm_debounce_seconds(payload)
         terminal_event = _confirmation_result_event(payload, candidate, stats)
         db.complete_organize_confirmation_with_delivery(
             token,
