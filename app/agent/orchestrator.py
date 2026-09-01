@@ -10,7 +10,7 @@ import re
 import secrets
 import sys
 import threading
-from time import monotonic
+from time import monotonic, time
 import unicodedata
 from typing import Any, Callable
 
@@ -27,7 +27,11 @@ from app.agent.action_history import (
 )
 from app.agent.capability_retrieval import capability_semantics, infer_media_intent
 from app.agent.objective_contract import infer_agent_objective
-from app.agent.confirmation import ConfirmationStore, SQLiteConfirmationStore
+from app.agent.confirmation import (
+    ConfirmationStore,
+    SQLiteConfirmationStore,
+    confirmation_reply_intent,
+)
 from app.agent.confirmation_contract import (
     build_confirmation_contract,
 )
@@ -6052,6 +6056,15 @@ class AgentOrchestrator:
             "invalidated_provider_plans": provider_state["plans"],
         }
 
+    def active_confirmation_count(self, *, owner: str) -> int:
+        """返回当前身份仍有效的确认票据数量，供入口保护现有行动卡片。"""
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return 0
+        tickets = self.confirmation_store.list_active_tickets(owner=owner_key)
+        self._reconcile_missing_confirmations(owner_key, tickets)
+        return len(tickets)
+
     def _active_action_plan_context(self, *, owner: str) -> str:
         """返回当前 owner 待确认计划的脱敏模型上下文。"""
         owner_key = str(owner or "").strip()
@@ -6073,6 +6086,191 @@ class AgentOrchestrator:
             expires_in=self.confirmation_store.ttl_seconds,
         )
         return action_plan_model_context(plan)
+
+    def _latest_confirmation_followup_source(
+        self, conversation_context: list[dict[str, Any]] | None
+    ) -> str:
+        """只从最近一条助手响应恢复唯一预览续接，禁止回退到更早的陈旧预览。"""
+        for item in reversed(conversation_context or []):
+            if not isinstance(item, dict) or item.get("role") != "assistant":
+                continue
+            source_tool = str(
+                item.get("confirmation_followup_tool")
+                or item.get("tool_name")
+                or ""
+            ).strip()
+            if not source_tool:
+                return ""
+            try:
+                return (
+                    source_tool
+                    if self.registry.confirmation_followup_for(source_tool)
+                    else ""
+                )
+            except AgentToolError:
+                return ""
+        return ""
+
+    def _confirmation_reply_response(
+        self,
+        intent: str,
+        *,
+        owner: str,
+        conversation_context: list[dict[str, Any]] | None,
+        request_id: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        """文本确认只生成卡片；文本取消可安全清空未执行票据。"""
+        owner_key = str(owner or "").strip()
+        tickets = (
+            self.confirmation_store.list_active_tickets(owner=owner_key)
+            if owner_key
+            else []
+        )
+        if owner_key:
+            self._reconcile_missing_confirmations(owner_key, tickets)
+        if intent == "cancel":
+            if not tickets:
+                return self._conversation_response("当前没有待取消的行动计划。")
+            cancelled = 0
+            for ticket in tickets:
+                if self.discard_confirmation(
+                    ticket.confirmation_id,
+                    owner=owner_key,
+                    advance_owner_epoch=False,
+                ):
+                    cancelled += 1
+            if cancelled:
+                suffix = f"（{cancelled} 项）" if cancelled > 1 else ""
+                return self._conversation_response(
+                    f"待确认的行动计划已取消{suffix}，未执行任何写入。"
+                )
+            return self._conversation_response(
+                "待确认的行动计划已经失效，未执行任何写入。"
+            )
+        if len(tickets) > 1:
+            return self._clarification_response(
+                "当前存在多项待确认行动计划，无法仅凭文字判断要操作哪一项。",
+                ["请使用对应卡片处理，或回复“取消”安全撤销全部未执行计划。"],
+            )
+        if tickets:
+            # 文本“确认”永远不执行写操作；它只重新投影唯一的服务端票据，
+            # 让刷新页面、消息被折叠或 Telegram 卡片丢失后仍能恢复按钮。
+            ticket = tickets[0]
+            remaining = max(1, int(ticket.expires_at - time()))
+            plan = build_action_plan(
+                plan_id=ticket.confirmation_id,
+                confirmation_contract=ticket.confirmation_contract,
+                expires_in=min(self.confirmation_store.ttl_seconds, remaining),
+            )
+            if not plan:
+                return self._clarification_response(
+                    "待确认行动计划无法恢复，请回复“取消”后重新生成预览。",
+                    ["回复“取消”不会执行任何写入。"],
+                )
+            return {
+                "request_id": str(request_id or ""),
+                "mode": "confirmation_required",
+                "tool_call": {"name": ticket.tool_name, "elapsed_ms": 0},
+                "result": {
+                    "ok": True,
+                    "status": "confirmation_required",
+                    "summary": "行动计划仍在等待确认，尚未执行。请核对后选择执行或取消。",
+                    "error": "",
+                    "suggestions": [],
+                    "evidence": [],
+                },
+                "action_plan": plan,
+            }
+        if not owner_key:
+            return self._unsupported(
+                "生成执行确认需要已登录会话",
+                ["请登录后重新生成操作预览。"],
+            )
+        source_tool = self._latest_confirmation_followup_source(conversation_context)
+        if not source_tool:
+            return self._clarification_response(
+                "当前没有可生成执行确认的最新预览，请先重新生成操作预览。",
+                ["重新描述要检查或修改的对象，我会先生成只读预览。"],
+            )
+        return self.prepare_confirmation_followup(
+            source_tool,
+            owner=owner_key,
+            request_id=request_id,
+            session_id=session_id,
+        )
+
+    def _attach_confirmation_followup(
+        self,
+        response: dict[str, Any],
+        *,
+        tool_name: str,
+        result: ToolResult,
+    ) -> dict[str, Any]:
+        """为可执行的只读预览附加“生成行动卡片”入口，不暴露写参数。"""
+        if not result.ok or str(result.status or "").strip() not in {
+            "ready",
+            "completed",
+            "preview",
+        }:
+            return response
+        try:
+            followup_tool = self.registry.confirmation_followup_for(tool_name)
+        except AgentToolError:
+            return response
+        if not followup_tool:
+            return response
+        enriched = dict(response)
+        enriched["followup_action"] = {
+            "kind": "prepare_confirmation",
+            "tool": tool_name,
+            "arguments": {},
+            "label": "生成执行确认",
+        }
+        return enriched
+
+    def _unique_confirmation_followup_action(
+        self, responses: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """从复合只读结果中保留唯一可执行预览；多计划时拒绝猜测。"""
+        actions: dict[str, dict[str, Any]] = {}
+        for response in responses:
+            if not isinstance(response, dict):
+                continue
+            action = response.get("followup_action")
+            if (
+                not isinstance(action, dict)
+                or action.get("kind") != "prepare_confirmation"
+                or action.get("arguments") != {}
+            ):
+                continue
+            source_tool = str(action.get("tool") or "").strip()
+            try:
+                target_tool = self.registry.confirmation_followup_for(source_tool)
+            except AgentToolError:
+                continue
+            if not target_tool:
+                continue
+            actions[source_tool] = {
+                "kind": "prepare_confirmation",
+                "tool": source_tool,
+                "arguments": {},
+                "label": "生成执行确认",
+            }
+        return next(iter(actions.values())) if len(actions) == 1 else {}
+
+    def _attach_unique_confirmation_followup(
+        self,
+        response: dict[str, Any],
+        *,
+        step_responses: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        action = self._unique_confirmation_followup_action(step_responses)
+        if not action:
+            return response
+        enriched = dict(response)
+        enriched["followup_action"] = action
+        return enriched
 
     @staticmethod
     def _append_action_plan_context(
@@ -6182,6 +6380,37 @@ class AgentOrchestrator:
     def is_read_tool(self, tool_name: str) -> bool:
         """让入口在执行前区分可直调只读工具与必须确认的动作。"""
         return self.registry.risk_for(str(tool_name or "").strip()) is RiskLevel.READ
+
+    def confirmation_followup_target(self, tool_name: str) -> str:
+        """返回只读预览的受控续接目标；空字符串表示没有续接。"""
+        return self.registry.confirmation_followup_for(str(tool_name or "").strip())
+
+    def prepare_confirmation_followup(
+        self,
+        source_tool: str,
+        *,
+        owner: str,
+        expected_owner_generation: int | None = None,
+        request_id: str = "",
+        session_id: str = "",
+        rate_identity: str = "",
+    ) -> dict[str, Any]:
+        """从私有预览上下文生成行动卡片；不会执行任何写操作。"""
+        trace_context = current_tool_context(
+            owner=owner, request_id=request_id, session_id=session_id
+        )
+        target_tool, arguments = self.registry.resolve_confirmation_followup(
+            str(source_tool or "").strip(), context=trace_context
+        )
+        return self.prepare(
+            target_tool,
+            arguments,
+            owner=owner,
+            expected_owner_generation=expected_owner_generation,
+            request_id=trace_context.request_id,
+            session_id=trace_context.session_id,
+            rate_identity=rate_identity,
+        )
 
     def invoke(
         self,
@@ -6307,9 +6536,12 @@ class AgentOrchestrator:
             if tool_name == "ingest.inspect"
             else normalized_arguments
         )
-        return self._response(
+        response = self._response(
             tool_name, public_arguments, result, elapsed_ms,
             request_id=trace_context.request_id,
+        )
+        return self._attach_confirmation_followup(
+            response, tool_name=tool_name, result=result
         )
 
     @staticmethod
@@ -6370,11 +6602,14 @@ class AgentOrchestrator:
                     )
 
         public_steps: list[dict[str, Any]] = []
+        step_responses: list[dict[str, Any]] = []
         total_elapsed_ms = 0
         completed = 0
         suggestions: list[str] = []
         for position, (tool_name, arguments) in enumerate(normalized_steps, start=1):
             response = self.invoke(tool_name, arguments, owner=owner)
+            if isinstance(response, dict):
+                step_responses.append(response)
             tool_call = response.get("tool_call") if isinstance(response, dict) else None
             elapsed_ms = (
                 int(tool_call.get("elapsed_ms") or 0)
@@ -6433,6 +6668,9 @@ class AgentOrchestrator:
             response["context_domains"] = context_domains
         if context_domains == ["rss"]:
             response["context_domain"] = "rss"
+        response = self._attach_unique_confirmation_followup(
+            response, step_responses=step_responses
+        )
         if owner:
             replay_steps = deepcopy(normalized_steps)
 
@@ -7672,6 +7910,21 @@ class AgentOrchestrator:
             end_trace_context(trace_token)
             raise
         try:
+            confirmation_intent = confirmation_reply_intent(message)
+            if confirmation_intent is not None:
+                response = self._confirmation_reply_response(
+                    confirmation_intent,
+                    owner=owner,
+                    conversation_context=conversation_context,
+                    request_id=_trace_context.request_id,
+                    session_id=_trace_context.session_id,
+                )
+                if not present:
+                    return response
+                return self._present_tool_response(
+                    message, response, owner=llm_rate_owner or owner
+                )
+
             ingest_link = agent_ingest_link_request(message)
             if ingest_link is not None:
                 if not owner:
@@ -7910,6 +8163,7 @@ class AgentOrchestrator:
             return None
 
         public_steps: list[dict[str, Any]] = []
+        step_responses: list[dict[str, Any]] = []
         replay_steps: list[tuple[str, dict[str, Any]]] = []
         suggestions: list[str] = []
         total_elapsed_ms = 0
@@ -7923,6 +8177,8 @@ class AgentOrchestrator:
             tool_name = str(execution.get("tool_name") or "").strip()
             arguments = execution.get("arguments")
             raw_response = execution.get("response")
+            if isinstance(raw_response, dict):
+                step_responses.append(raw_response)
             if not tool_name or not isinstance(arguments, dict):
                 return None
             replay_steps.append((tool_name, dict(arguments)))
@@ -8046,6 +8302,9 @@ class AgentOrchestrator:
             response["context_domains"] = context_domains
         if context_domains == ["rss"]:
             response["context_domain"] = "rss"
+        response = self._attach_unique_confirmation_followup(
+            response, step_responses=step_responses
+        )
         if owner:
             deferred_replay_steps = deepcopy(replay_steps)
 

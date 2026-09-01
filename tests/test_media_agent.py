@@ -719,6 +719,10 @@ class _FakeAgentService:
             }
         return {"message": message, "owner": bool(owner), "mode": "read_only"}
 
+    def active_confirmation_count(self, *, owner):
+        del owner
+        return 0
+
     def has_tool(self, tool_name):
         return tool_name != "missing" and not str(tool_name).startswith("missing-")
 
@@ -815,6 +819,17 @@ class AgentAPITests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["tool"], "config.diagnose")
+
+    def test_bare_confirmation_without_active_plan_reaches_agent_service(self):
+        csrf = self.login()
+        response = self.client.post(
+            "/api/agent/query",
+            headers={"X-CSRF-Token": csrf},
+            json={"session_id": "test_session_identifier_0001", "message": "确认"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["message"], "确认")
 
     def test_agent_query_preserves_complete_structured_result_payload(self):
         csrf = self.login()

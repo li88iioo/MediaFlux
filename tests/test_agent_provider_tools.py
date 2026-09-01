@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from app.agent.models import ToolContext
-from app.agent.provider_actions import provider_capabilities_arguments
+from app.agent.provider_actions import (
+    latest_provider_change_followup_arguments,
+    provider_capabilities_arguments,
+)
 from app.agent.registry import AgentToolError
 from app.agent.tools import build_tool_registry
 
@@ -22,6 +25,26 @@ def test_provider_gateway_tools_expose_reads_and_confirmation_gated_writes():
     assert registry.risk_for("provider.job.status").value == "read"
     assert registry.risk_for("provider.change.execute").value == "write"
     assert capabilities["provider.change.execute"]["requires_confirmation"] is True
+
+
+def test_provider_change_preview_exposes_server_side_confirmation_followup(monkeypatch):
+    registry = build_tool_registry()
+    assert (
+        registry.confirmation_followup_for("provider.change.preview")
+        == "provider.change.execute"
+    )
+    monkeypatch.setattr(
+        "app.agent.provider_actions.get_latest_prepared_provider_plan",
+        lambda *, owner, session_id: {
+            "plan_ref": f"PP-{owner[-4:]}-{session_id[-4:]}"
+        },
+    )
+
+    arguments = latest_provider_change_followup_arguments(
+        ToolContext(owner="owner-demo", session_id="session-demo")
+    )
+
+    assert arguments == {"plan_ref": "PP-demo-demo"}
 
 
 def test_provider_capabilities_returns_only_static_non_sensitive_state(monkeypatch):

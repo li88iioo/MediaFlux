@@ -504,6 +504,18 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
         self.assertTrue(
             capabilities["guangya.organize.cleanup.execute"]["requires_confirmation"]
         )
+        self.assertEqual(
+            registry.confirmation_followup_for(
+                "guangya.organize.cleanup.preview"
+            ),
+            "guangya.organize.cleanup.execute",
+        )
+        self.assertEqual(
+            registry.confirmation_followup_for(
+                "guangya.organize.cleanup.classify"
+            ),
+            "guangya.organize.cleanup.execute",
+        )
 
     def test_empty_only_cleanup_uses_canonical_exact_frozen_plan(self):
         client = FakeCleanupClient()

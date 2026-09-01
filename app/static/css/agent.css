@@ -1045,6 +1045,8 @@ body.agent-page-body::after { display: none; }
 }
 .agent-guidance-action svg { width: 14px; height: 14px; flex: 0 0 auto; }
 .agent-guidance-action.is-read { color: var(--accent); border-color: var(--accent-border); background: var(--accent-soft); }
+.agent-guidance-action.is-confirmation { color: var(--accent); border-color: var(--accent-border); background: var(--accent-soft); }
+.agent-guidance-action.is-confirmation:hover { background: var(--accent-soft-strong, var(--accent-soft)); }
 .agent-guidance-action:hover { color: var(--accent); border-color: var(--accent-border); transform: translateY(-1px); }
 
 .agent-confirmation-card {

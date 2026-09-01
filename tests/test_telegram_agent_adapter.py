@@ -229,6 +229,16 @@ class _FailingEditStreamBot(_EditStreamBot):
         return True
 
 
+class _OfflineAgentBot(_Bot):
+    def reply_to(self, message, text, **kwargs):
+        del message, text, kwargs
+        raise requests.ConnectTimeout("reply unavailable")
+
+    def send_message(self, chat_id, text, **kwargs):
+        del chat_id, text, kwargs
+        raise requests.ConnectTimeout("send unavailable")
+
+
 class _CallbackEditFallbackBot(_Bot):
     def __init__(self, *, offline: bool = False):
         super().__init__()
@@ -299,6 +309,7 @@ class _ConfirmationLifecycleStub:
 def _agent_service_mock() -> Mock:
     """返回满足查询确认生命周期契约的 Agent service mock。"""
     service = Mock()
+    service.active_confirmation_count.return_value = 0
     service.begin_query_confirmation_epoch.return_value = 1
     service.invalidate_query_confirmation_epoch.return_value = 1
     return service
@@ -484,6 +495,69 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.resolve(retained_cancel, owner="owner-b")
 
+    def test_action_store_preserves_confirmation_cards_across_new_messages(self):
+        for store_type in (TelegramAgentActionStore, SQLiteTelegramAgentActionStore):
+            with self.subTest(store=store_type.__name__):
+                tokens = iter((
+                    f"{store_type.__name__}-keep-confirm",
+                    f"{store_type.__name__}-keep-cancel",
+                    f"{store_type.__name__}-drop-followup",
+                ))
+                store = store_type(token_factory=lambda: next(tokens))
+                owner = f"owner-preserve-{store_type.__name__}"
+                confirm_id, cancel_id = store.create_confirmation_pair(
+                    owner=owner, plan_id="telegram-plan-preserve-123456"
+                )
+                followup_id = store.create_confirmation_followup(
+                    owner=owner, tool_name="guangya.rename.preview"
+                )
+
+                self.assertEqual(
+                    store.revoke_owner_non_confirmations(owner=owner), 1
+                )
+                for action_id in (confirm_id, cancel_id):
+                    self.assertIn(
+                        store.inspect(action_id, owner=owner)["action"],
+                        {"confirm", "cancel"},
+                    )
+                with self.assertRaises(ValueError):
+                    store.inspect(followup_id, owner=owner)
+
+                self.assertEqual(
+                    store.revoke_confirmation_plan(
+                        owner=owner, plan_id="telegram-plan-preserve-123456"
+                    ),
+                    2,
+                )
+                self.assertEqual(store.revoke_owner(owner=owner), 0)
+
+    def test_new_confirmation_pair_atomically_supersedes_old_pair(self):
+        for store_type in (TelegramAgentActionStore, SQLiteTelegramAgentActionStore):
+            with self.subTest(store=store_type.__name__):
+                tokens = iter((
+                    f"{store_type.__name__}-old-confirm",
+                    f"{store_type.__name__}-old-cancel",
+                    f"{store_type.__name__}-new-confirm",
+                    f"{store_type.__name__}-new-cancel",
+                ))
+                store = store_type(token_factory=lambda: next(tokens))
+                owner = f"owner-replace-{store_type.__name__}"
+                old_pair = store.create_confirmation_pair(
+                    owner=owner, plan_id="telegram-plan-old-123456"
+                )
+                new_pair = store.create_confirmation_pair(
+                    owner=owner, plan_id="telegram-plan-new-123456"
+                )
+
+                for action_id in old_pair:
+                    with self.assertRaises(ValueError):
+                        store.inspect(action_id, owner=owner)
+                for action_id in new_pair:
+                    self.assertIn(
+                        store.inspect(action_id, owner=owner)["action"],
+                        {"confirm", "cancel"},
+                    )
+
     def test_action_store_capacity_evicts_whole_confirmation_group(self):
         tokens = iter([
             "first-confirm", "first-cancel",
@@ -538,6 +612,46 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             store.create_workspace_action(
                 owner="owner-a", action_key="client_controlled_tool"
             )
+
+    def test_confirmation_followup_actions_are_owner_bound_and_one_time(self):
+        for store_type in (TelegramAgentActionStore, SQLiteTelegramAgentActionStore):
+            with self.subTest(store=store_type.__name__):
+                store = store_type(
+                    ttl_seconds=60,
+                    token_factory=lambda: "confirmation-followup-action",
+                )
+                action_id = store.create_confirmation_followup(
+                    owner="owner-preview",
+                    tool_name="guangya.media_hygiene.preview",
+                )
+                self.assertEqual(
+                    store.inspect(action_id, owner="owner-preview"),
+                    {
+                        "action": "prepare_confirmation_followup",
+                        "tool_name": "guangya.media_hygiene.preview",
+                        "action_key": "",
+                    },
+                )
+                with self.assertRaises(ValueError):
+                    store.resolve(action_id, owner="other-owner")
+                self.assertEqual(
+                    store.resolve(action_id, owner="owner-preview"),
+                    {
+                        "action": "prepare_confirmation_followup",
+                        "tool_name": "guangya.media_hygiene.preview",
+                    },
+                )
+                with self.assertRaises(ValueError):
+                    store.resolve(action_id, owner="owner-preview")
+
+    def test_confirmation_followup_action_rejects_invalid_tool_name(self):
+        for store_type in (TelegramAgentActionStore, SQLiteTelegramAgentActionStore):
+            with self.subTest(store=store_type.__name__):
+                store = store_type()
+                with self.assertRaises(ValueError):
+                    store.create_confirmation_followup(
+                        owner="owner-preview", tool_name="../unsafe"
+                    )
 
     def test_workspace_action_claim_can_restore_without_extending_expiry(self):
         now = [100.0]
@@ -1829,46 +1943,499 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertIn("• 检查片名", text)
         self.assertIn("<code>▍</code>", text)
 
-    def test_bare_confirmation_message_keeps_existing_card_actions(self):
+    def test_preview_followup_button_generates_confirmation_card_in_telegram(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        service = _agent_service_mock()
+        service.query.return_value = {
+            "mode": "read_only",
+            "response_contract": build_response_contract(
+                task_kind="action", presentation="narrative"
+            ),
+            "tool_call": {
+                "name": "guangya.media_hygiene.preview",
+                "elapsed_ms": 3,
+            },
+            "result": {
+                "ok": True,
+                "status": "ready",
+                "summary": "名称清理预览已生成",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "followup_action": {
+                "kind": "prepare_confirmation",
+                "tool": "guangya.media_hygiene.preview",
+                "arguments": {},
+                "label": "生成执行确认",
+            },
+        }
+        service.prepare_confirmation_followup.return_value = {
+            "mode": "confirmation_required",
+            "response_contract": build_response_contract(
+                task_kind="action", presentation="confirmation"
+            ),
+            "tool_call": {"name": "guangya.rename.execute", "elapsed_ms": 4},
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "确认后将执行刚才的名称清理预览",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": _pending_action_plan(
+                "preview-followup-telegram-plan-123456"
+            ),
+        }
+        tokens = iter((
+            "preview-followup-action",
+            "preview-followup-confirm",
+            "preview-followup-cancel",
+        ))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        bot = _Bot()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ):
+            self.assertTrue(handle_agent_message(
+                bot, _Telebot, _message("清理光鸭名称", message_id=1498)
+            ))
+            preview_markup = bot.replies[-1][2]["reply_markup"]
+            self.assertEqual(
+                [button.text for button in preview_markup.buttons],
+                ["生成执行确认"],
+            )
+
+            followup_call = _callback(
+                preview_markup.buttons[0].callback_data,
+                callback_id="prepare-preview-followup",
+            )
+            handle_agent_callback(bot, followup_call, _Telebot)
+
+        service.prepare_confirmation_followup.assert_called_once_with(
+            "guangya.media_hygiene.preview",
+            owner="tg:v1:100\x1f200",
+            request_id=ANY,
+            session_id=ANY,
+            rate_identity="tg:v1:100\x1f200",
+            expected_owner_generation=1,
+        )
+        service.confirm.assert_not_called()
+        confirmation_markup = bot.edits[-1][3]["reply_markup"]
+        self.assertEqual(
+            [button.text for button in confirmation_markup.buttons],
+            ["执行", "取消"],
+        )
+        self.assertIn("行动计划", bot.edits[-1][0])
+
+    def test_direct_confirmation_delivery_failure_revokes_hidden_plan(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        service = _agent_service_mock()
+        service.query.return_value = {
+            "mode": "confirmation_required",
+            "response_contract": build_response_contract(
+                task_kind="action", presentation="confirmation"
+            ),
+            "tool_call": {"name": "strm.run_once", "elapsed_ms": 4},
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "确认后执行 STRM 同步",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": _pending_action_plan(
+                "direct-offline-confirmation-plan-123456"
+            ),
+        }
+        tokens = iter(("direct-offline-confirm", "direct-offline-cancel"))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        bot = _OfflineAgentBot()
+        history = Mock()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_conversation", history
+        ):
+            self.assertTrue(handle_agent_message(
+                bot, _Telebot, _message("执行 STRM 同步", message_id=1497)
+            ))
+
+        service.discard_confirmation.assert_called_once_with(
+            "direct-offline-confirmation-plan-123456",
+            owner="tg:v1:100\x1f200",
+            advance_owner_epoch=False,
+        )
+        history.assert_not_called()
+        for action_id in ("direct-offline-confirm", "direct-offline-cancel"):
+            with self.assertRaises(ValueError):
+                store.inspect(action_id, owner="tg:v1:100\x1f200")
+
+    def test_followup_confirmation_delivery_failure_revokes_hidden_plan(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        service = _agent_service_mock()
+        service.prepare_confirmation_followup.return_value = {
+            "mode": "confirmation_required",
+            "response_contract": build_response_contract(
+                task_kind="action", presentation="confirmation"
+            ),
+            "tool_call": {"name": "guangya.rename.execute", "elapsed_ms": 4},
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "确认后执行名称清理",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": _pending_action_plan(
+                "preview-followup-offline-plan-123456"
+            ),
+        }
+        tokens = iter((
+            "offline-followup-action",
+            "offline-followup-confirm",
+            "offline-followup-cancel",
+        ))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        action_id = store.create_confirmation_followup(
+            owner="tg:v1:100\x1f200",
+            tool_name="guangya.media_hygiene.preview",
+        )
+        bot = _CallbackEditFallbackBot(offline=True)
+        history = Mock()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_callback_conversation",
+            history,
+        ), patch(
+            "app.bot.progress.schedule_terminal_delivery_retry"
+        ) as schedule_retry:
+            handle_agent_callback(
+                bot,
+                _callback(
+                    f"aga:{action_id}",
+                    callback_id="offline-followup-prepare",
+                ),
+                _Telebot,
+            )
+
+        service.discard_confirmation.assert_called_once_with(
+            "preview-followup-offline-plan-123456",
+            owner="tg:v1:100\x1f200",
+            advance_owner_epoch=False,
+        )
+        for action_id in ("offline-followup-confirm", "offline-followup-cancel"):
+            with self.assertRaises(ValueError):
+                store.inspect(action_id, owner="tg:v1:100\x1f200")
+        self.assertEqual(
+            json.loads(db.kv_get("telegram_pending_operations_v1", "[]")), []
+        )
+        schedule_retry.assert_not_called()
+        history.assert_not_called()
+
+    def test_resource_confirmation_delivery_failure_revokes_hidden_plan(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+        }
+        service = _agent_service_mock()
+        service.prepare.return_value = {
+            "mode": "confirmation_required",
+            "response_contract": build_response_contract(
+                task_kind="action", presentation="confirmation"
+            ),
+            "tool_call": {"name": "ingest.submit", "elapsed_ms": 3},
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "确认后提交所选资源",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": _pending_action_plan(
+                "resource-offline-confirmation-plan-123456"
+            ),
+        }
+        tokens = iter((
+            "offline-resource-qb",
+            "offline-resource-guangya",
+            "offline-resource-confirm",
+            "offline-resource-cancel",
+        ))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        interaction = store.create_resource_interaction(
+            owner="tg:v1:100\x1f200",
+            candidates=_store_resource_candidates("resource_result_123456"),
+        )
+        action_id = interaction["items"][0]["qb_action_id"]
+        bot = _CallbackEditFallbackBot(offline=True)
+        history = Mock()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_callback_conversation",
+            history,
+        ), patch(
+            "app.bot.progress.schedule_terminal_delivery_retry"
+        ) as schedule_retry:
+            handle_agent_callback(
+                bot,
+                _callback(
+                    f"aga:{action_id}",
+                    callback_id="offline-resource-prepare",
+                ),
+                _Telebot,
+            )
+
+        service.discard_confirmation.assert_called_once_with(
+            "resource-offline-confirmation-plan-123456",
+            owner="tg:v1:100\x1f200",
+            advance_owner_epoch=False,
+        )
+        for callback_id in ("offline-resource-confirm", "offline-resource-cancel"):
+            with self.assertRaises(ValueError):
+                store.inspect(callback_id, owner="tg:v1:100\x1f200")
+        self.assertEqual(
+            json.loads(db.kv_get("telegram_pending_operations_v1", "[]")), []
+        )
+        schedule_retry.assert_not_called()
+        history.assert_not_called()
+
+    def test_bare_confirmation_without_active_plan_can_generate_action_card(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        service = _agent_service_mock()
+        service.query.return_value = {
+            "mode": "confirmation_required",
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "确认后将执行刚才的名称清理预览",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": _pending_action_plan(
+                "preview-followup-telegram-plan-123456"
+            ),
+        }
+        store = TelegramAgentActionStore(
+            token_factory=iter(("followup-confirm", "followup-cancel")).__next__
+        )
+        bot = _Bot()
+        history = Mock()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ), patch(
+            "app.bot.agent_adapter._telegram_conversation_context",
+            return_value=([{
+                "role": "assistant",
+                "text": "名称清理预览已生成",
+                "tool_name": "guangya.media_hygiene.preview",
+            }], 1),
+        ), patch(
+            "app.bot.agent_adapter._record_telegram_conversation", history
+        ):
+            self.assertTrue(handle_agent_message(
+                bot, _Telebot, _message("确认", message_id=1499)
+            ))
+
+        service.query.assert_called_once()
+        self.assertEqual(service.query.call_args.args, ("确认",))
+        markup = bot.replies[-1][2]["reply_markup"]
+        self.assertEqual([button.text for button in markup.buttons], ["执行", "取消"])
+        self.assertIn("行动计划", bot.replies[-1][1])
+
+    def test_normal_message_keeps_confirmation_card_but_revokes_other_buttons(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        owner = "tg:v1:100\x1f200"
+        tokens = iter((
+            "normal-keep-confirm",
+            "normal-keep-cancel",
+            "normal-drop-followup",
+        ))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        confirm_id, cancel_id = store.create_confirmation_pair(
+            owner=owner, plan_id="telegram-plan-normal-message-123456"
+        )
+        followup_id = store.create_confirmation_followup(
+            owner=owner, tool_name="guangya.rename.preview"
+        )
+        service = _agent_service_mock()
+        service.query.return_value = _answer_response("普通检查完成")
+        bot = _Bot()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ):
+            self.assertTrue(handle_agent_message(
+                bot, _Telebot, _message("检查下载队列", message_id=1500)
+            ))
+
+        for action_id in (confirm_id, cancel_id):
+            self.assertIn(
+                store.inspect(action_id, owner=owner)["action"],
+                {"confirm", "cancel"},
+            )
+        with self.assertRaises(ValueError):
+            store.inspect(followup_id, owner=owner)
+
+    def test_bare_confirmation_message_restores_existing_card_actions(self):
         values = {
             "TG_AGENT_ENABLED": "1",
             "TG_CHAT_ID": "100",
             "TG_AGENT_ALLOWED_USER_IDS": "200",
         }
         owner = "tg:v1:100\x1f200"
-        for index, text in enumerate(("确认", "取消"), start=1):
-            with self.subTest(text=text):
-                tokens = iter((f"confirm-{index}", f"cancel-{index}"))
-                store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
-                confirm_id, cancel_id = store.create_confirmation_pair(
-                    owner=owner,
-                    plan_id=f"telegram-plan-{index}-123456",
-                )
-                service = _agent_service_mock()
-                bot = _Bot()
-                with patch(
-                    "app.bot.agent_adapter.get",
-                    side_effect=lambda key, default="": values.get(key, default),
-                ), patch(
-                    "app.bot.agent_adapter.get_agent_service", return_value=service
-                ), patch(
-                    "app.bot.agent_adapter.get_telegram_agent_action_store",
-                    return_value=store,
-                ):
-                    self.assertTrue(handle_agent_message(
-                        bot,
-                        _Telebot,
-                        _message(text, message_id=1500 + index),
-                    ))
+        tokens = iter((
+            "confirm-existing",
+            "cancel-existing",
+            "confirm-restored",
+            "cancel-restored",
+        ))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        confirm_id, cancel_id = store.create_confirmation_pair(
+            owner=owner,
+            plan_id="telegram-plan-existing-123456",
+        )
+        service = _agent_service_mock()
+        service.query.return_value = {
+            "mode": "confirmation_required",
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "行动计划仍在等待确认，尚未执行。",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": _pending_action_plan(
+                "telegram-plan-existing-123456"
+            ),
+        }
+        bot = _Bot()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ):
+            self.assertTrue(handle_agent_message(
+                bot, _Telebot, _message("确认", message_id=1501)
+            ))
 
-                service.query.assert_not_called()
-                self.assertIn("卡片上的执行或取消按钮", bot.replies[-1][1])
-                self.assertEqual(
-                    store.inspect(confirm_id, owner=owner)["action"], "confirm"
-                )
-                self.assertEqual(
-                    store.inspect(cancel_id, owner=owner)["action"], "cancel"
-                )
+        service.query.assert_called_once()
+        self.assertIn("行动计划", bot.replies[-1][1])
+        markup = bot.replies[-1][2]["reply_markup"]
+        self.assertEqual([button.text for button in markup.buttons], ["执行", "取消"])
+        for stale_id in (confirm_id, cancel_id):
+            with self.assertRaises(ValueError):
+                store.inspect(stale_id, owner=owner)
+        self.assertEqual(
+            store.inspect("confirm-restored", owner=owner)["action"], "confirm"
+        )
+        self.assertEqual(
+            store.inspect("cancel-restored", owner=owner)["action"], "cancel"
+        )
+        service.confirm.assert_not_called()
+
+    def test_bare_cancellation_uses_safe_service_fallback_and_clears_callbacks(self):
+        values = {
+            "TG_AGENT_ENABLED": "1",
+            "TG_CHAT_ID": "100",
+            "TG_AGENT_ALLOWED_USER_IDS": "200",
+            "TG_AGENT_STREAMING_ENABLED": "0",
+        }
+        owner = "tg:v1:100\x1f200"
+        tokens = iter(("confirm-cancel-text", "cancel-cancel-text"))
+        store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
+        confirm_id, cancel_id = store.create_confirmation_pair(
+            owner=owner, plan_id="telegram-plan-cancel-text-123456"
+        )
+        service = _agent_service_mock()
+        service.active_confirmation_count.return_value = 1
+        service.query.return_value = _answer_response(
+            "待确认的行动计划已取消，未执行任何写入。"
+        )
+        bot = _Bot()
+        with patch(
+            "app.bot.agent_adapter.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.bot.agent_adapter.get_agent_service", return_value=service
+        ), patch(
+            "app.bot.agent_adapter.get_telegram_agent_action_store",
+            return_value=store,
+        ):
+            self.assertTrue(handle_agent_message(
+                bot, _Telebot, _message("取消", message_id=1502)
+            ))
+
+        service.query.assert_called_once()
+        self.assertIn("已取消", bot.replies[-1][1])
+        for action_id in (confirm_id, cancel_id):
+            with self.assertRaises(ValueError):
+                store.inspect(action_id, owner=owner)
 
     def test_resource_candidates_include_non_final_native_read_plan_step(self):
         response = {
@@ -3217,8 +3784,10 @@ class TelegramAgentAdapterTests(unittest.TestCase):
 
         service.reset_session.assert_called_once_with(owner="tg:v1:100\x1f200")
         history_repository.delete_session.assert_called_once()
-        self.assertEqual(action_store.revoke_owner.call_count, 2)
-        action_store.revoke_owner.assert_any_call(owner="tg:v1:100\x1f200")
+        action_store.revoke_owner_non_confirmations.assert_called_once_with(
+            owner="tg:v1:100\x1f200"
+        )
+        action_store.revoke_owner.assert_called_once_with(owner="tg:v1:100\x1f200")
         history_record.assert_not_called()
         self.assertEqual(len(bot.replies), 1)
         self.assertIn("会话已重置", bot.replies[0][1])
@@ -3446,7 +4015,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(len(bot.replies), 1)
         self.assertIn("会话已重置", bot.replies[0][1])
 
-    def test_new_message_revokes_previous_confirmation_callback(self):
+    def test_new_message_preserves_previous_confirmation_callback(self):
         values = {
             "TG_AGENT_ENABLED": "1",
             "TG_CHAT_ID": "100",
@@ -3456,6 +4025,15 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         bot = _Bot()
         service = _agent_service_mock()
         service.query.return_value = _answer_response("新请求已处理")
+        service.confirm.return_value = {
+            "mode": "confirmed_action",
+            "result": {
+                "ok": True,
+                "summary": "原确认操作已执行",
+                "suggestions": [],
+                "evidence": [],
+            },
+        }
         tokens = iter(("stale-confirm-action", "stale-cancel-action"))
         store = TelegramAgentActionStore(token_factory=lambda: next(tokens))
         action_id, _cancel_id = store.create_confirmation_pair(
@@ -3485,9 +4063,13 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                 _Telebot,
             )
 
-        service.confirm.assert_not_called()
-        self.assertEqual(bot.answers[-1][1], "操作已过期或无效")
-        self.assertTrue(bot.answers[-1][2].get("show_alert"))
+        service.confirm.assert_called_once_with(
+            "stale-confirmation-ticket",
+            owner="tg:v1:100\x1f200",
+            request_id=ANY,
+            session_id=ANY,
+        )
+        self.assertEqual(bot.answers[-1][1], "正在执行，请稍候")
 
     def test_message_uses_isolated_owner_and_opaque_confirmation_callbacks(self):
         bot = _Bot()
@@ -6225,9 +6807,6 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         first_id, _first_cancel = store.create_confirmation_pair(
             owner="tg:v1:100\x1f200", plan_id="telegram-plan-ticket-1-1234"
         )
-        second_id, _second_cancel = store.create_confirmation_pair(
-            owner="tg:v1:100\x1f200", plan_id="telegram-plan-ticket-2-1234"
-        )
 
         def callback(action_id):
             return SimpleNamespace(
@@ -6249,6 +6828,10 @@ class TelegramAgentAdapterTests(unittest.TestCase):
             "app.bot.agent_adapter._TELEGRAM_CALLBACK_LIMIT_PER_MINUTE", 1
         ):
             handle_agent_callback(bot, callback(first_id))
+            second_id, _second_cancel = store.create_confirmation_pair(
+                owner="tg:v1:100\x1f200",
+                plan_id="telegram-plan-ticket-2-1234",
+            )
             handle_agent_callback(bot, callback(second_id))
             self.assertEqual(bot.answers[-1][1], "请求过于频繁，请稍后重试")
             # 限流发生在一次性 resolve 前；窗口恢复后仍可使用同一有效票据。

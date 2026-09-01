@@ -109,6 +109,23 @@ class ToolRegistry:
             raise ValueError(
                 f"LLM confirmation tool must be a confirmation-gated non-READ tool: {name}"
             )
+        confirmation_followup = str(spec.confirmation_followup or "").strip()
+        if spec.confirmation_followup_resolver is not None and not confirmation_followup:
+            raise ValueError(
+                f"confirmation followup resolver requires a followup target: {name}"
+            )
+        if confirmation_followup and (
+            spec.risk is not RiskLevel.READ
+            or spec.requires_confirmation
+            or not spec.llm_read
+            or not re.fullmatch(
+                r"[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,63})+",
+                confirmation_followup,
+            )
+        ):
+            raise ValueError(
+                f"confirmation followup requires an LLM-readable preview tool: {name}"
+            )
         native_exposed = spec.llm_read or spec.llm_confirmation
         alias = self._native_alias_for_spec(spec) if native_exposed else ""
         if spec.native_alias and not native_exposed:
@@ -249,6 +266,44 @@ class ToolRegistry:
     def llm_parallel_safe_for(self, name: str) -> bool:
         """返回只读能力是否允许与本轮其他只读工具并行。"""
         return bool(self._get_spec(name).llm_parallel_safe)
+
+    def confirmation_followup_for(self, name: str) -> str:
+        """返回只读预览声明的唯一确认续接；目标必须仍是受控确认工具。"""
+        source = self._get_spec(name)
+        target_name = str(source.confirmation_followup or "").strip()
+        if not target_name:
+            return ""
+        target = self._tools.get(target_name)
+        if (
+            target is None
+            or target.risk is RiskLevel.READ
+            or not target.requires_confirmation
+            or not target.llm_confirmation
+            or target.context_confirmation_preparer is None
+        ):
+            raise AgentToolError(
+                "预览的确认续接当前不可用", code="tool_not_exposed"
+            )
+        return target_name
+
+    def resolve_confirmation_followup(
+        self,
+        name: str,
+        *,
+        context: ToolContext | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """把只读预览续接解析成受目标 schema 约束的确认请求。"""
+        source = self._get_spec(name)
+        target_name = self.confirmation_followup_for(source.name)
+        if not target_name:
+            raise AgentToolError(
+                "该只读结果没有可生成的执行确认",
+                code="confirmation_not_supported",
+            )
+        resolver = source.confirmation_followup_resolver
+        arguments = resolver(context or ToolContext()) if resolver is not None else {}
+        target = self._get_spec(target_name)
+        return target_name, self._normalize_arguments(target, arguments)
 
     def validate_read_call(
         self, name: str, arguments: dict[str, Any] | None = None

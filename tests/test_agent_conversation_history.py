@@ -128,6 +128,37 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         ):
             self.assertNotIn(forbidden, raw)
 
+    def test_confirmation_followup_source_is_private_context_not_public_history(self):
+        response = _response(summary="复合预览完成")
+        response["tool_call"]["name"] = "agent.read_plan"
+        response["followup_action"] = {
+            "kind": "prepare_confirmation",
+            "tool": "guangya.organize.cleanup.preview",
+            "arguments": {},
+            "label": "生成执行确认",
+        }
+        self.repository.append_query_turn(
+            principal="browser-principal-a",
+            session_id=SESSION_A,
+            message="检查并清理残留目录",
+            response=response,
+        )
+
+        context = self.repository.get_llm_context(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        self.assertEqual(
+            context[-1]["confirmation_followup_tool"],
+            "guangya.organize.cleanup.preview",
+        )
+        history = self.repository.get_session(
+            principal="browser-principal-a", session_id=SESSION_A
+        )
+        projected = _public_session_projection(history)
+        self.assertNotIn(
+            "confirmation_followup_tool", projected["messages"][-1]["data"]
+        )
+
     def test_confirmed_resource_submit_persists_only_safe_case_progress(self):
         response = {
             "mode": "confirmed_action",

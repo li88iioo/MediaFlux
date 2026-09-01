@@ -101,7 +101,7 @@ class PagesUiContractTests(unittest.TestCase):
         self.assertRegex(media_recent_html, r"css/media-hub\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")
 
         agent_html = AGENT_HTML.read_text(encoding="utf-8")
-        self.assertRegex(agent_html, r"css/agent\.css'\) \}\}\?v=20260901b")
+        self.assertRegex(agent_html, r"css/agent\.css'\) \}\}\?v=20260901c")
 
         login_html = LOGIN_HTML.read_text(encoding="utf-8")
         self.assertRegex(login_html, r"css/core-layout\.css'\) \}\}\?v=202608(?:[12][0-9]|3[01])[a-z]")

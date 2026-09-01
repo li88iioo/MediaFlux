@@ -12,7 +12,10 @@ from app.agent.provider_operations import build_provider_catalog
 from app.agent.providers.media_server import MediaServerProviderTransport
 from app.agent.providers.qbittorrent import QBittorrentProviderTransport
 from app.agent.registry import AgentToolError
-from app.repositories.agent_provider_plans import invalidate_provider_plans_for_owner
+from app.repositories.agent_provider_plans import (
+    get_latest_prepared_provider_plan,
+    invalidate_provider_plans_for_owner,
+)
 
 _GATEWAY: ProviderGateway | None = None
 _LOCK = threading.Lock()
@@ -144,6 +147,20 @@ def preview_provider_change(
         return get_provider_gateway().preview_change(context=context, **normalized)
     except ProviderGatewayError as exc:
         raise AgentToolError(exc.safe_message, code=exc.code) from exc
+
+
+def latest_provider_change_followup_arguments(
+    context: ToolContext,
+) -> dict[str, Any]:
+    """从 owner/session 私有计划仓恢复最近一次 Provider 预检引用。"""
+    if not context.owner:
+        raise AgentToolError(
+            "Provider 写计划续接需要已登录会话", code="identity_required"
+        )
+    plan = get_latest_prepared_provider_plan(
+        owner=context.owner, session_id=context.session_id
+    )
+    return {"plan_ref": str(plan["plan_ref"])}
 
 
 def prepare_provider_change_execution(

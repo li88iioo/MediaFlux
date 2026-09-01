@@ -284,6 +284,36 @@ def create_provider_plan(
     return _internal_row(row)
 
 
+def get_latest_prepared_provider_plan(
+    *, owner: str, session_id: str
+) -> dict[str, Any]:
+    """返回当前 owner/session 最新且未过期的 Provider 写计划。"""
+    owner_digest, session_digest = _principal(owner, session_id)
+    stamp = now()
+    current_time = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE agent_provider_plans SET status='stale',summary='写计划已过期',"
+            "error_code='plan_expired',finished_at=COALESCE(finished_at,?),updated_at=? "
+            "WHERE owner_digest=? AND session_digest=? AND status='prepared' "
+            "AND expires_at<=?",
+            (stamp, stamp, owner_digest, session_digest, current_time),
+        )
+        row = conn.execute(
+            "SELECT * FROM agent_provider_plans WHERE owner_digest=? "
+            "AND session_digest=? AND status='prepared' AND expires_at>? "
+            # 时间戳只有秒级精度；rowid 才能稳定表示同一秒内的真实创建顺序。
+            "ORDER BY rowid DESC LIMIT 1",
+            (owner_digest, session_digest, current_time),
+        ).fetchone()
+    if row is None:
+        raise AgentToolError(
+            "最近的 Provider 写计划不存在或已过期，请重新预检",
+            code="confirmation_stale",
+        )
+    return _internal_row(row)
+
+
 def get_provider_plan(
     *, owner: str, session_id: str, plan_ref: str
 ) -> dict[str, Any]:

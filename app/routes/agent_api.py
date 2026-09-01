@@ -16,7 +16,6 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app import config
 from app.agent.action_plan_id import normalize_action_plan_id
-from app.agent.confirmation import confirmation_reply_intent
 from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.metrics import agent_metrics
 from app.agent.conversation_history import (
@@ -300,6 +299,29 @@ def _action_plan_id(value: Any) -> str:
     return token
 
 
+def _discard_unpublished_confirmation_response(
+    service: Any, response: Any, *, owner: str
+) -> bool:
+    """撤销已生成但没有取得发布权的行动计划，不推进后继查询 epoch。"""
+    action_plan = response.get("action_plan") if isinstance(response, dict) else None
+    plan_id = normalize_action_plan_id(
+        action_plan.get("plan_id") if isinstance(action_plan, dict) else None
+    )
+    if not plan_id:
+        return False
+    try:
+        return bool(service.discard_confirmation(
+            plan_id,
+            owner=owner,
+            advance_owner_epoch=False,
+        ))
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "未发布 Agent 行动计划回收失败 type=%s", type(exc).__name__
+        )
+        return False
+
+
 def _session_id(value: Any) -> str:
     if not isinstance(value, str):
         raise AgentToolError("session_id 必须是字符串")
@@ -404,6 +426,7 @@ def _public_session_projection(session: dict[str, Any]) -> dict[str, Any]:
         data = item.get("data") if isinstance(item.get("data"), dict) else {}
         public_data = dict(data)
         if role == "assistant":
+            public_data.pop("confirmation_followup_tool", None)
             tool_name = str(public_data.pop("tool_name", "") or "").strip()
             if tool_name:
                 public_data["tool_label"] = public_tool_label(tool_name)
@@ -525,6 +548,30 @@ def _ndjson_event(event_type: str, **payload: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _public_confirmation_followup_action(response: dict[str, Any]) -> dict[str, Any]:
+    """严格投影服务端生成的预览续接，流式降级时仍保留安全确认入口。"""
+    action = response.get("followup_action")
+    if not isinstance(action, dict) or action.get("kind") != "prepare_confirmation":
+        return {}
+    tool_name = str(action.get("tool") or "").strip()
+    arguments = action.get("arguments")
+    if (
+        not re.fullmatch(
+            r"[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,63})+",
+            tool_name,
+        )
+        or arguments != {}
+    ):
+        return {}
+    label = sanitize_public_text(action.get("label"), limit=80) or "生成执行确认"
+    return {
+        "kind": "prepare_confirmation",
+        "tool": tool_name,
+        "arguments": {},
+        "label": label,
+    }
+
+
 def _public_deterministic_fallback_response(
     response: dict[str, Any],
     *,
@@ -562,11 +609,13 @@ def _public_deterministic_fallback_response(
         request_id if _REQUEST_ID_PATTERN.fullmatch(str(request_id or "")) else ""
     )
     safe_contract = response_contract(response)
+    safe_followup = _public_confirmation_followup_action(response)
     projected = {
         "request_id": safe_request_id,
         "mode": mode,
         "tool_call": safe_tool_call,
         **({"response_contract": safe_contract} if safe_contract else {}),
+        **({"followup_action": safe_followup} if safe_followup else {}),
         "result": {
             "ok": bool(result.get("ok")),
             "status": status,
@@ -656,10 +705,14 @@ async def _stream_query_events(
         query_task = asyncio.create_task(asyncio.to_thread(execute_query))
 
         def consume_detached_query(task: asyncio.Task[Any]) -> None:
-            # Python 无法安全终止已进入线程池的同步调用；撤销时立即收回发布权，
-            # 后台调用完成后仅消费异常，绝不再写历史、票据或客户端事件。
+            # Python 无法安全终止已进入线程池的同步调用；撤销时立即收回发布权。
+            # 若后台调用随后才生成行动计划，必须按 plan_id 精确回收，不能留下
+            # 客户端从未见过却会阻塞后续确认的隐藏票据。
             try:
-                task.result()
+                detached_response = task.result()
+                _discard_unpublished_confirmation_response(
+                    service, detached_response, owner=operation.owner
+                )
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
@@ -928,6 +981,9 @@ async def _stream_query_events(
             final_response = attach_public_fallback_presentation(final_response)
 
         if await request.is_disconnected():
+            _discard_unpublished_confirmation_response(
+                service, final_response, owner=operation.owner
+            )
             coordinator.cancel(
                 owner=operation.owner,
                 operation_id=operation.operation_id,
@@ -972,6 +1028,9 @@ async def _stream_query_events(
             yield cancelled_event()
             return
         if not published or final_event is None:
+            _discard_unpublished_confirmation_response(
+                service, final_response, owner=operation.owner
+            )
             yield cancelled_event()
             return
         # 网络背压不属于进程内线性化临界区；最终事件快照已在锁内提交。
@@ -1020,12 +1079,7 @@ def query(request: Request, data: Any = Body(default=None)):
         message = normalize_agent_message(data["message"])
         owner = _agent_owner(request, data)
         request_key = _request_id(data.get("request_id"))
-        if confirmation_reply_intent(message) is not None:
-            _check_rate_limit(request, "query", limit=30)
-            return api_error(
-                "为确保执行对象准确，请使用行动计划卡片上的执行或取消按钮",
-                409,
-            )
+        service = get_agent_service()
         action_history_request = agent_action_history_request(message)
         recent_resource_submit = is_recent_resource_submit_message(message)
         recent_download_explanation = is_recent_download_explanation_message(message)
@@ -1244,7 +1298,6 @@ def query(request: Request, data: Any = Body(default=None)):
             query_kwargs["conversation_context"] = conversation_context
             query_kwargs["trusted_conversation_context"] = True
         streaming = bool(data.get("stream"))
-        service = get_agent_service()
         coordinator = get_agent_operation_coordinator()
         runtime_generation = current_agent_runtime_generation()
         operation, confirmation_epoch = coordinator.begin_with_context(
@@ -1307,10 +1360,16 @@ def query(request: Request, data: Any = Body(default=None)):
                             persist_final()
                             return api_response(response)
             except AgentRuntimeDisabled as exc:
+                _discard_unpublished_confirmation_response(
+                    service, response, owner=owner
+                )
                 _cancel_runtime_changed_operation(
                     service=service, operation=operation
                 )
                 return _agent_runtime_retry_response(exc)
+            _discard_unpublished_confirmation_response(
+                service, response, owner=owner
+            )
             return api_error("本次请求已被更新操作取代", 409)
         finally:
             state_buffer.discard()
@@ -1562,10 +1621,20 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
         service = get_agent_service()
         if not service.has_tool(tool_name):
             raise AgentToolError("未知 Agent 工具", code="tool_not_found")
+        followup_lookup = getattr(service, "confirmation_followup_target", None)
+        raw_followup_target = (
+            followup_lookup(tool_name) if callable(followup_lookup) else ""
+        )
+        followup_target = (
+            raw_followup_target.strip()
+            if isinstance(raw_followup_target, str)
+            else ""
+        )
+        rate_tool = followup_target or tool_name
         _check_rate_limit(
             request,
-            f"action:prepare:{tool_name}",
-            limit=_prepare_rate_limit(tool_name),
+            f"action:prepare:{rate_tool}",
+            limit=_prepare_rate_limit(rate_tool),
         )
         coordinator = get_agent_operation_coordinator()
         runtime_generation = current_agent_runtime_generation()
@@ -1583,8 +1652,12 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
             }
             if confirmation_epoch is not None:
                 prepare_kwargs["expected_owner_generation"] = confirmation_epoch
-            response = service.prepare(
-                tool_name, arguments, **prepare_kwargs
+            response = (
+                service.prepare_confirmation_followup(
+                    tool_name, **prepare_kwargs
+                )
+                if followup_target
+                else service.prepare(tool_name, arguments, **prepare_kwargs)
             )
             try:
                 with agent_runtime_admission(
@@ -1595,11 +1668,17 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
                         lambda: response,
                     )
             except AgentRuntimeDisabled as exc:
+                _discard_unpublished_confirmation_response(
+                    service, response, owner=owner
+                )
                 _cancel_runtime_changed_operation(
                     service=service, operation=operation
                 )
                 return _agent_runtime_retry_response(exc)
             if not published or finalized_response is None:
+                _discard_unpublished_confirmation_response(
+                    service, response, owner=owner
+                )
                 return api_error("会话状态已变化，请重新预检", 409)
             return api_response(finalized_response)
         finally:

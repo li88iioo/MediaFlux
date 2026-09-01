@@ -428,6 +428,7 @@ _TELEGRAM_ACTION_KINDS = frozenset({
     "confirm",
     "cancel",
     "prepare_resource",
+    "prepare_confirmation_followup",
     "paginate_resources",
     "invoke_read_tool",
     "invoke_workspace_action",
@@ -505,6 +506,13 @@ def _action_metadata(
         ):
             raise ValueError("操作已过期或无效")
         metadata.update({"result_id": resource_id, "target": target_name})
+    elif action_kind == "prepare_confirmation_followup":
+        tool = str(tool_name or "").strip()
+        if not re.fullmatch(
+            r"[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,63})+", tool
+        ):
+            raise ValueError("操作已过期或无效")
+        metadata["tool_name"] = tool
     elif action_kind == "invoke_read_tool":
         tool = str(tool_name or "")
         if tool != _MISSING_EPISODE_READ_TOOL:
@@ -540,6 +548,11 @@ def _resolved_action_payload(
             "result_id": metadata["result_id"],
             "position": position,
             "target": metadata["target"],
+        }
+    if action == "prepare_confirmation_followup":
+        return {
+            "action": action,
+            "tool_name": metadata["tool_name"],
         }
     if action == "invoke_read_tool":
         arguments = _load_action_json_object(arguments_json)
@@ -676,7 +689,11 @@ class TelegramAgentActionStore:
     def create_confirmation_pair(
         self, *, owner: str, plan_id: str
     ) -> tuple[str, str]:
-        """原子创建同一行动计划的执行/取消 callback。"""
+        """原子创建同一行动计划的执行/取消 callback。
+
+        Agent 确认仓对每个 owner 只保留最新计划，因此 Telegram 也必须同步
+        淘汰旧确认组，避免页面上出现仍可点击但后端已被替换的陈旧按钮。
+        """
         owner_key = str(owner or "").strip()
         ticket = normalize_action_plan_id(plan_id)
         if not owner_key or not ticket:
@@ -684,6 +701,13 @@ class TelegramAgentActionStore:
         with self._lock:
             now = self._clock()
             self._prune_locked(now)
+            for action_id in [
+                key
+                for key, item in self._items.items()
+                if secrets.compare_digest(item.owner, owner_key)
+                and item.action in {"confirm", "cancel"}
+            ]:
+                self._items.pop(action_id, None)
             confirm_id, cancel_id = self._new_action_ids_locked(2)
             group_id = f"confirmation:{ticket}"
             expires_at = now + self._ttl_seconds
@@ -787,6 +811,26 @@ class TelegramAgentActionStore:
                 "next_action_id": navigation_ids["next"],
                 "guard_action_id": guard_action_id,
             }
+
+    def create_confirmation_followup(
+        self, *, owner: str, tool_name: str
+    ) -> str:
+        """保存预览续接来源；callback 只携带 opaque id。"""
+        owner_key = str(owner or "").strip()
+        tool = str(tool_name or "").strip()
+        if (
+            not owner_key
+            or not re.fullmatch(
+                r"[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,63})+", tool
+            )
+        ):
+            raise ValueError("无法创建 Telegram 确认续接")
+        return self._create_single_action(
+            owner=owner_key,
+            action="prepare_confirmation_followup",
+            group_prefix="confirmation-followup",
+            tool_name=tool,
+        )
 
     def create_read_tool(
         self,
@@ -966,6 +1010,42 @@ class TelegramAgentActionStore:
                 metadata=metadata, arguments_json=item.arguments_json
             )
 
+    def revoke_confirmation_plan(self, *, owner: str, plan_id: str) -> int:
+        """只撤销指定行动计划的执行/取消按钮。"""
+        owner_key = str(owner or "").strip()
+        ticket = normalize_action_plan_id(plan_id)
+        if not owner_key or not ticket:
+            return 0
+        group_id = f"confirmation:{ticket}"
+        with self._lock:
+            self._prune_locked(self._clock())
+            revoked = [
+                action_id
+                for action_id, item in self._items.items()
+                if secrets.compare_digest(item.owner, owner_key)
+                and item.group_id == group_id
+            ]
+            for action_id in revoked:
+                self._items.pop(action_id, None)
+            return len(revoked)
+
+    def revoke_owner_non_confirmations(self, *, owner: str) -> int:
+        """新消息只撤销资源/分页/续接按钮，保留仍有效的行动卡片。"""
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return 0
+        with self._lock:
+            self._prune_locked(self._clock())
+            revoked = [
+                action_id
+                for action_id, item in self._items.items()
+                if secrets.compare_digest(item.owner, owner_key)
+                and item.action not in {"confirm", "cancel"}
+            ]
+            for action_id in revoked:
+                self._items.pop(action_id, None)
+            return len(revoked)
+
     def revoke_owner(self, *, owner: str) -> int:
         """撤销当前 Telegram 身份尚未消费的全部回调操作。"""
         owner_key = str(owner or "").strip()
@@ -1092,7 +1172,11 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
         arguments_json: str = "{}",
         action_key: str = "",
     ) -> str:
-        if action not in {"invoke_read_tool", "invoke_workspace_action"}:
+        if action not in {
+            "invoke_read_tool",
+            "invoke_workspace_action",
+            "prepare_confirmation_followup",
+        }:
             raise RuntimeError("无法生成 Telegram Agent 操作标识")
         with self._lock, db.get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1142,8 +1226,13 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
             self._ensure_schema(conn)
             now = self._clock()
             self._prune(conn, now)
-            confirm_id, cancel_id = self._new_action_ids(conn, count=2)
             owner_digest = self._owner_digest(owner_key)
+            conn.execute(
+                "DELETE FROM telegram_agent_actions WHERE owner_digest=? "
+                "AND action_kind IN ('confirm','cancel')",
+                (owner_digest,),
+            )
+            confirm_id, cancel_id = self._new_action_ids(conn, count=2)
             group_id = f"confirmation:{ticket}"
             expires_at = now + self._ttl_seconds
             created_at = db.now()
@@ -1464,6 +1553,37 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
         if invalid or resolved is None:
             raise ValueError("操作已过期或无效")
         return resolved
+
+    def revoke_confirmation_plan(self, *, owner: str, plan_id: str) -> int:
+        owner_key = str(owner or "").strip()
+        ticket = normalize_action_plan_id(plan_id)
+        if not owner_key or not ticket:
+            return 0
+        with self._lock, db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, self._clock())
+            cursor = conn.execute(
+                "DELETE FROM telegram_agent_actions WHERE owner_digest=? "
+                "AND group_id=?",
+                (self._owner_digest(owner_key), f"confirmation:{ticket}"),
+            )
+            return max(0, int(cursor.rowcount or 0))
+
+    def revoke_owner_non_confirmations(self, *, owner: str) -> int:
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return 0
+        with self._lock, db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, self._clock())
+            cursor = conn.execute(
+                "DELETE FROM telegram_agent_actions WHERE owner_digest=? "
+                "AND action_kind NOT IN ('confirm','cancel')",
+                (self._owner_digest(owner_key),),
+            )
+            return max(0, int(cursor.rowcount or 0))
 
     def revoke_owner(self, *, owner: str) -> int:
         owner_key = str(owner or "").strip()
@@ -2591,6 +2711,13 @@ def _publish_telegram_callback_response(
     if not allowed:
         if isinstance(publish_result, _TelegramPublishResult):
             _delete_stale_telegram_delivery(bot, publish_result.delivery)
+        return False
+    if (
+        not isinstance(publish_result, _TelegramPublishResult)
+        or not publish_result.sent
+    ):
+        # 没有实际送达就不能提交 read-state/history；否则用户看不到结果，
+        # 后续指代却会基于一条不存在的消息继续推进。
         return False
 
     def finalize_callback() -> None:
@@ -3753,6 +3880,35 @@ def handle_agent_reset(bot: Any, message: Any) -> None:
         bot.reply_to(message, "Agent 会话暂时无法重置，请稍后重试。")
 
 
+def _discard_unpublished_telegram_confirmation(
+    service: Any,
+    store: TelegramAgentActionStore,
+    *,
+    owner: str,
+    plan_id: str,
+) -> None:
+    """回收没有成功公开的确认票据及其 Telegram callback。"""
+    ticket = normalize_action_plan_id(plan_id)
+    if not ticket:
+        return
+    try:
+        store.revoke_confirmation_plan(owner=owner, plan_id=ticket)
+    except Exception as exc:
+        logger.warning(
+            "Telegram 未公开确认按钮回收失败 type=%s", type(exc).__name__
+        )
+    try:
+        service.discard_confirmation(
+            ticket,
+            owner=owner,
+            advance_owner_epoch=False,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Telegram 未公开确认票据回收失败 type=%s", type(exc).__name__
+        )
+
+
 def _confirmation_markup(
     telebot: Any,
     *,
@@ -3773,6 +3929,36 @@ def _confirmation_markup(
             "取消", callback_data=f"aga:{cancel_id}"
         ),
     )
+    return markup
+
+
+def _confirmation_followup_action(response: Any) -> dict[str, str]:
+    payload = response if isinstance(response, dict) else {}
+    action = payload.get("followup_action")
+    if not isinstance(action, dict) or action.get("kind") != "prepare_confirmation":
+        return {}
+    tool_name = str(action.get("tool") or "").strip()
+    if (
+        not re.fullmatch(
+            r"[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,63})+", tool_name
+        )
+        or action.get("arguments") != {}
+    ):
+        return {}
+    label = sanitize_public_text(action.get("label"), limit=80) or "生成执行确认"
+    return {"tool": tool_name, "label": label}
+
+
+def _confirmation_followup_markup(
+    telebot: Any, *, owner: str, action: dict[str, str]
+):
+    action_id = get_telegram_agent_action_store().create_confirmation_followup(
+        owner=owner, tool_name=action["tool"]
+    )
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    markup.add(telebot.types.InlineKeyboardButton(
+        action["label"], callback_data=f"aga:{action_id}"
+    ))
     return markup
 
 
@@ -4189,20 +4375,19 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         bot.reply_to(message, "请求过于频繁，请稍后重试。")
         return True
 
-    if confirmation_reply_intent(user_message) is not None:
-        # 文本确认没有绑定具体计划，既不能执行，也不能把仍有效的卡片当作
-        # “新查询”撤销。Web 与 Telegram 统一只接受卡片上的一次性按钮。
-        bot.reply_to(message, "请使用行动计划卡片上的执行或取消按钮。")
-        return True
-
     service = get_agent_service()
+    confirmation_intent = confirmation_reply_intent(user_message)
+
     coordinator = get_agent_operation_coordinator()
     runtime_generation = current_agent_runtime_generation()
 
     def initialize_query() -> int | None:
-        # 新消息是同一 Telegram 身份的最新意图；旧确认/资源按钮必须与
-        # confirmation epoch 在同一个 owner 临界区中同步失效。
-        get_telegram_agent_action_store().revoke_owner(owner=owner)
+        # 新消息会淘汰资源、分页和预览续接按钮，但必须保留当前行动卡片。
+        # confirmation epoch 同样保留有效票据；两边若不同步，下一句普通问题
+        # 就会把 Telegram 按钮撤掉，却留下只能靠按钮处理的隐藏票据。
+        get_telegram_agent_action_store().revoke_owner_non_confirmations(
+            owner=owner
+        )
         return begin_query_confirmation_epoch(service, owner=owner)
 
     operation, confirmation_epoch = coordinator.begin_with_context(
@@ -4411,34 +4596,42 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                 )
                 rendered = render_agent_response(response, confirmation=True)
             else:
-                candidates = (
-                    _resource_candidates(response)
-                    if _resource_candidates_are_primary(response)
-                    else []
-                )
-                if candidates:
-                    markup = _resource_markup(
-                        telebot,
-                        owner=owner,
-                        candidates=candidates,
+                followup_action = _confirmation_followup_action(response)
+                if followup_action:
+                    # 执行续接优先级最高；不能被同一响应中的通用下一步或
+                    # 资源建议覆盖，否则用户会失去唯一的确认入口。
+                    markup = _confirmation_followup_markup(
+                        telebot, owner=owner, action=followup_action
                     )
-                    rendered = _render_resource_candidates(response, candidates)
                 else:
-                    followups = _episode_resource_followups(response)
-                    if followups:
-                        markup = _episode_followup_markup(
+                    candidates = (
+                        _resource_candidates(response)
+                        if _resource_candidates_are_primary(response)
+                        else []
+                    )
+                    if candidates:
+                        markup = _resource_markup(
                             telebot,
                             owner=owner,
-                            followups=followups,
+                            candidates=candidates,
                         )
+                        rendered = _render_resource_candidates(response, candidates)
                     else:
-                        workspace_actions = _workspace_next_actions(response)
-                        if workspace_actions:
-                            markup = _workspace_next_actions_markup(
+                        followups = _episode_resource_followups(response)
+                        if followups:
+                            markup = _episode_followup_markup(
                                 telebot,
                                 owner=owner,
-                                actions=workspace_actions,
+                                followups=followups,
                             )
+                        else:
+                            workspace_actions = _workspace_next_actions(response)
+                            if workspace_actions:
+                                markup = _workspace_next_actions_markup(
+                                    telebot,
+                                    owner=owner,
+                                    actions=workspace_actions,
+                                )
             return rendered, markup
 
         # 只在 owner 临界区内构造短期 action token；真正的 Telegram 网络调用
@@ -4485,9 +4678,29 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             _delete_stale_telegram_delivery(bot, publish_result.delivery)
         if not allowed:
             raise AgentOperationCancelled("Telegram Agent 操作已失效")
+        if (
+            not isinstance(publish_result, _TelegramPublishResult)
+            or not publish_result.sent
+        ):
+            unpublished_plan = sanitize_action_plan(
+                response.get("action_plan") if isinstance(response, dict) else None
+            )
+            if unpublished_plan:
+                _discard_unpublished_telegram_confirmation(
+                    service,
+                    get_telegram_agent_action_store(),
+                    owner=owner,
+                    plan_id=unpublished_plan["plan_id"],
+                )
+            logger.warning("Telegram Agent 最终消息未送达，未提交会话状态")
+            return True
 
         def finalize_conversation() -> None:
             state_buffer.commit()
+            if confirmation_intent == "cancel":
+                # 文本取消已经在服务端撤销票据；同步清掉旧卡片的 opaque
+                # callback，避免用户之后误点一个必然失效的按钮。
+                get_telegram_agent_action_store().revoke_owner(owner=owner)
             _record_telegram_conversation(
                 owner,
                 message=user_message,
@@ -4792,6 +5005,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
     chat_id, user_id = _identity(call)
     callback_answered = False
     confirmed_action_completed = False
+    resolved_confirmation_plan_id = ""
     coordinator = get_agent_operation_coordinator()
     operation = None
     state_buffer: AgentStateCommitBuffer | None = None
@@ -5004,27 +5218,15 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                                 owner=owner,
                                 plan_id=action_plan["plan_id"],
                             )
-                            _record_telegram_callback_conversation(
-                                owner,
-                                message="准备提交所选资源",
-                                response=response,
-                                generation=history_generation,
-                                fallback_summary="资源提交已完成预检，等待确认。",
-                            )
                 except Exception:
-                    # 已生成但尚未公开的计划必须主动失效，避免运行态切换或按钮
-                    # 抢占后留下无入口的隐藏确认票据。
-                    try:
-                        service.discard_confirmation(
-                            action_plan["plan_id"],
-                            owner=owner,
-                            advance_owner_epoch=False,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Telegram 未发布资源计划回收失败 type=%s",
-                            type(exc).__name__,
-                        )
+                    # 已生成但尚未公开的计划必须主动失效，避免运行态切换、按钮
+                    # 抢占或 callback 创建异常后留下无入口的隐藏确认票据。
+                    _discard_unpublished_telegram_confirmation(
+                        service,
+                        store,
+                        owner=owner,
+                        plan_id=action_plan["plan_id"],
+                    )
                     raise
 
                 text = render_agent_response(response, confirmation=True)
@@ -5055,10 +5257,147 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 text,
                 label="Agent 操作结果",
                 reply_markup=markup,
-                runtime_retry=True,
+                persist_retry=False,
             )
             if not delivered:
-                logger.warning("Telegram Agent 终态待恢复投递")
+                _discard_unpublished_telegram_confirmation(
+                    service,
+                    store,
+                    owner=owner,
+                    plan_id=action_plan["plan_id"],
+                )
+                logger.warning("Telegram Agent 资源确认卡片未送达，计划已撤销")
+            else:
+                _record_telegram_callback_conversation(
+                    owner,
+                    message="准备提交所选资源",
+                    response=response,
+                    generation=history_generation,
+                    fallback_summary="资源提交已完成预检，等待确认。",
+                )
+            return
+
+        if action_kind == "prepare_confirmation_followup":
+            bot.answer_callback_query(call.id, "正在生成确认，请稍候")
+            callback_answered = True
+            typing_heartbeat = _start_telegram_operation_typing(
+                bot, call.message, is_current=lambda: True
+            )
+            action_plan: dict[str, Any] = {}
+            prepare_error: AgentToolError | None = None
+            try:
+                # 和资源提交保持同一两阶段边界：先只读检查 opaque callback，
+                # 再在 owner/session 私有上下文中生成一次性行动计划。慢预检不持锁。
+                with _telegram_runtime_admission() as runtime_generation:
+                    pass
+                with coordinator.owner_window(owner):
+                    action = store.inspect(action_id, owner=owner)
+                    if action.get("action") != "prepare_confirmation_followup":
+                        raise ValueError("操作已过期或无效")
+                    coordinator.invalidate_owner(
+                        owner=owner, reason="controlled_action"
+                    )
+                    confirmation_epoch = begin_query_confirmation_epoch(
+                        service, owner=owner
+                    )
+
+                prepare_kwargs: dict[str, Any] = {
+                    "owner": owner,
+                    "request_id": _trace_operation_id(operation),
+                    "session_id": _telegram_history_identity(owner)[1],
+                    "rate_identity": owner,
+                }
+                if confirmation_epoch is not None:
+                    prepare_kwargs["expected_owner_generation"] = confirmation_epoch
+                response = service.prepare_confirmation_followup(
+                    action["tool_name"], **prepare_kwargs
+                )
+                action_plan = sanitize_action_plan(
+                    response.get("action_plan")
+                    if isinstance(response, dict) else None
+                )
+                if not _confirmation_is_primary(response) or not action_plan:
+                    raise ValueError("确认续接未返回行动计划")
+                module = telebot_module
+                if module is None:
+                    import telebot as module
+
+                try:
+                    # 只有运行代次、原 callback 和 owner 状态仍一致时，才消费
+                    # “生成执行确认”按钮并替换成最终执行/取消卡片。
+                    with _telegram_runtime_admission(
+                        expected_generation=runtime_generation
+                    ):
+                        with coordinator.owner_window(owner):
+                            claimed = store.resolve(action_id, owner=owner)
+                            if (
+                                claimed.get("action")
+                                != "prepare_confirmation_followup"
+                                or claimed.get("tool_name") != action["tool_name"]
+                            ):
+                                raise ValueError("操作已过期或无效")
+                            markup = _confirmation_markup(
+                                module, owner=owner, plan_id=action_plan["plan_id"]
+                            )
+                except Exception:
+                    # 若计划已生成却未成功公开，立即撤销隐藏票据和 callback，
+                    # 避免后续文本确认被“已有计划”永久挡住。
+                    _discard_unpublished_telegram_confirmation(
+                        service,
+                        store,
+                        owner=owner,
+                        plan_id=action_plan["plan_id"],
+                    )
+                    raise
+
+                text = render_agent_response(response, confirmation=True)
+            except AgentToolError as exc:
+                prepare_error = exc
+            finally:
+                _stop_telegram_typing_heartbeat(typing_heartbeat)
+                typing_heartbeat = None
+
+            if prepare_error is not None:
+                logger.info(
+                    "Telegram 确认续接预检被拒绝 code=%s", prepare_error.code
+                )
+                _remove_callback_keyboard(bot, call.message)
+                bot.edit_message_text(
+                    "<b>无法生成执行确认</b>\n"
+                    "原预览或冻结计划已过期，请重新发起只读预览后再试。",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+                return
+
+            _remove_callback_keyboard(bot, call.message)
+            delivered = deliver_terminal_to_existing_message(
+                bot,
+                module,
+                call.message,
+                text,
+                label="Agent 行动计划",
+                reply_markup=markup,
+                persist_retry=False,
+            )
+            if not delivered:
+                _discard_unpublished_telegram_confirmation(
+                    service,
+                    store,
+                    owner=owner,
+                    plan_id=action_plan["plan_id"],
+                )
+                logger.warning("Telegram Agent 行动计划未送达，计划已撤销")
+            else:
+                _record_telegram_callback_conversation(
+                    owner,
+                    message="生成执行确认",
+                    response=response,
+                    generation=history_generation,
+                    fallback_summary="行动计划已完成预检，等待确认。",
+                )
             return
 
         if action_kind in {"cancel", "invoke_read_tool"}:
@@ -5085,6 +5424,9 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 with runtime_admission:
                     with coordinator.owner_window(owner):
                         action = store.resolve(action_id, owner=owner)
+                        resolved_confirmation_plan_id = str(
+                            action.get("plan_id") or ""
+                        )
                         coordinator.invalidate_owner(
                             owner=owner, reason="controlled_action"
                         )
@@ -5332,6 +5674,13 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 call.id, "Media Agent 当前未启用，本次未执行", show_alert=True
             )
     except (AgentToolError, ValueError):
+        if resolved_confirmation_plan_id and not confirmed_action_completed:
+            _discard_unpublished_telegram_confirmation(
+                service,
+                store,
+                owner=owner,
+                plan_id=resolved_confirmation_plan_id,
+            )
         if operation is not None and not coordinator.is_current(operation):
             _remove_callback_keyboard(bot, call.message)
             if not callback_answered:
@@ -5357,6 +5706,13 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             bot.answer_callback_query(call.id, "操作已过期或无效", show_alert=True)
     except Exception as exc:
         logger.warning("Telegram Agent 确认失败 type=%s", type(exc).__name__)
+        if resolved_confirmation_plan_id and not confirmed_action_completed:
+            _discard_unpublished_telegram_confirmation(
+                service,
+                store,
+                owner=owner,
+                plan_id=resolved_confirmation_plan_id,
+            )
         if operation is not None and not coordinator.is_current(operation):
             _remove_callback_keyboard(bot, call.message)
             if not callback_answered:

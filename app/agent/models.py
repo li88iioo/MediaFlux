@@ -71,6 +71,7 @@ class ToolContext:
 
 
 ContextualToolHandler = Callable[[dict[str, Any], ToolContext], ToolResult]
+ConfirmationFollowupResolver = Callable[[ToolContext], dict[str, Any]]
 ContextFreeConfirmedToolHandler = Callable[[dict[str, Any], str], ToolResult]
 ContextualConfirmedToolHandler = Callable[[dict[str, Any], str, ToolContext], ToolResult]
 ContextFreeConfirmationPreparer = Callable[[dict[str, Any]], tuple[ToolResult, str]]
@@ -98,6 +99,12 @@ class ToolSpec:
     llm_read_plan: bool = False
     llm_confirmation: bool = False
     native_alias: str = ""
+    # 只读预览可声明唯一的确认型续接工具。该字段只生成“准备行动计划”入口，
+    # 不会执行写操作；最终写入仍必须消费一次性确认票据。
+    confirmation_followup: str = ""
+    # 少数预览（如 Provider 写计划）需要从 owner/session 私有状态恢复
+    # 不透明参数；解析器只生成目标工具参数，仍会经过目标 validator 与确认门。
+    confirmation_followup_resolver: ConfirmationFollowupResolver | None = None
     # 结果的主展示语义跟随工具定义，避免编排器和消息渠道维护工具名白名单。
     result_presentation: str = "narrative"
     stages_resource_candidates: bool = False

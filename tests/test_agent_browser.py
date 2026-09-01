@@ -760,6 +760,59 @@ class AgentBrowserTests(unittest.TestCase):
         self.assertIn("未能完成检索", group.inner_text())
         self.assertIn("tmdb", self.page.locator(".agent-search-errors").inner_text())
 
+    def test_preview_followup_button_prepares_action_plan_without_text_dead_end(self):
+        self._set_query_response({
+            "request_id": "preview-followup",
+            "mode": "read_only",
+            "tool_call": {"name": "guangya.media_hygiene.preview", "elapsed_ms": 18},
+            "result": {
+                "ok": True, "status": "ready", "summary": "已生成 3 项名称清洗预览",
+                "data": {"rename_count": 3}, "evidence": [],
+                "suggestions": ["如确认上述名称符合预期，请回复确认以执行重命名。"],
+            },
+            "followup_action": {
+                "kind": "prepare_confirmation",
+                "tool": "guangya.media_hygiene.preview",
+                "arguments": {},
+                "label": "生成执行确认",
+            },
+        })
+        self.page.evaluate("payload => { window.__agentPrepareResponse = payload; }", {
+            "request_id": "preview-followup-prepare",
+            "mode": "confirmation_required",
+            "tool_call": {"name": "guangya.rename.execute", "elapsed_ms": 5},
+            "result": {
+                "ok": True, "status": "confirmation_required",
+                "summary": "确认后将重命名 3 个对象", "data": {},
+                "evidence": [], "suggestions": [],
+            },
+            "action_plan": _pending_action_plan("preview-followup-plan-123456", risk="danger"),
+        })
+
+        self.page.locator("#agentPrompt").fill("清理目录名称")
+        self.page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+        followup = self.page.get_by_role("button", name="生成执行确认")
+        followup.wait_for()
+        self.assertNotIn("回复确认", self.page.locator(".agent-guidance").inner_text())
+        followup.click()
+        self.page.locator(".agent-confirmation-card").wait_for()
+
+        calls = self.page.evaluate("window.__agentCalls")
+        prepare_calls = [
+            call for call in calls
+            if "/actions/guangya.media_hygiene.preview/prepare" in call["url"]
+        ]
+        self.assertEqual(len(prepare_calls), 1)
+        request_body = json.loads(prepare_calls[0]["body"])
+        self.assertRegex(request_body.pop("session_id"), r"^[A-Za-z0-9_-]{16,64}$")
+        self.assertEqual(request_body, {"arguments": {}})
+        self.assertFalse(any(
+            call["url"].endswith("/tools/guangya.rename.execute") for call in calls
+        ))
+        self.assertEqual(
+            self.page.locator(".agent-confirmation-submit").inner_text(), "执行"
+        )
+
     def test_indexer_result_prepares_confirmation_without_direct_submit(self):
         result_id = "result_demo_resource_123456"
         self._set_query_response({

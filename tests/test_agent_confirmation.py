@@ -1,10 +1,11 @@
 """Agent 受控写操作确认协议与 STRM 首个动作测试。"""
 from __future__ import annotations
 
+import json
 import re
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,7 @@ from app.agent.confirmation_contract import (
     sanitize_confirmation_contract,
 )
 from app.agent.feature_gate import AgentRuntimeDisabled
+from app.agent.llm_router import LLMReadPlan, LLMToolSelection
 from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
@@ -551,6 +553,339 @@ class ConfirmationStoreTests(unittest.TestCase):
 
 
 class ConfirmedToolRegistryTests(unittest.TestCase):
+    def test_registered_preview_followups_are_complete_and_confirmation_gated(self):
+        registry = build_tool_registry()
+        expected = {
+            "provider.change.preview": "provider.change.execute",
+            "guangya.organize.cleanup.preview": "guangya.organize.cleanup.execute",
+            "guangya.organize.cleanup.classify": "guangya.organize.cleanup.execute",
+            "guangya.fs.change.preview": "guangya.fs.change.execute",
+            "guangya.media_hygiene.preview": "guangya.rename.execute",
+            "guangya.rename.preview": "guangya.rename.execute",
+            "guangya.directory_scrape.preview": "guangya.directory_scrape.run",
+            "guangya.organize.preview": "guangya.organize.run_once",
+        }
+        actual = {
+            name: spec.confirmation_followup
+            for name, spec in registry._tools.items()
+            if spec.confirmation_followup
+        }
+        self.assertEqual(actual, expected)
+        for source_name, target_name in expected.items():
+            with self.subTest(source=source_name, target=target_name):
+                source = registry._tools[source_name]
+                target = registry._tools[target_name]
+                self.assertIs(source.risk, RiskLevel.READ)
+                self.assertTrue(source.llm_read)
+                self.assertFalse(source.requires_confirmation)
+                self.assertIsNot(target.risk, RiskLevel.READ)
+                self.assertTrue(target.requires_confirmation)
+                self.assertTrue(target.llm_confirmation)
+                self.assertIsNotNone(target.context_confirmation_preparer)
+                self.assertIsNotNone(target.context_confirmed_handler)
+
+    def test_preview_followup_generates_confirmation_card_without_executing_write(self):
+        executed = Mock()
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="preview.demo",
+            description="只读预览",
+            risk=RiskLevel.READ,
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            handler=lambda _arguments: ToolResult(True, "ready", "预览完成"),
+            validator=lambda _arguments: {},
+            llm_read=True,
+            confirmation_followup="write.demo",
+        ))
+        registry.register(ToolSpec(
+            name="write.demo",
+            description="确认后执行",
+            risk=RiskLevel.WRITE,
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            validator=lambda _arguments: {},
+            requires_confirmation=True,
+            context_confirmation_preparer=(
+                lambda _arguments, _context: (
+                    ToolResult(True, "confirmation_required", "请核对后执行"),
+                    "demo-fingerprint",
+                )
+            ),
+            context_confirmed_handler=(
+                lambda _arguments, _fingerprint, _context: (
+                    executed() or ToolResult(True, "completed", "已完成")
+                )
+            ),
+            llm_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "ticket-preview-followup-123456"),
+        )
+
+        preview = service.invoke("preview.demo", {}, owner="owner-a")
+        self.assertEqual(preview["followup_action"], {
+            "kind": "prepare_confirmation",
+            "tool": "preview.demo",
+            "arguments": {},
+            "label": "生成执行确认",
+        })
+        response = service.query(
+            "确认",
+            owner="owner-a",
+            conversation_context=[{
+                "role": "assistant",
+                "text": "预览完成",
+                "tool_name": "preview.demo",
+                "status": "ready",
+            }],
+            present=False,
+        )
+
+        self.assertEqual(response["mode"], "confirmation_required")
+        self.assertEqual(response["tool_call"]["name"], "write.demo")
+        self.assertEqual(service.active_confirmation_count(owner="owner-a"), 1)
+        executed.assert_not_called()
+
+    def test_preview_followup_resolver_recovers_private_arguments_by_context(self):
+        seen: list[ToolContext] = []
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="preview.private",
+            description="私有预览",
+            risk=RiskLevel.READ,
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            handler=lambda _arguments: ToolResult(True, "preview", "预览完成"),
+            validator=lambda _arguments: {},
+            llm_read=True,
+            confirmation_followup="write.private",
+            confirmation_followup_resolver=lambda context: (
+                seen.append(context) or {"opaque_ref": f"{context.owner}:{context.session_id}"}
+            ),
+        ))
+        registry.register(ToolSpec(
+            name="write.private",
+            description="执行私有计划",
+            risk=RiskLevel.WRITE,
+            parameters={
+                "type": "object",
+                "properties": {"opaque_ref": {"type": "string"}},
+                "required": ["opaque_ref"],
+                "additionalProperties": False,
+            },
+            validator=lambda arguments: {"opaque_ref": str(arguments["opaque_ref"])},
+            requires_confirmation=True,
+            context_confirmation_preparer=lambda arguments, _context: (
+                ToolResult(
+                    True,
+                    "confirmation_required",
+                    "请核对后执行",
+                    data={"opaque_ref": arguments["opaque_ref"]},
+                ),
+                "private-fingerprint",
+            ),
+            context_confirmed_handler=lambda _arguments, _fingerprint, _context: ToolResult(
+                True, "completed", "已完成"
+            ),
+            llm_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "ticket-private-followup-123456"),
+        )
+
+        response = service.prepare_confirmation_followup(
+            "preview.private",
+            owner="owner-private",
+            request_id="request-private",
+            session_id="session-private",
+        )
+
+        self.assertEqual(response["mode"], "confirmation_required")
+        self.assertEqual(response["tool_call"]["name"], "write.private")
+        self.assertEqual(
+            response["result"]["data"]["opaque_ref"],
+            "owner-private:session-private",
+        )
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].owner, "owner-private")
+        self.assertEqual(seen[0].session_id, "session-private")
+
+    def test_read_plan_preserves_unique_preview_followup_and_text_confirmation(self):
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="preview.demo",
+            description="预览",
+            risk=RiskLevel.READ,
+            parameters={},
+            handler=lambda _arguments: ToolResult(True, "ready", "预览完成"),
+            validator=lambda _arguments: {},
+            llm_read=True,
+            llm_read_plan=True,
+            confirmation_followup="write.demo",
+        ))
+        registry.register(ToolSpec(
+            name="read.demo",
+            description="辅助检查",
+            risk=RiskLevel.READ,
+            parameters={},
+            handler=lambda _arguments: ToolResult(True, "success", "检查完成"),
+            validator=lambda _arguments: {},
+            llm_read=True,
+            llm_read_plan=True,
+        ))
+        registry.register(ToolSpec(
+            name="write.demo",
+            description="执行",
+            risk=RiskLevel.WRITE,
+            parameters={},
+            validator=lambda _arguments: {},
+            requires_confirmation=True,
+            context_confirmation_preparer=lambda _arguments, _context: (
+                ToolResult(True, "confirmation_required", "预检通过"),
+                "read-plan-fingerprint",
+            ),
+            context_confirmed_handler=lambda _arguments, _fingerprint, _context: ToolResult(
+                True, "completed", "完成"
+            ),
+            llm_confirmation=True,
+        ))
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(token_factory=lambda: "read-plan-followup-ticket-123456"),
+        )
+
+        combined = service._execute_read_plan(
+            LLMReadPlan(steps=(
+                LLMToolSelection(tool_name="preview.demo", arguments={}),
+                LLMToolSelection(tool_name="read.demo", arguments={}),
+            )),
+            owner="owner-read-plan",
+        )
+
+        self.assertEqual(combined["tool_call"]["name"], "agent.read_plan")
+        self.assertEqual(combined["followup_action"]["tool"], "preview.demo")
+        response = service.query(
+            "确认",
+            owner="owner-read-plan",
+            conversation_context=[{
+                "role": "assistant",
+                "text": "复合检查完成",
+                "tool_name": "agent.read_plan",
+                "confirmation_followup_tool": "preview.demo",
+            }],
+            present=False,
+        )
+        self.assertEqual(response["mode"], "confirmation_required")
+        self.assertEqual(response["tool_call"]["name"], "write.demo")
+
+    def test_native_read_plan_preserves_one_followup_and_rejects_ambiguity(self):
+        registry = ToolRegistry()
+        for preview_name, write_name in (
+            ("preview.one", "write.one"),
+            ("preview.two", "write.two"),
+        ):
+            registry.register(ToolSpec(
+                name=preview_name,
+                description="预览",
+                risk=RiskLevel.READ,
+                parameters={},
+                handler=lambda _arguments: ToolResult(True, "ready", "预览完成"),
+                validator=lambda _arguments: {},
+                llm_read=True,
+                llm_read_plan=True,
+                confirmation_followup=write_name,
+            ))
+            registry.register(ToolSpec(
+                name=write_name,
+                description="执行",
+                risk=RiskLevel.WRITE,
+                parameters={},
+                validator=lambda _arguments: {},
+                requires_confirmation=True,
+                context_confirmation_preparer=lambda _arguments, _context: (
+                    ToolResult(True, "confirmation_required", "预检通过"),
+                    "native-read-plan",
+                ),
+                context_confirmed_handler=lambda _arguments, _fingerprint, _context: ToolResult(
+                    True, "completed", "完成"
+                ),
+                llm_confirmation=True,
+            ))
+        registry.register(ToolSpec(
+            name="read.support",
+            description="辅助检查",
+            risk=RiskLevel.READ,
+            parameters={},
+            handler=lambda _arguments: ToolResult(True, "success", "检查完成"),
+            validator=lambda _arguments: {},
+            llm_read=True,
+            llm_read_plan=True,
+        ))
+        service = AgentOrchestrator(registry)
+        preview_one = service.invoke("preview.one", {}, owner="owner-native")
+        support = service.invoke("read.support", {}, owner="owner-native")
+        unique = service._aggregate_native_read_executions(
+            [
+                {"tool_name": "preview.one", "arguments": {}, "response": preview_one},
+                {"tool_name": "read.support", "arguments": {}, "response": support},
+            ],
+            owner="owner-native",
+            completed=True,
+            narrative_suggestions=(),
+        )
+        self.assertEqual(unique["followup_action"]["tool"], "preview.one")
+
+        preview_two = service.invoke("preview.two", {}, owner="owner-native")
+        ambiguous = service._aggregate_native_read_executions(
+            [
+                {"tool_name": "preview.one", "arguments": {}, "response": preview_one},
+                {"tool_name": "preview.two", "arguments": {}, "response": preview_two},
+            ],
+            owner="owner-native",
+            completed=True,
+            narrative_suggestions=(),
+        )
+        self.assertNotIn("followup_action", ambiguous)
+
+    def test_confirmation_reply_does_not_reuse_older_preview_after_newer_response(self):
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="preview.demo", description="预览", risk=RiskLevel.READ,
+            parameters={}, handler=lambda _arguments: ToolResult(True, "ready", "完成"),
+            validator=lambda _arguments: {}, llm_read=True,
+            confirmation_followup="write.demo",
+        ))
+        registry.register(ToolSpec(
+            name="read.other", description="其他只读结果", risk=RiskLevel.READ,
+            parameters={}, handler=lambda _arguments: ToolResult(True, "success", "其他结果"),
+            validator=lambda _arguments: {}, llm_read=True,
+        ))
+        registry.register(ToolSpec(
+            name="write.demo", description="执行", risk=RiskLevel.WRITE,
+            parameters={}, validator=lambda _arguments: {}, requires_confirmation=True,
+            context_confirmation_preparer=lambda _arguments, _context: (
+                ToolResult(True, "confirmation_required", "预检"), "fingerprint"
+            ),
+            context_confirmed_handler=lambda _arguments, _fingerprint, _context: ToolResult(
+                True, "completed", "完成"
+            ),
+            llm_confirmation=True,
+        ))
+        service = AgentOrchestrator(registry)
+
+        response = service.query(
+            "确认",
+            owner="owner-a",
+            conversation_context=[
+                {"role": "assistant", "text": "预览完成", "tool_name": "preview.demo"},
+                {"role": "assistant", "text": "随后查询了其他状态", "tool_name": "read.other"},
+            ],
+            present=False,
+        )
+
+        self.assertEqual(response["mode"], "clarification")
+        self.assertEqual(service.active_confirmation_count(owner="owner-a"), 0)
+
     def test_removed_guangya_execute_names_are_not_runtime_tools(self):
         service = AgentOrchestrator(build_tool_registry())
         for removed_name in (
@@ -1426,6 +1761,62 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
     def _config_get(values):
         return lambda key, default="": values.get(key, default)
 
+    def test_preview_followup_prepare_endpoint_uses_server_side_source_context(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        service = Mock()
+        service.has_tool.return_value = True
+        service.confirmation_followup_target.return_value = "write.demo"
+        service.begin_query_confirmation_epoch.return_value = 7
+        service.prepare_confirmation_followup.return_value = {
+            "mode": "confirmation_required",
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "确认后执行",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": {
+                "version": 1,
+                "plan_id": "preview-followup-web-ticket-123456",
+                "status": "awaiting_approval",
+                "title": "执行预览计划",
+                "target": "最近预览",
+                "impact": "会执行冻结计划。",
+                "reversibility": "按业务流程恢复。",
+                "risk": "write",
+                "preflight_at": "2026-09-01T12:00:00+08:00",
+                "preflight_summary": "预检通过。",
+                "expires_in": 60,
+                "decisions": [
+                    {"id": "execute", "label": "执行"},
+                    {"id": "cancel", "label": "取消"},
+                ],
+            },
+        }
+
+        with patch("app.routes.agent_api.get_agent_service", return_value=service):
+            response = self.client.post(
+                "/api/agent/actions/preview.demo/prepare",
+                headers=headers,
+                json={
+                    "arguments": {},
+                    "session_id": "preview_followup_session_1234",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        service.prepare_confirmation_followup.assert_called_once_with(
+            "preview.demo",
+            owner=ANY,
+            request_id=ANY,
+            session_id="preview_followup_session_1234",
+            rate_identity=ANY,
+            expected_owner_generation=7,
+        )
+        service.prepare.assert_not_called()
+
     def test_query_prepare_confirm_and_replay(self):
         csrf = self.login()
         scheduler = Mock()
@@ -1487,7 +1878,7 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(replay.status_code, 409, replay.text)
             scheduler.trigger.assert_called_once_with("manual")
 
-    def test_query_rejects_natural_language_confirmation_and_preserves_plan(self):
+    def test_query_restores_natural_language_confirmation_card_without_write(self):
         csrf = self.login()
         scheduler = Mock()
         scheduler.validate_config.return_value = ""
@@ -1512,14 +1903,24 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(prepared.status_code, 200, prepared.text)
             plan_id = prepared.json()["action_plan"]["plan_id"]
 
-            rejected = self.client.post(
+            restored = self.client.post(
                 "/api/agent/query",
                 headers=headers,
                 json={"session_id": session_id, "message": "好的帮我执行", "stream": True},
             )
 
-            self.assertEqual(rejected.status_code, 409, rejected.text)
-            self.assertIn("行动计划卡片", rejected.text)
+            self.assertEqual(restored.status_code, 200, restored.text)
+            restored_events = [
+                json.loads(line)
+                for line in restored.text.splitlines()
+                if line.strip()
+            ]
+            final = next(
+                event for event in restored_events if event.get("type") == "final"
+            )["payload"]
+            self.assertEqual(final["mode"], "confirmation_required")
+            self.assertEqual(final["action_plan"]["plan_id"], plan_id)
+            self.assertIn("仍在等待确认", final["result"]["summary"])
             scheduler.trigger.assert_not_called()
 
             confirmed = self.client.post(
@@ -1530,7 +1931,7 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             self.assertEqual(confirmed.status_code, 202, confirmed.text)
             scheduler.trigger.assert_called_once_with("manual")
 
-    def test_query_rejects_natural_language_cancellation_and_preserves_plan(self):
+    def test_query_natural_language_cancellation_clears_plan_without_write(self):
         csrf = self.login()
         scheduler = Mock()
         scheduler.validate_config.return_value = ""
@@ -1553,23 +1954,17 @@ class AgentConfirmedActionAPITests(IsolatedDatabaseTestCase):
             )
             plan_id = prepared.json()["action_plan"]["plan_id"]
 
-            rejected = self.client.post(
+            cancelled = self.client.post(
                 "/api/agent/query",
                 headers=headers,
                 json={"session_id": session_id, "message": "取消"},
             )
 
-            self.assertEqual(rejected.status_code, 409, rejected.text)
-            self.assertIn("行动计划卡片", rejected.text)
+            self.assertEqual(cancelled.status_code, 200, cancelled.text)
+            self.assertIn("已取消", cancelled.json()["result"]["summary"])
+            self.assertIn("未执行任何写入", cancelled.json()["result"]["summary"])
             scheduler.trigger.assert_not_called()
 
-            discarded = self.client.post(
-                "/api/agent/actions/confirm/discard",
-                headers=headers,
-                json={"session_id": session_id, "plan_id": plan_id},
-            )
-            self.assertEqual(discarded.status_code, 200, discarded.text)
-            self.assertTrue(discarded.json()["discarded"])
             stale = self.client.post(
                 "/api/agent/actions/confirm",
                 headers=headers,

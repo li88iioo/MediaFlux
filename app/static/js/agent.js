@@ -1624,6 +1624,25 @@
         }).slice(0, 3);
     }
 
+    function confirmationFollowupFromPayload(payload) {
+        const action = payload?.followup_action;
+        if (!action || action.kind !== 'prepare_confirmation') return null;
+        const tool = String(action.tool || '').trim();
+        if (!/^[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,63})+$/.test(tool)) return null;
+        const argumentsValue = action.arguments;
+        if (!argumentsValue || typeof argumentsValue !== 'object' || Array.isArray(argumentsValue)) return null;
+        if (Object.keys(argumentsValue).length !== 0) return null;
+        const label = typeof action.label === 'string'
+            ? action.label.trim().slice(0, 80)
+            : '';
+        return {
+            mode: 'prepare_confirmation',
+            tool,
+            arguments: {},
+            label: label || '生成执行确认',
+        };
+    }
+
     function responseNotices(payload) {
         const candidates = [
             ...(Array.isArray(payload?.presentation?.notices) ? payload.presentation.notices : []),
@@ -1733,11 +1752,24 @@
     }
 
     function renderGuidance(payload) {
-        const items = responseGuidance(payload);
-        if (!items.length) return null;
+        const followup = confirmationFollowupFromPayload(payload);
+        const items = responseGuidance(payload).filter((item) => {
+            if (!followup) return true;
+            return !/(?:确认|执行)/.test(`${item.label} ${item.prompt}`);
+        });
+        if (!followup && !items.length) return null;
         const section = node('section', 'agent-guidance');
         section.append(node('h4', '', '下一步'));
         const actions = node('div', 'agent-guidance-actions');
+        if (followup) {
+            const button = node('button', 'agent-guidance-action is-confirmation');
+            button.type = 'button';
+            button.dataset.agentDirectTool = 'true';
+            button.setAttribute('aria-busy', 'false');
+            button.append(icon('shield-check'), node('span', '', followup.label));
+            directToolActions.set(button, followup);
+            actions.append(button);
+        }
         items.forEach((item) => {
             const button = node('button', `agent-guidance-action is-${item.kind}`);
             button.type = 'button';
@@ -2463,7 +2495,10 @@
         const pending = appendPendingMessage();
         const startedAt = performance.now();
         try {
-            const payload = await fetchJSON(`/api/agent/tools/${action.tool}`, {
+            const endpoint = action.mode === 'prepare_confirmation'
+                ? `/api/agent/actions/${encodeURIComponent(action.tool)}/prepare`
+                : `/api/agent/tools/${encodeURIComponent(action.tool)}`;
+            const payload = await fetchJSON(endpoint, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(sessionPayload({arguments: action.arguments}, requestSessionId)),
@@ -2490,7 +2525,9 @@
                     button.setAttribute('aria-busy', 'false');
                     const busyIcon = button.querySelector('svg, i[data-lucide]');
                     if (busyIcon) {
-                        busyIcon.replaceWith(icon('search'));
+                        busyIcon.replaceWith(icon(
+                            action.mode === 'prepare_confirmation' ? 'shield-check' : 'search'
+                        ));
                         refreshIcons(button);
                     }
                 }

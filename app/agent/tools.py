@@ -36,6 +36,7 @@ from app.agent.pending_action_actions import (
 )
 from app.agent.provider_actions import (
     execute_provider_change_confirmed,
+    latest_provider_change_followup_arguments,
     list_provider_capabilities,
     prepare_provider_change_execution,
     preview_provider_change,
@@ -1438,6 +1439,8 @@ def build_tool_registry(
         llm_read=True,
         llm_read_plan=True,
         native_alias="mf_provider_change_preview",
+        confirmation_followup="provider.change.execute",
+        confirmation_followup_resolver=latest_provider_change_followup_arguments,
         llm_domains=("media_library", "downloads"),
         llm_source_kind="provider_change_plan",
         llm_freshness="live",
@@ -3002,6 +3005,7 @@ def build_tool_registry(
         validator=guangya_cleanup_preview_arguments,
         llm_read=True,
         llm_read_plan=True,
+        confirmation_followup="guangya.organize.cleanup.execute",
         llm_domains=("cloud_files", "organize", "storage_hygiene"),
         llm_source_kind="guangya_snapshot",
         llm_freshness="live",
@@ -3052,6 +3056,7 @@ def build_tool_registry(
         validator=guangya_cleanup_classify_arguments,
         llm_read=True,
         llm_read_plan=True,
+        confirmation_followup="guangya.organize.cleanup.execute",
         llm_domains=("cloud_files", "organize", "storage_hygiene"),
         llm_source_kind="guangya_cleanup_plan",
         llm_freshness="live",
@@ -3202,6 +3207,7 @@ def build_tool_registry(
         llm_source_kind="guangya_fs_change_plan",
         llm_freshness="live",
         llm_parallel_safe=False,
+        confirmation_followup="guangya.fs.change.execute",
         llm_examples=(
             "把刚才光鸭目录中的垃圾目录移入回收站，先预览",
             "把这些对象移动到 /整理，先生成确认计划",
@@ -3257,6 +3263,7 @@ def build_tool_registry(
         llm_source_kind="guangya_snapshot",
         llm_freshness="live",
         llm_parallel_safe=False,
+        confirmation_followup="guangya.rename.execute",
         llm_examples=(
             "帮我清理光鸭 a 目录里媒体文件名中的网站垃圾信息",
             "整理这个 NSFW 目录的番号、视频名和字幕名",
@@ -3299,6 +3306,7 @@ def build_tool_registry(
         llm_source_kind="guangya_snapshot",
         llm_freshness="live",
         llm_parallel_safe=False,
+        confirmation_followup="guangya.rename.execute",
         llm_examples=(
             "去掉 /整理/动漫 下面文件名中的 Mbps 码率字段",
             "递归替换光鸭目录文件名中的旧片名",
@@ -3405,6 +3413,7 @@ def build_tool_registry(
         llm_domains=("organize", "media_identity"),
         llm_source_kind="system_state",
         llm_parallel_safe=False,
+        confirmation_followup="guangya.directory_scrape.run",
         llm_examples=("预览刚才第 1 个刮削候选",),
     ))
     registry.register(ToolSpec(
@@ -3432,6 +3441,7 @@ def build_tool_registry(
         validator=_no_arguments,
         llm_read=True,
         llm_read_plan=True,
+        confirmation_followup="guangya.organize.run_once",
     ))
     registry.register(ToolSpec(
         name="guangya.organize.run_once",

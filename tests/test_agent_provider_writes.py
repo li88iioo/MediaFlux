@@ -20,6 +20,8 @@ from app.agent.provider_models import (
 from app.agent.registry import AgentToolError
 from app.repositories.agent_provider_plans import (
     claim_provider_plan,
+    create_provider_plan,
+    get_latest_prepared_provider_plan,
     invalidate_provider_plans_for_owner,
 )
 
@@ -736,6 +738,41 @@ def test_provider_transport_recheck_blocks_race_without_external_side_effect(
     status = gateway.change_status(plan_ref=plan_ref, context=context)
     assert status.data["status"] == "stale"
     assert status.data["error_code"] == "confirmation_stale"
+
+
+def test_latest_provider_plan_uses_creation_order_with_second_precision_timestamps(
+    isolated_provider_db,
+):
+    common = {
+        "owner": "owner-order",
+        "session_id": "session-order",
+        "provider": "demo",
+        "profile_ref": "configured:demo",
+        "operation": "demo.pause",
+        "risk": "write",
+        "target_snapshot": {"id": "target"},
+        "context_fingerprint": "fingerprint",
+    }
+    with patch(
+        "app.repositories.agent_provider_plans.now",
+        return_value="2026-09-01 12:00:00",
+    ), patch(
+        "app.repositories.agent_provider_plans.secrets.token_hex",
+        side_effect=("1" * 24, "0" * 24),
+    ):
+        first = create_provider_plan(
+            **common, arguments={"value": "first"}, summary="first"
+        )
+        second = create_provider_plan(
+            **common, arguments={"value": "second"}, summary="second"
+        )
+
+    latest = get_latest_prepared_provider_plan(
+        owner="owner-order", session_id="session-order"
+    )
+    assert latest["plan_ref"] == second["plan_ref"]
+    assert latest["plan_ref"] != first["plan_ref"]
+    assert latest["arguments"] == {"value": "second"}
 
 
 def test_provider_owner_reset_removes_prepared_and_scrubs_running_plan(

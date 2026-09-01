@@ -669,8 +669,13 @@ def deliver_terminal_to_existing_message(
     label: str,
     reply_markup: Any = None,
     runtime_retry: bool = False,
+    persist_retry: bool = True,
 ) -> bool:
-    """可靠投递已有消息的终态：编辑失败时改发新消息，离线时留待重启补发。"""
+    """可靠投递已有消息的终态。
+
+    带一次性确认按钮的卡片不能通过纯文本 pending 记录重投；调用方应将
+    ``persist_retry`` 设为 ``False``，投递失败后同步撤销未公开计划。
+    """
     chat_id = getattr(getattr(source_message, "chat", None), "id", None)
     message_id = getattr(source_message, "message_id", None)
     if chat_id is None or message_id is None:
@@ -708,7 +713,9 @@ def deliver_terminal_to_existing_message(
         reply_markup=reply_markup,
         clear_reply_markup=True,
     )
-    if (
+    if not delivered and not persist_retry:
+        _remove_pending(operation.operation_id)
+    elif (
         not delivered
         and runtime_retry
         and not operation.terminal_outcome_unknown

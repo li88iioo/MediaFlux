@@ -23,6 +23,9 @@ from app.agent.media_facts import media_facts_match_context, validate_media_fact
 from app.sensitive_data import contains_sensitive_credential
 
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+_CONFIRMATION_FOLLOWUP_TOOL_RE = re.compile(
+    r"^[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,63})+$"
+)
 _SCHEMA_VERSION = 1
 _SUMMARY_STORAGE_VERSION = 2
 _UNSAFE_HISTORY_DETAIL = "[已隐藏敏感详情]"
@@ -947,6 +950,13 @@ class SQLiteAgentConversationHistoryRepository:
         entry: dict[str, Any] = {"role": role, "text": normalized[:600]}
         if role == "assistant":
             tool_name = str(data.get("tool_name") or "").strip()[:120]
+            confirmation_followup_tool = str(
+                data.get("confirmation_followup_tool") or ""
+            ).strip()
+            if not _CONFIRMATION_FOLLOWUP_TOOL_RE.fullmatch(
+                confirmation_followup_tool
+            ):
+                confirmation_followup_tool = ""
             status = str(data.get("status") or "").strip()[:64]
             suggestions = data.get("suggestions")
             media_context = self._media_context_projection(
@@ -969,6 +979,8 @@ class SQLiteAgentConversationHistoryRepository:
             )
             if tool_name:
                 entry["tool_name"] = tool_name
+            if confirmation_followup_tool:
+                entry["confirmation_followup_tool"] = confirmation_followup_tool
             if media_context:
                 entry["media_context"] = media_context
             if tentative_media_context:
@@ -1177,6 +1189,21 @@ class SQLiteAgentConversationHistoryRepository:
             "error": self._safe_optional_output_text(result.get("error"), limit=300),
             "suggestions": safe_suggestions,
         }
+        followup_action = response.get("followup_action")
+        if (
+            isinstance(followup_action, dict)
+            and followup_action.get("kind") == "prepare_confirmation"
+            and followup_action.get("arguments") == {}
+        ):
+            confirmation_followup_tool = str(
+                followup_action.get("tool") or ""
+            ).strip()
+            if _CONFIRMATION_FOLLOWUP_TOOL_RE.fullmatch(
+                confirmation_followup_tool
+            ):
+                projection["confirmation_followup_tool"] = (
+                    confirmation_followup_tool
+                )
         context_domain = str(response.get("context_domain") or "").strip()
         if not context_domain and tool_name.startswith("rss."):
             context_domain = "rss"
@@ -1386,6 +1413,7 @@ class SQLiteAgentConversationHistoryRepository:
             "media_context",
             "media_facts",
             "context_domains",
+            "confirmation_followup_tool",
         ):
             if encode_or_none() is not None:
                 break

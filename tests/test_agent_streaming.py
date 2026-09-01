@@ -20,7 +20,10 @@ from app.agent.state_commit import commit_or_defer_agent_state
 from app.clients.openai_compatible import ProviderStreamError
 from app.config import web_credentials
 from app.main import create_app
-from app.routes.agent_api import _stream_query_events
+from app.routes.agent_api import (
+    _public_deterministic_fallback_response,
+    _stream_query_events,
+)
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -165,6 +168,108 @@ class _ConfirmationRaceService(_FakeService):
 
     def invoke(self, _tool_name: str, _arguments: dict, **_kwargs):
         return self.response
+
+
+class _HiddenConfirmationService(_FakeService):
+    def __init__(self) -> None:
+        super().__init__(_tool_response())
+        self.confirmation_store = ConfirmationStore()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.owner = ""
+
+    @staticmethod
+    def has_tool(_tool_name: str) -> bool:
+        return True
+
+    @staticmethod
+    def confirmation_followup_target(_tool_name: str) -> str:
+        return ""
+
+    @staticmethod
+    def active_confirmation_count(*, owner: str) -> int:
+        del owner
+        return 0
+
+    def begin_query_confirmation_epoch(self, *, owner: str) -> int:
+        _revoked, generation = self.confirmation_store.rotate_owner(
+            owner=owner, preserve_active=True
+        )
+        return generation
+
+    def invalidate_query_confirmation_epoch(self, *, owner: str) -> int:
+        revoked, _generation = self.confirmation_store.rotate_owner(owner=owner)
+        return revoked
+
+    def discard_confirmation(
+        self, confirmation_id: str, *, owner: str, advance_owner_epoch: bool = True
+    ) -> bool:
+        del advance_owner_epoch
+        return self.confirmation_store.discard(
+            owner=owner, confirmation_id=confirmation_id
+        )
+
+    def _issue_response(self, *, owner: str, generation: int | None) -> dict:
+        ticket = self.confirmation_store.issue(
+            owner=owner,
+            tool_name="test.write",
+            arguments={"enabled": True},
+            expected_owner_generation=generation,
+            replace_active_ticket=True,
+        )
+        return {
+            "mode": "confirmation_required",
+            "tool_call": {"name": "test.write", "elapsed_ms": 1},
+            "result": {
+                "ok": True,
+                "status": "confirmation_required",
+                "summary": "等待确认",
+                "suggestions": [],
+                "evidence": [],
+            },
+            "action_plan": {
+                "version": 1,
+                "plan_id": ticket.confirmation_id,
+                "status": "awaiting_approval",
+                "title": "测试写入",
+                "target": "测试对象",
+                "impact": "会执行测试写入",
+                "reversibility": "可恢复",
+                "risk": "write",
+                "preflight_at": "2026-09-01T00:00:00+08:00",
+                "preflight_summary": "预检完成",
+                "expires_in": 60,
+                "decisions": [
+                    {"id": "execute", "label": "执行"},
+                    {"id": "cancel", "label": "取消"},
+                ],
+            },
+        }
+
+    def prepare(self, _tool_name: str, _arguments: dict, **kwargs):
+        self.owner = str(kwargs.get("owner") or "")
+        response = self._issue_response(
+            owner=self.owner,
+            generation=kwargs.get("expected_owner_generation"),
+        )
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("测试未释放确认预检")
+        return response
+
+    def query(self, message: str, **kwargs):
+        self.calls.append((message, kwargs))
+        if message != "旧确认请求":
+            return self.response
+        self.owner = str(kwargs.get("owner") or "")
+        response = self._issue_response(
+            owner=self.owner,
+            generation=kwargs.get("confirmation_owner_generation"),
+        )
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("测试未释放确认查询")
+        return response
 
 
 class _BlockingWorkspaceService(_FakeService):
@@ -846,6 +951,26 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(second["type"], "cancelled")
         self.assertEqual(second["reason"], "user_cancelled")
 
+    def test_stream_fallback_preserves_only_valid_confirmation_followup(self):
+        response = _tool_response()
+        response["followup_action"] = {
+            "kind": "prepare_confirmation",
+            "tool": "guangya.rename.execute",
+            "arguments": {},
+            "label": "生成执行确认",
+        }
+
+        projected = _public_deterministic_fallback_response(
+            response, request_id="fallback-followup-request"
+        )
+        self.assertEqual(projected["followup_action"], response["followup_action"])
+
+        response["followup_action"]["arguments"] = {"unsafe": True}
+        rejected = _public_deterministic_fallback_response(
+            response, request_id="fallback-followup-rejected"
+        )
+        self.assertNotIn("followup_action", rejected)
+
     def test_direct_tool_rejects_incomplete_service_contract(self):
         csrf = self._login()
 
@@ -943,6 +1068,90 @@ class AgentStreamingApiTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(stale.status_code, 409, stale.text)
         self.assertEqual(service.state_commits, [])
+
+    def test_superseded_prepare_discards_unpublished_confirmation(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _HiddenConfirmationService()
+        prepare_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        prepare_client.cookies.update(self.client.cookies)
+
+        try:
+            with patch("app.routes.agent_api.get_agent_service", return_value=service):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(
+                        prepare_client.post,
+                        "/api/agent/actions/test.write/prepare",
+                        headers=headers,
+                        json={"session_id": SESSION_ID, "arguments": {}},
+                    )
+                    self.assertTrue(service.started.wait(timeout=1))
+                    newer = self.client.post(
+                        "/api/agent/query",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "message": "检查下载队列状态",
+                            "request_id": "request_after_hidden_prepare_0001",
+                        },
+                    )
+                    self.assertEqual(newer.status_code, 200, newer.text)
+                    service.release.set()
+                    stale = pending.result(timeout=2)
+        finally:
+            service.release.set()
+            prepare_client.close()
+
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(
+            service.confirmation_store.list_active_tickets(owner=service.owner), []
+        )
+
+    def test_superseded_query_discards_unpublished_confirmation(self):
+        csrf = self._login()
+        headers = {"X-CSRF-Token": csrf}
+        service = _HiddenConfirmationService()
+        old_client = TestClient(
+            create_app(start_background=False), raise_server_exceptions=False
+        )
+        old_client.cookies.update(self.client.cookies)
+
+        try:
+            with patch("app.routes.agent_api.get_agent_service", return_value=service):
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(
+                        old_client.post,
+                        "/api/agent/query",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "message": "旧确认请求",
+                            "request_id": "request_hidden_query_old_0001",
+                        },
+                    )
+                    self.assertTrue(service.started.wait(timeout=1))
+                    newer = self.client.post(
+                        "/api/agent/query",
+                        headers=headers,
+                        json={
+                            "session_id": SESSION_ID,
+                            "message": "检查下载队列状态",
+                            "request_id": "request_hidden_query_new_0001",
+                        },
+                    )
+                    self.assertEqual(newer.status_code, 200, newer.text)
+                    service.release.set()
+                    stale = pending.result(timeout=2)
+        finally:
+            service.release.set()
+            old_client.close()
+
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(
+            service.confirmation_store.list_active_tickets(owner=service.owner), []
+        )
 
     def test_direct_read_revokes_superseded_query_confirmation_epoch(self):
         csrf = self._login()
